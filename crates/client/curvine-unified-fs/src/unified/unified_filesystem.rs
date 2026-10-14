@@ -27,10 +27,11 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
 use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
-    CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FilesystemInfo, FreeResult,
-    JobStatus, ListOptions, LoadJobCommand, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
-    OpenFlags, RenameFlags, RuntimeConfigEntry, RuntimeConfigResetResult,
-    RuntimeConfigUpdateResult, SetAttrOpts, TransferCommand, TransferKind, TransferState,
+    ContentSummary, CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus,
+    FilesystemInfo, FreeResult, JobStatus, ListOptions, LoadJobCommand, MkdirOpts,
+    MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags, RuntimeConfigEntry,
+    RuntimeConfigResetResult, RuntimeConfigUpdateResult, SetAttrOpts, TransferCommand,
+    TransferKind, TransferState,
 };
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::common::Utils;
@@ -265,6 +266,29 @@ impl UnifiedFileSystem {
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
         let fut = async { self.cv.get_filesystem_info().await };
         self.track("GetFilesystemInfo", "", "", fut).await
+    }
+
+    /// Returns a Curvine dir-space snapshot when applicable. Cache-mode mounts
+    /// that delegate full namespace queries to UFS return `Ok(None)` so callers
+    /// can fall back to a live recursive scan.
+    pub async fn try_get_content_summary_snapshot(
+        &self,
+        path: &Path,
+    ) -> FsResult<Option<ContentSummary>> {
+        if !path.is_cv() {
+            return err_box!("path is not curvine path");
+        }
+
+        match self.get_mount(path, RpcCode::GetContentSummary).await? {
+            Some((_, mount)) if mount.info.is_cache_mode() && !mount.info.is_fs_mode() => Ok(None),
+            _ => {
+                let fut = async { self.cv.get_content_summary(path).await };
+                match self.track("GetContentSummary", path.path(), "", fut).await {
+                    Ok(summary) => Ok(Some(summary)),
+                    Err(err) => Err(err),
+                }
+            }
+        }
     }
 
     /// Client-master version handshake: report this client's `component_info`

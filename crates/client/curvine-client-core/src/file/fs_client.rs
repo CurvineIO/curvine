@@ -22,6 +22,7 @@ use curvine_error::FsResult;
 use curvine_fs_api::{
     Path, RpcCode, GET_BLOCK_LOCATIONS_BATCH_MAX_ENCODED_PATH_BYTES,
     GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS, MASTER_CAPABILITY_GET_BLOCK_LOCATIONS_BATCH,
+    MASTER_CAPABILITY_GET_CONTENT_SUMMARY_SNAPSHOT,
 };
 use curvine_model::*;
 use curvine_model::{sanitize_client_context, ProtoUtils};
@@ -87,6 +88,7 @@ impl_with_client_context!(
     FreeRequest,
     GetBlockLocationsRequest,
     GetBlockLocationsBatchRequest,
+    GetContentSummaryRequest,
     GetFileStatusRequest,
     GetLockRequest,
     LinkRequest,
@@ -744,6 +746,27 @@ impl FsClient {
             results.push(result);
         }
         Ok(Some(results))
+    }
+
+    pub async fn get_content_summary(&self, path: &Path) -> FsResult<ContentSummary> {
+        if !self
+            .master_supports_capability(MASTER_CAPABILITY_GET_CONTENT_SUMMARY_SNAPSHOT)
+            .await
+        {
+            return Err(FsError::unsupported(
+                MASTER_CAPABILITY_GET_CONTENT_SUMMARY_SNAPSHOT,
+            ));
+        }
+
+        let header = GetContentSummaryRequest {
+            path: Some(path.encode()),
+            client_context: None,
+        };
+        let rep: GetContentSummaryResponse = self.rpc(RpcCode::GetContentSummary, header).await?;
+        let summary = rep
+            .summary
+            .ok_or_else(|| FsError::common("GetContentSummary response missing summary"))?;
+        Ok(ProtoUtils::content_summary_from_pb(summary))
     }
 
     pub async fn get_file_block_details(&self, path: &Path) -> FsResult<FileBlockDetails> {

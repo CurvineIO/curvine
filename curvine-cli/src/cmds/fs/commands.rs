@@ -132,6 +132,9 @@ pub enum FsSubCommand {
         #[clap(short, long, help = "Display the names of columns as a header line")]
         verbose: bool,
 
+        #[clap(long, help = "Force live recursive scan instead of dir-space snapshot")]
+        live: bool,
+
         #[clap(long, action = clap::ArgAction::Help, help = "Print help")]
         help: Option<bool>,
     },
@@ -166,6 +169,9 @@ pub enum FsSubCommand {
     Count {
         #[clap(help = "Path of the directory to count")]
         path: String,
+
+        #[clap(long, help = "Force live recursive scan instead of dir-space snapshot")]
+        live: bool,
     },
 
     /// Move file or directory
@@ -297,12 +303,14 @@ impl FsCommand {
                 path,
                 human_readable,
                 verbose,
+                live,
                 ..
             } => {
                 let du_cmd = DuCommand::Du {
                     path: path.clone(),
                     human_readable: *human_readable,
                     verbose: *verbose,
+                    live: *live,
                     help: None,
                 };
                 du_cmd.execute(client).await
@@ -329,8 +337,11 @@ impl FsCommand {
                 stat_cmd.execute(client).await
             }
 
-            FsSubCommand::Count { path } => {
-                let count_cmd = CountCommand::Count { path: path.clone() };
+            FsSubCommand::Count { path, live } => {
+                let count_cmd = CountCommand::Count {
+                    path: path.clone(),
+                    live: *live,
+                };
                 count_cmd.execute(client).await
             }
 

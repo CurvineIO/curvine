@@ -25,9 +25,10 @@ use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
 use curvine_model::ProtoUtils;
 use curvine_model::{CommitBlock, DeleteResult, FreeResult, ListOptions};
 use curvine_model::{
-    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
-    FilesystemInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
-    RuntimeConfigEntry, RuntimeConfigResetResult, RuntimeConfigUpdateResult, SetAttrOpts,
+    ContentSummary, CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock,
+    FileStatus, FilesystemInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
+    RenameFlags, RuntimeConfigEntry, RuntimeConfigResetResult, RuntimeConfigUpdateResult,
+    SetAttrOpts,
 };
 use curvine_proto::GetCvMetadataSnapshotPageResponse;
 use curvine_rpc::client::ClientConf;
@@ -335,6 +336,10 @@ impl CurvineFileSystem {
         paths: &[Path],
     ) -> FsResult<Option<Vec<FsResult<FileBlocks>>>> {
         self.fs_client.get_block_locations_batch(paths).await
+    }
+
+    pub async fn get_content_summary(&self, path: &Path) -> FsResult<ContentSummary> {
+        self.fs_client.get_content_summary(path).await
     }
 
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {

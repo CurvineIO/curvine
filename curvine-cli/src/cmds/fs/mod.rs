@@ -4,7 +4,6 @@ mod chmod;
 mod chown;
 mod commands;
 mod common;
-mod content_summary;
 mod count;
 mod df;
 mod du;

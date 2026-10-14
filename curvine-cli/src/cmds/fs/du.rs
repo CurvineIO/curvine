@@ -16,6 +16,9 @@ pub enum DuCommand {
         #[clap(short, long, help = "Display the names of columns as a header line")]
         verbose: bool,
 
+        #[clap(long, help = "Force live recursive scan instead of dir-space snapshot")]
+        live: bool,
+
         #[clap(long, action = clap::ArgAction::Help, help = "Print help")]
         help: Option<bool>,
     },
@@ -28,11 +31,12 @@ impl DuCommand {
                 path,
                 human_readable,
                 verbose,
+                live,
                 ..
             } => {
                 let path = CurvineURI::new(path)?;
+                let mut warn_fallback = true;
 
-                // Print header similar to HDFS du -v output, but only if verbose is true
                 if *verbose {
                     println!(
                         "{:>15}  {:>15}  {:>15}  PATH",
@@ -40,29 +44,54 @@ impl DuCommand {
                     );
                 }
 
-                match crate::cmds::fs::common::calculate_content_summary(&client, &path).await {
+                match crate::cmds::fs::common::resolve_content_summary_for_path(
+                    &client,
+                    &path,
+                    *live,
+                    &mut warn_fallback,
+                )
+                .await
+                {
                     Ok(summary) => {
-                        // Get file status to determine replication factor
                         let status = client.get_status(&path).await;
-                        // Default replication factor is 3 if we can't get the status
                         let replicas = status.map(|s| s.replicas).unwrap_or(1) as i64;
-                        // Calculate disk space consumed with all replicas
-                        let disk_space = summary.length * replicas;
+                        let logical = summary.logical_bytes as i64;
+                        let disk_space = logical * replicas;
 
-                        // Format similar to HDFS du output with single replica data added
+                        if *verbose {
+                            let source =
+                                crate::cmds::fs::common::format_content_summary_source(&summary);
+                            let (generation, finished) = summary
+                                .snapshot
+                                .as_ref()
+                                .map(|snap| {
+                                    (
+                                        snap.generation.to_string(),
+                                        crate::cmds::fs::common::format_epoch_ms_local(
+                                            snap.finished_ms,
+                                            "%Y-%m-%d %H:%M:%S",
+                                        ),
+                                    )
+                                })
+                                .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
+                            eprintln!(
+                                "du: source={source} generation={generation} finished={finished}"
+                            );
+                        }
+
                         if *human_readable {
                             println!(
                                 "{:>15}  {:>15}  {:>15}  {}",
-                                crate::cmds::fs::common::format_size(summary.length as u64),
-                                crate::cmds::fs::common::format_size(summary.length as u64),
+                                crate::cmds::fs::common::format_size(summary.logical_bytes),
+                                crate::cmds::fs::common::format_size(summary.logical_bytes),
                                 crate::cmds::fs::common::format_size(disk_space as u64),
                                 path.full_path()
                             );
                         } else {
                             println!(
                                 "{:>15}  {:>15}  {:>15}  {}",
-                                summary.length,
-                                summary.length,
+                                logical,
+                                logical,
                                 disk_space,
                                 path.full_path()
                             );
