@@ -49,7 +49,7 @@ impl InodeTtlChecker {
         })
     }
 
-    pub fn cleanup_once(&self) -> FsResult<i64> {
+    pub fn cleanup_once(&self) -> FsResult<u64> {
         let start_time = LocalTime::mills() as i64;
         let expired_buckets = self.bucket_list.get_expired_buckets_at(start_time);
 
@@ -60,20 +60,22 @@ impl InodeTtlChecker {
 
         info!("found {} expired buckets to process", expired_buckets.len());
 
-        let mut total_processed = 0i64;
+        let mut total_processed = 0u64;
         for bucket in expired_buckets {
             total_processed += self.process_expired_bucket(bucket)?;
         }
 
+        self.bucket_list.optimize_all();
+
         Ok(total_processed)
     }
 
-    fn process_expired_bucket(&self, bucket: Arc<TtlBucket>) -> FsResult<i64> {
+    fn process_expired_bucket(&self, bucket: Arc<TtlBucket>) -> FsResult<u64> {
         let inode_ids = std::mem::take(&mut *bucket.inodes.lock());
-        let total = inode_ids.len() as i64;
+        let total = inode_ids.len();
 
-        for inode_id in inode_ids.iter().copied() {
-            match self.action_executor.execute_by_id(inode_id) {
+        for inode_id in inode_ids {
+            match self.action_executor.execute_by_id(inode_id as i64) {
                 Err(e) => {
                     // A missing inode means it was already removed (e.g. by a
                     // concurrent delete); there is nothing left to clean up.

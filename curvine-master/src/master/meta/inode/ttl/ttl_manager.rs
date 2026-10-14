@@ -46,7 +46,7 @@ impl InodeTtlManager {
         Ok(manager)
     }
 
-    pub fn cleanup(&self) -> FsResult<i64> {
+    pub fn cleanup(&self) -> FsResult<u64> {
         let spend = TimeSpent::new();
 
         match self.checker.cleanup_once() {
