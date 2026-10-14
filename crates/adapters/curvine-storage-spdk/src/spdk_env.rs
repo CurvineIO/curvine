@@ -1893,8 +1893,11 @@ mod test {
         let fini_calls = Arc::new(AtomicUsize::new(0));
 
         let free_calls_for_hook = Arc::clone(&free_calls);
+        let qpair_key = qpair as usize;
         let poller_stop_calls_for_hook = Arc::clone(&poller_stop_calls);
+        let free_calls_for_detach = Arc::clone(&free_calls);
         let detach_calls_for_hook = Arc::clone(&detach_calls);
+        let free_calls_for_fini = Arc::clone(&free_calls);
         let fini_calls_for_hook = Arc::clone(&fini_calls);
         let retired_qpairs = Arc::clone(&env.retired_qpairs);
 
@@ -1903,7 +1906,8 @@ mod test {
             env.qpair_pool.try_reserve(ctrlr as usize),
             QpairReserveResult::Reserved
         );
-        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |freed_qpair| {
+            assert_eq!(freed_qpair as usize, qpair_key);
             free_calls_for_hook.fetch_add(1, Ordering::AcqRel);
             0
         });
@@ -1912,9 +1916,11 @@ mod test {
             retired_qpairs.mark_poller_exited_cleanly();
         }));
         env.test_hooks.detach_controllers = Some(Arc::new(move || {
+            assert_eq!(free_calls_for_detach.load(Ordering::Acquire), 1);
             detach_calls_for_hook.fetch_add(1, Ordering::AcqRel);
         }));
         env.test_hooks.env_fini = Some(Arc::new(move || {
+            assert_eq!(free_calls_for_fini.load(Ordering::Acquire), 1);
             fini_calls_for_hook.fetch_add(1, Ordering::AcqRel);
         }));
         env.state
