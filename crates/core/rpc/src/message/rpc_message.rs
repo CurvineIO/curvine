@@ -130,6 +130,11 @@ pub struct RpcMessage {
     pub protocol: Protocol,
     pub header: Option<BytesMut>,
     pub data: DataSlice,
+    /// Receipt time, stamped only by the wire-decode paths
+    /// (`RpcFrame::receive`, `ReadFrame::receive`) for non-heartbeat messages.
+    /// Locally built messages leave it `None`; new read paths must preserve
+    /// this invariant because the queue-delay metric and the audit `queueUs`
+    /// field derive from it.
     pub time: Option<Instant>,
 }
 
