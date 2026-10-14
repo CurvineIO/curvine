@@ -1008,6 +1008,15 @@ impl MasterFilesystem {
         }
     }
 
+    /// Blocks a client commits with one request, paired with the length that was
+    /// actually written so their placement reservation can be released.
+    fn committed_block_lengths(commit_blocks: &[CommitBlock]) -> Vec<(i64, i64)> {
+        commit_blocks
+            .iter()
+            .map(|commit| (commit.block_id, commit.block_len))
+            .collect()
+    }
+
     /// Document application to allocate a new block.
     #[allow(clippy::too_many_arguments)]
     pub fn add_block<T: AsRef<str>>(
@@ -1047,6 +1056,9 @@ impl MasterFilesystem {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
+        // Blocks this request commits were placed by earlier requests, so their
+        // placement reservation is resolved now.
+        let committed = Self::committed_block_lengths(&commit_blocks);
         let block =
             match fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len) {
                 Ok(block) => block,
@@ -1057,6 +1069,11 @@ impl MasterFilesystem {
                     return Err(e);
                 }
             };
+        {
+            let mut wm = self.worker_manager.write();
+            wm.track_block_reservation(block.id, &choose_workers, block_size);
+            wm.release_committed_reservations(&committed);
+        }
         let located = LocatedBlock {
             block,
             locs: choose_workers,
@@ -1125,6 +1142,10 @@ impl MasterFilesystem {
         options: CompleteFileOptions,
     ) -> FsResult<Option<FileBlocks>> {
         let path = path.as_ref();
+        // Capture the committed blocks before they are applied: committing a block
+        // resolves its placement reservation, and the same block may be committed
+        // again on flush or close.
+        let committed = Self::committed_block_lengths(&commit_blocks);
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         fs_dir.complete_file(
@@ -1136,6 +1157,9 @@ impl MasterFilesystem {
             options.only_flush,
             options.set_attr_opts,
         )?;
+        self.worker_manager
+            .write()
+            .release_committed_reservations(&committed);
 
         if options.only_flush && options.return_file_blocks {
             let file = inode.as_file_ref()?;
@@ -2058,10 +2082,13 @@ impl MasterFilesystem {
         };
         let block = match fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers) {
             Ok((block, assigned)) => {
-                if !assigned {
-                    self.worker_manager
-                        .write()
-                        .unschedule_chosen_workers(&choose_workers, block_size);
+                let mut wm = self.worker_manager.write();
+                if assigned {
+                    // The block now lives on the newly chosen workers, so the
+                    // reservation charged for them belongs to this block id.
+                    wm.track_block_reservation(block.id, &choose_workers, block_size);
+                } else {
+                    wm.unschedule_chosen_workers(&choose_workers, block_size);
                 }
                 block
             }
