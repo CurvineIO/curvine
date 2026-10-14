@@ -82,7 +82,7 @@ impl ReadFrame {
                         let bytes = self.read_full(data_size).await?;
                         DataSlice::Buffer(bytes)
                     };
-                    let msg = Message::new(protocol, header, data);
+                    let mut msg = Message::new(protocol, header, data);
 
                     let _ = mem::replace(&mut state, FrameSate::Head);
 
@@ -90,6 +90,7 @@ impl ReadFrame {
                     if msg.is_heartbeat() {
                         continue;
                     } else {
+                        msg.set_time();
                         return Ok(msg);
                     }
                 }
@@ -101,6 +102,8 @@ impl ReadFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::Builder;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     #[tokio::test]
@@ -120,5 +123,30 @@ mod tests {
 
         let msg = read_frame.receive().await.unwrap();
         assert!(msg.is_empty(), "expected empty message on peer EOF");
+    }
+
+    #[tokio::test]
+    async fn receive_stamps_receipt_time() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+
+        // Send one request frame exactly as a peer would.
+        let mut frame = BytesMut::new();
+        Builder::new_rpc(1i8).build().encode(&mut frame).unwrap();
+        let (_, mut client_write) = tokio::io::split(client);
+        client_write.write_all(&frame).await.unwrap();
+
+        let (read_half, _) = tokio::io::split(server_stream);
+        let mut read_frame = ReadFrame::new(read_half, FrameBuf::new(0));
+
+        let msg = read_frame.receive().await.unwrap();
+        assert!(!msg.is_empty(), "expected a decoded request");
+        assert!(
+            msg.time.is_some(),
+            "ReadFrame::receive must stamp the receipt time for handlers"
+        );
     }
 }
