@@ -25,8 +25,16 @@ use curvine_model::{
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::{ByteUnit, LocalTime};
 use log::{info, warn};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
+
+/// One worker charged for an in-flight block placement.
+#[derive(Debug, Clone, Copy)]
+struct PendingReservation {
+    worker_id: u32,
+    reserved: i64,
+    since_ms: u64,
+}
 
 pub struct WorkerManager {
     pub(crate) worker_map: WorkerMap,
@@ -34,6 +42,17 @@ pub struct WorkerManager {
     pub(crate) worker_policy: WorkerPolicyAdapter,
     pub(crate) cluster_id: String,
     pub(crate) conf: ClusterConf,
+    /// Placement reservations that are still in flight, keyed by block id.
+    ///
+    /// `choose_worker` charges the file block size to every picked worker, and
+    /// that charge is only cleared once a heartbeat reports the matching drop in
+    /// free space. A block that is committed before it fills (the normal case for
+    /// small files) never drops the full reservation, so the remainder has to be
+    /// released when the block is committed. Without that release the charges of
+    /// already committed blocks accumulate until the worker looks full and every
+    /// later placement fails with `No eligible workers`, which the client reports
+    /// as `EIO` for all writes.
+    pending_reservations: HashMap<i64, Vec<PendingReservation>>,
 }
 
 impl WorkerManager {
@@ -46,6 +65,7 @@ impl WorkerManager {
             worker_policy,
             cluster_id: conf.cluster_id.to_string(),
             conf: conf.clone(),
+            pending_reservations: HashMap::new(),
         })
     }
 
@@ -134,6 +154,55 @@ impl WorkerManager {
         self.adjust_chosen_workers(workers, block_size, false);
     }
 
+    /// Remember the reservation charged for a newly placed block so that
+    /// committing the block can release the part the worker will never write.
+    pub(crate) fn track_block_reservation(
+        &mut self,
+        block_id: i64,
+        workers: &[WorkerAddress],
+        block_size: i64,
+    ) {
+        if block_size <= 0 || workers.is_empty() {
+            return;
+        }
+        let now_ms = LocalTime::mills();
+        let entry = self.pending_reservations.entry(block_id).or_default();
+        for addr in workers {
+            entry.push(PendingReservation {
+                worker_id: addr.worker_id,
+                reserved: block_size,
+                since_ms: now_ms,
+            });
+        }
+    }
+
+    /// Release the reservation of a block the client has committed.
+    ///    /// The bytes that were actually written are already removed from the
+    /// reservation when a heartbeat reports the matching drop in free space, so
+    /// only the never-written remainder is released here. Dropping the tracking
+    /// entry keeps a repeated commit of the same block (`flush` followed by
+    /// `close`, or a later `add_block` replaying the previous commit) from
+    /// releasing the same reservation twice.
+    pub(crate) fn release_block_reservation(&mut self, block_id: i64, committed_len: i64) {
+        let Some(entry) = self.pending_reservations.remove(&block_id) else {
+            return;
+        };
+        let written = committed_len.max(0);
+        for reservation in entry {
+            let residual = reservation.reserved.saturating_sub(written);
+            if let Some(worker) = self.worker_map.workers.get_mut(&reservation.worker_id) {
+                worker.unschedule_bytes(residual);
+            }
+        }
+    }
+
+    /// Release the reservations of every block committed by one client request.
+    pub(crate) fn release_committed_reservations(&mut self, committed: &[(i64, i64)]) {
+        for (block_id, committed_len) in committed {
+            self.release_block_reservation(*block_id, *committed_len);
+        }
+    }
+
     fn expire_scheduled_bytes(&mut self) {
         let timeout_ms = self.conf.master.worker_lost_interval_ms();
         if timeout_ms == 0 {
@@ -143,6 +212,12 @@ impl WorkerManager {
         for worker in self.worker_map.workers.values_mut() {
             worker.expire_scheduled_bytes(now_ms, timeout_ms);
         }
+        // Reservations expire with the same timeout, so drop the bookkeeping of
+        // blocks that a crashed or disconnected client never committed.
+        self.pending_reservations.retain(|_, entry| {
+            entry.retain(|item| now_ms.saturating_sub(item.since_ms) < timeout_ms);
+            !entry.is_empty()
+        });
     }
 
     fn schedule_chosen_workers(&mut self, workers: &[WorkerAddress], block_size: i64) {
@@ -505,6 +580,97 @@ mod tests {
             manager.get_worker(1).unwrap().scheduled_bytes,
             8 * block_size
         );
+    }
+
+    #[test]
+    fn committing_a_block_releases_the_never_written_remainder() {
+        let mut manager = robin_manager();
+        let available = 1 << 30;
+        let block_size = 128 << 20;
+        let mut worker = worker_with_available(1, available);
+        worker.capacity = available;
+        manager.add_test_worker(worker);
+
+        let chosen = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.track_block_reservation(42, &chosen, block_size);
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+
+        // A 4 KiB file commits: the worker free space will only ever drop by the
+        // bytes that were actually written, so the rest of the reservation is
+        // released here and only those 4 KiB stay until a heartbeat observes them.
+        manager.release_block_reservation(42, 4096);
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 4096);
+
+        // `flush` then `close`, or a later add_block replaying the previous
+        // commit, must not release the same reservation twice.
+        manager.release_block_reservation(42, 4096);
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 4096);
+    }
+
+    #[test]
+    fn small_file_commits_keep_the_worker_allocatable() {
+        // LTP-style workload: many small files, each one reserving a full 128 MiB
+        // file block on placement and committing a few KiB. Committed blocks must
+        // not keep their reservation, otherwise the worker looks full after
+        // available / block_size files and every later write fails with EIO.
+        let mut manager = robin_manager();
+        let available = 1 << 30;
+        let block_size = 128 << 20;
+        let written = 4096;
+        let mut worker = worker_with_available(1, available);
+        worker.capacity = available;
+        manager.add_test_worker(worker);
+
+        for block_id in 0..64 {
+            let chosen = manager
+                .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+                .unwrap_or_else(|e| panic!("allocation {block_id} failed: {e}"));
+            manager.track_block_reservation(block_id, &chosen, block_size);
+            manager.release_block_reservation(block_id, written);
+        }
+
+        // Only the written bytes that a heartbeat has not observed yet stay
+        // reserved; the committed block sizes no longer accumulate.
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 64 * written);
+        assert!(manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .is_ok());
+    }
+
+    #[test]
+    fn uncommitted_block_bookkeeping_expires_with_the_reservation() {
+        let mut conf = ClusterConf::default();
+        conf.master.worker_policy = "robin".to_string();
+        conf.master.heartbeat_interval = "1ms".to_string();
+        conf.master.worker_lost_interval = "10ms".to_string();
+        conf.master.init().unwrap();
+        let mut manager = WorkerManager::new(&conf).unwrap();
+
+        let block_size = 128 << 20;
+        manager.add_test_worker(worker_with_available(1, 1 << 40));
+        let chosen = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.track_block_reservation(7, &chosen, block_size);
+        assert_eq!(manager.pending_reservations.len(), 1);
+
+        // A client that disconnects without committing must not leave bookkeeping
+        // behind forever: it expires together with the reservation it belongs to.
+        for item in manager.pending_reservations.get_mut(&7).unwrap() {
+            item.since_ms = 1;
+        }
+        manager
+            .worker_map
+            .workers
+            .get_mut(&1)
+            .unwrap()
+            .scheduled_since_ms = 1;
+        manager.expire_scheduled_bytes();
+
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 0);
+        assert!(manager.pending_reservations.is_empty());
     }
 
     #[test]
