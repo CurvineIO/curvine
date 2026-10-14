@@ -43,6 +43,28 @@ meta_dir = "./data/meta"
 audit_logging_enabled = true
 log = { level = "info", log_dir = "./logs", file_name = "master.log" }
 
+# Dir-space snapshots for `curvine fs du` / `count` (default off; see
+# docs/design/dir-space.md §13 before enabling in production).
+dir_space_enabled = false
+dir_space_global_scan_interval = "10m"
+dir_space_global_scan_timeout = "5m"
+dir_space_tracked_scan_interval = "2m"
+dir_space_tracked_scan_timeout = "90s"
+dir_space_max_inodes = 5000000
+dir_space_max_edges = 10000000
+dir_space_max_dirs = 1000000
+dir_space_max_depth = 1024
+dir_space_memory_budget = "768MB"
+dir_space_max_inode_record_bytes = "16MB"
+dir_space_track_max_inodes = 1000000
+dir_space_track_max_edges = 2000000
+dir_space_track_max_depth = 1024
+dir_space_track_memory_budget = "256MB"
+dir_space_max_tracked_points = 128
+dir_space_auto_track_mounts = true
+dir_space_tracked_paths = []
+dir_space_restore_wait_timeout = "30s"
+
 [web]
 port = 9000
 

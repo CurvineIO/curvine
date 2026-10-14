@@ -1197,4 +1197,70 @@ mod tests {
         assert!(err.to_string().contains("cancel"));
         Ok(())
     }
+
+    fn process_rss_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("VmRSS:")
+                        .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    /// Synthetic ~1M-inode tree for manual regression. Records scan duration,
+    /// entry count and RSS delta; no fixed latency assertion (hardware varies).
+    #[test]
+    #[ignore = "large dir-space scale test"]
+    fn dir_space_scale_one_million_inode_tree() -> CommonResult<()> {
+        const TARGET_FILES: u64 = 1_000_000;
+        const BATCH: u64 = 10_000;
+        const DIR_ID: i64 = 50_000;
+
+        let store = new_store("scale-1m")?;
+        let root = FsDir::create_root();
+        let bucket = dir("scale", DIR_ID, ROOT_INODE_ID);
+        write_batch(
+            &store,
+            &[root, bucket],
+            &[(ROOT_INODE_ID, "scale".to_string(), DIR_ID)],
+        )?;
+
+        let mut next_id = 100_000_i64;
+        let mut written = 0_u64;
+        while written < TARGET_FILES {
+            let chunk = BATCH.min(TARGET_FILES - written);
+            let mut inodes = Vec::with_capacity(chunk as usize);
+            let mut edges = Vec::with_capacity(chunk as usize);
+            for i in 0..chunk {
+                let id = next_id;
+                next_id += 1;
+                inodes.push(file(&format!("f{}", written + i), id, DIR_ID, 64));
+                edges.push((DIR_ID, format!("f{}", written + i), id));
+            }
+            write_batch(&store, &inodes, &edges)?;
+            written += chunk;
+        }
+
+        let rss_before = process_rss_kb();
+        let started = Instant::now();
+        let active = Arc::new(AtomicBool::new(true));
+        let snap = run_global(&store, &context(&active))?;
+        let elapsed_ms = started.elapsed().as_millis();
+        let rss_after = process_rss_kb();
+
+        eprintln!(
+            "dir_space_scale: inodes={} edges={} entries={} duration_ms={} rss_delta_kb={}",
+            snap.inode_count,
+            snap.edge_count,
+            snap.entries.len() + 1,
+            elapsed_ms,
+            rss_after.saturating_sub(rss_before)
+        );
+        assert_eq!(snap.inode_count, TARGET_FILES + 2);
+        assert!(snap.root.file_count >= TARGET_FILES);
+        Ok(())
+    }
 }

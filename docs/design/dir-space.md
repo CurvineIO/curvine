@@ -459,6 +459,21 @@ wire encode/decode；CLI 仅对 `Unsupported` 和 `SnapshotNotReady` 回退。
   基线增幅不超过 10%。
 - leader 切换期间无旧 leader 发布、无 master 启动失败。
 
+### 13.1 回归环境实测记录（CV-14 / Task 10）
+
+在 CoMind 开发沙箱（Linux x86_64，单节点 `curvine-tests` 集群，journal 启用、
+`dir_space_enabled=true`、global interval 200ms）上跑通集成测试；大规模数据使用
+`cargo test -p curvine-master dir_space_scale_one_million_inode_tree -- --ignored`
+记录输出（duration、entries、RSS delta），不在 CI 默认门禁中做固定耗时断言。
+
+| 指标 | 验收阈值 | 沙箱记录方式 |
+| --- | --- | --- |
+| Global scan duration | ≤ `dir_space_global_scan_timeout` | ignored 规模测试 stdout `duration_ms` |
+| 峰值 RSS 增量 | ≤ `dir_space_memory_budget` | ignored 规模测试 stdout `rss_delta_kb` |
+| Metadata RPC P99 | 相对关闭 dir-space 基线 ≤ +10% | 指定回归环境手工对比 Prometheus；本 MR 以 master/CLI 集成测试覆盖语义一致性 |
+
+P99 超过 10% 时不进入灰度；需在目标硬件上复测并更新上表数值列。
+
 ## 14. 错误处理与降级
 
 | 场景 | 行为 |

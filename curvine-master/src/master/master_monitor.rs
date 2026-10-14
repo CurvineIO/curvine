@@ -67,4 +67,11 @@ impl MasterMonitor {
         let cur: RoleState = self.journal_ctl.state();
         cur == RoleState::Exit
     }
+
+    /// Integration tests without a live journal use this to simulate leader /
+    /// follower transitions for dir-space scheduling.
+    #[doc(hidden)]
+    pub fn set_journal_role_for_test(&self, role: RoleState) {
+        self.journal_ctl.set_state(role);
+    }
 }

@@ -59,6 +59,35 @@ meta_dir = "testing/meta"
 # worker_policy = "weighted"
 log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 
+# Dir-space periodic directory usage snapshots for `curvine fs du` / `count`.
+# Disabled by default; enable only after validating scan RSS, duration and
+# metadata RPC P99 on your target hardware (see docs/design/dir-space.md §13).
+dir_space_enabled = false
+# Global full-namespace scan cadence and cooperative deadline (timeout must be
+# <= interval). Scans run only on the active master and never publish partial
+# results on timeout, limit or role loss.
+dir_space_global_scan_interval = "10m"
+dir_space_global_scan_timeout = "5m"
+# Tracked mount/config path scans (same timeout <= interval rule).
+dir_space_tracked_scan_interval = "2m"
+dir_space_tracked_scan_timeout = "90s"
+# Hard caps for one global scan round (inodes/edges/dirs/depth/memory/record size).
+dir_space_max_inodes = 5000000
+dir_space_max_edges = 10000000
+dir_space_max_dirs = 1000000
+dir_space_max_depth = 1024
+dir_space_memory_budget = "768MB"
+dir_space_max_inode_record_bytes = "16MB"
+# Separate, tighter limits for tracked-point scans.
+dir_space_track_max_inodes = 1000000
+dir_space_track_max_edges = 2000000
+dir_space_track_max_depth = 1024
+dir_space_track_memory_budget = "256MB"
+dir_space_max_tracked_points = 128
+dir_space_auto_track_mounts = true
+dir_space_tracked_paths = []
+dir_space_restore_wait_timeout = "30s"
+
 # Version compatibility policy.
 # mode: "diagnose" (default, allow with warnings) or "enforce" (reject
 # incompatible workers/clients). Bounds below are empty by default, meaning

@@ -13,16 +13,19 @@
 // limitations under the License.
 
 use curvine_client::file::{FsClient, FsContext};
+use curvine_client::unified::UnifiedFileSystem;
 use curvine_core_error::CommonResult;
-use curvine_fs_api::CurvineURI;
-use curvine_model::MountOptions;
+use curvine_error::{FsError, FsResult};
+use curvine_fs_api::{CurvineURI, FileSystem, Path};
+use curvine_model::{ContentSummary, MountOptions, MountOptionsBuilder, WriteType};
 use curvine_runtime::common::Logger;
-use curvine_runtime::runtime::RpcRuntime;
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_server::common::ufs_manager::UfsManager;
 use curvine_tests::Testing;
 use log::info;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 // Test the load function of curvine-client
 #[test]
@@ -246,4 +249,60 @@ async fn get_hdfs_test_config() -> HashMap<String, String> {
     let mut config = HashMap::new();
     config.insert("nameserver".to_string(), "test-cluster".to_string());
     config
+}
+
+fn enable_dir_space_with_mount_tracking(conf: &mut curvine_config::ClusterConf) {
+    conf.master.dir_space_enabled = true;
+    conf.master.dir_space_global_scan_interval = "500ms".to_string();
+    conf.master.dir_space_global_scan_timeout = "500ms".to_string();
+    conf.master.dir_space_tracked_scan_interval = "500ms".to_string();
+    conf.master.dir_space_tracked_scan_timeout = "500ms".to_string();
+    conf.master.dir_space_auto_track_mounts = true;
+    conf.master.init().expect("dir-space mount test config");
+}
+
+async fn wait_for_dir_space_snapshot(
+    fs: &UnifiedFileSystem,
+    path: &Path,
+) -> FsResult<ContentSummary> {
+    for _ in 0..160 {
+        match fs.try_get_content_summary_snapshot(path).await {
+            Ok(Some(summary)) if summary.snapshot.is_some() => return Ok(summary),
+            Ok(Some(_)) | Ok(None) | Err(FsError::SnapshotNotReady(_)) => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(FsError::snapshot_not_ready(path.to_string()))
+}
+
+#[test]
+fn dir_space_tracked_fs_mode_mount_snapshot() -> FsResult<()> {
+    let testing = Testing::builder()
+        .default()
+        .mutate_conf(enable_dir_space_with_mount_tracking)
+        .build()?;
+    testing.start_cluster()?;
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone())?;
+    let ufs_base = testing.ufs_path.clone();
+
+    rt.block_on(async move {
+        let ufs = Path::from_str(format!("{}/dir_space_mount", ufs_base))?;
+        let cv_mount = Path::from_str("/dir_space_mnt_it")?;
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::FsMode)
+            .build();
+        fs.mount(&ufs, &cv_mount, opts).await?;
+        fs.mkdir(&Path::from_str("/dir_space_mnt_it/sub")?, true)
+            .await?;
+        fs.create(&Path::from_str("/dir_space_mnt_it/sub/file")?, true)
+            .await?;
+
+        let summary = wait_for_dir_space_snapshot(&fs, &cv_mount).await?;
+        assert!(summary.file_count >= 1);
+        assert!(summary.directory_count >= 2);
+        Ok(())
+    })
 }

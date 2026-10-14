@@ -21,9 +21,9 @@ use curvine_model::MountOptions;
 use curvine_model::ProtoUtils;
 use curvine_model::{
     AccessMode, BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress,
-    CommitBlock, CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, LocatedBlock,
-    MkdirOpts, MkdirOptsBuilder, MountInfo, Provider, StorageType, TtlAction, TtlType,
-    WorkerAddress, WorkerInfo, WorkerStatus, WriteType,
+    CommitBlock, ContentSummary, CreateFileOpts, CreateFileOptsBuilder, DeleteResult,
+    FileAllocOpts, LocatedBlock, MkdirOpts, MkdirOptsBuilder, MountInfo, Provider, StorageType,
+    TtlAction, TtlType, WorkerAddress, WorkerInfo, WorkerStatus, WriteType,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
@@ -34,6 +34,7 @@ use curvine_proto::{
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
+use curvine_raft::raft::RoleState;
 use curvine_rpc::handler::MessageHandler;
 #[cfg(feature = "fault-injection")]
 use curvine_rpc::message::ResponseStatus;
@@ -47,6 +48,7 @@ use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader,
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
 use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
+use curvine_server::master::space::{DirSpaceManager, ScanOutcome};
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
 use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
@@ -218,7 +220,11 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
 fn new_handler_for_test_with_dir_space(
     test_name: &str,
     dir_space_enabled: bool,
-) -> (MasterHandler, MasterFilesystem) {
+) -> (
+    MasterHandler,
+    MasterFilesystem,
+    Option<Arc<DirSpaceManager>>,
+) {
     Master::init_test_metrics();
 
     let test_id = Utils::rand_str(8);
@@ -236,6 +242,10 @@ fn new_handler_for_test_with_dir_space(
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    if dir_space_enabled {
+        fs.master_monitor
+            .set_journal_role_for_test(RoleState::Leader);
+    }
     fs.add_test_worker(WorkerInfo::default());
     let retry_cache = FsRetryCache::with_conf(&conf.master)
         .expect("test master retry cache configuration should be valid");
@@ -275,9 +285,69 @@ fn new_handler_for_test_with_dir_space(
         rt,
         Master::get_metrics().expect("test master metrics should initialize"),
         Arc::new(RuntimeConfigRegistry::builder().build()),
-        dir_space_manager,
+        dir_space_manager.clone(),
     );
-    (handler, fs)
+    (handler, fs, dir_space_manager)
+}
+
+fn live_content_summary_recursive(
+    fs: &MasterFilesystem,
+    path: &str,
+) -> CommonResult<ContentSummary> {
+    let status = fs.file_status(path)?;
+    if !status.is_dir {
+        return Ok(ContentSummary::live_file(status.len.max(0) as u64));
+    }
+
+    let mut summary = ContentSummary::live_recursive(0, 0, 1);
+    for child in fs.list_status(path)? {
+        if child.is_dir {
+            let child_summary = live_content_summary_recursive(fs, &child.path)?;
+            summary.logical_bytes = summary
+                .logical_bytes
+                .saturating_add(child_summary.logical_bytes);
+            summary.file_count = summary.file_count.saturating_add(child_summary.file_count);
+            summary.directory_count = summary
+                .directory_count
+                .saturating_add(child_summary.directory_count);
+        } else {
+            summary.logical_bytes = summary
+                .logical_bytes
+                .saturating_add(child.len.max(0) as u64);
+            summary.file_count = summary.file_count.saturating_add(1);
+        }
+    }
+    Ok(summary)
+}
+
+fn rpc_get_content_summary(handler: &MasterHandler, path: &str) -> CommonResult<ContentSummary> {
+    let msg = Builder::new_rpc(RpcCode::GetContentSummary)
+        .proto_header(GetContentSummaryRequest {
+            path: Some(path.to_string()),
+            client_context: None,
+        })
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    let rep = handler.get_content_summary(&mut ctx)?;
+    let header: GetContentSummaryResponse = rep.parse_header()?;
+    Ok(ProtoUtils::content_summary_from_pb(
+        header.summary.expect("summary"),
+    ))
+}
+
+fn assert_summary_counts_match(snapshot: &ContentSummary, live: &ContentSummary, path: &str) {
+    assert_eq!(
+        snapshot.logical_bytes, live.logical_bytes,
+        "logical_bytes mismatch at {path}"
+    );
+    assert_eq!(
+        snapshot.file_count, live.file_count,
+        "file_count mismatch at {path}"
+    );
+    assert_eq!(
+        snapshot.directory_count, live.directory_count,
+        "directory_count mismatch at {path}"
+    );
 }
 
 #[cfg(feature = "fault-injection")]
@@ -3479,7 +3549,7 @@ fn complete_file_with_set_attr_applies_attributes() -> CommonResult<()> {
 #[test]
 fn content_summary_capability_advertised_when_dir_space_enabled() {
     let _guard = master_fs_test_serial();
-    let (handler, _fs) = new_handler_for_test_with_dir_space("content-summary-cap", true);
+    let (handler, _fs, _) = new_handler_for_test_with_dir_space("content-summary-cap", true);
 
     let msg = Builder::new_rpc(RpcCode::GetFilesystemInfo)
         .proto_header(GetFilesystemInfoRequest::default())
@@ -3496,7 +3566,7 @@ fn content_summary_capability_advertised_when_dir_space_enabled() {
 #[test]
 fn content_summary_file_returns_live_summary_without_snapshot_metadata() {
     let _guard = master_fs_test_serial();
-    let (handler, fs) = new_handler_for_test_with_dir_space("content-summary-file", true);
+    let (handler, fs, _) = new_handler_for_test_with_dir_space("content-summary-file", true);
     fs.mkdir("/fdir", true).unwrap();
     fs.create("/fdir/file.txt", true).unwrap();
 
@@ -3521,7 +3591,7 @@ fn content_summary_file_returns_live_summary_without_snapshot_metadata() {
 #[test]
 fn content_summary_directory_without_snapshot_is_not_ready() {
     let _guard = master_fs_test_serial();
-    let (handler, fs) = new_handler_for_test_with_dir_space("content-summary-dir", true);
+    let (handler, fs, _) = new_handler_for_test_with_dir_space("content-summary-dir", true);
     fs.mkdir("/data", true).unwrap();
 
     let msg = Builder::new_rpc(RpcCode::GetContentSummary)
@@ -3533,4 +3603,103 @@ fn content_summary_directory_without_snapshot_is_not_ready() {
     let mut ctx = RpcContext::new(&msg);
     let err = handler.get_content_summary(&mut ctx).unwrap_err();
     assert!(matches!(err, FsError::SnapshotNotReady(_)));
+}
+
+fn seed_dir_space_namespace(fs: &MasterFilesystem) -> CommonResult<()> {
+    fs.mkdir("/ds", true)?;
+    fs.mkdir("/ds/a", true)?;
+    fs.mkdir("/ds/b", true)?;
+    fs.create("/ds/a/f1.txt", true)?;
+    fs.create("/ds/a/f2.txt", true)?;
+    fs.create("/ds/b/f3.txt", true)?;
+    fs.link("/ds/a/f1.txt", "/ds/b/hlink")?;
+    Ok(())
+}
+
+#[test]
+fn content_summary_dir_space_e2e_matches_live_recursive() -> CommonResult<()> {
+    let _guard = master_fs_test_serial();
+    let (handler, fs, manager) = new_handler_for_test_with_dir_space("content-summary-e2e", true);
+    let manager = manager.expect("dir-space manager");
+    seed_dir_space_namespace(&fs)?;
+
+    assert_eq!(manager.try_scan_global(), ScanOutcome::Success);
+
+    for path in ["/ds", "/ds/a", "/ds/b"] {
+        let live = live_content_summary_recursive(&fs, path)?;
+        let snapshot = rpc_get_content_summary(&handler, path)?;
+        assert!(snapshot.snapshot.is_some(), "expected snapshot at {path}");
+        assert_summary_counts_match(&snapshot, &live, path);
+    }
+    Ok(())
+}
+
+#[test]
+fn content_summary_dir_space_mutations_match_live_after_rescan() -> CommonResult<()> {
+    let _guard = master_fs_test_serial();
+    let (handler, fs, manager) =
+        new_handler_for_test_with_dir_space("content-summary-mutations", true);
+    let manager = manager.expect("dir-space manager");
+    seed_dir_space_namespace(&fs)?;
+    assert_eq!(manager.try_scan_global(), ScanOutcome::Success);
+
+    fs.rename("/ds/a/f2.txt", "/ds/a/renamed.txt", RenameFlags::empty())?;
+    fs.delete("/ds/b/f3.txt", false)?;
+    fs.create("/ds/a/new-after-delete.txt", true)?;
+
+    assert_eq!(manager.try_scan_global(), ScanOutcome::Success);
+    let live = live_content_summary_recursive(&fs, "/ds")?;
+    let snapshot = rpc_get_content_summary(&handler, "/ds")?;
+    assert_summary_counts_match(&snapshot, &live, "/ds");
+    Ok(())
+}
+
+#[test]
+fn content_summary_dir_space_standby_then_active_publishes() -> CommonResult<()> {
+    let _guard = master_fs_test_serial();
+    let (handler, fs, manager) =
+        new_handler_for_test_with_dir_space("content-summary-standby", true);
+    let manager = manager.expect("dir-space manager");
+    seed_dir_space_namespace(&fs)?;
+
+    fs.master_monitor
+        .set_journal_role_for_test(RoleState::Follower);
+    assert_eq!(manager.try_scan_global(), ScanOutcome::RoleLost);
+    assert!(rpc_get_content_summary(&handler, "/ds").is_err());
+
+    fs.master_monitor
+        .set_journal_role_for_test(RoleState::Leader);
+    assert_eq!(manager.try_scan_global(), ScanOutcome::Success);
+    let live = live_content_summary_recursive(&fs, "/ds")?;
+    let snapshot = rpc_get_content_summary(&handler, "/ds")?;
+    assert_summary_counts_match(&snapshot, &live, "/ds");
+    Ok(())
+}
+
+#[test]
+fn content_summary_dir_space_failed_rescan_keeps_prior_generation() -> CommonResult<()> {
+    let _guard = master_fs_test_serial();
+    let (handler, fs, manager) =
+        new_handler_for_test_with_dir_space("content-summary-stale-gen", true);
+    let manager = manager.expect("dir-space manager");
+    seed_dir_space_namespace(&fs)?;
+    assert_eq!(manager.try_scan_global(), ScanOutcome::Success);
+    let first = rpc_get_content_summary(&handler, "/ds")?;
+    let first_gen = first.snapshot.as_ref().unwrap().generation;
+
+    let guard = {
+        let fs_dir = fs.fs_dir.read();
+        fs_dir.store_ref().begin_restore(Duration::from_secs(60))?
+    };
+    assert_eq!(manager.try_scan_global(), ScanOutcome::Failed);
+    drop(guard);
+
+    let still = rpc_get_content_summary(&handler, "/ds")?;
+    assert_eq!(
+        still.snapshot.as_ref().unwrap().generation,
+        first_gen,
+        "failed scan must not advance generation"
+    );
+    assert_summary_counts_match(&still, &first, "/ds");
+    Ok(())
 }

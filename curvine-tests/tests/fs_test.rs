@@ -17,8 +17,9 @@ use curvine_client::file::{CurvineFileSystem, FsContext};
 use curvine_client::ClientMetrics;
 use curvine_config::ClusterConf;
 use curvine_core_error::CommonResult;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{Path, Reader, Writer};
+use curvine_model::ContentSummary;
 use curvine_model::{
     CreateFileOptsBuilder, ListOptions, MkdirOptsBuilder, SetAttrOptsBuilder, StorageState,
     TtlAction,
@@ -30,6 +31,7 @@ use curvine_tests::Testing;
 use futures::stream::StreamExt;
 use log::info;
 use std::sync::Arc;
+use std::time::Duration;
 
 const PATH: &str = "/fs_test/a.log";
 
@@ -1382,4 +1384,85 @@ fn list_stream_matches_list_options_empty_dir() {
             .unwrap();
         assert!(stream.next().await.is_none());
     });
+}
+
+fn enable_dir_space_for_integration(conf: &mut ClusterConf) {
+    conf.master.dir_space_enabled = true;
+    conf.master.dir_space_global_scan_interval = "500ms".to_string();
+    conf.master.dir_space_global_scan_timeout = "500ms".to_string();
+    conf.master.dir_space_tracked_scan_interval = "500ms".to_string();
+    conf.master.dir_space_tracked_scan_timeout = "500ms".to_string();
+    conf.master.dir_space_auto_track_mounts = false;
+    conf.master.init().expect("dir-space test config");
+}
+
+async fn live_content_summary(fs: &CurvineFileSystem, path: &Path) -> FsResult<ContentSummary> {
+    let status = fs.get_status(path).await?;
+    if !status.is_dir {
+        return Ok(ContentSummary::live_file(status.len.max(0) as u64));
+    }
+
+    let mut summary = ContentSummary::live_recursive(0, 0, 1);
+    for child in fs.list_status(path).await? {
+        if child.is_dir {
+            let child_path = Path::from_str(&child.path)?;
+            let child_summary = Box::pin(live_content_summary(fs, &child_path)).await?;
+            summary.logical_bytes = summary
+                .logical_bytes
+                .saturating_add(child_summary.logical_bytes);
+            summary.file_count = summary.file_count.saturating_add(child_summary.file_count);
+            summary.directory_count = summary
+                .directory_count
+                .saturating_add(child_summary.directory_count);
+        } else {
+            summary.logical_bytes = summary
+                .logical_bytes
+                .saturating_add(child.len.max(0) as u64);
+            summary.file_count = summary.file_count.saturating_add(1);
+        }
+    }
+    Ok(summary)
+}
+
+async fn wait_for_dir_space_snapshot(
+    fs: &CurvineFileSystem,
+    path: &Path,
+) -> FsResult<ContentSummary> {
+    for _ in 0..80 {
+        match fs.get_content_summary(path).await {
+            Ok(summary) if summary.snapshot.is_some() => return Ok(summary),
+            Ok(_) | Err(FsError::SnapshotNotReady(_)) => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(FsError::snapshot_not_ready(path.to_string()))
+}
+
+#[test]
+fn dir_space_content_summary_matches_live_on_cluster() -> FsResult<()> {
+    let testing = Testing::builder()
+        .default()
+        .mutate_conf(enable_dir_space_for_integration)
+        .build()?;
+    testing.start_cluster()?;
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_fs(Some(rt.clone()), None)?;
+
+    rt.block_on(async move {
+        let root = Path::from_str("/dir_space_it")?;
+        let _ = fs.delete(&root, true).await;
+        fs.mkdir(&root, true).await?;
+        fs.mkdir(&Path::from_str("/dir_space_it/a")?, true).await?;
+        fs.create(&Path::from_str("/dir_space_it/a/f1")?, true)
+            .await?;
+
+        let snapshot = wait_for_dir_space_snapshot(&fs, &root).await?;
+        let live = live_content_summary(&fs, &root).await?;
+        assert_eq!(snapshot.logical_bytes, live.logical_bytes);
+        assert_eq!(snapshot.file_count, live.file_count);
+        assert_eq!(snapshot.directory_count, live.directory_count);
+        Ok(())
+    })
 }
