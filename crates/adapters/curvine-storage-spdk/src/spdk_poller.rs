@@ -195,6 +195,12 @@ impl RetiredQpair {
     }
 }
 
+pub(crate) enum RetiredQpairCleanup {
+    Retired(RetiredQpair),
+    MissingPollerMayPublish,
+    MissingAfterCleanPollerExit,
+}
+
 pub(crate) struct RetiredQpairRegistry {
     entries: Mutex<HashMap<usize, RetiredQpair>>,
     has_entries: AtomicBool,
@@ -246,6 +252,26 @@ impl RetiredQpairRegistry {
             self.has_entries.store(false, Ordering::Release);
         }
         retired
+    }
+
+    /// Transfers retirement ownership to cleanup. After observing a clean poller
+    /// exit, re-check the registry because shutdown publication can race the
+    /// initial lookup.
+    pub(crate) fn take_for_cleanup(
+        &self,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    ) -> RetiredQpairCleanup {
+        if let Some(retired) = self.take(qpair) {
+            return RetiredQpairCleanup::Retired(retired);
+        }
+
+        if !self.poller_exited_cleanly() {
+            return RetiredQpairCleanup::MissingPollerMayPublish;
+        }
+
+        self.take(qpair)
+            .map(RetiredQpairCleanup::Retired)
+            .unwrap_or(RetiredQpairCleanup::MissingAfterCleanPollerExit)
     }
 
     pub(crate) fn put_back(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair, retired: RetiredQpair) {
@@ -1727,6 +1753,41 @@ mod test {
 
         assert_eq!(retired.len(), 1);
         assert!(retired.take(qpair).unwrap().requires_free());
+    }
+
+    #[test]
+    fn retired_registry_cleanup_uses_existing_record() {
+        let qpair = 0x1 as *mut _;
+        let retired = RetiredQpairRegistry::new();
+        retired.mark_must_free(qpair);
+
+        assert!(matches!(
+            retired.take_for_cleanup(qpair),
+            RetiredQpairCleanup::Retired(entry) if entry.requires_free()
+        ));
+    }
+
+    #[test]
+    fn retired_registry_cleanup_defers_before_clean_poller_exit() {
+        let qpair = 0x1 as *mut _;
+        let retired = RetiredQpairRegistry::new();
+
+        assert!(matches!(
+            retired.take_for_cleanup(qpair),
+            RetiredQpairCleanup::MissingPollerMayPublish
+        ));
+    }
+
+    #[test]
+    fn retired_registry_cleanup_marks_missing_only_after_clean_exit_recheck() {
+        let qpair = 0x1 as *mut _;
+        let retired = RetiredQpairRegistry::new();
+        retired.mark_poller_exited_cleanly();
+
+        assert!(matches!(
+            retired.take_for_cleanup(qpair),
+            RetiredQpairCleanup::MissingAfterCleanPollerExit
+        ));
     }
 
     #[test]

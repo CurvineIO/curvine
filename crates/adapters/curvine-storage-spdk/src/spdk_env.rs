@@ -4,7 +4,8 @@ use crate::spdk_ffi;
 use crate::spdk_metrics;
 use crate::spdk_poller::{CtrlHandle, PollerConfig};
 use crate::spdk_poller::{
-    IoRequest, RetiredQpair, RetiredQpairRegistry, SpdkPoller, UnregisterResult,
+    IoRequest, RetiredQpair, RetiredQpairCleanup, RetiredQpairRegistry, SpdkPoller,
+    UnregisterResult,
 };
 use curvine_core_error::{err_box, err_msg, CommonResult};
 use curvine_io::{NvmeTarget, SpdkConf};
@@ -1164,6 +1165,20 @@ impl SpdkEnv {
             .or_insert(ctrlr as usize);
     }
 
+    fn finish_or_defer_retired_qpair(
+        &self,
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        retired: RetiredQpair,
+    ) {
+        if matches!(
+            self.finish_retired_qpair(ctrlr, qpair, retired),
+            RetiredQpairFinish::DeferredRetired
+        ) {
+            self.defer_qpair(ctrlr, qpair);
+        }
+    }
+
     fn finish_untracked_after_clean_poller_exit(
         &self,
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
@@ -1196,25 +1211,17 @@ impl SpdkEnv {
 
         for (qpair_key, ctrlr_key) in deferred {
             let qpair = qpair_key as *mut spdk_ffi::spdk_nvme_qpair;
-            let Some(retired) = self.retired_qpairs.take(qpair) else {
-                let ctrlr = ctrlr_key as *mut spdk_ffi::spdk_nvme_ctrlr;
-                if self.retired_qpairs.poller_exited_cleanly() {
-                    self.finish_untracked_after_clean_poller_exit(ctrlr, qpair);
-                    continue;
-                }
-                self.deferred_qpairs
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .entry(qpair_key)
-                    .or_insert(ctrlr_key);
-                continue;
-            };
             let ctrlr = ctrlr_key as *mut spdk_ffi::spdk_nvme_ctrlr;
-            if matches!(
-                self.finish_retired_qpair(ctrlr, qpair, retired),
-                RetiredQpairFinish::DeferredRetired
-            ) {
-                self.defer_qpair(ctrlr, qpair);
+            match self.retired_qpairs.take_for_cleanup(qpair) {
+                RetiredQpairCleanup::Retired(retired) => {
+                    self.finish_or_defer_retired_qpair(ctrlr, qpair, retired);
+                }
+                RetiredQpairCleanup::MissingAfterCleanPollerExit => {
+                    self.finish_untracked_after_clean_poller_exit(ctrlr, qpair);
+                }
+                RetiredQpairCleanup::MissingPollerMayPublish => {
+                    self.defer_qpair(ctrlr, qpair);
+                }
             }
         }
     }
@@ -1234,24 +1241,14 @@ impl SpdkEnv {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) {
         if let Some(retired) = self.retired_qpairs.take(qpair) {
-            if matches!(
-                self.finish_retired_qpair(ctrlr, qpair, retired),
-                RetiredQpairFinish::DeferredRetired
-            ) {
-                self.defer_qpair(ctrlr, qpair);
-            }
+            self.finish_or_defer_retired_qpair(ctrlr, qpair, retired);
             return;
         }
 
         match self.unregister_qpair_from_poller(qpair) {
             UnregisterResult::Acked => {
                 if let Some(retired) = self.retired_qpairs.take(qpair) {
-                    if matches!(
-                        self.finish_retired_qpair(ctrlr, qpair, retired),
-                        RetiredQpairFinish::DeferredRetired
-                    ) {
-                        self.defer_qpair(ctrlr, qpair);
-                    }
+                    self.finish_or_defer_retired_qpair(ctrlr, qpair, retired);
                 } else {
                     error!(
                         "unregister acked but no retired marker for qpair {:p}",
@@ -1264,20 +1261,17 @@ impl SpdkEnv {
             UnregisterResult::TimedOut => {
                 self.defer_qpair(ctrlr, qpair);
             }
-            UnregisterResult::Disconnected => {
-                if let Some(retired) = self.retired_qpairs.take(qpair) {
-                    if matches!(
-                        self.finish_retired_qpair(ctrlr, qpair, retired),
-                        RetiredQpairFinish::DeferredRetired
-                    ) {
-                        self.defer_qpair(ctrlr, qpair);
-                    }
-                } else if self.retired_qpairs.poller_exited_cleanly() {
+            UnregisterResult::Disconnected => match self.retired_qpairs.take_for_cleanup(qpair) {
+                RetiredQpairCleanup::Retired(retired) => {
+                    self.finish_or_defer_retired_qpair(ctrlr, qpair, retired);
+                }
+                RetiredQpairCleanup::MissingAfterCleanPollerExit => {
                     self.finish_untracked_after_clean_poller_exit(ctrlr, qpair);
-                } else {
+                }
+                RetiredQpairCleanup::MissingPollerMayPublish => {
                     self.defer_qpair(ctrlr, qpair);
                 }
-            }
+            },
         }
         self.resolve_deferred_qpairs();
     }
