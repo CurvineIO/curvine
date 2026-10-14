@@ -949,6 +949,40 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn retired_qpair_with_stale_callback_for_test() -> (RetiredQpair, *mut c_void) {
+    let completion = IoCompletion::new();
+    let inflight = Arc::new(AtomicUsize::new(0));
+    assert!(completion.complete(-libc::ESHUTDOWN));
+
+    let mut qpair_state = Box::new(QpairState {
+        dead: Arc::new(AtomicBool::new(true)),
+        pending: Vec::new(),
+        stale: Vec::new(),
+    });
+    let ctx = Box::into_raw(Box::new(CallbackCtx {
+        completion,
+        async_ctx: unsafe { std::mem::zeroed() },
+        bdev_inflight: inflight,
+        qpair_state: &mut *qpair_state,
+        pending_idx: 0,
+    }));
+    qpair_state.stale.push(ctx);
+
+    (
+        RetiredQpair {
+            state: Some(qpair_state),
+            must_free: true,
+        },
+        ctx as *mut c_void,
+    )
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn poller_callback_for_test(ctx: *mut c_void) {
+    poller_callback(ctx, 0);
+}
+
 impl Drop for SpdkPoller {
     fn drop(&mut self) {
         self.stop();

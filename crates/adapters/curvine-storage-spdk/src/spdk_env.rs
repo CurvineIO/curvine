@@ -2,6 +2,8 @@
 
 use crate::spdk_ffi;
 use crate::spdk_metrics;
+#[cfg(test)]
+use crate::spdk_poller::{poller_callback_for_test, retired_qpair_with_stale_callback_for_test};
 use crate::spdk_poller::{CtrlHandle, PollerConfig};
 use crate::spdk_poller::{
     IoRequest, RetiredQpair, RetiredQpairCleanup, RetiredQpairRegistry, SpdkPoller,
@@ -2274,7 +2276,8 @@ mod test {
             env.qpair_pool.try_reserve(ctrlr),
             QpairReserveResult::Reserved
         );
-        env.retired_qpairs.mark_must_free(qpair);
+        let (retired, stale_callback) = retired_qpair_with_stale_callback_for_test();
+        env.retired_qpairs.put_back(qpair, retired);
         env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
             if free_calls_for_hook.fetch_add(1, Ordering::AcqRel) == 0 {
                 -libc::EIO
@@ -2314,6 +2317,10 @@ mod test {
         );
         let (active, _) = env.qpair_pool.controller_stats(ctrlr);
         assert_eq!(active, 1);
+
+        // The failed free kept the retired QpairState alive, so a late SPDK
+        // callback can still safely dereference its CallbackCtx.
+        unsafe { poller_callback_for_test(stale_callback) };
 
         env.shutdown();
 
