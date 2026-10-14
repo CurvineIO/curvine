@@ -195,6 +195,11 @@ mod tests {
         // node counts as a standby until it is explicitly promoted.
         assert!(!checker.is_active());
         checker.run().unwrap();
+        assert_eq!(
+            checker.execution_count.get(),
+            0,
+            "a standby pass must not count as a TTL execution"
+        );
         assert!(
             fs.file_status("/ttl/standby.log").is_ok(),
             "a non-active node must not delete the expired file"
@@ -209,6 +214,11 @@ mod tests {
         fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
         assert!(checker.is_active());
         checker.run().unwrap();
+        assert_eq!(
+            checker.execution_count.get(),
+            1,
+            "the promoted pass must count as one TTL execution"
+        );
         assert!(
             fs.file_status("/ttl/standby.log").is_err(),
             "the active master must delete the expired file"
