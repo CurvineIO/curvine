@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// `mount_fs_mode` monomorphizes deeply nested `UnifiedFileSystem` async futures; the
+// test binary exceeds rustc's default query depth limit without this attribute.
+#![recursion_limit = "256"]
+
 //! Integration tests for `FallbackFsReader`.
 //!
 //! # Test Plan
