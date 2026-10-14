@@ -127,7 +127,7 @@ impl JournalLoader {
             log_store,
             sender,
             fsm_state: Arc::new(Mutex::new(FsmState::default())),
-            retain_checkpoint_num: 3.max(conf.retain_checkpoint_num),
+            retain_checkpoint_num: conf.retain_checkpoint_num,
             ignore_reply_error: conf.ignore_reply_error,
             max_retry_num: conf.max_retry_num,
             skip_failed_ufs_replay_after_retry: conf.skip_failed_ufs_replay_after_retry,

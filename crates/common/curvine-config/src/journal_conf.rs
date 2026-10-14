@@ -114,7 +114,13 @@ pub struct JournalConf {
     pub raft_retry_cache_size: u64,
     pub raft_retry_cache_ttl: String,
 
-    // The number of checkpoints saved.
+    // The number of checkpoints saved. It also sets the raft log retention
+    // window applied when compacting: the window keeps
+    // retain_checkpoint_num * snapshot_entries log entries, so that every
+    // saved checkpoint stays replayable from the retained log (an extra
+    // recovery path that avoids snapshot transfers). 0 is rejected by
+    // validation; raising this value also grows the retained raft log, so
+    // size the journal disk accordingly.
     pub retain_checkpoint_num: usize,
 
     pub ignore_reply_error: bool,
