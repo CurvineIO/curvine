@@ -193,7 +193,12 @@ fn recovery_process() {
                     let snapshot = rt.block_on(app.create_snapshot()).unwrap();
                     let compact = snapshot.fsm_state.compact();
                     log.create_snapshot(snapshot).unwrap();
-                    log.compact(compact).unwrap();
+                    // Compact the store directly (not LogStorage::compact):
+                    // this command builds the "log already trimmed"
+                    // precondition the recovery assertions need, while the
+                    // retention window applied on the production compact path
+                    // is covered by unit tests.
+                    log.write().compact(compact).unwrap();
                 }
                 done = seq;
             }
@@ -257,7 +262,6 @@ impl Cluster {
                 raft_max_election_ticks: 60,
                 snapshot_interval: "1h".into(),
                 snapshot_entries: 1_000_000,
-                retain_checkpoint_num: 0,
                 conn_timeout_ms: 500,
                 io_timeout_ms: 2000,
                 ..Default::default()

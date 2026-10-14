@@ -258,8 +258,8 @@ mod tests {
 
     #[test]
     fn compact_without_a_retention_window_trims_up_to_the_target() {
-        // retain_checkpoint_num = 0 disables the window.
-        let store = test_store("no-window", 1_000_000, 0);
+        // snapshot_entries = 0 leaves the retention window empty.
+        let store = test_store("no-window", 0, 3);
         store.append(&indexed_entries(1, 100)).unwrap();
 
         store.compact(70).unwrap();
