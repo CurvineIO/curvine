@@ -56,6 +56,10 @@ impl InodeTtlExecutor {
         Ok(inode)
     }
 
+    pub fn is_active(&self) -> bool {
+        self.filesystem.master_monitor.is_active()
+    }
+
     fn is_empty_dir(&self, path: &str) -> FsResult<bool> {
         let fs_dir = self.filesystem.fs_dir();
         let fs_dir_guard = fs_dir.read();

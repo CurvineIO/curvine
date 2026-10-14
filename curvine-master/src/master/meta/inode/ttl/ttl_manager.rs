@@ -46,6 +46,10 @@ impl InodeTtlManager {
         Ok(manager)
     }
 
+    pub fn is_active(&self) -> bool {
+        self.checker.is_active()
+    }
+
     pub fn cleanup(&self) -> FsResult<i64> {
         let spend = TimeSpent::new();
 
