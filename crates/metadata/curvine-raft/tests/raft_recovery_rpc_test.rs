@@ -193,7 +193,12 @@ fn recovery_process() {
                     let snapshot = rt.block_on(app.create_snapshot()).unwrap();
                     let compact = snapshot.fsm_state.compact();
                     log.create_snapshot(snapshot).unwrap();
-                    log.compact(compact).unwrap();
+                    // Compact the store directly (not LogStorage::compact):
+                    // this command builds the "log already trimmed"
+                    // precondition the recovery assertions need, while the
+                    // retention window applied on the production compact path
+                    // is covered by unit tests.
+                    log.write().compact(compact).unwrap();
                 }
                 done = seq;
             }

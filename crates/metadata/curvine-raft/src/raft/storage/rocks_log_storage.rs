@@ -25,18 +25,24 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 #[derive(Clone)]
 pub struct RocksLogStorage {
     core: Arc<RwLock<RocksStorageCore>>,
+    compact_retain_entries: u64,
 }
 
 impl RocksLogStorage {
     pub fn new(core: RocksStorageCore) -> Self {
         Self {
             core: Arc::new(RwLock::new(core)),
+            compact_retain_entries: 0,
         }
     }
 
     pub fn from_conf(conf: &JournalConf, format: bool) -> Self {
         let core = RocksStorageCore::new(conf.db_conf(), format);
-        Self::new(core)
+        Self {
+            core: Arc::new(RwLock::new(core)),
+            compact_retain_entries: (conf.retain_checkpoint_num as u64)
+                .saturating_mul(conf.snapshot_entries),
+        }
     }
 
     pub fn read(&self) -> RwLockReadGuard<'_, RocksStorageCore> {
@@ -107,6 +113,7 @@ impl LogStorage for RocksLogStorage {
     }
 
     fn compact(&self, index: u64) -> RaftResult<()> {
+        let index = index.saturating_sub(self.compact_retain_entries);
         let mut store = self.write();
         store.compact(index)?;
         Ok(())
@@ -199,3 +206,64 @@ impl Storage for RocksLogStorage {
         let _ = try_log!(store.store_meta());
     }
 }*/
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_runtime::common::{FileUtils, Utils};
+
+    fn test_store(
+        name: &str,
+        snapshot_entries: u64,
+        retain_checkpoint_num: usize,
+    ) -> RocksLogStorage {
+        let conf = JournalConf {
+            journal_dir: Utils::test_sub_dir(format!(
+                "rocks-compact-{}-{}",
+                name,
+                Utils::rand_id()
+            )),
+            snapshot_entries,
+            retain_checkpoint_num,
+            ..Default::default()
+        };
+        FileUtils::delete_path(&conf.journal_dir, true).unwrap();
+        RocksLogStorage::from_conf(&conf, true)
+    }
+
+    fn indexed_entries(low: u64, high: u64) -> Vec<Entry> {
+        (low..=high)
+            .map(|index| Entry {
+                index,
+                term: 1,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compact_keeps_the_retention_window() {
+        // Window = retain_checkpoint_num x snapshot_entries = 3 x 10.
+        let store = test_store("window", 10, 3);
+        store.append(&indexed_entries(1, 100)).unwrap();
+
+        store.compact(70).unwrap();
+        assert_eq!(store.first_index().unwrap(), 40);
+        assert_eq!(store.last_index().unwrap(), 100);
+
+        // Compacting inside the window must not trim anything further.
+        store.compact(70).unwrap();
+        assert_eq!(store.first_index().unwrap(), 40);
+    }
+
+    #[test]
+    fn compact_without_a_retention_window_trims_up_to_the_target() {
+        // snapshot_entries = 0 leaves the retention window empty.
+        let store = test_store("no-window", 0, 3);
+        store.append(&indexed_entries(1, 100)).unwrap();
+
+        store.compact(70).unwrap();
+        assert_eq!(store.first_index().unwrap(), 70);
+        assert_eq!(store.last_index().unwrap(), 100);
+    }
+}

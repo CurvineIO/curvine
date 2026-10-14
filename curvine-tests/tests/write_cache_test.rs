@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// The cache-mode test body monomorphizes deeply nested `UnifiedFileSystem` async
+// futures; the test binary exceeds rustc's default query depth limit without this.
+#![recursion_limit = "256"]
+
 use bytes::BytesMut;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem, UnifiedReader};
 use curvine_fs_api::{FileSystem, Path, Reader, RpcCode, Writer};

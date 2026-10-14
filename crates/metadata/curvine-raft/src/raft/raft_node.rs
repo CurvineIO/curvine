@@ -256,7 +256,9 @@ where
                 let mut data: SnapshotData = SnapshotData::decode(snapshot.get_data())?;
 
                 info!(
-                    "install snapshot start, dir: {}, fsm_state {:?}",
+                    "install snapshot start, node id: {}, node addr {}, dir: {}, fsm_state {:?}",
+                    data.node_id,
+                    ps.client.get_addr_string(data.node_id),
                     data.data_dir(),
                     data.fsm_state
                 );

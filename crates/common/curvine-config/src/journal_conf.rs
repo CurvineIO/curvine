@@ -114,9 +114,28 @@ pub struct JournalConf {
     pub raft_retry_cache_size: u64,
     pub raft_retry_cache_ttl: String,
 
-    // The number of checkpoints saved.
+    // The number of checkpoints saved. It also sets the raft log retention
+    // window applied when compacting: the window keeps
+    // retain_checkpoint_num * snapshot_entries log entries, so that every
+    // saved checkpoint stays replayable from the retained log (an extra
+    // recovery path that avoids snapshot transfers). 0 is rejected by
+    // validation; raising this value also grows the retained raft log, so
+    // size the journal disk accordingly.
     pub retain_checkpoint_num: usize,
 
+    /// How strictly journal replay treats batches it cannot apply.
+    ///
+    /// Default `false`: a batch that cannot be deserialized, or an op that
+    /// fails to replay, is fatal (after retries on the leader) instead of
+    /// being skipped, so the master never silently diverges from the rest of
+    /// the raft group.
+    ///
+    /// `true`: such failures are logged and skipped, and the apply
+    /// high-water mark advances past the failed batch so replay continues.
+    /// This also drops whole batches that cannot be decoded at all, typically
+    /// written by a newer-schema leader during a rolling upgrade. Skipping is
+    /// permanent: the dropped ops are never replayed again and this master may
+    /// diverge from its peers.
     pub ignore_reply_error: bool,
     pub max_retry_num: u64,
     // If leader UFS replay keeps failing after max_retry_num, advance the UFS

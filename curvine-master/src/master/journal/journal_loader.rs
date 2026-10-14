@@ -127,7 +127,7 @@ impl JournalLoader {
             log_store,
             sender,
             fsm_state: Arc::new(Mutex::new(FsmState::default())),
-            retain_checkpoint_num: 3.max(conf.retain_checkpoint_num),
+            retain_checkpoint_num: conf.retain_checkpoint_num,
             ignore_reply_error: conf.ignore_reply_error,
             max_retry_num: conf.max_retry_num,
             skip_failed_ufs_replay_after_retry: conf.skip_failed_ufs_replay_after_retry,
@@ -219,6 +219,21 @@ impl JournalLoader {
         }
     }
 
+    /// Advance the committed apply high-water mark without replaying any
+    /// metadata op: the no-op/config branch and batches deliberately skipped
+    /// under `ignore_reply_error` both need the watermark to move so that
+    /// replay can continue past them.
+    fn advance_watermark(&self, is_leader: bool, cur: FsmState, entry: &Entry) -> CommonResult<()> {
+        let mut applied = if is_leader {
+            cur.ufs_applied
+        } else {
+            cur.applied
+        };
+        applied.term = entry.term;
+        applied.index = entry.index;
+        self.set_applied(is_leader, applied, false)
+    }
+
     async fn replay_entry(&self, is_leader: bool, entry: &JournalEntry) -> CommonResult<()> {
         {
             let fs_dir = self.fs_dir.read();
@@ -254,18 +269,21 @@ impl JournalLoader {
         // Empty leader no-ops and configuration entries have no metadata mutation,
         // but still advance the committed apply high-water mark.
         if entry.get_entry_type() != EntryType::EntryNormal || entry.data.is_empty() {
-            let mut applied = if is_leader {
-                cur.ufs_applied
-            } else {
-                cur.applied
-            };
-            applied.term = entry.term;
-            applied.index = entry.index;
-            self.set_applied(is_leader, applied, false)?;
-            return Ok(());
+            return self.advance_watermark(is_leader, cur, entry);
         }
 
-        let batch = JournalBatch::deserialize_compat(&entry.data)?;
+        let batch = match JournalBatch::deserialize_compat(&entry.data) {
+            Ok(batch) => batch,
+            Err(e) if self.ignore_reply_error => {
+                error!(
+                    "skip failed journal batch deserialization, entry index={}, term={}, error={}",
+                    entry.index, entry.term, e
+                );
+                return self.advance_watermark(is_leader, cur, entry);
+            }
+            Err(e) => return Err(e),
+        };
+
         let batch_len = batch.len();
         let mut snapshot = None;
         let mut applied = Self::build_applied(entry);
@@ -1042,5 +1060,158 @@ impl AppStorage for JournalLoader {
     fn snapshot_dir(&self, snapshot_id: u64) -> RaftResult<String> {
         let fs_dir = self.fs_dir.read();
         Ok(fs_dir.get_checkpoint_path(snapshot_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_config::{ClusterConf, MasterConf};
+    use curvine_error::FsResult;
+    use curvine_runtime::common::{SerdeUtils, Utils};
+
+    // Regression tests for the batch-deserialization skip branch in `apply0`:
+    // with `ignore_reply_error` enabled an undecodable batch (typically written
+    // by a newer-schema leader during a rolling upgrade) is skipped and the
+    // apply watermark advances past it; with the flag disabled the replay error
+    // is propagated and the watermark must not move.
+    fn ignore_reply_error_conf(
+        name: &str,
+        ignore_reply_error: bool,
+    ) -> (ClusterConf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "curvine-journal-loader-{}-{}",
+            name,
+            Utils::rand_id()
+        ));
+        let conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            master: MasterConf {
+                meta_dir: root.join("meta").to_str().unwrap().into(),
+                ..Default::default()
+            },
+            journal: JournalConf {
+                journal_dir: root.join("journal").to_str().unwrap().into(),
+                io_threads: 1,
+                worker_threads: 2,
+                ignore_reply_error,
+                ..JournalConf::with_test()
+            },
+            ..Default::default()
+        };
+        (conf, root)
+    }
+
+    // Shorter than the smallest serialized batch (u64 seq_id + u64 batch
+    // length), so both the current and the legacy schema reject it.
+    fn corrupt_entry(index: u64, term: u64) -> Entry {
+        Entry {
+            index,
+            term,
+            data: b"corrupt".to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn valid_entry(index: u64, term: u64) -> Entry {
+        let mut batch = JournalBatch::new(1);
+        batch.push(JournalEntry::CacheInvalidation(CacheInvalidationEntry {
+            op_id: 41,
+            rpc_id: 9,
+            inodes: vec![],
+        }));
+        let data = SerdeUtils::serialize(&batch).unwrap();
+
+        Entry {
+            index,
+            term,
+            data,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn follower_skips_corrupt_batch_and_keeps_replaying() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("follower", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        rt.block_on(loader.apply(true, ApplyMsg::new_entry(corrupt_entry(1, 5))))?;
+        let state = loader.get_fsm_state();
+        assert_eq!(
+            state.applied.index, 1,
+            "skipped batch must advance the follower watermark"
+        );
+        assert_eq!(state.applied.term, 5);
+        assert_eq!(
+            state.ufs_applied.index, 0,
+            "follower must not advance the UFS watermark"
+        );
+
+        rt.block_on(loader.apply(true, ApplyMsg::new_entry(valid_entry(2, 5))))?;
+        let state = loader.get_fsm_state();
+        assert_eq!(state.applied.index, 2, "next valid entry must still apply");
+        assert_eq!(state.applied.op_id, 41);
+        assert_eq!(state.applied.rpc_id, 9);
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn leader_advances_ufs_watermark_when_skipping_corrupt_batch() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("leader", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        for index in 1..=2 {
+            rt.block_on(loader.apply0(true, &corrupt_entry(index, 7), false))?;
+        }
+        let state = loader.get_fsm_state();
+        assert_eq!(
+            state.ufs_applied.index, 2,
+            "skipped batch must advance the leader UFS watermark"
+        );
+        assert_eq!(state.ufs_applied.term, 7);
+        assert_eq!(state.applied.index, 2, "leader advances both watermarks");
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_batch_fails_replay_without_ignore_reply_error() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("strict", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        let error = rt
+            .block_on(loader.apply(true, ApplyMsg::new_entry(corrupt_entry(1, 5))))
+            .expect_err("corrupt batch must fail replay when ignore_reply_error is false");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to deserialize journal batch"),
+            "unexpected error: {}",
+            error
+        );
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            0,
+            "failed replay must not move the watermark"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 }

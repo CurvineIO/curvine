@@ -728,6 +728,36 @@ mod tests {
         assert!(err.contains("mds.rpc_port must be greater than zero"));
     }
 
+    // A zero checkpoint retention has no consistent interpretation (the
+    // checkpoint cleaner and the log retention window both derive from the
+    // same value), so loading must fail instead of silently reinterpreting
+    // the zero.
+    #[test]
+    fn zero_retain_checkpoint_num_is_rejected() {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-zero-retain-conf-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                [journal]
+                retain_checkpoint_num = 0
+            "#,
+        )
+        .unwrap();
+        let err = ClusterConf::from(path.to_str().unwrap())
+            .expect_err("retain_checkpoint_num = 0 must be rejected")
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            err.contains("journal.retain_checkpoint_num must be greater than zero"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn transfer_init_skips_unused_master_validation() {
         let path = std::env::temp_dir().join(format!(

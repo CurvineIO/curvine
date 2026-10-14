@@ -42,8 +42,8 @@
 //!    section is reported per inner leaf rather than at the section root.
 
 use crate::cluster_conf::ClusterConf;
-use crate::{ClientConf, FuseConf, JobConf, MasterConf, MdsConf, TransferConf};
-use curvine_core_error::{try_err, CommonResult};
+use crate::{ClientConf, FuseConf, JobConf, JournalConf, MasterConf, MdsConf, TransferConf};
+use curvine_core_error::{err_box, try_err, CommonResult};
 
 /// Uniform validation hook over one configuration section.
 pub trait ConfValidate {
@@ -67,6 +67,7 @@ impl ConfValidate for ClusterConf {
         if self.mds.enabled {
             self.mds.validate()?;
         }
+        self.journal.validate()?;
         self.client.validate()?;
         self.fuse.validate()?;
         self.job.validate()?;
@@ -81,6 +82,15 @@ impl ConfValidate for MdsConf {
     fn validate(&mut self) -> CommonResult<()> {
         if self.enabled {
             self.init()?;
+        }
+        Ok(())
+    }
+}
+
+impl ConfValidate for JournalConf {
+    fn validate(&mut self) -> CommonResult<()> {
+        if self.retain_checkpoint_num == 0 {
+            return err_box!("journal.retain_checkpoint_num must be greater than zero");
         }
         Ok(())
     }
