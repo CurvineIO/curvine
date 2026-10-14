@@ -38,6 +38,7 @@ use raft::eraftpb::{
 };
 use raft::{Config, RawNode};
 use raft::{GetEntriesContext, RaftState, StateRole, Storage, StorageError};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
@@ -796,6 +797,15 @@ fn remote_files() -> SnapshotFileList {
     }
 }
 
+/// The same manifest as `remote_files`, but rooted at `dir` — mirrors the
+/// `SnapshotData.files_data.dir` a snapshot records at creation.
+fn files_in_dir(dir: &str) -> SnapshotFileList {
+    SnapshotFileList {
+        dir: dir.to_string(),
+        files: remote_files().files,
+    }
+}
+
 /// The leader registers the first follower report and remembers the owner so a
 /// later restart knows the snapshot files live on another member.
 #[test]
@@ -907,6 +917,94 @@ fn snapshot_fetcher_builds_download_for_remote_snapshot() {
         matches!(fetcher, SnapshotFetcher::Remote(_, _)),
         "snapshot owned by another member must be downloaded"
     );
+}
+
+/// A complete local copy wins over a remote owner: manual meta+journal copies
+/// must not trigger a full re-download.
+#[test]
+fn snapshot_fetcher_uses_complete_local_copy_of_remote_snapshot() -> CommonResult<()> {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let dir = Utils::test_sub_dir(format!("snapshot-local-copy-{}", Utils::rand_id()));
+    FileUtils::delete_path(&dir, true)?;
+    FileUtils::create_dir(&dir, true)?;
+    std::fs::write(Path::new(&dir).join("checkpoint.db"), vec![0u8; 16])?;
+
+    let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0);
+    let mut data = reported_snapshot(5, 7);
+    data.files_data = Some(files_in_dir(&dir));
+
+    let fetcher =
+        SnapshotFetcher::new(9, &app, &conf, test_client(&conf, rt.clone()), data).unwrap();
+
+    match fetcher {
+        SnapshotFetcher::Local(data) => {
+            let files = data
+                .files_data
+                .expect("local snapshot must keep its file manifest");
+            assert_eq!(
+                files.dir, dir,
+                "a reused local copy must keep its manifest dir"
+            );
+        }
+        SnapshotFetcher::Remote(..) => panic!("complete local copy must not be downloaded"),
+    }
+
+    FileUtils::delete_path(&dir, true)?;
+    Ok(())
+}
+
+/// A local copy with a wrong file length is incomplete and must fall back to
+/// the download path.
+#[test]
+fn snapshot_fetcher_falls_back_on_local_length_mismatch() -> CommonResult<()> {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let dir = Utils::test_sub_dir(format!("snapshot-short-copy-{}", Utils::rand_id()));
+    FileUtils::delete_path(&dir, true)?;
+    FileUtils::create_dir(&dir, true)?;
+    std::fs::write(Path::new(&dir).join("checkpoint.db"), vec![0u8; 15])?;
+
+    let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0);
+    let mut data = reported_snapshot(5, 7);
+    data.files_data = Some(files_in_dir(&dir));
+
+    let fetcher =
+        SnapshotFetcher::new(9, &app, &conf, test_client(&conf, rt.clone()), data).unwrap();
+
+    assert!(
+        matches!(fetcher, SnapshotFetcher::Remote(_, _)),
+        "truncated local copy must fall back to download"
+    );
+
+    FileUtils::delete_path(&dir, true)?;
+    Ok(())
+}
+
+/// A local directory without the manifest files is not a usable copy and must
+/// fall back to the download path.
+#[test]
+fn snapshot_fetcher_falls_back_on_missing_local_files() -> CommonResult<()> {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let dir = Utils::test_sub_dir(format!("snapshot-missing-copy-{}", Utils::rand_id()));
+    FileUtils::delete_path(&dir, true)?;
+    FileUtils::create_dir(&dir, true)?;
+
+    let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0);
+    let mut data = reported_snapshot(5, 7);
+    data.files_data = Some(files_in_dir(&dir));
+
+    let fetcher =
+        SnapshotFetcher::new(9, &app, &conf, test_client(&conf, rt.clone()), data).unwrap();
+
+    assert!(
+        matches!(fetcher, SnapshotFetcher::Remote(_, _)),
+        "missing local copy must fall back to download"
+    );
+
+    FileUtils::delete_path(&dir, true)?;
+    Ok(())
 }
 
 /// AppStorage that records every snapshot applied to it and reports a fixed
