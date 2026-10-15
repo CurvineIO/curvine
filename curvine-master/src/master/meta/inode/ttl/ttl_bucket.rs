@@ -213,6 +213,16 @@ impl TtlBucketList {
         }
         buckets
     }
+
+    /// Reinsert a drained bucket after an interrupted cleanup pass (#1754).
+    pub fn put_back(&self, bucket: &TtlBucket) {
+        let ids: Vec<i64> = bucket.inodes.lock().iter().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        let target = self.get_or_create_bucket(bucket.interval_start_ms);
+        target.inodes.lock().extend(ids);
+    }
 }
 
 #[cfg(test)]
