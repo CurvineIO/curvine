@@ -49,6 +49,10 @@ impl InodeTtlChecker {
         })
     }
 
+    pub fn is_active(&self) -> bool {
+        self.action_executor.is_active()
+    }
+
     pub fn cleanup_once(&self) -> FsResult<i64> {
         let start_time = LocalTime::mills() as i64;
         let expired_buckets = self.bucket_list.get_expired_buckets_at(start_time);
@@ -73,6 +77,10 @@ impl InodeTtlChecker {
         let total = inode_ids.len() as i64;
 
         for inode_id in inode_ids.iter().copied() {
+            if !self.is_active() {
+                bucket.add(inode_id);
+                continue;
+            }
             match self.action_executor.execute_by_id(inode_id) {
                 Err(e) => {
                     // A missing inode means it was already removed (e.g. by a
@@ -91,6 +99,8 @@ impl InodeTtlChecker {
                 _ => (),
             }
         }
+
+        self.bucket_list.put_back(&bucket);
 
         Ok(total)
     }
