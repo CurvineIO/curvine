@@ -6,8 +6,8 @@ use crate::spdk_metrics;
 use crate::spdk_poller::{poller_callback_for_test, retired_qpair_with_stale_callback_for_test};
 use crate::spdk_poller::{CtrlHandle, PollerConfig};
 use crate::spdk_poller::{
-    IoRequest, RetiredQpair, RetiredQpairCleanup, RetiredQpairRegistry, SpdkPoller,
-    UnregisterResult,
+    IoRequest, RetiredQpair, RetiredQpairCleanup, RetiredQpairPollOutcome, RetiredQpairRegistry,
+    SpdkPoller, UnregisterResult,
 };
 use curvine_core_error::{err_box, err_msg, CommonResult};
 use curvine_io::{NvmeTarget, SpdkConf};
@@ -620,8 +620,11 @@ struct SpdkEnvTestHooks {
     env_fini: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     poller_stop: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     unregister_qpair: Option<std::sync::Arc<dyn Fn() -> UnregisterResult + Send + Sync>>,
-    poll_retired_qpair:
-        Option<std::sync::Arc<dyn Fn(*mut spdk_ffi::spdk_nvme_qpair) -> i32 + Send + Sync>>,
+    poll_retired_qpair: Option<
+        std::sync::Arc<
+            dyn Fn(*mut spdk_ffi::spdk_nvme_qpair) -> RetiredQpairPollOutcome + Send + Sync,
+        >,
+    >,
 }
 
 /// SPDK env lifecycle (singleton). Send + Sync
@@ -1103,27 +1106,42 @@ impl SpdkEnv {
         self.qpair_pool.acquire(ctrlr)
     }
 
-    fn prepare_retired_qpair_for_free(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) {
+    fn prepare_retired_qpair_for_free(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
         #[cfg(test)]
         if let Some(hook) = &self.test_hooks.poll_retired_qpair {
-            let rc = hook(qpair);
-            if rc < 0 {
-                warn!(
-                    "failed to poll retired SPDK qpair {:p} before free retry: rc={}",
-                    qpair, rc
-                );
-            }
-            return;
+            return self.retired_qpair_poll_outcome_allows_free(qpair, hook(qpair));
         }
 
         let poller = self.poller.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(poller) = poller.as_ref() {
-            let rc = poller.poll_retired_qpair(qpair);
-            if rc < 0 {
+            return self
+                .retired_qpair_poll_outcome_allows_free(qpair, poller.poll_retired_qpair(qpair));
+        }
+        true
+    }
+
+    fn retired_qpair_poll_outcome_allows_free(
+        &self,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        outcome: RetiredQpairPollOutcome,
+    ) -> bool {
+        match outcome {
+            RetiredQpairPollOutcome::Polled(rc) => {
+                if rc < 0 {
+                    warn!(
+                        "failed to poll retired SPDK qpair {:p} before free retry: rc={}",
+                        qpair, rc
+                    );
+                }
+                true
+            }
+            RetiredQpairPollOutcome::PollerGone => true,
+            RetiredQpairPollOutcome::Unacked => {
                 warn!(
-                    "failed to poll retired SPDK qpair {:p} before free retry: rc={}",
-                    qpair, rc
+                    "retired SPDK qpair {:p} poll request is still unacknowledged; deferring free retry",
+                    qpair
                 );
+                false
             }
         }
     }
@@ -1152,7 +1170,10 @@ impl SpdkEnv {
             }
         }
 
-        self.prepare_retired_qpair_for_free(qpair);
+        if !self.prepare_retired_qpair_for_free(qpair) {
+            self.retired_qpairs.put_back(qpair, retired);
+            return RetiredQpairFinish::DeferredRetired;
+        }
         let rc = self.qpair_pool.free_io_qpair(qpair);
         if rc != 0 {
             error!("failed to free retired SPDK qpair {:p}: rc={}", qpair, rc);
@@ -2348,7 +2369,7 @@ mod test {
         });
         env.test_hooks.poll_retired_qpair = Some(Arc::new(move |_| {
             poll_calls_for_hook.fetch_add(1, Ordering::AcqRel);
-            0
+            RetiredQpairPollOutcome::Polled(0)
         }));
         env.test_hooks.poller_stop = Some(Arc::new(move |_| {
             assert_eq!(poll_calls_for_poller_stop.load(Ordering::Acquire), 3);
@@ -2414,6 +2435,39 @@ mod test {
         );
         let (active, _) = env.qpair_pool.controller_stats(ctrlr);
         assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn retired_free_defers_when_poll_request_is_unacked() {
+        let ctrlr = 0x1000usize;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let free_calls = Arc::new(AtomicUsize::new(0));
+        let free_calls_for_hook = Arc::clone(&free_calls);
+
+        let mut env = SpdkEnv::new(SpdkConf::default()).unwrap();
+        env.qpair_pool.register_limit(ctrlr, 1);
+        assert_eq!(
+            env.qpair_pool.try_reserve(ctrlr),
+            QpairReserveResult::Reserved
+        );
+        let (retired, _) = retired_qpair_with_stale_callback_for_test();
+        env.retired_qpairs.put_back(qpair, retired);
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
+            free_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+            0
+        });
+        env.test_hooks.poll_retired_qpair = Some(Arc::new(|_| RetiredQpairPollOutcome::Unacked));
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+
+        env.retire_qpair(ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr, qpair);
+
+        assert_eq!(free_calls.load(Ordering::Acquire), 0);
+        assert!(env.retired_qpairs.has_entries());
+        assert_eq!(env.deferred_qpair_count(), 1);
+        assert_eq!(env.qpair_pool.controller_stats(ctrlr).0, 1);
+
+        env.retired_qpairs.take(qpair).unwrap().reclaim();
     }
 
     #[test]

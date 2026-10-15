@@ -61,6 +61,20 @@ pub(crate) enum UnregisterResult {
     Disconnected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetiredQpairPollOutcome {
+    Polled(i32),
+    PollerGone,
+    Unacked,
+}
+
+fn poll_ack_error_to_outcome(err: RecvTimeoutError) -> RetiredQpairPollOutcome {
+    match err {
+        RecvTimeoutError::Timeout => RetiredQpairPollOutcome::Unacked,
+        RecvTimeoutError::Disconnected => RetiredQpairPollOutcome::PollerGone,
+    }
+}
+
 fn unregister_ack_error_to_result(err: RecvTimeoutError) -> UnregisterResult {
     match err {
         RecvTimeoutError::Timeout => {
@@ -406,7 +420,10 @@ impl SpdkPoller {
         }
     }
 
-    pub(crate) fn poll_retired_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> i32 {
+    pub(crate) fn poll_retired_qpair(
+        &self,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    ) -> RetiredQpairPollOutcome {
         let (ack_tx, ack_rx) = mpsc::channel::<i32>();
         let req = IoRequest {
             op: IoOp::PollRetiredQpair { qpair, ack: ack_tx },
@@ -414,15 +431,16 @@ impl SpdkPoller {
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
         };
         let Some(tx) = &self.tx else {
-            return -libc::ENOTCONN;
+            return RetiredQpairPollOutcome::PollerGone;
         };
         if tx.send(req).is_err() {
-            return -libc::ENOTCONN;
+            return RetiredQpairPollOutcome::PollerGone;
         }
         let _ = self.eventfd.write(1);
-        ack_rx
-            .recv_timeout(Duration::from_millis(100))
-            .unwrap_or(-libc::ENOTCONN)
+        match ack_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(rc) => RetiredQpairPollOutcome::Polled(rc),
+            Err(err) => poll_ack_error_to_outcome(err),
+        }
     }
 
     /// Shut down the poller thread.
@@ -1005,6 +1023,18 @@ mod test {
         assert_eq!(
             unregister_ack_error_to_result(RecvTimeoutError::Timeout),
             UnregisterResult::TimedOut
+        );
+    }
+
+    #[test]
+    fn retired_poll_ack_timeout_stays_unacked() {
+        assert_eq!(
+            poll_ack_error_to_outcome(RecvTimeoutError::Timeout),
+            RetiredQpairPollOutcome::Unacked
+        );
+        assert_eq!(
+            poll_ack_error_to_outcome(RecvTimeoutError::Disconnected),
+            RetiredQpairPollOutcome::PollerGone
         );
     }
 
