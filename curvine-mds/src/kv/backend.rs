@@ -25,12 +25,12 @@
 //! fresh snapshot so read-modify-write and compare-and-set become correct
 //! under contention.
 
-use crate::kv::error::KvResult;
+use crate::kv::error::{KvError, KvResult};
 use crate::kv::metrics;
 use async_trait::async_trait;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A single transaction against a [`KvBackend`].
 ///
@@ -81,18 +81,44 @@ pub trait KvTransaction: Send {
 
 /// A pluggable byte-level KV store.
 ///
-/// Implementations provide transactions via [`KvBackend::begin`]; the
+/// Implementations provide raw transactions via [`KvBackend::begin_raw`]; the
+/// shared [`KvBackend::begin`] wrapper owns transaction metrics. The
 /// non-transactional convenience methods have default implementations that run
 /// a single auto-committed transaction, so a backend only has to implement
-/// `begin` and `name` to be fully usable.
+/// `begin_raw` and `name` to be fully usable.
 #[async_trait]
 pub trait KvBackend: Send + Sync {
     /// Short, stable backend identifier used as a metrics label
     /// (e.g. `"memory"`, `"fdb"`). Must be low-cardinality.
     fn name(&self) -> &'static str;
 
-    /// Starts a new transaction.
-    async fn begin(&self) -> KvResult<Box<dyn KvTransaction>>;
+    /// Starts a raw, uninstrumented transaction.
+    ///
+    /// Backend implementations must only create their transaction here; the
+    /// default [`KvBackend::begin`] owns operation metrics and in-flight
+    /// accounting for every backend.
+    async fn begin_raw(&self) -> KvResult<Box<dyn KvTransaction>>;
+
+    /// Starts a new instrumented transaction.
+    async fn begin(&self) -> KvResult<Box<dyn KvTransaction>> {
+        let start = Instant::now();
+        match self.begin_raw().await {
+            Ok(txn) => {
+                metrics::metrics().observe(self.name(), metrics::op::BEGIN, start, &Ok(()));
+                metrics::metrics().txn_in_flight.inc();
+                Ok(Box::new(InstrumentedTransaction::new(self.name(), txn)))
+            }
+            Err(error) => {
+                metrics::metrics().observe(
+                    self.name(),
+                    metrics::op::BEGIN,
+                    start,
+                    &Err(error.clone()),
+                );
+                Err(error)
+            }
+        }
+    }
 
     /// Point read of a single key. Tracks the key in the read-conflict set and
     /// is wrapped in [`run_txn`], so a concurrent change during the read is
@@ -229,6 +255,107 @@ pub trait KvBackend: Send + Sync {
     }
 }
 
+/// Shared metrics wrapper for every transaction returned by [`KvBackend::begin`].
+///
+/// Keeping this outside individual backends ensures a new backend gets the
+/// same operation labels, latency accounting, and in-flight lifecycle without
+/// importing Prometheus plumbing.
+struct InstrumentedTransaction {
+    backend: &'static str,
+    inner: Box<dyn KvTransaction>,
+    finished: bool,
+}
+
+impl InstrumentedTransaction {
+    fn new(backend: &'static str, inner: Box<dyn KvTransaction>) -> Self {
+        Self {
+            backend,
+            inner,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            metrics::metrics().txn_in_flight.dec();
+        }
+    }
+}
+
+#[async_trait]
+impl KvTransaction for InstrumentedTransaction {
+    async fn get(&mut self, key: &[u8]) -> KvResult<Option<Vec<u8>>> {
+        let start = Instant::now();
+        let result = self.inner.get(key).await;
+        observe_result(self.backend, metrics::op::GET, start, &result);
+        result
+    }
+
+    async fn multi_get(&mut self, keys: &[Vec<u8>]) -> KvResult<Vec<Option<Vec<u8>>>> {
+        let start = Instant::now();
+        let result = self.inner.multi_get(keys).await;
+        observe_result(self.backend, metrics::op::MULTI_GET, start, &result);
+        result
+    }
+
+    async fn snapshot_get(&mut self, key: &[u8]) -> KvResult<Option<Vec<u8>>> {
+        let start = Instant::now();
+        let result = self.inner.snapshot_get(key).await;
+        observe_result(self.backend, metrics::op::SNAPSHOT_GET, start, &result);
+        result
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8]) {
+        metrics::metrics().observe_kv_size(self.backend, key.len(), value.len());
+        self.inner.put(key, value);
+    }
+
+    fn delete(&mut self, key: &[u8]) {
+        self.inner.delete(key);
+    }
+
+    fn add_read_conflict(&mut self, key: &[u8]) {
+        self.inner.add_read_conflict(key);
+    }
+
+    async fn commit(&mut self) -> KvResult<()> {
+        if self.finished {
+            let result = Err(KvError::Backend("commit on finished transaction".into()));
+            metrics::metrics().observe(self.backend, metrics::op::COMMIT, Instant::now(), &result);
+            return result;
+        }
+
+        let start = Instant::now();
+        let result = self.inner.commit().await;
+        observe_result(self.backend, metrics::op::COMMIT, start, &result);
+        self.finish();
+        result
+    }
+
+    fn rollback(&mut self) {
+        if !self.finished {
+            self.inner.rollback();
+            self.finish();
+        }
+    }
+}
+
+impl Drop for InstrumentedTransaction {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn observe_result<T>(backend: &str, op: &str, start: Instant, result: &KvResult<T>) {
+    metrics::metrics().observe(
+        backend,
+        op,
+        start,
+        &result.as_ref().map(|_| ()).map_err(|error| error.clone()),
+    );
+}
+
 /// Default retry budget for [`run_txn`] and the convenience CAS helper.
 pub const DEFAULT_MAX_RETRIES: u32 = 16;
 
@@ -293,4 +420,124 @@ async fn backoff(attempt: u32) {
     // 1<<7 = 128 lets the 100ms cap actually take effect (1<<6 = 64 never would).
     let millis = (1u64 << attempt.min(7)).min(100);
     tokio::time::sleep(Duration::from_millis(millis)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deliberately has no metrics code: the shared `KvBackend::begin` wrapper
+    /// must provide the full operation instrumentation for a new backend.
+    struct MetricsFreeBackend;
+
+    struct MetricsFreeTransaction;
+
+    #[async_trait]
+    impl KvBackend for MetricsFreeBackend {
+        fn name(&self) -> &'static str {
+            "metrics-free-test"
+        }
+
+        async fn begin_raw(&self) -> KvResult<Box<dyn KvTransaction>> {
+            Ok(Box::new(MetricsFreeTransaction))
+        }
+    }
+
+    #[async_trait]
+    impl KvTransaction for MetricsFreeTransaction {
+        async fn get(&mut self, _key: &[u8]) -> KvResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        async fn multi_get(&mut self, keys: &[Vec<u8>]) -> KvResult<Vec<Option<Vec<u8>>>> {
+            Ok(vec![None; keys.len()])
+        }
+
+        async fn snapshot_get(&mut self, _key: &[u8]) -> KvResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn put(&mut self, _key: &[u8], _value: &[u8]) {}
+
+        fn delete(&mut self, _key: &[u8]) {}
+
+        fn add_read_conflict(&mut self, _key: &[u8]) {}
+
+        async fn commit(&mut self) -> KvResult<()> {
+            Ok(())
+        }
+
+        fn rollback(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn metrics_are_instrumented_without_backend_metrics_code() {
+        let backend = MetricsFreeBackend;
+        let metrics = metrics::metrics();
+        let name = backend.name();
+
+        let begin_before = metrics
+            .ops_total
+            .with_label_values(&[name, metrics::op::BEGIN])
+            .get();
+        let get_before = metrics
+            .ops_total
+            .with_label_values(&[name, metrics::op::GET])
+            .get();
+        let snapshot_before = metrics
+            .ops_total
+            .with_label_values(&[name, metrics::op::SNAPSHOT_GET])
+            .get();
+        let multi_get_before = metrics
+            .ops_total
+            .with_label_values(&[name, metrics::op::MULTI_GET])
+            .get();
+        let commit_before = metrics
+            .ops_total
+            .with_label_values(&[name, metrics::op::COMMIT])
+            .get();
+
+        let mut txn = backend.begin().await.unwrap();
+        txn.get(b"key").await.unwrap();
+        txn.snapshot_get(b"key").await.unwrap();
+        txn.multi_get(&[b"key".to_vec()]).await.unwrap();
+        txn.put(b"key", b"value");
+        txn.commit().await.unwrap();
+
+        assert_eq!(
+            metrics
+                .ops_total
+                .with_label_values(&[name, metrics::op::BEGIN])
+                .get(),
+            begin_before + 1
+        );
+        assert_eq!(
+            metrics
+                .ops_total
+                .with_label_values(&[name, metrics::op::GET])
+                .get(),
+            get_before + 1
+        );
+        assert_eq!(
+            metrics
+                .ops_total
+                .with_label_values(&[name, metrics::op::SNAPSHOT_GET])
+                .get(),
+            snapshot_before + 1
+        );
+        assert_eq!(
+            metrics
+                .ops_total
+                .with_label_values(&[name, metrics::op::MULTI_GET])
+                .get(),
+            multi_get_before + 1
+        );
+        assert_eq!(
+            metrics
+                .ops_total
+                .with_label_values(&[name, metrics::op::COMMIT])
+                .get(),
+            commit_before + 1
+        );
+    }
 }

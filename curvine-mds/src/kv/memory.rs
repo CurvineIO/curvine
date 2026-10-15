@@ -32,7 +32,6 @@ use crate::kv::metrics;
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 const BACKEND_NAME: &str = "memory";
 
@@ -197,23 +196,14 @@ impl KvBackend for MemoryBackend {
         BACKEND_NAME
     }
 
-    async fn begin(&self) -> KvResult<Box<dyn KvTransaction>> {
-        let start = Instant::now();
+    async fn begin_raw(&self) -> KvResult<Box<dyn KvTransaction>> {
         if let Some(error) = self.faults.take(metrics::op::BEGIN) {
-            metrics::metrics().observe(
-                BACKEND_NAME,
-                metrics::op::BEGIN,
-                start,
-                &Err(error.clone()),
-            );
             return Err(error);
         }
         let (read_version, snapshot) = {
             let store = self.store.lock().unwrap();
             (store.seq, store.data.clone())
         };
-        metrics::metrics().observe(BACKEND_NAME, metrics::op::BEGIN, start, &Ok(()));
-        metrics::metrics().txn_in_flight.inc();
         Ok(Box::new(MemTxn {
             store: self.store.clone(),
             faults: self.faults.clone(),
@@ -221,7 +211,6 @@ impl KvBackend for MemoryBackend {
             snapshot,
             reads: HashMap::new(),
             writes: BTreeMap::new(),
-            finished: false,
         }))
     }
 }
@@ -241,7 +230,6 @@ struct MemTxn {
     reads: HashMap<Vec<u8>, ()>,
     /// Buffered writes applied atomically at commit.
     writes: BTreeMap<Vec<u8>, PendingWrite>,
-    finished: bool,
 }
 
 impl MemTxn {
@@ -258,44 +246,24 @@ impl MemTxn {
 #[async_trait]
 impl KvTransaction for MemTxn {
     async fn get(&mut self, key: &[u8]) -> KvResult<Option<Vec<u8>>> {
-        let start = Instant::now();
         if let Some(error) = self.faults.take(metrics::op::GET) {
-            metrics::metrics().observe(BACKEND_NAME, metrics::op::GET, start, &Err(error.clone()));
             return Err(error);
         }
         self.reads.insert(key.to_vec(), ());
-        let value = self.read_key(key);
-        metrics::metrics().observe(BACKEND_NAME, metrics::op::GET, start, &Ok(()));
-        Ok(value)
+        Ok(self.read_key(key))
     }
 
     async fn snapshot_get(&mut self, key: &[u8]) -> KvResult<Option<Vec<u8>>> {
-        let start = Instant::now();
         if let Some(error) = self.faults.take(metrics::op::SNAPSHOT_GET) {
-            metrics::metrics().observe(
-                BACKEND_NAME,
-                metrics::op::SNAPSHOT_GET,
-                start,
-                &Err(error.clone()),
-            );
             return Err(error);
         }
         // Snapshot read: same snapshot as `get` but deliberately NOT recorded
         // in `self.reads`, so a concurrent change to this key won't conflict.
-        let value = self.read_key(key);
-        metrics::metrics().observe(BACKEND_NAME, metrics::op::SNAPSHOT_GET, start, &Ok(()));
-        Ok(value)
+        Ok(self.read_key(key))
     }
 
     async fn multi_get(&mut self, keys: &[Vec<u8>]) -> KvResult<Vec<Option<Vec<u8>>>> {
-        let start = Instant::now();
         if let Some(error) = self.faults.take(metrics::op::MULTI_GET) {
-            metrics::metrics().observe(
-                BACKEND_NAME,
-                metrics::op::MULTI_GET,
-                start,
-                &Err(error.clone()),
-            );
             return Err(error);
         }
         let mut out = Vec::with_capacity(keys.len());
@@ -303,7 +271,6 @@ impl KvTransaction for MemTxn {
             self.reads.insert(key.clone(), ());
             out.push(self.read_key(key));
         }
-        metrics::metrics().observe(BACKEND_NAME, metrics::op::MULTI_GET, start, &Ok(()));
         Ok(out)
     }
 
@@ -320,28 +287,11 @@ impl KvTransaction for MemTxn {
     }
 
     async fn commit(&mut self) -> KvResult<()> {
-        let start = Instant::now();
-        self.finished = true;
-        metrics::metrics().txn_in_flight.dec();
-
         if let Some(error) = self.faults.take(metrics::op::COMMIT) {
-            metrics::metrics().observe(
-                BACKEND_NAME,
-                metrics::op::COMMIT,
-                start,
-                &Err(error.clone()),
-            );
             return Err(error);
         }
         if self.faults.maybe_commit_conflict() {
-            let error = KvError::Conflict;
-            metrics::metrics().observe(
-                BACKEND_NAME,
-                metrics::op::COMMIT,
-                start,
-                &Err(error.clone()),
-            );
-            return Err(error);
+            return Err(KvError::Conflict);
         }
 
         let mut store = self.store.lock().unwrap();
@@ -353,14 +303,7 @@ impl KvTransaction for MemTxn {
             if let Some(entry) = store.data.get(key) {
                 if entry.version > self.read_version {
                     drop(store);
-                    let error = KvError::Conflict;
-                    metrics::metrics().observe(
-                        BACKEND_NAME,
-                        metrics::op::COMMIT,
-                        start,
-                        &Err(error.clone()),
-                    );
-                    return Err(error);
+                    return Err(KvError::Conflict);
                 }
             }
         }
@@ -386,36 +329,14 @@ impl KvTransaction for MemTxn {
         // Apply-then-unknown fault: writes have landed, but report
         // MaybeCommitted (FDB commit_unknown_result). run_txn must NOT retry.
         if self.faults.take_apply_then_unknown() {
-            let error = KvError::MaybeCommitted;
-            metrics::metrics().observe(
-                BACKEND_NAME,
-                metrics::op::COMMIT,
-                start,
-                &Err(error.clone()),
-            );
-            return Err(error);
+            return Err(KvError::MaybeCommitted);
         }
 
-        metrics::metrics().observe(BACKEND_NAME, metrics::op::COMMIT, start, &Ok(()));
         Ok(())
     }
 
     fn rollback(&mut self) {
-        if !self.finished {
-            self.finished = true;
-            metrics::metrics().txn_in_flight.dec();
-        }
         self.writes.clear();
         self.reads.clear();
-    }
-}
-
-impl Drop for MemTxn {
-    fn drop(&mut self) {
-        // A transaction dropped without commit/rollback still releases its
-        // in-flight slot so the gauge stays accurate.
-        if !self.finished {
-            metrics::metrics().txn_in_flight.dec();
-        }
     }
 }
