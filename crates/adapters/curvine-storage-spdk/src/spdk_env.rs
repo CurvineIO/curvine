@@ -82,15 +82,6 @@ enum RetiredQpairFinish {
     PendingDestroy,
 }
 
-fn finish_clean_retired_release_outcome(outcome: QpairReleaseOutcome) -> RetiredQpairFinish {
-    match outcome {
-        QpairReleaseOutcome::Cached | QpairReleaseOutcome::Destroyed => {
-            RetiredQpairFinish::Complete
-        }
-        QpairReleaseOutcome::PendingDestroy => RetiredQpairFinish::PendingDestroy,
-    }
-}
-
 pub struct QpairPool {
     pub(crate) inner: Mutex<HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>>>,
     pub(crate) pending_destroy: Mutex<HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>>>,
@@ -1153,20 +1144,17 @@ impl SpdkEnv {
         retired: RetiredQpair,
     ) -> RetiredQpairFinish {
         if !retired.requires_free() && self.state() == SpdkEnvState::Initialized {
-            match finish_clean_retired_release_outcome(self.qpair_pool.release(ctrlr, qpair)) {
-                RetiredQpairFinish::Complete => {
+            match self.qpair_pool.release(ctrlr, qpair) {
+                QpairReleaseOutcome::Cached | QpairReleaseOutcome::Destroyed => {
                     retired.reclaim();
                     return RetiredQpairFinish::Complete;
                 }
-                RetiredQpairFinish::PendingDestroy => {
+                QpairReleaseOutcome::PendingDestroy => {
                     // QpairPool owns retry through pending_destroy. Do not put
                     // the same qpair into deferred_qpairs.
                     retired.reclaim();
                     return RetiredQpairFinish::PendingDestroy;
                 }
-                RetiredQpairFinish::DeferredRetired => unreachable!(
-                    "clean retired release outcomes cannot ask retired registry to retry"
-                ),
             }
         }
 
@@ -1827,14 +1815,6 @@ mod test {
         assert_eq!(env.deferred_qpair_count(), 0);
         assert_eq!(cnt(&env.qpair_pool, ctrlr as usize), 1);
         assert_eq!(env.qpair_pool.controller_stats(ctrlr as usize).0, 0);
-    }
-
-    #[test]
-    fn pending_destroy_finish_outcome_does_not_defer() {
-        assert_eq!(
-            finish_clean_retired_release_outcome(QpairReleaseOutcome::PendingDestroy),
-            RetiredQpairFinish::PendingDestroy
-        );
     }
 
     #[test]
