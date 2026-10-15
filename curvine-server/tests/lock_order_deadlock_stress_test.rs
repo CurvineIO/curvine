@@ -97,6 +97,7 @@ fn stress_add_block_vs_block_report_no_hang() {
         let mut err = 0usize;
         for i in 0..loops {
             let report = BlockReportList {
+                report_id: 0,
                 cluster_id: "curvine".into(),
                 worker_id: 100,
                 full_report: false,
@@ -177,6 +178,7 @@ fn sanity_single_thread_paths_progress() {
             None,
         );
         let report = BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,

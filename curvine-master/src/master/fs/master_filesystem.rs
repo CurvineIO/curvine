@@ -59,6 +59,8 @@ pub struct MasterFilesystem {
     pub master_monitor: MasterMonitor,
     pub conf: Arc<MasterConf>,
     full_block_reports: Arc<Mutex<HashMap<u32, FullBlockReportState>>>,
+    // Last completed full report per worker: (report_id, completion time ms).
+    completed_full_reports: Arc<Mutex<HashMap<u32, (u64, u64)>>>,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
 }
@@ -97,10 +99,21 @@ fn snapshot_token_in_subtree(token: &str, subtree_path: &str) -> bool {
 }
 
 struct FullBlockReportState {
+    report_id: u64,
     total_len: u64,
     update_time_ms: u64,
     reported_blocks: HashSet<i64>,
     invalidated: bool,
+}
+
+/// Outcome of folding one full report batch into the master's session state.
+enum FullReportProgress {
+    /// Incremental report, or a full report that is still missing batches.
+    Partial,
+    /// The batch completed the report; holds every reported block id.
+    Complete(HashSet<i64>),
+    /// The batch belongs to a round that already completed.
+    Duplicate,
 }
 
 struct FullBlockReconcileState {
@@ -158,6 +171,7 @@ impl MasterFilesystem {
             master_monitor,
             conf: Arc::new(conf.master.clone()),
             full_block_reports: Default::default(),
+            completed_full_reports: Default::default(),
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
@@ -174,6 +188,7 @@ impl MasterFilesystem {
             master_monitor: js.master_monitor(),
             conf: Arc::new(conf.master.clone()),
             full_block_reports: Default::default(),
+            completed_full_reports: Default::default(),
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
@@ -1111,16 +1126,38 @@ impl MasterFilesystem {
         fs_dir.block_inode_state(id)
     }
 
-    fn collect_full_block_report(&self, list: &BlockReportList) -> Option<HashSet<i64>> {
+    fn collect_full_block_report(&self, list: &BlockReportList) -> FullReportProgress {
         if !list.full_report {
-            return None;
+            return FullReportProgress::Partial;
         }
 
         let now = LocalTime::mills();
+        let mut completed = self.completed_full_reports.lock();
+        completed
+            .retain(|_, (_, time_ms)| now.saturating_sub(*time_ms) <= FULL_BLOCK_REPORT_TTL_MS);
+        // A batch of a round that already completed was resent after its response
+        // was lost. Accepting it would open a new session holding only this batch.
+        if list.report_id != 0
+            && completed
+                .get(&list.worker_id)
+                .is_some_and(|(id, _)| *id == list.report_id)
+        {
+            return FullReportProgress::Duplicate;
+        }
+
         let mut reports = self.full_block_reports.lock();
         reports.retain(|_, report| {
             now.saturating_sub(report.update_time_ms) <= FULL_BLOCK_REPORT_TTL_MS
         });
+        // A different round id means the worker started a new full report, so the
+        // blocks accumulated for the previous round no longer apply.
+        if list.report_id != 0
+            && reports
+                .get(&list.worker_id)
+                .is_some_and(|report| report.report_id != 0 && report.report_id != list.report_id)
+        {
+            reports.remove(&list.worker_id);
+        }
         // A prior incremental report may have invalidated the session. Drop it so
         // this full report can start a fresh accumulation instead of being ignored.
         if reports
@@ -1134,6 +1171,7 @@ impl MasterFilesystem {
         let report = reports
             .entry(list.worker_id)
             .or_insert_with(|| FullBlockReportState {
+                report_id: list.report_id,
                 total_len: list.total_len,
                 update_time_ms: now,
                 reported_blocks: HashSet::with_capacity(list.total_len as usize),
@@ -1160,16 +1198,22 @@ impl MasterFilesystem {
         }
 
         if report.reported_blocks.len() as u64 >= report.total_len {
-            reports
-                .remove(&list.worker_id)
-                .map(|report| report.reported_blocks)
+            let report = reports.remove(&list.worker_id);
+            if list.report_id != 0 {
+                completed.insert(list.worker_id, (list.report_id, now));
+            }
+            match report {
+                Some(report) => FullReportProgress::Complete(report.reported_blocks),
+                None => FullReportProgress::Partial,
+            }
         } else {
-            None
+            FullReportProgress::Partial
         }
     }
 
     pub fn reset_full_block_report(&self, worker_id: u32) {
         self.full_block_reports.lock().remove(&worker_id);
+        self.completed_full_reports.lock().remove(&worker_id);
         self.invalidate_full_block_reconcile(worker_id);
     }
 
@@ -1219,7 +1263,19 @@ impl MasterFilesystem {
             self.invalidate_full_block_state(list.worker_id);
         }
 
-        let full_reported_blocks = self.collect_full_block_report(&list);
+        let full_reported_blocks = match self.collect_full_block_report(&list) {
+            FullReportProgress::Duplicate => {
+                info!(
+                    "ignored resent batch of completed full block report {} from worker {}",
+                    list.report_id, list.worker_id
+                );
+                return Ok(BlockReportResult {
+                    delete_blocks: Vec::new(),
+                });
+            }
+            FullReportProgress::Complete(blocks) => Some(blocks),
+            FullReportProgress::Partial => None,
+        };
         if list.blocks.is_empty() && full_reported_blocks.is_none() {
             return Ok(BlockReportResult {
                 delete_blocks: Vec::new(),
