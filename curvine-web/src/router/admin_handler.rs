@@ -3162,7 +3162,7 @@ async fn dir_space_update_v1(
     Json(payload): Json<DirSpaceUpdateRequest>,
 ) -> FsResult<Json<Value>> {
     use curvine_config::{
-        MasterConf, DIR_SPACE_ENABLED_RUNTIME_KEY, DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY,
+        DirSpaceConf, DIR_SPACE_ENABLED_RUNTIME_KEY, DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY,
     };
 
     if payload.enabled.is_none() && payload.path.is_none() {
@@ -3188,7 +3188,7 @@ async fn dir_space_update_v1(
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect();
-        let next = MasterConf::with_tracked_path(&paths, path, tracked)?;
+        let next = DirSpaceConf::with_tracked_path(&paths, path, tracked)?;
         let value = match serde_json::to_string(&next) {
             Ok(value) => value,
             Err(err) => return err_box!("dir-space paths: {}", err),
@@ -3212,7 +3212,7 @@ async fn dir_space_summaries_v1(
     Extension(instance): Extension<Arc<AdminRouterHandler>>,
     Json(payload): Json<DirSpaceSummariesRequest>,
 ) -> FsResult<Json<Value>> {
-    use curvine_config::MasterConf;
+    use curvine_config::DirSpaceConf;
 
     if payload.paths.len() > DIR_SPACE_SUMMARY_LIMIT {
         return err_box!(
@@ -3240,7 +3240,7 @@ async fn dir_space_summaries_v1(
 
     let mut items = Vec::with_capacity(payload.paths.len());
     for raw in payload.paths {
-        let canonical = MasterConf::normalize_tracked_path_list(&[raw], u32::MAX)?;
+        let canonical = DirSpaceConf::normalize_tracked_path_list(&[raw], u32::MAX)?;
         let Some(path) = canonical.into_iter().next() else {
             continue;
         };

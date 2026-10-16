@@ -252,13 +252,13 @@ async fn get_hdfs_test_config() -> HashMap<String, String> {
 }
 
 fn enable_dir_space_with_mount_tracking(conf: &mut curvine_config::ClusterConf) {
-    conf.master.dir_space_enabled = true;
-    conf.master.dir_space_global_scan_interval = "500ms".to_string();
-    conf.master.dir_space_global_scan_timeout = "500ms".to_string();
-    conf.master.dir_space_tracked_scan_interval = "500ms".to_string();
-    conf.master.dir_space_tracked_scan_timeout = "500ms".to_string();
-    conf.master.dir_space_auto_track_mounts = false;
-    conf.master.dir_space_tracked_paths = vec!["/dir_space_mnt_it".to_string()];
+    conf.master.dir_space.enabled = true;
+    conf.master.dir_space.global_scan_interval = "500ms".to_string();
+    conf.master.dir_space.global_scan_timeout = "500ms".to_string();
+    conf.master.dir_space.tracked_scan_interval = "500ms".to_string();
+    conf.master.dir_space.tracked_scan_timeout = "500ms".to_string();
+    conf.master.dir_space.auto_track_mounts = false;
+    conf.master.dir_space.tracked_paths = vec!["/dir_space_mnt_it".to_string()];
     conf.master.init().expect("dir-space mount test config");
 }
 

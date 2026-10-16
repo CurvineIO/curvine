@@ -16,7 +16,7 @@ use crate::util::*;
 use clap::{Parser, Subcommand};
 use curvine_client_core::file::FsClient;
 use curvine_config::{
-    MasterConf, DIR_SPACE_ENABLED_RUNTIME_KEY, DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY,
+    DirSpaceConf, DIR_SPACE_ENABLED_RUNTIME_KEY, DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY,
 };
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::RuntimeConfigEntry;
@@ -101,7 +101,7 @@ async fn set_enabled(client: &FsClient, enabled: bool) -> CommonResult<()> {
 
 async fn set_path(client: &FsClient, path: &str, tracked: bool) -> CommonResult<()> {
     let view = load_view(client).await?;
-    let next = MasterConf::with_tracked_path(&view.paths, path, tracked)?;
+    let next = DirSpaceConf::with_tracked_path(&view.paths, path, tracked)?;
     let value = match serde_json::to_string(&next) {
         Ok(value) => value,
         Err(err) => return err_box!("dir-space paths: {}", err),

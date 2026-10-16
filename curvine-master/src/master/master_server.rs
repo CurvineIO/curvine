@@ -185,7 +185,7 @@ impl Master {
         let rt = Arc::new(conf.master_server_conf().create_runtime());
         let replication_manager = MasterReplicationManager::new(&fs, &conf, &rt, &worker_manager)?;
 
-        // The scanner always starts. `dir_space_enabled` and the explicit path
+        // The scanner always starts. `dir_space.enabled` and the explicit path
         // list decide whether a tick walks RocksDB, and both can change at runtime.
         let dir_space_manager = Arc::new(DirSpaceManager::new(
             fs.clone(),

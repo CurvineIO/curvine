@@ -99,7 +99,7 @@ impl FsDir {
             evictor,
             op_id: AtomicCounter::new(0),
             restore_wait_timeout: std::time::Duration::from_millis(
-                conf.master.dir_space_restore_wait_timeout_ms(),
+                conf.master.dir_space.restore_wait_timeout_ms(),
             ),
         };
         fs_dir.update_last_inode_id(last_inode_id)?;

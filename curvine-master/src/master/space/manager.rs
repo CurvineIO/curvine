@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use curvine_config::MasterConf;
+use curvine_config::{DirSpaceConf, MasterConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::Path;
 use curvine_runtime::common::LocalTime;
@@ -184,9 +184,9 @@ impl DirSpaceManager {
         Self {
             fs,
             mount_manager,
-            file_enabled: conf.dir_space_enabled,
+            file_enabled: conf.dir_space.enabled,
             enabled_override: Mutex::new(None),
-            file_paths: conf.dir_space_tracked_paths_normalized.clone(),
+            file_paths: conf.dir_space.tracked_paths_normalized.clone(),
             paths_override: Mutex::new(None),
             config_epoch: AtomicU64::new(0),
             activity: Mutex::new(DirSpaceActivityState::default()),
@@ -276,7 +276,10 @@ impl DirSpaceManager {
     }
 
     fn mark_scan_path(&self, path: &str) {
-        self.activity.lock().expect("dir-space activity lock").current_path = path.to_string();
+        self.activity
+            .lock()
+            .expect("dir-space activity lock")
+            .current_path = path.to_string();
     }
 
     fn note_finished(&self, outcome: ScanOutcome) {
@@ -317,9 +320,9 @@ impl DirSpaceManager {
         &self,
         raw_paths: &[String],
     ) -> CommonResult<(Vec<String>, Vec<String>)> {
-        let normalized = MasterConf::normalize_tracked_path_list(
+        let normalized = DirSpaceConf::normalize_tracked_path_list(
             raw_paths,
-            self.conf.dir_space_max_tracked_points,
+            self.conf.dir_space.max_tracked_points,
         )?;
         let previous = self.explicit_paths();
         if normalized.iter().any(|path| path == "/") && !previous.iter().any(|path| path == "/") {
@@ -364,12 +367,12 @@ impl DirSpaceManager {
 
     /// Configured global scan interval in milliseconds (coordinator cadence).
     pub fn interval_ms(&self) -> u64 {
-        self.conf.dir_space_global_scan_interval_ms()
+        self.conf.dir_space.global_scan_interval_ms()
     }
 
     /// Configured tracked-point scan interval in milliseconds.
     pub fn point_interval_ms(&self) -> u64 {
-        self.conf.dir_space_tracked_scan_interval_ms()
+        self.conf.dir_space.tracked_scan_interval_ms()
     }
 
     /// Refresh the global snapshot age metric from the published generation.
@@ -406,23 +409,23 @@ impl DirSpaceManager {
 
     fn global_limits(&self) -> ScanLimits {
         ScanLimits {
-            max_inodes: self.conf.dir_space_max_inodes,
-            max_edges: self.conf.dir_space_max_edges,
-            max_dirs: self.conf.dir_space_max_dirs,
-            max_depth: self.conf.dir_space_max_depth,
-            memory_budget_bytes: self.conf.dir_space_memory_budget_bytes(),
-            max_inode_record_bytes: self.conf.dir_space_max_inode_record_bytes(),
+            max_inodes: self.conf.dir_space.max_inodes,
+            max_edges: self.conf.dir_space.max_edges,
+            max_dirs: self.conf.dir_space.max_dirs,
+            max_depth: self.conf.dir_space.max_depth,
+            memory_budget_bytes: self.conf.dir_space.memory_budget_bytes(),
+            max_inode_record_bytes: self.conf.dir_space.max_inode_record_bytes(),
         }
     }
 
     fn point_limits(&self) -> ScanLimits {
         ScanLimits {
-            max_inodes: self.conf.dir_space_track_max_inodes,
-            max_edges: self.conf.dir_space_track_max_edges,
-            max_dirs: self.conf.dir_space_max_dirs,
-            max_depth: self.conf.dir_space_track_max_depth,
-            memory_budget_bytes: self.conf.dir_space_track_memory_budget_bytes(),
-            max_inode_record_bytes: self.conf.dir_space_max_inode_record_bytes(),
+            max_inodes: self.conf.dir_space.track_max_inodes,
+            max_edges: self.conf.dir_space.track_max_edges,
+            max_dirs: self.conf.dir_space.max_dirs,
+            max_depth: self.conf.dir_space.track_max_depth,
+            memory_budget_bytes: self.conf.dir_space.track_memory_budget_bytes(),
+            max_inode_record_bytes: self.conf.dir_space.max_inode_record_bytes(),
         }
     }
 
@@ -487,7 +490,7 @@ impl DirSpaceManager {
             return (ScanOutcome::Success, 0, true);
         }
 
-        let timeout_ms = self.conf.dir_space_tracked_scan_timeout_ms();
+        let timeout_ms = self.conf.dir_space.tracked_scan_timeout_ms();
         let monitor = self.fs.master_monitor.clone();
         let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
         let monitor_for_ctx = monitor.clone();
@@ -705,7 +708,7 @@ impl DirSpaceManager {
         self.begin_scan("global", "/");
         let _mark = ScanMark(self);
 
-        let timeout_ms = self.conf.dir_space_global_scan_timeout_ms();
+        let timeout_ms = self.conf.dir_space.global_scan_timeout_ms();
         let monitor = self.fs.master_monitor.clone();
         let context = ScanContext {
             deadline: Instant::now() + std::time::Duration::from_millis(timeout_ms),
@@ -1055,10 +1058,10 @@ mod tests {
             },
             ..Default::default()
         };
-        conf.master.dir_space_enabled = dir_space_enabled;
+        conf.master.dir_space.enabled = dir_space_enabled;
         configure(&mut conf.master);
-        if dir_space_enabled && conf.master.dir_space_tracked_paths.is_empty() {
-            conf.master.dir_space_tracked_paths = vec!["/".to_string()];
+        if dir_space_enabled && conf.master.dir_space.tracked_paths.is_empty() {
+            conf.master.dir_space.tracked_paths = vec!["/".to_string()];
         }
         conf.master.init().unwrap();
         let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
@@ -1405,7 +1408,7 @@ mod tests {
     #[test]
     fn tracked_point_effective_paths_and_publish() {
         let (fs, conf) = test_fs_with_options("tracked-publish", true, |master| {
-            master.dir_space_tracked_paths = vec!["/a".to_string()];
+            master.dir_space.tracked_paths = vec!["/a".to_string()];
         });
         set_role(&monitor_for(&fs), true);
         seed_tree(&fs);
@@ -1429,7 +1432,7 @@ mod tests {
     #[test]
     fn tracked_point_stale_root_not_selected_after_rename() {
         let (fs, conf) = test_fs_with_options("tracked-stale", true, |master| {
-            master.dir_space_tracked_paths = vec!["/a".to_string()];
+            master.dir_space.tracked_paths = vec!["/a".to_string()];
         });
         set_role(&monitor_for(&fs), true);
         seed_tree(&fs);
@@ -1447,7 +1450,7 @@ mod tests {
     #[test]
     fn runtime_override_replaces_paths_and_disable_stops_scans() {
         let (fs, conf) = test_fs_with_options("runtime-paths", true, |master| {
-            master.dir_space_tracked_paths = vec!["/a".to_string()];
+            master.dir_space.tracked_paths = vec!["/a".to_string()];
         });
         set_role(&monitor_for(&fs), true);
         seed_tree(&fs);

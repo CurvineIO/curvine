@@ -25,10 +25,13 @@ pub use self::raft_peer::RaftPeer;
 mod journal_conf;
 pub use self::journal_conf::JournalConf;
 
-mod master_conf;
-pub use self::master_conf::{
-    MasterConf, DIR_SPACE_ENABLED_RUNTIME_KEY, DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY,
+mod dir_space_conf;
+pub use self::dir_space_conf::{
+    DirSpaceConf, DIR_SPACE_ENABLED_RUNTIME_KEY, DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY,
 };
+
+mod master_conf;
+pub use self::master_conf::MasterConf;
 
 mod mds_conf;
 pub use self::mds_conf::{KvBackendType, MdsConf};

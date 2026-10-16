@@ -1387,13 +1387,13 @@ fn list_stream_matches_list_options_empty_dir() {
 }
 
 fn enable_dir_space_for_integration(conf: &mut ClusterConf) {
-    conf.master.dir_space_enabled = true;
-    conf.master.dir_space_global_scan_interval = "500ms".to_string();
-    conf.master.dir_space_global_scan_timeout = "500ms".to_string();
-    conf.master.dir_space_tracked_scan_interval = "500ms".to_string();
-    conf.master.dir_space_tracked_scan_timeout = "500ms".to_string();
-    conf.master.dir_space_auto_track_mounts = false;
-    conf.master.dir_space_tracked_paths = vec!["/".to_string()];
+    conf.master.dir_space.enabled = true;
+    conf.master.dir_space.global_scan_interval = "500ms".to_string();
+    conf.master.dir_space.global_scan_timeout = "500ms".to_string();
+    conf.master.dir_space.tracked_scan_interval = "500ms".to_string();
+    conf.master.dir_space.tracked_scan_timeout = "500ms".to_string();
+    conf.master.dir_space.auto_track_mounts = false;
+    conf.master.dir_space.tracked_paths = vec!["/".to_string()];
     conf.master.init().expect("dir-space test config");
 }
 

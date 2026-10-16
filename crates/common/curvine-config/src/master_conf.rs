@@ -12,17 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{ClusterConf, CompatibilityConf, DBConf};
+use crate::{ClusterConf, CompatibilityConf, DBConf, DirSpaceConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_runtime::common::{ByteUnit, DurationUnit, LogConf, Utils};
 use curvine_runtime::runtime::GroupExecutor;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Arc;
-
-/// Runtime key for the dir-space scan switch (`cv admin config` / dir-space ops).
-pub const DIR_SPACE_ENABLED_RUNTIME_KEY: &str = "master.dir_space_enabled";
-/// Runtime key for the explicit dir-space path list.
-pub const DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY: &str = "master.dir_space_tracked_paths";
 
 // master Configuration file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,46 +161,12 @@ pub struct MasterConf {
     )]
     pub rocksdb: DBConf,
 
-    // Dir-space snapshot (default off).
-    pub dir_space_enabled: bool,
-    pub dir_space_global_scan_interval: String,
-    #[serde(skip)]
-    pub dir_space_global_scan_interval_unit: DurationUnit,
-    pub dir_space_global_scan_timeout: String,
-    #[serde(skip)]
-    pub dir_space_global_scan_timeout_unit: DurationUnit,
-    pub dir_space_tracked_scan_interval: String,
-    #[serde(skip)]
-    pub dir_space_tracked_scan_interval_unit: DurationUnit,
-    pub dir_space_tracked_scan_timeout: String,
-    #[serde(skip)]
-    pub dir_space_tracked_scan_timeout_unit: DurationUnit,
-    pub dir_space_max_inodes: u64,
-    pub dir_space_max_edges: u64,
-    pub dir_space_max_dirs: u64,
-    pub dir_space_memory_budget: String,
-    #[serde(skip)]
-    pub dir_space_memory_budget_unit: ByteUnit,
-    pub dir_space_max_depth: u32,
-    pub dir_space_track_max_inodes: u64,
-    pub dir_space_track_max_edges: u64,
-    pub dir_space_track_memory_budget: String,
-    #[serde(skip)]
-    pub dir_space_track_memory_budget_unit: ByteUnit,
-    pub dir_space_track_max_depth: u32,
-    pub dir_space_max_tracked_points: u32,
-    pub dir_space_max_inode_record_bytes: String,
-    #[serde(skip)]
-    pub dir_space_max_inode_record_bytes_unit: ByteUnit,
-    /// Parsed for compatibility. Mounts are not added to the tracked-path list.
-    pub dir_space_auto_track_mounts: bool,
-    pub dir_space_tracked_paths: Vec<String>,
-    pub dir_space_restore_wait_timeout: String,
-    #[serde(skip)]
-    pub dir_space_restore_wait_timeout_unit: DurationUnit,
-    /// Normalized absolute tracked paths (no root `/`), populated in `init()`.
-    #[serde(skip)]
-    pub dir_space_tracked_paths_normalized: Vec<String>,
+    /// Directory-usage snapshots. File keys live under `[master.dir_space]`.
+    #[serde(
+        default = "DirSpaceConf::default",
+        deserialize_with = "DirSpaceConf::deserialize_with_defaults"
+    )]
+    pub dir_space: DirSpaceConf,
 }
 
 impl MasterConf {
@@ -236,23 +197,7 @@ impl MasterConf {
         // Initialize lock expiration time
         self.lock_expire_time_unit = DurationUnit::from_str(&self.lock_expire_time)?;
 
-        self.dir_space_global_scan_interval_unit =
-            DurationUnit::from_str(&self.dir_space_global_scan_interval)?;
-        self.dir_space_global_scan_timeout_unit =
-            DurationUnit::from_str(&self.dir_space_global_scan_timeout)?;
-        self.dir_space_tracked_scan_interval_unit =
-            DurationUnit::from_str(&self.dir_space_tracked_scan_interval)?;
-        self.dir_space_tracked_scan_timeout_unit =
-            DurationUnit::from_str(&self.dir_space_tracked_scan_timeout)?;
-        self.dir_space_restore_wait_timeout_unit =
-            DurationUnit::from_str(&self.dir_space_restore_wait_timeout)?;
-        self.dir_space_memory_budget_unit = ByteUnit::from_str(&self.dir_space_memory_budget)?;
-        self.dir_space_track_memory_budget_unit =
-            ByteUnit::from_str(&self.dir_space_track_memory_budget)?;
-        self.dir_space_max_inode_record_bytes_unit =
-            ByteUnit::from_str(&self.dir_space_max_inode_record_bytes)?;
-
-        self.validate_dir_space()?;
+        self.dir_space.init()?;
 
         if self.heartbeat_interval_unit > self.worker_blacklist_interval_unit {
             return err_box!("Worker_blacklist_interval must be greater than heartbeat_interval");
@@ -279,171 +224,6 @@ impl MasterConf {
         }
 
         Ok(())
-    }
-
-    fn validate_dir_space(&mut self) -> CommonResult<()> {
-        if self.dir_space_global_scan_interval_unit.as_millis() == 0 {
-            return err_box!("dir_space_global_scan_interval must be greater than zero");
-        }
-        if self.dir_space_global_scan_timeout_unit.as_millis() == 0 {
-            return err_box!("dir_space_global_scan_timeout must be greater than zero");
-        }
-        if self.dir_space_tracked_scan_interval_unit.as_millis() == 0 {
-            return err_box!("dir_space_tracked_scan_interval must be greater than zero");
-        }
-        if self.dir_space_tracked_scan_timeout_unit.as_millis() == 0 {
-            return err_box!("dir_space_tracked_scan_timeout must be greater than zero");
-        }
-        if self.dir_space_restore_wait_timeout_unit.as_millis() == 0 {
-            return err_box!("dir_space_restore_wait_timeout must be greater than zero");
-        }
-
-        if self.dir_space_global_scan_timeout_unit > self.dir_space_global_scan_interval_unit {
-            return err_box!(
-                "dir_space_global_scan_timeout must not be greater than dir_space_global_scan_interval"
-            );
-        }
-        if self.dir_space_tracked_scan_timeout_unit > self.dir_space_tracked_scan_interval_unit {
-            return err_box!(
-                "dir_space_tracked_scan_timeout must not be greater than dir_space_tracked_scan_interval"
-            );
-        }
-
-        for field in [
-            ("dir_space_max_inodes", self.dir_space_max_inodes),
-            ("dir_space_max_edges", self.dir_space_max_edges),
-            ("dir_space_max_dirs", self.dir_space_max_dirs),
-            (
-                "dir_space_track_max_inodes",
-                self.dir_space_track_max_inodes,
-            ),
-            ("dir_space_track_max_edges", self.dir_space_track_max_edges),
-        ] {
-            if field.1 == 0 {
-                return err_box!("{} must be greater than zero", field.0);
-            }
-        }
-        if self.dir_space_max_depth == 0 {
-            return err_box!("dir_space_max_depth must be greater than zero");
-        }
-        if self.dir_space_track_max_depth == 0 {
-            return err_box!("dir_space_track_max_depth must be greater than zero");
-        }
-        if self.dir_space_max_tracked_points == 0 {
-            return err_box!("dir_space_max_tracked_points must be greater than zero");
-        }
-        if self.dir_space_memory_budget_unit.as_byte() == 0 {
-            return err_box!("dir_space_memory_budget must be greater than zero");
-        }
-        if self.dir_space_track_memory_budget_unit.as_byte() == 0 {
-            return err_box!("dir_space_track_memory_budget must be greater than zero");
-        }
-        if self.dir_space_max_inode_record_bytes_unit.as_byte() == 0 {
-            return err_box!("dir_space_max_inode_record_bytes must be greater than zero");
-        }
-
-        self.dir_space_tracked_paths_normalized = Self::normalize_tracked_path_list(
-            &self.dir_space_tracked_paths,
-            self.dir_space_max_tracked_points,
-        )?;
-        Ok(())
-    }
-
-    /// Normalize an explicit dir-space path list.
-    ///
-    /// Empty entries are dropped. `/` is kept and selects the global scan.
-    /// Other entries are absolute paths without a trailing slash. Duplicates
-    /// collapse. More entries than `max_points` is an error.
-    pub fn normalize_tracked_path_list(
-        raw_paths: &[String],
-        max_points: u32,
-    ) -> CommonResult<Vec<String>> {
-        let mut normalized = Vec::new();
-        for raw in raw_paths {
-            let path = raw.trim();
-            if path.is_empty() {
-                continue;
-            }
-            if !path.starts_with('/') {
-                return err_box!("dir_space_tracked_paths entries must be absolute paths");
-            }
-            if path.contains('*') || path.contains('?') || path.contains('[') {
-                return err_box!("dir_space_tracked_paths must not contain glob characters");
-            }
-            let mut norm = path.to_string();
-            while norm.len() > 1 && norm.ends_with('/') {
-                norm.pop();
-            }
-            if !normalized.iter().any(|existing| existing == &norm) {
-                normalized.push(norm);
-            }
-        }
-        if normalized.len() > max_points as usize {
-            return err_box!("dir_space_tracked_paths exceeds dir_space_max_tracked_points");
-        }
-        Ok(normalized)
-    }
-
-    /// Add or drop one statistics path. Canonicalizes like the file config.
-    /// Adding `/` is rejected. The master enforces `dir_space_max_tracked_points`
-    /// when the list is stored.
-    pub fn with_tracked_path(
-        paths: &[String],
-        path: &str,
-        tracked: bool,
-    ) -> CommonResult<Vec<String>> {
-        let path = path.trim();
-        if path.is_empty() {
-            return err_box!("dir-space path is required");
-        }
-        let canonical = Self::normalize_tracked_path_list(&[path.to_string()], u32::MAX)?;
-        let Some(path) = canonical.into_iter().next() else {
-            return err_box!("dir-space path is required");
-        };
-        if tracked && path == "/" {
-            return err_box!("dir-space cannot track the root directory");
-        }
-        let mut next = paths.to_vec();
-        if tracked {
-            if !next.iter().any(|existing| existing == &path) {
-                next.push(path);
-            }
-        } else {
-            next.retain(|existing| existing != &path);
-        }
-        Self::normalize_tracked_path_list(&next, u32::MAX)
-    }
-
-    pub fn dir_space_global_scan_interval_ms(&self) -> u64 {
-        self.dir_space_global_scan_interval_unit.as_millis()
-    }
-
-    pub fn dir_space_global_scan_timeout_ms(&self) -> u64 {
-        self.dir_space_global_scan_timeout_unit.as_millis()
-    }
-
-    pub fn dir_space_tracked_scan_interval_ms(&self) -> u64 {
-        self.dir_space_tracked_scan_interval_unit.as_millis()
-    }
-
-    pub fn dir_space_tracked_scan_timeout_ms(&self) -> u64 {
-        self.dir_space_tracked_scan_timeout_unit.as_millis()
-    }
-
-    pub fn dir_space_restore_wait_timeout_ms(&self) -> u64 {
-        self.dir_space_restore_wait_timeout_unit.as_millis()
-    }
-
-    pub fn dir_space_memory_budget_bytes(&self) -> u64 {
-        self.dir_space_memory_budget_unit.as_byte()
-    }
-
-    pub fn dir_space_track_memory_budget_bytes(&self) -> u64 {
-        self.dir_space_track_memory_budget_unit.as_byte()
-    }
-
-    pub fn dir_space_max_inode_record_bytes(&self) -> u64 {
-        self.dir_space_max_inode_record_bytes_unit.as_byte()
     }
 
     pub fn rocksdb_default() -> DBConf {
@@ -650,34 +430,7 @@ impl Default for MasterConf {
 
             rocksdb,
 
-            dir_space_enabled: false,
-            dir_space_global_scan_interval: "10m".to_string(),
-            dir_space_global_scan_interval_unit: Default::default(),
-            dir_space_global_scan_timeout: "5m".to_string(),
-            dir_space_global_scan_timeout_unit: Default::default(),
-            dir_space_tracked_scan_interval: "2m".to_string(),
-            dir_space_tracked_scan_interval_unit: Default::default(),
-            dir_space_tracked_scan_timeout: "90s".to_string(),
-            dir_space_tracked_scan_timeout_unit: Default::default(),
-            dir_space_max_inodes: 5_000_000,
-            dir_space_max_edges: 10_000_000,
-            dir_space_max_dirs: 1_000_000,
-            dir_space_memory_budget: "768MB".to_string(),
-            dir_space_memory_budget_unit: Default::default(),
-            dir_space_max_depth: 1024,
-            dir_space_track_max_inodes: 1_000_000,
-            dir_space_track_max_edges: 2_000_000,
-            dir_space_track_memory_budget: "256MB".to_string(),
-            dir_space_track_memory_budget_unit: Default::default(),
-            dir_space_track_max_depth: 1024,
-            dir_space_max_tracked_points: 128,
-            dir_space_max_inode_record_bytes: "16MB".to_string(),
-            dir_space_max_inode_record_bytes_unit: Default::default(),
-            dir_space_auto_track_mounts: false,
-            dir_space_tracked_paths: Vec::new(),
-            dir_space_restore_wait_timeout: "30s".to_string(),
-            dir_space_restore_wait_timeout_unit: Default::default(),
-            dir_space_tracked_paths_normalized: Vec::new(),
+            dir_space: DirSpaceConf::default(),
         };
 
         conf.init().unwrap();
@@ -803,117 +556,25 @@ mod tests {
             .contains("block_replication_job_timeout must be greater than zero"));
     }
 
-    mod dir_space {
-        use super::*;
+    #[test]
+    fn partial_dir_space_table_keeps_other_defaults() {
+        let conf: ClusterConf = toml::from_str(
+            r#"
+            [master.dir_space]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        assert!(conf.master.dir_space.enabled);
+        assert_eq!(conf.master.dir_space.global_scan_interval, "10m");
+        assert_eq!(conf.master.dir_space.max_inodes, 5_000_000);
+        assert!(conf.master.dir_space.tracked_paths.is_empty());
+    }
 
-        #[test]
-        fn defaults_disabled_with_design_values() {
-            let conf = MasterConf::default();
-            assert!(!conf.dir_space_enabled);
-            assert_eq!(conf.dir_space_global_scan_interval, "10m");
-            assert_eq!(conf.dir_space_global_scan_timeout, "5m");
-            assert_eq!(conf.dir_space_tracked_scan_interval, "2m");
-            assert_eq!(conf.dir_space_tracked_scan_timeout, "90s");
-            assert_eq!(conf.dir_space_max_inodes, 5_000_000);
-            assert_eq!(conf.dir_space_max_edges, 10_000_000);
-            assert_eq!(conf.dir_space_max_dirs, 1_000_000);
-            assert_eq!(conf.dir_space_memory_budget, "768MB");
-            assert_eq!(conf.dir_space_max_depth, 1024);
-            assert_eq!(conf.dir_space_track_max_inodes, 1_000_000);
-            assert_eq!(conf.dir_space_track_max_edges, 2_000_000);
-            assert_eq!(conf.dir_space_track_memory_budget, "256MB");
-            assert_eq!(conf.dir_space_track_max_depth, 1024);
-            assert_eq!(conf.dir_space_max_tracked_points, 128);
-            assert_eq!(conf.dir_space_max_inode_record_bytes, "16MB");
-            assert!(!conf.dir_space_auto_track_mounts);
-            assert_eq!(conf.dir_space_restore_wait_timeout, "30s");
-            assert_eq!(conf.dir_space_global_scan_interval_ms(), 600_000);
-            assert_eq!(
-                conf.dir_space_memory_budget_bytes(),
-                ByteUnit::mb(768).as_byte()
-            );
-        }
-
-        #[test]
-        fn zero_limits_rejected() {
-            let mut conf = MasterConf {
-                dir_space_max_inodes: 0,
-                ..Default::default()
-            };
-            let err = conf.init().unwrap_err();
-            assert!(err.to_string().contains("dir_space_max_inodes"));
-        }
-
-        #[test]
-        fn invalid_duration_rejected() {
-            let mut conf = MasterConf {
-                dir_space_global_scan_interval: "not-a-duration".to_string(),
-                ..Default::default()
-            };
-            assert!(conf.init().is_err());
-        }
-
-        #[test]
-        fn global_timeout_must_not_exceed_interval() {
-            let mut conf = MasterConf {
-                dir_space_global_scan_interval: "1m".to_string(),
-                dir_space_global_scan_timeout: "2m".to_string(),
-                ..Default::default()
-            };
-            let err = conf.init().unwrap_err();
-            assert!(err.to_string().contains("dir_space_global_scan_timeout"));
-        }
-
-        #[test]
-        fn relative_tracked_path_rejected() {
-            let mut conf = MasterConf {
-                dir_space_tracked_paths: vec!["relative/path".to_string()],
-                ..Default::default()
-            };
-            let err = conf.init().unwrap_err();
-            assert!(err
-                .to_string()
-                .contains("dir_space_tracked_paths entries must be absolute"));
-        }
-
-        #[test]
-        fn tracked_paths_deduped_and_root_kept() {
-            let mut conf = MasterConf {
-                dir_space_tracked_paths: vec![
-                    "/".to_string(),
-                    "/data/".to_string(),
-                    "/data".to_string(),
-                    "/other".to_string(),
-                ],
-                ..Default::default()
-            };
-            conf.init().unwrap();
-            assert_eq!(
-                conf.dir_space_tracked_paths_normalized,
-                vec!["/".to_string(), "/data".to_string(), "/other".to_string()]
-            );
-        }
-
-        #[test]
-        fn with_tracked_path_adds_and_removes_canonical_paths() {
-            let added =
-                MasterConf::with_tracked_path(&["/data".to_string()], "/track/", true).unwrap();
-            assert_eq!(added, vec!["/data".to_string(), "/track".to_string()]);
-            let again = MasterConf::with_tracked_path(&added, "/track", true).unwrap();
-            assert_eq!(again, added);
-            let removed = MasterConf::with_tracked_path(&added, "/track/", false).unwrap();
-            assert_eq!(removed, vec!["/data".to_string()]);
-            assert!(MasterConf::with_tracked_path(&[], "relative", true).is_err());
-            assert!(MasterConf::with_tracked_path(&[], "  ", true).is_err());
-            assert!(MasterConf::with_tracked_path(&[], "/", true)
-                .unwrap_err()
-                .to_string()
-                .contains("root"));
-            assert!(MasterConf::with_tracked_path(&[], "//", true).is_err());
-            let without_root =
-                MasterConf::with_tracked_path(&["/".to_string(), "/data".to_string()], "/", false)
-                    .unwrap();
-            assert_eq!(without_root, vec!["/data".to_string()]);
-        }
+    #[test]
+    fn omitted_dir_space_table_uses_defaults() {
+        let conf: ClusterConf = toml::from_str("[master]").unwrap();
+        assert!(!conf.master.dir_space.enabled);
+        assert_eq!(conf.master.dir_space.restore_wait_timeout, "30s");
     }
 }
