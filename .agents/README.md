@@ -48,6 +48,7 @@ rm -rf .claude/skills && ln -sfn ../.agents/skills .claude/skills
 | `cv-run-workflow` | Dispatch GitHub Actions |
 | `cv-csi-test` | CSI driver integration testing |
 | `cv-test-report` | Publish full-chain daily reports to the Hextra GH Pages site |
+| `cv-update-metrics` | Keep Grafana dashboards in sync when Prometheus metrics change |
 
 ## Rules
 

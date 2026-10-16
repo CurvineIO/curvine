@@ -207,3 +207,23 @@ per-metric panels in the same row to continue troubleshooting.
 Data links / variable interlinking (click an instance → set `$instance`, click
 an opcode → set `$opcode`) are enhancements; panel descriptions already state the
 next variable to switch. They can be added after the core dashboard is in use.
+
+## Cluster overview
+
+[`curvine-all.json`](./curvine-all.json) is the cluster operations dashboard
+(title `Curvine 运维总览`, uid `curvine-overview`). Rows stay grouped as key
+posture, overview, master, worker, client SDK / scrape / process, and transfer.
+
+1. Import the JSON and select Prometheus for the `Datasource` variable.
+2. Leave `AppID`, `Database`, and `Token` at `.*` unless the scrape platform
+   injects those labels and you need a narrower match. Do not commit a real
+   token. `label=~".*"` matches only series that already have the label; if the
+   deployment does not inject `__DATABASE__` or `__TOKEN__`, remove those
+   matchers from the queries.
+3. Open the panel information icon for the Chinese description: what the metric
+   means, and what an up or down trend means.
+
+Readiness is `up / scraped targets`, not a fixed fleet size. Master and worker
+CPU panels are `100 * rate(process_cpu_seconds_total)`: 100 means one full core.
+When a Prometheus metric changes, update this dashboard in the same change. See
+the `cv-update-metrics` skill.

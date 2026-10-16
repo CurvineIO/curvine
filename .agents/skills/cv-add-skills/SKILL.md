@@ -157,6 +157,7 @@ ls -la .github/skills .cursor/skills .claude/skills
 | `cv-run-workflow` | CI |
 | `cv-tasks-breakdown` | Planning |
 | `cv-test-report` | Testing — publish full-chain reports |
+| `cv-update-metrics` | Metrics — sync Grafana dashboards when metrics change |
 
 ## Related
 

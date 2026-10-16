@@ -97,6 +97,12 @@ Usage notes:
 <location>project</location>
 </skill>
 
+<skill>
+<name>cv-update-metrics</name>
+<description>Update the checked-in Curvine Grafana dashboards when Prometheus metrics are added, renamed, removed, or change meaning. Use when changing master, worker, client, or transfer metrics, or when editing etc/grafana dashboard JSON.</description>
+<location>project</location>
+</skill>
+
 </available_skills>
 <!-- SKILLS_TABLE_END -->
 
