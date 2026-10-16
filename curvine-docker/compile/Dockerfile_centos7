@@ -78,17 +78,25 @@ RUN if [ -d "$JAVA_HOME/include" ] && [ ! -d "$JAVA_HOME/jre/include" ]; then \
         ln -s ../include "$JAVA_HOME/jre/include"; \
     fi
 
-# 1.1. Install Node.js 16 LTS (CentOS 7 glibc 2.17; Node 22 requires glibc >= 2.28)
-RUN NODE_VERSION=16.20.2 && \
+# 1.1. Install Node.js 22 LTS on glibc 2.17 (CentOS 7)
+# Official nodejs.org Linux builds require glibc >= 2.28; use the community
+# glibc-217 rebuild from unofficial-builds.nodejs.org on x86_64.
+RUN NODE_VERSION=22.23.3 && \
     ARCH=$(uname -m) && \
     case "${ARCH}" in \
-        x86_64) NODE_ARCH="x64" ;; \
-        aarch64) NODE_ARCH="arm64" ;; \
+        x86_64) \
+            NODE_PACKAGE="node-v${NODE_VERSION}-linux-x64-glibc-217.tar.xz" && \
+            NODE_SHA256="5473ba6774b3c631201a1d29fd4f1809fd927d2266894c544ca47f301eec15bf" && \
+            NODE_URL="https://unofficial-builds.nodejs.org/download/release/v${NODE_VERSION}/${NODE_PACKAGE}" ;; \
+        aarch64) \
+            echo "Node.js ${NODE_VERSION} on CentOS 7 aarch64 is unsupported (no glibc-217 build)" && exit 1 ;; \
         *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
     esac && \
-    echo "Installing Node.js ${NODE_VERSION} for ${NODE_ARCH}..." && \
-    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" | \
-        tar -xJ -C /usr/local --strip-components=1 && \
+    echo "Installing Node.js ${NODE_VERSION} (${NODE_PACKAGE})..." && \
+    curl -fsSL -o "/tmp/${NODE_PACKAGE}" "${NODE_URL}" && \
+    echo "${NODE_SHA256}  /tmp/${NODE_PACKAGE}" | sha256sum -c - && \
+    tar -xJf "/tmp/${NODE_PACKAGE}" -C /usr/local --strip-components=1 && \
+    rm -f "/tmp/${NODE_PACKAGE}" && \
     echo "✓ Node.js ${NODE_VERSION} installed successfully for ${ARCH}"
 
 # 1.2. Install FoundationDB client library (x86_64)
