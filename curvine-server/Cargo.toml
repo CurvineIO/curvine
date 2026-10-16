@@ -63,7 +63,6 @@ futures = { workspace = true }
 clap = { workspace = true }
 crossbeam = { workspace = true }
 rusqlite = { workspace = true }
-mysql = { workspace = true }
 dashmap = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
@@ -77,4 +76,5 @@ curvine-s3-gateway = { workspace = true }
 
 [dev-dependencies]
 curvine-fault = { workspace = true, features = ["http-client"] }
+mysql = { workspace = true }
 raft = { workspace = true }

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_data_transfer::transfer::postgres_rustls_connector;
 use curvine_data_transfer::transfer::{
     PostgresTransferStore, TransferMountSnapshotUpdate, TransferPlannedTasks,
     TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
@@ -20,9 +21,7 @@ use curvine_model::{
     TaskAttemptStart, TransferJobRecord, TransferKind, TransferProgress, TransferState,
     TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
 };
-use native_tls::TlsConnector;
 use postgres::{Client, Config};
-use postgres_native_tls::MakeTlsConnector;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -44,8 +43,8 @@ impl Drop for TestSchema {
 
 fn admin_client(url: &str) -> Result<Client, Box<dyn std::error::Error>> {
     let config = Config::from_str(url)?;
-    let tls = TlsConnector::new()?;
-    Ok(config.connect(MakeTlsConnector::new(tls))?)
+    let tls = postgres_rustls_connector(None)?;
+    Ok(config.connect(tls)?)
 }
 
 fn test_store_url() -> Option<(String, TestSchema)> {

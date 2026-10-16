@@ -47,7 +47,7 @@ use curvine_job_client::{JobListOptions, JobMasterClient, TransferClient};
 use curvine_model::{
     AccessMode, FileBlocks, FileStatus, FilesystemInfo, JobSourceType, JobStatus, JobTaskState,
     ListOptions, LoadJobCommand, MountInfo, MountOptions, Provider, StorageState, StorageType,
-    TransferCommand, TransferKind, TransferState, TtlAction, WorkerInfo, WriteType,
+    TransferCommand, TransferKind, TransferState, TtlAction, TtlType, WorkerInfo, WriteType,
 };
 use curvine_net::net::InetAddr;
 use curvine_proto::{
@@ -150,6 +150,8 @@ struct MountRequest {
     write_type: String,
     #[serde(default = "default_ttl")]
     ttl: String,
+    #[serde(default)]
+    ttl_type: Option<String>,
     #[serde(default)]
     read_verify_ufs: bool,
     #[serde(default)]
@@ -3079,6 +3081,9 @@ fn parse_mount_options(payload: &MountRequest) -> FsResult<MountOptions> {
         .filter(|v| !v.trim().is_empty())
     {
         opts = opts.access_mode(AccessMode::try_from(access_mode.as_str())?);
+    }
+    if let Some(ttl_type) = payload.ttl_type.as_ref().filter(|v| !v.trim().is_empty()) {
+        opts = opts.ttl_type(TtlType::try_from(ttl_type.as_str())?);
     }
 
     Ok(opts.build())

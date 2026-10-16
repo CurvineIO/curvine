@@ -32,6 +32,7 @@ import {
   rowsFromProperties,
   schemeOf,
   textFromProperties,
+  ttlTypeLabel,
   writeTypeLabel,
   type PropertyRow
 } from './utils'
@@ -42,6 +43,7 @@ interface MountForm {
   update: boolean
   write_type: string
   ttl: string
+  ttl_type: string
   read_verify_ufs: boolean
   auto_cache: boolean
   access_mode: string
@@ -58,6 +60,7 @@ function emptyForm(): MountForm {
     update: false,
     write_type: 'fs_mode',
     ttl: '7d',
+    ttl_type: 'mtime',
     read_verify_ufs: false,
     auto_cache: true,
     access_mode: 'read_only',
@@ -75,6 +78,7 @@ function formFromMount(mount: MountInfo): MountForm {
     update: true,
     write_type: writeTypeLabel(mount.write_type),
     ttl: formatMountTtl(mount.ttl_ms),
+    ttl_type: ttlTypeLabel(mount.ttl_type),
     read_verify_ufs: Boolean(mount.read_verify_ufs),
     auto_cache: (mount as { auto_cache?: boolean }).auto_cache !== false,
     access_mode: accessModeLabel(mount.access_mode),
@@ -218,6 +222,7 @@ export function MountFormSheet({
       update: Boolean(form.update),
       write_type: form.write_type,
       ttl: form.ttl,
+      ttl_type: form.ttl_type,
       read_verify_ufs: Boolean(form.read_verify_ufs),
       auto_cache: Boolean(form.auto_cache),
       access_mode: form.access_mode,
@@ -327,6 +332,17 @@ export function MountFormSheet({
               onChange={(ttl) => setForm((current) => ({ ...current, ttl }))}
               placeholder={t('mounts.form.ttlPlaceholder')}
               testId="mount-ttl"
+            />
+            <SelectField
+              label={t('mounts.form.ttlType')}
+              value={form.ttl_type}
+              onChange={(ttl_type) => setForm((current) => ({ ...current, ttl_type }))}
+              description={t('mounts.form.ttlTypeHint')}
+              options={[
+                { value: 'mtime', label: t('mounts.form.mtime') },
+                { value: 'atime', label: t('mounts.form.atime') }
+              ]}
+              testId="mount-ttl-type"
             />
             <SelectField
               label={t('mounts.form.provider')}

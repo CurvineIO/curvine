@@ -19,7 +19,7 @@ pub use self::mysql_store::MysqlTransferStore;
 #[cfg(feature = "transfer-store-postgres")]
 mod postgres_store;
 #[cfg(feature = "transfer-store-postgres")]
-pub use self::postgres_store::PostgresTransferStore;
+pub use self::postgres_store::{postgres_rustls_connector, PostgresTransferStore};
 
 mod metrics;
 pub(crate) use self::metrics::record_master_rpc;

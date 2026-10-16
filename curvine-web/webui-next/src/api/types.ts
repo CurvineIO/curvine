@@ -181,6 +181,8 @@ export interface MountInfo {
   /** 1/'FsMode' or 0/'CacheMode'. */
   write_type?: number | string | null
   ttl_ms?: number | null
+  /** 0/'Mtime' (default) or 1/'Atime'. */
+  ttl_type?: number | string | null
   provider?: string | null
   properties?: Record<string, string> | null
   replicas?: number | null

@@ -1,11 +1,29 @@
 import { describe, expect, it } from 'vitest'
 
 import type { MountInfo } from '@/api/types'
-import { buildMountTree, matchesCvPath } from './utils'
+import { buildMountTree, matchesCvPath, ttlTypeLabel } from './utils'
 
 function mount(cvPath: string): MountInfo {
   return { cv_path: cvPath, ufs_path: `file://${cvPath}` }
 }
+
+describe('ttlTypeLabel', () => {
+  it('maps proto values to ttl type labels', () => {
+    expect(ttlTypeLabel(0)).toBe('mtime')
+    expect(ttlTypeLabel(1)).toBe('atime')
+    expect(ttlTypeLabel('Mtime')).toBe('mtime')
+    expect(ttlTypeLabel('Atime')).toBe('atime')
+    expect(ttlTypeLabel('mtime')).toBe('mtime')
+    expect(ttlTypeLabel('atime')).toBe('atime')
+  })
+
+  it('defaults missing or unknown values to mtime', () => {
+    expect(ttlTypeLabel(undefined)).toBe('mtime')
+    expect(ttlTypeLabel(null)).toBe('mtime')
+    expect(ttlTypeLabel('')).toBe('mtime')
+    expect(ttlTypeLabel('bogus')).toBe('mtime')
+  })
+})
 
 describe('matchesCvPath', () => {
   it('matches a path fragment and requires every token', () => {

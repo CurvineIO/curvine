@@ -20,17 +20,21 @@ use curvine_model::{
     TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTaskSummary,
     TransferTenantSummary, WorkerInflight,
 };
-use native_tls::{Certificate, TlsConnector};
 use percent_encoding::percent_decode_str;
 use postgres::{error::SqlState, GenericClient, Row, Transaction};
-use postgres_native_tls::MakeTlsConnector;
+use postgres_rustls::MakeTlsConnector;
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
+use rustls::pki_types::CertificateDer;
+use rustls::RootCertStore;
+use rustls_pemfile::certs;
 use std::collections::BTreeSet;
 use std::error::Error as _;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
+use tokio_rustls::TlsConnector as TokioTlsConnector;
 use url::Url;
 
 use crate::transfer::{
@@ -52,8 +56,8 @@ pub struct PostgresTransferStore {
 impl PostgresTransferStore {
     pub fn open(url: &str) -> FsResult<Self> {
         let (config, root_cert_path) = postgres_config(url)?;
-        let tls = postgres_tls_connector(root_cert_path)?;
-        let manager = PostgresConnectionManager::new(config, MakeTlsConnector::new(tls));
+        let tls = postgres_rustls_connector(root_cert_path)?;
+        let manager = PostgresConnectionManager::new(config, tls);
         let pool = Pool::builder().build(manager).map_err(postgres_pool_err)?;
         let mut conn = pool.get().map_err(postgres_pool_err)?;
         if !postgres_schema_ready(&mut conn)? {
@@ -137,8 +141,15 @@ fn postgres_config(url: &str) -> FsResult<(postgres::Config, Option<PathBuf>)> {
     Ok((config, Some(PathBuf::from(root_cert_path))))
 }
 
-fn postgres_tls_connector(root_cert_path: Option<PathBuf>) -> FsResult<TlsConnector> {
-    let mut builder = TlsConnector::builder();
+/// Builds a PostgreSQL TLS connector backed by rustls (no system OpenSSL).
+pub fn postgres_rustls_connector(root_cert_path: Option<PathBuf>) -> FsResult<MakeTlsConnector> {
+    let mut root_store = RootCertStore::empty();
+    let native_roots = rustls_native_certs::load_native_certs();
+    for cert in native_roots.certs {
+        if root_store.add(cert).is_err() {
+            log::warn!("transfer PostgreSQL TLS: skipped an invalid system root certificate");
+        }
+    }
     if let Some(path) = root_cert_path {
         let pem = fs::read(&path).map_err(|_| {
             FsError::common(format!(
@@ -146,17 +157,35 @@ fn postgres_tls_connector(root_cert_path: Option<PathBuf>) -> FsResult<TlsConnec
                 path.display()
             ))
         })?;
-        let certificate = Certificate::from_pem(&pem).map_err(|_| {
-            FsError::common(format!(
-                "PostgreSQL root certificate at '{}' is not valid PEM",
+        let mut reader = pem.as_slice();
+        let parsed: Vec<CertificateDer<'static>> = certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                FsError::common(format!(
+                    "PostgreSQL root certificate at '{}' is not valid PEM",
+                    path.display()
+                ))
+            })?;
+        if parsed.is_empty() {
+            return Err(FsError::common(format!(
+                "PostgreSQL root certificate at '{}' contains no certificates",
                 path.display()
-            ))
-        })?;
-        builder.add_root_certificate(certificate);
+            )));
+        }
+        for certificate in parsed {
+            root_store.add(certificate).map_err(|_| {
+                FsError::common(format!(
+                    "PostgreSQL root certificate at '{}' is not a valid trust anchor",
+                    path.display()
+                ))
+            })?;
+        }
     }
-    builder
-        .build()
-        .map_err(|_| FsError::common("Unable to initialize PostgreSQL TLS support"))
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = TokioTlsConnector::from(Arc::new(config));
+    Ok(MakeTlsConnector::new(connector))
 }
 
 fn postgres_schema_ready(conn: &mut PgConnection) -> FsResult<bool> {
@@ -1147,12 +1176,19 @@ fn json_err(_: serde_json::Error) -> FsError {
     FsError::common("Transfer metadata store contains invalid data")
 }
 
+fn postgres_rustls_error(err: &postgres::Error) -> Option<String> {
+    fn walk(source: &(dyn std::error::Error + 'static)) -> Option<String> {
+        if let Some(rustls_error) = source.downcast_ref::<rustls::Error>() {
+            return Some(rustls_error.to_string());
+        }
+        source.source().and_then(walk)
+    }
+    err.source().and_then(walk)
+}
+
 fn postgres_err(err: postgres::Error) -> FsError {
     log::warn!("transfer PostgreSQL store operation failed: {}", err);
-    if let Some(tls_error) = err
-        .source()
-        .and_then(|source| source.downcast_ref::<native_tls::Error>())
-    {
+    if let Some(tls_error) = postgres_rustls_error(&err) {
         return FsError::transfer_store_unavailable(format!(
             "PostgreSQL TLS handshake failed: {tls_error}; verify the server certificate, hostname, and transfer.store_url sslrootcert"
         ));

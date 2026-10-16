@@ -35,6 +35,7 @@ import {
   matchesCvPath,
   providerLabel,
   schemeOf,
+  ttlTypeLabel,
   writeTypeLabel,
   type MountTreeNode
 } from './mounts/utils'
@@ -314,7 +315,7 @@ export function MountsPage() {
           />
         </TableCell>
         <TableCell className="tabular-nums text-muted-foreground">
-          {formatMountTtl(mount.ttl_ms)}
+          {formatMountTtl(mount.ttl_ms)} · {t(`mounts.form.${ttlTypeLabel(mount.ttl_type)}`)}
         </TableCell>
         <TableCell className="text-muted-foreground">
           {providerLabel(mount.provider) || schemeOf(mount.ufs_path) || 'auto'}
@@ -517,9 +518,9 @@ export function MountsPage() {
             <TableHeader className="bg-card">
               <TableRow>
                 <TableHead className="w-[18%]">{t('mounts.table.curvinePath')}</TableHead>
-                <TableHead className="w-[26%]">{t('mounts.table.ufsUri')}</TableHead>
+                <TableHead className="w-[24%]">{t('mounts.table.ufsUri')}</TableHead>
                 <TableHead className="w-[9%]">{t('mounts.table.mode')}</TableHead>
-                <TableHead className="w-[7%]">{t('mounts.table.ttl')}</TableHead>
+                <TableHead className="w-[9%]">{t('mounts.table.ttl')}</TableHead>
                 <TableHead className="w-[10%]">{t('mounts.table.provider')}</TableHead>
                 <TableHead className="w-[17%]">{t('mounts.table.resync')}</TableHead>
                 <TableHead className="w-[13%] text-right">{t('common.actions')}</TableHead>

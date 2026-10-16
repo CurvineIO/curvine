@@ -13,9 +13,12 @@ transfer-store-sqlite = ["transfer", "dep:rusqlite"]
 transfer-store-mysql = ["transfer", "dep:mysql"]
 transfer-store-postgres = [
     "transfer",
-    "dep:native-tls",
     "dep:postgres",
-    "dep:postgres-native-tls",
+    "dep:postgres_rustls",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:rustls-pemfile",
+    "dep:tokio-rustls",
     "dep:percent-encoding",
     "dep:r2d2",
     "dep:r2d2_postgres",
@@ -71,9 +74,12 @@ once_cell = { workspace = true }
 axum = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 mysql = { workspace = true, optional = true }
-native-tls = { workspace = true, optional = true }
 postgres = { workspace = true, optional = true }
-postgres-native-tls = { workspace = true, optional = true }
+postgres_rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 percent-encoding = { workspace = true, optional = true }
 r2d2 = { workspace = true, optional = true }
 r2d2_postgres = { workspace = true, optional = true }

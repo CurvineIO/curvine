@@ -45,6 +45,13 @@ fn ttl_action_to_str(ttl_action: TtlActionProto) -> &'static str {
     }
 }
 
+fn ttl_type_to_str(ttl_type: Option<i32>) -> &'static str {
+    match ttl_type {
+        Some(1) => "atime",
+        _ => "mtime",
+    }
+}
+
 fn provider_to_str(provider: Option<i32>) -> &'static str {
     match provider {
         Some(0) => "auto",
@@ -90,6 +97,7 @@ impl Display for GetMountTableResponse {
         let mut access_mode_width = 11;
         let mut write_cache_width = 11;
         let mut storage_width = 7;
+        let mut ttl_type_width = 8;
         let mut ttl_action_width = 10;
         let mut provider_width = 8;
 
@@ -118,6 +126,7 @@ impl Display for GetMountTableResponse {
                 .len(),
             );
             storage_width = storage_width.max(storage_type_to_str(mnt.storage_type).len());
+            ttl_type_width = ttl_type_width.max(ttl_type_to_str(mnt.ttl_type).len());
             ttl_action_width = ttl_action_width.max(ttl_action_to_str(mnt.ttl_action()).len());
             provider_width = provider_width.max(provider_to_str(mnt.provider).len());
         }
@@ -131,6 +140,7 @@ impl Display for GetMountTableResponse {
         access_mode_width += 2;
         write_cache_width += 2;
         storage_width += 2;
+        ttl_type_width += 2;
         ttl_action_width += 2;
         provider_width += 2;
 
@@ -146,6 +156,7 @@ impl Display for GetMountTableResponse {
         write!(f, "{:-^width$}+", "", width = access_mode_width)?;
         write!(f, "{:-^width$}+", "", width = write_cache_width)?;
         write!(f, "{:-^width$}+", "", width = storage_width)?;
+        write!(f, "{:-^width$}+", "", width = ttl_type_width)?;
         write!(f, "{:-^width$}+", "", width = ttl_action_width)?;
         writeln!(f, "{:-^width$}+", "", width = provider_width)?;
 
@@ -184,6 +195,7 @@ impl Display for GetMountTableResponse {
             width = write_cache_width - 1
         )?;
         write!(f, " {:<width$}|", "Storage", width = storage_width - 1)?;
+        write!(f, " {:<width$}|", "TTL Type", width = ttl_type_width - 1)?;
         write!(
             f,
             " {:<width$}|",
@@ -202,6 +214,7 @@ impl Display for GetMountTableResponse {
         write!(f, "{:-^width$}+", "", width = access_mode_width)?;
         write!(f, "{:-^width$}+", "", width = write_cache_width)?;
         write!(f, "{:-^width$}+", "", width = storage_width)?;
+        write!(f, "{:-^width$}+", "", width = ttl_type_width)?;
         write!(f, "{:-^width$}+", "", width = ttl_action_width)?;
         writeln!(f, "{:-^width$}+", "", width = provider_width)?;
 
@@ -257,6 +270,12 @@ impl Display for GetMountTableResponse {
             write!(
                 f,
                 " {:<width$}|",
+                ttl_type_to_str(mnt.ttl_type),
+                width = ttl_type_width - 1
+            )?;
+            write!(
+                f,
+                " {:<width$}|",
                 ttl_action_to_str(mnt.ttl_action()),
                 width = ttl_action_width - 1
             )?;
@@ -278,11 +297,57 @@ impl Display for GetMountTableResponse {
         write!(f, "{:-^width$}+", "", width = access_mode_width)?;
         write!(f, "{:-^width$}+", "", width = write_cache_width)?;
         write!(f, "{:-^width$}+", "", width = storage_width)?;
+        write!(f, "{:-^width$}+", "", width = ttl_type_width)?;
         write!(f, "{:-^width$}+", "", width = ttl_action_width)?;
         writeln!(f, "{:-^width$}+", "", width = provider_width)?;
 
         writeln!(f, "Total mount points: {}", self.mount_table.len())?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mount_info(ttl_type: Option<i32>) -> crate::MountInfoProto {
+        crate::MountInfoProto {
+            cv_path: "/lake/raw".to_string(),
+            ufs_path: "file:///lake/raw".to_string(),
+            mount_id: 1,
+            properties: Default::default(),
+            ttl_ms: 604800000,
+            ttl_action: TtlActionProto::Free as i32,
+            read_verify_ufs: false,
+            storage_type: None,
+            block_size: None,
+            replicas: None,
+            write_type: WriteTypeProto::FsMode as i32,
+            provider: None,
+            auto_cache: None,
+            access_mode: None,
+            write_cache: None,
+            ttl_type,
+        }
+    }
+
+    #[test]
+    fn ttl_type_to_str_maps_proto_values() {
+        assert_eq!(ttl_type_to_str(Some(0)), "mtime");
+        assert_eq!(ttl_type_to_str(Some(1)), "atime");
+        assert_eq!(ttl_type_to_str(None), "mtime");
+    }
+
+    #[test]
+    fn mount_table_shows_ttl_type_column() {
+        let response = GetMountTableResponse {
+            mount_table: vec![mount_info(Some(0)), mount_info(Some(1))],
+        };
+        let output = response.to_string();
+        assert!(output.contains("TTL Type"));
+        assert!(output.contains("mtime"));
+        assert!(output.contains("atime"));
+        assert!(output.find("TTL Type").unwrap() < output.find("TTL Action").unwrap());
     }
 }

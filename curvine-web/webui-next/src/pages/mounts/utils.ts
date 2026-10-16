@@ -36,6 +36,11 @@ export function accessModeLabel(value: unknown): string {
   return String(value || 'read_only').toLowerCase()
 }
 
+export function ttlTypeLabel(value: unknown): 'mtime' | 'atime' {
+  if (value === 1 || value === 'Atime' || value === 'atime') return 'atime'
+  return 'mtime'
+}
+
 export function providerLabel(value: unknown): string {
   if (!value) return 'auto'
   if (value === 'OssHdfs') return 'oss-hdfs'

@@ -12,8 +12,19 @@ import { RefreshProvider } from '@/refresh/refresh-context'
 import { MountsPage } from './mounts-page'
 
 const mounts = [
-  { cv_path: '/lake/raw', ufs_path: 'file:///lake/raw', write_type: 1 },
-  { cv_path: '/lake/curated', ufs_path: 'file:///lake/curated', write_type: 1 }
+  {
+    cv_path: '/lake/raw',
+    ufs_path: 'file:///lake/raw',
+    write_type: 1,
+    ttl_ms: 604800000,
+    ttl_type: 1
+  },
+  {
+    cv_path: '/lake/curated',
+    ufs_path: 'file:///lake/curated',
+    write_type: 1,
+    ttl_ms: 604800000
+  }
 ] as MountInfo[]
 
 function makeClient(list: MountInfo[] = mounts) {
@@ -76,5 +87,13 @@ describe('MountsPage views', () => {
 
     expect(screen.queryByTestId('mount-row-/lake/curated')).not.toBeInTheDocument()
     expect(screen.getByTestId('mount-row-/lake/raw')).toBeInTheDocument()
+  })
+
+  it('shows the ttl type next to the ttl, defaulting to mtime', async () => {
+    renderPage('en', makeClient().client)
+
+    await waitFor(() => expect(screen.getByTestId('mount-row-/lake/raw')).toBeInTheDocument())
+    expect(screen.getByText('7d · atime')).toBeInTheDocument()
+    expect(screen.getByText('7d · mtime')).toBeInTheDocument()
   })
 })
