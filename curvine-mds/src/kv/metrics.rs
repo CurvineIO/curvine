@@ -36,7 +36,6 @@ const LATENCY_BUCKETS_US: &[f64] = &[
 
 /// KV size buckets in bytes. Centred on the ~128B target single-KV budget so the
 /// P50/P95/P99 around it are visible, with headroom for oversized records.
-#[cfg(feature = "fdb")]
 const KV_SIZE_BUCKETS_BYTES: &[f64] = &[
     16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1_024.0, 2_048.0, 4_096.0, 16_384.0, 65_536.0,
 ];
@@ -58,10 +57,8 @@ pub struct KvMetrics {
     /// Currently in-flight transactions.
     pub txn_in_flight: Gauge,
     /// Distribution of key sizes written to the backend, in bytes, by backend.
-    #[cfg(feature = "fdb")]
     pub kv_key_size_bytes: HistogramVec,
     /// Distribution of value sizes written to the backend, in bytes, by backend.
-    #[cfg(feature = "fdb")]
     pub kv_value_size_bytes: HistogramVec,
 }
 
@@ -103,14 +100,12 @@ impl KvMetrics {
                 "mds_kv_txn_in_flight",
                 "Currently in-flight KV transactions",
             )?,
-            #[cfg(feature = "fdb")]
             kv_key_size_bytes: Metrics::new_histogram_vec_with_buckets(
                 "mds_kv_key_size_bytes",
                 "Distribution of KV key sizes in bytes",
                 &["backend"],
                 KV_SIZE_BUCKETS_BYTES,
             )?,
-            #[cfg(feature = "fdb")]
             kv_value_size_bytes: Metrics::new_histogram_vec_with_buckets(
                 "mds_kv_value_size_bytes",
                 "Distribution of KV value sizes in bytes",
@@ -132,7 +127,7 @@ impl KvMetrics {
                 self.ops_err_total
                     .with_label_values(&[backend, op, error.kind()])
                     .inc();
-                if matches!(error, KvError::Conflict) {
+                if op == op::COMMIT && matches!(error, KvError::Conflict) {
                     self.txn_conflicts_total.with_label_values(&[backend]).inc();
                 }
             }
@@ -146,7 +141,6 @@ impl KvMetrics {
 
     /// Records the byte size of a key/value pair buffered for write, so the
     /// KV-size distribution (P50/P95/P99 vs the ~128B budget) is observable.
-    #[cfg(feature = "fdb")]
     pub fn observe_kv_size(&self, backend: &str, key_len: usize, value_len: usize) {
         self.kv_key_size_bytes
             .with_label_values(&[backend])
@@ -187,6 +181,15 @@ mod tests {
             .ops_err_total
             .with_label_values(&[backend, op::COMMIT, "conflict"])
             .get();
+        assert_eq!(after, before + 1);
+
+        let before = m.txn_conflicts_total.with_label_values(&[backend]).get();
+        m.observe(backend, op::GET, Instant::now(), &Err(KvError::Conflict));
+        let after = m.txn_conflicts_total.with_label_values(&[backend]).get();
+        assert_eq!(after, before, "only commit conflicts are counted");
+
+        m.observe(backend, op::COMMIT, Instant::now(), &Err(KvError::Conflict));
+        let after = m.txn_conflicts_total.with_label_values(&[backend]).get();
         assert_eq!(after, before + 1);
     }
 }

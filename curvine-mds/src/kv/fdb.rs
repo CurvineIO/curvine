@@ -32,13 +32,11 @@
 
 use crate::kv::backend::{KvBackend, KvTransaction};
 use crate::kv::error::{KvError, KvResult};
-use crate::kv::metrics;
 use async_trait::async_trait;
 use foundationdb::options::{ConflictRangeType, TransactionOption};
 use foundationdb::{api::NetworkAutoStop, Database, FdbError, Transaction};
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
-use std::time::Instant;
 
 const BACKEND_NAME: &str = "fdb";
 
@@ -229,27 +227,14 @@ impl KvBackend for FdbBackend {
         BACKEND_NAME
     }
 
-    async fn begin(&self) -> KvResult<Box<dyn KvTransaction>> {
-        let start = Instant::now();
-        let result: KvResult<Transaction> = (|| {
+    async fn begin_raw(&self) -> KvResult<Box<dyn KvTransaction>> {
+        let trx: Transaction = (|| {
             let trx = self.db.create_trx().map_err(map_fdb_read_error)?;
             // Bound how long any operation on this txn waits on a stuck cluster.
             trx.set_option(TransactionOption::Timeout(self.txn_timeout_ms))
                 .map_err(map_fdb_read_error)?;
             Ok(trx)
-        })();
-        let trx = match result {
-            Ok(trx) => trx,
-            Err(error) => {
-                metrics::metrics().observe(
-                    BACKEND_NAME,
-                    metrics::op::BEGIN,
-                    start,
-                    &Err(error.clone()),
-                );
-                return Err(error);
-            }
-        };
+        })()?;
         // Eagerly resolve the read version so the snapshot is pinned at begin,
         // not lazily at the first read. Without this, FDB picks the read
         // version on the first get, and a write committed between begin and
@@ -257,21 +242,9 @@ impl KvBackend for FdbBackend {
         // "reads observe a snapshot taken when the transaction began" contract
         // (and the memory backend's begin-snapshot behavior).
         if let Err(err) = trx.get_read_version().await {
-            let error = map_fdb_read_error(err);
-            metrics::metrics().observe(
-                BACKEND_NAME,
-                metrics::op::BEGIN,
-                start,
-                &Err(error.clone()),
-            );
-            return Err(error);
+            return Err(map_fdb_read_error(err));
         }
-        metrics::metrics().observe(BACKEND_NAME, metrics::op::BEGIN, start, &Ok(()));
-        metrics::metrics().txn_in_flight.inc();
-        Ok(Box::new(FdbTxn {
-            trx: Some(trx),
-            finished: false,
-        }))
+        Ok(Box::new(FdbTxn { trx: Some(trx) }))
     }
 }
 
@@ -289,7 +262,6 @@ struct FdbTxn {
     /// `Some` until commit/rollback/drop; taken out to move into `commit`,
     /// which consumes the `Transaction`.
     trx: Option<Transaction>,
-    finished: bool,
 }
 
 impl FdbTxn {
@@ -303,34 +275,25 @@ impl FdbTxn {
 #[async_trait]
 impl KvTransaction for FdbTxn {
     async fn get(&mut self, key: &[u8]) -> KvResult<Option<Vec<u8>>> {
-        let start = Instant::now();
         // snapshot = false ⇒ the read is added to the read-conflict set.
-        let result = self
-            .trx()?
+        self.trx()?
             .get(key, false)
             .await
             .map_err(map_fdb_read_error)
-            .map(|opt| opt.map(|slice| slice.to_vec()));
-        observe_read(metrics::op::GET, start, &result);
-        result
+            .map(|opt| opt.map(|slice| slice.to_vec()))
     }
 
     async fn snapshot_get(&mut self, key: &[u8]) -> KvResult<Option<Vec<u8>>> {
-        let start = Instant::now();
         // snapshot = true ⇒ same snapshot as `get`, but NOT added to the
         // read-conflict set, so a concurrent change won't conflict at commit.
-        let result = self
-            .trx()?
+        self.trx()?
             .get(key, true)
             .await
             .map_err(map_fdb_read_error)
-            .map(|opt| opt.map(|slice| slice.to_vec()));
-        observe_read(metrics::op::SNAPSHOT_GET, start, &result);
-        result
+            .map(|opt| opt.map(|slice| slice.to_vec()))
     }
 
     async fn multi_get(&mut self, keys: &[Vec<u8>]) -> KvResult<Vec<Option<Vec<u8>>>> {
-        let start = Instant::now();
         let trx = self.trx()?;
         let mut out = Vec::with_capacity(keys.len());
         let mut error: Option<KvError> = None;
@@ -346,17 +309,14 @@ impl KvTransaction for FdbTxn {
                 }
             }
         }
-        let result = match error {
+        match error {
             Some(err) => Err(err),
             None => Ok(out),
-        };
-        observe_read(metrics::op::MULTI_GET, start, &result);
-        result
+        }
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) {
         if let Some(trx) = self.trx.as_ref() {
-            metrics::metrics().observe_kv_size(BACKEND_NAME, key.len(), value.len());
             trx.set(key, value);
         }
     }
@@ -377,69 +337,26 @@ impl KvTransaction for FdbTxn {
     }
 
     async fn commit(&mut self) -> KvResult<()> {
-        let start = Instant::now();
-        self.finished = true;
-        // Take the transaction BEFORE touching the in-flight gauge: a repeat
-        // commit (trx already None) is a no-op error and must not decrement the
-        // gauge, or it would drive txn_in_flight negative.
+        // Take the transaction before committing so a repeated raw commit is a
+        // no-op error; the shared wrapper owns the in-flight gauge.
         let trx = match self.trx.take() {
             Some(trx) => trx,
             None => {
-                let error = KvError::Backend("commit on finished transaction".into());
-                metrics::metrics().observe(
-                    BACKEND_NAME,
-                    metrics::op::COMMIT,
-                    start,
-                    &Err(error.clone()),
-                );
-                return Err(error);
+                return Err(KvError::Backend("commit on finished transaction".into()));
             }
         };
-        metrics::metrics().txn_in_flight.dec();
-        let result = match trx.commit().await {
+        match trx.commit().await {
             Ok(_) => Ok(()),
             // `commit` consumes the txn; on error the `TransactionCommitError`
             // derefs to the underlying `FdbError`, which carries the code.
             Err(commit_err) => Err(map_fdb_commit_error(commit_err.into())),
-        };
-        metrics::metrics().observe(
-            BACKEND_NAME,
-            metrics::op::COMMIT,
-            start,
-            &result.as_ref().map(|_| ()).map_err(|e| e.clone()),
-        );
-        result
+        }
     }
 
     fn rollback(&mut self) {
-        if !self.finished {
-            self.finished = true;
-            metrics::metrics().txn_in_flight.dec();
-        }
         // Dropping the Transaction cancels/destroys it.
         self.trx = None;
     }
-}
-
-impl Drop for FdbTxn {
-    fn drop(&mut self) {
-        // A transaction dropped without commit/rollback still releases its
-        // in-flight slot so the gauge stays accurate.
-        if !self.finished {
-            metrics::metrics().txn_in_flight.dec();
-        }
-    }
-}
-
-/// Records the outcome/latency of a read op; reads don't touch the KV-size
-/// histogram (that tracks writes).
-fn observe_read<T>(op: &'static str, start: Instant, result: &KvResult<T>) {
-    metrics::metrics().observe(
-        BACKEND_NAME,
-        op,
-        start,
-        &result.as_ref().map(|_| ()).map_err(|e| e.clone()),
-    );
 }
 
 #[cfg(test)]
