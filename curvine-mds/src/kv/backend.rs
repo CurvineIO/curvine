@@ -97,9 +97,15 @@ pub trait KvBackend: Send + Sync {
     /// Backend implementations must only create their transaction here; the
     /// default [`KvBackend::begin`] owns operation metrics and in-flight
     /// accounting for every backend.
+    /// Decorating backends must delegate to the inner backend's `begin_raw`,
+    /// never its `begin`, to avoid wrapping and counting the transaction twice.
     async fn begin_raw(&self) -> KvResult<Box<dyn KvTransaction>>;
 
     /// Starts a new instrumented transaction.
+    ///
+    /// Implementors must not override this method: doing so bypasses the shared
+    /// operation metrics and in-flight accounting. Customize [`Self::begin_raw`]
+    /// instead.
     async fn begin(&self) -> KvResult<Box<dyn KvTransaction>> {
         let start = Instant::now();
         match self.begin_raw().await {
@@ -428,14 +434,14 @@ mod tests {
 
     /// Deliberately has no metrics code: the shared `KvBackend::begin` wrapper
     /// must provide the full operation instrumentation for a new backend.
-    struct MetricsFreeBackend;
+    struct MetricsFreeBackend(&'static str);
 
     struct MetricsFreeTransaction;
 
     #[async_trait]
     impl KvBackend for MetricsFreeBackend {
         fn name(&self) -> &'static str {
-            "metrics-free-test"
+            self.0
         }
 
         async fn begin_raw(&self) -> KvResult<Box<dyn KvTransaction>> {
@@ -472,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_are_instrumented_without_backend_metrics_code() {
-        let backend = MetricsFreeBackend;
+        let backend = MetricsFreeBackend("metrics-free-test");
         let metrics = metrics::metrics();
         let name = backend.name();
 
@@ -496,6 +502,12 @@ mod tests {
             .ops_total
             .with_label_values(&[name, metrics::op::COMMIT])
             .get();
+        let key_sizes = metrics.kv_key_size_bytes.with_label_values(&[name]);
+        let value_sizes = metrics.kv_value_size_bytes.with_label_values(&[name]);
+        let key_count_before = key_sizes.get_sample_count();
+        let key_sum_before = key_sizes.get_sample_sum();
+        let value_count_before = value_sizes.get_sample_count();
+        let value_sum_before = value_sizes.get_sample_sum();
 
         let mut txn = backend.begin().await.unwrap();
         txn.get(b"key").await.unwrap();
@@ -503,6 +515,11 @@ mod tests {
         txn.multi_get(&[b"key".to_vec()]).await.unwrap();
         txn.put(b"key", b"value");
         txn.commit().await.unwrap();
+
+        assert_eq!(key_sizes.get_sample_count(), key_count_before + 1);
+        assert_eq!(key_sizes.get_sample_sum(), key_sum_before + 3.0);
+        assert_eq!(value_sizes.get_sample_count(), value_count_before + 1);
+        assert_eq!(value_sizes.get_sample_sum(), value_sum_before + 5.0);
 
         assert_eq!(
             metrics
@@ -539,5 +556,92 @@ mod tests {
                 .get(),
             commit_before + 1
         );
+    }
+
+    struct FailingBeginBackend;
+
+    #[async_trait]
+    impl KvBackend for FailingBeginBackend {
+        fn name(&self) -> &'static str {
+            "metrics-failed-begin-test"
+        }
+
+        async fn begin_raw(&self) -> KvResult<Box<dyn KvTransaction>> {
+            Err(KvError::Backend("begin failed".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_begin_records_error_without_returning_a_transaction() {
+        let backend = FailingBeginBackend;
+        let metrics = metrics::metrics();
+        let name = backend.name();
+        let total = metrics
+            .ops_total
+            .with_label_values(&[name, metrics::op::BEGIN]);
+        let errors =
+            metrics
+                .ops_err_total
+                .with_label_values(&[name, metrics::op::BEGIN, "backend"]);
+        let successes = metrics
+            .ops_ok_total
+            .with_label_values(&[name, metrics::op::BEGIN]);
+        let latency = metrics
+            .op_latency_us
+            .with_label_values(&[name, metrics::op::BEGIN]);
+        let total_before = total.get();
+        let errors_before = errors.get();
+        let successes_before = successes.get();
+        let latency_before = latency.get_sample_count();
+
+        assert!(matches!(
+            backend.begin().await,
+            Err(KvError::Backend(message)) if message == "begin failed"
+        ));
+
+        assert_eq!(total.get(), total_before + 1);
+        assert_eq!(errors.get(), errors_before + 1);
+        assert_eq!(successes.get(), successes_before);
+        assert_eq!(latency.get_sample_count(), latency_before + 1);
+    }
+
+    #[tokio::test]
+    async fn commit_on_finished_transaction_records_error() {
+        for (name, rollback) in [
+            ("metrics-commit-after-commit-test", false),
+            ("metrics-commit-after-rollback-test", true),
+        ] {
+            let backend = MetricsFreeBackend(name);
+            let mut txn = backend.begin().await.unwrap();
+            if rollback {
+                txn.rollback();
+            } else {
+                txn.commit().await.unwrap();
+            }
+
+            let metrics = metrics::metrics();
+            let total = metrics
+                .ops_total
+                .with_label_values(&[name, metrics::op::COMMIT]);
+            let errors =
+                metrics
+                    .ops_err_total
+                    .with_label_values(&[name, metrics::op::COMMIT, "backend"]);
+            let successes = metrics
+                .ops_ok_total
+                .with_label_values(&[name, metrics::op::COMMIT]);
+            let total_before = total.get();
+            let errors_before = errors.get();
+            let successes_before = successes.get();
+
+            assert!(matches!(
+                txn.commit().await,
+                Err(KvError::Backend(message)) if message == "commit on finished transaction"
+            ));
+
+            assert_eq!(total.get(), total_before + 1);
+            assert_eq!(errors.get(), errors_before + 1);
+            assert_eq!(successes.get(), successes_before);
+        }
     }
 }

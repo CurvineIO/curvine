@@ -244,10 +244,7 @@ impl KvBackend for FdbBackend {
         if let Err(err) = trx.get_read_version().await {
             return Err(map_fdb_read_error(err));
         }
-        Ok(Box::new(FdbTxn {
-            trx: Some(trx),
-            finished: false,
-        }))
+        Ok(Box::new(FdbTxn { trx: Some(trx) }))
     }
 }
 
@@ -265,7 +262,6 @@ struct FdbTxn {
     /// `Some` until commit/rollback/drop; taken out to move into `commit`,
     /// which consumes the `Transaction`.
     trx: Option<Transaction>,
-    finished: bool,
 }
 
 impl FdbTxn {
@@ -341,7 +337,6 @@ impl KvTransaction for FdbTxn {
     }
 
     async fn commit(&mut self) -> KvResult<()> {
-        self.finished = true;
         // Take the transaction before committing so a repeated raw commit is a
         // no-op error; the shared wrapper owns the in-flight gauge.
         let trx = match self.trx.take() {
@@ -359,9 +354,6 @@ impl KvTransaction for FdbTxn {
     }
 
     fn rollback(&mut self) {
-        if !self.finished {
-            self.finished = true;
-        }
         // Dropping the Transaction cancels/destroys it.
         self.trx = None;
     }
