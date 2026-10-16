@@ -61,7 +61,7 @@ dir_space_track_max_edges = 2000000
 dir_space_track_max_depth = 1024
 dir_space_track_memory_budget = "256MB"
 dir_space_max_tracked_points = 128
-dir_space_auto_track_mounts = true
+dir_space_auto_track_mounts = false
 dir_space_tracked_paths = []
 dir_space_restore_wait_timeout = "30s"
 

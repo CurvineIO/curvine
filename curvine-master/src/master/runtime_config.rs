@@ -12,14 +12,90 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_config::{ClusterConf, RuntimeConfigEntryView, RuntimeConfigRegistry};
-use curvine_core_error::CommonResult;
+use std::sync::Arc;
+
+use curvine_config::{RuntimeConfigEntryView, RuntimeConfigRegistry};
+use curvine_core_error::{err_box, CommonResult};
 use curvine_proto::RuntimeConfigEntryProto;
 use serde_json::Value;
 
-/// Master-side runtime registry (#266 / #268). Keys are added as features land (#271+).
-pub fn build_master_runtime_registry(_conf: &ClusterConf) -> RuntimeConfigRegistry {
-    RuntimeConfigRegistry::builder().build()
+use crate::master::space::DirSpaceManager;
+
+pub const DIR_SPACE_ENABLED_KEY: &str = "master.dir_space_enabled";
+pub const DIR_SPACE_TRACKED_PATHS_KEY: &str = "master.dir_space_tracked_paths";
+
+/// Master-side runtime registry.
+///
+/// Dir-space exposes the on/off switch and the explicit statistics-path list.
+/// Overrides are volatile: restart restores the file-backed values.
+pub fn build_master_runtime_registry(manager: Arc<DirSpaceManager>) -> RuntimeConfigRegistry {
+    RuntimeConfigRegistry::builder()
+        .register(
+            DIR_SPACE_ENABLED_KEY,
+            {
+                let manager = manager.clone();
+                move || Value::from(manager.file_enabled())
+            },
+            {
+                let manager = manager.clone();
+                move || Value::from(manager.tracking_enabled())
+            },
+            {
+                let manager = manager.clone();
+                move |raw| {
+                    let enabled = parse_enabled(raw)?;
+                    let previous = manager.update_enabled(enabled);
+                    Ok((Value::from(previous), Value::from(enabled)))
+                }
+            },
+            {
+                let manager = manager.clone();
+                move || Ok(Value::from(manager.reset_enabled()))
+            },
+        )
+        .register(
+            DIR_SPACE_TRACKED_PATHS_KEY,
+            {
+                let manager = manager.clone();
+                move || Value::from(manager.file_tracked_paths())
+            },
+            {
+                let manager = manager.clone();
+                move || Value::from(manager.explicit_paths())
+            },
+            {
+                let manager = manager.clone();
+                move |raw| {
+                    let paths = parse_tracked_paths(raw)?;
+                    let (previous, applied) = manager.update_tracked_paths(&paths)?;
+                    Ok((Value::from(previous), Value::from(applied)))
+                }
+            },
+            {
+                let manager = manager.clone();
+                move || Ok(Value::from(manager.reset_tracked_paths()))
+            },
+        )
+        .build()
+}
+
+fn parse_enabled(raw: &str) -> CommonResult<bool> {
+    match raw.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => err_box!("{} expects true or false", DIR_SPACE_ENABLED_KEY),
+    }
+}
+
+fn parse_tracked_paths(raw: &str) -> CommonResult<Vec<String>> {
+    match serde_json::from_str(raw) {
+        Ok(paths) => Ok(paths),
+        Err(err) => err_box!(
+            "{} expects a JSON string array: {}",
+            DIR_SPACE_TRACKED_PATHS_KEY,
+            err
+        ),
+    }
 }
 
 pub fn runtime_entry_to_proto(view: RuntimeConfigEntryView) -> RuntimeConfigEntryProto {

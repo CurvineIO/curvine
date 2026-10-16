@@ -237,6 +237,9 @@ fn new_handler_for_test_with_dir_space(
         Utils::test_sub_dir(format!("master-fs-test/journal-{test_name}-{test_id}"));
     conf.master.dir_space_enabled = dir_space_enabled;
     if dir_space_enabled {
+        if conf.master.dir_space_tracked_paths.is_empty() {
+            conf.master.dir_space_tracked_paths = vec!["/".to_string()];
+        }
         conf.master.init().unwrap();
     }
 

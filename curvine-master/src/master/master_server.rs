@@ -185,18 +185,13 @@ impl Master {
         let rt = Arc::new(conf.master_server_conf().create_runtime());
         let replication_manager = MasterReplicationManager::new(&fs, &conf, &rt, &worker_manager)?;
 
-        // The dir-space manager owns the snapshot store and query facade; the
-        // master actor drives its scans, the RPC handler (Task 8) serves its
-        // queries. Built once here so both sides observe the same generations.
-        let dir_space_manager = if conf.master.dir_space_enabled {
-            Some(Arc::new(DirSpaceManager::new(
-                fs.clone(),
-                mount_manager.clone(),
-                Arc::new(conf.master.clone()),
-            )))
-        } else {
-            None
-        };
+        // The scanner always starts. `dir_space_enabled` and the explicit path
+        // list decide whether a tick walks RocksDB, and both can change at runtime.
+        let dir_space_manager = Arc::new(DirSpaceManager::new(
+            fs.clone(),
+            mount_manager.clone(),
+            Arc::new(conf.master.clone()),
+        ));
 
         let actor = MasterActor::new(
             fs.clone(),
@@ -204,13 +199,13 @@ impl Master {
             conf.master.new_executor(),
             &replication_manager,
             quota_manager,
-            dir_space_manager.clone(),
+            Some(dir_space_manager.clone()),
         );
 
         // step 3: Create rpc server.
         let retry_cache = FsRetryCache::with_conf(&conf.master)?;
         let metrics_fs = fs.clone();
-        let runtime_config = Arc::new(build_master_runtime_registry(&conf));
+        let runtime_config = Arc::new(build_master_runtime_registry(dir_space_manager.clone()));
         let start_time_ms = LocalTime::mills();
         let start_time = LocalTime::now_datetime();
         let service = MasterService::new(
@@ -224,7 +219,7 @@ impl Master {
             metrics,
             fault_http,
             runtime_config.clone(),
-            dir_space_manager,
+            Some(dir_space_manager),
         );
 
         let rpc_conf = conf.master_server_conf();

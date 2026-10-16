@@ -34,8 +34,8 @@
 //!   generation, never by wall clock.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use curvine_config::MasterConf;
@@ -47,7 +47,7 @@ use log::{info, warn};
 use crate::master::fs::MasterFilesystem;
 use crate::master::space::scanner::{GlobalScanner, PointScanner, ScanContext, ScanLimits};
 use crate::master::space::store::DirSpaceSnapshotStore;
-use crate::master::space::types::{DirAgg, DirSpaceSnapshot, SnapshotMeta, SnapshotSource};
+use crate::master::space::types::{DirSpaceSnapshot, SnapshotMeta, SnapshotSource};
 use crate::master::MountManager;
 use std::collections::HashSet;
 
@@ -99,10 +99,19 @@ pub enum DirSpaceQueryError {
 /// Scan driver plus query facade over the published snapshot generations.
 pub struct DirSpaceManager {
     fs: MasterFilesystem,
+    /// Kept so callers can share the mount table. Mounts are not scanned
+    /// unless their path is in the explicit tracked-path list.
+    #[allow(dead_code)]
     mount_manager: Arc<MountManager>,
     conf: Arc<MasterConf>,
     store: DirSpaceSnapshotStore,
     pub(crate) scan_permit: AtomicBool,
+    file_enabled: bool,
+    enabled_override: Mutex<Option<bool>>,
+    file_paths: Vec<String>,
+    paths_override: Mutex<Option<Vec<String>>>,
+    /// Bumped on every runtime override so the coordinator scans on its next tick.
+    config_epoch: AtomicU64,
 }
 
 impl DirSpaceManager {
@@ -116,10 +125,105 @@ impl DirSpaceManager {
         Self {
             fs,
             mount_manager,
+            file_enabled: conf.dir_space_enabled,
+            enabled_override: Mutex::new(None),
+            file_paths: conf.dir_space_tracked_paths_normalized.clone(),
+            paths_override: Mutex::new(None),
+            config_epoch: AtomicU64::new(0),
             conf,
             store: DirSpaceSnapshotStore::new(),
             scan_permit: AtomicBool::new(false),
         }
+    }
+
+    pub fn file_enabled(&self) -> bool {
+        self.file_enabled
+    }
+
+    pub fn file_tracked_paths(&self) -> Vec<String> {
+        self.file_paths.clone()
+    }
+
+    /// File value, or the runtime override when one is set.
+    pub fn tracking_enabled(&self) -> bool {
+        self.enabled_override
+            .lock()
+            .expect("dir-space enabled lock")
+            .unwrap_or(self.file_enabled)
+    }
+
+    /// Generation of the runtime path/enabled overrides. Starts at 0.
+    pub fn config_epoch(&self) -> u64 {
+        self.config_epoch.load(Ordering::SeqCst)
+    }
+
+    fn bump_config_epoch(&self) {
+        self.config_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Replace the enabled override. Returns the previous effective value.
+    pub fn update_enabled(&self, enabled: bool) -> bool {
+        let previous = self.tracking_enabled();
+        *self
+            .enabled_override
+            .lock()
+            .expect("dir-space enabled lock") = Some(enabled);
+        self.bump_config_epoch();
+        previous
+    }
+
+    /// Drop the enabled override and return the file-backed value.
+    pub fn reset_enabled(&self) -> bool {
+        *self
+            .enabled_override
+            .lock()
+            .expect("dir-space enabled lock") = None;
+        self.bump_config_epoch();
+        self.file_enabled
+    }
+
+    /// Replace the explicit path list. `/` selects the global scan.
+    /// Returns `(previous, applied)` normalized lists.
+    pub fn update_tracked_paths(
+        &self,
+        raw_paths: &[String],
+    ) -> CommonResult<(Vec<String>, Vec<String>)> {
+        let normalized = MasterConf::normalize_tracked_path_list(
+            raw_paths,
+            self.conf.dir_space_max_tracked_points,
+        )?;
+        let previous = self.explicit_paths();
+        *self
+            .paths_override
+            .lock()
+            .expect("dir-space tracked paths lock") = Some(normalized.clone());
+        self.bump_config_epoch();
+        self.sync_tracked_point_catalog();
+        Ok((previous, normalized))
+    }
+
+    /// Drop the path override and return the file-backed list.
+    pub fn reset_tracked_paths(&self) -> Vec<String> {
+        *self
+            .paths_override
+            .lock()
+            .expect("dir-space tracked paths lock") = None;
+        self.bump_config_epoch();
+        self.sync_tracked_point_catalog();
+        self.file_paths.clone()
+    }
+
+    /// Effective explicit list, including `/` when the global scan is selected.
+    pub fn explicit_paths(&self) -> Vec<String> {
+        self.paths_override
+            .lock()
+            .expect("dir-space tracked paths lock")
+            .clone()
+            .unwrap_or_else(|| self.file_paths.clone())
+    }
+
+    pub fn tracks_root(&self) -> bool {
+        self.explicit_paths().iter().any(|path| path == "/")
     }
 
     pub fn store(&self) -> &DirSpaceSnapshotStore {
@@ -190,45 +294,22 @@ impl DirSpaceManager {
         }
     }
 
-    /// Effective tracked-point paths: explicit config first, then fs-mode
-    /// mounts sorted by path, capped by `dir_space_max_tracked_points`.
-    /// Root `/` is never tracked (global covers it).
+    /// Point-scan paths from the explicit list. `/` is omitted; it selects
+    /// the global scan via [`Self::tracks_root`].
     pub fn effective_tracked_paths(&self) -> Vec<String> {
-        let max = self.conf.dir_space_max_tracked_points as usize;
-        let mut paths: Vec<String> = self
-            .conf
-            .dir_space_tracked_paths_normalized
-            .iter()
-            .filter(|p| p.as_str() != "/")
-            .cloned()
-            .collect();
-        let mut seen: HashSet<String> = paths.iter().cloned().collect();
-
-        if self.conf.dir_space_auto_track_mounts {
-            let mut mount_paths: Vec<String> = self
-                .mount_manager
-                .get_mount_table()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|m| m.is_fs_mode())
-                .filter_map(|m| normalize_tracked_path(&m.cv_path).ok())
-                .filter(|p| p.as_str() != "/" && seen.insert(p.clone()))
-                .collect();
-            mount_paths.sort();
-            for path in mount_paths {
-                if paths.len() >= max {
-                    break;
-                }
-                paths.push(path);
-            }
-        }
-
-        paths.truncate(max);
-        paths
+        self.explicit_paths()
+            .into_iter()
+            .filter(|path| path != "/")
+            .collect()
     }
 
-    /// Drop store entries for paths no longer in the effective tracked set.
+    /// Drop published snapshots that the current explicit list no longer covers.
     pub fn sync_tracked_point_catalog(&self) {
+        if !self.tracks_root() && self.store.clear_global() {
+            if let Ok(metrics) = crate::master::Master::get_metrics() {
+                metrics.dir_space_global_ready.set(0);
+            }
+        }
         let effective: HashSet<String> = self.effective_tracked_paths().into_iter().collect();
         for path in self.store.points().keys().cloned().collect::<Vec<_>>() {
             if !effective.contains(&path) {
@@ -249,7 +330,7 @@ impl DirSpaceManager {
     /// effective path list. Returns the next round-robin cursor and whether the
     /// full list was completed within the round deadline.
     pub fn try_scan_tracked_points(&self, start_index: usize) -> (ScanOutcome, usize, bool) {
-        if !self.conf.dir_space_enabled {
+        if !self.tracking_enabled() {
             return (ScanOutcome::Disabled, start_index, false);
         }
         if !self.fs.master_monitor.is_active() {
@@ -315,6 +396,18 @@ impl DirSpaceManager {
                     let inode_count = snapshot.meta.inode_count;
                     let edge_count = snapshot.meta.edge_count;
                     let anomaly_count = snapshot.meta.anomaly_count;
+                    if !self
+                        .explicit_paths()
+                        .iter()
+                        .any(|candidate| candidate == &path)
+                    {
+                        index = (index + 1) % paths.len();
+                        scanned += 1;
+                        if scanned >= paths.len() {
+                            return (ScanOutcome::Success, 0, true);
+                        }
+                        continue;
+                    }
                     let generation = self.store.publish_point(&path, snapshot).meta.generation;
                     info!(
                         "dir-space point scan published {} generation {} in {} ms",
@@ -375,8 +468,9 @@ impl DirSpaceManager {
 
         let mut entries = unpublished.entries;
         let root = unpublished.root;
-        let root_entry = entries.entry(root_id).or_insert_with(DirAgg::empty_dir);
-        root_entry.merge(&root)?;
+        // `root` already includes this directory. Merging it into `empty_dir()`
+        // would count the snapshot root twice.
+        entries.insert(root_id, root);
         let stats = unpublished.stats;
 
         Ok(DirSpaceSnapshot {
@@ -455,12 +549,15 @@ impl DirSpaceManager {
     /// on every return path. Failures never publish, so the previous good
     /// generation survives.
     pub fn try_scan_global(&self) -> ScanOutcome {
-        if !self.conf.dir_space_enabled {
+        if !self.tracking_enabled() {
             return ScanOutcome::Disabled;
         }
         if !self.fs.master_monitor.is_active() {
             self.record_simple_outcome(ScanOutcome::RoleLost);
             return ScanOutcome::RoleLost;
+        }
+        if !self.tracks_root() {
+            return ScanOutcome::Success;
         }
         if self
             .scan_permit
@@ -499,10 +596,10 @@ impl DirSpaceManager {
         let mut entries = unpublished.entries;
         let root_id = unpublished.root_id;
         let root = unpublished.root;
-        // The root aggregate is carried by the scanner separately; merge it
-        // into the published map so queries on the root resolve directly.
-        let root_entry = entries.entry(root_id).or_insert_with(DirAgg::empty_dir);
-        root_entry.merge(&root)?;
+        // The scanner returns the root aggregate separately. Store it as-is:
+        // it already counts this directory, so merging into `empty_dir()`
+        // would add one extra directory.
+        entries.insert(root_id, root);
         let stats = unpublished.stats;
 
         Ok(DirSpaceSnapshot {
@@ -542,6 +639,9 @@ impl DirSpaceManager {
                 let inode_count = snapshot.meta.inode_count;
                 let edge_count = snapshot.meta.edge_count;
                 let anomaly_count = snapshot.meta.anomaly_count;
+                if !self.tracks_root() {
+                    return ScanOutcome::Success;
+                }
                 let generation = self.store.publish_global(snapshot).meta.generation;
                 info!(
                     "dir-space global scan published generation {} in {} ms",
@@ -645,7 +745,7 @@ impl DirSpaceManager {
         &self,
         path: &str,
     ) -> Result<crate::master::space::store::DirSpaceQueryResult, DirSpaceQueryError> {
-        if !self.conf.dir_space_enabled {
+        if !self.tracking_enabled() {
             return Err(DirSpaceQueryError::Disabled);
         }
 
@@ -819,6 +919,9 @@ mod tests {
         };
         conf.master.dir_space_enabled = dir_space_enabled;
         configure(&mut conf.master);
+        if dir_space_enabled && conf.master.dir_space_tracked_paths.is_empty() {
+            conf.master.dir_space_tracked_paths = vec!["/".to_string()];
+        }
         conf.master.init().unwrap();
         let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
         (fs, Arc::new(conf.master))
@@ -915,7 +1018,11 @@ mod tests {
         // A published generation must serve queries for the seeded dirs.
         let res = manager.query("/a").expect("query must hit");
         assert_eq!(res.source, SnapshotSource::Global);
-        assert!(res.snapshot.entries[&res.snapshot.root_id].directory_count >= 3);
+        // `/`, `/a`, `/ab`, `/a/sub`.
+        assert_eq!(
+            res.snapshot.entries[&res.snapshot.root_id].directory_count,
+            4
+        );
     }
 
     #[test]
@@ -1173,6 +1280,9 @@ mod tests {
         let point = manager.store().point("/a").expect("point published");
         assert_eq!(point.source, SnapshotSource::TrackedPoint);
         assert!(point.entries.contains_key(&point.root_id));
+        // `/a` and `/a/sub`; the point root must not be counted twice.
+        assert_eq!(point.entries[&point.root_id].directory_count, 2);
+        assert_eq!(point.entries[&point.root_id].file_count, 0);
 
         let res = manager.query("/a/sub").expect("point query");
         assert_eq!(res.source, SnapshotSource::TrackedPoint);
@@ -1194,6 +1304,89 @@ mod tests {
             .select_point("/a-renamed/sub", &manager.store().points())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn runtime_override_replaces_paths_and_disable_stops_scans() {
+        let (fs, conf) = test_fs_with_options("runtime-paths", true, |master| {
+            master.dir_space_tracked_paths = vec!["/a".to_string()];
+        });
+        set_role(&monitor_for(&fs), true);
+        seed_tree(&fs);
+        let manager = manager_for(&fs, &conf);
+        let registry = crate::master::build_master_runtime_registry(manager.clone());
+
+        assert_eq!(manager.explicit_paths(), vec!["/a".to_string()]);
+        let (outcome, _, complete) = manager.try_scan_tracked_points(0);
+        assert_eq!(outcome, ScanOutcome::Success);
+        assert!(complete);
+        manager.query("/a").expect("point snapshot");
+
+        registry
+            .set("master.dir_space_tracked_paths", "[]", Some("test"))
+            .unwrap();
+        assert!(manager.explicit_paths().is_empty());
+        assert!(manager.store().point("/a").is_none());
+        assert!(matches!(
+            manager.query("/a"),
+            Err(DirSpaceQueryError::SnapshotMiss(_))
+        ));
+
+        registry
+            .set("master.dir_space_tracked_paths", "[\"/a\"]", Some("test"))
+            .unwrap();
+        assert_eq!(manager.explicit_paths(), vec!["/a".to_string()]);
+        manager.try_scan_tracked_points(0);
+        manager.query("/a/sub").expect("republished point");
+
+        registry
+            .set("master.dir_space_enabled", "false", Some("test"))
+            .unwrap();
+        assert!(matches!(
+            manager.query("/a"),
+            Err(DirSpaceQueryError::Disabled)
+        ));
+        assert_eq!(manager.try_scan_global(), ScanOutcome::Disabled);
+        assert_eq!(manager.try_scan_tracked_points(0).0, ScanOutcome::Disabled);
+
+        registry
+            .reset("master.dir_space_enabled", Some("test"))
+            .unwrap();
+        assert!(manager.tracking_enabled());
+        registry
+            .reset("master.dir_space_tracked_paths", Some("test"))
+            .unwrap();
+        assert_eq!(manager.explicit_paths(), vec!["/a".to_string()]);
+
+        assert!(registry
+            .set(
+                "master.dir_space_tracked_paths",
+                "[\"relative\"]",
+                Some("test"),
+            )
+            .is_err());
+        assert_eq!(manager.explicit_paths(), vec!["/a".to_string()]);
+        assert!(manager.config_epoch() >= 1);
+    }
+
+    #[test]
+    fn removing_root_drops_the_global_snapshot() {
+        let (fs, conf) = test_fs("drop-root", true);
+        set_role(&monitor_for(&fs), true);
+        seed_tree(&fs);
+        let manager = manager_for(&fs, &conf);
+
+        assert!(manager.tracks_root());
+        assert_eq!(manager.try_scan_global(), ScanOutcome::Success);
+        assert!(manager.store().global().is_some());
+
+        manager.update_tracked_paths(&[]).unwrap();
+        assert!(!manager.tracks_root());
+        assert!(manager.store().global().is_none());
+        assert!(matches!(
+            manager.query("/"),
+            Err(DirSpaceQueryError::SnapshotMiss(_))
+        ));
     }
 
     #[test]

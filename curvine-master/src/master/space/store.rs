@@ -111,6 +111,11 @@ impl DirSpaceSnapshotStore {
         snapshot
     }
 
+    /// Drops the global snapshot so queries stop serving it.
+    pub fn clear_global(&self) -> bool {
+        self.inner.write().global.take().is_some()
+    }
+
     /// Removes a tracked point so its last generation is never selected again.
     /// Returns whether a point existed for the path.
     pub fn remove_point(&self, root_path: &str) -> bool {

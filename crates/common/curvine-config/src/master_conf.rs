@@ -192,6 +192,7 @@ pub struct MasterConf {
     pub dir_space_max_inode_record_bytes: String,
     #[serde(skip)]
     pub dir_space_max_inode_record_bytes_unit: ByteUnit,
+    /// Parsed for compatibility. Mounts are not added to the tracked-path list.
     pub dir_space_auto_track_mounts: bool,
     pub dir_space_tracked_paths: Vec<String>,
     pub dir_space_restore_wait_timeout: String,
@@ -336,8 +337,24 @@ impl MasterConf {
             return err_box!("dir_space_max_inode_record_bytes must be greater than zero");
         }
 
+        self.dir_space_tracked_paths_normalized = Self::normalize_tracked_path_list(
+            &self.dir_space_tracked_paths,
+            self.dir_space_max_tracked_points,
+        )?;
+        Ok(())
+    }
+
+    /// Normalize an explicit dir-space path list.
+    ///
+    /// Empty entries are dropped. `/` is kept and selects the global scan.
+    /// Other entries are absolute paths without a trailing slash. Duplicates
+    /// collapse. More entries than `max_points` is an error.
+    pub fn normalize_tracked_path_list(
+        raw_paths: &[String],
+        max_points: u32,
+    ) -> CommonResult<Vec<String>> {
         let mut normalized = Vec::new();
-        for raw in self.dir_space_tracked_paths.clone() {
+        for raw in raw_paths {
             let path = raw.trim();
             if path.is_empty() {
                 continue;
@@ -352,18 +369,14 @@ impl MasterConf {
             while norm.len() > 1 && norm.ends_with('/') {
                 norm.pop();
             }
-            if norm == "/" {
-                continue;
-            }
-            if !normalized.iter().any(|p| p == &norm) {
+            if !normalized.iter().any(|existing| existing == &norm) {
                 normalized.push(norm);
             }
         }
-        if normalized.len() > self.dir_space_max_tracked_points as usize {
+        if normalized.len() > max_points as usize {
             return err_box!("dir_space_tracked_paths exceeds dir_space_max_tracked_points");
         }
-        self.dir_space_tracked_paths_normalized = normalized;
-        Ok(())
+        Ok(normalized)
     }
 
     pub fn dir_space_global_scan_interval_ms(&self) -> u64 {
@@ -625,7 +638,7 @@ impl Default for MasterConf {
             dir_space_max_tracked_points: 128,
             dir_space_max_inode_record_bytes: "16MB".to_string(),
             dir_space_max_inode_record_bytes_unit: Default::default(),
-            dir_space_auto_track_mounts: true,
+            dir_space_auto_track_mounts: false,
             dir_space_tracked_paths: Vec::new(),
             dir_space_restore_wait_timeout: "30s".to_string(),
             dir_space_restore_wait_timeout_unit: Default::default(),
@@ -777,7 +790,7 @@ mod tests {
             assert_eq!(conf.dir_space_track_max_depth, 1024);
             assert_eq!(conf.dir_space_max_tracked_points, 128);
             assert_eq!(conf.dir_space_max_inode_record_bytes, "16MB");
-            assert!(conf.dir_space_auto_track_mounts);
+            assert!(!conf.dir_space_auto_track_mounts);
             assert_eq!(conf.dir_space_restore_wait_timeout, "30s");
             assert_eq!(conf.dir_space_global_scan_interval_ms(), 600_000);
             assert_eq!(
@@ -829,7 +842,7 @@ mod tests {
         }
 
         #[test]
-        fn tracked_paths_deduped_and_root_removed() {
+        fn tracked_paths_deduped_and_root_kept() {
             let mut conf = MasterConf {
                 dir_space_tracked_paths: vec![
                     "/".to_string(),
@@ -842,7 +855,7 @@ mod tests {
             conf.init().unwrap();
             assert_eq!(
                 conf.dir_space_tracked_paths_normalized,
-                vec!["/data".to_string(), "/other".to_string()]
+                vec!["/".to_string(), "/data".to_string(), "/other".to_string()]
             );
         }
     }

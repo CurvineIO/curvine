@@ -25,7 +25,7 @@
 //!   `Busy` on the manager permit and leaves the next-due untouched.
 //! - Metrics ages (global snapshot age) are refreshed on each tick.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use curvine_error::FsError;
@@ -58,6 +58,8 @@ pub struct DirSpaceCoordinatorTask {
     point_next_due: std::sync::Mutex<Instant>,
     /// Round-robin cursor into the effective tracked path list.
     point_cursor: AtomicUsize,
+    /// Last applied [`DirSpaceManager::config_epoch`].
+    seen_epoch: AtomicU64,
 }
 
 impl DirSpaceCoordinatorTask {
@@ -73,6 +75,7 @@ impl DirSpaceCoordinatorTask {
             global_next_due: std::sync::Mutex::new(Instant::now()),
             point_next_due: std::sync::Mutex::new(Instant::now()),
             point_cursor: AtomicUsize::new(0),
+            seen_epoch: AtomicU64::new(0),
         }
     }
 
@@ -135,6 +138,11 @@ impl DirSpaceCoordinatorTask {
             *global_next_due = Instant::now();
             *point_next_due = Instant::now();
         }
+        let epoch = self.manager.config_epoch();
+        if self.seen_epoch.swap(epoch, Ordering::SeqCst) != epoch {
+            *global_next_due = Instant::now();
+            *point_next_due = Instant::now();
+        }
         if !active {
             return;
         }
@@ -142,10 +150,14 @@ impl DirSpaceCoordinatorTask {
         // Snapshot ages and point aggregates are refreshed every tick (§12).
         self.manager.refresh_global_age();
         self.manager.refresh_point_metrics();
+        if !self.manager.tracking_enabled() {
+            return;
+        }
 
         let now = Instant::now();
-        let global_due = now >= *global_next_due;
-        let point_due = now >= *point_next_due;
+        let global_due = self.manager.tracks_root() && now >= *global_next_due;
+        let point_due =
+            !self.manager.effective_tracked_paths().is_empty() && now >= *point_next_due;
 
         if global_due && (!point_due || *global_next_due <= *point_next_due) {
             let outcome = self.manager.try_scan_global();

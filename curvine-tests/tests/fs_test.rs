@@ -1393,6 +1393,7 @@ fn enable_dir_space_for_integration(conf: &mut ClusterConf) {
     conf.master.dir_space_tracked_scan_interval = "500ms".to_string();
     conf.master.dir_space_tracked_scan_timeout = "500ms".to_string();
     conf.master.dir_space_auto_track_mounts = false;
+    conf.master.dir_space_tracked_paths = vec!["/".to_string()];
     conf.master.init().expect("dir-space test config");
 }
 
