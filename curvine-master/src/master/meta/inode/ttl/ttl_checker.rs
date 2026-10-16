@@ -78,7 +78,8 @@ impl InodeTtlChecker {
         let inode_ids = std::mem::take(&mut *bucket.inodes.lock());
         let total = inode_ids.len();
 
-        for inode_id in inode_ids.iter().copied() {
+        for inode_id in inode_ids {
+            let inode_id = inode_id as i64;
             if !self.is_active() {
                 bucket.add(inode_id);
                 continue;

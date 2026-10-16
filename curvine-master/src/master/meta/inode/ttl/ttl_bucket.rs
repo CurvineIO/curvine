@@ -220,8 +220,7 @@ impl TtlBucketList {
     }
 
     pub fn optimize_all(&self) {
-        let buckets: Vec<Arc<TtlBucket>> =
-            self.buckets.lock().values().cloned().collect();
+        let buckets: Vec<Arc<TtlBucket>> = self.buckets.lock().values().cloned().collect();
         for bucket in buckets {
             bucket.optimize();
         }
@@ -229,7 +228,7 @@ impl TtlBucketList {
 
     /// Reinsert a drained bucket after an interrupted cleanup pass (#1754).
     pub fn put_back(&self, bucket: &TtlBucket) {
-        let ids: Vec<u64> = bucket.inodes.lock().iter().copied().collect();
+        let ids: Vec<u64> = bucket.inodes.lock().clone().iter().collect();
         if ids.is_empty() {
             return;
         }
@@ -413,8 +412,7 @@ mod tests {
         const IDS_PER_BUCKET: i64 = 10_000;
         const TOTAL_INODES: i64 = NUM_BUCKETS * IDS_PER_BUCKET; // 10_000_000
 
-        let list =
-            TtlBucketList::new(INTERVAL_MS).expect("valid ttl bucket interval");
+        let list = TtlBucketList::new(INTERVAL_MS).expect("valid ttl bucket interval");
 
         // Bucket i receives IDs [i*IDS_PER_BUCKET + 1, (i+1)*IDS_PER_BUCKET].
         // Drive `get_or_create_bucket` + `TtlBucket::add` directly to avoid
@@ -524,10 +522,7 @@ mod tests {
                 bucket.add(bucket_idx * IDS_PER_BUCKET + offset + 1);
             }
         }
-        assert_eq!(
-            list.total_inodes(),
-            (PRE_BUCKETS * IDS_PER_BUCKET) as u64
-        );
+        assert_eq!(list.total_inodes(), (PRE_BUCKETS * IDS_PER_BUCKET) as u64);
 
         // Writer touches brand-new buckets so it must acquire the global
         // `buckets` mutex (via get_or_create_bucket) while optimize_all is
