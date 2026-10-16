@@ -3406,8 +3406,12 @@ fn resent_final_full_report_batch_is_ignored() -> CommonResult<()> {
     assert_eq!(res.delete_blocks, vec![last]);
 
     // The response to the final batch was lost and the worker resends it.
+    // The deletes it carried must be delivered again, but no new session opens.
+    assert_eq!(fs.full_report_completed_round(0), Some(7));
     let res = fs.block_report(full_report_batch(7, 2, last), None)?;
-    assert!(res.delete_blocks.is_empty(), "resent batch must be ignored");
+    assert_eq!(res.delete_blocks, vec![last]);
+    assert_eq!(fs.full_report_open_sessions(), 0, "resend opened a session");
+    assert_eq!(fs.full_report_completed_round(0), Some(7));
 
     // A new round from the same worker is processed normally.
     let res = fs.block_report(full_report_batch(8, 2, last), None)?;
@@ -3432,10 +3436,12 @@ fn reset_full_block_report_forgets_completed_round() -> CommonResult<()> {
     let res = fs.block_report(full_report_batch(5, 1, block_id), None)?;
     assert_eq!(res.delete_blocks, vec![block_id]);
     let res = fs.block_report(full_report_batch(5, 1, block_id), None)?;
-    assert!(res.delete_blocks.is_empty());
+    assert_eq!(res.delete_blocks, vec![block_id]);
+    assert_eq!(fs.full_report_completed_round(0), Some(5));
 
     // The worker registered again, so its previous round must be forgotten.
     fs.reset_full_block_report(0);
+    assert_eq!(fs.full_report_completed_round(0), None);
     let res = fs.block_report(full_report_batch(5, 1, block_id), None)?;
     assert_eq!(res.delete_blocks, vec![block_id]);
     Ok(())

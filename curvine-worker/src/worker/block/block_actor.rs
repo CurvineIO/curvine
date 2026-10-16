@@ -58,7 +58,9 @@ fn new_report_id() -> u64 {
 /// When that retry budget runs out it surfaces as `FsError::IO`, which is the
 /// case that reaches here in practice (the `Timeout` and `NotLeaderMaster`
 /// variants are kept for completeness). `FsError::IO` can also be an IO error
-/// returned by the master itself, which is retried needlessly but is bounded.
+/// returned by the master itself. That is how the master asks for a resend while
+/// it is still processing the completing batch of the same round; other master
+/// IO failures are retried needlessly but only a bounded number of times.
 /// Anything else is a decision made by the master, so startup should fail.
 fn is_retryable_report_error(err: &CommonError) -> bool {
     matches!(
