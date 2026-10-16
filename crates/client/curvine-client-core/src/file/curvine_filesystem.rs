@@ -342,6 +342,10 @@ impl CurvineFileSystem {
         self.fs_client.get_content_summary(path).await
     }
 
+    pub async fn get_dir_space_status(&self) -> FsResult<curvine_model::DirSpaceStatus> {
+        self.fs_client.get_dir_space_status().await
+    }
+
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
         self.fs_client.get_filesystem_info().await
     }

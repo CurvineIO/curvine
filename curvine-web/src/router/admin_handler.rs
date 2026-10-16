@@ -3089,6 +3089,193 @@ fn parse_mount_options(payload: &MountRequest) -> FsResult<MountOptions> {
     Ok(opts.build())
 }
 
+#[derive(Debug, Deserialize)]
+struct DirSpaceUpdateRequest {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    tracked: Option<bool>,
+}
+
+async fn dir_space_body(client: &UnifiedFileSystem) -> FsResult<Value> {
+    use curvine_config::{DIR_SPACE_ENABLED_RUNTIME_KEY, DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY};
+
+    let entries = client.get_runtime_config(None).await?;
+    let enabled_raw = runtime_entry_value(&entries, DIR_SPACE_ENABLED_RUNTIME_KEY)?;
+    let enabled = match enabled_raw {
+        "true" => true,
+        "false" => false,
+        other => return err_box!("unexpected dir-space switch value {}", other),
+    };
+    let paths_raw = runtime_entry_value(&entries, DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY)?;
+    let paths: Vec<String> = match serde_json::from_str(paths_raw) {
+        Ok(paths) => paths,
+        Err(err) => return err_box!("dir-space paths: {}", err),
+    };
+    Ok(json!({
+        "enabled": enabled,
+        "paths": paths,
+    }))
+}
+
+fn runtime_entry_value<'a>(
+    entries: &'a [curvine_model::RuntimeConfigEntry],
+    key: &str,
+) -> FsResult<&'a str> {
+    match entries.iter().find(|entry| entry.key == key) {
+        Some(entry) => Ok(entry.effective_value_json.as_str()),
+        None => err_box!("master runtime config has no key {}", key),
+    }
+}
+
+async fn dir_space_v1(
+    Extension(instance): Extension<Arc<AdminRouterHandler>>,
+) -> FsResult<Json<Value>> {
+    let client = instance.unified_client(false);
+    Ok(api_success(dir_space_body(&client).await?))
+}
+
+async fn dir_space_status_v1(
+    Extension(instance): Extension<Arc<AdminRouterHandler>>,
+) -> FsResult<Json<Value>> {
+    let client = instance.unified_client(false);
+    let status = client.get_dir_space_status().await?;
+    Ok(api_success(json!({
+        "enabled": status.enabled,
+        "scanning": status.scanning,
+        "in_round": status.in_round,
+        "phase": status.phase,
+        "scope": status.scope,
+        "current_path": status.current_path,
+        "last_outcome": status.last_outcome,
+        "last_finished_ms": status.last_finished_ms,
+        "next_scan_at_ms": status.next_scan_at_ms,
+        "paths_total": status.paths_total,
+        "paths_done": status.paths_done,
+    })))
+}
+
+async fn dir_space_update_v1(
+    Extension(instance): Extension<Arc<AdminRouterHandler>>,
+    Json(payload): Json<DirSpaceUpdateRequest>,
+) -> FsResult<Json<Value>> {
+    use curvine_config::{
+        MasterConf, DIR_SPACE_ENABLED_RUNTIME_KEY, DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY,
+    };
+
+    if payload.enabled.is_none() && payload.path.is_none() {
+        return err_box!("dir-space update requires enabled and/or path");
+    }
+    let client = instance.unified_client(false);
+    if let Some(enabled) = payload.enabled {
+        let value = if enabled { "true" } else { "false" };
+        client
+            .update_runtime_config(DIR_SPACE_ENABLED_RUNTIME_KEY, value)
+            .await?;
+    }
+    if let Some(path) = payload.path.as_deref() {
+        let Some(tracked) = payload.tracked else {
+            return err_box!("dir-space path update requires tracked");
+        };
+        let current = dir_space_body(&client).await?;
+        let Some(paths) = current.get("paths").and_then(Value::as_array) else {
+            return err_box!("dir-space paths missing");
+        };
+        let paths: Vec<String> = paths
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        let next = MasterConf::with_tracked_path(&paths, path, tracked)?;
+        let value = match serde_json::to_string(&next) {
+            Ok(value) => value,
+            Err(err) => return err_box!("dir-space paths: {}", err),
+        };
+        client
+            .update_runtime_config(DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY, &value)
+            .await?;
+    }
+    Ok(api_success(dir_space_body(&client).await?))
+}
+
+const DIR_SPACE_SUMMARY_LIMIT: usize = 128;
+
+#[derive(Debug, Deserialize)]
+struct DirSpaceSummariesRequest {
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+async fn dir_space_summaries_v1(
+    Extension(instance): Extension<Arc<AdminRouterHandler>>,
+    Json(payload): Json<DirSpaceSummariesRequest>,
+) -> FsResult<Json<Value>> {
+    use curvine_config::MasterConf;
+
+    if payload.paths.len() > DIR_SPACE_SUMMARY_LIMIT {
+        return err_box!(
+            "dir-space summary request exceeds {} paths",
+            DIR_SPACE_SUMMARY_LIMIT
+        );
+    }
+    let client = instance.unified_client(false);
+    let state = dir_space_body(&client).await?;
+    let enabled = state
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let tracked = state
+        .get("paths")
+        .and_then(Value::as_array)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut items = Vec::with_capacity(payload.paths.len());
+    for raw in payload.paths {
+        let canonical = MasterConf::normalize_tracked_path_list(&[raw], u32::MAX)?;
+        let Some(path) = canonical.into_iter().next() else {
+            continue;
+        };
+        if !enabled || !tracked.contains(&path) {
+            items.push(json!({ "path": path, "state": "off" }));
+            continue;
+        }
+        match client
+            .try_get_content_summary_snapshot(&FsPath::from_str(&path)?)
+            .await
+        {
+            Ok(Some(summary)) if summary.snapshot.is_some() => {
+                items.push(json!({
+                    "path": path,
+                    "state": "ready",
+                    "logical_bytes": summary.logical_bytes,
+                    "directory_count": summary.directory_count,
+                    "file_count": summary.file_count,
+                }));
+            }
+            Ok(_) => items.push(json!({ "path": path, "state": "pending" })),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::SnapshotNotReady | ErrorKind::Unsupported | ErrorKind::FileNotFound
+                ) =>
+            {
+                items.push(json!({ "path": path, "state": "pending" }));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(api_success(json!({ "items": items })))
+}
+
 async fn mounts_v1(
     Extension(instance): Extension<Arc<AdminRouterHandler>>,
 ) -> FsResult<Json<Value>> {
@@ -4272,6 +4459,15 @@ impl RouterHandler for AdminRouterHandler {
             .route(
                 "/api/v1/workers/decommission",
                 post(worker_decommission_v1).delete(worker_remove_decommission_v1),
+            )
+            .route(
+                "/api/v1/fs/dir-space",
+                get(dir_space_v1).post(dir_space_update_v1),
+            )
+            .route("/api/v1/fs/dir-space/status", get(dir_space_status_v1))
+            .route(
+                "/api/v1/fs/dir-space/summaries",
+                post(dir_space_summaries_v1),
             )
             .route("/api/v1/mounts", get(mounts_v1).post(mount_create_v1))
             .route("/api/v1/mounts/delete", post(mount_delete_v1))

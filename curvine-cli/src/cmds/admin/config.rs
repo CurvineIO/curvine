@@ -87,12 +87,13 @@ mod tests {
 
     #[test]
     fn admin_config_set_parses() {
-        let args = AdminCommand::try_parse_from(["curvine", "admin", "config", "set", "k", "v"])
-            .expect("parse");
+        let args =
+            AdminCommand::try_parse_from(["curvine", "config", "set", "k", "v"]).expect("parse");
         match args.action {
             AdminSubCommand::Config(cfg) => {
                 assert!(matches!(cfg.action, ConfigSubCommand::Set { .. }));
             }
+            AdminSubCommand::DirSpace(_) => panic!("expected config"),
         }
     }
 }

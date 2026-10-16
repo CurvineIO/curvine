@@ -108,6 +108,21 @@ function createStubClient(overrides: Partial<ApiClient> = {}): ApiClient {
     fetchBrowseData: vi.fn(async () => ({ path: '/', items: [] })),
     fetchBlocksData: vi.fn(async () => ({})),
     downloadFile: vi.fn(async () => new Blob(['hello curvine'])),
+    fetchDirSpace: vi.fn(async () => ({ enabled: false, paths: [] })),
+    fetchDirSpaceStatus: vi.fn(async () => ({
+      enabled: false,
+      scanning: false,
+      in_round: false,
+      phase: 'disabled',
+      scope: 'none',
+      current_path: '',
+      last_outcome: '',
+      last_finished_ms: 0,
+      next_scan_at_ms: 0,
+      paths_total: 0,
+      paths_done: 0
+    })),
+    updateDirSpace: vi.fn(async () => ({ enabled: false, paths: [] })),
     fetchMountsData: vi.fn(async () => [
       {
         mount_id: 'm1',

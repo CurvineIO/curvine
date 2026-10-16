@@ -216,6 +216,39 @@ impl MasterHandler {
         })
     }
 
+    pub fn get_dir_space_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let _header: GetDirSpaceStatusRequest = ctx.parse_header()?;
+        let Some(manager) = self.dir_space_manager.as_ref() else {
+            return ctx.response(GetDirSpaceStatusResponse {
+                enabled: false,
+                scanning: false,
+                in_round: false,
+                phase: "disabled".to_string(),
+                scope: "none".to_string(),
+                current_path: None,
+                last_outcome: None,
+                last_finished_ms: 0,
+                next_scan_at_ms: 0,
+                paths_total: 0,
+                paths_done: 0,
+            });
+        };
+        let activity = manager.activity();
+        ctx.response(GetDirSpaceStatusResponse {
+            enabled: activity.enabled,
+            scanning: activity.scanning,
+            in_round: activity.in_round,
+            phase: activity.phase.to_string(),
+            scope: activity.scope,
+            current_path: (!activity.current_path.is_empty()).then_some(activity.current_path),
+            last_outcome: (!activity.last_outcome.is_empty()).then_some(activity.last_outcome),
+            last_finished_ms: activity.last_finished_ms,
+            next_scan_at_ms: activity.next_scan_at_ms,
+            paths_total: activity.paths_total,
+            paths_done: activity.paths_done,
+        })
+    }
+
     pub fn get_req_cache(&self, id: i64) -> Option<OperationStatus> {
         if let Some(ref c) = self.retry_cache {
             c.get(&id)
@@ -1400,6 +1433,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::GetMountTable => self.get_mount_table(ctx),
                 RpcCode::GetMountInfo => self.get_mount_info(ctx),
                 RpcCode::GetContentSummary => self.get_content_summary(ctx),
+                RpcCode::GetDirSpaceStatus => self.get_dir_space_status(ctx),
 
                 RpcCode::MetricsReport => self.metrics_report(ctx),
                 RpcCode::UpdateRuntimeConfig => self.update_runtime_config(ctx),

@@ -515,6 +515,24 @@ message ResetRuntimeConfigResponse {
     required string effective_value_json = 2;
 }
 
+// Dir-space scan-round status for the web console.
+message GetDirSpaceStatusRequest {
+}
+
+message GetDirSpaceStatusResponse {
+    required bool enabled = 1;
+    required bool scanning = 2;
+    required bool in_round = 3;
+    required string phase = 4;
+    required string scope = 5;
+    optional string current_path = 6;
+    optional string last_outcome = 7;
+    required int64 last_finished_ms = 8;
+    required int64 next_scan_at_ms = 9;
+    required uint32 paths_total = 10;
+    required uint32 paths_done = 11;
+}
+
 // Dir-space content summary.
 message GetContentSummaryRequest {
     optional string path = 1;

@@ -3,14 +3,15 @@ import { CheckIcon, CopyIcon, FileIcon, FolderIcon } from 'lucide-react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 
 import { useApi } from '@/api/api-context'
-import type { BrowseData, MountInfo } from '@/api/types'
+import type { BrowseData, DirSpaceState, DirSpaceStatus, DirSpaceSummary, MountInfo } from '@/api/types'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { EmptyNotice, ErrorAlert } from '@/components/data-state'
 import { PageHeader } from '@/components/page-header'
-import { MonoText, StatusBadge } from '@/components/resource-table'
+import { MonoText, StatusBadge, type StatusTone } from '@/components/resource-table'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Switch } from '@/components/ui/switch'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -151,6 +152,10 @@ export function BrowsePage() {
   const [bulkFreeOpen, setBulkFreeOpen] = useState(false)
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [dirSpace, setDirSpace] = useState<DirSpaceState | null>(null)
+  const [dirSpaceStatus, setDirSpaceStatus] = useState<DirSpaceStatus | null>(null)
+  const [dirSpaceSummaries, setDirSpaceSummaries] = useState<Record<string, DirSpaceSummary>>({})
+  const [dirSpaceBusy, setDirSpaceBusy] = useState('')
 
   const browsePathRef = useRef(browsePath)
   const cacheOnlyRef = useRef(cacheOnly)
@@ -719,6 +724,83 @@ export function BrowsePage() {
   }, [api, hasMore, loadingMore, nextStartAfter, saveBrowseSnapshot])
 
   useRefreshSignal(useCallback(() => fetchData(), [fetchData]))
+
+  const reloadDirSpace = useCallback(async () => {
+    const state = await api.fetchDirSpace()
+    setDirSpace(state)
+    return state
+  }, [api])
+
+  const reloadDirSpaceStatus = useCallback(async () => {
+    const status = await api.fetchDirSpaceStatus()
+    setDirSpaceStatus(status)
+    return status
+  }, [api])
+
+  useEffect(() => {
+    void reloadDirSpace().catch((error) => {
+      toast.error(error instanceof Error ? error.message : String(error))
+    })
+  }, [reloadDirSpace, toast])
+
+  useEffect(() => {
+    let cancelled = false
+    const load = () => {
+      void reloadDirSpaceStatus().catch(() => {
+        if (!cancelled) setDirSpaceStatus(null)
+      })
+    }
+    load()
+    const timer = window.setInterval(load, 3000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [reloadDirSpaceStatus])
+
+  useRefreshSignal(
+    useCallback(async () => {
+      await Promise.all([reloadDirSpace(), reloadDirSpaceStatus()])
+    }, [reloadDirSpace, reloadDirSpaceStatus])
+  )
+
+  const configuredDirPaths = useMemo(() => new Set(dirSpace?.paths ?? []), [dirSpace])
+  const trackedDirPaths = useMemo(
+    () => new Set(dirSpace?.enabled ? dirSpace.paths : []),
+    [dirSpace]
+  )
+
+  useEffect(() => {
+    if (!dirSpace?.enabled) {
+      setDirSpaceSummaries({})
+      return
+    }
+    const wanted = new Set<string>()
+    if (trackedDirPaths.has(pathFromUrl)) wanted.add(pathFromUrl)
+    for (const item of items) {
+      const itemPath = String(item.path || '')
+      if (item.is_dir && trackedDirPaths.has(itemPath)) wanted.add(itemPath)
+    }
+    if (wanted.size === 0) {
+      setDirSpaceSummaries({})
+      return
+    }
+    let cancelled = false
+    void api
+      .fetchDirSpaceSummaries([...wanted])
+      .then((result) => {
+        if (cancelled) return
+        const next: Record<string, DirSpaceSummary> = {}
+        for (const item of result.items || []) next[item.path] = item
+        setDirSpaceSummaries(next)
+      })
+      .catch(() => {
+        if (!cancelled) setDirSpaceSummaries({})
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [api, dirSpace?.enabled, items, pathFromUrl, trackedDirPaths])
 
   /* ----------------------------------------------------------- restore once */
 
@@ -1522,6 +1604,64 @@ export function BrowsePage() {
     return formatBytes(Number(item.len || 0))
   }
 
+  async function setDirSpaceEnabled(enabled: boolean) {
+    setDirSpaceBusy('switch')
+    try {
+      const state = await api.updateDirSpace({ enabled })
+      setDirSpace(state)
+      toast.success(t('browse.dirSpace.switchUpdated'))
+    } catch (error) {
+      toast.error(
+        t('browse.dirSpace.updateFailed', {
+          error: error instanceof Error ? error.message : String(error)
+        })
+      )
+    } finally {
+      setDirSpaceBusy('')
+    }
+  }
+
+  async function toggleDirSpacePath(path: string, tracked: boolean) {
+    if (path === '/' && tracked) return
+    setDirSpaceBusy(path)
+    try {
+      const state = await api.updateDirSpace({ path, tracked })
+      setDirSpace(state)
+      toast.success(t('browse.dirSpace.pathUpdated', { path }))
+    } catch (error) {
+      toast.error(
+        t('browse.dirSpace.updateFailed', {
+          error: error instanceof Error ? error.message : String(error)
+        })
+      )
+    } finally {
+      setDirSpaceBusy('')
+    }
+  }
+
+  function directorySize(path: string) {
+    if (!dirSpace?.enabled || !trackedDirPaths.has(path)) return null
+    const summary = dirSpaceSummaries[path]
+    if (!summary || summary.state !== 'ready') {
+      return <span className="text-muted-foreground">{t('browse.dirSpace.pending')}</span>
+    }
+    return (
+      <span
+        className="inline-flex items-center justify-end gap-1.5 text-primary"
+        title={t('browse.dirSpace.summaryTitle', {
+          dirs: summary.directory_count || 0,
+          files: summary.file_count || 0
+        })}
+        data-testid={`browse-dir-size-${path}`}
+      >
+        {formatBytes(summary.logical_bytes || 0)}
+        <span className="rounded bg-primary/10 px-1 py-0.5 text-[10px] font-medium leading-none">
+          {t('browse.dirSpace.tag')}
+        </span>
+      </span>
+    )
+  }
+
   function expireText(item: BrowseRow): string {
     const expireAt = expireTimeMs(item)
     return expireAt == null ? t('browse.expire.never') : formatTime(expireAt)
@@ -1541,12 +1681,71 @@ export function BrowsePage() {
     return item.is_dir ? t('browse.freeAction.itemDir') : t('browse.freeAction.itemFile')
   }
 
+  function dirSpaceStatusView(status: DirSpaceStatus): { text: string; tone: StatusTone; title: string } {
+    const next =
+      status.next_scan_at_ms > 0
+        ? new Date(status.next_scan_at_ms).toLocaleTimeString('zh-CN', { hour12: false })
+        : ''
+    const title = [status.current_path, status.last_outcome, next ? t('browse.dirSpace.nextAt', { time: next }) : '']
+      .filter(Boolean)
+      .join(' · ')
+    if (!status.enabled || status.phase === 'disabled') {
+      return { text: t('browse.dirSpace.statusDisabled'), tone: 'neutral', title }
+    }
+    if (status.phase === 'scanning') {
+      const progress = status.paths_total > 0 ? ` ${status.paths_done}/${status.paths_total}` : ''
+      return { text: `${t('browse.dirSpace.statusScanning')}${progress}`, tone: 'info', title }
+    }
+    if (status.phase === 'in_round') {
+      return {
+        text: t('browse.dirSpace.statusInRound', { done: status.paths_done, total: status.paths_total }),
+        tone: 'info',
+        title
+      }
+    }
+    if (status.phase === 'completed') {
+      const failed = status.last_outcome !== '' && status.last_outcome !== 'success'
+      const base = failed ? t('browse.dirSpace.statusFailed') : t('browse.dirSpace.statusCompleted')
+      return {
+        text: next ? `${base} · ${t('browse.dirSpace.nextAt', { time: next })}` : base,
+        tone: failed ? 'warning' : 'positive',
+        title
+      }
+    }
+    return { text: t('browse.dirSpace.statusIdle'), tone: 'neutral', title }
+  }
+
+  const statusView = dirSpaceStatus ? dirSpaceStatusView(dirSpaceStatus) : null
+
   return (
     <>
       <PageHeader
         eyebrow={t('nav.groupFilesystem')}
         title={t('browse.title')}
         description={t('browse.subtitle')}
+        actions={
+          dirSpace ? (
+            <div className="flex items-center gap-3">
+              {statusView && (
+                <span title={statusView.title} data-testid="browse-dir-space-status">
+                  <StatusBadge value={statusView.text} tone={statusView.tone} />
+                </span>
+              )}
+              <label className="flex items-center gap-2 text-xs whitespace-nowrap">
+                <Switch
+                  checked={dirSpace.enabled}
+                  disabled={dirSpaceBusy === 'switch'}
+                  onCheckedChange={(checked) => void setDirSpaceEnabled(checked)}
+                  aria-label={
+                    dirSpace.enabled ? t('browse.dirSpace.disableSwitch') : t('browse.dirSpace.enableSwitch')
+                  }
+                  data-testid="browse-dir-space-switch"
+                />
+                {dirSpace.enabled ? t('browse.dirSpace.disableSwitch') : t('browse.dirSpace.enableSwitch')}
+              </label>
+            </div>
+          ) : undefined
+        }
       />
 
       {/* Navigation row. The trail is the primary way around — its 🏠 Root and
@@ -1594,6 +1793,20 @@ export function BrowsePage() {
           />
           {t('browse.cacheOnly')}
         </label>
+        {dirSpace && pathFromUrl !== '/' && (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={dirSpaceBusy === pathFromUrl}
+            onClick={() => void toggleDirSpacePath(pathFromUrl, !configuredDirPaths.has(pathFromUrl))}
+            data-testid="browse-dir-space-current"
+          >
+            {configuredDirPaths.has(pathFromUrl)
+              ? t('browse.dirSpace.disablePath')
+              : t('browse.dirSpace.enablePath')}
+          </Button>
+        )}
+        {pathFromUrl !== '/' && directorySize(pathFromUrl)}
         <ColumnsPicker
           columns={BROWSABLE_COLUMNS}
           visible={visibleColumns}
@@ -1751,6 +1964,7 @@ export function BrowsePage() {
                   {t(column.labelKey)}
                 </TableHead>
               ))}
+              <TableHead>{t('browse.table.dirSpace')}</TableHead>
               <TableHead className="text-right">{t('common.actions')}</TableHead>
             </TableRow>
           </TableHeader>
@@ -1847,7 +2061,9 @@ export function BrowsePage() {
                   <TableCell className="text-muted-foreground">
                     {item.is_dir ? t('browse.itemType.directory') : t('browse.itemType.file')}
                   </TableCell>
-                  <TableCell className="text-right tabular-nums">{itemSizeText(item)}</TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {item.is_dir ? directorySize(itemPath) || '-' : itemSizeText(item)}
+                  </TableCell>
                   <TableCell className="text-muted-foreground">{formatTime(item.mtime)}</TableCell>
                   <TableCell className={expired ? 'font-medium text-warning' : 'text-muted-foreground'}>
                     {expireText(item)}
@@ -1864,6 +2080,21 @@ export function BrowsePage() {
                       )}
                     </TableCell>
                   ))}
+                  <TableCell>
+                    {item.is_dir && (
+                      <Switch
+                        checked={configuredDirPaths.has(itemPath)}
+                        disabled={dirSpace == null || dirSpaceBusy === itemPath || dirSpaceBusy === 'switch'}
+                        onCheckedChange={(checked) => void toggleDirSpacePath(itemPath, checked)}
+                        aria-label={
+                          configuredDirPaths.has(itemPath)
+                            ? t('browse.dirSpace.disablePath')
+                            : t('browse.dirSpace.enablePath')
+                        }
+                        data-testid={`browse-dir-space-${itemPath}`}
+                      />
+                    )}
+                  </TableCell>
                   <TableCell>
                     <div className="flex items-center justify-end gap-1">
                       <Button

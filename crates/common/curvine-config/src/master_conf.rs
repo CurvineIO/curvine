@@ -19,6 +19,11 @@ use curvine_runtime::runtime::GroupExecutor;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Arc;
 
+/// Runtime key for the dir-space scan switch (`cv admin config` / dir-space ops).
+pub const DIR_SPACE_ENABLED_RUNTIME_KEY: &str = "master.dir_space_enabled";
+/// Runtime key for the explicit dir-space path list.
+pub const DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY: &str = "master.dir_space_tracked_paths";
+
 // master Configuration file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -377,6 +382,36 @@ impl MasterConf {
             return err_box!("dir_space_tracked_paths exceeds dir_space_max_tracked_points");
         }
         Ok(normalized)
+    }
+
+    /// Add or drop one statistics path. Canonicalizes like the file config.
+    /// Adding `/` is rejected. The master enforces `dir_space_max_tracked_points`
+    /// when the list is stored.
+    pub fn with_tracked_path(
+        paths: &[String],
+        path: &str,
+        tracked: bool,
+    ) -> CommonResult<Vec<String>> {
+        let path = path.trim();
+        if path.is_empty() {
+            return err_box!("dir-space path is required");
+        }
+        let canonical = Self::normalize_tracked_path_list(&[path.to_string()], u32::MAX)?;
+        let Some(path) = canonical.into_iter().next() else {
+            return err_box!("dir-space path is required");
+        };
+        if tracked && path == "/" {
+            return err_box!("dir-space cannot track the root directory");
+        }
+        let mut next = paths.to_vec();
+        if tracked {
+            if !next.iter().any(|existing| existing == &path) {
+                next.push(path);
+            }
+        } else {
+            next.retain(|existing| existing != &path);
+        }
+        Self::normalize_tracked_path_list(&next, u32::MAX)
     }
 
     pub fn dir_space_global_scan_interval_ms(&self) -> u64 {
@@ -857,6 +892,28 @@ mod tests {
                 conf.dir_space_tracked_paths_normalized,
                 vec!["/".to_string(), "/data".to_string(), "/other".to_string()]
             );
+        }
+
+        #[test]
+        fn with_tracked_path_adds_and_removes_canonical_paths() {
+            let added =
+                MasterConf::with_tracked_path(&["/data".to_string()], "/track/", true).unwrap();
+            assert_eq!(added, vec!["/data".to_string(), "/track".to_string()]);
+            let again = MasterConf::with_tracked_path(&added, "/track", true).unwrap();
+            assert_eq!(again, added);
+            let removed = MasterConf::with_tracked_path(&added, "/track/", false).unwrap();
+            assert_eq!(removed, vec!["/data".to_string()]);
+            assert!(MasterConf::with_tracked_path(&[], "relative", true).is_err());
+            assert!(MasterConf::with_tracked_path(&[], "  ", true).is_err());
+            assert!(MasterConf::with_tracked_path(&[], "/", true)
+                .unwrap_err()
+                .to_string()
+                .contains("root"));
+            assert!(MasterConf::with_tracked_path(&[], "//", true).is_err());
+            let without_root =
+                MasterConf::with_tracked_path(&["/".to_string(), "/data".to_string()], "/", false)
+                    .unwrap();
+            assert_eq!(without_root, vec!["/data".to_string()]);
         }
     }
 }

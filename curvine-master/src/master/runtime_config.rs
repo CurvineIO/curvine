@@ -21,8 +21,8 @@ use serde_json::Value;
 
 use crate::master::space::DirSpaceManager;
 
-pub const DIR_SPACE_ENABLED_KEY: &str = "master.dir_space_enabled";
-pub const DIR_SPACE_TRACKED_PATHS_KEY: &str = "master.dir_space_tracked_paths";
+pub const DIR_SPACE_ENABLED_KEY: &str = curvine_config::DIR_SPACE_ENABLED_RUNTIME_KEY;
+pub const DIR_SPACE_TRACKED_PATHS_KEY: &str = curvine_config::DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY;
 
 /// Master-side runtime registry.
 ///

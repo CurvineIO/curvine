@@ -112,6 +112,65 @@ pub struct DirSpaceManager {
     paths_override: Mutex<Option<Vec<String>>>,
     /// Bumped on every runtime override so the coordinator scans on its next tick.
     config_epoch: AtomicU64,
+    /// Latest scan-round progress. The coordinator publishes the schedule;
+    /// scan attempts publish whether a round is running and how it finished.
+    activity: Mutex<DirSpaceActivityState>,
+}
+
+/// Point-in-time dir-space scan status for the web console.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirSpaceActivity {
+    pub enabled: bool,
+    pub scanning: bool,
+    pub in_round: bool,
+    pub phase: &'static str,
+    pub scope: String,
+    pub current_path: String,
+    pub last_outcome: String,
+    pub last_finished_ms: i64,
+    pub next_scan_at_ms: i64,
+    pub paths_total: u32,
+    pub paths_done: u32,
+}
+
+#[derive(Clone, Debug)]
+struct DirSpaceActivityState {
+    scanning: bool,
+    in_round: bool,
+    scope: String,
+    current_path: String,
+    last_outcome: String,
+    last_finished_ms: i64,
+    next_scan_at_ms: i64,
+    paths_total: u32,
+    paths_done: u32,
+}
+
+impl Default for DirSpaceActivityState {
+    fn default() -> Self {
+        Self {
+            scanning: false,
+            in_round: false,
+            scope: "none".to_string(),
+            current_path: String::new(),
+            last_outcome: String::new(),
+            last_finished_ms: 0,
+            next_scan_at_ms: 0,
+            paths_total: 0,
+            paths_done: 0,
+        }
+    }
+}
+
+/// Clears the in-flight scan flag when a round returns.
+struct ScanMark<'a>(&'a DirSpaceManager);
+
+impl Drop for ScanMark<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.activity.lock().expect("dir-space activity lock");
+        state.scanning = false;
+        state.current_path.clear();
+    }
 }
 
 impl DirSpaceManager {
@@ -130,6 +189,7 @@ impl DirSpaceManager {
             file_paths: conf.dir_space_tracked_paths_normalized.clone(),
             paths_override: Mutex::new(None),
             config_epoch: AtomicU64::new(0),
+            activity: Mutex::new(DirSpaceActivityState::default()),
             conf,
             store: DirSpaceSnapshotStore::new(),
             scan_permit: AtomicBool::new(false),
@@ -157,6 +217,74 @@ impl DirSpaceManager {
         self.config_epoch.load(Ordering::SeqCst)
     }
 
+    /// Current scan phase. `phase` is one of `disabled`, `idle`, `scanning`,
+    /// `in_round`, or `completed`.
+    pub fn activity(&self) -> DirSpaceActivity {
+        let state = self.activity.lock().expect("dir-space activity lock");
+        let enabled = self.tracking_enabled();
+        let phase = if !enabled {
+            "disabled"
+        } else if state.scanning {
+            "scanning"
+        } else if state.in_round {
+            "in_round"
+        } else if state.last_finished_ms > 0 {
+            "completed"
+        } else {
+            "idle"
+        };
+        DirSpaceActivity {
+            enabled,
+            scanning: state.scanning,
+            in_round: state.in_round,
+            phase,
+            scope: state.scope.clone(),
+            current_path: state.current_path.clone(),
+            last_outcome: state.last_outcome.clone(),
+            last_finished_ms: state.last_finished_ms,
+            next_scan_at_ms: state.next_scan_at_ms,
+            paths_total: state.paths_total,
+            paths_done: state.paths_done,
+        }
+    }
+
+    /// Record the next due time and whether a point round is still open.
+    pub fn publish_schedule(
+        &self,
+        in_round: bool,
+        scope: &str,
+        next_scan_at_ms: i64,
+        paths_total: u32,
+        paths_done: u32,
+    ) {
+        let mut state = self.activity.lock().expect("dir-space activity lock");
+        if !state.scanning {
+            state.scope = scope.to_string();
+        }
+        state.in_round = in_round;
+        state.next_scan_at_ms = next_scan_at_ms;
+        state.paths_total = paths_total;
+        state.paths_done = paths_done;
+    }
+
+    fn begin_scan(&self, scope: &str, path: &str) {
+        let mut state = self.activity.lock().expect("dir-space activity lock");
+        state.scanning = true;
+        state.in_round = true;
+        state.scope = scope.to_string();
+        state.current_path = path.to_string();
+    }
+
+    fn mark_scan_path(&self, path: &str) {
+        self.activity.lock().expect("dir-space activity lock").current_path = path.to_string();
+    }
+
+    fn note_finished(&self, outcome: ScanOutcome) {
+        let mut state = self.activity.lock().expect("dir-space activity lock");
+        state.last_outcome = outcome.as_str().to_string();
+        state.last_finished_ms = LocalTime::mills() as i64;
+    }
+
     fn bump_config_epoch(&self) {
         self.config_epoch.fetch_add(1, Ordering::SeqCst);
     }
@@ -182,7 +310,8 @@ impl DirSpaceManager {
         self.file_enabled
     }
 
-    /// Replace the explicit path list. `/` selects the global scan.
+    /// Replace the explicit path list. `/` selects the global scan when it is
+    /// already configured. A list that newly introduces `/` is rejected.
     /// Returns `(previous, applied)` normalized lists.
     pub fn update_tracked_paths(
         &self,
@@ -193,6 +322,9 @@ impl DirSpaceManager {
             self.conf.dir_space_max_tracked_points,
         )?;
         let previous = self.explicit_paths();
+        if normalized.iter().any(|path| path == "/") && !previous.iter().any(|path| path == "/") {
+            return err_box!("dir-space cannot track the root directory");
+        }
         *self
             .paths_override
             .lock()
@@ -346,6 +478,8 @@ impl DirSpaceManager {
             return (ScanOutcome::Busy, start_index, false);
         }
         let _permit = PermitGuard(&self.scan_permit);
+        self.begin_scan("point", "");
+        let _mark = ScanMark(self);
 
         self.sync_tracked_point_catalog();
         let paths = self.effective_tracked_paths();
@@ -372,10 +506,12 @@ impl DirSpaceManager {
             }
             if !monitor.is_active() {
                 self.record_simple_outcome_for_scope("point", ScanOutcome::RoleLost);
+                self.note_finished(ScanOutcome::RoleLost);
                 return (ScanOutcome::RoleLost, index, false);
             }
 
             let path = paths[index].clone();
+            self.mark_scan_path(&path);
             let Some(root_id) = self.resolve_tracked_root(&path) else {
                 warn!(
                     "dir-space tracked point {} skipped: path missing or not a directory",
@@ -384,6 +520,7 @@ impl DirSpaceManager {
                 index = (index + 1) % paths.len();
                 scanned += 1;
                 if scanned >= paths.len() {
+                    self.note_finished(ScanOutcome::Success);
                     return (ScanOutcome::Success, 0, true);
                 }
                 continue;
@@ -404,6 +541,7 @@ impl DirSpaceManager {
                         index = (index + 1) % paths.len();
                         scanned += 1;
                         if scanned >= paths.len() {
+                            self.note_finished(ScanOutcome::Success);
                             return (ScanOutcome::Success, 0, true);
                         }
                         continue;
@@ -430,27 +568,23 @@ impl DirSpaceManager {
             index = (index + 1) % paths.len();
             scanned += 1;
             if scanned >= paths.len() {
-                return (
-                    if any_success {
-                        ScanOutcome::Success
-                    } else {
-                        ScanOutcome::Failed
-                    },
-                    0,
-                    true,
-                );
+                let outcome = if any_success {
+                    ScanOutcome::Success
+                } else {
+                    ScanOutcome::Failed
+                };
+                self.note_finished(outcome);
+                return (outcome, 0, true);
             }
         }
 
-        (
-            if any_success {
-                ScanOutcome::Success
-            } else {
-                ScanOutcome::Timeout
-            },
-            index,
-            false,
-        )
+        let outcome = if any_success {
+            ScanOutcome::Success
+        } else {
+            ScanOutcome::Timeout
+        };
+        self.note_finished(outcome);
+        (outcome, index, false)
     }
 
     fn run_point_scan(
@@ -568,6 +702,8 @@ impl DirSpaceManager {
             return ScanOutcome::Busy;
         }
         let _permit = PermitGuard(&self.scan_permit);
+        self.begin_scan("global", "/");
+        let _mark = ScanMark(self);
 
         let timeout_ms = self.conf.dir_space_global_scan_timeout_ms();
         let monitor = self.fs.master_monitor.clone();
@@ -580,7 +716,9 @@ impl DirSpaceManager {
         let started_ms = LocalTime::mills() as i64;
         let result = self.run_scan(&context);
         let duration_ms = (LocalTime::mills() as i64 - started_ms).max(0) as u64;
-        self.record_outcome(result, duration_ms)
+        let outcome = self.record_outcome(result, duration_ms);
+        self.note_finished(outcome);
+        outcome
     }
 
     fn run_scan(&self, context: &ScanContext) -> CommonResult<DirSpaceSnapshot> {
@@ -1364,6 +1502,9 @@ mod tests {
                 "[\"relative\"]",
                 Some("test"),
             )
+            .is_err());
+        assert!(registry
+            .set("master.dir_space_tracked_paths", "[\"/\"]", Some("test"),)
             .is_err());
         assert_eq!(manager.explicit_paths(), vec!["/a".to_string()]);
         assert!(manager.config_epoch() >= 1);

@@ -223,3 +223,19 @@ mod tests {
         assert!(summary.snapshot.is_none());
     }
 }
+
+/// Scan-round status published by the master dir-space coordinator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirSpaceStatus {
+    pub enabled: bool,
+    pub scanning: bool,
+    pub in_round: bool,
+    pub phase: String,
+    pub scope: String,
+    pub current_path: String,
+    pub last_outcome: String,
+    pub last_finished_ms: i64,
+    pub next_scan_at_ms: i64,
+    pub paths_total: u32,
+    pub paths_done: u32,
+}

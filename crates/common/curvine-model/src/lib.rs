@@ -124,7 +124,9 @@ mod file_lock;
 pub use self::file_lock::*;
 
 mod content_summary;
-pub use self::content_summary::{ContentSummary, ContentSummarySnapshot, ContentSummarySource};
+pub use self::content_summary::{
+    ContentSummary, ContentSummarySnapshot, ContentSummarySource, DirSpaceStatus,
+};
 
 mod result;
 pub use self::result::*;

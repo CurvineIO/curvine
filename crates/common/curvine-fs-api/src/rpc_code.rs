@@ -97,6 +97,7 @@ pub enum RpcCode {
     ReconcileReplication = 66,
     SubmitFencedReplication = 67,
     GetContentSummary = 68,
+    GetDirSpaceStatus = 69,
 
     MetricsReport = 60,
     GetBlockLocationsBatch = 61,

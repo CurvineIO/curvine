@@ -21,7 +21,7 @@ mod store;
 mod types;
 
 pub use agg::{AggregationOutput, SubtreeAggregator};
-pub use manager::{DirSpaceManager, DirSpaceQueryError, ScanOutcome};
+pub use manager::{DirSpaceActivity, DirSpaceManager, DirSpaceQueryError, ScanOutcome};
 pub use scan_lease::{
     LeaseTicket, MetadataRestoreGuard, MetadataScanControl, MetadataScanLease, RestoreTicket,
 };

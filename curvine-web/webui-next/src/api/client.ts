@@ -19,6 +19,10 @@ import type {
   LoginPayload,
   MasterHaData,
   MetricQueryParams,
+  DirSpaceState,
+  DirSpaceStatus,
+  DirSpaceSummary,
+  DirSpaceUpdate,
   MountInfo,
   ObservabilityDashboard,
   ObservabilityHealth,
@@ -78,6 +82,11 @@ export interface ApiClient {
   fetchWorkersData(): Promise<WorkersData>
   fetchWorkerDetail(worker: string): Promise<WorkerDetailData>
   updateWorkerAction(worker: string, action: WorkerAction): Promise<unknown>
+
+  fetchDirSpace(): Promise<DirSpaceState>
+  fetchDirSpaceStatus(): Promise<DirSpaceStatus>
+  updateDirSpace(data: DirSpaceUpdate): Promise<DirSpaceState>
+  fetchDirSpaceSummaries(paths: string[]): Promise<{ items: DirSpaceSummary[] }>
 
   fetchMountsData(): Promise<unknown>
   saveMount(data: Record<string, unknown>): Promise<unknown>
@@ -193,6 +202,12 @@ export function createApiClient(options: HttpClientOptions = {}): ApiClient {
     fetchWorkersData: () => get<WorkersData>('/v1/workers'),
     fetchWorkerDetail: (worker) => get<WorkerDetailData>(`/v1/workers/detail/${encodeURIComponent(worker)}`),
     updateWorkerAction: (worker, action) => post('/v1/workers/action', { worker, action }),
+
+    fetchDirSpace: () => get<DirSpaceState>('/v1/fs/dir-space'),
+    fetchDirSpaceStatus: () => get<DirSpaceStatus>('/v1/fs/dir-space/status'),
+    updateDirSpace: (data) => post<DirSpaceState>('/v1/fs/dir-space', data),
+    fetchDirSpaceSummaries: (paths) =>
+      post<{ items: DirSpaceSummary[] }>('/v1/fs/dir-space/summaries', { paths }),
 
     fetchMountsData: () => get('/v1/mounts'),
     saveMount: (data) => post('/v1/mounts', data),

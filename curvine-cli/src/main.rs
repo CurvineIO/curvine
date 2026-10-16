@@ -237,6 +237,7 @@ fn main() -> CommonResult<()> {
             Some(Commands::Node(cmd)) => cmd.execute(fs_client, conf.clone()).await,
             Some(Commands::Admin(cmd)) => match cmd.action {
                 cmds::AdminSubCommand::Config(config) => config.execute(fs_client).await,
+                cmds::AdminSubCommand::DirSpace(dir_space) => dir_space.execute(fs_client).await,
             },
             Some(Commands::Version) | None => Ok(()),
         };

@@ -174,6 +174,39 @@ export interface UfsSyncJob {
   [key: string]: unknown
 }
 
+export interface DirSpaceState {
+  enabled: boolean
+  paths: string[]
+}
+
+export interface DirSpaceStatus {
+  enabled: boolean
+  scanning: boolean
+  in_round: boolean
+  phase: 'disabled' | 'idle' | 'scanning' | 'in_round' | 'completed' | string
+  scope: string
+  current_path: string
+  last_outcome: string
+  last_finished_ms: number
+  next_scan_at_ms: number
+  paths_total: number
+  paths_done: number
+}
+
+export interface DirSpaceUpdate {
+  enabled?: boolean
+  path?: string
+  tracked?: boolean
+}
+
+export interface DirSpaceSummary {
+  path: string
+  state: 'ready' | 'pending' | 'off'
+  logical_bytes?: number
+  directory_count?: number
+  file_count?: number
+}
+
 export interface MountInfo {
   mount_id?: string | number | null
   cv_path: string

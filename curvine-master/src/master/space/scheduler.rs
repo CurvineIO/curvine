@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use curvine_error::FsError;
+use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::LoopTask;
 
 use crate::master::space::manager::{DirSpaceManager, ScanOutcome};
@@ -144,6 +145,7 @@ impl DirSpaceCoordinatorTask {
             *point_next_due = Instant::now();
         }
         if !active {
+            self.publish_schedule(&global_next_due, &point_next_due, false);
             return;
         }
 
@@ -151,6 +153,7 @@ impl DirSpaceCoordinatorTask {
         self.manager.refresh_global_age();
         self.manager.refresh_point_metrics();
         if !self.manager.tracking_enabled() {
+            self.publish_schedule(&global_next_due, &point_next_due, false);
             return;
         }
 
@@ -162,6 +165,7 @@ impl DirSpaceCoordinatorTask {
         if global_due && (!point_due || *global_next_due <= *point_next_due) {
             let outcome = self.manager.try_scan_global();
             self.schedule_global_after(&mut global_next_due, outcome);
+            self.publish_schedule(&global_next_due, &point_next_due, false);
             return;
         }
 
@@ -171,7 +175,52 @@ impl DirSpaceCoordinatorTask {
                 self.manager.try_scan_tracked_points(start);
             self.point_cursor.store(next_cursor, Ordering::SeqCst);
             self.schedule_point_after(&mut point_next_due, outcome, round_complete);
+            self.publish_schedule(&global_next_due, &point_next_due, !round_complete);
+            return;
         }
+
+        let in_round = self.point_cursor.load(Ordering::SeqCst) != 0
+            && !self.manager.effective_tracked_paths().is_empty();
+        self.publish_schedule(&global_next_due, &point_next_due, in_round);
+    }
+
+    fn publish_schedule(&self, global_due: &Instant, point_due: &Instant, in_round: bool) {
+        let paths = self.manager.effective_tracked_paths();
+        let tracks_root = self.manager.tracks_root();
+        let cursor = self.point_cursor.load(Ordering::SeqCst);
+        let paths_total = paths.len() as u32;
+        let paths_done = if in_round {
+            cursor.min(paths.len()) as u32
+        } else {
+            paths_total
+        };
+        let mut next_ms = 0i64;
+        let mut scope = "none";
+        if self.manager.tracking_enabled() {
+            let mut candidates: Vec<(Instant, &str)> = Vec::new();
+            if tracks_root {
+                candidates.push((*global_due, "global"));
+            }
+            if !paths.is_empty() {
+                candidates.push((*point_due, "point"));
+            }
+            if let Some((due, which)) = candidates.iter().min_by_key(|(due, _)| *due) {
+                scope = if in_round { "point" } else { *which };
+                next_ms = unix_ms_of(*due);
+            }
+        }
+        self.manager
+            .publish_schedule(in_round, scope, next_ms, paths_total, paths_done);
+    }
+}
+
+fn unix_ms_of(due: Instant) -> i64 {
+    let now = Instant::now();
+    let now_ms = LocalTime::mills() as i64;
+    if due <= now {
+        now_ms
+    } else {
+        now_ms + due.saturating_duration_since(now).as_millis() as i64
     }
 }
 

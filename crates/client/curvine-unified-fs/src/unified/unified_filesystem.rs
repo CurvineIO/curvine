@@ -379,6 +379,11 @@ impl UnifiedFileSystem {
         self.track("GetRuntimeConfig", label, "", fut).await
     }
 
+    pub async fn get_dir_space_status(&self) -> FsResult<curvine_model::DirSpaceStatus> {
+        let fut = async { self.cv.get_dir_space_status().await };
+        self.track("GetDirSpaceStatus", "", "", fut).await
+    }
+
     pub async fn reset_runtime_config(&self, key: &str) -> FsResult<RuntimeConfigResetResult> {
         let fut = async { self.cv.reset_runtime_config(key).await };
         self.track("ResetRuntimeConfig", key, "", fut).await

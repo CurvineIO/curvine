@@ -13,9 +13,11 @@
 // limitations under the License.
 
 mod config;
+mod dir_space;
 
 use clap::{Parser, Subcommand};
 pub use config::ConfigCommand;
+pub use dir_space::DirSpaceCommand;
 
 #[derive(Parser, Debug)]
 pub struct AdminCommand {
@@ -27,4 +29,7 @@ pub struct AdminCommand {
 pub enum AdminSubCommand {
     #[command(name = "config")]
     Config(ConfigCommand),
+    /// Directory statistics switch and explicit path list
+    #[command(name = "dir-space")]
+    DirSpace(DirSpaceCommand),
 }

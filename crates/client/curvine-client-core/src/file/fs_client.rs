@@ -111,6 +111,8 @@ impl_without_client_context!(
     GetFileBlockDetailsRequest,
     GetJobStatusRequest,
     GetFilesystemInfoRequest,
+    GetDirSpaceStatusRequest,
+    GetDirSpaceStatusResponse,
     GetMountInfoRequest,
     GetMountTableRequest,
     GetRuntimeConfigRequest,
@@ -767,6 +769,24 @@ impl FsClient {
             .summary
             .ok_or_else(|| FsError::common("GetContentSummary response missing summary"))?;
         Ok(ProtoUtils::content_summary_from_pb(summary))
+    }
+
+    pub async fn get_dir_space_status(&self) -> FsResult<curvine_model::DirSpaceStatus> {
+        let header = GetDirSpaceStatusRequest {};
+        let rep: GetDirSpaceStatusResponse = self.rpc(RpcCode::GetDirSpaceStatus, header).await?;
+        Ok(curvine_model::DirSpaceStatus {
+            enabled: rep.enabled,
+            scanning: rep.scanning,
+            in_round: rep.in_round,
+            phase: rep.phase,
+            scope: rep.scope,
+            current_path: rep.current_path.unwrap_or_default(),
+            last_outcome: rep.last_outcome.unwrap_or_default(),
+            last_finished_ms: rep.last_finished_ms,
+            next_scan_at_ms: rep.next_scan_at_ms,
+            paths_total: rep.paths_total,
+            paths_done: rep.paths_done,
+        })
     }
 
     pub async fn get_file_block_details(&self, path: &Path) -> FsResult<FileBlockDetails> {
