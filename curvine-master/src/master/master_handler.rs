@@ -630,20 +630,32 @@ impl MasterHandler {
         // and clear every other label for the peer; otherwise a peer whose
         // verdict changes over time leaves stale series stuck at 1.
         let verdict_label = Self::verdict_label(&verdict);
-        let is_worker = dedup_key.starts_with("worker:");
-        for label in Self::VERDICT_LABELS {
-            let active = if label == verdict_label { 1 } else { 0 };
-            if is_worker {
-                let worker_id = &dedup_key["worker:".len()..];
+        if let Some(worker_id) = dedup_key.strip_prefix("worker:") {
+            for label in Self::VERDICT_LABELS {
+                let active = if label == verdict_label { 1 } else { 0 };
                 metrics
                     .compat_worker_verdict
                     .with_label_values(&[worker_id, label])
                     .set(active);
-            } else {
-                metrics
-                    .compat_client_verdict
-                    .with_label_values(&[dedup_key, label])
-                    .set(active);
+            }
+        } else {
+            // Client addresses are not bounded by cluster size, so only
+            // clients that are not compatible keep a series, and only for
+            // their current verdict. A compatible client has its series
+            // removed so they do not accumulate for every address seen.
+            let compatible = verdict.is_compatible();
+            for label in Self::VERDICT_LABELS {
+                if !compatible && label == verdict_label {
+                    metrics
+                        .compat_client_verdict
+                        .with_label_values(&[dedup_key, label])
+                        .set(1);
+                } else {
+                    // Fails only when the series does not exist.
+                    let _ = metrics
+                        .compat_client_verdict
+                        .remove_label_values(&[dedup_key, label]);
+                }
             }
         }
 
@@ -1551,6 +1563,26 @@ mod tests {
                 .get(),
             1
         );
+
+        // Once the client is compatible its series is removed, not set to 0.
+        MasterHandler::check_peer_compatibility(
+            "client",
+            "client:10.0.0.1",
+            &warned,
+            CompatibilityMode::Diagnose,
+            CompatibilityVerdict::Compatible,
+            metrics,
+        )
+        .unwrap();
+        for label in MasterHandler::VERDICT_LABELS {
+            assert!(
+                metrics
+                    .compat_client_verdict
+                    .remove_label_values(&["client:10.0.0.1", label])
+                    .is_err(),
+                "series for {label} still exists"
+            );
+        }
     }
 
     #[test]
