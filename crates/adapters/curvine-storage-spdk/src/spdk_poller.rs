@@ -460,6 +460,14 @@ impl SpdkPoller {
             .any(|qs| !qs.pending.is_empty() && !qs.dead.load(Ordering::Acquire))
     }
 
+    fn should_exit_on_shutdown(
+        shutdown: &AtomicBool,
+        rx_empty: bool,
+        _qpair_state: &HashMap<usize, Box<QpairState>>,
+    ) -> bool {
+        shutdown.load(Ordering::Acquire) && rx_empty
+    }
+
     /// Main poller loop. Runs on dedicated thread.
     fn poller_loop(
         rx: crossbeam::channel::Receiver<IoRequest>,
@@ -485,10 +493,7 @@ impl SpdkPoller {
         let poll_interval = config.poll_interval_ms as i32;
         loop {
             // Check shutdown first
-            if shutdown.load(Ordering::Acquire)
-                && rx.is_empty()
-                && !Self::has_active_qpairs(&qpair_state)
-            {
+            if Self::should_exit_on_shutdown(&shutdown, rx.is_empty(), &qpair_state) {
                 break;
             }
 
@@ -1949,6 +1954,45 @@ mod test {
         assert_eq!(inflight.load(Ordering::Acquire), 1);
         entry.reclaim();
         assert_eq!(inflight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn shutdown_exit_does_not_wait_for_active_qpairs() {
+        let shutdown = AtomicBool::new(true);
+        let mut qpair_state = HashMap::new();
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: IoCompletion::new(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: Arc::new(AtomicUsize::new(1)),
+            dma_ref_released: AtomicBool::new(false),
+            qpair_state: std::ptr::null_mut(),
+            pending_idx: 0,
+        }));
+        qpair_state.insert(
+            0xDEAD,
+            Box::new(QpairState {
+                dead: Arc::new(AtomicBool::new(false)),
+                pending: vec![ctx],
+                stale: Vec::new(),
+            }),
+        );
+
+        assert!(SpdkPoller::has_active_qpairs(&qpair_state));
+        assert!(SpdkPoller::should_exit_on_shutdown(
+            &shutdown,
+            true,
+            &qpair_state
+        ));
+
+        for (_, mut qs) in qpair_state {
+            qs.reclaim_stale();
+            for pending in qs.pending.drain(..) {
+                unsafe {
+                    (*pending).release_dma_ref();
+                    drop(Box::from_raw(pending));
+                }
+            }
+        }
     }
 
     #[test]
