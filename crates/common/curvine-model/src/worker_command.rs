@@ -66,5 +66,7 @@ pub struct BlockReportList {
     pub worker_id: u32,
     pub full_report: bool,
     pub total_len: u64,
+    /// Full report round id; 0 when the worker did not send one.
+    pub report_id: u64,
     pub blocks: Vec<BlockReportInfo>,
 }

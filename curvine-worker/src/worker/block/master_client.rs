@@ -124,6 +124,7 @@ impl MasterClient {
 
     pub fn full_block_report(
         &self,
+        report_id: u64,
         total_size: usize,
         blocks: &[BlockMeta],
     ) -> CommonResult<BlockReportListResponse> {
@@ -133,6 +134,7 @@ impl MasterClient {
             worker_session_id: Some(self.worker_session_id.clone()),
             full_report: true,
             total_len: total_size as u64,
+            report_id: Some(report_id),
             blocks: vec![],
         };
 
@@ -169,6 +171,7 @@ impl MasterClient {
             worker_session_id: Some(self.worker_session_id.clone()),
             full_report: false,
             total_len: blocks.len() as u64,
+            report_id: None,
             blocks: vec![],
         };
 
