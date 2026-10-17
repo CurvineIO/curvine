@@ -1238,22 +1238,37 @@ impl SpdkEnv {
 
     /// Names of all discovered bdevs.
     pub fn bdev_names(&self) -> Vec<String> {
-        self.bdevs.iter().map(|b| b.name.clone()).collect()
+        self.active_bdevs().map(|b| b.name.clone()).collect()
     }
 
     /// All discovered bdev metadata.
-    pub fn bdevs(&self) -> &[BdevInfo] {
-        &self.bdevs
+    pub fn bdevs(&self) -> Vec<BdevInfo> {
+        self.active_bdevs().cloned().collect()
+    }
+
+    /// Number of bdevs currently available for new opens.
+    pub fn active_bdev_count(&self) -> usize {
+        self.active_bdevs().count()
     }
 
     /// Look up a bdev by name.
     pub fn get_bdev(&self, name: &str) -> Option<&BdevInfo> {
-        self.bdevs.iter().find(|b| b.name == name)
+        self.active_bdevs().find(|b| b.name == name)
     }
 
     /// Total capacity across all bdevs, in bytes.
     pub fn total_capacity(&self) -> u64 {
-        self.bdevs.iter().map(|b| b.size_bytes).sum()
+        self.active_bdevs().map(|b| b.size_bytes).sum()
+    }
+
+    /// Iterate bdevs whose controller is still active and available for opens.
+    fn active_bdevs(&self) -> impl Iterator<Item = &BdevInfo> {
+        self.bdevs.iter().filter(|bdev| {
+            self.controllers
+                .iter()
+                .find(|entry| entry.ctrlr == bdev.ctrlr)
+                .is_some_and(|entry| entry.state() == ControllerState::Active)
+        })
     }
 
     /// Number of live `SpdkBdev` handles.
@@ -2245,6 +2260,32 @@ mod test {
     }
 
     #[test]
+    fn detached_controller_is_hidden_from_bdev_metadata() {
+        let mut env = SpdkEnv::new(SpdkConf::default()).unwrap();
+        env.bdevs.push(BdevInfo {
+            name: "nvme-a".into(),
+            size_bytes: 1024,
+            block_size: 512,
+            num_blocks: 2,
+            target_endpoint: "tcp://a".into(),
+            ctrlr: 0x1000,
+            ns: 0x2000,
+            io_timeout_ms: 1000,
+        });
+        env.controllers.push(ControllerEntry {
+            target_idx: 0,
+            ctrlr: 0x1000,
+            state: AtomicU8::new(ControllerState::Detached as u8),
+        });
+
+        assert!(env.bdev_names().is_empty());
+        assert_eq!(env.active_bdev_count(), 0);
+        assert!(env.bdevs().is_empty());
+        assert!(env.get_bdev("nvme-a").is_none());
+        assert_eq!(env.total_capacity(), 0);
+    }
+
+    #[test]
     fn detach_preflight_rejects_open_handles() {
         let err = SpdkEnv::validate_detach_preconditions(1, 2)
             .expect_err("open handles must block detach")
@@ -2401,6 +2442,9 @@ mod test {
 
         assert_eq!(env.controllers[0].state(), ControllerState::Detached);
         assert_eq!(env.qpair_pool.controller_stats(0x1000), (0, 0));
+        assert_eq!(env.active_bdev_count(), 0);
+        assert!(env.bdevs().is_empty());
+        assert!(env.get_bdev("nvme-0").is_none());
     }
 
     #[test]
