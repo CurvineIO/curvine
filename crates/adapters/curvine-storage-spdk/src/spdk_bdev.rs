@@ -403,7 +403,7 @@ impl SpdkBdev {
             }
             let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
-                if rc == -libc::EIO {
+                if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                     self.io_channel.qpair_dead.store(true, Ordering::Release);
                 }
                 return err_box!(
@@ -486,7 +486,7 @@ impl SpdkBdev {
                 let rc = completion.wait(self.io_timeout_ms * 1000);
 
                 if rc != 0 {
-                    if rc == -libc::EIO {
+                    if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                         self.io_channel.qpair_dead.store(true, Ordering::Release);
                     }
                     return err_box!(
@@ -536,7 +536,7 @@ impl SpdkBdev {
             }
             let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
-                if rc == -libc::EIO {
+                if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                     self.io_channel.qpair_dead.store(true, Ordering::Release);
                 }
                 return err_box!(
@@ -573,7 +573,7 @@ impl SpdkBdev {
         )?;
         let rc = completion.wait(self.io_timeout_ms * 1000);
         if rc != 0 {
-            if rc == -libc::EIO {
+            if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                 self.io_channel.qpair_dead.store(true, Ordering::Release);
             }
             return err_box!(
