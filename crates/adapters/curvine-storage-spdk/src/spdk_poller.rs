@@ -978,6 +978,13 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
 
 #[cfg(test)]
 pub(crate) fn retired_qpair_with_stale_callback_for_test() -> (RetiredQpair, *mut c_void) {
+    let (retired, stale_callback, _) = retired_qpair_with_stale_inflight_for_test();
+    (retired, stale_callback)
+}
+
+#[cfg(test)]
+pub(crate) fn retired_qpair_with_stale_inflight_for_test(
+) -> (RetiredQpair, *mut c_void, Arc<AtomicUsize>) {
     let completion = IoCompletion::new();
     let inflight = Arc::new(AtomicUsize::new(1));
     assert!(completion.complete(-libc::ESHUTDOWN));
@@ -990,7 +997,7 @@ pub(crate) fn retired_qpair_with_stale_callback_for_test() -> (RetiredQpair, *mu
     let ctx = Box::into_raw(Box::new(CallbackCtx {
         completion,
         async_ctx: unsafe { std::mem::zeroed() },
-        bdev_inflight: inflight,
+        bdev_inflight: inflight.clone(),
         dma_ref_released: AtomicBool::new(false),
         qpair_state: &mut *qpair_state,
         pending_idx: 0,
@@ -1003,6 +1010,7 @@ pub(crate) fn retired_qpair_with_stale_callback_for_test() -> (RetiredQpair, *mu
             must_free: true,
         },
         ctx as *mut c_void,
+        inflight,
     )
 }
 

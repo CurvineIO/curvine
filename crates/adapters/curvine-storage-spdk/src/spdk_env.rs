@@ -3,7 +3,10 @@
 use crate::spdk_ffi;
 use crate::spdk_metrics;
 #[cfg(test)]
-use crate::spdk_poller::{poller_callback_for_test, retired_qpair_with_stale_callback_for_test};
+use crate::spdk_poller::{
+    poller_callback_for_test, retired_qpair_with_stale_callback_for_test,
+    retired_qpair_with_stale_inflight_for_test,
+};
 use crate::spdk_poller::{CtrlHandle, PollerConfig};
 use crate::spdk_poller::{
     IoRequest, RetiredQpair, RetiredQpairCleanup, RetiredQpairPollOutcome, RetiredQpairRegistry,
@@ -1829,6 +1832,32 @@ mod test {
 
         assert_eq!(env.deferred_qpair_count(), 1);
         assert!(env.retired_qpairs.take(qpair).is_none());
+    }
+
+    #[test]
+    fn retire_qpair_reclaims_stale_inflight_before_drop_wait() {
+        let mut env = test_env();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let (retired, _, inflight) = retired_qpair_with_stale_inflight_for_test();
+
+        env.qpair_pool.register_limit(ctrlr as usize, 1);
+        assert_eq!(
+            env.qpair_pool.try_reserve(ctrlr as usize),
+            QpairReserveResult::Reserved
+        );
+        env.retired_qpairs.put_back(qpair, retired);
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(|_| 0);
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+
+        assert_eq!(inflight.load(Ordering::Acquire), 1);
+
+        env.retire_qpair(ctrlr, qpair);
+
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+        assert_eq!(env.deferred_qpair_count(), 0);
+        assert_eq!(env.qpair_pool.controller_stats(ctrlr as usize).0, 0);
     }
 
     #[test]
