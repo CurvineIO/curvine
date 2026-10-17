@@ -1226,7 +1226,7 @@ impl FsDir {
                     opts.clone()
                 };
                 cur_inode.as_mut().set_attr(set_opts)?;
-                change_inodes.push(cur_inode.as_ref().clone());
+                change_inodes.push(cur_inode.as_ref().clone_metadata());
             }
 
             match cur_inode.as_mut() {
