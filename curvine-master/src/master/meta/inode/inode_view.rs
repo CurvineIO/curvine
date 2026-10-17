@@ -111,6 +111,15 @@ pub enum InodeView {
 }
 
 impl InodeView {
+    /// Copy an inode for persistence; directory edges are stored separately.
+    /// This copy must not replace the live directory because its children are empty.
+    pub(crate) fn clone_metadata(&self) -> Self {
+        match self {
+            Dir(dir) => Self::new_dir(dir.name.clone(), dir.dir.clone_metadata()),
+            _ => self.clone(),
+        }
+    }
+
     pub fn new_dir(name: String, dir: InodeDir) -> Self {
         Dir(Box::new(NamedDir::new(name, dir)))
     }
@@ -638,6 +647,35 @@ impl PartialEq for InodeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_clone_preserves_persisted_fields_without_copying_children() {
+        let mut inode = InodeView::new_dir("parent".into(), InodeDir::new(7001, 42));
+        inode.set_parent_id(7000);
+        inode.incr_nlink(43);
+        inode
+            .set_attr(SetAttrOpts {
+                owner: Some("owner".into()),
+                group: Some("group".into()),
+                mode: Some(0o2750),
+                atime: Some(45),
+                mtime: Some(46),
+                ttl_ms: Some(10_000),
+                add_x_attr: HashMap::from([("user.research".into(), vec![1, 2, 3])]),
+                ..Default::default()
+            })
+            .unwrap();
+        inode
+            .add_child(InodeView::new_dir("child".into(), InodeDir::new(7002, 44)))
+            .unwrap();
+        let copy = inode.clone_metadata();
+        assert_eq!(inode.child_len(), 1);
+        assert_eq!(copy.child_len(), 0);
+        assert_eq!(
+            SerdeUtils::serialize(&inode).unwrap(),
+            SerdeUtils::serialize(&copy).unwrap()
+        );
+    }
 
     #[test]
     fn setattr_updates_ctime_when_mtime_is_omitted() {
