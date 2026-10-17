@@ -676,9 +676,7 @@ impl SpdkPoller {
                 qs.dead.store(true, Ordering::Release);
                 for &ptr in &qs.pending {
                     unsafe {
-                        if (*ptr).completion.complete(-libc::ESHUTDOWN) {
-                            (*ptr).bdev_inflight.fetch_sub(1, Ordering::Release);
-                        }
+                        (*ptr).completion.complete(-libc::ESHUTDOWN);
                     }
                 }
                 let pending = std::mem::take(&mut qs.pending);
@@ -741,6 +739,7 @@ impl SpdkPoller {
             completion: req.completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: req.bdev_inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: qs_ptr,
             pending_idx,
         });
@@ -811,13 +810,11 @@ impl SpdkPoller {
                     if pos < (*qs_ptr).pending.len() {
                         (*(&mut (*qs_ptr).pending)[pos]).pending_idx = pos;
                     }
+                    (*cb_ctx_ptr).release_dma_ref();
                     drop(Box::from_raw(cb_ctx_ptr));
-                    if req.completion.complete(rc) {
-                        req.bdev_inflight.fetch_sub(1, Ordering::Release);
-                    }
+                    req.completion.complete(rc);
                 }
             }
-            return;
         }
     }
 
@@ -830,11 +827,9 @@ impl SpdkPoller {
             let count = pending.len();
             for cb_ptr in &pending {
                 // Signal but DON'T free - keep alive for late callbacks.
-                let ctx = *cb_ptr as *mut CallbackCtx;
+                let ctx = *cb_ptr;
                 unsafe {
-                    if (*ctx).completion.complete(-libc::EIO) {
-                        (*ctx).bdev_inflight.fetch_sub(1, Ordering::Release);
-                    }
+                    (*ctx).completion.complete(-libc::EIO);
                 }
             }
             // Move to stale so reclaim_stale can free them later.
@@ -920,7 +915,10 @@ unsafe impl Send for QpairState {}
 impl QpairState {
     fn reclaim_stale(&mut self) {
         for ptr in self.stale.drain(..) {
-            unsafe { drop(Box::from_raw(ptr as *mut CallbackCtx)) };
+            unsafe {
+                (*ptr).release_dma_ref();
+                drop(Box::from_raw(ptr));
+            };
         }
     }
 }
@@ -930,10 +928,19 @@ struct CallbackCtx {
     completion: Arc<IoCompletion>,
     async_ctx: spdk_ffi::curvine_async_ctx,
     bdev_inflight: Arc<AtomicUsize>,
+    dma_ref_released: AtomicBool,
     /// Points back to the qpair's QpairState
     qpair_state: *mut QpairState,
     /// Index into QpairState::pending
     pending_idx: usize,
+}
+
+impl CallbackCtx {
+    fn release_dma_ref(&self) {
+        if !self.dma_ref_released.swap(true, Ordering::AcqRel) {
+            self.bdev_inflight.fetch_sub(1, Ordering::Release);
+        }
+    }
 }
 
 /// SPDK NVMe completion callback.
@@ -946,7 +953,7 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
     let ctx = &*(cb_arg as *mut CallbackCtx);
 
     if ctx.completion.complete(status) {
-        let qs = &mut *(ctx.qpair_state as *mut QpairState);
+        let qs = &mut *ctx.qpair_state;
 
         // Defensive: skip swap_remove if pending is empty (underflow guard).
         if !qs.pending.is_empty() {
@@ -961,16 +968,18 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
             }
         }
 
-        ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
+        ctx.release_dma_ref();
         // Free the CallbackCtx now that accounting is done.
         drop(Box::from_raw(cb_arg as *mut CallbackCtx));
+    } else {
+        ctx.release_dma_ref();
     }
 }
 
 #[cfg(test)]
 pub(crate) fn retired_qpair_with_stale_callback_for_test() -> (RetiredQpair, *mut c_void) {
     let completion = IoCompletion::new();
-    let inflight = Arc::new(AtomicUsize::new(0));
+    let inflight = Arc::new(AtomicUsize::new(1));
     assert!(completion.complete(-libc::ESHUTDOWN));
 
     let mut qpair_state = Box::new(QpairState {
@@ -982,6 +991,7 @@ pub(crate) fn retired_qpair_with_stale_callback_for_test() -> (RetiredQpair, *mu
         completion,
         async_ctx: unsafe { std::mem::zeroed() },
         bdev_inflight: inflight,
+        dma_ref_released: AtomicBool::new(false),
         qpair_state: &mut *qpair_state,
         pending_idx: 0,
     }));
@@ -1041,7 +1051,7 @@ mod test {
     #[test]
     fn retired_qpair_free_failure_keeps_stale_callback_ctx_valid_until_reclaim() {
         let completion = IoCompletion::new();
-        let inflight = Arc::new(AtomicUsize::new(0));
+        let inflight = Arc::new(AtomicUsize::new(1));
 
         // Force the callback into the late path: completion was already signaled
         // when the qpair was retired, so a later SPDK callback must not free ctx.
@@ -1058,6 +1068,7 @@ mod test {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: qpair_state_ptr,
             pending_idx: 0,
         }));
@@ -1075,6 +1086,7 @@ mod test {
 
         // Simulate a later successful free: only now is it safe to reclaim stale.
         retired.reclaim();
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1100,6 +1112,7 @@ mod test {
             completion: completion_1.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_1.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs_dead as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1109,6 +1122,7 @@ mod test {
             completion: completion_2.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_2.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs_dead as *mut QpairState,
             pending_idx: 1,
         }));
@@ -1126,6 +1140,7 @@ mod test {
             completion: completion_3.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_3.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs_live as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1146,9 +1161,9 @@ mod test {
         // Assert: LIVE entry NOT completed (timeout with 1ms).
         assert_eq!(completion_3.wait(1000), -libc::ETIMEDOUT);
 
-        // Assert: DEAD entries' bdev_inflight decremented.
-        assert_eq!(inflight_1.load(Ordering::Acquire), 0);
-        assert_eq!(inflight_2.load(Ordering::Acquire), 0);
+        // Assert: DEAD entries keep DMA refs until callback or stale reclaim.
+        assert_eq!(inflight_1.load(Ordering::Acquire), 1);
+        assert_eq!(inflight_2.load(Ordering::Acquire), 1);
 
         // Assert: LIVE entry's bdev_inflight unchanged.
         assert_eq!(inflight_3.load(Ordering::Acquire), 1);
@@ -1162,6 +1177,8 @@ mod test {
         if let Some(qs) = qpair_state.get_mut(&DEAD) {
             qs.reclaim_stale();
         }
+        assert_eq!(inflight_1.load(Ordering::Acquire), 0);
+        assert_eq!(inflight_2.load(Ordering::Acquire), 0);
         qpair_state.remove(&DEAD);
 
         // Assert: LIVE still present and untouched.
@@ -1171,7 +1188,10 @@ mod test {
         // The raw pointer in qs_live.pending must be reclaimed.
         if let Some(qs) = qpair_state.get_mut(&LIVE) {
             for cb_ptr in qs.pending.drain(..) {
-                unsafe { drop(Box::from_raw(cb_ptr as *mut CallbackCtx)) };
+                unsafe {
+                    (*cb_ptr).release_dma_ref();
+                    drop(Box::from_raw(cb_ptr as *mut CallbackCtx));
+                };
             }
         }
     }
@@ -1193,6 +1213,7 @@ mod test {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: qs_ptr,
             pending_idx: 0,
         });
@@ -1222,6 +1243,7 @@ mod test {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &*qs as *const QpairState as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1252,26 +1274,30 @@ mod test {
             stale: Vec::new(),
         });
 
-        // Simulate force_complete_qpair signaling first.
+        // Simulate force_complete_qpair signaling first without releasing DMA.
         assert!(completion.complete(42));
-        inflight.fetch_sub(1, Ordering::Release);
-        assert_eq!(inflight.load(Ordering::Acquire), 0);
+        assert_eq!(inflight.load(Ordering::Acquire), 1);
 
         // Now poller_callback fires on the same ctx.
         let ctx = Box::into_raw(Box::new(CallbackCtx {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         }));
         qs.pending.push(ctx);
 
-        // complete() returns false -> fetch_sub skipped.
+        // complete() returns false, but the late callback releases DMA once.
         unsafe { poller_callback(ctx as *mut c_void, 99) };
 
         assert_eq!(completion.wait(0), 42, "first signal wins");
-        assert_eq!(inflight.load(Ordering::Acquire), 0, "no double-decrement");
+        assert_eq!(inflight.load(Ordering::Acquire), 0, "DMA ref released once");
+        unsafe {
+            (*ctx).release_dma_ref();
+            drop(Box::from_raw(ctx));
+        }
     }
 
     #[test]
@@ -1287,6 +1313,7 @@ mod test {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &*qs as *const QpairState as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1313,6 +1340,7 @@ mod test {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         });
@@ -1325,8 +1353,10 @@ mod test {
             if pos < qs.pending.len() {
                 unsafe { (*qs.pending[pos]).pending_idx = pos };
             }
-            unsafe { drop(Box::from_raw(cb_ctx_ptr)) };
-            inflight.fetch_sub(1, Ordering::Release);
+            unsafe {
+                (*cb_ctx_ptr).release_dma_ref();
+                drop(Box::from_raw(cb_ctx_ptr));
+            }
             completion.complete(-libc::ENOMEM);
         }
 
@@ -1350,6 +1380,7 @@ mod test {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         });
@@ -1395,6 +1426,7 @@ mod test {
             completion: completion_0.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_0.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1404,6 +1436,7 @@ mod test {
             completion: completion_1.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_1.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 1,
         }));
@@ -1415,8 +1448,10 @@ mod test {
             if pos < qs.pending.len() {
                 unsafe { (*qs.pending[pos]).pending_idx = pos };
             }
-            unsafe { drop(Box::from_raw(ctx_0)) };
-            inflight_0.fetch_sub(1, Ordering::Release);
+            unsafe {
+                (*ctx_0).release_dma_ref();
+                drop(Box::from_raw(ctx_0));
+            }
             completion_0.complete(-libc::EIO);
         }
 
@@ -1436,12 +1471,15 @@ mod test {
         assert_eq!(inflight_1.load(Ordering::Acquire), 1);
 
         // Clean up ctx_1.
-        unsafe { drop(Box::from_raw(ctx_1)) };
+        unsafe {
+            (*ctx_1).release_dma_ref();
+            drop(Box::from_raw(ctx_1));
+        }
     }
 
     #[test]
     fn poller_callback_late_path_does_not_double_signal() {
-        let inflight = Arc::new(AtomicUsize::new(0));
+        let inflight = Arc::new(AtomicUsize::new(1));
         let completion = IoCompletion::new();
         let qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
@@ -1451,13 +1489,14 @@ mod test {
 
         // Simulate force_complete signaling first.
         assert!(completion.complete(-libc::EIO));
-        assert_eq!(inflight.load(Ordering::Acquire), 0);
+        assert_eq!(inflight.load(Ordering::Acquire), 1);
 
         // Now simulate the late SPDK callback.
         let ctx = Box::into_raw(Box::new(CallbackCtx {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &*qs as *const QpairState as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1465,11 +1504,14 @@ mod test {
 
         // Completion unchanged (still -EIO from force_complete).
         assert_eq!(completion.wait(0), -libc::EIO);
-        // Inflight unchanged (force_complete already decremented).
+        // Late callback releases the DMA ref after force-complete signaled the waiter.
         assert_eq!(inflight.load(Ordering::Acquire), 0);
 
-        // Late path doesn't free — reclaim manually.
-        unsafe { drop(Box::from_raw(ctx)) };
+        // Late path doesn't free; stale reclaim later observes the ref already released.
+        unsafe {
+            (*ctx).release_dma_ref();
+            drop(Box::from_raw(ctx));
+        }
     }
 
     #[test]
@@ -1491,6 +1533,7 @@ mod test {
                 completion: completions[i].clone(),
                 async_ctx: unsafe { std::mem::zeroed() },
                 bdev_inflight: inflight[i].clone(),
+                dma_ref_released: AtomicBool::new(false),
                 qpair_state: &mut *qs as *mut QpairState,
                 pending_idx: i,
             }));
@@ -1562,6 +1605,7 @@ mod test {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1609,6 +1653,7 @@ mod test {
             completion: completion_1.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_1.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1618,6 +1663,7 @@ mod test {
             completion: completion_2.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_2.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 1,
         }));
@@ -1659,15 +1705,17 @@ mod test {
         assert!(retired_qs.stale.contains(&ctx_1));
         assert!(retired_qs.stale.contains(&ctx_2));
 
-        // 3: pending entries signaled with -ESHUTDOWN, inflight decremented
+        // 3: pending entries signaled with -ESHUTDOWN, DMA refs kept until reclaim
         assert_eq!(completion_1.wait(0), -libc::ESHUTDOWN);
         assert_eq!(completion_2.wait(0), -libc::ESHUTDOWN);
-        assert_eq!(inflight_1.load(Ordering::Acquire), 0);
-        assert_eq!(inflight_2.load(Ordering::Acquire), 0);
+        assert_eq!(inflight_1.load(Ordering::Acquire), 1);
+        assert_eq!(inflight_2.load(Ordering::Acquire), 1);
 
         // 5: ack was sent
         assert_eq!(ack_rx.try_recv(), Ok(()), "handle_unregister must send ack");
         retired_qpair.reclaim();
+        assert_eq!(inflight_1.load(Ordering::Acquire), 0);
+        assert_eq!(inflight_2.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1683,6 +1731,7 @@ mod test {
             completion: old_completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: old_inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: std::ptr::null_mut(),
             pending_idx: 0,
         }));
@@ -1706,6 +1755,7 @@ mod test {
             completion: new_completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: new_inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1746,11 +1796,14 @@ mod test {
         assert_eq!(old_completion.wait(1), -libc::ETIMEDOUT);
         // new entry was signaled with -ESHUTDOWN
         assert_eq!(new_completion.wait(0), -libc::ESHUTDOWN);
-        assert_eq!(new_inflight.load(Ordering::Acquire), 0);
+        assert_eq!(old_inflight.load(Ordering::Acquire), 1);
+        assert_eq!(new_inflight.load(Ordering::Acquire), 1);
 
         assert_eq!(ack_rx.try_recv(), Ok(()), "ack must be sent");
         assert!(retired_qpair.requires_free());
         retired_qpair.reclaim();
+        assert_eq!(old_inflight.load(Ordering::Acquire), 0);
+        assert_eq!(new_inflight.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1869,6 +1922,7 @@ mod test {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1884,8 +1938,9 @@ mod test {
         let entry = retired.take(qpair).expect("shutdown record must exist");
         assert!(entry.requires_free());
         assert_eq!(completion.wait(0), -libc::EIO);
-        assert_eq!(inflight.load(Ordering::Acquire), 0);
+        assert_eq!(inflight.load(Ordering::Acquire), 1);
         entry.reclaim();
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1917,6 +1972,7 @@ mod test {
             completion: completion_1.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_1.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1926,6 +1982,7 @@ mod test {
             completion: completion_2.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_2.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 1,
         }));
@@ -1966,8 +2023,13 @@ mod test {
             1,
             "stale entry inflight must not be decremented"
         );
-        // pending entry was signaled with -EIO
+        // pending entry was signaled with -EIO but still owns its DMA ref.
         assert_eq!(completion_2.wait(0), -libc::EIO);
+        assert_eq!(inflight_2.load(Ordering::Acquire), 1);
+        if let Some(qs) = qpair_state.get_mut(&0xDEAD) {
+            qs.reclaim_stale();
+        }
+        assert_eq!(inflight_1.load(Ordering::Acquire), 0);
         assert_eq!(inflight_2.load(Ordering::Acquire), 0);
     }
 }
