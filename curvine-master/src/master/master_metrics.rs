@@ -254,7 +254,7 @@ impl MasterMetrics {
             )?,
             compat_client_verdict: m::new_gauge_vec(
                 "compat_client_verdict",
-                "Current compatibility verdict per client, labelled by client_addr and verdict",
+                "Current compatibility verdict of each non-compatible client, labelled by client_addr and verdict; compatible clients have no series",
                 &["client_addr", "verdict"],
             )?,
             compat_enforce_rejected_total: m::new_counter_vec(
