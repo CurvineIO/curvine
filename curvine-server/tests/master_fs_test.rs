@@ -459,6 +459,7 @@ fn block_report_for_non_file_inode_schedules_worker_delete() -> CommonResult<()>
 
     let result = fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
@@ -487,6 +488,7 @@ fn block_report_for_writing_non_file_inode_defers_worker_delete() -> CommonResul
 
     let result = fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
@@ -515,6 +517,7 @@ fn block_report_for_writing_missing_inode_defers_worker_delete() -> CommonResult
 
     let result = fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
@@ -543,6 +546,7 @@ fn full_block_report_for_writing_missing_inode_schedules_worker_delete() -> Comm
 
     let result = fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: true,
@@ -583,6 +587,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
         .collect();
 
     let req = BlockReportListRequest {
+        report_id: None,
         cluster_id: "curvine".into(),
         worker_id,
         full_report: true,
@@ -607,6 +612,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
 
     let result = fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id,
             full_report: true,
@@ -651,6 +657,7 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
 
     fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
@@ -679,6 +686,7 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
 
     fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
@@ -918,6 +926,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
 
     fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
@@ -948,6 +957,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
 
     fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
@@ -964,6 +974,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
 
     fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
@@ -980,6 +991,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
 
     fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
@@ -2907,6 +2919,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
 
         fs.block_report(
             BlockReportList {
+                report_id: 0,
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
@@ -2940,6 +2953,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
 
         fs.block_report(
             BlockReportList {
+                report_id: 0,
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
@@ -2973,6 +2987,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
 
         fs.block_report(
             BlockReportList {
+                report_id: 0,
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
@@ -3017,6 +3032,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
         // Worker 100 (default) reports block as SpdkDisk
         fs.block_report(
             BlockReportList {
+                report_id: 0,
                 cluster_id: "curvine".into(),
                 worker_id: 100,
                 full_report: true,
@@ -3034,6 +3050,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
         // Worker 200 reports same block as Disk
         fs.block_report(
             BlockReportList {
+                report_id: 0,
                 cluster_id: "curvine".into(),
                 worker_id: 200,
                 full_report: false,
@@ -3087,6 +3104,7 @@ fn file_block_details_preserve_mixed_replica_storage_types() -> CommonResult<()>
     ] {
         fs.block_report(
             BlockReportList {
+                report_id: 0,
                 cluster_id: "curvine".into(),
                 worker_id,
                 full_report,
@@ -3353,5 +3371,78 @@ fn complete_file_with_set_attr_applies_attributes() -> CommonResult<()> {
         "xattr should be set by complete_file"
     );
 
+    Ok(())
+}
+
+fn full_report_batch(report_id: u64, total_len: u64, block_id: i64) -> BlockReportList {
+    BlockReportList {
+        report_id,
+        cluster_id: "curvine".into(),
+        worker_id: 0,
+        full_report: true,
+        total_len,
+        blocks: vec![BlockReportInfo::new(
+            block_id,
+            BlockReportStatus::Finalized,
+            StorageType::Disk,
+            1,
+        )],
+    }
+}
+
+#[test]
+fn resent_final_full_report_batch_is_ignored() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-report-resent-final");
+    fs.mkdir("/dir-full-report", true)?;
+    let dir_status = fs.file_status("/dir-full-report")?;
+    let first = InodeId::create_block_id(dir_status.id, 0)?;
+    let last = InodeId::create_block_id(dir_status.id, 1)?;
+
+    // Two batches complete the round; each block is rejected because its inode is a dir.
+    let res = fs.block_report(full_report_batch(7, 2, first), None)?;
+    assert_eq!(res.delete_blocks, vec![first]);
+    let res = fs.block_report(full_report_batch(7, 2, last), None)?;
+    assert_eq!(res.delete_blocks, vec![last]);
+
+    // The response to the final batch was lost and the worker resends it.
+    // The deletes it carried must be delivered again, but no new session opens.
+    assert_eq!(fs.full_report_completed_round(0), Some(7));
+    let res = fs.block_report(full_report_batch(7, 2, last), None)?;
+    assert_eq!(res.delete_blocks, vec![last]);
+    assert_eq!(fs.full_report_open_sessions(), 0, "resend opened a session");
+    assert_eq!(fs.full_report_completed_round(0), Some(7));
+
+    // A new round from the same worker is processed normally.
+    let res = fs.block_report(full_report_batch(8, 2, last), None)?;
+    assert_eq!(res.delete_blocks, vec![last]);
+
+    // Reports without an id keep the previous behavior.
+    let res = fs.block_report(full_report_batch(0, 2, last), None)?;
+    assert_eq!(res.delete_blocks, vec![last]);
+    let res = fs.block_report(full_report_batch(0, 2, last), None)?;
+    assert_eq!(res.delete_blocks, vec![last]);
+    Ok(())
+}
+
+#[test]
+fn reset_full_block_report_forgets_completed_round() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-report-reset");
+    fs.mkdir("/dir-full-report-reset", true)?;
+    let dir_status = fs.file_status("/dir-full-report-reset")?;
+    let block_id = InodeId::create_block_id(dir_status.id, 0)?;
+
+    let res = fs.block_report(full_report_batch(5, 1, block_id), None)?;
+    assert_eq!(res.delete_blocks, vec![block_id]);
+    let res = fs.block_report(full_report_batch(5, 1, block_id), None)?;
+    assert_eq!(res.delete_blocks, vec![block_id]);
+    assert_eq!(fs.full_report_completed_round(0), Some(5));
+
+    // The worker registered again, so its previous round must be forgotten.
+    fs.reset_full_block_report(0);
+    assert_eq!(fs.full_report_completed_round(0), None);
+    let res = fs.block_report(full_report_batch(5, 1, block_id), None)?;
+    assert_eq!(res.delete_blocks, vec![block_id]);
     Ok(())
 }

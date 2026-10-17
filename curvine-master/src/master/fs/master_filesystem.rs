@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::context::ValidateAddBlock;
+use crate::master::fs::full_block_report::{FullReportProgress, FullReportTracker};
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
@@ -58,7 +59,7 @@ pub struct MasterFilesystem {
     pub worker_manager: SyncWorkerManager,
     pub master_monitor: MasterMonitor,
     pub conf: Arc<MasterConf>,
-    full_block_reports: Arc<Mutex<HashMap<u32, FullBlockReportState>>>,
+    full_report_tracker: FullReportTracker,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
 }
@@ -96,13 +97,6 @@ fn snapshot_token_in_subtree(token: &str, subtree_path: &str) -> bool {
                 .unwrap_or(false))
 }
 
-struct FullBlockReportState {
-    total_len: u64,
-    update_time_ms: u64,
-    reported_blocks: HashSet<i64>,
-    invalidated: bool,
-}
-
 struct FullBlockReconcileState {
     running: bool,
     generation: u64,
@@ -114,7 +108,6 @@ struct FullBlockReconcileJob {
     reported_blocks: HashSet<i64>,
 }
 
-const FULL_BLOCK_REPORT_TTL_MS: u64 = 60 * 60 * 1000;
 const FULL_BLOCK_RECONCILE_THREADS: usize = 2;
 const FULL_BLOCK_RECONCILE_QUEUE_SIZE: usize = 128;
 
@@ -157,7 +150,7 @@ impl MasterFilesystem {
             worker_manager,
             master_monitor,
             conf: Arc::new(conf.master.clone()),
-            full_block_reports: Default::default(),
+            full_report_tracker: Default::default(),
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
@@ -173,7 +166,7 @@ impl MasterFilesystem {
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
             conf: Arc::new(conf.master.clone()),
-            full_block_reports: Default::default(),
+            full_report_tracker: Default::default(),
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
@@ -1111,78 +1104,26 @@ impl MasterFilesystem {
         fs_dir.block_inode_state(id)
     }
 
-    fn collect_full_block_report(&self, list: &BlockReportList) -> Option<HashSet<i64>> {
-        if !list.full_report {
-            return None;
-        }
-
-        let now = LocalTime::mills();
-        let mut reports = self.full_block_reports.lock();
-        reports.retain(|_, report| {
-            now.saturating_sub(report.update_time_ms) <= FULL_BLOCK_REPORT_TTL_MS
-        });
-        // A prior incremental report may have invalidated the session. Drop it so
-        // this full report can start a fresh accumulation instead of being ignored.
-        if reports
-            .get(&list.worker_id)
-            .map(|report| report.invalidated)
-            .unwrap_or(false)
-        {
-            reports.remove(&list.worker_id);
-        }
-
-        let report = reports
-            .entry(list.worker_id)
-            .or_insert_with(|| FullBlockReportState {
-                total_len: list.total_len,
-                update_time_ms: now,
-                reported_blocks: HashSet::with_capacity(list.total_len as usize),
-                invalidated: false,
-            });
-
-        if report.total_len != list.total_len {
-            warn!(
-                "full block report for worker {} restarted because total_len changed from {} to {}; discarding {} accumulated block ids",
-                list.worker_id,
-                report.total_len,
-                list.total_len,
-                report.reported_blocks.len()
-            );
-            report.total_len = list.total_len;
-            report.reported_blocks.clear();
-            report.reported_blocks.reserve(list.total_len as usize);
-            report.invalidated = false;
-        }
-        report.update_time_ms = now;
-
-        for block in &list.blocks {
-            report.reported_blocks.insert(block.id);
-        }
-
-        if report.reported_blocks.len() as u64 >= report.total_len {
-            reports
-                .remove(&list.worker_id)
-                .map(|report| report.reported_blocks)
-        } else {
-            None
-        }
-    }
-
     pub fn reset_full_block_report(&self, worker_id: u32) {
-        self.full_block_reports.lock().remove(&worker_id);
+        self.full_report_tracker.reset(worker_id);
         self.invalidate_full_block_reconcile(worker_id);
     }
 
+    /// Report id of the last fully processed full report of the worker.
+    #[doc(hidden)]
+    pub fn full_report_completed_round(&self, worker_id: u32) -> Option<u64> {
+        self.full_report_tracker.completed_round(worker_id)
+    }
+
+    /// Number of workers with a partially accumulated full report.
+    #[doc(hidden)]
+    pub fn full_report_open_sessions(&self) -> usize {
+        self.full_report_tracker.open_sessions()
+    }
+
     fn invalidate_full_block_report_session(&self, worker_id: u32) {
-        let now = LocalTime::mills();
-        let mut reports = self.full_block_reports.lock();
-        // Only invalidate an in-flight session. Inserting a stub invalidated
-        // entry would make the next full report return None forever.
-        if let Some(report) = reports.get_mut(&worker_id) {
-            report.update_time_ms = now;
-            report.reported_blocks.clear();
-            report.invalidated = true;
-        }
+        self.full_report_tracker
+            .invalidate_session(worker_id, LocalTime::mills());
     }
 
     fn invalidate_full_block_state(&self, worker_id: u32) {
@@ -1219,7 +1160,32 @@ impl MasterFilesystem {
             self.invalidate_full_block_state(list.worker_id);
         }
 
-        let full_reported_blocks = self.collect_full_block_report(&list);
+        let full_reported_blocks = match self.full_report_tracker.collect(&list, LocalTime::mills())
+        {
+            FullReportProgress::Duplicate => {
+                // The response to this batch may have been lost, so its delete
+                // commands and location updates must still be delivered. Both are
+                // idempotent; only the session and the reconcile are skipped.
+                info!(
+                    "resent batch of completed full block report {} from worker {}: not reconciling again",
+                    list.report_id, list.worker_id
+                );
+                None
+            }
+            FullReportProgress::InFlight => {
+                // The first attempt may still fail, so do not acknowledge the resend.
+                // The worker retries IO errors after a short backoff.
+                return Err(FsError::io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "full block report {} from worker {} is still being processed",
+                        list.report_id, list.worker_id
+                    ),
+                )));
+            }
+            FullReportProgress::Complete(blocks) => Some(blocks),
+            FullReportProgress::Partial => None,
+        };
         if list.blocks.is_empty() && full_reported_blocks.is_none() {
             return Ok(BlockReportResult {
                 delete_blocks: Vec::new(),
@@ -1312,11 +1278,35 @@ impl MasterFilesystem {
         }
         drop(wm);
 
-        if let Some(reported_blocks) = full_reported_blocks {
-            self.submit_full_block_reconcile(list.worker_id, reported_blocks, replication_handler)?;
-        }
+        // Keep the block ids of a completing batch so a failure can be retried.
+        let retry_blocks = full_reported_blocks.clone();
+        let applied = (|| -> FsResult<()> {
+            if let Some(reported_blocks) = full_reported_blocks {
+                self.submit_full_block_reconcile(
+                    list.worker_id,
+                    reported_blocks,
+                    replication_handler,
+                )?;
+            }
+            self.apply_block_report_batch(batch)
+        })();
 
-        self.apply_block_report_batch(batch)?;
+        if let Some(blocks) = retry_blocks {
+            let now = LocalTime::mills();
+            match &applied {
+                Ok(()) => self
+                    .full_report_tracker
+                    .finish(list.worker_id, list.report_id, now),
+                Err(_) => self.full_report_tracker.abort(
+                    list.worker_id,
+                    list.report_id,
+                    list.total_len,
+                    blocks,
+                    now,
+                ),
+            }
+        }
+        applied?;
 
         Ok(BlockReportResult { delete_blocks })
     }

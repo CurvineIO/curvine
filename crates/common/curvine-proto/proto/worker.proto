@@ -131,6 +131,8 @@ message BlockReportListRequest {
     required bool full_report = 3;
     required uint64 total_len = 4;
     repeated BlockReportInfoProto blocks = 5;
+    // Identifies one full report round so the master can recognize a resent batch.
+    optional uint64 report_id = 6;
 }
 
 message BlockReportListResponse {
