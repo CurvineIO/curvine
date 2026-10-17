@@ -47,6 +47,11 @@ pub enum IoOp {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
         ack: mpsc::Sender<()>,
     },
+    /// Stop polling admin completions before a controller is detached.
+    UnregisterCtrlr {
+        ctrlr: CtrlHandle,
+        ack: mpsc::Sender<()>,
+    },
     /// Poll a retired qpair once before retrying free on the owner thread.
     PollRetiredQpair {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
@@ -175,6 +180,7 @@ enum PollerState {
 
 /// SPDK NVMe controller handle — thread-safe.
 #[repr(transparent)]
+#[derive(Clone, Copy)]
 pub struct CtrlHandle(pub *mut spdk_ffi::spdk_nvme_ctrlr);
 
 // SAFETY: opaque SPDK handle; admin completion is thread-safe.
@@ -420,6 +426,28 @@ impl SpdkPoller {
         }
     }
 
+    /// Remove a controller from admin polling. An acknowledgement is the
+    /// barrier that makes a later `spdk_nvme_detach` safe.
+    pub(crate) fn unregister_ctrlr(&self, ctrlr: CtrlHandle) -> UnregisterResult {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let req = IoRequest {
+            op: IoOp::UnregisterCtrlr { ctrlr, ack: ack_tx },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+        let Some(tx) = &self.tx else {
+            return UnregisterResult::Disconnected;
+        };
+        if tx.send(req).is_err() {
+            return UnregisterResult::Disconnected;
+        }
+        let _ = self.eventfd.write(1);
+        match ack_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(()) => UnregisterResult::Acked,
+            Err(err) => unregister_ack_error_to_result(err),
+        }
+    }
+
     pub(crate) fn poll_retired_qpair(
         &self,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
@@ -477,7 +505,7 @@ impl SpdkPoller {
         mut config: PollerConfig,
         retired: Arc<RetiredQpairRegistry>,
     ) {
-        let active_ctrlrs: Vec<CtrlHandle> = std::mem::take(&mut config.ctrlrs);
+        let mut active_ctrlrs: Vec<CtrlHandle> = std::mem::take(&mut config.ctrlrs);
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
         let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
@@ -508,6 +536,9 @@ impl SpdkPoller {
                     match &req.op {
                         IoOp::UnregisterQpair { .. } => {
                             Self::handle_unregister(&req, &mut qpair_state, &retired);
+                        }
+                        IoOp::UnregisterCtrlr { .. } => {
+                            Self::handle_unregister_ctrlr(&req, &mut active_ctrlrs);
                         }
                         IoOp::PollRetiredQpair { .. } => {
                             Self::handle_poll_retired(&req);
@@ -597,6 +628,9 @@ impl SpdkPoller {
                             match &req.op {
                                 IoOp::UnregisterQpair { .. } => {
                                     Self::handle_unregister(&req, &mut qpair_state, &retired);
+                                }
+                                IoOp::UnregisterCtrlr { .. } => {
+                                    Self::handle_unregister_ctrlr(&req, &mut active_ctrlrs);
                                 }
                                 IoOp::PollRetiredQpair { .. } => {
                                     Self::handle_poll_retired(&req);
@@ -694,6 +728,13 @@ impl SpdkPoller {
         }
     }
 
+    fn handle_unregister_ctrlr(req: &IoRequest, active_ctrlrs: &mut Vec<CtrlHandle>) {
+        if let IoOp::UnregisterCtrlr { ctrlr, ack } = &req.op {
+            active_ctrlrs.retain(|active| active.0 != ctrlr.0);
+            let _ = ack.send(());
+        }
+    }
+
     fn handle_poll_retired(req: &IoRequest) {
         if let IoOp::PollRetiredQpair { qpair, ack } = &req.op {
             let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0) };
@@ -714,6 +755,9 @@ impl SpdkPoller {
             IoOp::Flush { qpair, .. } => *qpair,
             IoOp::UnregisterQpair { .. } | IoOp::PollRetiredQpair { .. } => {
                 unreachable!("control request handled before submit_one")
+            }
+            IoOp::UnregisterCtrlr { .. } => {
+                unreachable!("UnregisterCtrlr handled by handle_unregister_ctrlr")
             }
         };
 
@@ -803,6 +847,9 @@ impl SpdkPoller {
             }
             IoOp::PollRetiredQpair { .. } => {
                 unreachable!("control request handled before submit_one")
+            }
+            IoOp::UnregisterCtrlr { .. } => {
+                unreachable!("UnregisterCtrlr handled by handle_unregister_ctrlr")
             }
         };
 
@@ -1883,6 +1930,82 @@ mod test {
 
         assert_eq!(retired.len(), 1);
         assert!(retired.take(qpair).unwrap().requires_free());
+    }
+
+    #[test]
+    fn unregister_ctrlr_removes_only_requested_controller() {
+        let ctrlr_a = CtrlHandle(0x1000usize as *mut _);
+        let ctrlr_b = CtrlHandle(0x2000usize as *mut _);
+        let mut active = vec![ctrlr_a, ctrlr_b];
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let req = IoRequest {
+            op: IoOp::UnregisterCtrlr {
+                ctrlr: ctrlr_a,
+                ack: ack_tx,
+            },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+
+        SpdkPoller::handle_unregister_ctrlr(&req, &mut active);
+
+        assert_eq!(ack_rx.try_recv(), Ok(()));
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0, ctrlr_b.0);
+    }
+
+    #[test]
+    fn unregister_absent_ctrlr_is_idempotent() {
+        let mut active = vec![CtrlHandle(0x2000usize as *mut _)];
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let req = IoRequest {
+            op: IoOp::UnregisterCtrlr {
+                ctrlr: CtrlHandle(0x1000usize as *mut _),
+                ack: ack_tx,
+            },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+
+        SpdkPoller::handle_unregister_ctrlr(&req, &mut active);
+
+        assert_eq!(ack_rx.try_recv(), Ok(()));
+        assert_eq!(active.len(), 1);
+    }
+
+    #[test]
+    fn unregister_ctrlr_real_round_trip_acks() {
+        let retired = RetiredQpairRegistry::new();
+        let config = PollerConfig {
+            poll_interval_ms: 10,
+            spin_iter: 10,
+            io_queue_depth: 8,
+            ctrlrs: Vec::new(),
+        };
+        let poller = SpdkPoller::start(config, retired);
+        let ctrlr = CtrlHandle(0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr);
+
+        let result = poller.unregister_ctrlr(ctrlr);
+
+        assert_eq!(result, UnregisterResult::Acked);
+    }
+
+    #[test]
+    fn unregister_ctrlr_after_stop_returns_disconnected() {
+        let retired = RetiredQpairRegistry::new();
+        let config = PollerConfig {
+            poll_interval_ms: 10,
+            spin_iter: 10,
+            io_queue_depth: 8,
+            ctrlrs: Vec::new(),
+        };
+        let mut poller = SpdkPoller::start(config, retired);
+        poller.stop();
+        let ctrlr = CtrlHandle(0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr);
+
+        let result = poller.unregister_ctrlr(ctrlr);
+
+        assert_eq!(result, UnregisterResult::Disconnected);
     }
 
     #[test]
