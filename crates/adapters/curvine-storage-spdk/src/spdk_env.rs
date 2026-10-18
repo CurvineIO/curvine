@@ -609,7 +609,7 @@ pub(crate) struct RetiredDmaRegistry {
 }
 
 impl RetiredDmaRegistry {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             entries: Mutex::new(Vec::new()),
         })
@@ -663,7 +663,7 @@ impl RetiredDmaRegistry {
     }
 
     #[cfg(test)]
-    fn count(&self) -> usize {
+    pub(crate) fn count(&self) -> usize {
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

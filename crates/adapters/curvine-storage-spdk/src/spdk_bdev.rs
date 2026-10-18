@@ -786,12 +786,7 @@ impl Drop for SpdkBdev {
                     count,
                     max_wait.as_secs()
                 );
-                self.retired_dma.defer(
-                    self.name.clone(),
-                    self.read_buf.take(),
-                    self.write_buf.take(),
-                    self.inflight.clone(),
-                );
+                self.defer_dma_buffers();
                 break;
             }
             if !logged {
@@ -815,13 +810,26 @@ impl Drop for SpdkBdev {
     }
 }
 
+impl SpdkBdev {
+    fn defer_dma_buffers(&mut self) {
+        self.retired_dma.defer(
+            self.name.clone(),
+            self.read_buf.take(),
+            self.write_buf.take(),
+            self.inflight.clone(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::spdk_env::RetiredDmaRegistry;
     use crate::spdk_env::SpdkEnv;
     use crate::spdk_poller::IoCompletion;
     use curvine_io::SpdkConf;
     use nix::sys::eventfd::EfdFlags;
+    use std::mem::ManuallyDrop;
 
     fn ensure_spdk_init() {
         if SpdkEnv::global().is_some() {
@@ -880,6 +888,45 @@ mod test {
             err
         );
         assert_eq!(inflight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn defer_dma_buffers_moves_bdev_buffers_to_retired_registry() {
+        let (tx, _rx) = crossbeam::channel::unbounded();
+        let retired_dma = RetiredDmaRegistry::new();
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let eventfd = Arc::new(EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK).unwrap());
+        let mut bdev = ManuallyDrop::new(SpdkBdev {
+            name: "test-bdev".to_string(),
+            size: 4096,
+            block_size: 4096,
+            pos: 0,
+            writable: true,
+            read_buf: Some(DmaBuf::null_for_test(4096, 4096)),
+            write_buf: Some(DmaBuf::null_for_test(4096, 4096)),
+            ns: std::ptr::null_mut(),
+            io_channel: SpdkIoChannel {
+                qpair: std::ptr::null_mut(),
+                poller_tx: tx,
+                eventfd,
+                poller_is_sleeping: Arc::new(AtomicBool::new(false)),
+                qpair_dead: Arc::new(AtomicBool::new(false)),
+            },
+            ctrlr: std::ptr::null_mut(),
+            io_timeout_ms: 1,
+            inflight: inflight.clone(),
+            retired_dma: retired_dma.clone(),
+        });
+
+        bdev.defer_dma_buffers();
+
+        assert_eq!(retired_dma.count(), 1);
+        assert!(bdev.read_buf.is_none());
+        assert!(bdev.write_buf.is_none());
+        assert_eq!(retired_dma.reclaim(), 0);
+        inflight.store(0, Ordering::Release);
+        assert_eq!(retired_dma.reclaim(), 1);
+        assert_eq!(retired_dma.count(), 0);
     }
 
     #[test]

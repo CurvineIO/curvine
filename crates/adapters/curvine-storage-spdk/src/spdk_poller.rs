@@ -1960,6 +1960,8 @@ mod test {
     fn shutdown_exit_does_not_wait_for_active_qpairs() {
         let shutdown = AtomicBool::new(true);
         let mut qpair_state = HashMap::new();
+        // Keep this as a pure state test: submitting fake I/O through a live poller
+        // would dereference fake SPDK ns/qpair pointers in the C shim.
         let ctx = Box::into_raw(Box::new(CallbackCtx {
             completion: IoCompletion::new(),
             async_ctx: unsafe { std::mem::zeroed() },
