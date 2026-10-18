@@ -23,6 +23,11 @@ use curvine_rocksdb::{
 use curvine_runtime::common::SerdeUtils as Serde;
 use std::collections::HashMap;
 
+#[cfg(test)]
+thread_local! {
+    static LOCATION_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub struct RocksInodeStore {
     pub(crate) db: DBEngine,
 }
@@ -133,6 +138,8 @@ impl RocksInodeStore {
                 // a corrupt SST outside this one. Retry the per-block query to preserve its
                 // error scope; corruption inside the requested prefix still
                 // propagates. No partial location list is published.
+                #[cfg(test)]
+                LOCATION_FALLBACKS.with(|count| count.set(count.get() + 1));
                 locations = self.get_locations(id)?;
             }
             result.insert(id, locations);
@@ -426,35 +433,24 @@ mod tests {
             )));
             conf.disable_block_cache = true;
             let store = RocksInodeStore::new(conf.clone(), true).unwrap();
-            let mut batch = store.new_batch();
-            for id in [100, 101] {
+            for id in [100, 5000, 10000] {
+                let mut batch = store.new_batch();
                 batch
                     .add_location(id, &BlockLocation::new(100, StorageType::Disk))
                     .unwrap();
+                batch.commit().unwrap();
+                store.db.flush(true).unwrap();
+                if compact {
+                    store.db.get_db().compact_range_cf(
+                        store.db.cf(RocksInodeStore::CF_BLOCK).unwrap(),
+                        Some(RocksUtils::i64_to_bytes(id)),
+                        Some(RocksUtils::i64_to_bytes(id + 1)),
+                    );
+                }
             }
-            batch.commit().unwrap();
-            store.db.flush(true).unwrap();
-            if compact {
-                store.db.get_db().compact_range_cf(
-                    store.db.cf(RocksInodeStore::CF_BLOCK).unwrap(),
-                    Some(RocksUtils::i64_to_bytes(100)),
-                    Some(RocksUtils::i64_to_bytes(102)),
-                );
-            }
-            let mut batch = store.new_batch();
-            batch
-                .add_location(10000, &BlockLocation::new(100, StorageType::Disk))
-                .unwrap();
-            batch.commit().unwrap();
-            store.db.flush(true).unwrap();
-            if compact {
-                store.db.get_db().compact_range_cf(
-                    store.db.cf(RocksInodeStore::CF_BLOCK).unwrap(),
-                    Some(RocksUtils::i64_to_bytes(10000)),
-                    Some(RocksUtils::i64_to_bytes(10001)),
-                );
-            }
-            let bad_key = RocksUtils::i64_u32_to_bytes(10000, 100);
+            // Keep the corrupt key in the iterator's range, but in a separate
+            // SST from both requested prefixes.
+            let bad_key = RocksUtils::i64_u32_to_bytes(5000, 100);
             let live = store.db.get_db().live_files().unwrap();
             let bad = live
                 .iter()
@@ -488,32 +484,50 @@ mod tests {
             drop(file);
             let reopened = RocksInodeStore::new(conf, false).unwrap();
             assert!(
-                reopened.get_locations(10000).is_err(),
+                reopened.get_locations(5000).is_err(),
                 "fault must be detected"
             );
+            let outside_a = reopened.get_locations(100);
+            let outside_b = reopened.get_locations(101);
+            let outside = reopened.get_locations_many([100, 101]);
+            assert_eq!(
+                outside.is_ok(),
+                outside_a.is_ok() && outside_b.is_ok(),
+                "corruption beyond the upper bound must preserve per-block error scope"
+            );
             let a = reopened.get_locations(100);
-            let b = reopened.get_locations(101);
+            let b = reopened.get_locations(10000);
             let baseline_ok = a.is_ok() && b.is_ok();
             assert!(
-                reopened.get_locations_many([100, 10000]).is_err(),
+                reopened.get_locations_many([100, 5000]).is_err(),
                 "requested SST corruption must propagate"
             );
-            let candidate = reopened.get_locations_many([100, 101]);
-            println!("neighbor corruption: compact={compact}, level={bad_level}, baseline_ok={baseline_ok}, candidate={candidate:?}");
+            LOCATION_FALLBACKS.with(|count| count.set(0));
+            let candidate = reopened.get_locations_many([100, 10000]);
             assert_eq!(
                 candidate.is_ok(),
                 baseline_ok,
-                "candidate must preserve the actual bounded-prefix error scope"
+                "corruption between requested blocks must preserve per-block error scope"
             );
-            if baseline_ok {
-                let candidate = candidate.unwrap();
-                let workers = |list: &[BlockLocation]| {
-                    list.iter()
-                        .map(|x| (x.worker_id, x.storage_type))
-                        .collect::<Vec<_>>()
-                };
+            if compact {
+                assert!(baseline_ok, "compacted good SSTs must remain readable");
+                assert!(
+                    LOCATION_FALLBACKS.with(|count| count.get()) > 0,
+                    "the in-range corrupt SST must exercise the per-block fallback"
+                );
+            }
+            let workers = |list: &[BlockLocation]| {
+                list.iter()
+                    .map(|x| (x.worker_id, x.storage_type))
+                    .collect::<Vec<_>>()
+            };
+            if let Ok(outside) = outside {
+                assert_eq!(workers(&outside[&100]), workers(&outside_a.unwrap()));
+                assert_eq!(workers(&outside[&101]), workers(&outside_b.unwrap()));
+            }
+            if let Ok(candidate) = candidate {
                 assert_eq!(workers(&candidate[&100]), workers(&a.unwrap()));
-                assert_eq!(workers(&candidate[&101]), workers(&b.unwrap()));
+                assert_eq!(workers(&candidate[&10000]), workers(&b.unwrap()));
             }
         }
     }
