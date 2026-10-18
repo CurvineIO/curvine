@@ -515,13 +515,22 @@ impl MasterHandler {
             .compatibility_policy
             .should_evaluate(req.component_info.is_some())
         {
+            let verdict = self
+                .compatibility_policy
+                .check_client(req.component_info.as_ref());
+            self.metrics.record_client_compat(
+                self.client_ip(),
+                req.component_info
+                    .as_ref()
+                    .map(|info| info.release_version.as_deref().unwrap_or_default()),
+                Self::verdict_label(&verdict),
+            );
             Self::check_peer_compatibility(
                 "client",
                 &format!("client:{}", self.client_ip()),
                 &self.compat_warned,
                 self.compatibility_policy.mode,
-                self.compatibility_policy
-                    .check_client(req.component_info.as_ref()),
+                verdict,
                 self.metrics,
             )?;
         }
@@ -638,26 +647,10 @@ impl MasterHandler {
                     .with_label_values(&[worker_id, label])
                     .set(active);
             }
-        } else {
-            // Client addresses are not bounded by cluster size, so only
-            // clients that are not compatible keep a series, and only for
-            // their current verdict. A compatible client has its series
-            // removed so they do not accumulate for every address seen.
-            let compatible = verdict.is_compatible();
-            for label in Self::VERDICT_LABELS {
-                if !compatible && label == verdict_label {
-                    metrics
-                        .compat_client_verdict
-                        .with_label_values(&[dedup_key, label])
-                        .set(1);
-                } else {
-                    // Fails only when the series does not exist.
-                    let _ = metrics
-                        .compat_client_verdict
-                        .remove_label_values(&[dedup_key, label]);
-                }
-            }
         }
+        // Client verdicts are not recorded here: client addresses are not
+        // bounded by cluster size, so `get_filesystem_info` aggregates them by
+        // release version through `MasterMetrics::record_client_compat`.
 
         if !verdict.rejects(mode) {
             if !verdict.is_compatible() {
@@ -1546,7 +1539,7 @@ mod tests {
             1
         );
 
-        // Client verdicts use the client gauge.
+        // Client verdicts are aggregated by `record_client_compat`, not here.
         MasterHandler::check_peer_compatibility(
             "client",
             "client:10.0.0.1",
@@ -1556,33 +1549,6 @@ mod tests {
             metrics,
         )
         .unwrap();
-        assert_eq!(
-            metrics
-                .compat_client_verdict
-                .with_label_values(&["client:10.0.0.1", "missing_info"])
-                .get(),
-            1
-        );
-
-        // Once the client is compatible its series is removed, not set to 0.
-        MasterHandler::check_peer_compatibility(
-            "client",
-            "client:10.0.0.1",
-            &warned,
-            CompatibilityMode::Diagnose,
-            CompatibilityVerdict::Compatible,
-            metrics,
-        )
-        .unwrap();
-        for label in MasterHandler::VERDICT_LABELS {
-            assert!(
-                metrics
-                    .compat_client_verdict
-                    .remove_label_values(&["client:10.0.0.1", label])
-                    .is_err(),
-                "series for {label} still exists"
-            );
-        }
     }
 
     #[test]
