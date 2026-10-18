@@ -1769,6 +1769,13 @@ fn rename_posix_semantics(fs: &MasterFilesystem) -> CommonResult<()> {
         file_parent_nlink + 1
     );
 
+    // Cross-parent EXCHANGE of non-empty directories keeps each subtree with its directory.
+    let left_file = fs.create("/a/ex_left/dir/sub/file", true)?.id;
+    let right_file = fs.create("/a/ex_right/dir/file", true)?.id;
+    fs.rename("/a/ex_left/dir", "/a/ex_right/dir", RenameFlags::EXCHANGE)?;
+    assert_eq!(fs.file_status("/a/ex_right/dir/sub/file")?.id, left_file);
+    assert_eq!(fs.file_status("/a/ex_left/dir/file")?.id, right_file);
+
     // src symlink, dst symlink -> overwrite existing symlink and keep dst deletable.
     fs.symlink("nobody", "/a/symbolic", false, 0o777)?;
     fs.rename("/a/symbolic", "/a/asymbolic", RenameFlags::empty())?;

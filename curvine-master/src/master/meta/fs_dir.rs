@@ -496,7 +496,7 @@ impl FsDir {
         };
 
         // Modify the time and name of the rename node.
-        let mut new_inode = src_inode.as_ref().clone();
+        let mut new_inode = src_inode.as_ref().clone_metadata();
         new_inode.change_name(new_name);
         new_inode.set_parent_id(dst_parent.id());
         new_inode.update_ctime(mtime);
@@ -517,7 +517,9 @@ impl FsDir {
         // Update memory status.
         // step 1: Delete the original node.
         // step 2: Add a new node.
-        let _ = src_parent.delete_child(src_inode.id(), src_inode.name())?;
+        let detached = src_parent.delete_child(src_inode.id(), src_inode.name())?;
+        // Persist first, then transfer the subtree under the same namespace lock.
+        new_inode.adopt_directory_children(detached);
         let _ = dst_parent.add_child(new_inode)?;
 
         Ok(del_res)
@@ -578,11 +580,11 @@ impl FsDir {
         let src_name = src_inp.name().to_string();
         let dst_name = dst_inp.name().to_string();
 
-        let mut at_src = dst_inode.as_ref().clone();
+        let mut at_src = dst_inode.as_ref().clone_metadata();
         at_src.change_name(src_name.clone());
         at_src.set_parent_id(src_parent.id());
 
-        let mut at_dst = src_inode.as_ref().clone();
+        let mut at_dst = src_inode.as_ref().clone_metadata();
         at_dst.change_name(dst_name.clone());
         at_dst.set_parent_id(dst_parent.id());
 
@@ -613,8 +615,10 @@ impl FsDir {
             &at_dst,
         )?;
 
-        let _ = src_parent.delete_child(src_inode.id(), &src_name)?;
-        let _ = dst_parent.delete_child(dst_inode.id(), &dst_name)?;
+        let detached_src = src_parent.delete_child(src_id, &src_name)?;
+        let detached_dst = dst_parent.delete_child(dst_id, &dst_name)?;
+        at_src.adopt_directory_children(detached_dst);
+        at_dst.adopt_directory_children(detached_src);
         let _ = src_parent.add_child(at_src)?;
         let _ = dst_parent.add_child(at_dst)?;
 

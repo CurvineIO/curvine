@@ -112,11 +112,18 @@ pub enum InodeView {
 
 impl InodeView {
     /// Copy an inode for persistence; directory edges are stored separately.
-    /// This copy must not replace the live directory because its children are empty.
+    /// Its children are empty: adopt the live children before it replaces the live directory.
     pub(crate) fn clone_metadata(&self) -> Self {
         match self {
             Dir(dir) => Self::new_dir(dir.name.clone(), dir.dir.clone_metadata()),
             _ => self.clone(),
+        }
+    }
+
+    pub(crate) fn adopt_directory_children(&mut self, detached: Self) {
+        debug_assert_eq!(self.is_dir(), detached.is_dir());
+        if let (Dir(updated), Dir(original)) = (self, detached) {
+            updated.dir.adopt_children(original.dir);
         }
     }
 

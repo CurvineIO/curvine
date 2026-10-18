@@ -62,6 +62,14 @@ impl InodeDir {
         }
     }
 
+    /// Attach the original subtree after its updated metadata has been persisted.
+    /// The caller owns the detached directory and still holds the namespace lock.
+    pub(crate) fn adopt_children(&mut self, detached: Self) {
+        debug_assert_eq!(self.id, detached.id);
+        debug_assert_eq!(self.children_len(), 0);
+        self.children = detached.children;
+    }
+
     pub fn new(id: i64, time: i64) -> Self {
         Self {
             id,
