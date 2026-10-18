@@ -63,6 +63,7 @@ impl VfsDir {
         let stats = FsStats::new(&stg_dir);
 
         // SPDK: skip filesystem (no local dir, version file, or filesystem checks).
+        // TODO(spdk): persist dir_id for SpdkDisk too; it's regenerated randomly every restart, breaking the dir_id-to-bdev binding.
         if conf.storage_type != StorageType::SpdkDisk {
             FileUtils::create_dir(stats.path(), true)?;
             stats.check_dir()?;
