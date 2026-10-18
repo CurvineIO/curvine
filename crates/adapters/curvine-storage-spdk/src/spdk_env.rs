@@ -1246,6 +1246,44 @@ impl SpdkEnv {
         self.active_bdevs().cloned().collect()
     }
 
+    /// Number of discovered bdev slots. Slots are stable for this SPDK env and
+    /// include detached controllers so dir_id modulo mapping never remaps.
+    pub fn bdev_slot_count(&self) -> usize {
+        self.bdevs.len()
+    }
+
+    /// Return the bdev assigned to a stable slot only if its controller is active.
+    pub fn active_bdev_at_slot(&self, slot: usize) -> CommonResult<&BdevInfo> {
+        let bdev = self.bdevs.get(slot).ok_or_else(|| {
+            err_msg!(
+                "SPDK bdev slot {} is out of range; {} slot(s) were discovered",
+                slot,
+                self.bdevs.len()
+            )
+        })?;
+        let controller = self
+            .controllers
+            .iter()
+            .find(|entry| entry.ctrlr == bdev.ctrlr)
+            .ok_or_else(|| {
+                err_msg!(
+                    "SPDK bdev slot {} ('{}') has no controller record; refusing to remap",
+                    slot,
+                    bdev.name
+                )
+            })?;
+        if controller.state() != ControllerState::Active {
+            return err_box!(
+                "SPDK bdev slot {} ('{}', target {}) is {:?}; refusing to remap dir_id to another bdev",
+                slot,
+                bdev.name,
+                controller.target_idx,
+                controller.state()
+            );
+        }
+        Ok(bdev)
+    }
+
     /// Number of bdevs currently available for new opens.
     pub fn active_bdev_count(&self) -> usize {
         self.active_bdevs().count()
@@ -1263,12 +1301,14 @@ impl SpdkEnv {
 
     /// Iterate bdevs whose controller is still active and available for opens.
     fn active_bdevs(&self) -> impl Iterator<Item = &BdevInfo> {
-        self.bdevs.iter().filter(|bdev| {
-            self.controllers
-                .iter()
-                .find(|entry| entry.ctrlr == bdev.ctrlr)
-                .is_some_and(|entry| entry.state() == ControllerState::Active)
-        })
+        self.bdevs.iter().filter(|bdev| self.is_bdev_active(bdev))
+    }
+
+    fn is_bdev_active(&self, bdev: &BdevInfo) -> bool {
+        self.controllers
+            .iter()
+            .find(|entry| entry.ctrlr == bdev.ctrlr)
+            .is_some_and(|entry| entry.state() == ControllerState::Active)
     }
 
     /// Number of live `SpdkBdev` handles.
@@ -2272,17 +2312,41 @@ mod test {
             ns: 0x2000,
             io_timeout_ms: 1000,
         });
+        env.bdevs.push(BdevInfo {
+            name: "nvme-b".into(),
+            size_bytes: 2048,
+            block_size: 512,
+            num_blocks: 4,
+            target_endpoint: "tcp://b".into(),
+            ctrlr: 0x3000,
+            ns: 0x4000,
+            io_timeout_ms: 1000,
+        });
         env.controllers.push(ControllerEntry {
             target_idx: 0,
             ctrlr: 0x1000,
             state: AtomicU8::new(ControllerState::Detached as u8),
         });
+        env.controllers.push(ControllerEntry {
+            target_idx: 1,
+            ctrlr: 0x3000,
+            state: AtomicU8::new(ControllerState::Active as u8),
+        });
 
-        assert!(env.bdev_names().is_empty());
-        assert_eq!(env.active_bdev_count(), 0);
-        assert!(env.bdevs().is_empty());
+        assert_eq!(env.bdev_slot_count(), 2);
+        assert_eq!(env.bdev_names(), vec!["nvme-b".to_string()]);
+        assert_eq!(env.active_bdev_count(), 1);
+        assert_eq!(env.bdevs().len(), 1);
         assert!(env.get_bdev("nvme-a").is_none());
-        assert_eq!(env.total_capacity(), 0);
+        assert_eq!(env.get_bdev("nvme-b").unwrap().name, "nvme-b");
+        assert_eq!(env.total_capacity(), 2048);
+
+        let err = env
+            .active_bdev_at_slot(0)
+            .expect_err("detached slot must not remap to another bdev")
+            .to_string();
+        assert!(err.contains("refusing to remap"), "unexpected error: {err}");
+        assert_eq!(env.active_bdev_at_slot(1).unwrap().name, "nvme-b");
     }
 
     #[test]
