@@ -170,7 +170,12 @@ fn fsck_reports_lost_replica_in_two_worker_cluster() -> CommonResult<()> {
             conf.client.block_size = 64 * 1024;
             conf.client.block_size_str = "64KB".to_string();
             conf.master.min_block_size = 64 * 1024;
-            conf.master.heartbeat_interval = "1h".to_string();
+            // Workers are listed as live only after their first heartbeat, so the
+            // interval must be short enough for the cluster to become ready. It is
+            // long enough that the worker removed below does not heartbeat back in
+            // before fsck runs. The master requires both worker intervals to be at
+            // least the heartbeat interval.
+            conf.master.heartbeat_interval = "5s".to_string();
             conf.master.worker_blacklist_interval = "20s".to_string();
             conf.master.worker_lost_interval = "30s".to_string();
         })
