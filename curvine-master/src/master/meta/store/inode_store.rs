@@ -149,26 +149,28 @@ impl InodeStore {
         batch.write_inode(parent)?;
 
         let mut stack = LinkedList::new();
-        stack.push_back((parent.id(), del_name.to_string(), del.clone()));
+        // The caller keeps the namespace stable until this batch commits.
+        // Borrow nodes while walking instead of repeatedly cloning subtrees.
+        stack.push_back((parent.id(), del_name, del));
         let mut del_res = DeleteResult::new();
         let mut deleted_files = 0i64;
         let mut deleted_dirs = 0i64;
 
         while let Some((parent_id, edge_name, inode)) = stack.pop_front() {
             // Delete inode edges
-            batch.delete_child(parent_id, &edge_name)?;
+            batch.delete_child(parent_id, edge_name)?;
 
-            match &inode {
+            match inode {
                 InodeView::Dir(dir) => {
                     batch.delete_inode(inode.id())?;
-                    self.ttl_bucket_list.remove(&inode);
+                    self.ttl_bucket_list.remove(inode);
 
                     // Don't count root directory
                     if dir.id != ROOT_INODE_ID {
                         deleted_dirs += 1;
                     }
                     for item in dir.children_iter() {
-                        stack.push_back((inode.id(), item.name().to_string(), item.clone()))
+                        stack.push_back((inode.id(), item.name(), item))
                     }
                 }
 
