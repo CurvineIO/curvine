@@ -179,9 +179,11 @@ pub struct SpdkBdev {
     pos: i64,
     /// Whether opened for writing.
     writable: bool,
-    /// Read buffer (avoids repeated allocation).
+    /// Read buffer (avoids repeated allocation). Only `None` after
+    /// `defer_dma_buffers()` moves ownership during drop.
     read_buf: Option<DmaBuf>,
-    /// Write buffer (avoids repeated allocation).
+    /// Write buffer (avoids repeated allocation). Only `None` after
+    /// `defer_dma_buffers()` moves ownership during drop.
     write_buf: Option<DmaBuf>,
     /// Raw namespace pointer.
     ns: *mut crate::spdk_ffi::spdk_nvme_ns,

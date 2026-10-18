@@ -1959,19 +1959,23 @@ mod test {
     #[test]
     fn shutdown_exit_does_not_wait_for_active_qpairs() {
         let shutdown = AtomicBool::new(true);
+        let retired = RetiredQpairRegistry::new();
         let mut qpair_state = HashMap::new();
         // Keep this as a pure state test: submitting fake I/O through a live poller
         // would dereference fake SPDK ns/qpair pointers in the C shim.
+        let completion = IoCompletion::new();
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let qpair_key = 0xDEADusize;
         let ctx = Box::into_raw(Box::new(CallbackCtx {
-            completion: IoCompletion::new(),
+            completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
-            bdev_inflight: Arc::new(AtomicUsize::new(1)),
+            bdev_inflight: inflight.clone(),
             dma_ref_released: AtomicBool::new(false),
             qpair_state: std::ptr::null_mut(),
             pending_idx: 0,
         }));
         qpair_state.insert(
-            0xDEAD,
+            qpair_key,
             Box::new(QpairState {
                 dead: Arc::new(AtomicBool::new(false)),
                 pending: vec![ctx],
@@ -1986,15 +1990,18 @@ mod test {
             &qpair_state
         ));
 
-        for (_, mut qs) in qpair_state {
-            qs.reclaim_stale();
-            for pending in qs.pending.drain(..) {
-                unsafe {
-                    (*pending).release_dma_ref();
-                    drop(Box::from_raw(pending));
-                }
-            }
-        }
+        SpdkPoller::publish_shutdown_records(&mut qpair_state, &retired);
+
+        assert!(qpair_state.is_empty());
+        assert!(retired.poller_exited_cleanly());
+        assert_eq!(completion.wait(0), -libc::EIO);
+        assert_eq!(inflight.load(Ordering::Acquire), 1);
+
+        let qpair = qpair_key as *mut spdk_ffi::spdk_nvme_qpair;
+        let entry = retired.take(qpair).expect("shutdown record must exist");
+        assert!(entry.requires_free());
+        entry.reclaim();
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
     }
 
     #[test]
