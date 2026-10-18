@@ -1241,9 +1241,11 @@ impl SpdkEnv {
         self.active_bdevs().map(|b| b.name.clone()).collect()
     }
 
-    /// All discovered bdev metadata.
-    pub fn bdevs(&self) -> Vec<BdevInfo> {
-        self.active_bdevs().cloned().collect()
+    /// All discovered bdev metadata, borrowed. Filtering requires a fresh
+    /// `Vec` on every call, but returning references avoids cloning each
+    /// `BdevInfo`'s `String` fields (name, target_endpoint).
+    pub fn bdevs(&self) -> Vec<&BdevInfo> {
+        self.active_bdevs().collect()
     }
 
     /// Number of discovered bdev slots. Slots are stable for this SPDK env and
