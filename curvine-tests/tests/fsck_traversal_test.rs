@@ -170,7 +170,11 @@ fn fsck_reports_lost_replica_in_two_worker_cluster() -> CommonResult<()> {
             conf.client.block_size = 64 * 1024;
             conf.client.block_size_str = "64KB".to_string();
             conf.master.min_block_size = 64 * 1024;
-            conf.master.heartbeat_interval = "1h".to_string();
+            // Workers are listed as live only after their first heartbeat, so the
+            // interval must be short enough for the cluster to become ready. The
+            // master requires both worker intervals to be at least the heartbeat
+            // interval.
+            conf.master.heartbeat_interval = "5s".to_string();
             conf.master.worker_blacklist_interval = "20s".to_string();
             conf.master.worker_lost_interval = "30s".to_string();
         })
@@ -195,13 +199,26 @@ fn fsck_reports_lost_replica_in_two_worker_cluster() -> CommonResult<()> {
             .remove_expired_worker(lost_worker_id)
             .is_some());
 
-        let output = FsckCommand {
-            path: "/fsck-multi".to_string(),
-            detail: true,
-            list_page_size: 3,
+        // The removed worker is still running, so its next heartbeat lists it as
+        // live again. That happens at most once per heartbeat interval, so if it
+        // lands between the removal and fsck, remove the worker again and retry.
+        let mut output = String::new();
+        for _ in 0..5 {
+            output = FsckCommand {
+                path: "/fsck-multi".to_string(),
+                detail: true,
+                list_page_size: 3,
+            }
+            .render(fs.fs_client())
+            .await?;
+            if output.contains("Unavailable replicas: 1") {
+                break;
+            }
+            master
+                .worker_manager
+                .write()
+                .remove_expired_worker(lost_worker_id);
         }
-        .render(fs.fs_client())
-        .await?;
 
         assert!(output.contains("Files: 1 | Blocks: 1"));
         assert!(output.contains("Expected replicas: 2"));

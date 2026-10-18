@@ -589,6 +589,7 @@ impl ProtoUtils {
             worker_id: list.worker_id,
             full_report: list.full_report,
             total_len: list.total_len,
+            report_id: list.report_id.unwrap_or(0),
             blocks: vec![],
         };
         for block in list.blocks {

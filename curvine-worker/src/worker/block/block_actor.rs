@@ -29,20 +29,39 @@ use dashmap::{DashMap, DashSet};
 use log::{info, warn};
 use std::mem::size_of_val;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Attempts per full block report batch, including the first one.
-const FULL_REPORT_MAX_ATTEMPTS: u32 = 5;
+///
+/// Each attempt is a full connector RPC that retries internally, so with the
+/// default client config (120s rpc timeout + 120s retry window) a sustained
+/// failure takes about `3 * 240s + 3s` (~12 min) before startup fails.
+const FULL_REPORT_MAX_ATTEMPTS: u32 = 3;
 /// Backoff before the first retry; doubled on every further retry.
 const FULL_REPORT_RETRY_BASE: Duration = Duration::from_secs(1);
 /// Upper bound of the backoff between two attempts.
 const FULL_REPORT_RETRY_MAX: Duration = Duration::from_secs(10);
 
+/// Id shared by every batch of one full report round, so the master can tell a
+/// resent batch from the start of a new round. Never 0, which means "no id".
+fn new_report_id() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    nanos.max(1)
+}
+
 /// Whether a failed full block report batch may succeed when sent again.
 ///
-/// Only transport level failures (timeouts, IO errors and a master switch) are
-/// transient. Anything else is a decision made by the master, so retrying it
-/// would not help and startup should fail.
+/// The cluster connector already retries timeouts and master switches itself.
+/// When that retry budget runs out it surfaces as `FsError::IO`, which is the
+/// case that reaches here in practice (the `Timeout` and `NotLeaderMaster`
+/// variants are kept for completeness). `FsError::IO` can also be an IO error
+/// returned by the master itself. That is how the master asks for a resend while
+/// it is still processing the completing batch of the same round; other master
+/// IO failures are retried needlessly but only a bounded number of times.
+/// Anything else is a decision made by the master, so startup should fail.
 fn is_retryable_report_error(err: &CommonError) -> bool {
     matches!(
         err.downcast_ref::<FsError>(),
@@ -52,8 +71,9 @@ fn is_retryable_report_error(err: &CommonError) -> bool {
 
 /// Run one full block report RPC and resend it on transient errors.
 ///
-/// The master accumulates a full report by `worker_id` and `total_len` and
-/// de-duplicates block ids, so resending a batch of the same report is safe.
+/// The master accumulates a full report by `worker_id` and `report_id`,
+/// de-duplicates block ids and remembers the last completed `report_id`, so
+/// resending any batch of the same round is safe.
 /// Gives up early once `is_stopped` reports that the worker is shutting down.
 fn send_with_retry<T>(
     what: &str,
@@ -82,6 +102,10 @@ fn send_with_retry<T>(
             err
         );
         sleep(backoff);
+        // The worker may have started shutting down while we were waiting.
+        if is_stopped() {
+            return Err(err);
+        }
         backoff = (backoff * 2).min(FULL_REPORT_RETRY_MAX);
         attempt += 1;
     }
@@ -184,8 +208,9 @@ impl BlockActor {
 
     pub fn full_block_report(&self) -> CommonResult<usize> {
         let blocks = self.store.all_blocks()?;
+        let report_id = new_report_id();
         if blocks.is_empty() {
-            let response = self.send_full_report(0, &[])?;
+            let response = self.send_full_report(report_id, 0, &[])?;
             let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
             HeartbeatTask::delete_block_task(
                 self.executor.clone(),
@@ -202,7 +227,7 @@ impl BlockActor {
             let end = (off + self.block_report_limit).min(blocks.len());
             let batch = &blocks[off..end];
             let spend = TimeSpent::new();
-            let response = self.send_full_report(blocks.len(), batch)?;
+            let response = self.send_full_report(report_id, blocks.len(), batch)?;
             info!(
                 "full block report, blocks={}, msg_bytes={}, used_ms={}",
                 batch.len(),
@@ -225,6 +250,7 @@ impl BlockActor {
 
     fn send_full_report(
         &self,
+        report_id: u64,
         total_len: usize,
         batch: &[BlockMeta],
     ) -> CommonResult<BlockReportListResponse> {
@@ -232,7 +258,7 @@ impl BlockActor {
             "full block report",
             || self.worker_ctl.state::<ServerState>() == ServerState::Stop,
             std::thread::sleep,
-            || self.client.full_block_report(total_len, batch),
+            || self.client.full_block_report(report_id, total_len, batch),
         )
     }
 
@@ -356,6 +382,34 @@ mod tests {
 
         assert!(res.is_err());
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn stops_when_worker_shuts_down_during_backoff() {
+        let calls = Cell::new(0);
+        let stopped = Cell::new(false);
+
+        let res: CommonResult<()> = send_with_retry(
+            "test",
+            || stopped.get(),
+            |_| stopped.set(true),
+            || {
+                calls.set(calls.get() + 1);
+                Err(io_error())
+            },
+        );
+
+        assert!(res.is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn report_ids_are_nonzero_and_change_between_rounds() {
+        let first = new_report_id();
+        std::thread::sleep(Duration::from_millis(1));
+        let second = new_report_id();
+        assert_ne!(first, 0);
+        assert_ne!(first, second);
     }
 
     #[test]
