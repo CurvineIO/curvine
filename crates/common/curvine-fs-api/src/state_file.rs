@@ -36,6 +36,37 @@ impl StateWriter {
         })
     }
 
+    /// Creates a new state file that only the current user can read or write.
+    ///
+    /// The file is created exclusively and without following symlinks, with
+    /// mode `0600`, so a file or symlink planted at `path` is never opened or
+    /// truncated. The parent directory must not be writable by other users
+    /// unless it has the sticky bit, as `/tmp` does.
+    #[cfg(unix)]
+    pub fn new_private<T: AsRef<str>>(path: T) -> IOResult<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file_path = std::path::Path::new(path.as_ref());
+        let dir = match file_path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => std::path::Path::new("."),
+        };
+        check_state_dir(dir)?;
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(file_path)?;
+        let inner = BufWriter::with_capacity(FILE_BUFFER_SIZE, file);
+
+        Ok(Self {
+            path: path.as_ref().to_string(),
+            inner,
+        })
+    }
+
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -89,6 +120,49 @@ impl StateReader {
         })
     }
 
+    /// Opens a state file written by `StateWriter::new_private`.
+    ///
+    /// Fails if `path` is a symlink, is not a regular file, is owned by another
+    /// user, or can be accessed by group or others.
+    #[cfg(unix)]
+    pub fn open_private<T: AsRef<str>>(path: T) -> IOResult<Self> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path.as_ref())?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(state_file_error(format!(
+                "state file {} is not a regular file",
+                path.as_ref()
+            )));
+        }
+        let uid = unsafe { libc::geteuid() };
+        if meta.uid() != uid {
+            return Err(state_file_error(format!(
+                "state file {} is owned by uid {}, expected {}",
+                path.as_ref(),
+                meta.uid(),
+                uid
+            )));
+        }
+        if meta.mode() & 0o077 != 0 {
+            return Err(state_file_error(format!(
+                "state file {} has mode {:o}, expected no group or other access",
+                path.as_ref(),
+                meta.mode() & 0o777
+            )));
+        }
+        let inner = BufReader::with_capacity(FILE_BUFFER_SIZE, file);
+
+        Ok(Self {
+            path: path.as_ref().to_string(),
+            inner,
+        })
+    }
+
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -124,6 +198,35 @@ impl StateReader {
         let res = try_err!(serde_json::from_str(line.trim_end()));
         Ok(res)
     }
+}
+
+#[cfg(unix)]
+fn state_file_error(msg: String) -> curvine_io::IOError {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg).into()
+}
+
+/// State files must not be created in a directory other users can add files to,
+/// unless the sticky bit stops them from replacing ours.
+#[cfg(unix)]
+fn check_state_dir(dir: &std::path::Path) -> IOResult<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(state_file_error(format!(
+            "state directory {} is not a directory",
+            dir.display()
+        )));
+    }
+    let mode = meta.mode();
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(state_file_error(format!(
+            "state directory {} has mode {:o}: writable by other users without the sticky bit",
+            dir.display(),
+            mode & 0o7777
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -166,5 +269,176 @@ mod tests {
         assert_eq!(read_set.len(), 2);
         assert!(read_set.contains(&1));
         assert!(read_set.contains(&2));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod private_tests {
+    use super::{StateReader, StateWriter};
+    use curvine_runtime::common::Utils;
+    use std::fs;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::PathBuf;
+
+    fn private_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("state-file-{}", Utils::rand_str(12)));
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    fn path_of(dir: &std::path::Path, name: &str) -> String {
+        dir.join(name).to_string_lossy().to_string()
+    }
+
+    fn mode_of(path: &str) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn new_private_round_trips_with_owner_only_mode() {
+        let dir = private_dir();
+        let path = path_of(&dir, "state.data");
+
+        let mut writer = StateWriter::new_private(&path).unwrap();
+        writer.write_len(7).unwrap();
+        writer.write_struct(&"payload".to_string()).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        assert_eq!(mode_of(&path), 0o600);
+
+        let mut reader = StateReader::open_private(&path).unwrap();
+        assert_eq!(reader.read_len().unwrap(), 7);
+        assert_eq!(reader.read_struct::<String>().unwrap(), "payload");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_private_does_not_truncate_an_existing_file() {
+        let dir = private_dir();
+        let path = path_of(&dir, "state.data");
+        fs::write(&path, "keep me").unwrap();
+
+        assert!(StateWriter::new_private(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "keep me");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_private_does_not_follow_a_symlink() {
+        let dir = private_dir();
+        let target = path_of(&dir, "target");
+        let link = path_of(&dir, "state.data");
+        fs::write(&target, "keep me").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(StateWriter::new_private(&link).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+
+        // A dangling symlink must not be created through either.
+        let dangling_target = path_of(&dir, "missing");
+        let dangling = path_of(&dir, "dangling.data");
+        symlink(&dangling_target, &dangling).unwrap();
+        assert!(StateWriter::new_private(&dangling).is_err());
+        assert!(!std::path::Path::new(&dangling_target).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_private_rejects_a_directory_other_users_can_write() {
+        let dir = private_dir();
+        let path = path_of(&dir, "state.data");
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = StateWriter::new_private(&path).err().unwrap();
+        assert!(err.to_string().contains("sticky"), "{err}");
+        assert!(!std::path::Path::new(&path).exists());
+
+        // The sticky bit, as on /tmp, makes a shared directory acceptable.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o1777)).unwrap();
+        StateWriter::new_private(&path).unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_private_rejects_a_missing_directory() {
+        let dir = private_dir();
+        let path = path_of(&dir.join("missing"), "state.data");
+        assert!(StateWriter::new_private(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_private_rejects_a_symlink() {
+        let dir = private_dir();
+        let target = path_of(&dir, "target");
+        let link = path_of(&dir, "state.data");
+        let mut writer = StateWriter::new_private(&target).unwrap();
+        writer.write_len(1).unwrap();
+        writer.flush().unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(StateReader::open_private(&link).is_err());
+        assert!(StateReader::open_private(&target).is_ok());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_private_rejects_group_or_other_access() {
+        let dir = private_dir();
+        for mode in [0o640, 0o604, 0o644, 0o666] {
+            let path = path_of(&dir, &format!("state-{mode:o}.data"));
+            fs::write(&path, "1\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let err = StateReader::open_private(&path).err().unwrap();
+            assert!(
+                err.to_string().contains("no group or other access"),
+                "{err}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_private_rejects_a_directory() {
+        let dir = private_dir();
+        assert!(StateReader::open_private(dir.to_string_lossy()).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_private_rejects_a_file_of_another_owner() {
+        // Changing the owner needs root, so only run where that is possible.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let dir = private_dir();
+        let path = path_of(&dir, "state.data");
+        fs::write(&path, "1\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::chown(&path, Some(12345), None).unwrap();
+
+        let err = StateReader::open_private(&path).err().unwrap();
+        assert!(err.to_string().contains("owned by uid"), "{err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_private_reports_a_missing_file() {
+        let dir = private_dir();
+        let path = path_of(&dir, "missing.data");
+        let err = StateReader::open_private(&path).err().unwrap();
+        assert!(
+            err.to_string().to_lowercase().contains("no such file"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
