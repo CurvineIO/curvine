@@ -55,6 +55,14 @@ meta_dir = "testing/meta"
 # Worker selection policy: local, robin, random, load_based, or weighted.
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"
+# Log rotation applies when log_dir is a directory; stdout and stderr are not rotated.
+# max_file_size_mb: rotate when the file reaches this size in MB (default 100, 0 = no size limit).
+# time_rotation: "daily" or "hourly" (default none). Combined with max_file_size_mb, whichever
+#   fires first rotates the file.
+# With both options unset, files rotate by size only, at 100 MB. If max_file_size_mb = 0 and no
+#   valid time_rotation is set, files rotate daily so they cannot grow without limit.
+# max_log_files: number of rotated files to keep (default 10).
+# Example: log = { level = "info", log_dir = "logs", file_name = "master.log", max_file_size_mb = 200, time_rotation = "daily", max_log_files = 20 }
 log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 
 # Version compatibility policy.
