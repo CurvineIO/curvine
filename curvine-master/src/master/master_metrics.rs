@@ -21,8 +21,95 @@ use curvine_core_error::CommonResult;
 use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
 use curvine_model::{MetricValue, WorkerInfo};
 use curvine_runtime::sync::FastDashMap;
+use curvine_sys::version::ReleaseVersion;
+use dashmap::DashMap;
 use log::{debug, info, warn};
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::time::{Duration, Instant};
+
+/// Release version label of a client that sent no component info yet.
+const CLIENT_VERSION_NONE: &str = "none";
+/// Release version label of a client whose reported version cannot be parsed.
+/// Parsing keeps the label set bounded by real builds, not by client input.
+const CLIENT_VERSION_UNKNOWN: &str = "unknown";
+
+struct ClientCompat {
+    release_version: String,
+    verdict: &'static str,
+    last_seen: Instant,
+}
+
+/// Last compatibility verdict of each client address, aggregated into
+/// `(release_version, verdict)` counts when metrics are scraped.
+///
+/// The client address is state here, never a metric label, so the number of
+/// series depends on the number of client builds, not on the number of
+/// addresses. Addresses that stop calling are dropped after `TTL`.
+#[derive(Default)]
+pub(crate) struct ClientCompatTracker {
+    clients: DashMap<String, ClientCompat>,
+}
+
+impl ClientCompatTracker {
+    pub(crate) const TTL: Duration = Duration::from_secs(60 * 60);
+
+    /// Record the verdict of one request. `release_version` is `None` when the
+    /// request carried no component info, which a client sends only on the
+    /// first call of a session; its later calls keep the version and verdict
+    /// recorded for the address. Returns true when the verdict of the address
+    /// changed, including its first observation.
+    pub(crate) fn record(
+        &self,
+        client_ip: &str,
+        release_version: Option<&str>,
+        verdict: &'static str,
+        now: Instant,
+    ) -> bool {
+        if let Some(mut known) = self.clients.get_mut(client_ip) {
+            known.last_seen = now;
+            let Some(version) = release_version else {
+                return false;
+            };
+            let changed = known.verdict != verdict;
+            known.release_version = Self::version_label(version);
+            known.verdict = verdict;
+            return changed;
+        }
+
+        self.clients.insert(
+            client_ip.to_string(),
+            ClientCompat {
+                release_version: release_version
+                    .map(Self::version_label)
+                    .unwrap_or_else(|| CLIENT_VERSION_NONE.to_string()),
+                verdict,
+                last_seen: now,
+            },
+        );
+        true
+    }
+
+    /// Drop addresses not seen within the TTL and count the rest by
+    /// `(release_version, verdict)`.
+    pub(crate) fn counts(&self, now: Instant) -> HashMap<(String, &'static str), i64> {
+        self.clients
+            .retain(|_, c| now.saturating_duration_since(c.last_seen) <= Self::TTL);
+        let mut counts = HashMap::new();
+        for entry in self.clients.iter() {
+            *counts
+                .entry((entry.release_version.clone(), entry.verdict))
+                .or_insert(0) += 1;
+        }
+        counts
+    }
+
+    fn version_label(version: &str) -> String {
+        ReleaseVersion::parse(version)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| CLIENT_VERSION_UNKNOWN.to_string())
+    }
+}
 
 pub struct MasterMetrics {
     pub(crate) rpc_request_total_count: Counter,
@@ -89,11 +176,16 @@ pub struct MasterMetrics {
     pub(crate) fs_dir_probe_acquire_us: Gauge,
 
     // Compatibility metrics.
-    // Per-verdict gauge: 1 for the current verdict of each worker/client
+    // Per-verdict gauge: 1 for the current verdict of each worker
     // (compatible, missing_info, blocked, protocol_mismatch, version_too_old,
-    // version_unknown). Only one label per peer is active at a time.
+    // version_unknown). Only one label per worker is active at a time.
     pub(crate) compat_worker_verdict: GaugeVec,
+    // Number of clients per release version and verdict. Client addresses are
+    // not a label because they are not bounded by cluster size.
     pub(crate) compat_client_verdict: GaugeVec,
+    // Number of times a client address changed to a verdict, by verdict.
+    pub(crate) compat_client_verdict_total: CounterVec,
+    compat_clients: ClientCompatTracker,
     // Total number of enforce-mode rejections, labelled by component and verdict.
     pub(crate) compat_enforce_rejected_total: CounterVec,
 }
@@ -254,9 +346,15 @@ impl MasterMetrics {
             )?,
             compat_client_verdict: m::new_gauge_vec(
                 "compat_client_verdict",
-                "Current compatibility verdict per client, labelled by client_addr and verdict",
-                &["client_addr", "verdict"],
+                "Number of clients per release version and compatibility verdict",
+                &["release_version", "verdict"],
             )?,
+            compat_client_verdict_total: m::new_counter_vec(
+                "compat_client_verdict_total",
+                "Total number of times a client address changed to a compatibility verdict, labelled by verdict",
+                &["verdict"],
+            )?,
+            compat_clients: ClientCompatTracker::default(),
             compat_enforce_rejected_total: m::new_counter_vec(
                 "compat_enforce_rejected_total",
                 "Total number of enforce-mode compatibility rejections, labelled by component and verdict",
@@ -277,8 +375,38 @@ impl MasterMetrics {
         }
     }
 
+    /// Record the compatibility verdict of a client request.
+    /// `release_version` is `None` when the request carried no component info.
+    pub(crate) fn record_client_compat(
+        &self,
+        client_ip: &str,
+        release_version: Option<&str>,
+        verdict: &'static str,
+    ) {
+        if self
+            .compat_clients
+            .record(client_ip, release_version, verdict, Instant::now())
+        {
+            self.compat_client_verdict_total
+                .with_label_values(&[verdict])
+                .inc();
+        }
+    }
+
+    /// Rebuild the client gauge from the tracker, so versions and verdicts no
+    /// client holds any more disappear from the output.
+    fn refresh_client_verdicts(&self) {
+        self.compat_client_verdict.reset();
+        for ((version, verdict), count) in self.compat_clients.counts(Instant::now()) {
+            self.compat_client_verdict
+                .with_label_values(&[&version, verdict])
+                .set(count);
+        }
+    }
+
     pub fn text_output(&self, fs: MasterFilesystem) -> CommonResult<String> {
         let filesystem_info = fs.filesystem_info()?;
+        self.refresh_client_verdicts();
         self.capacity.set(filesystem_info.capacity);
         self.available.set(filesystem_info.available);
         self.fs_used.set(filesystem_info.fs_used);
@@ -363,6 +491,105 @@ impl Debug for MasterMetrics {
 mod tests {
     use super::*;
     use curvine_model::WorkerAddress;
+
+    fn count(
+        counts: &HashMap<(String, &'static str), i64>,
+        version: &str,
+        verdict: &'static str,
+    ) -> i64 {
+        counts
+            .get(&(version.to_string(), verdict))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn client_verdicts_are_aggregated_by_release_version() {
+        let tracker = ClientCompatTracker::default();
+        let now = Instant::now();
+        // Many addresses on one build produce one entry, not one each.
+        for i in 0..50 {
+            tracker.record(
+                &format!("10.0.0.{i}"),
+                Some("0.1.0"),
+                "version_too_old",
+                now,
+            );
+        }
+        tracker.record("10.0.1.1", Some("0.3.0"), "compatible", now);
+
+        let counts = tracker.counts(now);
+        assert_eq!(counts.len(), 2);
+        assert_eq!(count(&counts, "0.1.0", "version_too_old"), 50);
+        assert_eq!(count(&counts, "0.3.0", "compatible"), 1);
+    }
+
+    #[test]
+    fn later_statfs_without_component_info_keeps_the_recorded_version() {
+        let tracker = ClientCompatTracker::default();
+        let now = Instant::now();
+        assert!(tracker.record("10.0.0.1", Some("0.3.0"), "compatible", now));
+
+        // The following calls of the session carry no component_info.
+        assert!(!tracker.record("10.0.0.1", None, "missing_info", now));
+        assert!(!tracker.record("10.0.0.1", None, "missing_info", now));
+
+        let counts = tracker.counts(now);
+        assert_eq!(counts.len(), 1);
+        assert_eq!(count(&counts, "0.3.0", "compatible"), 1);
+    }
+
+    #[test]
+    fn first_call_without_component_info_is_a_legacy_client() {
+        let tracker = ClientCompatTracker::default();
+        let now = Instant::now();
+        assert!(tracker.record("10.0.0.1", None, "missing_info", now));
+        assert_eq!(count(&tracker.counts(now), "none", "missing_info"), 1);
+    }
+
+    #[test]
+    fn record_reports_verdict_transitions_only() {
+        let tracker = ClientCompatTracker::default();
+        let now = Instant::now();
+        assert!(tracker.record("10.0.0.1", Some("0.2.0"), "blocked", now));
+        assert!(!tracker.record("10.0.0.1", Some("0.2.0"), "blocked", now));
+        assert!(tracker.record("10.0.0.1", Some("0.3.0"), "compatible", now));
+        assert!(tracker.record("10.0.0.1", Some("0.2.0"), "blocked", now));
+    }
+
+    #[test]
+    fn unparseable_versions_share_one_label() {
+        let tracker = ClientCompatTracker::default();
+        let now = Instant::now();
+        for i in 0..20 {
+            tracker.record(
+                &format!("10.0.0.{i}"),
+                Some(&format!("garbage-{i}")),
+                "version_unknown",
+                now,
+            );
+        }
+        let counts = tracker.counts(now);
+        assert_eq!(counts.len(), 1);
+        assert_eq!(count(&counts, "unknown", "version_unknown"), 20);
+    }
+
+    #[test]
+    fn idle_clients_expire() {
+        let tracker = ClientCompatTracker::default();
+        let start = Instant::now();
+        tracker.record("10.0.0.1", Some("0.3.0"), "compatible", start);
+        tracker.record(
+            "10.0.0.2",
+            Some("0.3.0"),
+            "compatible",
+            start + ClientCompatTracker::TTL,
+        );
+
+        let later = start + ClientCompatTracker::TTL + Duration::from_secs(1);
+        assert_eq!(count(&tracker.counts(later), "0.3.0", "compatible"), 1);
+        assert!(tracker.counts(later + ClientCompatTracker::TTL).is_empty());
+    }
 
     fn live_worker(ip: &str, rpc_port: u32, scheduled_bytes: i64) -> WorkerInfo {
         let mut worker = WorkerInfo::new(
