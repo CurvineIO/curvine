@@ -742,9 +742,10 @@ impl Display for SpdkBdev {
 
 impl Drop for SpdkBdev {
     fn drop(&mut self) {
-        // Retire the qpair first. If the poller force-completed I/O and moved
-        // callbacks to stale, retirement reclaims them and releases DMA refs
-        // before the wait loop below observes `inflight`.
+        // Retire the qpair before waiting on `inflight` below. Retirement
+        // reclaims stale callback contexts, which is what releases DMA refs
+        // after force-completion; if this ran after the wait loop, the loop
+        // could never observe inflight == 0 for a force-completed qpair.
         let env = crate::spdk_env::SpdkEnv::global_including_shutdown();
         if let Some(env) = env {
             env.retire_qpair(self.ctrlr, self.io_channel.qpair);

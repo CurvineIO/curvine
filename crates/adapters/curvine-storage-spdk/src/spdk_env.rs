@@ -627,6 +627,7 @@ impl RetiredDmaRegistry {
             "Deferring SPDK DMA buffers for '{}' with {} in-flight ref(s)",
             bdev_name, pending
         );
+        // TODO(spdk): expose retired-DMA defer/reclaim counters and gauges via spdk_metrics.
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
