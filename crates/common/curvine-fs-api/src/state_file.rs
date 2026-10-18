@@ -128,9 +128,11 @@ impl StateReader {
     pub fn open_private<T: AsRef<str>>(path: T) -> IOResult<Self> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
+        // O_NONBLOCK keeps a FIFO at `path` from blocking the open until a writer
+        // connects; it is then rejected below. It has no effect on regular files.
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path.as_ref())?;
         let meta = file.metadata()?;
         if !meta.is_file() {
@@ -205,10 +207,14 @@ fn state_file_error(msg: String) -> curvine_io::IOError {
     std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg).into()
 }
 
-/// State files must not be created in a directory other users can add files to,
-/// unless the sticky bit stops them from replacing ours.
+/// Checks that `dir` is safe to keep state files in.
+///
+/// It must be owned by the current effective user or by root, because the owner
+/// of a directory can remove files from it even when the sticky bit is set. It
+/// must not be writable by group or others unless it has the sticky bit, as
+/// `/tmp` does, which stops them from replacing our files.
 #[cfg(unix)]
-fn check_state_dir(dir: &std::path::Path) -> IOResult<()> {
+pub fn check_state_dir(dir: &std::path::Path) -> IOResult<()> {
     use std::os::unix::fs::MetadataExt;
 
     let meta = std::fs::metadata(dir)?;
@@ -216,6 +222,15 @@ fn check_state_dir(dir: &std::path::Path) -> IOResult<()> {
         return Err(state_file_error(format!(
             "state directory {} is not a directory",
             dir.display()
+        )));
+    }
+    let uid = unsafe { libc::geteuid() };
+    if meta.uid() != uid && meta.uid() != 0 {
+        return Err(state_file_error(format!(
+            "state directory {} is owned by uid {}, expected {} or root",
+            dir.display(),
+            meta.uid(),
+            uid
         )));
     }
     let mode = meta.mode();
@@ -426,6 +441,45 @@ mod private_tests {
 
         let err = StateReader::open_private(&path).err().unwrap();
         assert!(err.to_string().contains("owned by uid"), "{err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_private_rejects_a_fifo_without_blocking() {
+        let dir = private_dir();
+        let path = path_of(&dir, "state.fifo");
+        let c_path = std::ffi::CString::new(path.clone()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        // Opening a FIFO for reading blocks until a writer connects, so run it on
+        // another thread to fail the test instead of hanging it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(StateReader::open_private(&path).is_err());
+        });
+        let rejected = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("open_private blocked on a FIFO");
+        assert!(rejected);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_private_rejects_a_directory_of_another_owner() {
+        // Changing the owner needs root, so only run where that is possible.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let dir = private_dir();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o1777)).unwrap();
+        std::os::unix::fs::chown(&dir, Some(12345), None).unwrap();
+
+        let path = path_of(&dir, "state.data");
+        let err = StateWriter::new_private(&path).err().unwrap();
+        assert!(err.to_string().contains("owned by uid"), "{err}");
+        assert!(!std::path::Path::new(&path).exists());
 
         let _ = fs::remove_dir_all(&dir);
     }
