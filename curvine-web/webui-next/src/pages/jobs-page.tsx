@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CircleAlert } from 'lucide-react'
+import { useSearchParams } from 'react-router-dom'
 
 import { useApi } from '@/api/api-context'
 import type { JobInfo, MountInfo } from '@/api/types'
@@ -105,6 +106,7 @@ export function JobsPage() {
   const [polling, setPolling] = useState(true)
 
   const [selectedJobId, setSelectedJobId] = useState('')
+  const [searchParams, setSearchParams] = useSearchParams()
   const [loadFormOpen, setLoadFormOpen] = useState(false)
   const loadSheet = useSlidingSheet(loadFormOpen)
   const [cancelTarget, setCancelTarget] = useState<JobInfo | null>(null)
@@ -245,6 +247,42 @@ export function JobsPage() {
     const timer = window.setTimeout(() => void performJobIdLookup(trimmed), 300)
     return () => window.clearTimeout(timer)
   }, [query, performJobIdLookup])
+
+  // Deep link: /jobs?job=<id> opens that job's diagnostics sheet on arrival.
+  useEffect(() => {
+    const param = String(searchParams.get('job') || '').trim()
+    if (!param) return
+    const match = jobsRef.current.find(
+      (job) => normalizeJobId(jobId(job)) === normalizeJobId(param)
+    )
+    if (match) {
+      setSelectedJobId(jobId(match))
+      return
+    }
+    let cancelled = false
+    void lookupJob(param).then((job) => {
+      if (cancelled || !job) return
+      setSelectedJobId(jobId(job))
+      void openDetails(job)
+    })
+    return () => {
+      cancelled = true
+    }
+    // Only the URL parameter may retrigger this, not list refreshes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams])
+
+  const clearJobParam = useCallback(() => {
+    setSearchParams(
+      (current) => {
+        if (!current.has('job')) return current
+        const next = new URLSearchParams(current)
+        next.delete('job')
+        return next
+      },
+      { replace: true }
+    )
+  }, [setSearchParams])
 
   /* ------------------------------------------------------------- derived */
 
@@ -699,7 +737,10 @@ export function JobsPage() {
           job={detailSheet.value}
           mounts={mounts}
           loading={detailLoading}
-          onClose={() => setSelectedJobId('')}
+          onClose={() => {
+            setSelectedJobId('')
+            clearJobParam()
+          }}
           onCopy={(text, message) => copyText(text, message)}
         />
       )}

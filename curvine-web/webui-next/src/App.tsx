@@ -35,6 +35,9 @@ const JobsPage = lazy(() =>
 const TransfersPage = lazy(() =>
   import('@/pages/transfers-page').then((module) => ({ default: module.TransfersPage }))
 )
+const SyncJobsPage = lazy(() =>
+  import('@/pages/sync-jobs-page').then((module) => ({ default: module.SyncJobsPage }))
+)
 const ObservabilityPage = lazy(() =>
   import('@/pages/observability-page').then((module) => ({ default: module.ObservabilityPage }))
 )
@@ -71,6 +74,7 @@ export function App() {
         <Route path="workers/:id?" element={<WorkersPage />} />
         <Route path="jobs" element={<JobsPage />} />
         <Route path="transfers" element={<TransfersPage />} />
+        <Route path="sync-jobs" element={<SyncJobsPage />} />
         <Route path="observability" element={<ObservabilityPage />} />
         <Route path="operations" element={<OperationsPage />} />
         <Route path="config" element={<ConfigPage />} />

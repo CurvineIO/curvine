@@ -75,6 +75,9 @@ message GetJobStatusResponse {
   repeated LoadTaskStatusProto tasks = 12;
   // 1 = Manual (user-submitted), 2 = fs_mode auto-export. Absent => Manual.
   optional int32 source_type = 13;
+  // Transfer job that executes this load/export job (set when the submitter
+  // routed the work through the transfer service). Absent => self-executed.
+  optional string transfer_job_id = 14;
 }
 
 message LoadTaskStatusProto {

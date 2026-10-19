@@ -1,4 +1,5 @@
 import { render, screen, within } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it } from 'vitest'
 
 import { ApiProvider } from '@/api/api-context'
@@ -28,19 +29,21 @@ describe('TransfersPage mobile layout', () => {
     } as unknown as ApiClient
 
     render(
-      <ApiProvider client={client}>
-        <I18nProvider>
-          <RefreshProvider>
-            <ToastProvider>
-              <CopyFallbackProvider>
-                <TooltipProvider>
-                  <TransfersPage />
-                </TooltipProvider>
-              </CopyFallbackProvider>
-            </ToastProvider>
-          </RefreshProvider>
-        </I18nProvider>
-      </ApiProvider>
+      <MemoryRouter initialEntries={['/transfers']}>
+        <ApiProvider client={client}>
+          <I18nProvider>
+            <RefreshProvider>
+              <ToastProvider>
+                <CopyFallbackProvider>
+                  <TooltipProvider>
+                    <TransfersPage />
+                  </TooltipProvider>
+                </CopyFallbackProvider>
+              </ToastProvider>
+            </RefreshProvider>
+          </I18nProvider>
+        </ApiProvider>
+      </MemoryRouter>
     )
 
     const row = await screen.findByTestId('transfer-row-job-responsive-test')

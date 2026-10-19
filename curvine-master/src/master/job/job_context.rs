@@ -88,6 +88,7 @@ impl JobContext {
             create_time: LocalTime::mills() as i64,
             overwrite: job_conf.overwrite,
             source_type: job_conf.source_type.unwrap_or_default(),
+            transfer_job_id: job_conf.transfer_job_id.clone(),
         };
 
         JobContext {

@@ -66,6 +66,7 @@ impl JobHandler {
                 .into_iter()
                 .map(Self::task_status_response)
                 .collect(),
+            transfer_job_id: status.transfer_job_id,
         }
     }
 

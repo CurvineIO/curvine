@@ -1151,6 +1151,18 @@ fn job_status_payload(status: JobStatus) -> Value {
         create_time_ms,
         None,
     );
+    // Backend-resolved association for "jump to the related job": a recorded
+    // transfer job id wins (the sync was executed through the transfer
+    // service), otherwise the load/export job itself is the related job.
+    let related_job_kind = if status.transfer_job_id.is_some() {
+        "transfer"
+    } else {
+        "load"
+    };
+    let related_job_id = status
+        .transfer_job_id
+        .clone()
+        .unwrap_or_else(|| status.job_id.clone());
     json!({
         "job_id": status.job_id,
         "id": status.job_id,
@@ -1179,6 +1191,9 @@ fn job_status_payload(status: JobStatus) -> Value {
             JobSourceType::Manual => "Manual",
             JobSourceType::FsModeAuto => "CompleteFile / Rename",
         },
+        "transfer_job_id": status.transfer_job_id,
+        "related_job_kind": related_job_kind,
+        "related_job_id": related_job_id,
         "tasks": status.tasks.into_iter().map(|task| json!({
             "task_id": task.task_id,
             "source_path": task.source_path,
@@ -4505,6 +4520,7 @@ impl RouterHandler for AdminRouterHandler {
             .route("/mounts", get(spa_index))
             .route("/jobs", get(spa_index))
             .route("/transfers", get(spa_index))
+            .route("/sync-jobs", get(spa_index))
             .route("/config", get(spa_index))
             .route("/blocks", get(spa_index))
             .route("/preview", get(spa_index))
@@ -4881,6 +4897,45 @@ mod transfer_tests {
         let name = transfer_display_name("alice", "/tmp/foo/bar", 1_719_763_852_000);
         assert!(name.starts_with("transfer_alice_"));
         assert!(name.ends_with("_foo-bar"));
+    }
+}
+
+#[cfg(test)]
+mod job_status_payload_tests {
+    use super::*;
+    use curvine_model::JobStatus;
+
+    fn status(job_id: &str) -> JobStatus {
+        JobStatus {
+            job_id: job_id.to_string(),
+            source_path: "/mnt/a".to_string(),
+            target_path: "s3://bucket/a".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn payload_reports_load_job_when_not_transfer_backed() {
+        let payload = job_status_payload(status("job_abc123"));
+        assert_eq!(payload["related_job_kind"], json!("load"));
+        assert_eq!(payload["related_job_id"], json!("job_abc123"));
+        assert!(payload["transfer_job_id"].is_null());
+    }
+
+    #[test]
+    fn payload_prefers_recorded_transfer_job_for_deep_link() {
+        let mut st = status("job_abc123");
+        st.transfer_job_id = Some("0b6f42f4-2a6f-4a5a-9e7e-8e6b0c9d1a11".to_string());
+        let payload = job_status_payload(st);
+        assert_eq!(payload["related_job_kind"], json!("transfer"));
+        assert_eq!(
+            payload["related_job_id"],
+            json!("0b6f42f4-2a6f-4a5a-9e7e-8e6b0c9d1a11")
+        );
+        assert_eq!(
+            payload["transfer_job_id"],
+            json!("0b6f42f4-2a6f-4a5a-9e7e-8e6b0c9d1a11")
+        );
     }
 }
 

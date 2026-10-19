@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronLeftIcon, ChevronRightIcon, CircleAlert } from 'lucide-react'
+import { useSearchParams } from 'react-router-dom'
 
 import { ApiError } from '@/api/error'
 import { useApi } from '@/api/api-context'
@@ -137,6 +138,7 @@ export function TransfersPage() {
   const [polling, setPolling] = useState(true)
 
   const [selectedTransferId, setSelectedTransferId] = useState('')
+  const [searchParams, setSearchParams] = useSearchParams()
   const [submitFormOpen, setSubmitFormOpen] = useState(false)
   const submitSheet = useSlidingSheet(submitFormOpen)
   const [cancelTarget, setCancelTarget] = useState<TransferInfo | null>(null)
@@ -273,6 +275,65 @@ export function TransfersPage() {
       window.clearTimeout(timer)
     }
   }, [api, query, t])
+
+  // Deep link: /transfers?job=<id> opens that transfer's diagnostics sheet on arrival.
+  useEffect(() => {
+    const param = String(searchParams.get('job') || '').trim()
+    if (!param) return
+    const existing = transfersRef.current.find(
+      (transfer) => transferId(transfer).toLowerCase() === param.toLowerCase()
+    )
+    if (existing) {
+      void openDetails(existing)
+      return
+    }
+    let cancelled = false
+    setJobIdLookupLoading(true)
+    setJobIdLookupError(null)
+    void api
+      .fetchTransferStatus(param, { page_size: TASK_PAGE_DEFAULT })
+      .then((response) => {
+        if (cancelled) return
+        const transfer = response as TransferInfo
+        upsertVisibleTransfer(transfer)
+        setSelectedTransferId(transferId(transfer))
+        setTaskPageSize(TASK_PAGE_DEFAULT)
+        setTaskNextPageToken(String(transfer?.next_page_token || ''))
+      })
+      .catch((error) => {
+        if (cancelled) return
+        const notFound =
+          error instanceof ApiError &&
+          (error.status === 404 || /\bjob\b.*\bnot found\b/i.test(error.message))
+        if (!notFound) {
+          setJobIdLookupError(
+            t('transfers.alerts.lookupFailed', {
+              error: error instanceof Error ? error.message : String(error)
+            })
+          )
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setJobIdLookupLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+    // Only the URL parameter may retrigger this, not list refreshes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams])
+
+  const clearJobParam = useCallback(() => {
+    setSearchParams(
+      (current) => {
+        if (!current.has('job')) return current
+        const next = new URLSearchParams(current)
+        next.delete('job')
+        return next
+      },
+      { replace: true }
+    )
+  }, [setSearchParams])
 
   useEffect(() => {
     if (!polling) {
@@ -940,7 +1001,10 @@ export function TransfersPage() {
           taskNextPageToken={taskNextPageToken}
           taskPageSize={taskPageSize}
           taskLoadingMore={taskLoadingMore}
-          onClose={closeDetails}
+          onClose={() => {
+            closeDetails()
+            clearJobParam()
+          }}
           onCopy={(text, message) => void copyText(text, message)}
           onRetry={() => setRetryTarget(detailSheet.value ?? null)}
           onLoadMore={() => void loadMoreTasks()}

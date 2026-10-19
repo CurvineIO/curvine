@@ -35,6 +35,14 @@ import {
 } from '@/lib/browseColumns'
 import { useCopy } from '@/components/copy-fallback'
 import { readStoredColumns, writeStoredColumns } from '@/lib/column-visibility'
+import {
+  aggregateBatchUfsSyncJobs,
+  batchUfsSyncPollIntervalMs,
+  countActiveUfsSyncJobs,
+  ufsSyncPollIntervalMs
+} from '@/lib/ufs-sync/aggregate'
+import { MAX_POLL_ATTEMPTS, readJson, writeJson } from '@/lib/ufs-sync/storage'
+import { useUfsSyncTracked } from '@/lib/ufs-sync/useUfsSyncTracked'
 import { formatBytes, formatTime } from '@/lib/format'
 import { useSlidingSheet } from '@/lib/use-sliding-sheet'
 import { useRefreshSignal } from '@/refresh/refresh-context'
@@ -42,8 +50,8 @@ import { ColumnsPicker } from '@/components/columns-picker'
 import { MkdirSheet, PathBreadcrumb } from './browse/browse-controls'
 import { BlocksSheet } from './browse/blocks-sheet'
 import { PreviewSheet } from './browse/preview-sheet'
-import { UfsSyncPanel, UploadBatchesPanel } from './browse/sync-panels'
-import type { BrowseRow, TrackedUploadBatch, UfsSyncBatch, UfsSyncJob } from './browse/types'
+import { UploadBatchesPanel } from './browse/sync-panels'
+import type { BrowseRow, TrackedUploadBatch, UfsSyncJob } from './browse/types'
 import {
   fileName,
   isReadOnlyMount,
@@ -57,9 +65,6 @@ import {
 const BROWSE_SNAPSHOT_TTL_MS = 10 * 60 * 1000
 const UPLOAD_BATCH_KEEP_MS = 24 * 60 * 60 * 1000
 const UPLOAD_BATCH_STALE_MS = 10 * 60 * 1000
-const UFS_SYNC_KEEP_MS = 30 * 60 * 1000
-const UFS_SYNC_RESTORE_KEEP_MS = 24 * 60 * 60 * 1000
-const MAX_POLL_ATTEMPTS = 240
 
 /**
  * Entries per listing request. A directory with tens of thousands of files used
@@ -70,26 +75,6 @@ const BROWSE_PAGE = 500
 
 const BROWSE_COLUMNS_STORAGE_KEY = 'curvine.web.fs.browseColumns.v1'
 const UPLOAD_BATCH_STORAGE_KEY = 'curvine.web.fs.uploadBatches.v1'
-const UFS_SYNC_STORAGE_KEY = 'curvine.web.fs.ufsSyncJobs.v3'
-const UFS_SYNC_DISMISSED_STORAGE_KEY = 'curvine.web.fs.ufsSyncDismissed.v1'
-const UFS_SYNC_PANEL_STORAGE_KEY = 'curvine.web.fs.ufsSyncPanelExpanded.v1'
-
-function readJson<T>(key: string, fallback: T): T {
-  try {
-    const raw = window.localStorage.getItem(key)
-    return raw ? ((JSON.parse(raw) as T) ?? fallback) : fallback
-  } catch {
-    return fallback
-  }
-}
-
-function writeJson(key: string, value: unknown) {
-  try {
-    window.localStorage.setItem(key, JSON.stringify(value))
-  } catch {
-    // Storage may be full or unavailable; tracking is best-effort.
-  }
-}
 
 function browseSnapshotKey(cacheOnly: boolean, path: string): string {
   return `curvine.web.fs.browseSnapshot.v1:${cacheOnly ? 'cache' : 'all'}:${normalizePath(path)}`
@@ -132,8 +117,13 @@ export function BrowsePage() {
   const [mounts, setMounts] = useState<MountInfo[]>([])
   const [visibleColumns, setVisibleColumns] = useState<BrowseColumnKey[]>(DEFAULT_VISIBLE_COLUMNS)
   const [uploadBatches, setUploadBatches] = useState<Record<string, TrackedUploadBatch>>({})
-  const [ufsSyncJobs, setUfsSyncJobs] = useState<Record<string, UfsSyncJob>>({})
-  const [ufsSyncPanelExpanded, setUfsSyncPanelExpanded] = useState(true)
+  // Shared UFS sync tracker (same hook the sync-jobs page mounts): owns the
+  // tracked rows, their storage persistence and the cross-tab reconciliation.
+  const ufsSync = useUfsSyncTracked()
+  const { jobs: ufsSyncJobs, jobsRef: ufsSyncJobsRef } = ufsSync
+  const setUfsSyncJob = ufsSync.setJob
+  const removeUfsSyncJob = ufsSync.removeJob
+  const isUfsSyncDismissed = ufsSync.isDismissed
   const [mkdirOpen, setMkdirOpen] = useState(false)
   const mkdirSheet = useSlidingSheet(mkdirOpen)
   // Clicking a file previews it; the 块 button opens the block locations. Both are drawers
@@ -163,15 +153,12 @@ export function BrowsePage() {
   const mountsRef = useRef<MountInfo[]>([])
   const mountsLoadedRef = useRef(false)
   const uploadBatchesRef = useRef(uploadBatches)
-  const ufsSyncJobsRef = useRef(ufsSyncJobs)
-  const ufsSyncDismissedRef = useRef<Record<string, number>>({})
   const summaryLoadToken = useRef(0)
   const ufsSyncDiscoverToken = useRef(0)
   const ufsSyncTimers = useRef<Record<string, number>>({})
   const ufsSyncBatchTimers = useRef<Record<string, number>>({})
-  const ufsSyncSaveTimer = useRef<number | null>(null)
+  const resumedUfsPollsRef = useRef(false)
   const uploadStorageTimer = useRef<number | null>(null)
-  const ufsStorageTimer = useRef<number | null>(null)
   const ufsDiscoverTimer = useRef<number | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const folderInputRef = useRef<HTMLInputElement | null>(null)
@@ -185,7 +172,6 @@ export function BrowsePage() {
   itemsRef.current = items
   mountsRef.current = mounts
   uploadBatchesRef.current = uploadBatches
-  ufsSyncJobsRef.current = ufsSyncJobs
 
   /* ---------------------------------------------------------------- mounts */
 
@@ -251,149 +237,6 @@ export function BrowsePage() {
   }, [api])
 
   /* ----------------------------------------------------------- ufs tracking */
-
-  const isUfsSyncDismissed = useCallback((path: string, job?: UfsSyncJob | null) => {
-    const normalized = normalizePath(path)
-    const dismissedAt = Number(ufsSyncDismissedRef.current[normalized] || 0)
-    if (!dismissedAt) return false
-    if (!job) return true
-    const state = job.state || job.status || ''
-    const done = Boolean(job.done) || isTerminalSyncState(state)
-    if (!done) return false
-    const serverUpdated = Number(job.update_time_ms || job.updated_at || 0)
-    return !serverUpdated || serverUpdated <= dismissedAt
-  }, [])
-
-  const flushUfsSyncJobsToStorage = useCallback(() => {
-    ufsSyncSaveTimer.current = null
-    try {
-      const now = Date.now()
-      const stored = readJson<Record<string, UfsSyncJob>>(UFS_SYNC_STORAGE_KEY, {})
-      const jobs: Record<string, UfsSyncJob> = { ...stored }
-      for (const [path, job] of Object.entries(ufsSyncJobsRef.current)) {
-        const state = syncState(job)
-        if (job.done || isTerminalSyncState(state)) {
-          delete jobs[path]
-          continue
-        }
-        const currentUpdatedAt = Number(job.updated_at || 0)
-        const storedUpdatedAt = Number(jobs[path]?.updated_at || 0)
-        if (now - Number(job.updated_at || now) <= UFS_SYNC_KEEP_MS && currentUpdatedAt >= storedUpdatedAt) {
-          jobs[path] = job
-        }
-      }
-      for (const [path, job] of Object.entries(jobs)) {
-        const state = syncState(job)
-        if (
-          !job ||
-          job.done ||
-          isTerminalSyncState(state) ||
-          now - Number(job.updated_at || now) > UFS_SYNC_KEEP_MS ||
-          isUfsSyncDismissed(path, job)
-        ) {
-          delete jobs[path]
-        }
-      }
-      window.localStorage.setItem(UFS_SYNC_STORAGE_KEY, JSON.stringify(jobs))
-    } catch {
-      // Best-effort persistence.
-    }
-  }, [isUfsSyncDismissed])
-
-  const saveUfsSyncJobs = useCallback(() => {
-    if (ufsSyncSaveTimer.current) window.clearTimeout(ufsSyncSaveTimer.current)
-    ufsSyncSaveTimer.current = window.setTimeout(flushUfsSyncJobsToStorage, 400)
-  }, [flushUfsSyncJobsToStorage])
-
-  const setUfsSyncJob = useCallback(
-    (path: string, job: Partial<UfsSyncJob>) => {
-      const normalized = normalizePath(path)
-      const nextJob: UfsSyncJob = {
-        ...(ufsSyncJobsRef.current[normalized] || ({} as UfsSyncJob)),
-        ...job,
-        path: normalized,
-        updated_at: Date.now()
-      }
-      if (isUfsSyncDismissed(normalized, nextJob)) return
-      const next = { ...ufsSyncJobsRef.current, [normalized]: nextJob }
-      ufsSyncJobsRef.current = next
-      setUfsSyncJobs(next)
-      saveUfsSyncJobs()
-    },
-    [isUfsSyncDismissed, saveUfsSyncJobs]
-  )
-
-  const removeUfsSyncJob = useCallback((path: string) => {
-    const normalized = normalizePath(path)
-    const next = { ...ufsSyncJobsRef.current }
-    delete next[normalized]
-    ufsSyncJobsRef.current = next
-    setUfsSyncJobs(next)
-    try {
-      const stored = readJson<Record<string, UfsSyncJob>>(UFS_SYNC_STORAGE_KEY, {})
-      delete stored[normalized]
-      window.localStorage.setItem(UFS_SYNC_STORAGE_KEY, JSON.stringify(stored))
-    } catch {
-      // Best-effort persistence.
-    }
-  }, [])
-
-  const aggregateBatchUfsSyncJobs = useCallback(
-    (serverJobs: UfsSyncJob[], previous: UfsSyncJob): Partial<UfsSyncJob> => {
-      let completedFiles = 0
-      let failedFiles = 0
-      let syncingFiles = 0
-      let waitingFiles = 0
-      let loadedSize = 0
-      let message = ''
-      for (const job of serverJobs) {
-        const state = syncState(job)
-        const totalFiles = Math.max(1, Number(job.total_files || 1))
-        const completed = state === 'Completed' ? totalFiles : Number(job.completed_files || 0)
-        completedFiles += Math.max(0, Math.min(totalFiles, completed))
-        loadedSize += Number(job.loaded_size || 0)
-        if (['Failed', 'Canceled', 'Unknown', 'Timed out'].includes(state)) {
-          failedFiles += 1
-          if (!message && job.message) message = String(job.message)
-        } else if (['Pending', 'Loading'].includes(state)) {
-          syncingFiles += 1
-        } else if (!isTerminalSyncState(state)) {
-          waitingFiles += 1
-        }
-      }
-      const totalFiles = Math.max(Number(previous.total_files || 0), serverJobs.length)
-      let activeState = 'Waiting for UFS sync'
-      if (completedFiles >= totalFiles) activeState = 'Completed'
-      else if (failedFiles > 0) activeState = 'Needs attention'
-      else if (syncingFiles > 0) activeState = 'Syncing to UFS'
-      else if (waitingFiles > 0) activeState = 'Waiting for UFS sync'
-      const done = activeState === 'Completed' || (failedFiles > 0 && completedFiles + failedFiles >= totalFiles)
-      return {
-        state: activeState,
-        status: activeState,
-        total_files: totalFiles,
-        completed_files: completedFiles,
-        loaded_size: loadedSize,
-        total_size: Number(previous.total_size || 0),
-        done,
-        message
-      }
-    },
-    []
-  )
-
-  const batchUfsSyncPollIntervalMs = useCallback((jobCount: number) => {
-    if (jobCount > 200) return 8000
-    if (jobCount > 50) return 5000
-    return 3000
-  }, [])
-
-  const ufsSyncPollIntervalMs = useCallback(() => {
-    const active = Object.keys(ufsSyncTimers.current).length
-    if (active > 20) return 5000
-    if (active > 5) return 3000
-    return 2000
-  }, [])
 
   const pollBatchUfsSync = useCallback(
     (batchId: string, pathPrefix: string) => {
@@ -461,7 +304,7 @@ export function BrowsePage() {
       }
       ufsSyncBatchTimers.current[batchId] = window.setTimeout(tick, 500)
     },
-    [api, aggregateBatchUfsSyncJobs, batchUfsSyncPollIntervalMs, setUfsSyncJob, t]
+    [api, setUfsSyncJob, t]
   )
 
   const pollUfsSync = useCallback(
@@ -479,7 +322,7 @@ export function BrowsePage() {
         if (!done && attempts < MAX_POLL_ATTEMPTS) {
           ufsSyncTimers.current[path] = window.setTimeout(
             () => void pollUfsSync(path),
-            ufsSyncPollIntervalMs()
+            ufsSyncPollIntervalMs(Object.keys(ufsSyncTimers.current).length)
           )
         } else if (!done) {
           setUfsSyncJob(path, {
@@ -514,7 +357,7 @@ export function BrowsePage() {
         if (attempts < MAX_POLL_ATTEMPTS) {
           ufsSyncTimers.current[path] = window.setTimeout(
             () => void pollUfsSync(path),
-            ufsSyncPollIntervalMs()
+            ufsSyncPollIntervalMs(Object.keys(ufsSyncTimers.current).length)
           )
         } else {
           setUfsSyncJob(path, {
@@ -526,7 +369,7 @@ export function BrowsePage() {
         }
       }
     },
-    [api, setUfsSyncJob, t, ufsSyncPollIntervalMs]
+    [api, setUfsSyncJob, t]
   )
 
   const trackUfsSync = useCallback(
@@ -805,9 +648,6 @@ export function BrowsePage() {
   /* ----------------------------------------------------------- restore once */
 
   useEffect(() => {
-    ufsSyncDismissedRef.current = readJson<Record<string, number>>(UFS_SYNC_DISMISSED_STORAGE_KEY, {})
-    setUfsSyncPanelExpanded(readJson<boolean | null>(UFS_SYNC_PANEL_STORAGE_KEY, null) !== false)
-
     const storedColumns = readStoredColumns(BROWSE_COLUMNS_STORAGE_KEY, BROWSABLE_COLUMNS)
     if (storedColumns) setVisibleColumns(storedColumns)
 
@@ -826,20 +666,10 @@ export function BrowsePage() {
   }, [])
 
   useEffect(() => {
-    // Restore persisted UFS sync jobs, then resume polling for the non-terminal ones.
-    const now = Date.now()
-    const restored = readJson<Record<string, UfsSyncJob>>(UFS_SYNC_STORAGE_KEY, {})
-    const jobs: Record<string, UfsSyncJob> = {}
-    for (const [path, job] of Object.entries(restored)) {
-      if (!job || now - Number(job.updated_at || now) > UFS_SYNC_RESTORE_KEEP_MS) continue
-      if (isUfsSyncDismissed(path, job)) continue
-      const state = syncState(job)
-      if (job.done || isTerminalSyncState(state)) continue
-      jobs[path] = job
-    }
-    ufsSyncJobsRef.current = jobs
-    setUfsSyncJobs(jobs)
-    for (const [path, job] of Object.entries(jobs)) {
+    // Resume polling for the persisted rows the tracker restored on mount.
+    if (!ufsSync.restored || resumedUfsPollsRef.current) return
+    resumedUfsPollsRef.current = true
+    for (const [path, job] of Object.entries(ufsSyncJobsRef.current)) {
       if (job.done || syncState(job) === 'Queued') continue
       if (job.batch_aggregate && job.batch_id) {
         pollBatchUfsSync(job.batch_id, path)
@@ -848,7 +678,7 @@ export function BrowsePage() {
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [ufsSync.restored])
 
   useEffect(() => {
     // Route change drives the listing, mirroring the Vue $route.query.path watcher.
@@ -907,44 +737,7 @@ export function BrowsePage() {
     }
   }, [])
 
-  useEffect(() => {
-    const refreshJobs = () => {
-      const stored = readJson<Record<string, UfsSyncJob>>(UFS_SYNC_STORAGE_KEY, {})
-      const next = { ...ufsSyncJobsRef.current }
-      let changed = false
-      for (const [path, job] of Object.entries(stored)) {
-        if (!job) continue
-        if (isUfsSyncDismissed(path, job)) continue
-        const state = syncState(job)
-        if (job.done || isTerminalSyncState(state)) continue
-        const currentUpdatedAt = Number(next[path]?.updated_at || 0)
-        const storedUpdatedAt = Number(job.updated_at || 0)
-        if (!next[path] || storedUpdatedAt > currentUpdatedAt) {
-          next[path] = job
-          changed = true
-        }
-      }
-      if (!changed) return
-      ufsSyncJobsRef.current = next
-      setUfsSyncJobs(next)
-    }
-    const tick = () => {
-      refreshJobs()
-      ufsStorageTimer.current = window.setTimeout(tick, 1000)
-    }
-    ufsStorageTimer.current = window.setTimeout(tick, 1000)
-    return () => {
-      if (ufsStorageTimer.current) window.clearTimeout(ufsStorageTimer.current)
-    }
-  }, [isUfsSyncDismissed])
-
-  const ufsSyncActiveCount = useMemo(
-    () =>
-      Object.values(ufsSyncJobs).filter(
-        (job) => job && !job.done && !isTerminalSyncState(syncState(job))
-      ).length,
-    [ufsSyncJobs]
-  )
+  const ufsSyncActiveCount = useMemo(() => countActiveUfsSyncJobs(ufsSyncJobs), [ufsSyncJobs])
 
   const ufsSyncDiscoverIntervalMs = useCallback(() => {
     if (ufsSyncActiveCount > 100) return 12000
@@ -975,7 +768,6 @@ export function BrowsePage() {
       Object.values(ufsSyncBatchTimers.current).forEach((timer) => window.clearTimeout(timer))
       ufsSyncTimers.current = {}
       ufsSyncBatchTimers.current = {}
-      if (ufsSyncSaveTimer.current) window.clearTimeout(ufsSyncSaveTimer.current)
     },
     []
   )
@@ -985,84 +777,7 @@ export function BrowsePage() {
   const visibleColumnList = useMemo(() => orderColumns(visibleColumns), [visibleColumns])
   const uploadBatchList = useMemo(() => Object.values(uploadBatches), [uploadBatches])
 
-  const ufsSyncList = useMemo(
-    () => Object.values(ufsSyncJobs).filter((job) => !job.batch_id),
-    [ufsSyncJobs]
-  )
-
-  const ufsSyncBatchList = useMemo<UfsSyncBatch[]>(() => {
-    const batches: Record<string, UfsSyncBatch> = {}
-    for (const job of Object.values(ufsSyncJobs)) {
-      if (!job.batch_id) continue
-      const firstPath = String(job.path || job.source_path || '')
-      const batch: UfsSyncBatch =
-        batches[job.batch_id] ||
-        ({
-          id: job.batch_id,
-          label: job.batch_label || firstPath,
-          subtitle: firstPath,
-          title: firstPath,
-          totalFiles: 0,
-          syncedFiles: 0,
-          terminalFiles: 0,
-          uploadFiles: 0,
-          waitingFiles: 0,
-          syncingFiles: 0,
-          failedFiles: 0,
-          syncedSize: 0,
-          totalSize: 0,
-          progressSize: 0,
-          progress: 0,
-          state: 'Queued',
-          message: ''
-        } as UfsSyncBatch)
-      const state = syncState(job)
-      const progress = Number(job.progress || 0)
-      const totalSize = Number(job.total_size || 0)
-      const totalFiles = Math.max(1, Number(job.total_files || 0))
-      const completedFiles = state === 'Completed' ? totalFiles : Number(job.completed_files || 0)
-      batch.totalFiles += totalFiles
-      batch.syncedFiles += Math.max(0, Math.min(totalFiles, completedFiles))
-      batch.totalSize += totalSize
-      batch.progressSize += totalSize > 0 ? (totalSize * progress) / 100 : 0
-      if (state === 'Completed') batch.syncedSize += totalSize || Number(job.loaded_size || 0)
-      if (['Uploading to Curvine', 'Queued'].includes(state)) batch.uploadFiles += 1
-      else if (['Waiting for UFS sync', 'Checking UFS sync', 'NotStarted'].includes(state)) {
-        batch.waitingFiles += 1
-      } else if (['Pending', 'Loading'].includes(state)) batch.syncingFiles += 1
-      if (Boolean(job.done) || isTerminalSyncState(state)) batch.terminalFiles += 1
-      if (['Failed', 'Canceled', 'Unknown', 'Timed out'].includes(state)) batch.failedFiles += 1
-      if (!batch.message && job.message) batch.message = String(job.message)
-      batches[job.batch_id] = batch
-    }
-    return Object.values(batches).map((batch) => {
-      const progress =
-        batch.totalSize > 0
-          ? Math.max(0, Math.min(100, Math.round((batch.progressSize / batch.totalSize) * 100)))
-          : batch.syncedFiles === batch.totalFiles
-            ? 100
-            : 0
-      if (batch.syncedFiles >= batch.totalFiles) return { ...batch, state: 'Completed', progress: 100 }
-      if (batch.failedFiles > 0) return { ...batch, state: 'Needs attention', progress }
-      if (batch.syncingFiles > 0) return { ...batch, state: 'Syncing to UFS', progress }
-      if (batch.waitingFiles > 0) return { ...batch, state: 'Waiting for UFS sync', progress }
-      if (batch.uploadFiles > 0) return { ...batch, state: 'Uploading to Curvine', progress }
-      if (batch.terminalFiles >= batch.totalFiles) {
-        return { ...batch, state: 'Finished with skipped files', progress }
-      }
-      return { ...batch, progress }
-    })
-  }, [ufsSyncJobs])
-
-  const ufsSyncJobCount = ufsSyncList.length + ufsSyncBatchList.length
-  const ufsSyncSummaryText = ufsSyncJobCount
-    ? ufsSyncActiveCount > 0
-      ? t('browse.ufsSync.activeTotal', { active: ufsSyncActiveCount, total: ufsSyncJobCount })
-      : t('browse.ufsSync.tracked', { total: ufsSyncJobCount })
-    : ''
-
   const canFreeCurrentPath = isMountedPath(browsePath)
-  const showUfsPanel = ufsSyncJobCount > 0
 
   /* ------------------------------------------------------------- selection */
 
@@ -1122,14 +837,6 @@ export function BrowsePage() {
 
   /* -------------------------------------------------------------- handlers */
 
-  useEffect(() => {
-    // Auto-expand the panel when new work appears while it is collapsed.
-    if (ufsSyncActiveCount > 0 && !ufsSyncPanelExpanded) {
-      setUfsSyncPanelExpanded(true)
-      writeJson(UFS_SYNC_PANEL_STORAGE_KEY, true)
-    }
-  }, [ufsSyncActiveCount, ufsSyncPanelExpanded])
-
   function navigateTo(path: string) {
     const normalized = normalizePath(path)
     // Compare against the route's path, not `browsePathRef`: that ref mirrors the
@@ -1173,43 +880,6 @@ export function BrowsePage() {
     uploadBatchesRef.current = {}
     setUploadBatches({})
     writeJson(UPLOAD_BATCH_STORAGE_KEY, {})
-  }
-
-  function clearCompletedUfsSyncJobs() {
-    const next: Record<string, UfsSyncJob> = {}
-    for (const [path, job] of Object.entries(ufsSyncJobsRef.current)) {
-      if (!job) continue
-      const isDone = Boolean(job.done) || isTerminalSyncState(syncState(job))
-      if (isDone) {
-        const normalized = normalizePath(path)
-        const stamp = Math.max(
-          Number(ufsSyncDismissedRef.current[normalized] || 0),
-          Number(job.update_time_ms || job.updated_at || 0),
-          Date.now()
-        )
-        ufsSyncDismissedRef.current = { ...ufsSyncDismissedRef.current, [normalized]: stamp }
-        if (ufsSyncTimers.current[path]) {
-          window.clearTimeout(ufsSyncTimers.current[path])
-          delete ufsSyncTimers.current[path]
-        }
-        if (job.batch_id && ufsSyncBatchTimers.current[job.batch_id]) {
-          window.clearTimeout(ufsSyncBatchTimers.current[job.batch_id])
-          delete ufsSyncBatchTimers.current[job.batch_id]
-        }
-        continue
-      }
-      next[path] = job
-    }
-    ufsSyncJobsRef.current = next
-    setUfsSyncJobs(next)
-    writeJson(UFS_SYNC_DISMISSED_STORAGE_KEY, ufsSyncDismissedRef.current)
-    writeJson(UFS_SYNC_STORAGE_KEY, next)
-  }
-
-  function toggleUfsSyncPanel() {
-    const next = !ufsSyncPanelExpanded
-    setUfsSyncPanelExpanded(next)
-    writeJson(UFS_SYNC_PANEL_STORAGE_KEY, next)
   }
 
   async function copyPath(path: string, message: string) {
@@ -1919,19 +1589,6 @@ export function BrowsePage() {
           batches={uploadBatchList}
           onClearCompleted={clearCompletedUploadBatches}
           onClear={clearUploadBatches}
-        />
-      )}
-
-      {showUfsPanel && (
-        <UfsSyncPanel
-          batches={ufsSyncBatchList}
-          jobs={ufsSyncList}
-          browsePath={browsePath}
-          expanded={ufsSyncPanelExpanded}
-          summaryText={ufsSyncSummaryText}
-          onToggle={toggleUfsSyncPanel}
-          onClearCompleted={clearCompletedUfsSyncJobs}
-          onViewJobs={() => navigate('/jobs')}
         />
       )}
 

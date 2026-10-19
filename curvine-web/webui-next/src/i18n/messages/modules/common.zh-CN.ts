@@ -103,6 +103,8 @@ export default {
     jobsSubtitle: '手动加载与 fs_mode 自动导出诊断',
     transfers: '传输作业',
     transfersSubtitle: 'Transfer 加载 / 导出任务',
+    syncJobs: 'UFS 同步进度',
+    syncJobsSubtitle: 'FS 模式同步到 UFS 的逐路径进度',
     config: '配置',
     configSubtitle: '只读集群配置'
   },

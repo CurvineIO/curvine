@@ -135,6 +135,9 @@ function createStubClient(overrides: Partial<ApiClient> = {}): ApiClient {
     ]),
     fetchJobsData: vi.fn(async () => ({ items: [] })),
     fetchTransfersData: vi.fn(async () => ({ items: [] })),
+    fetchUfsSyncJobs: vi.fn(async () => ({ items: [], path: '/', total: 0 })),
+    fetchUfsSyncStatus: vi.fn(async () => null),
+    fetchJobStatus: vi.fn(async () => ({})),
     fetchObservabilityHealth: vi.fn(async () => ({
       enabled: true,
       mode: 'builtin',
@@ -233,6 +236,7 @@ describe('Console shell', () => {
     expect(screen.getByTestId('nav-overview')).toBeInTheDocument()
     expect(screen.getByTestId('nav-browse')).toBeInTheDocument()
     expect(screen.getByTestId('nav-workers')).toBeInTheDocument()
+    expect(screen.getByTestId('nav-sync-jobs')).toBeInTheDocument()
     expect(screen.getByTestId('nav-config')).toBeInTheDocument()
     expect(screen.getByTestId('locale-select')).toBeInTheDocument()
     expect(screen.getByTestId('auto-refresh-toggle')).toBeInTheDocument()
@@ -886,6 +890,15 @@ describe('Console shell', () => {
     expect(await screen.findByTestId('transfers-open-submit')).toBeInTheDocument()
     expect(screen.getByTestId('transfers-filter-kind')).toBeInTheDocument()
     expect(screen.getByTestId('transfers-search')).toBeInTheDocument()
+  })
+
+  it('renders the sync jobs page filters and empty state', async () => {
+    renderApp('/sync-jobs', createStubClient())
+
+    expect(await screen.findByTestId('sync-jobs-status-filter')).toBeInTheDocument()
+    expect(screen.getByTestId('sync-jobs-search')).toBeInTheDocument()
+    expect(screen.getByTestId('sync-jobs-poll-toggle')).toBeInTheDocument()
+    expect(screen.getByTestId('sync-jobs-refresh')).toBeInTheDocument()
   })
 
   it('keeps the sidebar ruler inside the panel at any width', async () => {

@@ -1342,6 +1342,8 @@ pub(crate) fn load_job_info(
         create_time: job.created_at,
         overwrite: Some(overwrite),
         source_type: Default::default(),
+        // The transfer job this planned load task belongs to.
+        transfer_job_id: Some(job.job_id.clone()),
     })
 }
 
@@ -1510,6 +1512,9 @@ mod tests {
 
         let info = load_job_info(&job(command), &mount, None, &client_conf).unwrap();
         assert_eq!(info.replicas, 3);
+        // Planned load tasks stay associated with their transfer job so the
+        // master job status can deep link back to it.
+        assert_eq!(info.transfer_job_id.as_deref(), Some("job-1"));
     }
 
     #[test]

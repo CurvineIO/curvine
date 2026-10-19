@@ -1938,6 +1938,7 @@ mod tests {
             create_time: 0,
             overwrite: None,
             source_type: JobSourceType::default(),
+            transfer_job_id: None,
         };
         TaskContext::new(LoadTaskInfo {
             job,

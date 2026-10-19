@@ -146,6 +146,9 @@ pub(crate) fn job_status_from_transfer(status: GetTransferStatusResponse) -> Job
         state,
         status.progress.total_size,
     );
+    // This JobStatus view is backed by a transfer job: keep the association so
+    // console deep links resolve to the transfer job.
+    let transfer_job_id = Some(status.job_id.clone());
     JobStatus {
         job_id: status.job_id,
         state,
@@ -169,6 +172,7 @@ pub(crate) fn job_status_from_transfer(status: GetTransferStatusResponse) -> Job
         loading_files: counts.loading_files,
         source_type: Default::default(),
         tasks: Vec::new(),
+        transfer_job_id,
     }
 }
 
@@ -572,6 +576,11 @@ mod tests {
         assert_eq!(job_status.running_files, 1);
         assert_eq!(job_status.loading_files, 1);
         assert_eq!(job_status.tasks.len(), 0);
+        assert_eq!(
+            job_status.transfer_job_id.as_deref(),
+            Some("job-1"),
+            "transfer-backed status keeps its transfer job association"
+        );
     }
 
     #[test]

@@ -242,6 +242,7 @@ impl JobManager {
             loading_files,
             source_type: job.info.source_type,
             tasks,
+            transfer_job_id: job.info.transfer_job_id.clone(),
         }
     }
 

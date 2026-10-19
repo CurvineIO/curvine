@@ -1,4 +1,6 @@
 import { render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { MemoryRouter, useSearchParams } from 'react-router-dom'
 import { describe, expect, it } from 'vitest'
 
 import { ApiProvider } from '@/api/api-context'
@@ -7,7 +9,7 @@ import type { JobInfo } from '@/api/types'
 import { ToastProvider } from '@/components/ui/toast'
 import { CopyFallbackProvider } from '@/components/copy-fallback'
 import { TooltipProvider } from '@/components/ui/tooltip'
-import { I18nProvider } from '@/i18n'
+import { I18nProvider, LOCALE_STORAGE_KEY } from '@/i18n'
 import { RefreshProvider } from '@/refresh/refresh-context'
 import { JobsPage } from './jobs-page'
 
@@ -36,21 +38,23 @@ function stubClient(items: JobInfo[]): ApiClient {
   } as unknown as ApiClient
 }
 
-function renderPage(items: JobInfo[]) {
+function renderPage(items: JobInfo[], route = '/jobs') {
   return render(
-    <ApiProvider client={stubClient(items)}>
-      <I18nProvider>
-        <RefreshProvider>
-          <ToastProvider>
-            <CopyFallbackProvider>
-              <TooltipProvider>
-                <JobsPage />
-              </TooltipProvider>
-            </CopyFallbackProvider>
-          </ToastProvider>
-        </RefreshProvider>
-      </I18nProvider>
-    </ApiProvider>
+    <MemoryRouter initialEntries={[route]}>
+      <ApiProvider client={stubClient(items)}>
+        <I18nProvider>
+          <RefreshProvider>
+            <ToastProvider>
+              <CopyFallbackProvider>
+                <TooltipProvider>
+                  <JobsPage />
+                </TooltipProvider>
+              </CopyFallbackProvider>
+            </ToastProvider>
+          </RefreshProvider>
+        </I18nProvider>
+      </ApiProvider>
+    </MemoryRouter>
   )
 }
 
@@ -82,5 +86,50 @@ describe('JobsPage rows', () => {
     await waitFor(() => expect(screen.getByTestId(`job-row-${JOB_ID}`)).toBeInTheDocument())
     const copy = screen.getByTestId(`job-copy-${JOB_ID}`)
     expect(copy).toHaveAttribute('title', expect.stringContaining(JOB_ID))
+  })
+})
+
+function SearchProbe() {
+  const [searchParams] = useSearchParams()
+  return <div data-testid="search-probe">{searchParams.toString()}</div>
+}
+
+describe('JobsPage deep link', () => {
+  it('opens the diagnostics sheet from a ?job= link and clears the param on close', async () => {
+    renderPage([job], `/jobs?job=${JOB_ID}`)
+
+    expect(await screen.findByTestId('job-diagnostics-sheet')).toBeInTheDocument()
+
+    // Closing the sheet drops the URL parameter, so a reload does not reopen it.
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByTestId('job-diagnostics-sheet')).not.toBeInTheDocument())
+  })
+
+  it('still exposes the deep link in the address bar while the sheet is open', async () => {
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, 'en')
+    render(
+      <MemoryRouter initialEntries={[`/jobs?job=${JOB_ID}`]}>
+        <ApiProvider client={stubClient([job])}>
+          <I18nProvider>
+            <RefreshProvider>
+              <ToastProvider>
+                <CopyFallbackProvider>
+                  <TooltipProvider>
+                    <JobsPage />
+                    <SearchProbe />
+                  </TooltipProvider>
+                </CopyFallbackProvider>
+              </ToastProvider>
+            </RefreshProvider>
+          </I18nProvider>
+        </ApiProvider>
+      </MemoryRouter>
+    )
+
+    await screen.findByTestId('job-diagnostics-sheet')
+    expect(screen.getByTestId('search-probe')).toHaveTextContent(`job=${JOB_ID}`)
+
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(screen.getByTestId('search-probe')).toHaveTextContent(''))
   })
 })

@@ -165,6 +165,9 @@ pub struct JobStatus {
     pub loading_files: u64,
     pub source_type: JobSourceType,
     pub tasks: Vec<LoadTaskStatus>,
+    /// Associated transfer job id, present when the job was executed through the
+    /// transfer service. Drives the console deep link to `/transfers`.
+    pub transfer_job_id: Option<String>,
 }
 
 impl JobStatus {
@@ -200,6 +203,11 @@ pub struct LoadJobCommand {
     /// backward compatibility with older clients that do not set the field.
     #[serde(default)]
     pub source_type: Option<JobSourceType>,
+    /// Associated transfer job id when this load/export was executed through the
+    /// transfer service. Lets the console link a sync record straight to the
+    /// transfer job instead of guessing from the job id shape.
+    #[serde(default)]
+    pub transfer_job_id: Option<String>,
 }
 
 impl LoadJobCommand {
@@ -219,6 +227,7 @@ pub struct LoadJobCommandBuilder {
     ttl_action: Option<TtlAction>,
     overwrite: Option<bool>,
     source_type: Option<JobSourceType>,
+    transfer_job_id: Option<String>,
 }
 
 impl LoadJobCommandBuilder {
@@ -269,6 +278,11 @@ impl LoadJobCommandBuilder {
         self
     }
 
+    pub fn transfer_job_id(mut self, transfer_job_id: impl Into<String>) -> Self {
+        let _ = self.transfer_job_id.insert(transfer_job_id.into());
+        self
+    }
+
     pub fn build(self) -> LoadJobCommand {
         LoadJobCommand {
             source_path: self.source_path,
@@ -280,6 +294,7 @@ impl LoadJobCommandBuilder {
             ttl_action: self.ttl_action,
             overwrite: self.overwrite,
             source_type: self.source_type,
+            transfer_job_id: self.transfer_job_id,
         }
     }
 }
@@ -299,6 +314,10 @@ pub struct LoadJobInfo {
     pub overwrite: Option<bool>,
     #[serde(default)]
     pub source_type: JobSourceType,
+    /// Transfer job that executes this job, when the submitter routed the work
+    /// through the transfer service.
+    #[serde(default)]
+    pub transfer_job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

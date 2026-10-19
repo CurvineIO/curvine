@@ -150,6 +150,7 @@ impl JobMasterClient {
                 .into_iter()
                 .map(Self::task_status_from_pb)
                 .collect(),
+            transfer_job_id: status.transfer_job_id,
         }
     }
 

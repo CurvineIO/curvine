@@ -20,6 +20,7 @@ fn load_task(task_id: &str, estimated_size: i64) -> LoadTaskInfo {
             create_time: 0,
             overwrite: None,
             source_type: Default::default(),
+            transfer_job_id: None,
         },
         task_id: task_id.to_string(),
         worker: WorkerAddress::default(),

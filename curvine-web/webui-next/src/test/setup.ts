@@ -1,5 +1,10 @@
 import '@testing-library/jest-dom/vitest'
+import { configure } from '@testing-library/react'
 import { vi } from 'vitest'
+
+// Vitest runs files in parallel workers; under full-suite load the default 1s
+// findBy/waitFor budget expires before lazy routes and data effects settle.
+configure({ asyncUtilTimeout: 3000 })
 
 // jsdom implements neither the async clipboard API nor execCommand, so without
 // this every copy path would report "Browser blocked clipboard access" and the

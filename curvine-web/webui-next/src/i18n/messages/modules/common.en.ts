@@ -104,6 +104,8 @@ export default {
     jobsSubtitle: 'Manual load and fs_mode auto-export diagnostics',
     transfers: 'Transfer Jobs',
     transfersSubtitle: 'Transfer service load/export jobs',
+    syncJobs: 'UFS Sync Progress',
+    syncJobsSubtitle: 'FS mode sync to UFS, per path',
     config: 'Config',
     configSubtitle: 'Readonly cluster configuration'
   },

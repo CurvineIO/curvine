@@ -1,5 +1,6 @@
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { MemoryRouter, useSearchParams } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ApiError } from '@/api/error'
@@ -42,22 +43,24 @@ function makeClient(
   return { client, fetchTransfersData, fetchTransferStatus }
 }
 
-function renderPageWithClient(locale: AppLocale, client: ApiClient) {
+function renderPageWithClient(locale: AppLocale, client: ApiClient, route = '/transfers') {
   window.localStorage.setItem(LOCALE_STORAGE_KEY, locale)
   return render(
-    <ApiProvider client={client}>
-      <I18nProvider>
-        <RefreshProvider>
-          <ToastProvider>
-            <CopyFallbackProvider>
-              <TooltipProvider>
-                <TransfersPage />
-              </TooltipProvider>
-            </CopyFallbackProvider>
-          </ToastProvider>
-        </RefreshProvider>
-      </I18nProvider>
-    </ApiProvider>
+    <MemoryRouter initialEntries={[route]}>
+      <ApiProvider client={client}>
+        <I18nProvider>
+          <RefreshProvider>
+            <ToastProvider>
+              <CopyFallbackProvider>
+                <TooltipProvider>
+                  <TransfersPage />
+                </TooltipProvider>
+              </CopyFallbackProvider>
+            </ToastProvider>
+          </RefreshProvider>
+        </I18nProvider>
+      </ApiProvider>
+    </MemoryRouter>
   )
 }
 
@@ -77,7 +80,8 @@ describe('TransfersPage localization', () => {
 
     expect(await screen.findByRole('heading', { level: 1, name: '传输作业' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '提交传输' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '刷新' })).toBeInTheDocument()
+    // While the first fetch is in flight the spinner makes the name "Loading 刷新".
+    expect(await screen.findByRole('button', { name: '刷新' })).toBeInTheDocument()
 
     for (const header of [
       '作业 ID',
@@ -106,7 +110,7 @@ describe('TransfersPage localization', () => {
 
     expect(await screen.findByRole('heading', { level: 1, name: 'Transfer Jobs' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Submit Transfer' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Refresh' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Refresh' })).toBeInTheDocument()
 
     await waitFor(() => expect(screen.getByTestId('transfer-row-job-abc123')).toBeInTheDocument())
     expect(screen.getByText('Running')).toBeInTheDocument()
@@ -148,6 +152,9 @@ describe('TransfersPage localization', () => {
     renderPageWithClient('en', client)
 
     await screen.findByTestId('transfer-row-job-abc123')
+    // The poll tick calls fetchTransferStatus for the visible rows and would race
+    // the assertions below on a loaded machine; switch it off before typing.
+    await userEvent.click(screen.getByTestId('transfers-poll-toggle'))
     await userEvent.type(screen.getByTestId('transfers-search'), jobId)
 
     const row = await screen.findByTestId(`transfer-row-${jobId}`)
@@ -165,7 +172,9 @@ describe('TransfersPage localization', () => {
     await screen.findByTestId(`transfer-row-${jobId}`)
     await userEvent.click(screen.getByTestId(`transfer-details-${jobId}`))
     expect(await screen.findByTestId('transfer-diagnostics-sheet')).toBeInTheDocument()
-  })
+    // Two debounce-then-fetch cycles plus 72 keystrokes need more than the 5s default
+    // once the whole suite runs in parallel.
+  }, 15000)
 
   it('treats a missing full job id as an empty search result', async () => {
     const jobId = '12345678-1234-1234-1234-123456789abc'
@@ -185,7 +194,7 @@ describe('TransfersPage localization', () => {
     expect(await screen.findByText(/No transfers matched the current filters/)).toBeInTheDocument()
     expect(screen.queryByText(/No transfer jobs tracked yet/)).not.toBeInTheDocument()
     expect(screen.queryByText(/Transfer lookup failed/)).not.toBeInTheDocument()
-  })
+  }, 15000)
 
   it('shows lookup failures without claiming the job was not found', async () => {
     const jobId = '12345678-1234-1234-1234-123456789abc'
@@ -198,7 +207,7 @@ describe('TransfersPage localization', () => {
 
     expect(await screen.findByText(/Transfer lookup failed: Service unavailable/)).toBeInTheDocument()
     expect(screen.queryByText(/No transfers matched the current filters/)).not.toBeInTheDocument()
-  })
+  }, 15000)
 
   it('heads the row with the job id', async () => {
     renderPage('en')
@@ -296,5 +305,77 @@ describe('TransfersPage localization', () => {
     // One line per row: the message is reachable through the icon's hover title.
     const icon = screen.getByTestId('transfer-message-job-abc123')
     expect(icon.closest('span')).toHaveAttribute('title', 'waiting for scheduling capacity')
+  })
+})
+
+function SearchProbe() {
+  const [searchParams] = useSearchParams()
+  return <div data-testid="search-probe">{searchParams.toString()}</div>
+}
+
+describe('TransfersPage deep link', () => {
+  it('opens the diagnostics sheet from a ?job= link and clears the param on close', async () => {
+    const jobId = '12345678-1234-1234-1234-123456789abc'
+    const { client, fetchTransferStatus } = makeClient(
+      { items: [], total: 0, counts: { all: 0 } },
+      async () => ({ ...transfer, job_id: jobId }) as TransferInfo
+    )
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, 'en')
+    render(
+      <MemoryRouter initialEntries={[`/transfers?job=${jobId}`]}>
+        <ApiProvider client={client}>
+          <I18nProvider>
+            <RefreshProvider>
+              <ToastProvider>
+                <CopyFallbackProvider>
+                  <TooltipProvider>
+                    <TransfersPage />
+                    <SearchProbe />
+                  </TooltipProvider>
+                </CopyFallbackProvider>
+              </ToastProvider>
+            </RefreshProvider>
+          </I18nProvider>
+        </ApiProvider>
+      </MemoryRouter>
+    )
+
+    expect(await screen.findByTestId('transfer-diagnostics-sheet')).toBeInTheDocument()
+    // The lookup asks for the first task page so the sheet is complete on arrival.
+    expect(fetchTransferStatus).toHaveBeenCalledWith(jobId, { page_size: 100 })
+
+    // Closing the sheet drops the URL parameter, so a reload does not reopen it.
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(screen.getByTestId('search-probe')).toHaveTextContent(''))
+    expect(screen.queryByTestId('transfer-diagnostics-sheet')).not.toBeInTheDocument()
+  })
+
+  it('opens the sheet from the link without a lookup error when the transfer is already listed', async () => {
+    const { client } = makeClient()
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, 'en')
+    render(
+      <MemoryRouter initialEntries={['/transfers?job=job-abc123']}>
+        <ApiProvider client={client}>
+          <I18nProvider>
+            <RefreshProvider>
+              <ToastProvider>
+                <CopyFallbackProvider>
+                  <TooltipProvider>
+                    <TransfersPage />
+                    <SearchProbe />
+                  </TooltipProvider>
+                </CopyFallbackProvider>
+              </ToastProvider>
+            </RefreshProvider>
+          </I18nProvider>
+        </ApiProvider>
+      </MemoryRouter>
+    )
+
+    expect(await screen.findByTestId('transfer-diagnostics-sheet')).toBeInTheDocument()
+    expect(screen.queryByText(/Transfer lookup failed/)).not.toBeInTheDocument()
+
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(screen.getByTestId('search-probe')).toHaveTextContent(''))
   })
 })

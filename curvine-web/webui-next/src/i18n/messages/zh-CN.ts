@@ -7,6 +7,7 @@ import browse from './modules/browse.zh-CN'
 import mounts from './modules/mounts.zh-CN'
 import jobs from './modules/jobs.zh-CN'
 import transfers from './modules/transfers.zh-CN'
+import syncJobs from './modules/sync-jobs.zh-CN'
 import observability from './modules/observability.zh-CN'
 import operations from './modules/operations.zh-CN'
 import delta from './modules/delta.zh-CN'
@@ -21,6 +22,7 @@ export default {
   ...mounts,
   ...jobs,
   ...transfers,
+  ...syncJobs,
   ...observability,
   ...operations,
   ...delta

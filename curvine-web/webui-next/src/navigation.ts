@@ -5,6 +5,7 @@ import {
   HardDriveIcon,
   LayoutDashboardIcon,
   ListChecksIcon,
+  RefreshCwIcon,
   ServerIcon,
   SettingsIcon,
   ShieldCheckIcon,
@@ -72,6 +73,12 @@ export const navigationGroups: NavigationGroup[] = [
         labelKey: 'nav.transfers',
         subtitleKey: 'nav.transfersSubtitle',
         icon: ArrowLeftRightIcon
+      },
+      {
+        to: '/sync-jobs',
+        labelKey: 'nav.syncJobs',
+        subtitleKey: 'nav.syncJobsSubtitle',
+        icon: RefreshCwIcon
       }
     ]
   },
