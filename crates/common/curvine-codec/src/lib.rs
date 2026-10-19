@@ -18,6 +18,15 @@
 //! payloads, pairing a frozen field encoding with a per-record schema version
 //! that governs future evolution between codec-format binaries.
 //!
+//! The bincode-to-codec switch is a one-time hard cutover: journal entries in
+//! the raft log and meta DB values written by the old bincode paths are not
+//! read back, and the legacy decode fallbacks (`MountInfo::decode_persisted`,
+//! the pre-protobuf journal replay schema) were removed together with their
+//! compat tests. Upgrading a cluster with existing bincode data in place is
+//! not supported — a fresh deployment (or a full metadata rebuild) is
+//! required. The schema version in the record header does not bridge the
+//! bincode-to-codec transition.
+//!
 //! # Field encoding (frozen once released)
 //!
 //! - Integers: fixed-width little-endian (`u8..u64`, `i8..i64`).
@@ -58,10 +67,13 @@
 //! tooling only; no production read path dispatches on it. That is
 //! deliberate: the check is a heuristic — a legacy `JournalBatch` whose
 //! `seq_id` low byte lands in `0x81..=0xBF` (63 of 256 candidates, ~1 in
-//! 4 batches) passes it. A false positive is caught only when the remaining
-//! bytes disagree with the target layout; a payload that happens to fit
-//! decodes without an error, so callers must decide the format from external
-//! context (journal switch point, column-family marker) before decoding.
+//! 4 batches) passes it — so sniffing could not have supported a reliable
+//! bincode-to-codec rolling upgrade even before the fallbacks were removed
+//! (see the hard-cutover note above). A false positive is caught only when
+//! the remaining bytes disagree with the target layout; a payload that
+//! happens to fit decodes without an error. Callers must decide the format
+//! from external context (journal switch point, column-family marker) before
+//! decoding.
 //!
 //! [`Codec::decode`] always parses that header first (see
 //! [`Codec::parse_version`]) and hands the recovered version to the payload

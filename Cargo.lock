@@ -2704,6 +2704,7 @@ name = "curvine-master"
 version = "0.6.1-alpha"
 dependencies = [
  "axum 0.7.9",
+ "bincode",
  "bytes",
  "curvine-alloc",
  "curvine-codec",

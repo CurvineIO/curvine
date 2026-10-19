@@ -140,8 +140,8 @@ impl Decode for FileLock {
         let lock_flags = LockFlags::decode(reader)?;
         let start = reader.get_u64()?;
         let end = reader.get_u64()?;
-        // Writers always emit this byte; a pre-#1878 record without it goes
-        // through `LegacyFileLock` instead of this decoder.
+        // Strict on purpose: pre-#1878 records are not read back after the
+        // codec cutover, so a missing byte means corruption.
         let session_owned = reader.get_bool()?;
         Ok(Self {
             client_id,
