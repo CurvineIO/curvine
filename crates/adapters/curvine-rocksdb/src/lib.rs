@@ -16,5 +16,6 @@ pub mod rocksdb;
 
 pub use self::rocksdb::*;
 pub use ::rocksdb::{
-    DBIteratorWithThreadMode, DBPinnableSlice, Error, WriteBatchWithTransaction, DB,
+    perf, DBIteratorWithThreadMode, DBPinnableSlice, Error, ReadOptions, WriteBatchWithTransaction,
+    DB,
 };
