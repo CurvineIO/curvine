@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +37,25 @@ pub enum LockType {
     UnLock = 2,
 }
 
+impl Encode for LockType {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i8(*self as i8)
+    }
+}
+
+impl Decode for LockType {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let raw = reader.get_i8()?;
+        let value = Self::from(raw as u8);
+        if value as u8 != raw as u8 {
+            return Err(CodecError::invalid_tag("LockType", raw as i64));
+        }
+        Ok(value)
+    }
+}
+
 #[repr(u8)]
 #[derive(
     Debug,
@@ -56,6 +76,25 @@ pub enum LockFlags {
     Flock = 1, // BSD lock (flock)
 }
 
+impl Encode for LockFlags {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i8(*self as i8)
+    }
+}
+
+impl Decode for LockFlags {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let raw = reader.get_i8()?;
+        let value = Self::from(raw as u8);
+        if value as u8 != raw as u8 {
+            return Err(CodecError::invalid_tag("LockFlags", raw as i64));
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct FileLock {
     pub client_id: String,
@@ -66,4 +105,34 @@ pub struct FileLock {
     pub lock_flags: LockFlags,
     pub start: u64,
     pub end: u64,
+}
+
+impl Encode for FileLock {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        self.client_id.encode(writer)?;
+        writer.put_u64(self.owner_id)?;
+        writer.put_u32(self.pid)?;
+        writer.put_u64(self.acquire_time)?;
+        self.lock_type.encode(writer)?;
+        self.lock_flags.encode(writer)?;
+        writer.put_u64(self.start)?;
+        writer.put_u64(self.end)
+    }
+}
+
+impl Decode for FileLock {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        Ok(Self {
+            client_id: String::decode(reader)?,
+            owner_id: reader.get_u64()?,
+            pid: reader.get_u32()?,
+            acquire_time: reader.get_u64()?,
+            lock_type: LockType::decode(reader)?,
+            lock_flags: LockFlags::decode(reader)?,
+            start: reader.get_u64()?,
+            end: reader.get_u64()?,
+        })
+    }
 }

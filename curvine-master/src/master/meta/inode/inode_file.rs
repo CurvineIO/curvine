@@ -16,6 +16,7 @@ use crate::master::meta::feature::{AclFeature, FileFeature, WriteFeature};
 use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
 use crate::master::meta::store::InodeStore;
 use crate::master::meta::{BlockMeta, InodeId};
+use curvine_codec::{CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_model::{
@@ -668,10 +669,53 @@ impl PartialEq for InodeFile {
     }
 }
 
+impl Encode for InodeFile {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.reserve(self.blocks.len().saturating_mul(16).saturating_add(256));
+        writer.put_i64(self.id)?;
+        writer.put_i64(self.parent_id)?;
+        self.file_type.encode(writer)?;
+        writer.put_i64(self.mtime)?;
+        writer.put_i64(self.atime)?;
+        writer.put_i64(self.len)?;
+        writer.put_u32(self.block_size)?;
+        writer.put_u8(self.replicas)?;
+        self.storage_policy.encode(writer)?;
+        self.features.encode(writer)?;
+        self.blocks.encode(writer)?;
+        writer.put_u32(self.nlink)?;
+        writer.put_u32(self.next_seq)?;
+        self.target.encode(writer)
+    }
+}
+
+impl Decode for InodeFile {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        Ok(Self {
+            id: reader.get_i64()?,
+            parent_id: reader.get_i64()?,
+            file_type: FileType::decode(reader)?,
+            mtime: reader.get_i64()?,
+            atime: reader.get_i64()?,
+            len: reader.get_i64()?,
+            block_size: reader.get_u32()?,
+            replicas: reader.get_u8()?,
+            storage_policy: StoragePolicy::decode(reader)?,
+            features: FileFeature::decode(reader)?,
+            blocks: Vec::<BlockMeta>::decode(reader)?,
+            nlink: reader.get_u32()?,
+            next_seq: reader.get_u32()?,
+            target: Option::<String>::decode(reader)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curvine_model::FileAllocMode;
+    use curvine_model::{FileAllocMode, StorageState, StorageType, TtlAction};
 
     fn test_file(block_size: i64) -> InodeFile {
         let mut opts = CreateFileOpts::with_create(false);
@@ -771,5 +815,109 @@ mod tests {
 
         assert!(file.mtime > 2);
         assert_eq!(file.ctime(), file.mtime);
+    }
+
+    #[test]
+    fn inode_file_round_trips_all_fields() {
+        let file = InodeFile {
+            id: 101,
+            parent_id: 7,
+            file_type: FileType::Link,
+            mtime: 1_000,
+            atime: 2_000,
+            len: 3_000_000,
+            block_size: 4096,
+            replicas: 2,
+            storage_policy: StoragePolicy {
+                storage_type: StorageType::SpdkDisk,
+                ttl_ms: 600_000,
+                ttl_action: TtlAction::Free,
+                ufs_mtime: 1_234,
+                state: StorageState::Both,
+            },
+            features: FileFeature {
+                x_attr: HashMap::from([("user.k".to_string(), vec![9, 8, 7])]),
+                file_write: Some(WriteFeature {
+                    clients: std::collections::HashSet::from(["writer-1".to_string()]),
+                }),
+                acl: AclFeature {
+                    owner: "owner".to_string(),
+                    group: "group".to_string(),
+                    mode: 0o755,
+                },
+            },
+            blocks: vec![
+                BlockMeta {
+                    id: 900,
+                    len: 4096,
+                    replicas: 1,
+                    locs: Some(vec![BlockLocation::new(11, StorageType::Ssd)]),
+                    alloc_opts: None,
+                },
+                BlockMeta {
+                    id: 901,
+                    len: 0,
+                    replicas: 0,
+                    locs: None,
+                    alloc_opts: Some(FileAllocOpts {
+                        truncate: false,
+                        off: 0,
+                        len: 8192,
+                        mode: FileAllocMode::KEEP_SIZE,
+                    }),
+                },
+            ],
+            nlink: 3,
+            next_seq: 42,
+            target: Some("ufs://bucket/key".to_string()),
+        };
+
+        let mut writer = Writer::new(1).unwrap();
+        file.encode(&mut writer).unwrap();
+        let bytes = writer.into_inner();
+        let mut reader = Reader::new(&bytes, 1).unwrap();
+        let decoded = InodeFile::decode(&mut reader).unwrap();
+        assert!(reader.is_empty());
+
+        assert_eq!(decoded.id, file.id);
+        assert_eq!(decoded.parent_id, file.parent_id);
+        assert_eq!(decoded.file_type, file.file_type);
+        assert_eq!(decoded.mtime, file.mtime);
+        assert_eq!(decoded.atime, file.atime);
+        assert_eq!(decoded.len, file.len);
+        assert_eq!(decoded.block_size, file.block_size);
+        assert_eq!(decoded.replicas, file.replicas);
+        assert_eq!(decoded.storage_policy, file.storage_policy);
+        assert_eq!(decoded.features.x_attr, file.features.x_attr);
+        assert_eq!(
+            decoded.features.file_write.as_ref().map(|w| &w.clients),
+            file.features.file_write.as_ref().map(|w| &w.clients)
+        );
+        assert_eq!(decoded.features.acl.owner, file.features.acl.owner);
+        assert_eq!(decoded.features.acl.group, file.features.acl.group);
+        assert_eq!(decoded.features.acl.mode, file.features.acl.mode);
+        assert_eq!(decoded.nlink, file.nlink);
+        assert_eq!(decoded.next_seq, file.next_seq);
+        assert_eq!(decoded.target, file.target);
+
+        assert_eq!(decoded.blocks.len(), 2);
+        assert_eq!(decoded.blocks[0].id, 900);
+        assert_eq!(decoded.blocks[0].len, 4096);
+        assert_eq!(decoded.blocks[0].replicas, 1);
+        let locs = decoded.blocks[0].locs.as_ref().expect("locs");
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].worker_id, 11);
+        assert_eq!(locs[0].storage_type, StorageType::Ssd);
+        assert!(decoded.blocks[0].alloc_opts.is_none());
+
+        assert_eq!(decoded.blocks[1].id, 901);
+        assert_eq!(decoded.blocks[1].len, 0);
+        assert_eq!(decoded.blocks[1].replicas, 0);
+        assert!(decoded.blocks[1].locs.is_none());
+        let opts = decoded.blocks[1].alloc_opts.as_ref().expect("alloc_opts");
+        assert!(!opts.truncate);
+        assert_eq!(opts.off, 0);
+        assert_eq!(opts.len, 8192);
+        assert_eq!(opts.mode, FileAllocMode::KEEP_SIZE);
     }
 }

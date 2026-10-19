@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_codec::{CodecResult, Decode, Encode, Reader, Writer};
 use serde::{Deserialize, Serialize};
 
 // File and directory permission control.
@@ -37,5 +38,25 @@ impl AclFeature {
 impl Default for AclFeature {
     fn default() -> Self {
         Self::with_mode(Self::DEFAULT_MODE)
+    }
+}
+
+impl Encode for AclFeature {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_str(&self.owner)?;
+        writer.put_str(&self.group)?;
+        writer.put_u32(self.mode)
+    }
+}
+
+impl Decode for AclFeature {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        Ok(Self {
+            owner: reader.get_str()?,
+            group: reader.get_str()?,
+            mode: reader.get_u32()?,
+        })
     }
 }

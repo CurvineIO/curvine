@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::master::meta::feature::{AclFeature, WriteFeature};
+use curvine_codec::{CodecResult, Decode, Encode, Reader, Writer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -95,5 +96,25 @@ impl FileFeature {
 impl Default for FileFeature {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Encode for FileFeature {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        self.x_attr.encode(writer)?;
+        self.file_write.encode(writer)?;
+        self.acl.encode(writer)
+    }
+}
+
+impl Decode for FileFeature {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        Ok(Self {
+            x_attr: HashMap::decode(reader)?,
+            file_write: Option::<WriteFeature>::decode(reader)?,
+            acl: AclFeature::decode(reader)?,
+        })
     }
 }
