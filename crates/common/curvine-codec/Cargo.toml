@@ -1,0 +1,9 @@
+[package]
+name = "curvine-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+bincode = { workspace = true }
+serde = { workspace = true }
