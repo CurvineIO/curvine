@@ -19,6 +19,7 @@ use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
+use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{
     FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction, INTERNAL_CTIME_XATTR,
@@ -56,6 +57,24 @@ impl DerefMut for NamedFile {
     }
 }
 
+impl Encode for NamedFile {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_str(&self.name)?;
+        self.file.encode(writer)
+    }
+}
+
+impl Decode for NamedFile {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        Ok(Self {
+            name: reader.get_str()?,
+            file: InodeFile::decode(reader)?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedDir {
     pub name: String,
@@ -82,6 +101,24 @@ impl DerefMut for NamedDir {
     }
 }
 
+impl Encode for NamedDir {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_str(&self.name)?;
+        self.dir.encode(writer)
+    }
+}
+
+impl Decode for NamedDir {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        Ok(Self {
+            name: reader.get_str()?,
+            dir: InodeDir::decode(reader)?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedEntry {
     pub name: String,
@@ -99,6 +136,24 @@ impl NamedEntry {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+impl Encode for NamedEntry {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_str(&self.name)?;
+        writer.put_i64(self.id)
+    }
+}
+
+impl Decode for NamedEntry {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        Ok(Self {
+            name: reader.get_str()?,
+            id: reader.get_i64()?,
+        })
     }
 }
 
@@ -656,6 +711,42 @@ impl Debug for InodeView {
 impl PartialEq for InodeView {
     fn eq(&self, other: &Self) -> bool {
         self.id() == other.id()
+    }
+}
+
+const TAG_FILE: u8 = 1;
+const TAG_DIR: u8 = 2;
+const TAG_ENTRY: u8 = 3;
+
+impl Encode for InodeView {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        match self {
+            File(file) => {
+                writer.put_u8(TAG_FILE)?;
+                file.encode(writer)
+            }
+            Dir(dir) => {
+                writer.put_u8(TAG_DIR)?;
+                dir.encode(writer)
+            }
+            FileEntry(entry) => {
+                writer.put_u8(TAG_ENTRY)?;
+                entry.encode(writer)
+            }
+        }
+    }
+}
+
+impl Decode for InodeView {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        match reader.get_u8()? {
+            TAG_FILE => Ok(File(Box::new(NamedFile::decode(reader)?))),
+            TAG_DIR => Ok(Dir(Box::new(NamedDir::decode(reader)?))),
+            TAG_ENTRY => Ok(FileEntry(Box::new(NamedEntry::decode(reader)?))),
+            other => Err(CodecError::invalid_tag("InodeView", other as i64)),
+        }
     }
 }
 
