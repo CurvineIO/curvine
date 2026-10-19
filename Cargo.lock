@@ -2305,6 +2305,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-codec"
+version = "0.2.2"
+dependencies = [
+ "bincode",
+ "serde",
+]
+
+[[package]]
 name = "curvine-common-macros"
 version = "0.2.2"
 dependencies = [

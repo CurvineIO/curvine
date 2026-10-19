@@ -74,6 +74,8 @@ pub enum ErrorKind {
     TransferAlreadyRunning = 35,
     TransferTargetConflict = 36,
     SnapshotNotReady = 37,
+    Encode = 38,
+    Decode = 39,
 
     #[num_enum(default)]
     Common = 10000,
@@ -232,6 +234,14 @@ pub enum FsError {
     #[error("{0}")]
     SnapshotNotReady(ErrorImpl<StringError>),
 
+    // Curvine codec encoding error.
+    #[error("{0}")]
+    Encode(ErrorImpl<StringError>),
+
+    // Curvine codec decoding error.
+    #[error("{0}")]
+    Decode(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -324,6 +334,14 @@ impl FsError {
             path.as_ref()
         );
         Self::SnapshotNotReady(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn encode_err(msg: impl Into<String>) -> Self {
+        Self::Encode(ErrorImpl::with_source(msg.into().into()))
+    }
+
+    pub fn decode_err(msg: impl Into<String>) -> Self {
+        Self::Decode(ErrorImpl::with_source(msg.into().into()))
     }
 
     pub fn file_exists(path: impl AsRef<str>) -> Self {
@@ -471,6 +489,8 @@ impl FsError {
             FsError::TransferAlreadyRunning(_) => ErrorKind::TransferAlreadyRunning,
             FsError::TransferTargetConflict(_) => ErrorKind::TransferTargetConflict,
             FsError::SnapshotNotReady(_) => ErrorKind::SnapshotNotReady,
+            FsError::Encode(_) => ErrorKind::Encode,
+            FsError::Decode(_) => ErrorKind::Decode,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -620,6 +640,8 @@ impl ErrorExt for FsError {
             FsError::TransferAlreadyRunning(e) => FsError::TransferAlreadyRunning(e.ctx(ctx)),
             FsError::TransferTargetConflict(e) => FsError::TransferTargetConflict(e.ctx(ctx)),
             FsError::SnapshotNotReady(e) => FsError::SnapshotNotReady(e.ctx(ctx)),
+            FsError::Encode(e) => FsError::Encode(e.ctx(ctx)),
+            FsError::Decode(e) => FsError::Decode(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -663,6 +685,8 @@ impl ErrorExt for FsError {
             FsError::TransferAlreadyRunning(e) => e.encode(ErrorKind::TransferAlreadyRunning),
             FsError::TransferTargetConflict(e) => e.encode(ErrorKind::TransferTargetConflict),
             FsError::SnapshotNotReady(e) => e.encode(ErrorKind::SnapshotNotReady),
+            FsError::Encode(e) => e.encode(ErrorKind::Encode),
+            FsError::Decode(e) => e.encode(ErrorKind::Decode),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -711,6 +735,8 @@ impl ErrorExt for FsError {
             ErrorKind::TransferAlreadyRunning => FsError::TransferAlreadyRunning(de.into_string()),
             ErrorKind::TransferTargetConflict => FsError::TransferTargetConflict(de.into_string()),
             ErrorKind::SnapshotNotReady => FsError::SnapshotNotReady(de.into_string()),
+            ErrorKind::Encode => FsError::Encode(de.into_string()),
+            ErrorKind::Decode => FsError::Decode(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }
@@ -871,5 +897,25 @@ mod tests {
     #[test]
     pub fn snapshot_not_ready_kind_value_test() {
         assert_eq!(ErrorKind::SnapshotNotReady as i32, 37);
+    }
+
+    #[test]
+    pub fn codec_error_round_trip_test() {
+        assert_eq!(ErrorKind::Encode as i32, 38);
+        assert_eq!(ErrorKind::Decode as i32, 39);
+
+        let encode_error = FsError::encode_err("encode failed");
+        assert!(matches!(encode_error.kind(), ErrorKind::Encode));
+        let bytes = encode_error.encode();
+        let decoded = FsError::decode(bytes);
+        assert!(matches!(decoded, FsError::Encode(_)));
+        assert!(decoded.to_string().contains("encode failed"));
+
+        let decode_error = FsError::decode_err("decode failed");
+        assert!(matches!(decode_error.kind(), ErrorKind::Decode));
+        let bytes = decode_error.encode();
+        let decoded = FsError::decode(bytes);
+        assert!(matches!(decoded, FsError::Decode(_)));
+        assert!(decoded.to_string().contains("decode failed"));
     }
 }
