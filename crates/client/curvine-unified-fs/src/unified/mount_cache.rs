@@ -72,7 +72,7 @@ use curvine_runtime::runtime::RpcRuntime;
 use curvine_runtime::sync::AtomicCounter;
 use log::{debug, warn};
 use once_cell::sync::OnceCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
@@ -189,6 +189,11 @@ pub struct MountCache {
     mounts: RwLock<InnerMap>,
     update_interval: u64,
     last_update: AtomicCounter,
+    /// Mount table version held by this cache, valid when `version_known`.
+    /// Lets the periodic refresh become a tens-of-bytes probe instead of a
+    /// full table pull when the master reports no change.
+    last_version: AtomicU64,
+    version_known: AtomicBool,
     /// Single-flight lock: only one task performs full refresh when TTL expires.
     refresh_lock: Mutex<()>,
     /// True while a background refresh has been scheduled but not yet finished.
@@ -202,6 +207,8 @@ impl MountCache {
             mounts: RwLock::new(InnerMap::default()),
             update_interval,
             last_update: AtomicCounter::new(0),
+            last_version: AtomicU64::new(0),
+            version_known: AtomicBool::new(false),
             refresh_lock: Mutex::new(()),
             refreshing: AtomicBool::new(false),
         }
@@ -217,15 +224,53 @@ impl MountCache {
         self.last_update.get() != 0
     }
 
-    /// Performs the actual full refresh of the mount table from the master.
-    /// Guarded by `refresh_lock` so only one refresh runs at a time.
+    /// Pulls the mount table from the master, negotiating by version, and
+    /// applies the response to the cache. Guarded by `refresh_lock` so only one
+    /// refresh runs at a time.
     async fn do_refresh(&self, fs: &UnifiedFileSystem) -> FsResult<()> {
-        let mounts = fs.get_mount_table().await?;
+        let known = if self.version_known.load(Ordering::Acquire) {
+            Some(self.last_version.load(Ordering::Acquire))
+        } else {
+            None
+        };
+        let (mounts, version) = fs.get_mount_table_versioned(known).await?;
+        self.apply_refresh(known, mounts, version)
+    }
+
+    /// Applies a refresh response to the cache:
+    ///
+    /// - Master reports "no change" (same version, empty table) → the cache is
+    ///   kept as-is (including lazily-initialized UFS handles) and only the
+    ///   TTL is renewed.
+    /// - Anything else (first pull, change, legacy master without a version)
+    ///   → full replace, and the reported version is recorded. A legacy
+    ///   master's response carries no version, so every refresh stays a full
+    ///   pull — identical to the pre-negotiation behavior.
+    fn apply_refresh(
+        &self,
+        known: Option<u64>,
+        mounts: Vec<MountInfo>,
+        version: Option<u64>,
+    ) -> FsResult<()> {
         let mut state = self.mounts.write().unwrap();
 
-        state.clear();
-        for item in mounts {
-            state.insert(item)?;
+        if version.is_some() && version == known && mounts.is_empty() {
+            debug!(
+                "mount table unchanged (version {:?}), skip rebuild",
+                version
+            );
+        } else {
+            state.clear();
+            for item in mounts {
+                state.insert(item)?;
+            }
+            match version {
+                Some(v) => {
+                    self.last_version.store(v, Ordering::Release);
+                    self.version_known.store(true, Ordering::Release);
+                }
+                None => self.version_known.store(false, Ordering::Release),
+            }
         }
 
         debug!("update mounts {:?}", state.len());
@@ -369,6 +414,18 @@ mod tests {
         }
     }
 
+    fn oss_mount(cv_path: &str, mount_id: u32) -> MountInfo {
+        let mut info = opendal_oss_mount();
+        info.cv_path = cv_path.to_string();
+        info.ufs_path = format!("oss://example-bucket{}", cv_path);
+        info.mount_id = mount_id;
+        info
+    }
+
+    fn cached_mount(cache: &MountCache, cv_path: &str) -> Option<Arc<MountValue>> {
+        cache.mounts.read().unwrap().get(true, cv_path)
+    }
+
     #[test]
     fn cache_insert_is_metadata_only_for_unsupported_provider() {
         let mut mounts = InnerMap::default();
@@ -396,5 +453,106 @@ mod tests {
             .expect("mounted path should be cached");
 
         assert!(mount.ufs().is_err());
+    }
+
+    #[test]
+    fn first_pull_records_version_for_negotiation() {
+        let cache = MountCache::new(60_000);
+        assert!(!cache.version_known.load(Ordering::Acquire));
+
+        cache
+            .apply_refresh(None, vec![oss_mount("/a", 1)], Some(5))
+            .unwrap();
+
+        assert!(cache.version_known.load(Ordering::Acquire));
+        assert_eq!(cache.last_version.load(Ordering::Acquire), 5);
+        assert!(cached_mount(&cache, "/a").is_some());
+    }
+
+    #[test]
+    fn negotiated_matching_version_skips_rebuild_without_jitter() {
+        let cache = MountCache::new(60_000);
+        cache
+            .apply_refresh(None, vec![oss_mount("/a", 1)], Some(3))
+            .unwrap();
+        let before = cached_mount(&cache, "/a").unwrap();
+
+        // Same version + empty payload = "no change": the cached MountValue
+        // (and any lazily-initialized UFS handle) must survive untouched.
+        cache.apply_refresh(Some(3), vec![], Some(3)).unwrap();
+
+        let after = cached_mount(&cache, "/a").unwrap();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(cache.last_version.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn bumped_version_with_empty_payload_rebuilds() {
+        let cache = MountCache::new(60_000);
+        cache
+            .apply_refresh(None, vec![oss_mount("/a", 1)], Some(3))
+            .unwrap();
+
+        // A version bump with an empty table is a real change (last mount
+        // removed) — the stale cache must be cleared.
+        cache.apply_refresh(Some(3), vec![], Some(4)).unwrap();
+
+        assert!(cached_mount(&cache, "/a").is_none());
+        assert_eq!(cache.last_version.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn same_version_with_payload_still_rebuilds() {
+        let cache = MountCache::new(60_000);
+        cache
+            .apply_refresh(None, vec![oss_mount("/a", 1)], Some(3))
+            .unwrap();
+
+        // Defensive: a payload must never be dropped, even on a version match.
+        cache
+            .apply_refresh(Some(3), vec![oss_mount("/b", 2)], Some(3))
+            .unwrap();
+
+        assert!(cached_mount(&cache, "/a").is_none());
+        assert!(cached_mount(&cache, "/b").is_some());
+    }
+
+    #[test]
+    fn version_regression_forces_full_rebuild() {
+        let cache = MountCache::new(60_000);
+        cache
+            .apply_refresh(None, vec![oss_mount("/a", 1)], Some(42))
+            .unwrap();
+
+        // Restart / HA failover can yield a lower version; a mismatch must
+        // rebuild instead of wrongly reporting "no change".
+        cache
+            .apply_refresh(Some(42), vec![oss_mount("/b", 2)], Some(3))
+            .unwrap();
+
+        assert!(cached_mount(&cache, "/a").is_none());
+        assert!(cached_mount(&cache, "/b").is_some());
+        assert_eq!(cache.last_version.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn legacy_master_response_keeps_full_pull_mode() {
+        let cache = MountCache::new(60_000);
+
+        // A master without version negotiation returns the full table and no
+        // version — the cache must stay version-unknown (full pull per refresh).
+        cache
+            .apply_refresh(None, vec![oss_mount("/a", 1)], None)
+            .unwrap();
+
+        assert!(!cache.version_known.load(Ordering::Acquire));
+        assert!(cached_mount(&cache, "/a").is_some());
+
+        cache
+            .apply_refresh(None, vec![oss_mount("/a", 1), oss_mount("/b", 2)], None)
+            .unwrap();
+
+        assert!(!cache.version_known.load(Ordering::Acquire));
+        assert_eq!(cache.mounts.read().unwrap().len(), 2);
     }
 }

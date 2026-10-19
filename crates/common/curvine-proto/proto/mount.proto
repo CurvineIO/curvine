@@ -75,10 +75,18 @@ message UnMountRequest {
 message UnMountResponse {
 }
 
-message GetMountTableRequest {}
+message GetMountTableRequest {
+    // Version the client already holds. Absent (= first pull or legacy client)
+    // or different from the master's current version → full table is returned.
+    optional int64 known_version = 1;
+}
 
 message GetMountTableResponse {
     repeated MountInfoProto mount_table = 1;
+    // Master's current mount table version. Absent from legacy masters; when
+    // present and equal to known_version with an empty mount_table, it means
+    // "no change since your last pull".
+    optional int64 version = 2;
 }
 
 message GetMountInfoRequest {

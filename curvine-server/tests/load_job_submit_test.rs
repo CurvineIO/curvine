@@ -109,6 +109,7 @@ fn load_task(task_id: &str, job_id: &str) -> LoadTaskInfo {
         create_time: 0,
         overwrite: None,
         source_type: Default::default(),
+        transfer_job_id: None,
     };
 
     LoadTaskInfo {

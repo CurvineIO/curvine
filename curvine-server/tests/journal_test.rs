@@ -323,6 +323,13 @@ fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult
     assert_eq!(leader_mnt.len(), follower_mnt.len());
     assert_eq!(leader_mnt[0], follower_mnt[0]);
 
+    // Mount ops replay through the same choke points on both nodes, so the
+    // negotiation version sequences must match exactly.
+    let leader_snap = mnt_mgr1.mount_table_snapshot().unwrap();
+    let follower_snap = mnt_mgr2.mount_table_snapshot().unwrap();
+    assert!(leader_snap.version > 0);
+    assert_eq!(leader_snap.version, follower_snap.version);
+
     Ok(())
 }
 
@@ -427,6 +434,12 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
     assert_eq!(leader_mnt.len(), 1);
     assert_eq!(leader_mnt.len(), follower_mnt.len());
     assert_eq!(leader_mnt[0], follower_mnt[0]);
+
+    // Raft-replicated mount ops must yield identical negotiation versions on
+    // both nodes.
+    let leader_snap = mnt_mgr1.mount_table_snapshot().unwrap();
+    let follower_snap = mnt_mgr2.mount_table_snapshot().unwrap();
+    assert_eq!(leader_snap.version, follower_snap.version);
 
     Ok(())
 }
@@ -819,6 +832,9 @@ fn test_master_restart_with_snapshot_recovery() -> CommonResult<()> {
     let leader_mnt = mnt_mgr.get_mount_table().unwrap();
     assert_eq!(leader_mnt.len(), 1);
 
+    let version_before = mnt_mgr.mount_table_snapshot().unwrap().version;
+    assert!(version_before > 0);
+
     // Create a snapshot manually.
     js.create_snapshot()?;
 
@@ -835,6 +851,11 @@ fn test_master_restart_with_snapshot_recovery() -> CommonResult<()> {
     assert!(fs.exists("/a")?);
     let leader_mnt = mnt_mgr.get_mount_table().unwrap();
     assert_eq!(leader_mnt.len(), 1);
+
+    // The persisted mount table version must survive the restart so clients
+    // holding the old version keep negotiating instead of re-pulling.
+    let version_after = mnt_mgr.mount_table_snapshot().unwrap().version;
+    assert_eq!(version_after, version_before);
 
     drop(fs);
     drop(mnt_mgr);

@@ -2755,6 +2755,40 @@ fn test_reject_invalid_s3_mount_update_before_persist() -> CommonResult<()> {
 }
 
 #[test]
+fn test_mount_table_snapshot_version_bumps_on_changes() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (_fs, js, _loader, _js2, _fs2) = setup_pair("mount-snapshot-version");
+    let mnt_mgr = js.mount_manager();
+
+    // Fresh cluster: empty snapshot at the adopted (zero) version.
+    let snap = mnt_mgr.mount_table_snapshot()?;
+    assert_eq!(snap.version, 0);
+    assert!(snap.entries.is_empty());
+
+    // A mount op bumps the version and publishes the entry in the snapshot.
+    let opts = MountOptions::builder().build();
+    mnt_mgr.unprotected_add_mount(opts.clone().to_info(1, "/mnt/one", "file:///tmp/one"))?;
+    let snap = mnt_mgr.mount_table_snapshot()?;
+    assert_eq!(snap.version, 1);
+    assert_eq!(snap.entries.len(), 1);
+    assert_eq!(snap.entries[0].cv_path, "/mnt/one");
+
+    // An update goes through the same choke point and bumps again.
+    mnt_mgr.unprotected_add_mount(opts.clone().to_info(1, "/mnt/one", "file:///tmp/one"))?;
+    assert_eq!(mnt_mgr.mount_table_snapshot()?.version, 2);
+
+    // Umount bumps the version and empties the snapshot.
+    mnt_mgr.unprotected_umount_by_id(1)?;
+    let snap = mnt_mgr.mount_table_snapshot()?;
+    assert_eq!(snap.version, 3);
+    assert!(snap.entries.is_empty());
+
+    // The legacy Vec API stays consistent with the snapshot view.
+    assert!(mnt_mgr.get_mount_table()?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn test_inode_file_num_stays_non_negative_for_symlink_create_delete() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "inode-file-num-symlink");

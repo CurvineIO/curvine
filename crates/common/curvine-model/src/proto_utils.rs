@@ -22,6 +22,7 @@ use prost::bytes::BytesMut;
 use prost::Message;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 pub struct ProtoUtils;
 
@@ -766,6 +767,30 @@ impl ProtoUtils {
             ufs_path: info.ufs_path,
             mount_id: info.mount_id,
             properties: info.properties,
+            ttl_ms: info.ttl_ms,
+            ttl_action: info.ttl_action.into(),
+            read_verify_ufs: info.read_verify_ufs,
+            storage_type: info.storage_type.map(|v| v.into()),
+            block_size: info.block_size,
+            replicas: info.replicas,
+            write_type: info.write_type.into(),
+            provider: info.provider.map(|v| v.into()),
+            auto_cache: Some(info.auto_cache),
+            access_mode: Some(info.access_mode.into()),
+            write_cache: Some(info.write_cache),
+            ttl_type: Some(info.ttl_type.into()),
+        }
+    }
+
+    /// Shared-entry variant of [`ProtoUtils::mount_info_to_pb`] for serving the
+    /// table from an `Arc` snapshot: clones fields out of the reference instead
+    /// of consuming the entry.
+    pub fn mount_info_arc_to_pb(info: &Arc<MountInfo>) -> MountInfoProto {
+        MountInfoProto {
+            cv_path: info.cv_path.clone(),
+            ufs_path: info.ufs_path.clone(),
+            mount_id: info.mount_id,
+            properties: info.properties.clone(),
             ttl_ms: info.ttl_ms,
             ttl_action: info.ttl_action.into(),
             read_verify_ufs: info.read_verify_ufs,

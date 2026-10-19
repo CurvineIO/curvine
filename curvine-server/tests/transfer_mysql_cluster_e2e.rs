@@ -617,6 +617,7 @@ fn group_job_info(
         create_time: 0,
         overwrite: Some(true),
         source_type: JobSourceType::default(),
+        transfer_job_id: None,
     }
 }
 
@@ -1267,6 +1268,7 @@ fn tm_transfer_task(task_id: &str, run_id: u64, attempt_id: u64, session: &str) 
             create_time: 0,
             overwrite: Some(true),
             source_type: JobSourceType::default(),
+            transfer_job_id: None,
         },
         task_id: task_id.to_string(),
         worker: WorkerAddress::default(),

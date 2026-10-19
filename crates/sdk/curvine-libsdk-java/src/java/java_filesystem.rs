@@ -210,6 +210,7 @@ impl JavaFilesystem {
                 .into_iter()
                 .map(ProtoUtils::mount_info_to_pb)
                 .collect(),
+            version: None,
         };
         let bytes = ProtoUtils::encode(response)?;
         Ok(JavaUtils::new_jarray(env, &bytes)?)
@@ -331,6 +332,7 @@ impl JavaFilesystem {
                 .into_iter()
                 .map(Self::task_status_to_pb)
                 .collect(),
+            transfer_job_id: status.transfer_job_id,
         };
         let bytes = ProtoUtils::encode(response)?;
         let byte_arr = JavaUtils::new_jarray(env, &bytes)?;

@@ -40,6 +40,11 @@ impl RocksInodeStore {
     pub const PREFIX_LOCK: u8 = 0x02;
     pub const PREFIX_UFS_DEFERRED: u8 = 0x03;
 
+    // Single-key marker for the mount table version (get mount table
+    // negotiation). Must not share PREFIX_MOUNT: the mount table is read via a
+    // prefix scan on that prefix and would pick the version key up as a row.
+    pub const PREFIX_MOUNT_TABLE_VERSION: u8 = 0x04;
+
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
             .set_disable_wal(true)
@@ -218,6 +223,21 @@ impl RocksInodeStore {
         }
 
         Ok(vec)
+    }
+
+    pub fn save_mount_table_version(&self, version: u64) -> CommonResult<()> {
+        let key = [Self::PREFIX_MOUNT_TABLE_VERSION];
+        let value = MetadataCodec::encode(&version)?;
+        self.db.put_cf(Self::CF_COMMON, key, value)
+    }
+
+    /// Missing key (fresh cluster / pre-upgrade store) reads as version 0.
+    pub fn get_mount_table_version(&self) -> CommonResult<u64> {
+        let key = [Self::PREFIX_MOUNT_TABLE_VERSION];
+        match self.db.get_cf(Self::CF_COMMON, key)? {
+            None => Ok(0),
+            Some(v) => MetadataCodec::decode(&v),
+        }
     }
 
     pub fn get_locks(&self, id: i64) -> CommonResult<LockMeta> {

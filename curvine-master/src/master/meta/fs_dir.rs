@@ -1252,6 +1252,15 @@ impl FsDir {
         self.store.get_mount_table()
     }
 
+    pub fn save_mount_table_version(&mut self, version: u64) -> FsResult<()> {
+        self.store.save_mount_table_version(version)?;
+        Ok(())
+    }
+
+    pub fn get_mount_table_version(&self) -> CommonResult<u64> {
+        self.store.get_mount_table_version()
+    }
+
     pub fn get_mount_point(&self, id: u32) -> CommonResult<Option<MountInfo>> {
         self.store.get_mount_point(id)
     }

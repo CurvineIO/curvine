@@ -978,7 +978,19 @@ impl FsClient {
     }
 
     pub async fn get_mount_table(&self) -> FsResult<GetMountTableResponse> {
-        let req = GetMountTableRequest {};
+        self.get_mount_table_versioned(None).await
+    }
+
+    /// Full-table pull with version negotiation: passing the version the
+    /// caller already holds lets a current master reply with an empty table
+    /// when nothing changed. `None` keeps the legacy full-pull semantics.
+    pub async fn get_mount_table_versioned(
+        &self,
+        known_version: Option<u64>,
+    ) -> FsResult<GetMountTableResponse> {
+        let req = GetMountTableRequest {
+            known_version: known_version.map(|v| v as i64),
+        };
         let rep: GetMountTableResponse = self.rpc(RpcCode::GetMountTable, req).await?;
         Ok(rep)
     }

@@ -364,6 +364,16 @@ impl UnifiedFileSystem {
         self.track("GetMountTable", "", "", fut).await
     }
 
+    /// Version-negotiated direct pull (table + master version). Used by the
+    /// mount cache refresh; management callers keep using `get_mount_table`.
+    pub async fn get_mount_table_versioned(
+        &self,
+        known_version: Option<u64>,
+    ) -> FsResult<(Vec<MountInfo>, Option<u64>)> {
+        let fut = async { self.cv.get_mount_table_versioned(known_version).await };
+        self.track("GetMountTable", "", "", fut).await
+    }
+
     pub async fn update_runtime_config(
         &self,
         key: &str,

@@ -1019,6 +1019,14 @@ impl InodeStore {
         self.store.get_mount_table()
     }
 
+    pub fn save_mount_table_version(&self, version: u64) -> CommonResult<()> {
+        self.store.save_mount_table_version(version)
+    }
+
+    pub fn get_mount_table_version(&self) -> CommonResult<u64> {
+        self.store.get_mount_table_version()
+    }
+
     pub fn get_file_counts(&self) -> (i64, i64) {
         self.fs_stats.counts()
     }

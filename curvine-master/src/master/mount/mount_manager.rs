@@ -23,6 +23,7 @@ use curvine_fs_api::{self, CurvineURI, Path};
 use curvine_model::{MkdirOpts, MountInfo, MountOptions};
 use curvine_ufs_api::S3Conf;
 use log::info;
+use std::sync::Arc;
 
 pub struct MountManager {
     master_fs: MasterFilesystem,
@@ -140,7 +141,9 @@ impl MountManager {
         self.add_mount(mnt_id, cv_path, ufs_path, mnt_opt)
     }
 
-    pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<()> {
+    /// Returns the new mount table version; the caller persists it under its
+    /// own `fs_dir` write lock (journal replay holds one).
+    pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<u64> {
         self.mount_table.unprotected_add_mount(info)
     }
 
@@ -153,7 +156,7 @@ impl MountManager {
         self.umount(&info.cv_path)
     }
 
-    pub fn unprotected_umount_by_id(&self, id: u32) -> FsResult<()> {
+    pub fn unprotected_umount_by_id(&self, id: u32) -> FsResult<u64> {
         self.mount_table.unprotected_umount_by_id(id)
     }
 
@@ -169,13 +172,12 @@ impl MountManager {
     }
 
     pub fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {
-        let table = self.mount_table.get_mount_table()?;
+        self.mount_table.get_mount_table()
+    }
 
-        let mut entries = Vec::new();
-        table.iter().for_each(|entry| {
-            entries.push(entry.clone());
-        });
-        Ok(entries)
+    /// Shared snapshot for `GetMountTable` serving: O(1) clone, no deep copy.
+    pub fn mount_table_snapshot(&self) -> FsResult<Arc<crate::master::mount::TableSnapshot>> {
+        self.mount_table.snapshot()
     }
 }
 

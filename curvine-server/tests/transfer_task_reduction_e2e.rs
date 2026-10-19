@@ -432,6 +432,7 @@ fn e2e_job_info(
         create_time: 0,
         overwrite: Some(true),
         source_type: JobSourceType::default(),
+        transfer_job_id: None,
     }
 }
 

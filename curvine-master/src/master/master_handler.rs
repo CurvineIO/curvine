@@ -1129,14 +1129,29 @@ impl MasterHandler {
     }
 
     fn get_mount_table(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let _: GetMountTableRequest = ctx.parse_header()?;
-        let table = self.mount_manager.get_mount_table()?;
+        let req: GetMountTableRequest = ctx.parse_header()?;
+        let snapshot = self.mount_manager.mount_table_snapshot()?;
 
-        let mount_table: Vec<MountInfoProto> = table
-            .into_iter()
-            .map(ProtoUtils::mount_info_to_pb)
-            .collect();
-        let rep_header = GetMountTableResponse { mount_table };
+        // Version negotiation: a client whose known version matches the
+        // current snapshot gets an empty table back (tens of bytes) instead of
+        // the full re-encoded MB-scale table. Equality is the only success
+        // case — any mismatch (first pull = None, change, restart/HA version
+        // gap) falls through to the full response, so a stale hit is impossible.
+        let version = Some(snapshot.version as i64);
+        let mount_table = if req.known_version == version {
+            Vec::new()
+        } else {
+            snapshot
+                .entries
+                .iter()
+                .map(ProtoUtils::mount_info_arc_to_pb)
+                .collect()
+        };
+
+        let rep_header = GetMountTableResponse {
+            mount_table,
+            version,
+        };
         ctx.response(rep_header)
     }
 

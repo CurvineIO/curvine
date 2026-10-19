@@ -77,6 +77,7 @@ fn job_info(source: &str, target: &str, mount: &MountInfo) -> LoadJobInfo {
         create_time: 0,
         overwrite: Some(true),
         source_type: JobSourceType::default(),
+        transfer_job_id: None,
     }
 }
 

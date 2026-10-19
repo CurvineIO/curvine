@@ -25,7 +25,7 @@ use curvine_tests::Testing;
 use log::info;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Test the load function of curvine-client
 #[test]
@@ -218,6 +218,140 @@ fn test_mount_umount_s3_hdfs_and_path_mapping() -> CommonResult<()> {
         let umount_resp = client.umount(&invalid_mnt_path).await;
         info!("UmountResp: {:?}", umount_resp);
         assert!(umount_resp.is_err(), "{}", umount_resp.unwrap_err());
+
+        Ok(())
+    })
+}
+
+// Mount table scale + version negotiation: build 1000+ mount points, then
+// compare a full pull against a negotiated no-change pull. Self-contained
+// (file:// UFS paths) so it runs without external S3/HDFS. Timings are logged
+// for the perf record and only sanity-asserted (negotiated must not be slower
+// than full) to stay robust on loaded CI machines; correctness is asserted
+// strictly.
+#[test]
+fn test_mount_table_scale_version_negotiation_perf() -> CommonResult<()> {
+    Logger::default();
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let cluster_conf = testing.get_active_cluster_conf()?;
+
+    let client_rt = Arc::new(cluster_conf.client_rpc_conf().create_runtime());
+    let rt = client_rt.clone();
+
+    client_rt.block_on(async move {
+        let fs_context = Arc::new(FsContext::with_rt(cluster_conf.clone(), rt.clone())?);
+        let client = FsClient::new(fs_context);
+
+        // Clean leftovers so the mount counts below stay deterministic.
+        let exists = client.get_mount_table().await?;
+        for mnt in exists.mount_table {
+            let path = mnt.cv_path.into();
+            let _ = client.umount(&path).await;
+        }
+
+        let scale: i64 = 1000;
+        let mut props = HashMap::new();
+        props.insert(
+            "s3.endpoint_url".to_string(),
+            "http://127.0.0.1:9000".to_string(),
+        );
+        props.insert(
+            "s3.credentials.access".to_string(),
+            "test-access-key".to_string(),
+        );
+        props.insert(
+            "s3.credentials.secret".to_string(),
+            "test-secret-key".to_string(),
+        );
+        let mnt_opt = MountOptions::builder().set_properties(props).build();
+
+        for i in 0..scale {
+            let ufs_path = format!("file:///tmp/curvine-scale-mount-{}", i).into();
+            let cv_path = format!("/scale/dir-{}/mnt-{}", i / 100, i).into();
+            client
+                .mount(&ufs_path, &cv_path, mnt_opt.clone())
+                .await
+                .unwrap_or_else(|e| panic!("mount #{} failed: {}", i, e));
+        }
+        info!("mounted {} mount points", scale);
+
+        const ROUNDS: u32 = 5;
+
+        // Prime pull (no known version): captures the current version and
+        // asserts the master reports one.
+        let rep = client.get_mount_table_versioned(None).await?;
+        assert_eq!(rep.mount_table.len() as i64, scale);
+        let last_version: Option<u64> = rep.version.map(|v| v as u64);
+        assert!(
+            last_version.is_some(),
+            "master must report the mount table version"
+        );
+
+        // 1) Full pulls without a known version — the legacy/baseline shape.
+        let mut full_ms: u128 = 0;
+        for _ in 0..ROUNDS {
+            let start = Instant::now();
+            let rep = client.get_mount_table_versioned(None).await?;
+            full_ms += start.elapsed().as_millis();
+            assert_eq!(rep.mount_table.len() as i64, scale);
+        }
+        info!(
+            "GetMountTable full pull x{} avg {} ms ({} mounts)",
+            ROUNDS,
+            full_ms / ROUNDS as u128,
+            scale
+        );
+
+        // 2) Legacy request (no known_version field set) still gets the table.
+        let rep = client.get_mount_table().await?;
+        assert_eq!(rep.mount_table.len() as i64, scale);
+
+        // 3) Negotiated pulls with the current version — no change since the
+        // last pull, so the master replies with an empty payload.
+        let mut nego_ms: u128 = 0;
+        for _ in 0..ROUNDS {
+            let start = Instant::now();
+            let rep = client.get_mount_table_versioned(last_version).await?;
+            nego_ms += start.elapsed().as_millis();
+            assert!(
+                rep.mount_table.is_empty(),
+                "unchanged table must return an empty payload"
+            );
+            assert_eq!(rep.version.map(|v| v as u64), last_version);
+        }
+        info!(
+            "GetMountTable negotiated pull x{} avg {} ms",
+            ROUNDS,
+            nego_ms / ROUNDS as u128
+        );
+        assert!(
+            nego_ms <= full_ms,
+            "negotiated pull ({}ms) should not be slower than full pull ({}ms)",
+            nego_ms,
+            full_ms
+        );
+
+        // 4) A stale known version (mount happened elsewhere) → full table and
+        // a bumped version in the same response.
+        let ufs_path = format!("file:///tmp/curvine-scale-mount-{}", scale).into();
+        let cv_path = format!("/scale/dir-{}/mnt-{}", scale / 100, scale).into();
+        client.mount(&ufs_path, &cv_path, mnt_opt.clone()).await?;
+        let rep = client.get_mount_table_versioned(last_version).await?;
+        assert_eq!(rep.mount_table.len() as i64, scale + 1);
+        assert!(rep.version.unwrap() as u64 > last_version.unwrap());
+
+        // 5) A version the master never issued (restart gap / HA mismatch)
+        // must fall through to a full table — no false "no change".
+        let rep = client.get_mount_table_versioned(Some(987654321)).await?;
+        assert_eq!(rep.mount_table.len() as i64, scale + 1);
+
+        // Cleanup so other tests start from a clean table.
+        let exists = client.get_mount_table().await?;
+        for mnt in exists.mount_table {
+            let path = mnt.cv_path.into();
+            let _ = client.umount(&path).await;
+        }
 
         Ok(())
     })

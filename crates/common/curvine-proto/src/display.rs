@@ -343,6 +343,7 @@ mod tests {
     fn mount_table_shows_ttl_type_column() {
         let response = GetMountTableResponse {
             mount_table: vec![mount_info(Some(0)), mount_info(Some(1))],
+            version: None,
         };
         let output = response.to_string();
         assert!(output.contains("TTL Type"));

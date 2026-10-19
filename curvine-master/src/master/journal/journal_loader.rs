@@ -1256,10 +1256,11 @@ impl JournalLoader {
     }
 
     pub fn mount(&self, entry: MountEntry) -> CommonResult<()> {
-        self.mnt_mgr.unprotected_add_mount(entry.info.clone())?;
+        let version = self.mnt_mgr.unprotected_add_mount(entry.info.clone())?;
 
         let mut fs_dir = self.fs_dir.write();
         fs_dir.unprotected_store_mount(entry.info)?;
+        fs_dir.save_mount_table_version(version)?;
         Ok(())
     }
 
@@ -1268,9 +1269,10 @@ impl JournalLoader {
             warn!("Unmount: id already unmounted: {:?}", entry);
             return Ok(());
         }
-        self.mnt_mgr.unprotected_umount_by_id(entry.id)?;
+        let version = self.mnt_mgr.unprotected_umount_by_id(entry.id)?;
         let mut fs_dir = self.fs_dir.write();
         fs_dir.unprotected_unmount(entry.id)?;
+        fs_dir.save_mount_table_version(version)?;
         Ok(())
     }
 

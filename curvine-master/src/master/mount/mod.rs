@@ -16,4 +16,4 @@ mod mount_manager;
 mod mount_table;
 
 pub use mount_manager::MountManager;
-pub use mount_table::MountTable;
+pub use mount_table::{MountTable, TableSnapshot};

@@ -22,7 +22,7 @@ use log::{info, warn};
 use rand::Rng;
 use std::collections::HashMap;
 use std::convert::Into;
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub struct MountTableInner {
     ufs2mountid: HashMap<String, u32>,
@@ -30,8 +30,20 @@ pub struct MountTableInner {
     mountpath2id: HashMap<String, u32>,
 }
 
+/// Immutable point-in-time view of the mount table served to `GetMountTable`.
+///
+/// Rebuilt (O(N)) only inside the write choke points; readers share the `Arc`
+/// clones so a pull costs one atomic increment instead of a full deep copy
+/// under the table lock.
+#[derive(Clone)]
+pub struct TableSnapshot {
+    pub version: u64,
+    pub entries: Vec<Arc<MountInfo>>,
+}
+
 pub struct MountTable {
     inner: RwLock<MountTableInner>,
+    snapshot: RwLock<Arc<TableSnapshot>>,
     fs_dir: SyncFsDir,
 }
 
@@ -43,6 +55,10 @@ impl MountTable {
                 mountid2entry: HashMap::new(),
                 mountpath2id: HashMap::new(),
             }),
+            snapshot: RwLock::new(Arc::new(TableSnapshot {
+                version: 0,
+                entries: Vec::new(),
+            })),
             fs_dir,
         }
     }
@@ -61,26 +77,71 @@ impl MountTable {
         }
     }
 
-    //for new master node
-    pub fn restore(&self) -> FsResult<()> {
-        let mounts = self.fs_dir.read().get_mount_table()?;
-        self.replace_with_mounts(mounts)
-    }
-
-    pub fn restore_best_effort(&self) {
-        match self.fs_dir.read().get_mount_table() {
-            Ok(mounts) => {
-                if let Err(e) = self.replace_with_mounts(mounts) {
-                    warn!("failed to restore mount table: {}", e);
-                }
-            }
-            Err(e) => {
-                warn!("failed to restore mount table: {}", e);
-            }
+    fn read_snapshot(&self) -> FsResult<Arc<TableSnapshot>> {
+        match self.snapshot.read() {
+            Ok(snap) => Ok(snap.clone()),
+            Err(e) => err_box!("mount table snapshot read lock poisoned: {}", e),
         }
     }
 
-    fn replace_with_mounts(&self, mounts: Vec<MountInfo>) -> FsResult<()> {
+    fn write_snapshot(&self) -> FsResult<RwLockWriteGuard<'_, Arc<TableSnapshot>>> {
+        match self.snapshot.write() {
+            Ok(snap) => Ok(snap),
+            Err(e) => err_box!("mount table snapshot write lock poisoned: {}", e),
+        }
+    }
+
+    /// Publishes a fresh snapshot of `inner` with version bumped by one.
+    ///
+    /// Caller must hold `write_inner()` on the same `inner`; the snapshot lock
+    /// is a different lock so no re-entrancy occurs. Persisting the new version
+    /// to the store is left to the caller (after the inner lock is released).
+    fn publish_snapshot(&self, inner: &MountTableInner) -> FsResult<u64> {
+        let mut snap = self.write_snapshot()?;
+        let version = snap.version + 1;
+        let entries = inner
+            .mountid2entry
+            .values()
+            .map(|m| Arc::new(m.clone()))
+            .collect();
+        *snap = Arc::new(TableSnapshot { version, entries });
+        Ok(version)
+    }
+
+    //for new master node
+    pub fn restore(&self) -> FsResult<()> {
+        let mounts = self.fs_dir.read().get_mount_table()?;
+        let version = self.fs_dir.read().get_mount_table_version()?;
+        self.replace_with_mounts(mounts, version)
+    }
+
+    pub fn restore_best_effort(&self) {
+        let mounts = match self.fs_dir.read().get_mount_table() {
+            Ok(mounts) => mounts,
+            Err(e) => {
+                warn!("failed to restore mount table: {}", e);
+                return;
+            }
+        };
+        // Read before replace_with_mounts: that helper must stay pure
+        // in-memory, and this caller already held the fs_dir read guard above.
+        let version = match self.fs_dir.read().get_mount_table_version() {
+            Ok(version) => version,
+            Err(e) => {
+                warn!("failed to read mount table version: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = self.replace_with_mounts(mounts, version) {
+            warn!("failed to restore mount table: {}", e);
+        }
+    }
+
+    /// Replaces the in-memory table and snapshot with `mounts`. Pure
+    /// in-memory: never touches `fs_dir`, because callers (`restore`,
+    /// `restore_best_effort`) already hold or just released its guard and
+    /// `SyncFsDir` forbids re-entrancy.
+    fn replace_with_mounts(&self, mounts: Vec<MountInfo>, version: u64) -> FsResult<()> {
         let mut restored = MountTableInner {
             ufs2mountid: HashMap::new(),
             mountid2entry: HashMap::new(),
@@ -106,6 +167,13 @@ impl MountTable {
                 return err_box!("duplicate restored mount id");
             }
         }
+
+        let entries = restored
+            .mountid2entry
+            .values()
+            .map(|m| Arc::new(m.clone()))
+            .collect();
+        *self.write_snapshot()? = Arc::new(TableSnapshot { version, entries });
 
         *self.write_inner()? = restored;
         Ok(())
@@ -157,7 +225,11 @@ impl MountTable {
         Ok(inner.mountpath2id.contains_key(cv_path))
     }
 
-    pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<()> {
+    /// In-memory add + snapshot publish. Returns the new version; persisting
+    /// it is the caller's job — this method must not touch `fs_dir`, since
+    /// every caller (journal replay, add/update) already holds or immediately
+    /// takes the `fs_dir` write lock and `SyncFsDir` forbids re-entrancy.
+    pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<u64> {
         info!("add mount: {:?}", info);
 
         let mut inner = self.write_inner()?;
@@ -168,8 +240,7 @@ impl MountTable {
             .mountpath2id
             .insert(info.cv_path.to_string(), info.mount_id);
         inner.mountid2entry.insert(info.mount_id, info);
-
-        Ok(())
+        self.publish_snapshot(&inner)
     }
 
     pub fn add_mount(
@@ -190,11 +261,11 @@ impl MountTable {
         self.check_conflict(cv_path, ufs_path)?;
 
         let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
-        self.unprotected_add_mount(info.clone())?;
+        let version = self.unprotected_add_mount(info.clone())?;
 
         let mut fs_dir = self.fs_dir.write();
         fs_dir.store_mount(info, true)?;
-        Ok(())
+        fs_dir.save_mount_table_version(version)
     }
 
     pub fn update_mount(&self, info: MountInfo) -> FsResult<()> {
@@ -203,11 +274,11 @@ impl MountTable {
             return err_box!("cannot change mount path");
         }
 
-        self.unprotected_add_mount(info.clone())?;
+        let version = self.unprotected_add_mount(info.clone())?;
 
         let mut fs_dir = self.fs_dir.write();
         fs_dir.store_mount(info, true)?;
-        Ok(())
+        fs_dir.save_mount_table_version(version)
     }
 
     pub fn assign_mount_id(&self) -> FsResult<u32> {
@@ -223,26 +294,19 @@ impl MountTable {
     }
 
     pub fn umount(&self, mount_path: &str) -> FsResult<()> {
-        let mut inner = self.write_inner()?;
-
-        let mount_id = match inner.mountpath2id.get(mount_path) {
-            Some(&id) => id,
-            None => return err_box!("failed found {} to umount", mount_path),
+        let mount_id = {
+            let inner = self.read_inner()?;
+            match inner.mountpath2id.get(mount_path) {
+                Some(&id) => id,
+                None => return err_box!("failed found {} to umount", mount_path),
+            }
         };
 
-        let ufs_path = match inner.mountid2entry.get(&mount_id) {
-            Some(entry) => entry.ufs_path.clone(),
-            None => return err_box!("failed found {} matched mountentry to umount", mount_id),
-        };
-
-        inner.ufs2mountid.remove(&ufs_path);
-        inner.mountpath2id.remove(mount_path);
-        inner.mountid2entry.remove(&mount_id);
+        let version = self.unprotected_umount_by_id(mount_id)?;
 
         let mut fs_dir = self.fs_dir.write();
         fs_dir.unmount(mount_id)?;
-
-        Ok(())
+        fs_dir.save_mount_table_version(version)
     }
 
     /// use ufs_uri to find ufs config
@@ -303,12 +367,19 @@ impl MountTable {
     }
 
     pub fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {
-        let inner = self.read_inner()?;
-        let table = inner.mountid2entry.values().cloned().collect();
-        Ok(table)
+        let snap = self.read_snapshot()?;
+        Ok(snap.entries.iter().map(|e| e.as_ref().clone()).collect())
     }
 
-    pub fn unprotected_umount_by_id(&self, mount_id: u32) -> FsResult<()> {
+    /// O(1) point-in-time view of the table for `GetMountTable` serving.
+    pub fn snapshot(&self) -> FsResult<Arc<TableSnapshot>> {
+        self.read_snapshot()
+    }
+
+    /// In-memory remove + snapshot publish. Returns the new version; the
+    /// caller persists it under its own `fs_dir` write lock (see the
+    /// re-entrancy note on [`MountTable::unprotected_add_mount`]).
+    pub fn unprotected_umount_by_id(&self, mount_id: u32) -> FsResult<u64> {
         let mut inner = self.write_inner()?;
 
         let info = match inner.mountid2entry.remove(&mount_id) {
@@ -318,6 +389,6 @@ impl MountTable {
 
         inner.ufs2mountid.remove(&info.ufs_path);
         inner.mountpath2id.remove(&info.cv_path);
-        Ok(())
+        self.publish_snapshot(&inner)
     }
 }

@@ -384,14 +384,27 @@ impl CurvineFileSystem {
     }
 
     pub async fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {
-        let res = self.fs_client.get_mount_table().await?;
+        Ok(self.get_mount_table_versioned(None).await?.0)
+    }
+
+    /// Version-negotiated pull: returns the table (empty when the master
+    /// reports no change since `known_version`) plus the master's current
+    /// version (`None` from legacy masters).
+    pub async fn get_mount_table_versioned(
+        &self,
+        known_version: Option<u64>,
+    ) -> FsResult<(Vec<MountInfo>, Option<u64>)> {
+        let res = self
+            .fs_client
+            .get_mount_table_versioned(known_version)
+            .await?;
         let table = res
             .mount_table
             .into_iter()
             .map(ProtoUtils::mount_info_from_pb)
             .collect();
 
-        Ok(table)
+        Ok((table, res.version.map(|v| v as u64)))
     }
 
     pub async fn mount(&self, ufs_path: &Path, cv_path: &Path, opts: MountOptions) -> FsResult<()> {
