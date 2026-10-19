@@ -18,7 +18,6 @@ use curvine_config::JournalConf;
 use curvine_core_error::CommonResult;
 use curvine_error::FsResult;
 use curvine_raft::raft::RaftClient;
-use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::channel::BlockingReceiver;
 use std::sync::mpsc::RecvTimeoutError;
@@ -114,7 +113,7 @@ impl SenderTask {
 
         let spend = TimeSpent::new();
 
-        let bytes = SerdeUtils::serialize(&self.batch)?;
+        let bytes = JournalBatch::encode(&mut self.batch)?;
         self.client.block_on_send_propose(bytes)?;
 
         self.metrics.journal_flush_count.inc();

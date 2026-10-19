@@ -40,7 +40,6 @@ use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::ResponseStatus;
 use curvine_rpc::message::{Builder, MAX_DATE_SIZE};
 use curvine_runtime::common::LocalTime;
-use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
@@ -2494,7 +2493,7 @@ fn apply_entries(
             let entry = Entry {
                 term: 1,
                 index,
-                data: SerdeUtils::serialize(&batch)?,
+                data: batch.encode()?,
                 ..Default::default()
             };
             loader.apply(true, ApplyMsg::new_entry(entry)).await?;

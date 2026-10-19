@@ -23,7 +23,6 @@ use curvine_net::net::NetUtils;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
 use curvine_raft::raft::{NodeId, RaftPeer};
-use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{CommonUtils, FileUtils, Logger, TimeSpent, Utils};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_server::master::fs::MasterFilesystem;
@@ -52,7 +51,7 @@ fn replay_entries(
             let entry = Entry {
                 term: 1,
                 index: offset as u64 + 1,
-                data: SerdeUtils::serialize(&batch)?,
+                data: batch.encode()?,
                 ..Default::default()
             };
             loader.apply(true, ApplyMsg::new_entry(entry)).await?;
@@ -133,7 +132,7 @@ fn leader_promotion_applies_committed_metadata_before_returning() -> CommonResul
     target.append_committed_entry_for_test(Entry {
         term: 1,
         index: 1,
-        data: SerdeUtils::serialize(&batch)?,
+        data: batch.encode()?,
         ..Default::default()
     })?;
 
@@ -177,7 +176,7 @@ fn leader_promotion_advances_applied_index_over_committed_noop() -> CommonResult
     journal_system.append_committed_entry_for_test(Entry {
         term: 1,
         index: 1,
-        data: SerdeUtils::serialize(&batch)?,
+        data: batch.encode()?,
         ..Default::default()
     })?;
     journal_system.append_committed_entry_for_test(Entry {
@@ -269,7 +268,7 @@ fn follower_replay_allows_inode_id_below_allocator_watermark() -> CommonResult<(
     let entry = Entry {
         term: 1,
         index: 1,
-        data: SerdeUtils::serialize(&batch)?,
+        data: batch.encode()?,
         ..Default::default()
     };
     target.append_committed_entry_for_test(entry.clone())?;

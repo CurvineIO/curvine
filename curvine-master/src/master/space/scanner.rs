@@ -40,13 +40,14 @@ use std::time::Instant;
 
 use curvine_core_error::{err_box, try_err, CommonResult};
 use curvine_rocksdb::RocksUtils;
-use curvine_runtime::common::{LocalTime, SerdeUtils};
+use curvine_runtime::common::LocalTime;
 
 use super::agg::{AggregationOutput, SubtreeAggregator};
 use super::types::{AggregationStats, DirAgg, SnapshotSource};
 use crate::master::meta::inode::{InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::space::scan_lease::MetadataScanLease;
+use crate::master::MetadataCodec;
 
 /// Cooperative checks (deadline / role / lease cancellation) run every this
 /// many records.
@@ -588,7 +589,7 @@ fn i64_from_value(value: &[u8]) -> CommonResult<i64> {
 /// Deserialize one inode record into a compact fact. Corruption or a
 /// key/value id mismatch fails the whole round (never silently skipped).
 fn inode_fact_from_view(id: i64, bytes: &[u8]) -> CommonResult<InodeFact> {
-    let view: InodeView = SerdeUtils::deserialize(bytes)?;
+    let view: InodeView = MetadataCodec::decode(bytes)?;
     if view.id() != id {
         return err_box!(
             "dir-space scan: inode key/value id mismatch (key {}, value {})",
@@ -884,13 +885,9 @@ mod tests {
         let active = Arc::new(AtomicBool::new(true));
         let err = run_global(&store, &context(&active)).unwrap_err();
         let msg = err.to_string();
-        // Deserialization of the garbage record fails the whole round. The
-        // exact message comes from the serde layer ("invalid value: integer").
-        assert!(
-            msg.contains("invalid value") || msg.contains("deserialize"),
-            "unexpected error: {}",
-            msg
-        );
+        // Codec decoding of the garbage record fails the whole round. The
+        // injected bytes carry a bad header, so the codec reports "bad magic".
+        assert!(msg.contains("bad magic"), "unexpected error: {}", msg);
         Ok(())
     }
 
@@ -901,7 +898,7 @@ mod tests {
         write_batch(&store, &[root], &[])?;
 
         let good: InodeView = file("x", 6002, ROOT_INODE_ID, 1);
-        let bytes = SerdeUtils::serialize(&good)?;
+        let bytes = MetadataCodec::encode(&good)?;
         // Key is 5 bytes: not a valid inode id key.
         let mut batch = store.new_batch();
         batch.put_cf_raw(RocksInodeStore::CF_INODES, b"short", bytes)?;
@@ -920,7 +917,7 @@ mod tests {
         write_batch(&store, &[root], &[])?;
 
         let inode: InodeView = file("x", 6002, ROOT_INODE_ID, 1);
-        let bytes = SerdeUtils::serialize(&inode)?;
+        let bytes = MetadataCodec::encode(&inode)?;
         // Stored under a different id than the inode itself carries.
         let mut batch = store.new_batch();
         batch.put_cf_raw(

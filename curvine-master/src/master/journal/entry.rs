@@ -14,12 +14,12 @@
 
 use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use crate::master::meta::BlockMeta;
+use crate::master::MetadataCodec;
 use curvine_core_error::{err_box, CommonResult};
-use curvine_model::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
-use curvine_runtime::common::SerdeUtils;
-use log::debug;
+use curvine_model::{CommitBlock, FileLock, MountInfo, ProtoUtils, SetAttrOpts};
+use curvine_proto::*;
+use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::io::Cursor;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct MkdirEntry {
@@ -204,8 +204,83 @@ pub enum JournalEntry {
     Free(FreeEntry),
     UfsApplied(UfsAppliedEntry),
     Snapshot(SnapshotEntry),
-    // Keep new variants appended so existing journal discriminants remain stable.
+    // Protobuf field numbers live in journal.proto: append new variants there
+    // with a fresh field number and keep them last in this enum.
     CacheInvalidation(CacheInvalidationEntry),
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct JournalBatch {
+    pub(crate) seq_id: u64,
+    pub(crate) batch: Vec<JournalEntry>,
+}
+
+impl JournalBatch {
+    /// Encodes the batch as a `JournalBatchProto` payload. Heavy inode
+    /// metadata travels as `MetadataCodec` bytes inside the protobuf.
+    ///
+    /// The entries are drained, but the backing allocation is kept so the
+    /// next flush can reuse it. A failure leaves the batch empty; the writer
+    /// thread aborts the master instead of retrying.
+    pub fn encode(&mut self) -> CommonResult<Vec<u8>> {
+        let mut entries = Vec::with_capacity(self.batch.len());
+        for entry in self.batch.drain(..) {
+            entries.push(entry.into_proto()?);
+        }
+
+        Ok(JournalBatchProto {
+            seq_id: self.seq_id,
+            batch: entries,
+        }
+        .encode_to_vec())
+    }
+
+    /// Decodes one record written by [`Self::encode`].
+    pub(crate) fn decode(bytes: &[u8]) -> CommonResult<Self> {
+        // `encode` always writes at least the `seq_id` field, so an empty
+        // payload is structurally invalid; prost would otherwise fill the
+        // required field with a default and accept it.
+        if bytes.is_empty() {
+            return err_box!("journal record has no protobuf payload");
+        }
+        let proto = JournalBatchProto::decode(bytes)?;
+        Self::from_proto(proto)
+    }
+
+    fn from_proto(proto: JournalBatchProto) -> CommonResult<Self> {
+        let mut batch = Vec::with_capacity(proto.batch.len());
+        for entry in proto.batch {
+            batch.push(JournalEntry::from_proto(entry)?);
+        }
+
+        Ok(Self {
+            seq_id: proto.seq_id,
+            batch,
+        })
+    }
+
+    pub fn new(seq_id: u64) -> Self {
+        Self {
+            seq_id,
+            batch: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, entry: JournalEntry) {
+        self.batch.push(entry)
+    }
+
+    pub fn len(&self) -> usize {
+        self.batch.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn next(&mut self) {
+        self.seq_id += 1;
+    }
 }
 
 impl JournalEntry {
@@ -276,164 +351,314 @@ impl JournalEntry {
             _ => None,
         }
     }
-}
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct JournalBatch {
-    pub(crate) seq_id: u64,
-    pub(crate) batch: Vec<JournalEntry>,
-}
+    fn into_proto(self) -> CommonResult<JournalEntryProto> {
+        use journal_entry_proto::Entry as PbEntry;
 
-impl JournalBatch {
-    pub(crate) fn deserialize_compat(bytes: &[u8]) -> CommonResult<Self> {
-        match SerdeUtils::deserialize(bytes) {
-            Ok(batch) => Ok(batch),
-            Err(current_err) => match deserialize_legacy_batch(bytes) {
-                Ok(batch) => {
-                    debug!(
-                        "replaying legacy journal batch with pre-extension entry schemas, seq_id={}",
-                        batch.seq_id
-                    );
-                    Ok(batch.into())
-                }
-                Err(legacy_err) => err_box!(
-                    "failed to deserialize journal batch with current or legacy schemas: current={}, legacy={}",
-                    current_err,
-                    legacy_err
-                ),
-            },
-        }
-    }
-
-    pub fn new(seq_id: u64) -> Self {
-        Self {
-            seq_id,
-            batch: vec![],
-        }
-    }
-
-    pub fn push(&mut self, entry: JournalEntry) {
-        self.batch.push(entry)
-    }
-
-    pub fn len(&self) -> usize {
-        self.batch.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn next(&mut self) {
-        self.seq_id += 1;
-        self.batch.clear();
-    }
-}
-
-// bincode encodes struct fields positionally, so appending fields to RenameEntry
-// cannot be made backward compatible with serde(default). Keep this schema only
-// for replaying entries written before exchange inode ids were introduced.
-#[derive(Deserialize)]
-struct LegacyRenameEntry {
-    op_id: u64,
-    rpc_id: i64,
-    src: String,
-    dst: String,
-    mtime: i64,
-    flags: u32,
-}
-
-// FreeEntry::recursive was appended in #721. Old bincode entries do not have
-// this field, so decoding them with the current type consumes the next entry's
-// enum tag as a bool.
-#[derive(Deserialize)]
-struct LegacyFreeEntry {
-    op_id: u64,
-    rpc_id: i64,
-    path: String,
-    mtime: i64,
-}
-
-#[derive(Deserialize)]
-enum LegacyJournalEntry {
-    Mkdir(MkdirEntry),
-    CreateFile(CreateFileEntry),
-    ReopenFile(ReopenFileEntry),
-    OverWriteFile(OverWriteFileEntry),
-    AddBlock(AddBlockEntry),
-    CompleteFile(CompleteFileEntry),
-    Rename(LegacyRenameEntry),
-    Delete(DeleteEntry),
-    Mount(MountEntry),
-    UnMount(UnMountEntry),
-    SetAttr(SetAttrEntry),
-    Symlink(SymlinkEntry),
-    Link(LinkEntry),
-    SetLocks(SetLocksEntry),
-    Free(LegacyFreeEntry),
-    UfsApplied(UfsAppliedEntry),
-    Snapshot(SnapshotEntry),
-}
-
-#[derive(Deserialize)]
-struct LegacyJournalBatch {
-    seq_id: u64,
-    batch: Vec<LegacyJournalEntry>,
-}
-
-fn deserialize_legacy_batch(bytes: &[u8]) -> CommonResult<LegacyJournalBatch> {
-    let mut reader = Cursor::new(bytes);
-    let batch = SerdeUtils::deserialize_from(&mut reader)?;
-    if reader.position() != bytes.len() as u64 {
-        return err_box!("legacy journal batch has trailing bytes");
-    }
-    Ok(batch)
-}
-
-impl From<LegacyJournalBatch> for JournalBatch {
-    fn from(batch: LegacyJournalBatch) -> Self {
-        Self {
-            seq_id: batch.seq_id,
-            batch: batch.batch.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-impl From<LegacyJournalEntry> for JournalEntry {
-    fn from(entry: LegacyJournalEntry) -> Self {
-        match entry {
-            LegacyJournalEntry::Mkdir(entry) => Self::Mkdir(entry),
-            LegacyJournalEntry::CreateFile(entry) => Self::CreateFile(entry),
-            LegacyJournalEntry::ReopenFile(entry) => Self::ReopenFile(entry),
-            LegacyJournalEntry::OverWriteFile(entry) => Self::OverWriteFile(entry),
-            LegacyJournalEntry::AddBlock(entry) => Self::AddBlock(entry),
-            LegacyJournalEntry::CompleteFile(entry) => Self::CompleteFile(entry),
-            LegacyJournalEntry::Rename(entry) => Self::Rename(RenameEntry {
-                op_id: entry.op_id,
-                rpc_id: entry.rpc_id,
-                src: entry.src,
-                dst: entry.dst,
-                mtime: entry.mtime,
-                flags: entry.flags,
-                src_inode_id: 0,
-                dst_inode_id: 0,
+        let entry = match self {
+            JournalEntry::Mkdir(e) => PbEntry::Mkdir(MkdirEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                dir: MetadataCodec::encode(&e.dir)?,
             }),
-            LegacyJournalEntry::Delete(entry) => Self::Delete(entry),
-            LegacyJournalEntry::Mount(entry) => Self::Mount(entry),
-            LegacyJournalEntry::UnMount(entry) => Self::UnMount(entry),
-            LegacyJournalEntry::SetAttr(entry) => Self::SetAttr(entry),
-            LegacyJournalEntry::Symlink(entry) => Self::Symlink(entry),
-            LegacyJournalEntry::Link(entry) => Self::Link(entry),
-            LegacyJournalEntry::SetLocks(entry) => Self::SetLocks(entry),
-            LegacyJournalEntry::Free(entry) => Self::Free(FreeEntry {
-                op_id: entry.op_id,
-                rpc_id: entry.rpc_id,
-                path: entry.path,
-                mtime: entry.mtime,
-                recursive: false,
+
+            JournalEntry::CreateFile(e) => PbEntry::CreateFile(CreateFileEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                file: MetadataCodec::encode(&e.file)?,
             }),
-            LegacyJournalEntry::UfsApplied(entry) => Self::UfsApplied(entry),
-            LegacyJournalEntry::Snapshot(entry) => Self::Snapshot(entry),
-        }
+
+            JournalEntry::ReopenFile(e) => PbEntry::ReopenFile(ReopenFileEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                file: MetadataCodec::encode(&e.file)?,
+            }),
+
+            JournalEntry::OverWriteFile(e) => PbEntry::OverwriteFile(OverWriteFileEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                file: MetadataCodec::encode(&e.file)?,
+            }),
+
+            JournalEntry::AddBlock(e) => PbEntry::AddBlock(AddBlockEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                blocks: MetadataCodec::encode(&e.blocks)?,
+                commit_block: e
+                    .commit_block
+                    .into_iter()
+                    .map(ProtoUtils::commit_block_to_pb)
+                    .collect(),
+            }),
+
+            JournalEntry::CompleteFile(e) => PbEntry::CompleteFile(CompleteFileEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                file: MetadataCodec::encode(&e.file)?,
+                commit_blocks: e
+                    .commit_blocks
+                    .into_iter()
+                    .map(ProtoUtils::commit_block_to_pb)
+                    .collect(),
+            }),
+
+            JournalEntry::Rename(e) => PbEntry::Rename(RenameEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                src: e.src,
+                dst: e.dst,
+                mtime: e.mtime,
+                flags: e.flags,
+                src_inode_id: Some(e.src_inode_id),
+                dst_inode_id: Some(e.dst_inode_id),
+            }),
+
+            JournalEntry::Delete(e) => PbEntry::Delete(DeleteEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                mtime: e.mtime,
+            }),
+
+            JournalEntry::Mount(e) => PbEntry::Mount(MountEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                info: ProtoUtils::mount_info_to_pb(e.info),
+            }),
+
+            JournalEntry::UnMount(e) => PbEntry::Unmount(UnMountEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                id: e.id,
+            }),
+
+            JournalEntry::SetAttr(e) => PbEntry::SetAttr(SetAttrEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                opts: ProtoUtils::set_attr_opts_to_pb(e.opts),
+            }),
+
+            JournalEntry::Symlink(e) => PbEntry::Symlink(SymlinkEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                link: e.link,
+                new_inode: MetadataCodec::encode(&e.new_inode)?,
+                force: e.force,
+            }),
+
+            JournalEntry::Link(e) => PbEntry::Link(LinkEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                mtime: e.mtime,
+                src_path: e.src_path,
+                dst_path: e.dst_path,
+            }),
+
+            JournalEntry::SetLocks(e) => PbEntry::SetLocks(SetLocksEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                ino: e.ino,
+                locks: e
+                    .locks
+                    .into_iter()
+                    .map(ProtoUtils::file_lock_to_pb)
+                    .collect(),
+            }),
+
+            JournalEntry::Free(e) => PbEntry::Free(FreeEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                mtime: e.mtime,
+                recursive: Some(e.recursive),
+            }),
+
+            JournalEntry::UfsApplied(e) => PbEntry::UfsApplied(UfsAppliedEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                term: e.term,
+                index: e.index,
+            }),
+
+            JournalEntry::Snapshot(e) => PbEntry::Snapshot(SnapshotEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                node_id: e.node_id,
+                dir: e.dir,
+            }),
+
+            JournalEntry::CacheInvalidation(e) => {
+                PbEntry::CacheInvalidation(CacheInvalidationEntryProto {
+                    op_id: e.op_id,
+                    rpc_id: e.rpc_id,
+                    inodes: MetadataCodec::encode(&e.inodes)?,
+                })
+            }
+        };
+
+        Ok(JournalEntryProto { entry: Some(entry) })
+    }
+
+    fn from_proto(proto: JournalEntryProto) -> CommonResult<Self> {
+        use journal_entry_proto::Entry as PbEntry;
+
+        let Some(entry) = proto.entry else {
+            return err_box!("journal entry protobuf payload is missing");
+        };
+
+        Ok(match entry {
+            PbEntry::Mkdir(e) => JournalEntry::Mkdir(MkdirEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                dir: MetadataCodec::decode(&e.dir)?,
+            }),
+
+            PbEntry::CreateFile(e) => JournalEntry::CreateFile(CreateFileEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                file: MetadataCodec::decode(&e.file)?,
+            }),
+
+            PbEntry::ReopenFile(e) => JournalEntry::ReopenFile(ReopenFileEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                file: MetadataCodec::decode(&e.file)?,
+            }),
+
+            PbEntry::OverwriteFile(e) => JournalEntry::OverWriteFile(OverWriteFileEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                file: MetadataCodec::decode(&e.file)?,
+            }),
+
+            PbEntry::AddBlock(e) => JournalEntry::AddBlock(AddBlockEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                blocks: MetadataCodec::decode(&e.blocks)?,
+                commit_block: e
+                    .commit_block
+                    .into_iter()
+                    .map(ProtoUtils::commit_block_from_pb)
+                    .collect(),
+            }),
+
+            PbEntry::CompleteFile(e) => JournalEntry::CompleteFile(CompleteFileEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                file: MetadataCodec::decode(&e.file)?,
+                commit_blocks: e
+                    .commit_blocks
+                    .into_iter()
+                    .map(ProtoUtils::commit_block_from_pb)
+                    .collect(),
+            }),
+
+            PbEntry::Rename(e) => JournalEntry::Rename(RenameEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                src: e.src,
+                dst: e.dst,
+                mtime: e.mtime,
+                flags: e.flags,
+                src_inode_id: e.src_inode_id.unwrap_or(0),
+                dst_inode_id: e.dst_inode_id.unwrap_or(0),
+            }),
+
+            PbEntry::Delete(e) => JournalEntry::Delete(DeleteEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                mtime: e.mtime,
+            }),
+
+            PbEntry::Mount(e) => JournalEntry::Mount(MountEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                info: ProtoUtils::mount_info_from_pb(e.info),
+            }),
+
+            PbEntry::Unmount(e) => JournalEntry::UnMount(UnMountEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                id: e.id,
+            }),
+
+            PbEntry::SetAttr(e) => JournalEntry::SetAttr(SetAttrEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                opts: ProtoUtils::set_attr_opts_from_pb(e.opts),
+            }),
+
+            PbEntry::Symlink(e) => JournalEntry::Symlink(SymlinkEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                link: e.link,
+                new_inode: MetadataCodec::decode(&e.new_inode)?,
+                force: e.force,
+            }),
+
+            PbEntry::Link(e) => JournalEntry::Link(LinkEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                mtime: e.mtime,
+                src_path: e.src_path,
+                dst_path: e.dst_path,
+            }),
+
+            PbEntry::SetLocks(e) => JournalEntry::SetLocks(SetLocksEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                ino: e.ino,
+                locks: e
+                    .locks
+                    .into_iter()
+                    .map(ProtoUtils::file_lock_from_pb)
+                    .collect(),
+            }),
+
+            PbEntry::Free(e) => JournalEntry::Free(FreeEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                mtime: e.mtime,
+                recursive: e.recursive.unwrap_or(false),
+            }),
+
+            PbEntry::UfsApplied(e) => JournalEntry::UfsApplied(UfsAppliedEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                term: e.term,
+                index: e.index,
+            }),
+
+            PbEntry::Snapshot(e) => JournalEntry::Snapshot(SnapshotEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                node_id: e.node_id,
+                dir: e.dir,
+            }),
+
+            PbEntry::CacheInvalidation(e) => {
+                JournalEntry::CacheInvalidation(CacheInvalidationEntry {
+                    op_id: e.op_id,
+                    rpc_id: e.rpc_id,
+                    inodes: MetadataCodec::decode(&e.inodes)?,
+                })
+            }
+        })
     }
 }

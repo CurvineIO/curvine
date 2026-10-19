@@ -19,13 +19,13 @@ use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
+use crate::master::MetadataCodec;
 use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{
     FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction, TtlType, INTERNAL_CTIME_XATTR,
     INTERNAL_TTL_TYPE_XATTR,
 };
-use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{LocalTime, Utils};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, LinkedList};
@@ -686,7 +686,7 @@ impl InodeView {
         stack.push_back(self);
 
         while let Some(v) = stack.pop_front() {
-            let bytes = SerdeUtils::serialize(&v)?;
+            let bytes = MetadataCodec::encode(v)?;
             if !v.is_root() {
                 let hash = Utils::crc32(&bytes) as u128;
                 res += hash

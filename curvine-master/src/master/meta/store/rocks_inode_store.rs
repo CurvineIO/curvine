@@ -14,6 +14,7 @@
 
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::LockMeta;
+use crate::master::MetadataCodec;
 use curvine_core_error::CommonResult;
 use curvine_model::{BlockLocation, FileLock, MountInfo};
 use curvine_rocksdb::{
@@ -22,7 +23,6 @@ use curvine_rocksdb::{
 use curvine_rocksdb::{
     DBIteratorWithThreadMode, DBPinnableSlice, Error, WriteBatchWithTransaction, DB,
 };
-use curvine_runtime::common::SerdeUtils as Serde;
 use std::collections::HashMap;
 
 pub struct RocksInodeStore {
@@ -79,7 +79,7 @@ impl RocksInodeStore {
         let mut vec = Vec::with_capacity(8);
         for item in iter {
             let bytes = item?;
-            let location = Serde::deserialize::<BlockLocation>(&bytes.1)?;
+            let location = MetadataCodec::decode::<BlockLocation>(&bytes.1)?;
             vec.push(location);
         }
 
@@ -107,7 +107,7 @@ impl RocksInodeStore {
             None => Ok(None),
 
             Some(v) => {
-                let inode: InodeView = Serde::deserialize(&v)?;
+                let inode: InodeView = MetadataCodec::decode(&v)?;
                 Ok(Some(inode))
             }
         }
@@ -174,7 +174,7 @@ impl RocksInodeStore {
         let mut vec = Vec::with_capacity(8);
         for item in iter {
             let bytes = item?;
-            let location = Serde::deserialize::<i64>(&bytes.1)?;
+            let location = MetadataCodec::decode::<i64>(&bytes.1)?;
             vec.push(location);
         }
 
@@ -183,7 +183,7 @@ impl RocksInodeStore {
 
     pub fn add_mountpoint(&self, id: u32, entry: &MountInfo) -> CommonResult<()> {
         let key = RocksUtils::u8_u32_to_bytes(Self::PREFIX_MOUNT, id);
-        let value = Serde::serialize(entry)?;
+        let value = MetadataCodec::encode(entry)?;
         self.db.put_cf(Self::CF_COMMON, key, value)
     }
 
@@ -201,7 +201,7 @@ impl RocksInodeStore {
             None => Ok(None),
 
             Some(v) => {
-                let info = MountInfo::decode_persisted(&v)?;
+                let info: MountInfo = MetadataCodec::decode(&v)?;
                 Ok(Some(info))
             }
         }
@@ -212,7 +212,7 @@ impl RocksInodeStore {
         let mut vec = Vec::with_capacity(8);
         for item in iter {
             let bytes = item?;
-            let mnt = MountInfo::decode_persisted(&bytes.1)?;
+            let mnt: MountInfo = MetadataCodec::decode(&bytes.1)?;
             vec.push(mnt);
         }
 
@@ -224,7 +224,7 @@ impl RocksInodeStore {
         let bytes = self.db.get_cf(Self::CF_COMMON, key)?;
 
         if let Some(bytes) = bytes {
-            let locks: Vec<FileLock> = Serde::deserialize(&bytes)?;
+            let locks: Vec<FileLock> = MetadataCodec::decode(&bytes)?;
             Ok(LockMeta::with_vec(locks))
         } else {
             Ok(LockMeta::default())
@@ -236,7 +236,7 @@ impl RocksInodeStore {
         if lock.is_empty() {
             self.db.delete_cf(RocksInodeStore::CF_COMMON, key)
         } else {
-            let value = Serde::serialize(&lock)?;
+            let value = MetadataCodec::encode(&lock.to_vec())?;
             self.db.put_cf(RocksInodeStore::CF_COMMON, key, value)
         }
     }
@@ -317,19 +317,19 @@ impl<'a> InodeWriteBatch<'a> {
     pub fn add_location(&mut self, id: i64, loc: &BlockLocation) -> CommonResult<()> {
         // store with the key of  (block_id, worker_id)
         let key = RocksUtils::i64_u32_to_bytes(id, loc.worker_id);
-        let value = Serde::serialize(loc)?;
+        let value = MetadataCodec::encode(loc)?;
         self.put_cf(RocksInodeStore::CF_BLOCK, key, value)?;
 
         // store with the key of (worker_id, block_id)
         let key = RocksUtils::u32_i64_to_bytes(loc.worker_id, id);
-        let value = Serde::serialize(&id)?;
+        let value = MetadataCodec::encode(&id)?;
         self.put_cf(RocksInodeStore::CF_LOCATION, key, value)
     }
 
     // Add an inode.
     pub fn write_inode(&mut self, inode: &InodeView) -> CommonResult<()> {
         let key = RocksUtils::i64_to_bytes(inode.id());
-        let value = Serde::serialize(inode)?;
+        let value = MetadataCodec::encode(inode)?;
         self.put_cf(RocksInodeStore::CF_INODES, key, value)
     }
 

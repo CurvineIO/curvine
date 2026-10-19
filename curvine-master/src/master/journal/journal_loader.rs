@@ -272,7 +272,7 @@ impl JournalLoader {
             return self.advance_watermark(is_leader, cur, entry);
         }
 
-        let batch = match JournalBatch::deserialize_compat(&entry.data) {
+        let batch = match JournalBatch::decode(&entry.data) {
             Ok(batch) => batch,
             Err(e) if self.ignore_reply_error => {
                 error!(
@@ -281,7 +281,7 @@ impl JournalLoader {
                 );
                 return self.advance_watermark(is_leader, cur, entry);
             }
-            Err(e) => return Err(e),
+            Err(e) => return err_box!("failed to decode journal batch: {}", e),
         };
 
         let batch_len = batch.len();
@@ -1068,7 +1068,7 @@ mod tests {
     use super::*;
     use curvine_config::{ClusterConf, MasterConf};
     use curvine_error::FsResult;
-    use curvine_runtime::common::{SerdeUtils, Utils};
+    use curvine_runtime::common::Utils;
 
     // Regression tests for the batch-deserialization skip branch in `apply0`:
     // with `ignore_reply_error` enabled an undecodable batch (typically written
@@ -1103,8 +1103,7 @@ mod tests {
         (conf, root)
     }
 
-    // Shorter than the smallest serialized batch (u64 seq_id + u64 batch
-    // length), so both the current and the legacy schema reject it.
+    // Not a valid JournalBatchProto payload.
     fn corrupt_entry(index: u64, term: u64) -> Entry {
         Entry {
             index,
@@ -1121,7 +1120,7 @@ mod tests {
             rpc_id: 9,
             inodes: vec![],
         }));
-        let data = SerdeUtils::serialize(&batch).unwrap();
+        let data = batch.encode().unwrap();
 
         Entry {
             index,

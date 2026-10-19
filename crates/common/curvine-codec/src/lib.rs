@@ -16,8 +16,16 @@
 //!
 //! This crate replaces bincode for metadata (meta DB values) and journal
 //! payloads, pairing a frozen field encoding with a per-record schema version
-//! so records written by old and new binaries can coexist during rolling
-//! upgrades.
+//! that governs future evolution between codec-format binaries.
+//!
+//! The bincode-to-codec switch is a one-time hard cutover: journal entries in
+//! the raft log and meta DB values written by the old bincode paths are not
+//! read back, and the legacy decode fallbacks (`MountInfo::decode_persisted`,
+//! the pre-protobuf journal replay schema) were removed together with their
+//! compat tests. Upgrading a cluster with existing bincode data in place is
+//! not supported — a fresh deployment (or a full metadata rebuild) is
+//! required. The schema version in the record header does not bridge the
+//! bincode-to-codec transition.
 //!
 //! # Field encoding (frozen once released)
 //!
@@ -54,12 +62,13 @@
 //!   starts with a low enum tag, and short string length prefixes stay small.
 //! - `SCHEMA_VERSION` (6 bits) is `1..=63`; `0` is invalid.
 //!
-//! Sniffing with [`Codec::is_codec_format`] is a heuristic: a legacy `JournalBatch`
-//! whose `seq_id` low byte lands in `0x81..=0xBF` (63 of 256 candidates, ~1 in
-//! 4 batches) passes the check. Deterministic dispatch must rely on context
-//! (journal switch point, column family markers), while the payload-level
-//! validation here guarantees such false positives fail loudly instead of
-//! decoding silently.
+//! [`Codec::is_codec_format`] is a payload-detection helper for tests and
+//! tooling only; no production read path dispatches on it. That is
+//! deliberate: the check is a heuristic — a legacy `JournalBatch` whose
+//! `seq_id` low byte lands in `0x81..=0xBF` (63 of 256 candidates, ~1 in
+//! 4 batches) passes it — so sniffing could not have supported a reliable
+//! bincode-to-codec rolling upgrade even before the fallbacks were removed
+//! (see the hard-cutover note above).
 //!
 //! [`Codec::decode`] always parses that header first (see
 //! [`Codec::parse_version`]) and hands the recovered version to the payload

@@ -16,15 +16,12 @@ use crate::state::{
     CreateFileOpts, CreateFileOptsBuilder, StoragePolicy, StorageType, TtlAction, TtlType,
 };
 use crate::{ClientConfDefaults, CurvinePath};
-use bincode::Options;
 use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{err_box, CommonError, CommonResult};
 use curvine_runtime::common::DurationUnit;
-use log::warn;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::ErrorKind;
 
 #[repr(i32)]
 #[derive(
@@ -162,133 +159,9 @@ pub struct MountInfo {
     pub auto_cache: bool,
     pub access_mode: AccessMode,
     pub write_cache: bool,
-    /// TTL expiration base time. Must stay the LAST field for bincode
-    /// compatibility with payloads persisted before this field existed.
+    /// TTL expiration base time. Field order is the persisted wire format:
+    /// append new fields after this one; see `Encode`/`Decode`.
     pub ttl_type: TtlType,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct LegacyMountInfo {
-    cv_path: String,
-    ufs_path: String,
-    mount_id: u32,
-    properties: HashMap<String, String>,
-    ttl_ms: i64,
-    ttl_action: TtlAction,
-    read_verify_ufs: bool,
-    storage_type: Option<StorageType>,
-    block_size: Option<i64>,
-    replicas: Option<i32>,
-    write_type: WriteType,
-    provider: Option<Provider>,
-}
-
-impl From<LegacyMountInfo> for MountInfo {
-    fn from(info: LegacyMountInfo) -> Self {
-        Self {
-            cv_path: info.cv_path,
-            ufs_path: info.ufs_path,
-            mount_id: info.mount_id,
-            properties: info.properties,
-            ttl_ms: info.ttl_ms,
-            ttl_action: info.ttl_action,
-            read_verify_ufs: info.read_verify_ufs,
-            storage_type: info.storage_type,
-            block_size: info.block_size,
-            replicas: info.replicas,
-            write_type: info.write_type,
-            provider: info.provider,
-            auto_cache: true,
-            access_mode: AccessMode::ReadOnly,
-            write_cache: false,
-            ttl_type: TtlType::Mtime,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct LegacyMountInfoWithAutoCacheAccessMode {
-    cv_path: String,
-    ufs_path: String,
-    mount_id: u32,
-    properties: HashMap<String, String>,
-    ttl_ms: i64,
-    ttl_action: TtlAction,
-    read_verify_ufs: bool,
-    storage_type: Option<StorageType>,
-    block_size: Option<i64>,
-    replicas: Option<i32>,
-    write_type: WriteType,
-    provider: Option<Provider>,
-    auto_cache: bool,
-    access_mode: AccessMode,
-}
-
-impl From<LegacyMountInfoWithAutoCacheAccessMode> for MountInfo {
-    fn from(info: LegacyMountInfoWithAutoCacheAccessMode) -> Self {
-        Self {
-            cv_path: info.cv_path,
-            ufs_path: info.ufs_path,
-            mount_id: info.mount_id,
-            properties: info.properties,
-            ttl_ms: info.ttl_ms,
-            ttl_action: info.ttl_action,
-            read_verify_ufs: info.read_verify_ufs,
-            storage_type: info.storage_type,
-            block_size: info.block_size,
-            replicas: info.replicas,
-            write_type: info.write_type,
-            provider: info.provider,
-            auto_cache: info.auto_cache,
-            access_mode: info.access_mode,
-            write_cache: false,
-            ttl_type: TtlType::Mtime,
-        }
-    }
-}
-
-/// Layout persisted between the `write_cache` and the `ttl_type` additions:
-/// it ends at `write_cache` (the previous last field) and has no `ttl_type`.
-#[derive(Debug, Clone, Deserialize)]
-struct LegacyMountInfoWithWriteCache {
-    cv_path: String,
-    ufs_path: String,
-    mount_id: u32,
-    properties: HashMap<String, String>,
-    ttl_ms: i64,
-    ttl_action: TtlAction,
-    read_verify_ufs: bool,
-    storage_type: Option<StorageType>,
-    block_size: Option<i64>,
-    replicas: Option<i32>,
-    write_type: WriteType,
-    provider: Option<Provider>,
-    auto_cache: bool,
-    access_mode: AccessMode,
-    write_cache: bool,
-}
-
-impl From<LegacyMountInfoWithWriteCache> for MountInfo {
-    fn from(info: LegacyMountInfoWithWriteCache) -> Self {
-        Self {
-            cv_path: info.cv_path,
-            ufs_path: info.ufs_path,
-            mount_id: info.mount_id,
-            properties: info.properties,
-            ttl_ms: info.ttl_ms,
-            ttl_action: info.ttl_action,
-            read_verify_ufs: info.read_verify_ufs,
-            storage_type: info.storage_type,
-            block_size: info.block_size,
-            replicas: info.replicas,
-            write_type: info.write_type,
-            provider: info.provider,
-            auto_cache: info.auto_cache,
-            access_mode: info.access_mode,
-            write_cache: info.write_cache,
-            ttl_type: TtlType::Mtime,
-        }
-    }
 }
 
 impl Encode for MountInfo {
@@ -339,47 +212,6 @@ impl Decode for MountInfo {
 }
 
 impl MountInfo {
-    pub fn decode_persisted(bytes: &[u8]) -> CommonResult<Self> {
-        match bincode::deserialize::<Self>(bytes) {
-            Ok(info) => Ok(info),
-            Err(e) if Self::is_unexpected_eof(&e) => {
-                if let Ok(legacy) = bincode::DefaultOptions::new()
-                    .with_fixint_encoding()
-                    .reject_trailing_bytes()
-                    .deserialize::<LegacyMountInfoWithWriteCache>(bytes)
-                {
-                    return Ok(legacy.into());
-                }
-
-                if let Ok(legacy) = bincode::DefaultOptions::new()
-                    .with_fixint_encoding()
-                    .reject_trailing_bytes()
-                    .deserialize::<LegacyMountInfoWithAutoCacheAccessMode>(bytes)
-                {
-                    return Ok(legacy.into());
-                }
-
-                let legacy: LegacyMountInfo = bincode::DefaultOptions::new()
-                    .with_fixint_encoding()
-                    .reject_trailing_bytes()
-                    .deserialize(bytes)
-                    .map_err(|legacy_e| {
-                        warn!("legacy MountInfo decode also failed: {}", legacy_e);
-                        e
-                    })?;
-                Ok(legacy.into())
-            }
-            Err(e) => err_box!(e),
-        }
-    }
-
-    fn is_unexpected_eof(err: &bincode::Error) -> bool {
-        matches!(
-            err.as_ref(),
-            bincode::ErrorKind::Io(e) if e.kind() == ErrorKind::UnexpectedEof
-        )
-    }
-
     pub fn auto_cache(&self) -> bool {
         self.auto_cache && self.ttl_ms > 0
     }
