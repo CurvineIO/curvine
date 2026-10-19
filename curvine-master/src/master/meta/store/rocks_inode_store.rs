@@ -16,12 +16,17 @@ use crate::master::meta::inode::InodeView;
 use crate::master::meta::LockMeta;
 use curvine_core_error::CommonResult;
 use curvine_model::{BlockLocation, FileLock, MountInfo};
-use curvine_rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
+use curvine_rocksdb::{DBConf, DBEngine, ReadOptions, RocksIterator, RocksUtils};
 use curvine_rocksdb::{
     DBIteratorWithThreadMode, DBPinnableSlice, Error, WriteBatchWithTransaction, DB,
 };
 use curvine_runtime::common::SerdeUtils as Serde;
 use std::collections::HashMap;
+
+#[cfg(test)]
+thread_local! {
+    static LOCATION_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 pub struct RocksInodeStore {
     pub(crate) db: DBEngine,
@@ -82,6 +87,64 @@ impl RocksInodeStore {
         }
 
         Ok(vec)
+    }
+
+    /// Reuse one iterator only within the caller's namespace guard.
+    /// Results are owned; no iterator, pinned value, or cache escapes the call.
+    pub fn get_locations_many(
+        &self,
+        ids: impl IntoIterator<Item = i64>,
+    ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
+        let ids: Vec<i64> = ids.into_iter().collect();
+        // Bound the shared iterator to the requested range so seeking past the
+        // last requested prefix cannot walk tombstones of neighbouring blocks.
+        // Keys are big-endian, so byte order is the unsigned order of the id.
+        let mut opt = ReadOptions::default();
+        let bounded = ids.iter().copied().filter(|id| *id != -1);
+        if let (Some(min), Some(max)) = (
+            bounded.clone().min_by_key(|id| *id as u64),
+            bounded.max_by_key(|id| *id as u64),
+        ) {
+            opt.set_iterate_lower_bound(RocksUtils::i64_to_bytes(min));
+            let upper = RocksUtils::calculate_end_bytes(&RocksUtils::i64_to_bytes(max));
+            if !upper.is_empty() {
+                opt.set_iterate_upper_bound(upper);
+            }
+        }
+        // DBConf currently uses the default ordered memtable and no prefix extractor.
+        let mut iter = self
+            .db
+            .get_db()
+            .raw_iterator_cf_opt(self.db.cf(Self::CF_BLOCK)?, opt);
+        let mut result = HashMap::with_capacity(ids.len());
+        for id in ids {
+            // Preserve the existing all-0xff prefix boundary behavior.
+            if id == -1 {
+                result.insert(id, self.get_locations(id)?);
+                continue;
+            }
+            let prefix = RocksUtils::i64_to_bytes(id);
+            iter.seek(prefix);
+            let mut locations = Vec::with_capacity(8);
+            while let Some((key, value)) = iter.item() {
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                locations.push(Serde::deserialize::<BlockLocation>(value)?);
+                iter.next();
+            }
+            if iter.status().is_err() {
+                // The shared iterator spans every requested prefix and may touch
+                // a corrupt SST outside this one. Retry the per-block query to preserve its
+                // error scope; corruption inside the requested prefix still
+                // propagates. No partial location list is published.
+                #[cfg(test)]
+                LOCATION_FALLBACKS.with(|count| count.set(count.get() + 1));
+                locations = self.get_locations(id)?;
+            }
+            result.insert(id, locations);
+        }
+        Ok(result)
     }
 
     pub fn new_batch(&self) -> InodeWriteBatch<'_> {
@@ -350,5 +413,231 @@ impl<'a> InodeWriteBatch<'a> {
 
     pub fn commit(self) -> CommonResult<()> {
         self.db.write_batch(self.batch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_model::StorageType;
+    use curvine_rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
+    use curvine_runtime::common::Utils;
+
+    #[test]
+    fn reused_location_iterator_does_not_expand_corrupt_sst_scope() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        for compact in [false, true] {
+            let mut conf = DBConf::new(Utils::test_sub_dir(format!(
+                "location-corrupt-neighbor-{}",
+                Utils::rand_str(8)
+            )));
+            conf.disable_block_cache = true;
+            let store = RocksInodeStore::new(conf.clone(), true).unwrap();
+            for id in [100, 5000, 10000] {
+                let mut batch = store.new_batch();
+                batch
+                    .add_location(id, &BlockLocation::new(100, StorageType::Disk))
+                    .unwrap();
+                batch.commit().unwrap();
+                store.db.flush(true).unwrap();
+                if compact {
+                    store.db.get_db().compact_range_cf(
+                        store.db.cf(RocksInodeStore::CF_BLOCK).unwrap(),
+                        Some(RocksUtils::i64_to_bytes(id)),
+                        Some(RocksUtils::i64_to_bytes(id + 1)),
+                    );
+                }
+            }
+            // Keep the corrupt key in the iterator's range, but in a separate
+            // SST from both requested prefixes.
+            let bad_key = RocksUtils::i64_u32_to_bytes(5000, 100);
+            let live = store.db.get_db().live_files().unwrap();
+            let bad = live
+                .iter()
+                .find(|file| {
+                    file.column_family_name == RocksInodeStore::CF_BLOCK
+                        && file.start_key.as_deref() == Some(bad_key.as_slice())
+                        && file.end_key.as_deref() == Some(bad_key.as_slice())
+                })
+                .unwrap();
+            let bad_level = bad.level;
+            if compact {
+                assert!(bad_level > 0, "test must exercise a non-L0 SST");
+            }
+            let bad_path = store
+                .db
+                .get_db()
+                .path()
+                .join(bad.name.trim_start_matches('/'));
+            drop(store);
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&bad_path)
+                .unwrap();
+            let mut byte = [0u8];
+            file.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0x80;
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&byte).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            let reopened = RocksInodeStore::new(conf, false).unwrap();
+            assert!(
+                reopened.get_locations(5000).is_err(),
+                "fault must be detected"
+            );
+            let outside_a = reopened.get_locations(100);
+            let outside_b = reopened.get_locations(101);
+            let outside = reopened.get_locations_many([100, 101]);
+            assert_eq!(
+                outside.is_ok(),
+                outside_a.is_ok() && outside_b.is_ok(),
+                "corruption beyond the upper bound must preserve per-block error scope"
+            );
+            let a = reopened.get_locations(100);
+            let b = reopened.get_locations(10000);
+            let baseline_ok = a.is_ok() && b.is_ok();
+            assert!(
+                reopened.get_locations_many([100, 5000]).is_err(),
+                "requested SST corruption must propagate"
+            );
+            LOCATION_FALLBACKS.with(|count| count.set(0));
+            let candidate = reopened.get_locations_many([100, 10000]);
+            assert_eq!(
+                candidate.is_ok(),
+                baseline_ok,
+                "corruption between requested blocks must preserve per-block error scope"
+            );
+            if compact {
+                assert!(baseline_ok, "compacted good SSTs must remain readable");
+                assert!(
+                    LOCATION_FALLBACKS.with(|count| count.get()) > 0,
+                    "the in-range corrupt SST must exercise the per-block fallback"
+                );
+            }
+            let workers = |list: &[BlockLocation]| {
+                list.iter()
+                    .map(|x| (x.worker_id, x.storage_type))
+                    .collect::<Vec<_>>()
+            };
+            if let Ok(outside) = outside {
+                assert_eq!(workers(&outside[&100]), workers(&outside_a.unwrap()));
+                assert_eq!(workers(&outside[&101]), workers(&outside_b.unwrap()));
+            }
+            if let Ok(candidate) = candidate {
+                assert_eq!(workers(&candidate[&100]), workers(&a.unwrap()));
+                assert_eq!(workers(&candidate[&10000]), workers(&b.unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn reused_location_iterator_matches_prefix_queries() {
+        let conf = DBConf::new(Utils::test_sub_dir(format!(
+            "location-iterator-{}",
+            Utils::rand_str(8)
+        )));
+        let store = RocksInodeStore::new(conf, true).unwrap();
+        let stored = [i64::MIN, -42, -1, 0, 1, 8192, i64::MAX];
+        let mut batch = store.new_batch();
+        for (i, id) in stored.iter().enumerate() {
+            batch
+                .add_location(*id, &BlockLocation::new(100, StorageType::Ssd))
+                .unwrap();
+            if i % 2 == 0 {
+                batch
+                    .add_location(*id, &BlockLocation::new(101, StorageType::Disk))
+                    .unwrap();
+            }
+        }
+        batch.commit().unwrap();
+        let requested = [8192, -42, -1, 2, i64::MAX, i64::MIN, 0, 1, 8192];
+        for flush in [false, true] {
+            if flush {
+                store.db.flush(true).unwrap();
+            }
+            let actual = store.get_locations_many(requested).unwrap();
+            for id in requested {
+                let expected = store.get_locations(id).unwrap();
+                let pairs = |v: &[BlockLocation]| {
+                    v.iter()
+                        .map(|x| (x.worker_id, x.storage_type))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(pairs(&actual[&id]), pairs(&expected));
+            }
+        }
+        assert!(store.get_locations_many([]).unwrap().is_empty());
+        store.delete_locations(100).unwrap();
+        let actual = store.get_locations_many(requested).unwrap();
+        for id in requested {
+            let expected = store.get_locations(id).unwrap();
+            assert_eq!(
+                actual[&id].iter().map(|x| x.worker_id).collect::<Vec<_>>(),
+                expected.iter().map(|x| x.worker_id).collect::<Vec<_>>()
+            );
+        }
+        // Corrupt a requested value: the candidate must propagate decode failure.
+        store
+            .db
+            .put_cf(
+                RocksInodeStore::CF_BLOCK,
+                RocksUtils::i64_u32_to_bytes(2, 101),
+                [0xff],
+            )
+            .unwrap();
+        assert!(store.get_locations(2).is_err());
+        assert!(store.get_locations_many([2]).is_err());
+    }
+
+    #[test]
+    fn reused_location_iterator_skips_no_trailing_tombstones() {
+        let conf = DBConf::new(Utils::test_sub_dir(format!(
+            "location-trailing-tombstones-{}",
+            Utils::rand_str(8)
+        )));
+        let store = RocksInodeStore::new(conf, true).unwrap();
+        let block_id = |inode: i64, seq: i64| (inode << 20) | seq;
+        let requested = (0..4).map(|seq| block_id(1000, seq)).collect::<Vec<_>>();
+        let mut batch = store.new_batch();
+        for id in &requested {
+            batch
+                .add_location(*id, &BlockLocation::new(100, StorageType::Disk))
+                .unwrap();
+        }
+        for seq in 0..1024 {
+            batch
+                .add_location(
+                    block_id(1001, seq),
+                    &BlockLocation::new(100, StorageType::Disk),
+                )
+                .unwrap();
+        }
+        batch
+            .add_location(
+                block_id(1002, 0),
+                &BlockLocation::new(100, StorageType::Disk),
+            )
+            .unwrap();
+        batch.commit().unwrap();
+        let mut batch = store.new_batch();
+        for seq in 0..1024 {
+            batch.delete_location(block_id(1001, seq), 100).unwrap();
+        }
+        batch.commit().unwrap();
+
+        set_perf_stats(PerfStatsLevel::EnableCount);
+        let mut perf = PerfContext::default();
+        perf.reset();
+        let actual = store.get_locations_many(requested.iter().copied()).unwrap();
+        let skipped = perf.metric(PerfMetric::InternalDeleteSkippedCount);
+        set_perf_stats(PerfStatsLevel::Disable);
+
+        assert_eq!(actual.len(), requested.len());
+        for id in &requested {
+            assert_eq!(actual[id].len(), 1);
+        }
+        assert_eq!(skipped, 0, "iterator walked past the requested blocks");
     }
 }

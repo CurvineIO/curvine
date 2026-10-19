@@ -776,8 +776,10 @@ impl MasterFilesystem {
         fs_dir: &FsDir,
         file: &InodeFile,
     ) -> FsResult<Vec<LocatedBlock>> {
-        let wm = self.worker_manager.read();
         let file_locs = fs_dir.get_file_locations(file)?;
+        // Location reads only need the caller's namespace guard. Acquire worker
+        // state afterwards so RocksDB lookups do not delay heartbeats.
+        let wm = self.worker_manager.read();
         let mut block_locs = Vec::with_capacity(file_locs.len());
 
         for (index, meta) in file.blocks.iter().enumerate() {
@@ -1776,6 +1778,117 @@ mod tests {
             .add_block_location(block_id, BlockLocation::with_id(100))
             .unwrap();
         block_id
+    }
+
+    #[test]
+    fn multiblock_open_preserves_order_and_filters_current_worker_state() {
+        for count in [0, 1, 16, 256] {
+            let fs = test_fs(&format!("multiblock-open-{count}"));
+            let worker = |id, status| {
+                let mut worker = WorkerInfo::default();
+                worker.address.worker_id = id;
+                worker.status = status;
+                worker
+            };
+            for id in [100, 200] {
+                fs.add_test_worker(worker(id, WorkerStatus::Live));
+            }
+            let path = "/multiblock";
+            fs.create_with_opts(
+                path,
+                CreateFileOptsBuilder::new()
+                    .block_size(1_048_576)
+                    .replicas(2)
+                    .build(),
+                OpenFlags::new_create(),
+            )
+            .unwrap();
+            let mut commits = Vec::new();
+            let mut previous = None;
+            for index in 0..count {
+                let located = fs
+                    .add_block(
+                        path,
+                        None,
+                        ClientAddress::default(),
+                        commits.clone(),
+                        vec![],
+                        index * 1_048_576,
+                        previous,
+                    )
+                    .unwrap();
+                previous = Some(located.block.clone());
+                commits.push(CommitBlock {
+                    block_id: located.block.id,
+                    block_len: 1_048_576,
+                    locations: vec![BlockLocation::with_id(100), BlockLocation::with_id(200)],
+                });
+            }
+            fs.complete_file(
+                path,
+                None,
+                count * 1_048_576,
+                commits.clone(),
+                "",
+                false,
+                None,
+            )
+            .unwrap();
+            let expected_ids = commits
+                .iter()
+                .map(|block| block.block_id)
+                .collect::<Vec<_>>();
+            let check = |blocks: FileBlocks, workers: &[u32]| {
+                assert_eq!(blocks.status.len, count * 1_048_576);
+                assert_eq!(
+                    blocks
+                        .block_locs
+                        .iter()
+                        .map(|block| block.block.id)
+                        .collect::<Vec<_>>(),
+                    expected_ids
+                );
+                for block in blocks.block_locs {
+                    assert_eq!(block.block.len, 1_048_576);
+                    assert_eq!(
+                        block
+                            .locs
+                            .iter()
+                            .map(|loc| loc.worker_id)
+                            .collect::<Vec<_>>(),
+                        workers
+                    );
+                }
+            };
+            check(fs.get_block_locations(path).unwrap(), &[100, 200]);
+            check(
+                fs.open_file(path, CreateFileOpts::with_create(false), OpenFlags::new(0))
+                    .unwrap(),
+                &[100, 200],
+            );
+            let details = fs.get_file_block_details(path).unwrap();
+            assert_eq!(
+                details
+                    .blocks
+                    .iter()
+                    .map(|block| block.block_id)
+                    .collect::<Vec<_>>(),
+                expected_ids
+            );
+
+            fs.add_test_worker(worker(100, WorkerStatus::Blacklist));
+            check(fs.get_block_locations(path).unwrap(), &[200]);
+            fs.add_test_worker(worker(200, WorkerStatus::Decommission));
+            if count == 0 {
+                check(fs.get_block_locations(path).unwrap(), &[]);
+            } else {
+                assert!(fs
+                    .get_block_locations(path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("all replicas has been lost"));
+            }
+        }
     }
 
     #[test]

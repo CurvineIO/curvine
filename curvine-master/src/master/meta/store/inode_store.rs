@@ -772,6 +772,11 @@ impl InodeStore {
         &self,
         file: &InodeFile,
     ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
+        if file.blocks.len() > 1 {
+            return self
+                .store
+                .get_locations_many(file.blocks.iter().map(|meta| meta.id));
+        }
         let mut res = HashMap::with_capacity(file.blocks.len());
         for meta in &file.blocks {
             let locs = self.store.get_locations(meta.id)?;
