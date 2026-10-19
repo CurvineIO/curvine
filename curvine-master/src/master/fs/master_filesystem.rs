@@ -33,6 +33,7 @@ use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
 use parking_lot::Mutex;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -987,7 +988,7 @@ impl MasterFilesystem {
             }
         }
 
-        if let InodeView::Dir(dir) = resolved {
+        if let InodeView::Dir(dir) = resolved.as_ref() {
             for child in dir.children_iter() {
                 let child_path = child_snapshot_path(path, child.name());
                 self.collect_cv_metadata_snapshot_page(
@@ -1007,14 +1008,22 @@ impl MasterFilesystem {
         Ok(())
     }
 
-    fn resolve_snapshot_inode(&self, fs_dir: &FsDir, inode: &InodeView) -> FsResult<InodeView> {
+    /// Directory children live only in the in-memory tree. Borrow that node.
+    /// `FileEntry` stores a name and id, so load the file inode for its blocks
+    /// and hard-link name. The caller holds the namespace read lock for the walk.
+    fn resolve_snapshot_inode<'a>(
+        &self,
+        fs_dir: &FsDir,
+        inode: &'a InodeView,
+    ) -> FsResult<Cow<'a, InodeView>> {
         if let InodeView::FileEntry(entry) = inode {
-            return fs_dir
+            let loaded = fs_dir
                 .store
                 .get_inode(entry.id, Some(&entry.name))?
-                .ok_or_else(|| FsError::file_not_found(entry.name.clone()));
+                .ok_or_else(|| FsError::file_not_found(entry.name.clone()))?;
+            return Ok(Cow::Owned(loaded));
         }
-        Ok(inode.clone())
+        Ok(Cow::Borrowed(inode))
     }
 
     pub fn filesystem_info(&self) -> FsResult<FilesystemInfo> {
@@ -2021,6 +2030,70 @@ mod tests {
         let sync_fs_dir = fs.fs_dir();
         let fs_dir = sync_fs_dir.read();
         assert_eq!(fs_dir.get_inode_path(status.id).unwrap(), "/dir/new.log");
+    }
+
+    #[test]
+    fn cv_metadata_snapshot_page_walks_live_children_and_loads_file_entries() {
+        let fs = test_fs("snapshot-page-borrow");
+        let source = fs.create("/a/b.txt", true).unwrap();
+        fs.create("/a/c/d.txt", true).unwrap();
+        fs.create("/z.txt", true).unwrap();
+        fs.link("/a/b.txt", "/a/b-link.txt").unwrap();
+
+        let mut token = None;
+        let mut paths = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = fs.cv_metadata_snapshot_page(token, 2).unwrap();
+            assert!(pages < 8, "snapshot pagination did not finish");
+            pages += 1;
+            assert!(page.entries.len() <= 2);
+            paths.extend(page.entries.iter().map(|entry| entry.status.path.clone()));
+            match page.next_page_token {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            paths,
+            vec![
+                "/".to_string(),
+                "/a".to_string(),
+                "/a/b-link.txt".to_string(),
+                "/a/b.txt".to_string(),
+                "/a/c".to_string(),
+                "/a/c/d.txt".to_string(),
+                "/z.txt".to_string(),
+            ]
+        );
+
+        let full = fs.cv_metadata_snapshot_page(None, 100).unwrap();
+        assert!(full.next_page_token.is_none());
+        let dir = full
+            .entries
+            .iter()
+            .find(|entry| entry.status.path == "/a")
+            .unwrap();
+        assert!(dir.status.is_dir);
+        assert!(dir.blocks.is_none());
+        assert_eq!(dir.status.children_num, 3);
+
+        let link = full
+            .entries
+            .iter()
+            .find(|entry| entry.status.path == "/a/b-link.txt")
+            .unwrap();
+        let file = full
+            .entries
+            .iter()
+            .find(|entry| entry.status.path == "/a/b.txt")
+            .unwrap();
+        assert_eq!(link.status.name, "b-link.txt");
+        assert_eq!(link.status.id, source.id);
+        assert_eq!(file.status.id, source.id);
+        assert!(link.blocks.is_some());
+        assert!(file.blocks.is_some());
     }
 
     #[test]
