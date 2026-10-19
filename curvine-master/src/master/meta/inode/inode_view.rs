@@ -754,7 +754,6 @@ mod tests {
         assert!(!inode.is_expired().unwrap());
     }
 
-
     #[test]
     fn metadata_clone_preserves_persisted_fields_without_copying_children() {
         let mut inode = InodeView::new_dir("parent".into(), InodeDir::new(7001, 42));

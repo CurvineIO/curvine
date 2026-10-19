@@ -3732,7 +3732,6 @@ fn content_summary_dir_space_failed_rescan_keeps_prior_generation() -> CommonRes
     Ok(())
 }
 
-
 fn full_report_batch(report_id: u64, total_len: u64, block_id: i64) -> BlockReportList {
     BlockReportList {
         report_id,
