@@ -234,6 +234,40 @@ fn empty_member_recovers_logs_or_snapshot_without_leader_change_or_new_write() {
 }
 
 #[test]
+fn wiped_member_rejoins_without_active_recovery_recovering_snapshot_or_logs() {
+    for compact in [false, true] {
+        let mut cluster = Cluster::new();
+        for _ in 0..5 {
+            cluster.write();
+        }
+        let committed = cluster.peers[0].raw.raft.raft_log.committed;
+        let term = cluster.peers[0].raw.raft.term;
+        assert_eq!(
+            cluster.peers[0].raw.raft.prs().get(3).unwrap().matched,
+            committed
+        );
+        if compact {
+            cluster.peers[0]
+                .raw
+                .mut_store()
+                .wl()
+                .compact(committed)
+                .unwrap();
+        }
+        // Wiped peer rejoins with original Raft ID 3, new session 301, but recovery is NOT active.
+        cluster.peers[2] = Peer::new(3, false, 301);
+        cluster.peers[0].raw.ping();
+        cluster.drain();
+        assert_eq!(cluster.peers[0].raw.raft.term, term);
+        assert_eq!(cluster.peers[0].raw.raft.state, StateRole::Leader);
+        assert_eq!(cluster.peers[2].applied, committed);
+        assert_eq!(cluster.peers[2].raw.raft.raft_log.committed, committed);
+        assert_eq!(cluster.peers[2].raw.raft.raft_log.last_index(), committed);
+        assert_eq!(cluster.snapshots > 0, compact);
+    }
+}
+
+#[test]
 fn recovery_retries_a_temporarily_unavailable_snapshot() {
     let mut cluster = Cluster::new();
     cluster.write();

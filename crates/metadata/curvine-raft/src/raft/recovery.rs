@@ -265,14 +265,23 @@ impl Recovery {
         }
         // Do not reinterpret a stale heartbeat, nor globally weaken commit_to.
         if kind == MessageType::MsgHeartbeat && term >= raw.raft.term {
+            // A heartbeat carrying an obsolete receiver session represents an early
+            // rejoin/restart handshake before the leader has learned this incarnation.
+            // Its commit index reflects stale replication progress from the prior
+            // incarnation and must not advance commits or panic unrecovered tail.
+            let obsolete_receiver = request
+                .receiver_session
+                .is_some_and(|expected| expected != session);
             let past_tail = request.message.commit > raw.raft.raft_log.last_index();
-            if past_tail && !self.active {
+            if past_tail && !self.active && !obsolete_receiver {
                 return Err(RaftError::other("leader heartbeat exceeds local log tail; possible lost persistent state; use journal.recover_from_peers for an isolated member rebuild".into()));
             }
             // Before the leader has learned this incarnation, even an in-range
             // commit can refer to its obsolete matched index. A partially
             // recovered suffix must be verified by a fenced probe first.
-            if self.active && (past_tail || request.receiver_session != Some(session)) {
+            if obsolete_receiver
+                || (self.active && (past_tail || request.receiver_session != Some(session)))
+            {
                 request.message.commit = request.message.commit.min(raw.raft.raft_log.committed);
             }
         }

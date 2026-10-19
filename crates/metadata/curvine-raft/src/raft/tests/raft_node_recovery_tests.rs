@@ -21,6 +21,8 @@ use std::time::Instant;
 
 fn test_node(rt: Arc<Runtime>) -> RaftNode<MemLogStorage, HashAppStorage<String, String>> {
     let mut conf = JournalConf::with_test();
+    conf.rpc_retry_max_duration_ms = 0;
+    conf.conn_retry_max_duration_ms = 0;
     let ports = [
         conf.rpc_port,
         NetUtils::get_available_port(),
@@ -355,4 +357,107 @@ fn follower_snapshot_is_throttled_by_min_interval() {
     );
     assert_eq!(node.last_snapshot_op_id, 4);
     wait_for_snapshot_job(&node);
+}
+
+#[test]
+fn wiped_follower_early_rejoin_handshake_clamps_obsolete_commit_without_panic() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone());
+    assert_eq!(node.raw.raft.raft_log.last_index(), 0);
+    assert_eq!(node.raw.raft.raft_log.committed, 0);
+    assert!(!node.recovery.active);
+    assert_eq!(node.session, 101);
+
+    let leader_id = 2;
+    let leader_term = 5;
+    let high_commit = 105311900;
+    let old_receiver_session = 99;
+
+    let mut message = raft::eraftpb::Message {
+        from: leader_id,
+        to: node.id(),
+        term: leader_term,
+        commit: high_commit,
+        ..Default::default()
+    };
+    message.set_msg_type(MessageType::MsgHeartbeat);
+    let request = RaftRequest {
+        message,
+        sender_session: Some(201),
+        receiver_session: Some(old_receiver_session),
+        leader_commit: Some(high_commit),
+    };
+
+    let mut promise = HashMap::new();
+    let (raft_tx, raft_rx) = tokio::sync::oneshot::channel();
+    let raft_message = Builder::new_rpc(RaftCode::Raft)
+        .proto_header(request)
+        .build();
+
+    node.handle_available(Envelope::new(raft_message, raft_tx), &mut promise)
+        .unwrap();
+    let response = rt.block_on(raft_rx).unwrap().unwrap();
+
+    // The early handshake must not fail or panic.
+    assert_eq!(response.response_status(), ResponseStatus::Success);
+
+    let raft_response: RaftResponse = response.parse_header().unwrap();
+    assert_eq!(raft_response.session, Some(101));
+    assert_eq!(raft_response.term, Some(leader_term));
+    assert_eq!(raft_response.recovering, Some(false));
+
+    // Follower must not commit beyond its available local log.
+    assert_eq!(node.raw.raft.raft_log.committed, 0);
+    assert_eq!(node.raw.raft.raft_log.last_index(), 0);
+    assert_eq!(node.raw.raft.leader_id, leader_id);
+
+    // When the leader observes this response, verify that:
+    // 1. Leader learns the new session.
+    // 2. Leader treats the node as a replacement and resets replication progress.
+    // 3. Leader does not trust stale progress and initiates probe/snapshot catch-up.
+    let mut leader = test_node(rt.clone());
+    leader.raw.raft.become_candidate();
+    leader.raw.raft.become_leader();
+    leader.raw.raft.term = leader_term;
+    assert!(leader.peer_sessions.begin(node.id(), leader_term, 1));
+    leader.peer_sessions.observe(
+        &mut leader.raw,
+        SessionEvent {
+            peer: node.id(),
+            term: leader_term,
+            heartbeat: 1,
+            response: Some(RaftResponse {
+                session: Some(old_receiver_session),
+                term: Some(leader_term),
+                recovering: Some(false),
+            }),
+        },
+    );
+    assert_eq!(
+        leader.peer_sessions.get(node.id()),
+        Some(old_receiver_session)
+    );
+    {
+        let pr = leader.raw.raft.mut_prs().get_mut(node.id()).unwrap();
+        pr.matched = high_commit;
+        pr.committed_index = high_commit;
+        pr.recent_active = true;
+    }
+
+    assert!(leader.peer_sessions.begin(node.id(), leader_term, 2));
+    leader.peer_sessions.observe(
+        &mut leader.raw,
+        SessionEvent {
+            peer: node.id(),
+            term: leader_term,
+            heartbeat: 2,
+            response: Some(raft_response),
+        },
+    );
+    assert_eq!(leader.peer_sessions.get(node.id()), Some(101));
+    let pr = leader.raw.raft.prs().get(node.id()).unwrap();
+    assert_eq!(pr.matched, 0);
+    assert_eq!(pr.committed_index, 0);
+    assert!(!pr.recent_active);
+    assert!(leader.raw.raft.msgs.iter().any(|m| m.to == node.id()));
 }
