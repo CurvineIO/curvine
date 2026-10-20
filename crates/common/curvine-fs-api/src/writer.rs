@@ -102,6 +102,20 @@ pub trait Writer {
 
     fn flush(&mut self) -> impl Future<Output = FsResult<()>>;
 
+    /// Keeps an idle network write connection alive between chunks.
+    ///
+    /// A streaming writer spends most of its wall time waiting for the next
+    /// chunk, and a data connection with no timer of its own looks dead to a peer
+    /// that reaps idle connections. Callers that block on their source for a
+    /// while should poke this before reading; implementations that hold no such
+    /// connection keep the no-op default.
+    ///
+    /// Implementations must make this cheap when nothing is due: it may be called
+    /// on every chunk boundary.
+    fn keepalive(&mut self) -> impl Future<Output = FsResult<()>> {
+        async move { Ok(()) }
+    }
+
     fn complete(&mut self) -> impl Future<Output = FsResult<()>>;
 
     /// Completes the write operation and optionally applies file attributes.

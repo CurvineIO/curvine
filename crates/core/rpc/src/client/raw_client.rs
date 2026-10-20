@@ -47,6 +47,17 @@ impl RawClient {
         Ok(client)
     }
 
+    /// Arms the idle heartbeat on this raw connection.
+    ///
+    /// Only a raw connection that keeps its frame intact can heartbeat: the frame
+    /// is exclusively owned, so the caller decides when the send side is idle.
+    /// A `BufferClient` splits this frame and runs its own heartbeat loop, so it
+    /// must never arm this one as well.
+    pub fn with_heartbeat_period(mut self, period: Option<Duration>) -> Self {
+        self.frame = self.frame.with_heartbeat(period);
+        self
+    }
+
     pub async fn conn(addr: &InetAddr, conf: &ClientConf) -> IOResult<TcpStream> {
         let timeout = Duration::from_millis(conf.conn_timeout_ms);
         let stream = time::timeout(timeout, TcpStream::connect(addr.as_pair())).await??;

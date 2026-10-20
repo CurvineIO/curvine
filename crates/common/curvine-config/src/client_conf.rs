@@ -165,6 +165,13 @@ pub struct ClientConf {
     pub rpc_timeout_ms: u64,
     #[client_cli]
     pub data_timeout_ms: u64,
+    /// Maximum send-side silence on a raw data connection before the client
+    /// emits a heartbeat. `0` disables it (default). Set it to roughly half the
+    /// worker's `worker.io_timeout` so an idle-but-healthy write connection is
+    /// refreshed twice per peer window; this is what lets the worker safely reap
+    /// truly dead connections instead of keeping them forever.
+    #[client_cli]
+    pub rpc_heartbeat_interval_ms: u64,
     pub pipeline_timeout_ms: u64,
 
     // Pool size 3 reaches the highest QPS. Pool size 1 keeps one connection per master
@@ -372,6 +379,7 @@ impl ClientConf {
             conn_timeout_ms: conf.conn_timeout_ms,
             rpc_timeout_ms: conf.rpc_timeout_ms,
             data_timeout_ms: conf.data_timeout_ms,
+            heartbeat_interval_ms: conf.rpc_heartbeat_interval_ms,
 
             conn_size: conf.master_conn_pool_size,
 
@@ -440,6 +448,7 @@ impl Default for ClientConf {
             conn_timeout_ms: 30 * 1000,
             rpc_timeout_ms: 120 * 1000,
             data_timeout_ms: 120 * 1000,
+            rpc_heartbeat_interval_ms: 0,
             pipeline_timeout_ms: 120 * 1000,
             master_conn_pool_size: 1,
 

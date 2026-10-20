@@ -135,6 +135,28 @@ impl BlockClient {
         }
     }
 
+    /// Keeps an idle write connection alive between chunks.
+    ///
+    /// The owner of a write connection spends most of its wall time reading the
+    /// source, not writing, so the peer sees long silences on a perfectly healthy
+    /// connection. A raw data connection has no timer of its own, hence the owner
+    /// calls this wherever it naturally waits. It is a no-op until the configured
+    /// idle period elapses, so it is safe to call on every turn.
+    ///
+    /// A send failure means the connection is gone; it is marked closed so the
+    /// pool discards it and the caller's next operation reconnects instead of
+    /// writing into a half-open socket.
+    pub async fn heartbeat_if_idle(&self) -> FsResult<()> {
+        let Some(client) = self.client.as_ref() else {
+            return Ok(());
+        };
+        if let Err(err) = client.heartbeat_if_idle().await {
+            client.set_closed();
+            return Err(FsError::from(err));
+        }
+        Ok(())
+    }
+
     pub async fn write_block(
         &self,
         blk: &ExtendedBlock,
