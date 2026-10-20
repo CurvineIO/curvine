@@ -213,8 +213,14 @@ bin/dfs fs -ls /
 
 访问 Web 界面：
 
+单机模式请打开 Master Web 作为集群控制台（默认端口 9001；9000 已不再使用）：
+
 ```
-http://your-hostname:9000
+# Master Web（集群控制台）
+http://your-hostname:9001
+
+# Worker Web（本机 metrics）
+http://your-hostname:9002
 ```
 
 Curvine 使用 TOML 格式的配置文件。示例配置位于 conf/curvine-cluster.toml，主要配置项包括：

@@ -72,6 +72,16 @@ Curvine is a high-performance distributed cache file system built in Rust. It la
 - **Raft Consensus**: Master metadata is replicated via Raft for consistency and high availability.
 - **Observability**: Built-in metrics system and Web UI for per-component performance monitoring.
 
+Access the Web UI after a local cluster is up:
+
+```
+# Master Web (cluster console)
+http://your-hostname:9001
+
+# Worker Web (local metrics)
+http://your-hostname:9002
+```
+
 ## 📈 Use Cases
 
 ![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.png)
