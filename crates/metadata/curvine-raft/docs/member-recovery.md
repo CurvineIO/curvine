@@ -78,8 +78,9 @@ recover_from_peers = 3
    marker 会记录原目标 ID；同一节点重启时若发现配置指向另一个 ID，会直接拒绝启动。
    系统不会跨节点读取其他成员的本地 marker，因此“只恢复一个成员”依赖运维串行执行。
 6. **只启动目标成员**：保持原 `raft_id`、hostname、RPC 地址和卷映射不变。严禁旧实例
-   同时复活。恢复期间 startup/liveness 应探测 Raft 端口 8996，readiness 探测 Master
-   RPC 端口 8995；8996 可用而 8995 未就绪表示进程仍在恢复，不应被 liveness 杀死。
+   同时复活。恢复期间 startup/liveness 应探测 Raft 端口 8996，readiness 使用
+   HTTP /rolloutz。角色尚未发布，或 leader 的 UFS 尚未追平时，/rolloutz 保持未就绪。
+   8996 可连而 /rolloutz 未就绪表示进程仍在恢复，不应被 liveness 杀死。
 7. **验证恢复**：确认出现会话握手、Append 或 Snapshot 下载/安装；不得再出现
    `to_commit ... out of range`。确认 marker 存在于恢复过程中，并在日志出现
    `member recovery completed` 后由程序删除。

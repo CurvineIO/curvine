@@ -41,6 +41,7 @@ message JournalEntryProto {
         UfsAppliedEntryProto ufs_applied = 16;
         SnapshotEntryProto snapshot = 17;
         CacheInvalidationEntryProto cache_invalidation = 18;
+        UfsDeferredEntryProto ufs_deferred = 19;
     }
 }
 
@@ -176,6 +177,16 @@ message UfsAppliedEntryProto {
     required int64 rpc_id = 2;
     required uint64 term = 3;
     required uint64 index = 4;
+}
+
+message UfsDeferredEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required uint64 term = 3;
+    required uint64 index = 4;
+    required string error = 5;
+    // JournalBatchProto of the UFS ops copied out of the raft log.
+    required bytes payload = 6;
 }
 
 message SnapshotEntryProto {

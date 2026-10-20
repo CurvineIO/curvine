@@ -10,6 +10,11 @@ spec:
     matchLabels:
       role: cv-worker
   replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   template:
     metadata:
       labels:
@@ -42,23 +47,22 @@ spec:
           image: docker.io/curvine:latest
           imagePullPolicy: IfNotPresent
           readinessProbe:
-            tcpSocket:
-              port: 8997
-            initialDelaySeconds: 10
+            httpGet:
+              path: /readyz
+              port: 9000
             periodSeconds: 10
-            timeoutSeconds: 1
+            timeoutSeconds: 2
             failureThreshold: 3
-            successThreshold: 1
           livenessProbe:
-            tcpSocket:
-              port: 8997
-            initialDelaySeconds: 15
-            periodSeconds: 300
-            timeoutSeconds: 60
-            failureThreshold: 5
+            httpGet:
+              path: /healthz
+              port: 9000
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
           ports:
           - containerPort: 8997
-          - containerPort: 9001
+          - containerPort: 9000
           args:
             - worker
           env:

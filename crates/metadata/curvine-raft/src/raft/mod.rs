@@ -63,6 +63,9 @@ pub const DEFAULT_LEADER_ID: u64 = 0;
 pub const LOG_START_INDEX: u64 = 0;
 
 impl FsmState {
+    /// Compact only through the prefix both metadata apply and UFS replay have
+    /// passed. A failed UFS op stays in the log until it has been copied into
+    /// the metadata store; the cursor then moves without reporting catch-up.
     pub fn compact(&self) -> u64 {
         let applied = if self.applied.index <= self.ufs_applied.index {
             &self.applied

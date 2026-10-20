@@ -177,6 +177,19 @@ pub struct UfsAppliedEntry {
     pub(crate) index: u64,
 }
 
+/// A UFS side effect copied out of the raft log after a permanent failure.
+/// `index` is the original log entry. `payload` is the serialized UFS ops.
+/// Applying this entry does not mean the side effect succeeded.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct UfsDeferredEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) term: u64,
+    pub(crate) index: u64,
+    pub(crate) error: String,
+    pub(crate) payload: Vec<u8>,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct SnapshotEntry {
     pub(crate) op_id: u64,
@@ -207,6 +220,7 @@ pub enum JournalEntry {
     // Protobuf field numbers live in journal.proto: append new variants there
     // with a fresh field number and keep them last in this enum.
     CacheInvalidation(CacheInvalidationEntry),
+    UfsDeferred(UfsDeferredEntry),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -304,6 +318,7 @@ impl JournalEntry {
             JournalEntry::CacheInvalidation(e) => e.op_id,
             JournalEntry::UfsApplied(e) => e.op_id,
             JournalEntry::Snapshot(e) => e.op_id,
+            JournalEntry::UfsDeferred(e) => e.op_id,
         }
     }
 
@@ -327,7 +342,27 @@ impl JournalEntry {
             JournalEntry::CacheInvalidation(e) => e.rpc_id,
             JournalEntry::UfsApplied(e) => e.rpc_id,
             JournalEntry::Snapshot(e) => e.rpc_id,
+            JournalEntry::UfsDeferred(e) => e.rpc_id,
         }
+    }
+
+    /// UFS mkdir/export/rename/delete. Metadata-only entries are not included.
+    pub fn affects_ufs(&self) -> bool {
+        matches!(
+            self,
+            JournalEntry::Mkdir(_)
+                | JournalEntry::CompleteFile(_)
+                | JournalEntry::Rename(_)
+                | JournalEntry::Delete(_)
+        )
+    }
+
+    /// Export-style side effects that select a worker. Mkdir talks to UFS directly.
+    pub fn needs_worker_for_ufs(&self) -> bool {
+        matches!(
+            self,
+            JournalEntry::CompleteFile(_) | JournalEntry::Rename(_) | JournalEntry::Delete(_)
+        )
     }
 
     pub fn inode_id(&self) -> Option<i64> {
@@ -501,6 +536,15 @@ impl JournalEntry {
                     inodes: MetadataCodec::encode(&e.inodes)?,
                 })
             }
+
+            JournalEntry::UfsDeferred(e) => PbEntry::UfsDeferred(UfsDeferredEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                term: e.term,
+                index: e.index,
+                error: e.error,
+                payload: e.payload,
+            }),
         };
 
         Ok(JournalEntryProto { entry: Some(entry) })
@@ -659,6 +703,15 @@ impl JournalEntry {
                     inodes: MetadataCodec::decode(&e.inodes)?,
                 })
             }
+
+            PbEntry::UfsDeferred(e) => JournalEntry::UfsDeferred(UfsDeferredEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                term: e.term,
+                index: e.index,
+                error: e.error,
+                payload: e.payload,
+            }),
         })
     }
 }

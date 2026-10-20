@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::master::journal::RecoveryGate;
 use curvine_raft::raft::RoleState;
 use curvine_runtime::sync::StateCtl;
 use num_enum::{FromPrimitive, IntoPrimitive};
@@ -37,6 +38,7 @@ pub enum MasterState {
 pub struct MasterMonitor {
     pub(crate) journal_ctl: StateCtl,
     pub fs_ctl: StateCtl,
+    recovery: RecoveryGate,
 }
 
 impl MasterMonitor {
@@ -44,7 +46,24 @@ impl MasterMonitor {
         Self {
             journal_ctl,
             fs_ctl,
+            recovery: RecoveryGate::new(),
         }
+    }
+
+    pub(crate) fn recovery(&self) -> RecoveryGate {
+        self.recovery.clone()
+    }
+
+    pub fn is_safe_mode(&self) -> bool {
+        self.recovery.is_safe_mode()
+    }
+
+    pub fn ufs_caught_up(&self) -> bool {
+        self.recovery.ufs_caught_up()
+    }
+
+    pub fn ufs_pending(&self) -> u64 {
+        self.recovery.pending()
     }
 
     // Determine whether the current node is an active node.

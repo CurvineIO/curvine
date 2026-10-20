@@ -27,6 +27,8 @@ use curvine_runtime::common::{ByteUnit, LocalTime};
 use log::{info, warn};
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 pub struct WorkerManager {
     pub(crate) worker_map: WorkerMap,
@@ -34,6 +36,7 @@ pub struct WorkerManager {
     pub(crate) worker_policy: WorkerPolicyAdapter,
     pub(crate) cluster_id: String,
     pub(crate) conf: ClusterConf,
+    worker_registered: Arc<Notify>,
 }
 
 impl WorkerManager {
@@ -46,7 +49,20 @@ impl WorkerManager {
             worker_policy,
             cluster_id: conf.cluster_id.to_string(),
             conf: conf.clone(),
+            worker_registered: Arc::new(Notify::new()),
         })
+    }
+
+    pub fn registered_notify(&self) -> Arc<Notify> {
+        self.worker_registered.clone()
+    }
+
+    pub fn live_worker_count(&self) -> usize {
+        self.worker_map
+            .workers()
+            .values()
+            .filter(|worker| worker.is_live())
+            .count()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -64,6 +80,7 @@ impl WorkerManager {
         startup_time_ms: u64,
         storages: Vec<StorageInfo>,
         component_info: Option<ComponentInfoProto>,
+        presence_only: bool,
     ) -> FsResult<(Vec<WorkerCommand>, bool)> {
         // The cluster id must match to prevent misregistration.
         if cluster_id != self.cluster_id {
@@ -117,6 +134,7 @@ impl WorkerManager {
                 return Ok((vec![], true));
             }
 
+<<<<<<< HEAD
             HeartbeatStatus::Running => {
                 let current_session_mismatch = self
                     .worker_map
@@ -140,6 +158,11 @@ impl WorkerManager {
                 }
                 self.block_map.handle_heartbeat(addr.worker_id)
             }
+=======
+            HeartbeatStatus::Running if presence_only => Vec::new(),
+
+            HeartbeatStatus::Running => self.block_map.handle_heartbeat(addr.worker_id),
+>>>>>>> 49ca7acd (fix(master): keep the control plane up across master recovery)
 
             HeartbeatStatus::End => {
                 info!("Worker unregister: {}", addr);
@@ -179,6 +202,7 @@ impl WorkerManager {
             storages,
             component_info,
         )?;
+        self.worker_registered.notify_one();
         self.expire_scheduled_bytes();
         Ok((cmds, false))
     }
@@ -479,6 +503,53 @@ mod tests {
     }
 
     #[test]
+    fn running_heartbeat_is_live_and_start_is_not() {
+        let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
+        let cluster_id = manager.cluster_id.clone();
+        let addr = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                String::new(),
+                TransferWorkerCapabilities::default(),
+                0,
+                0,
+                String::new(),
+                0,
+                vec![],
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(manager.live_worker_count(), 0);
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                String::new(),
+                TransferWorkerCapabilities::default(),
+                0,
+                0,
+                String::new(),
+                0,
+                vec![],
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(manager.live_worker_count(), 1);
+    }
+
+    #[test]
     fn available_bytes_clamps_negative_values_and_saturates() {
         let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
         manager.add_test_worker(worker_with_available(1, -10));
@@ -636,6 +707,7 @@ mod tests {
                 0,
                 vec![storage(available, available)],
                 None,
+                false,
             )
             .unwrap();
 
@@ -680,6 +752,7 @@ mod tests {
                 0,
                 vec![storage(available, remaining)],
                 None,
+                false,
             )
             .unwrap();
 
@@ -741,6 +814,7 @@ mod tests {
                 0,
                 vec![storage(available, available)],
                 None,
+                false,
             )
             .unwrap();
 

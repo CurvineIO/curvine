@@ -134,6 +134,9 @@ pub struct MasterMetrics {
     pub(crate) journal_term: Gauge,
     pub(crate) journal_applied: Gauge,
     pub(crate) journal_ufs_applied: Gauge,
+    pub(crate) ufs_replay_pending: Gauge,
+    pub(crate) master_safe_mode: Gauge,
+    pub(crate) master_ufs_caught_up: Gauge,
 
     pub(crate) rocksdb_metrics: GaugeVec,
 
@@ -276,6 +279,18 @@ impl MasterMetrics {
             journal_ufs_applied: m::new_gauge(
                 "journal_ufs_applied",
                 "Last UFS-applied index of the journal state machine",
+            )?,
+            ufs_replay_pending: m::new_gauge(
+                "ufs_replay_pending",
+                "Journal entries whose UFS side effect is not finished",
+            )?,
+            master_safe_mode: m::new_gauge(
+                "master_safe_mode",
+                "1 when the master has stopped metadata service after unrecoverable damage",
+            )?,
+            master_ufs_caught_up: m::new_gauge(
+                "master_ufs_caught_up",
+                "1 when the leader UFS watermark has reached the metadata watermark",
             )?,
 
             rocksdb_metrics: m::new_gauge_vec("rocksdb_metrics", "RocksDB metrics", &["tag"])?,
@@ -489,6 +504,12 @@ impl MasterMetrics {
         self.allocatable_available
             .set(filesystem_info.allocatable_available);
         Self::refresh_scheduled_bytes(&self.scheduled_bytes, &filesystem_info.live_workers);
+        self.ufs_replay_pending
+            .set(fs.master_monitor.ufs_pending() as i64);
+        self.master_safe_mode
+            .set(i64::from(fs.master_monitor.is_safe_mode()));
+        self.master_ufs_caught_up
+            .set(i64::from(fs.master_monitor.ufs_caught_up()));
 
         if filesystem_info.block_num > 0 {
             let avg_size = filesystem_info.fs_used / filesystem_info.block_num;

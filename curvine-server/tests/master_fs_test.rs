@@ -29,8 +29,9 @@ use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
     CreateFileRequest, DeleteRequest, GetContentSummaryRequest, GetContentSummaryResponse,
-    GetFilesystemInfoRequest, GetFilesystemInfoResponse, MkdirOptsProto, MkdirRequest,
-    RenameRequest,
+    GetFilesystemInfoRequest, GetFilesystemInfoResponse, HeartbeatStatusProto, MkdirOptsProto,
+    MkdirRequest, RenameRequest, WorkerAddressProto, WorkerHeartbeatRequest,
+    WorkerHeartbeatResponse,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -3801,5 +3802,78 @@ fn reset_full_block_report_forgets_completed_round() -> CommonResult<()> {
     assert_eq!(fs.full_report_completed_round(0), None);
     let res = fs.block_report(full_report_batch(5, 1, block_id), None)?;
     assert_eq!(res.delete_blocks, vec![block_id]);
+    Ok(())
+}
+
+#[test]
+fn standby_records_running_heartbeat_and_rejects_metadata_writes() -> CommonResult<()> {
+    let _guard = master_fs_test_serial();
+    let (handler, fs, _) = new_handler_for_test_with_dir_space("standby-heartbeat", false);
+    fs.master_monitor
+        .set_journal_role_for_test(RoleState::Follower);
+
+    let mkdir = Builder::new_rpc(RpcCode::Mkdir).build();
+    let mkdir_error = handler
+        .handle(&mkdir)?
+        .check_error_ext::<FsError>()
+        .expect_err("standby mkdir");
+    assert!(
+        matches!(mkdir_error, FsError::NotLeaderMaster(_)),
+        "metadata write on standby must be NotLeader, got {mkdir_error}"
+    );
+
+    let add_block = Builder::new_rpc(RpcCode::AddBlock).build();
+    let block_error = handler
+        .handle(&add_block)?
+        .check_error_ext::<FsError>()
+        .expect_err("standby add block");
+    assert!(matches!(block_error, FsError::NotLeaderMaster(_)));
+
+    let report = Builder::new_rpc(RpcCode::WorkerBlockReport).build();
+    let report_error = handler
+        .handle(&report)?
+        .check_error_ext::<FsError>()
+        .expect_err("standby block report");
+    assert!(matches!(report_error, FsError::NotLeaderMaster(_)));
+
+    let before = fs.filesystem_info()?.live_workers.len();
+    let heartbeat = Builder::new_rpc(RpcCode::WorkerHeartbeat)
+        .proto_header(WorkerHeartbeatRequest {
+            cluster_id: "curvine".to_string(),
+            worker_id: 42,
+            fs_ctime: 1,
+            address: WorkerAddressProto {
+                worker_id: 42,
+                hostname: "standby-worker".to_string(),
+                ip_addr: "127.0.0.1".to_string(),
+                rpc_port: 8997,
+                web_port: 9000,
+            },
+            failed_dirs: 0,
+            status: HeartbeatStatusProto::Running as i32,
+            software_version: String::new(),
+            storages: vec![],
+            blocks: vec![],
+            weight: Some(1),
+            worker_session_id: Some(String::new()),
+            ..Default::default()
+        })
+        .build();
+    let response = handler.handle(&heartbeat)?;
+    let header: WorkerHeartbeatResponse = response.parse_header()?;
+    assert!(
+        header.cmds.is_empty(),
+        "standby heartbeat must not emit block commands"
+    );
+    assert_eq!(fs.filesystem_info()?.live_workers.len(), before + 1);
+
+    fs.master_monitor
+        .set_journal_role_for_test(RoleState::Leader);
+    let live = fs.filesystem_info()?.live_workers;
+    assert_eq!(live.len(), before + 1);
+    assert!(
+        live.iter().any(|worker| worker.worker_id() == 42),
+        "promotion keeps the standby registration without a new Start"
+    );
     Ok(())
 }

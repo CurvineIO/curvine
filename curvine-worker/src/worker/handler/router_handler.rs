@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::worker::block::MasterRegistration;
 use crate::worker::task::TaskManager;
 use crate::worker::Worker;
 use axum::extract::{Extension, Query};
@@ -37,6 +38,7 @@ pub struct WorkerRouterHandler {
     #[allow(dead_code)] // used by integration tests and registry wiring
     pub(crate) task_manager: Arc<TaskManager>,
     pub(crate) runtime_config: Arc<RuntimeConfigRegistry>,
+    pub(crate) registration: MasterRegistration,
 }
 
 fn worker_config_extra() -> Value {
@@ -55,6 +57,24 @@ async fn healthz(server_state: Arc<OnceCell<StateCtl>>) -> (StatusCode, &'static
         (StatusCode::OK, "ok\n")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "worker is not running\n")
+    }
+}
+
+async fn readyz(
+    server_state: Arc<OnceCell<StateCtl>>,
+    registration: MasterRegistration,
+) -> (StatusCode, &'static str) {
+    worker_ready(is_serving(&server_state), registration.ready())
+}
+
+fn worker_ready(serving: bool, registered: bool) -> (StatusCode, &'static str) {
+    if serving && registered {
+        (StatusCode::OK, "ok\n")
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker is not registered\n",
+        )
     }
 }
 
@@ -85,10 +105,16 @@ async fn update_runtime_config(
 impl RouterHandler for WorkerRouterHandler {
     fn router(&self) -> Router {
         let server_state = self.server_state.clone();
+        let ready_state = self.server_state.clone();
+        let registration = self.registration.clone();
         let instance = Arc::new(self.clone());
         let router = Router::new()
             .route("/metrics", get(metrics))
             .route("/healthz", get(move || healthz(server_state.clone())))
+            .route(
+                "/readyz",
+                get(move || readyz(ready_state.clone(), registration.clone())),
+            )
             .route("/api/v1/worker/config", get(runtime_config))
             .route("/api/update_config", post(update_runtime_config))
             .layer(Extension(instance));
@@ -117,9 +143,19 @@ mod tests {
 
         ctl.set_state(ServerState::Shutdown);
         assert!(!is_serving(&cell));
+    }
 
-        ctl.set_state(ServerState::Stop);
-        assert!(!is_serving(&cell));
+    #[test]
+    fn readyz_requires_start_and_running_heartbeat() {
+        assert_eq!(
+            worker_ready(true, false).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            worker_ready(false, true).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(worker_ready(true, true).0, StatusCode::OK);
     }
 
     #[test]

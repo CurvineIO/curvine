@@ -14,13 +14,14 @@
 
 #![allow(clippy::result_large_err)]
 
+use crate::master::journal::recovery::RecoveryGate;
 use crate::master::journal::*;
 use crate::master::meta::inode::{InodeDir, InodeFile, InodePath};
 use crate::master::meta::FsDir;
 use crate::master::{Master, MasterMetrics};
 use curvine_config::JournalConf;
 use curvine_core_error::err_box;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_model::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
 use curvine_raft::conf::JournalConfExt;
 use curvine_raft::raft::RaftClient;
@@ -34,6 +35,7 @@ use std::sync::Mutex;
 pub struct JournalWriter {
     enable: bool,
     node_id: u64,
+    recovery: RecoveryGate,
     sender: BlockingSender<JournalEntry>,
     metrics: &'static MasterMetrics,
     receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
@@ -46,14 +48,19 @@ pub struct JournalWriter {
 }
 
 impl JournalWriter {
-    pub fn new(testing: bool, client: RaftClient, conf: &JournalConf) -> FsResult<Self> {
+    pub(crate) fn new(
+        testing: bool,
+        client: RaftClient,
+        conf: &JournalConf,
+        recovery: RecoveryGate,
+    ) -> FsResult<Self> {
         let node_id = conf.node_id()?;
         let metrics = Master::get_metrics()?;
         let (sender, receiver) = BlockingChannel::new(conf.writer_channel_size).split();
 
         let receiver = if !testing {
             // Start the send log thread.
-            let task = SenderTask::new(client, conf, 0)?;
+            let task = SenderTask::new(client, conf, 0, recovery.clone())?;
             task.spawn(receiver)?;
             None
         } else {
@@ -63,6 +70,7 @@ impl JournalWriter {
         Ok(Self {
             enable: conf.enable,
             node_id,
+            recovery,
             sender,
             metrics,
             receiver,
@@ -75,6 +83,12 @@ impl JournalWriter {
     }
 
     fn send_inner(&self, entry: JournalEntry) -> FsResult<()> {
+        if self.recovery.rejects_writes() {
+            return Err(FsError::journal_unavailable(
+                "journal writer is not accepting writes",
+            )
+            .into());
+        }
         debug!("send_entry {:?}", entry);
         self.sender.send(entry)?;
         self.metrics.journal_queue_len.inc();
@@ -364,6 +378,12 @@ impl JournalWriter {
         if !self.enable {
             return Ok(());
         }
+        if self.recovery.rejects_writes() {
+            return Err(FsError::journal_unavailable(
+                "journal writer is not accepting writes",
+            )
+            .into());
+        }
 
         let entry = UfsAppliedEntry {
             op_id,
@@ -374,6 +394,21 @@ impl JournalWriter {
         self.metrics.journal_queue_len.inc();
         self.sender.send(JournalEntry::UfsApplied(entry))?;
 
+        Ok(())
+    }
+
+    pub fn log_ufs_deferred(&self, entry: UfsDeferredEntry) -> FsResult<()> {
+        if !self.enable {
+            return Ok(());
+        }
+        if self.recovery.rejects_writes() {
+            return Err(FsError::journal_unavailable(
+                "journal writer is not accepting writes",
+            )
+            .into());
+        }
+        self.metrics.journal_queue_len.inc();
+        self.sender.send(JournalEntry::UfsDeferred(entry))?;
         Ok(())
     }
 
@@ -441,7 +476,7 @@ mod tests {
 
         let rt = conf.journal.create_runtime();
         let client = RaftClient::from_conf(rt, &conf.journal);
-        JournalWriter::new(true, client, &conf.journal)
+        JournalWriter::new(true, client, &conf.journal, super::RecoveryGate::new())
     }
 
     fn build_fs_dir(conf: &ClusterConf, writer: Arc<JournalWriter>) -> FsResult<FsDir> {
@@ -661,6 +696,21 @@ mod tests {
         writer.maybe_emit_snapshot(&fs_dir)?;
         assert_eq!(checkpoint_dirs(&conf).len(), 2);
 
+        Ok(())
+    }
+
+    #[test]
+    fn safe_mode_rejects_metadata_writes() -> FsResult<()> {
+        let conf = test_conf("writer_safe_mode");
+        let writer = build_writer(&conf)?;
+        writer.recovery.enter_safe_mode("failed to deserialize journal batch");
+        let error = writer
+            .log_ufs_applied(1, 1, 1)
+            .expect_err("safe mode must reject journal writes");
+        assert!(
+            error.to_string().contains("JournalUnavailable"),
+            "unexpected error: {error}"
+        );
         Ok(())
     }
 }

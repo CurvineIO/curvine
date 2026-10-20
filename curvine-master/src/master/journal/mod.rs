@@ -24,6 +24,9 @@ pub use self::entry::*;
 mod journal_system;
 pub use self::journal_system::JournalSystem;
 
+mod recovery;
+pub(crate) use self::recovery::RecoveryGate;
+
 mod sender_task;
 pub use self::sender_task::SenderTask;
 

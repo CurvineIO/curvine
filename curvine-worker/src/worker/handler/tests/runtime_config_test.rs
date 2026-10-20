@@ -1,4 +1,5 @@
 use super::*;
+use crate::worker::block::MasterRegistration;
 use crate::worker::runtime_config::{
     build_worker_runtime_registry, TASK_REPORT_INTERVAL_CONFIG, TASK_TIMEOUT_CONFIG,
     TRANSFER_INFLIGHT_BUDGET_CONFIG, WORKER_MAX_CONCURRENT_TASKS_CONFIG,
@@ -21,6 +22,7 @@ fn test_handler() -> WorkerRouterHandler {
         server_state: Arc::default(),
         task_manager: task_manager.clone(),
         runtime_config: Arc::new(build_worker_runtime_registry(task_manager, &conf)),
+        registration: MasterRegistration::new(),
     }
 }
 fn test_task_manager(handler: &WorkerRouterHandler) -> Arc<TaskManager> {

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockActor, BlockStore};
+use crate::worker::block::{BlockActor, BlockStore, MasterRegistration};
 use crate::worker::handler::{ConnectionPeer, WorkerHandler, WorkerRouterHandler};
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
@@ -60,6 +60,7 @@ pub struct WorkerService {
     /// handlers share the policy without deep-copying it per connection.
     compatibility_policy: Arc<CompatibilityPolicy>,
     runtime_config: Arc<RuntimeConfigRegistry>,
+    registration: MasterRegistration,
 }
 
 impl WorkerService {
@@ -97,6 +98,7 @@ impl WorkerService {
             server_state: Arc::new(OnceCell::new()),
             compatibility_policy: Arc::new(conf.worker.compatibility.to_policy()),
             runtime_config,
+            registration: MasterRegistration::new(),
         };
         Ok(ws)
     }
@@ -148,6 +150,7 @@ impl WebHandlerService for WorkerService {
             server_state: self.server_state.clone(),
             task_manager: self.task_manager.clone(),
             runtime_config: self.runtime_config.clone(),
+            registration: self.registration.clone(),
         }
     }
 }
@@ -267,6 +270,7 @@ impl Worker {
             start_ms,
             service.task_manager.inflight_budget_bytes(),
             service.task_manager.worker_max_concurrent_tasks_shared(),
+            service.registration.clone(),
         )?;
 
         let master_client = block_actor.client.clone();

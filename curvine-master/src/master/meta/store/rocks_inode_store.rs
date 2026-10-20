@@ -38,6 +38,7 @@ impl RocksInodeStore {
 
     pub const PREFIX_MOUNT: u8 = 0x01;
     pub const PREFIX_LOCK: u8 = 0x02;
+    pub const PREFIX_UFS_DEFERRED: u8 = 0x03;
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
@@ -243,6 +244,40 @@ impl RocksInodeStore {
 
     pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
         self.db.get_rocksdb_metrics()
+    }
+
+    fn ufs_deferred_key(index: u64) -> [u8; 9] {
+        let mut key = [0u8; 9];
+        key[0] = Self::PREFIX_UFS_DEFERRED;
+        key[1..].copy_from_slice(&index.to_be_bytes());
+        key
+    }
+
+    pub fn put_ufs_deferred(&self, index: u64, payload: &[u8]) -> CommonResult<()> {
+        self.db
+            .put_cf(Self::CF_COMMON, Self::ufs_deferred_key(index), payload)
+    }
+
+    pub fn delete_ufs_deferred(&self, index: u64) -> CommonResult<()> {
+        self.db
+            .delete_cf(Self::CF_COMMON, Self::ufs_deferred_key(index))
+    }
+
+    pub fn ufs_deferred_records(&self) -> CommonResult<Vec<(u64, Vec<u8>)>> {
+        let iter = self
+            .db
+            .prefix_scan(Self::CF_COMMON, [Self::PREFIX_UFS_DEFERRED])?;
+        let mut records = Vec::new();
+        for item in iter {
+            let (key, value) = item?;
+            if key.len() < 9 {
+                continue;
+            }
+            let mut index_bytes = [0u8; 8];
+            index_bytes.copy_from_slice(&key[1..9]);
+            records.push((u64::from_be_bytes(index_bytes), value.to_vec()));
+        }
+        Ok(records)
     }
 }
 

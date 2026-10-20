@@ -111,6 +111,11 @@ impl ClusterConnector {
         }
     }
 
+    /// Every configured master, excluding the unset leader sentinel.
+    pub fn peer_ids(&self) -> Vec<u64> {
+        self.node_list(false)
+    }
+
     /// When obtaining node_list, it means that the leader id access failed and all nodes need to be traversed.
     fn node_list(&self, leader_first: bool) -> Vec<u64> {
         let mut vec = vec![];

@@ -1195,6 +1195,67 @@ impl FsClient {
         rep.parse_header().map_err(Into::into)
     }
 
+    /// Deliver one RPC to every configured master. The leader response is the
+    /// one returned when a leader is known; followers are still contacted so
+    /// they can keep a local worker map.
+    pub async fn rpc_all_masters<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>
+    where
+        T: PMessage + WithClientContext,
+        R: PMessage + Default,
+    {
+        if code != RpcCode::GetFilesystemInfo {
+            self.ensure_handshake().await;
+        }
+        let ids = self.connector.peer_ids();
+        if ids.is_empty() {
+            return self.rpc(code, header).await;
+        }
+        let msg = Self::build_rpc_message(code, header).into_arc();
+        let leader = self.connector.leader_id();
+        let mut replies = Vec::new();
+        let mut last_error = None;
+        for id in ids {
+            match self
+                .connector
+                .timeout_rpc::<FsError>(id, msg.clone())
+                .await
+            {
+                Ok(response) => replies.push((id, response)),
+                Err((_, error)) => {
+                    warn!(
+                        "rpc to master {} failed: {}",
+                        self.connector.get_addr_string(id),
+                        error
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        let roles: Vec<(u64, HeartbeatRole)> = replies
+            .iter()
+            .map(|(id, response)| (*id, heartbeat_role(response)))
+            .collect();
+        match select_heartbeat_peer(leader, &roles) {
+            Some(id) => {
+                self.connector.change_leader(id);
+                replies
+                    .into_iter()
+                    .find(|(peer, _)| *peer == id)
+                    .expect("selected peer has a reply")
+                    .1
+                    .parse_header()
+                    .map_err(Into::into)
+            }
+            None => {
+                self.connector
+                    .change_leader(ClusterConnector::DEFAULT_LEADER_ID);
+                Err(last_error
+                    .unwrap_or_else(|| FsError::journal_unavailable("heartbeat reached no master"))
+                    .into())
+            }
+        }
+    }
+
     pub async fn rpc_bytes(
         &self,
         code: RpcCode,
@@ -1271,14 +1332,104 @@ impl FsClient {
         self.context.rt().block_on(self.rpc(code, header))
     }
 
+    pub fn rpc_blocking_all_masters<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>
+    where
+        T: PMessage + WithClientContext,
+        R: PMessage + Default,
+    {
+        self.context
+            .rt()
+            .block_on(self.rpc_all_masters(code, header))
+    }
+
     pub fn client_addr(&self) -> &ClientAddress {
         &self.context.client_addr
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeartbeatRole {
+    Leader,
+    Standby,
+    Unknown,
+}
+
+fn heartbeat_role(message: &Message) -> HeartbeatRole {
+    match message.parse_header::<WorkerHeartbeatResponse>() {
+        Ok(header) => match header.role {
+            Some(1) => HeartbeatRole::Leader,
+            Some(2) => HeartbeatRole::Standby,
+            _ => HeartbeatRole::Unknown,
+        },
+        Err(_) => HeartbeatRole::Unknown,
+    }
+}
+
+/// Prefer a peer that says it is leader. A cached id that is now standby, or
+/// that did not answer, must not hide another master's leader response.
+/// Legacy replies (role 0) are used only when nobody reports leadership.
+fn select_heartbeat_peer(
+    cached_leader: Option<u64>,
+    replies: &[(u64, HeartbeatRole)],
+) -> Option<u64> {
+    if let Some((id, _)) = replies
+        .iter()
+        .find(|(_, role)| *role == HeartbeatRole::Leader)
+    {
+        return Some(*id);
+    }
+    if let Some(id) = cached_leader {
+        if let Some((_, role)) = replies.iter().find(|(peer, _)| *peer == id) {
+            if *role != HeartbeatRole::Standby {
+                return Some(id);
+            }
+        }
+        return replies
+            .iter()
+            .find(|(_, role)| *role == HeartbeatRole::Unknown)
+            .map(|(id, _)| *id);
+    }
+    replies
+        .iter()
+        .find(|(_, role)| *role != HeartbeatRole::Standby)
+        .map(|(id, _)| *id)
+        .or_else(|| replies.first().map(|(id, _)| *id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_keeps_a_live_leader_when_the_cached_id_is_stale() {
+        assert_eq!(
+            select_heartbeat_peer(
+                Some(1),
+                &[(1, HeartbeatRole::Standby), (2, HeartbeatRole::Leader)]
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            select_heartbeat_peer(Some(1), &[(2, HeartbeatRole::Leader)]),
+            Some(2)
+        );
+        assert_eq!(
+            select_heartbeat_peer(Some(1), &[(2, HeartbeatRole::Unknown)]),
+            Some(2)
+        );
+        assert_eq!(
+            select_heartbeat_peer(Some(1), &[(1, HeartbeatRole::Unknown)]),
+            Some(1)
+        );
+        assert_eq!(
+            select_heartbeat_peer(Some(1), &[(2, HeartbeatRole::Standby)]),
+            None
+        );
+        assert_eq!(
+            select_heartbeat_peer(None, &[(2, HeartbeatRole::Standby)]),
+            Some(2)
+        );
+    }
 
     fn request_with_current_context() -> Message {
         FsClient::build_rpc_message(

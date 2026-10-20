@@ -22,8 +22,42 @@ use curvine_model::{
 };
 use curvine_proto::*;
 use curvine_sys::version;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// Set when this worker process has completed Start and Running heartbeats.
+#[derive(Clone)]
+pub struct MasterRegistration {
+    start_ok: Arc<AtomicBool>,
+    running_ok: Arc<AtomicBool>,
+}
+
+impl MasterRegistration {
+    pub fn new() -> Self {
+        Self {
+            start_ok: Arc::new(AtomicBool::new(false)),
+            running_ok: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn mark_start(&self) {
+        self.start_ok.store(true, Ordering::Release);
+    }
+
+    pub fn mark_running(&self) {
+        self.running_ok.store(true, Ordering::Release);
+    }
+
+    pub fn ready(&self) -> bool {
+        self.start_ok.load(Ordering::Acquire) && self.running_ok.load(Ordering::Acquire)
+    }
+}
+
+impl Default for MasterRegistration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 //Worker and master communicate with the customer client.
 // Use the synchronous client service.
@@ -47,6 +81,7 @@ pub struct MasterClient {
     /// Constant for the lifetime of the worker process, so it is built once
     /// and cloned into each request instead of re-allocated on the hot path.
     pub(crate) component_info: ComponentInfoProto,
+    registration: MasterRegistration,
 }
 
 impl MasterClient {
@@ -61,6 +96,7 @@ impl MasterClient {
         startup_time_ms: u64,
         transfer_inflight_budget_bytes: Arc<AtomicI64>,
         worker_max_concurrent_tasks: Arc<AtomicUsize>,
+        registration: MasterRegistration,
     ) -> Self {
         // Directly reused file system client service.
         let fs_client = FsClient::new(context);
@@ -78,6 +114,7 @@ impl MasterClient {
             transfer_inflight_budget_bytes,
             worker_max_concurrent_tasks,
             component_info,
+            registration,
         }
     }
 
@@ -116,8 +153,21 @@ impl MasterClient {
             req.storages.push(ProtoUtils::storage_info_to_pb(item));
         }
 
-        let rep_header: WorkerHeartbeatResponse =
-            self.fs_client.rpc_blocking(RpcCode::WorkerHeartbeat, req)?;
+        let rep_header: WorkerHeartbeatResponse = if matches!(
+            status,
+            HeartbeatStatus::Start | HeartbeatStatus::Running
+        ) {
+            self.fs_client
+                .rpc_blocking_all_masters(RpcCode::WorkerHeartbeat, req)?
+        } else {
+            self.fs_client
+                .rpc_blocking(RpcCode::WorkerHeartbeat, req)?
+        };
+        match status {
+            HeartbeatStatus::Start => self.registration.mark_start(),
+            HeartbeatStatus::Running => self.registration.mark_running(),
+            HeartbeatStatus::End => {}
+        }
 
         Ok(rep_header)
     }

@@ -862,6 +862,11 @@ impl MasterHandler {
         }
         let rep_header = WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+            role: Some(if self.fs.master_monitor.is_active() {
+                1
+            } else {
+                2
+            }),
         };
         ctx.response(rep_header)
     }
@@ -1014,6 +1019,9 @@ impl MasterHandler {
                     u64::try_from(header.fs_ctime).unwrap_or_default(),
                     ProtoUtils::storage_info_list_from_pb(header.storages),
                     header.component_info,
+                    // A presence-only heartbeat refreshes liveness without driving
+                    // block commands; the monitor decides this per request.
+                    !fs.master_monitor.is_active(),
                 )?
             };
             if accepted_start {
@@ -1398,9 +1406,14 @@ impl MessageHandler for MasterHandler {
 
         self.record_rpc_queue_duration(ctx);
 
-        // Unified processing of all RPC requests (standby NotLeader uses the same
-        // observability + error_ext conversion path as async_handle).
-        let response = if !self.fs.master_monitor.is_active() {
+        // Heartbeats update this process's worker map on every member. Every
+        // other RPC still requires the active leader, and safe mode stops
+        // metadata service without dropping the process.
+        let response = if matches!(code, RpcCode::WorkerHeartbeat) {
+            self.worker_heartbeat(ctx)
+        } else if self.fs.master_monitor.is_safe_mode() {
+            Err(FsError::journal_unavailable("master is in safe mode"))
+        } else if !self.fs.master_monitor.is_active() {
             Err(FsError::not_leader_master(ctx.code, self.client_ip()))
         } else {
             match code {
@@ -1445,8 +1458,8 @@ impl MessageHandler for MasterHandler {
                 RpcCode::GetRuntimeConfig => self.get_runtime_config(ctx),
                 RpcCode::ResetRuntimeConfig => self.reset_runtime_config(ctx),
 
-                // Worker related requests
-                RpcCode::WorkerHeartbeat => self.worker_heartbeat(ctx),
+                // Worker related requests. Heartbeats are dispatched above so a
+                // standby can record local presence.
                 RpcCode::WorkerBlockReport => self.block_report(ctx),
                 RpcCode::SetWorkerStatus => self.set_worker_status(ctx),
 
@@ -1489,7 +1502,9 @@ impl MessageHandler for MasterHandler {
         let ctx = &mut rpc_context;
         let code = RpcCode::from(msg.code());
 
-        let res = if !self.fs.master_monitor.is_active() {
+        let res = if self.fs.master_monitor.is_safe_mode() {
+            Err(FsError::journal_unavailable("master is in safe mode"))
+        } else if !self.fs.master_monitor.is_active() {
             Err(FsError::not_leader_master(ctx.code, self.client_ip()))
         } else {
             match code {

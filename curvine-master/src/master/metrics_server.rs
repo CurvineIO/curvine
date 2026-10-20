@@ -57,13 +57,25 @@ async fn metrics(Extension(handler): Extension<Arc<MasterMetricsHandler>>) -> Fs
 async fn healthz(
     Extension(handler): Extension<Arc<MasterMetricsHandler>>,
 ) -> (StatusCode, &'static str) {
-    health_status(handler.fs.master_monitor.journal_state())
+    health_status(probe_view(&handler.fs))
 }
 
 async fn readyz(
     Extension(handler): Extension<Arc<MasterMetricsHandler>>,
 ) -> (StatusCode, &'static str) {
-    ready_status(handler.fs.master_monitor.journal_state())
+    ready_status(probe_view(&handler.fs))
+}
+
+async fn recoveryz(
+    Extension(handler): Extension<Arc<MasterMetricsHandler>>,
+) -> (StatusCode, &'static str) {
+    recovery_status(probe_view(&handler.fs))
+}
+
+async fn rolloutz(
+    Extension(handler): Extension<Arc<MasterMetricsHandler>>,
+) -> (StatusCode, &'static str) {
+    rollout_status(probe_view(&handler.fs))
 }
 
 fn runtime_payload(runtime: &MasterRuntimeMetadata) -> Value {
@@ -80,23 +92,75 @@ async fn master_runtime(Extension(handler): Extension<Arc<MasterMetricsHandler>>
     Json(runtime_payload(&handler.runtime))
 }
 
-/// Liveness semantics: once the journal role is known the master is serving, so
-/// both the active (leader) and the standby (follower) node report healthy.
-fn health_status(state: MasterState) -> (StatusCode, &'static str) {
-    match state {
-        MasterState::Active | MasterState::Standby => (StatusCode::OK, "ok\n"),
-        MasterState::SafeMode | MasterState::Exit => {
-            (StatusCode::SERVICE_UNAVAILABLE, "master is not serving\n")
-        }
+#[derive(Clone, Copy)]
+struct ProbeView {
+    role: MasterState,
+    safe_mode: bool,
+    ufs_caught_up: bool,
+}
+
+fn probe_view(fs: &MasterFilesystem) -> ProbeView {
+    ProbeView {
+        role: fs.master_monitor.journal_state(),
+        safe_mode: fs.master_monitor.is_safe_mode(),
+        ufs_caught_up: fs.master_monitor.ufs_caught_up(),
     }
 }
 
-/// Readiness semantics: only the active (leader) master can serve metadata, so
-/// a standby answers 503 and traffic should be routed to the leader instead.
-fn ready_status(state: MasterState) -> (StatusCode, &'static str) {
-    match state {
-        MasterState::Active => (StatusCode::OK, "ok\n"),
-        MasterState::Standby => (StatusCode::SERVICE_UNAVAILABLE, "not ready: standby\n"),
+/// Liveness: a known Raft role is healthy, and safe mode stays healthy so a
+/// damaged node is not restarted in a loop. Init and exit are not healthy.
+fn health_status(view: ProbeView) -> (StatusCode, &'static str) {
+    if view.safe_mode || matches!(view.role, MasterState::Active | MasterState::Standby) {
+        (StatusCode::OK, "ok\n")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "master is not serving\n")
+    }
+}
+
+/// Metadata readiness: only an active leader that is not in safe mode.
+fn ready_status(view: ProbeView) -> (StatusCode, &'static str) {
+    if view.role == MasterState::Active && !view.safe_mode {
+        (StatusCode::OK, "ok\n")
+    } else if view.role == MasterState::Standby && !view.safe_mode {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready: standby\n")
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready: master is not serving\n",
+        )
+    }
+}
+
+/// UFS recovery: leader, metadata service up, and the UFS watermark has caught
+/// the metadata watermark.
+fn recovery_status(view: ProbeView) -> (StatusCode, &'static str) {
+    if view.role == MasterState::Active && !view.safe_mode && view.ufs_caught_up {
+        (StatusCode::OK, "ok\n")
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not recovered: ufs replay pending\n",
+        )
+    }
+}
+
+/// Rolling update gate. A follower is ready once its role is known. A leader
+/// stays unready until UFS replay has caught up, so the controller does not
+/// replace the next master while this one is still waiting for workers.
+fn rollout_status(view: ProbeView) -> (StatusCode, &'static str) {
+    if view.safe_mode {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready: master is not serving\n",
+        );
+    }
+    match view.role {
+        MasterState::Standby => (StatusCode::OK, "ok\n"),
+        MasterState::Active if view.ufs_caught_up => (StatusCode::OK, "ok\n"),
+        MasterState::Active => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not recovered: ufs replay pending\n",
+        ),
         MasterState::SafeMode | MasterState::Exit => (
             StatusCode::SERVICE_UNAVAILABLE,
             "not ready: master is not serving\n",
@@ -122,6 +186,8 @@ fn metrics_router(handler: MasterMetricsHandler) -> Router {
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/recoveryz", get(recoveryz))
+        .route("/rolloutz", get(rolloutz))
         .route("/api/v1/master/runtime", get(master_runtime))
         .route("/api/v1/master/runtime/config", get(runtime_config))
         .route("/api/update_config", post(update_runtime_config))
@@ -285,9 +351,17 @@ mod tests {
     use curvine_raft::raft::RoleState;
     use curvine_runtime::sync::StateCtl;
 
-    fn health_with_role(role: RoleState) -> (StatusCode, &'static str) {
+    fn view_for(role: RoleState, safe_mode: bool, ufs_caught_up: bool) -> ProbeView {
         let monitor = MasterMonitor::new(StateCtl::new(role.into()), StateCtl::new(0));
-        health_status(monitor.journal_state())
+        ProbeView {
+            role: monitor.journal_state(),
+            safe_mode,
+            ufs_caught_up,
+        }
+    }
+
+    fn health_with_role(role: RoleState) -> (StatusCode, &'static str) {
+        health_status(view_for(role, false, false))
     }
 
     #[test]
@@ -309,8 +383,31 @@ mod tests {
     }
 
     fn ready_with_role(role: RoleState) -> (StatusCode, &'static str) {
-        let monitor = MasterMonitor::new(StateCtl::new(role.into()), StateCtl::new(0));
-        ready_status(monitor.journal_state())
+        ready_status(view_for(role, false, false))
+    }
+
+    #[test]
+    fn safe_mode_stays_alive_but_not_ready_or_recovered() {
+        let view = view_for(RoleState::Leader, true, false);
+        assert_eq!(health_status(view).0, StatusCode::OK);
+        assert_eq!(ready_status(view).0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(recovery_status(view).0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rollout_status(view).0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn leader_rollout_waits_for_ufs_and_follower_does_not() {
+        let leader_behind = view_for(RoleState::Leader, false, false);
+        assert_eq!(recovery_status(leader_behind).0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rollout_status(leader_behind).0, StatusCode::SERVICE_UNAVAILABLE);
+
+        let leader_caught_up = view_for(RoleState::Leader, false, true);
+        assert_eq!(recovery_status(leader_caught_up).0, StatusCode::OK);
+        assert_eq!(rollout_status(leader_caught_up).0, StatusCode::OK);
+
+        let follower = view_for(RoleState::Follower, false, false);
+        assert_eq!(rollout_status(follower).0, StatusCode::OK);
+        assert_eq!(recovery_status(follower).0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

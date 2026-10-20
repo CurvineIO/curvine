@@ -149,7 +149,9 @@ master_addrs = [{{ hostname = "127.0.0.1", port = {master_port} }}]
             .join("../curvine-docker/deploy/example/curvine-master.yaml"),
     )
     .unwrap();
-    assert!(manifest.contains("readinessProbe:\n            tcpSocket:\n              port: 8995"));
+    assert!(manifest.contains(
+        "readinessProbe:\n            httpGet:\n              path: /rolloutz\n              port: 9010"
+    ));
     assert!(manifest.contains("startupProbe:\n            tcpSocket:\n              port: 8996"));
     assert!(manifest.contains("livenessProbe:\n            tcpSocket:\n              port: 8996"));
 

@@ -100,7 +100,12 @@ impl JournalSystem {
     ) -> FsResult<FsInitParts> {
         let worker_manager = SyncWorkerManager::new(WorkerManager::new(conf)?);
         let client = RaftClient::from_conf(rt.clone(), &conf.journal);
-        let journal_writer = Arc::new(JournalWriter::new(conf.testing, client, &conf.journal)?);
+        let journal_writer = Arc::new(JournalWriter::new(
+            conf.testing,
+            client,
+            &conf.journal,
+            master_monitor.recovery(),
+        )?);
 
         let ttl_bucket_list = Arc::new(TtlBucketList::new(
             conf.master.ttl_bucket_interval_ms() as i64
@@ -310,6 +315,8 @@ impl JournalSystem {
                 parts.job_manager.clone(),
                 log_store,
                 parts.journal_writer.clone(),
+                parts.worker_manager.clone(),
+                master_monitor.recovery(),
             )?,
             conf.journal.clone(),
             role_monitor,

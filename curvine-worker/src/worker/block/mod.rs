@@ -18,7 +18,7 @@ mod block_store;
 pub use self::block_store::BlockStore;
 
 mod master_client;
-pub use self::master_client::MasterClient;
+pub use self::master_client::{MasterClient, MasterRegistration};
 
 mod block_actor;
 pub use self::block_actor::BlockActor;

@@ -869,8 +869,8 @@ mod tests {
         assert_eq!(inode.child_len(), 1);
         assert_eq!(copy.child_len(), 0);
         assert_eq!(
-            SerdeUtils::serialize(&inode).unwrap(),
-            SerdeUtils::serialize(&copy).unwrap()
+            MetadataCodec::encode(&inode).unwrap(),
+            MetadataCodec::encode(&copy).unwrap()
         );
     }
 

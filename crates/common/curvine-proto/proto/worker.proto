@@ -116,6 +116,10 @@ message WorkerHeartbeatRequest {
 
 message WorkerHeartbeatResponse {
     repeated WorkerCommandProto cmds = 1;
+    // 0 = legacy peer that did not report a role, 1 = leader, 2 = standby.
+    // Absence stays 0 so a mixed-version cluster can still tell a real leader
+    // response from a standby success.
+    optional uint32 role = 2;
 }
 
 enum BlockReportStatusProto {

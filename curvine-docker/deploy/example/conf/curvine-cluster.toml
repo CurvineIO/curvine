@@ -86,6 +86,8 @@ log = { level = "info", log_dir = "./logs", file_name = "mds.log" }
 
 [journal]
 rpc_port = 8996
+# Pod DNS names, not the Ready endpoints of the headless Service. Leader
+# /rolloutz can stay 503 during UFS replay without removing Raft peers.
 journal_addrs = [
     {id = 1, hostname = "cv-master-0.svc.cluster.local", port = 8996},
     {id = 2, hostname = "cv-master-1.svc.cluster.local", port = 8996},

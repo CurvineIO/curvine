@@ -11,6 +11,15 @@ spec:
       role: cv-master
   serviceName: "cv-master"
   podManagementPolicy: "Parallel"
+  # Roll one master at a time. Before a rolling update, set partition to
+  # replicas-1 and decrease it only after that pod accepts TCP 8996 and
+  # /rolloutz is 200. journal_addrs in the example config are pod DNS names,
+  # not Ready Service endpoints.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      partition: 0
   replicas: 3
   template:
     metadata:
@@ -41,32 +50,32 @@ spec:
           args:
             - master
           readinessProbe:
-            tcpSocket:
-              port: 8995
-            initialDelaySeconds: 10
+            httpGet:
+              path: /rolloutz
+              port: 9010
             periodSeconds: 10
-            timeoutSeconds: 1
+            timeoutSeconds: 2
             failureThreshold: 3
-            successThreshold: 1
-          # The Raft listener starts before the Master RPC listener. During a
-          # lost-member snapshot restore, 8996 remains live while 8995 stays
-          # intentionally unready.
+          # TCP 8996 is process and Raft liveness. Role publication, metadata
+          # catch-up, and UFS replay must not kill the pod. /rolloutz stays
+          # 503 until a follower has a known role, or a leader has finished
+          # UFS replay, which holds the next StatefulSet pod.
           startupProbe:
             tcpSocket:
               port: 8996
             periodSeconds: 10
-            timeoutSeconds: 1
+            timeoutSeconds: 2
             failureThreshold: 180
           livenessProbe:
             tcpSocket:
               port: 8996
             periodSeconds: 10
-            timeoutSeconds: 1
+            timeoutSeconds: 2
             failureThreshold: 6
           ports:
             - containerPort: 8995
             - containerPort: 8996
-            - containerPort: 9001
+            - containerPort: 9010
           volumeMounts:
           - name: curvine-conf
             mountPath: /app/curvine/conf

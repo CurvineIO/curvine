@@ -273,6 +273,10 @@ impl FsError {
         Self::NotLeaderMaster(ErrorImpl::with_source(msg.into().into()))
     }
 
+    pub fn journal_unavailable(msg: impl Into<String>) -> Self {
+        Self::common(format!("JournalUnavailable: {}", msg.into()))
+    }
+
     pub fn in_progress(req_id: i64) -> Self {
         let msg = format!("Request {} in progress", req_id);
         Self::InProgress(ErrorImpl::with_source(msg.into()))

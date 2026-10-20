@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockMeta, BlockStore, HeartbeatTask, MasterClient};
+use crate::worker::block::{BlockMeta, BlockStore, HeartbeatTask, MasterClient, MasterRegistration};
 use curvine_client_core::file::FsContext;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
@@ -145,6 +145,7 @@ impl BlockActor {
         startup_time_ms: u64,
         transfer_inflight_budget_bytes: Arc<AtomicI64>,
         worker_max_concurrent_tasks: Arc<AtomicUsize>,
+        registration: MasterRegistration,
     ) -> CommonResult<BlockActor> {
         let context = FsContext::with_rt(conf.clone(), rt)?;
         let context = Arc::new(context);
@@ -158,6 +159,7 @@ impl BlockActor {
             startup_time_ms,
             transfer_inflight_budget_bytes,
             worker_max_concurrent_tasks,
+            registration,
         );
         let executor = GroupExecutor::new(
             "worker-block-executor",
