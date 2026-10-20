@@ -970,6 +970,102 @@ fn detected_wiped_member_quarantine_rejects_voting_and_campaigning() {
 }
 
 #[test]
+fn detected_wiped_member_with_zero_commit_activates_quarantine_and_disables_elections_until_finish()
+{
+    let mut peer = Peer::new(3, false, 301);
+    let leader_id = 1;
+    let leader_term = 30;
+    let target_commit = 10;
+
+    // Triggering heartbeat has commit = 0, but leader_commit > 0, and receiver session is obsolete.
+    let mut request = heartbeat(0);
+    request.message.from = leader_id;
+    request.message.term = leader_term;
+    request.message.commit = 0;
+    request.receiver_session = Some(300); // obsolete receiver session from prior dead incarnation
+    request.leader_commit = Some(target_commit); // leader_commit > 0
+
+    assert_eq!(peer.raw.raft.raft_log.last_index(), 0);
+    assert_eq!(peer.raw.raft.raft_log.committed, 0);
+    assert!(!peer.recovery.active);
+    assert_eq!(peer.raw.raft.vote, 0);
+    let marker = peer.recovery.marker.as_ref().unwrap().clone();
+    assert!(!marker.exists());
+
+    // 1. Leader heartbeat with commit = 0 must trigger automatic recovery quarantine for empty log.
+    peer.recovery.step(&mut peer.raw, request, 301).unwrap();
+    assert!(peer.recovery.active);
+    assert_eq!(peer.raw.raft.vote, 3);
+    assert!(marker.exists());
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "3\n");
+
+    // 2. Voting and campaigning remain disabled during recovery quarantine.
+    for kind in [
+        MessageType::MsgRequestVote,
+        MessageType::MsgRequestPreVote,
+        MessageType::MsgHup,
+        MessageType::MsgTimeoutNow,
+    ] {
+        let mut msg = heartbeat(target_commit);
+        msg.message.set_msg_type(kind);
+        msg.receiver_session = Some(301);
+        let err = peer
+            .recovery
+            .step(&mut peer.raw, msg, 301)
+            .expect_err("voting and campaigning must be rejected during recovery quarantine");
+        assert!(err
+            .to_string()
+            .contains("voting and campaigning are disabled"));
+    }
+    assert_eq!(peer.raw.raft.vote, 3);
+    assert_eq!(peer.raw.raft.state, StateRole::Follower);
+
+    // 3. Recovery cannot finish prematurely before log/commit catch up and session is fenced.
+    assert!(!peer.recovery.finish(&peer.raw, 0, 0).unwrap());
+    assert!(peer.recovery.active);
+    assert!(marker.exists());
+
+    // 4. Follower catches up log and commit to target_commit, receives a fenced probe.
+    let entries: Vec<Entry> = (1..=target_commit)
+        .map(|idx| Entry {
+            index: idx,
+            term: leader_term,
+            ..Default::default()
+        })
+        .collect();
+    peer.raw.mut_store().wl().append(&entries).unwrap();
+    peer.raw.raft.raft_log.committed = target_commit;
+    peer.raw.raft.term = leader_term;
+    peer.raw.raft.leader_id = leader_id;
+    peer.raw.raft.state = StateRole::Follower;
+
+    // Fenced leader heartbeat with current session.
+    let mut fenced_request = heartbeat(target_commit);
+    fenced_request.message.from = leader_id;
+    fenced_request.message.term = leader_term;
+    fenced_request.receiver_session = Some(301);
+    fenced_request.leader_commit = Some(target_commit);
+    peer.recovery
+        .step(&mut peer.raw, fenced_request, 301)
+        .unwrap();
+
+    // 5. Calling finish() completes recovery: marker is removed and quarantine is deactivated.
+    assert!(peer
+        .recovery
+        .finish(&peer.raw, target_commit, target_commit)
+        .unwrap());
+    assert!(!peer.recovery.active);
+    assert!(!marker.exists());
+
+    // 6. After recovery completes, voting and campaigning are no longer disabled.
+    let mut vote_msg = heartbeat(target_commit);
+    vote_msg.message.set_msg_type(MessageType::MsgRequestVote);
+    vote_msg.receiver_session = Some(301);
+    vote_msg.message.term = leader_term + 1;
+    assert!(peer.recovery.step(&mut peer.raw, vote_msg, 301).is_ok());
+}
+
+#[test]
 fn detected_wiped_member_creates_marker_atomically_and_survives_restart() {
     let root = std::env::temp_dir().join(format!(
         "curvine-detected-recovery-marker-{}",

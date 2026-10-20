@@ -665,6 +665,120 @@ fn wiped_follower_early_rejoin_handshake_clamps_obsolete_commit_without_panic() 
 }
 
 #[test]
+fn wiped_follower_early_rejoin_with_zero_commit_heartbeat_activates_quarantine() {
+    let rt = JournalConf::with_test().create_runtime();
+    let follower_id = 3;
+    let leader_id = 2;
+    let mut node = test_node(rt.clone(), follower_id);
+    assert_eq!(node.id(), follower_id);
+    assert_eq!(node.raw.raft.raft_log.last_index(), 0);
+    assert_eq!(node.raw.raft.raft_log.committed, 0);
+    assert!(!node.recovery.active);
+    assert_eq!(node.session, 301);
+
+    let leader_term = 5;
+    let leader_commit_val = 105311900;
+    let old_receiver_session = 99;
+
+    // Heartbeat has commit = 0, but leader_commit > 0, and receiver session is obsolete.
+    let mut message = raft::eraftpb::Message {
+        from: leader_id,
+        to: node.id(),
+        term: leader_term,
+        commit: 0,
+        ..Default::default()
+    };
+    message.set_msg_type(MessageType::MsgHeartbeat);
+    let request = RaftRequest {
+        message,
+        sender_session: Some(201),
+        receiver_session: Some(old_receiver_session),
+        leader_commit: Some(leader_commit_val),
+    };
+
+    let mut promise = HashMap::new();
+    let (raft_tx, raft_rx) = tokio::sync::oneshot::channel();
+    let raft_message = Builder::new_rpc(RaftCode::Raft)
+        .proto_header(request)
+        .build();
+
+    node.handle_available(Envelope::new(raft_message, raft_tx), &mut promise)
+        .unwrap();
+    let response = rt.block_on(raft_rx).unwrap().unwrap();
+    assert_eq!(response.response_status(), ResponseStatus::Success);
+
+    let raft_response: RaftResponse = response.parse_header().unwrap();
+    assert_eq!(raft_response.session, Some(node.session));
+    assert_eq!(raft_response.term, Some(leader_term));
+    assert_eq!(raft_response.recovering, Some(true));
+
+    // Follower must not commit beyond its available local log.
+    assert_eq!(node.raw.raft.raft_log.committed, 0);
+    assert_eq!(node.raw.raft.raft_log.last_index(), 0);
+    assert_eq!(node.raw.raft.leader_id, leader_id);
+
+    // Follower must enter recovery quarantine, record abstention, and persist the marker.
+    assert!(node.recovery.active);
+    assert_eq!(node.raw.raft.vote, node.id());
+    assert!(node.storage.conf.recovery_marker().exists());
+    assert_eq!(
+        std::fs::read_to_string(node.storage.conf.recovery_marker()).unwrap(),
+        format!("{}\n", node.id())
+    );
+
+    // While quarantined in recovery mode, voting is rejected and abstention is preserved.
+    let (vote_tx, vote_rx) = tokio::sync::oneshot::channel();
+    let mut vote_message = raft::eraftpb::Message {
+        from: leader_id,
+        to: node.id(),
+        term: leader_term + 1,
+        ..Default::default()
+    };
+    vote_message.set_msg_type(MessageType::MsgRequestVote);
+    let vote_request = RaftRequest {
+        message: vote_message,
+        sender_session: Some(201),
+        receiver_session: Some(node.session),
+        leader_commit: Some(0),
+    };
+    let vote_rpc = Builder::new_rpc(RaftCode::Raft)
+        .proto_header(vote_request)
+        .build();
+    node.handle_available(Envelope::new(vote_rpc, vote_tx), &mut promise)
+        .unwrap();
+    let vote_response = rt.block_on(vote_rx).unwrap().unwrap();
+    assert_eq!(vote_response.response_status(), ResponseStatus::Error);
+    assert_ne!(node.raw.raft.vote, leader_id);
+    assert_eq!(node.raw.raft.vote, node.id());
+
+    // Local election timeouts and campaigning are rejected during recovery quarantine.
+    let (camp_tx, camp_rx) = tokio::sync::oneshot::channel();
+    let mut camp_message = raft::eraftpb::Message {
+        from: node.id(),
+        to: node.id(),
+        term: leader_term + 1,
+        ..Default::default()
+    };
+    camp_message.set_msg_type(MessageType::MsgHup);
+    let camp_request = RaftRequest {
+        message: camp_message,
+        sender_session: Some(node.session),
+        receiver_session: Some(node.session),
+        leader_commit: Some(0),
+    };
+    let camp_rpc = Builder::new_rpc(RaftCode::Raft)
+        .proto_header(camp_request)
+        .build();
+    node.handle_available(Envelope::new(camp_rpc, camp_tx), &mut promise)
+        .unwrap();
+    let camp_response = rt.block_on(camp_rx).unwrap().unwrap();
+    assert_eq!(camp_response.response_status(), ResponseStatus::Error);
+    assert_eq!(node.raw.raft.state, raft::StateRole::Follower);
+
+    let _ = std::fs::remove_dir_all(&node.storage.conf.journal_dir);
+}
+
+#[test]
 fn wiped_follower_persists_self_vote_to_rocksdb_before_outbound_replication() {
     let rt = JournalConf::with_test().create_runtime();
     let follower_id = 3;

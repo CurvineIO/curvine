@@ -324,10 +324,11 @@ impl Recovery {
                 .receiver_session
                 .is_some_and(|expected| expected != session);
             let past_tail = request.message.commit > raw.raft.raft_log.last_index();
+            let empty_log = raw.raft.raft_log.last_index() == 0;
             if past_tail && !self.active && !obsolete_receiver {
                 return Err(RaftError::other("leader heartbeat exceeds local log tail; possible lost persistent state; use journal.recover_from_peers for an isolated member rebuild".into()));
             }
-            if past_tail && obsolete_receiver && !self.active {
+            if (past_tail || empty_log) && obsolete_receiver && !self.active {
                 if raw.raft.prs().conf().voters().ids().iter().count() < 3 {
                     return Err(RaftError::other("member recovery requires a healthy majority of an existing cluster with at least three voters".into()));
                 }

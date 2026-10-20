@@ -151,9 +151,48 @@ pub struct JournalConf {
     #[serde(default = "JournalConf::rocksdb_default")]
     pub rocksdb: DBConf,
 
-    /// Raft ID of one lost HA member to rebuild from healthy peers. Only the
-    /// matching member disables elections and voting until durable Raft and
-    /// application state have caught up.
+    /// Raft ID of one lost HA member to explicitly rebuild from healthy peers.
+    ///
+    /// When configured, only the matching member activates recovery quarantine,
+    /// disabling elections, campaigning, and voting until durable Raft logs,
+    /// HardState, and application state have caught up with the leader.
+    ///
+    /// # Automatic Quarantine Trigger
+    /// For completely wiped members (empty local log, `last_index == 0`) or members
+    /// whose local log tail lags behind the leader's commit (`past_tail`), explicit
+    /// configuration is often unnecessary. When such a member rejoins with a new
+    /// session, receiving a leader heartbeat carrying an obsolete receiver session
+    /// automatically triggers recovery quarantine—even if the heartbeat's commit index
+    /// is 0 (provided the handshake request contains the `leader_commit` field). This
+    /// requires a healthy cluster with at least three voters and a leader supporting
+    /// the recovery handshake.
+    ///
+    /// # Recovery Marker Lifecycle
+    /// - **Detection & Activation**: When recovery quarantine is activated (either
+    ///   automatically or via `recover_from_peers`), a durable marker file
+    ///   (`member-recovery-in-progress`) recording the local Raft ID is atomically created
+    ///   and fsynced in `journal_dir`.
+    /// - **Restart Persistence**: If the recovering member crashes or restarts before
+    ///   catch-up finishes, the presence of the marker file forces recovery quarantine
+    ///   to remain active, even if `recover_from_peers` has been omitted or removed from
+    ///   the configuration.
+    /// - **Required at Finish**: During `finish()`, the configured marker file is
+    ///   strictly required to exist on disk. If the marker was deleted prematurely,
+    ///   recovery fails closed with an error and keeps quarantine active. Only upon
+    ///   verified catch-up and log/state persistence is the marker removed using
+    ///   `remove_file()`, followed by `sync_all()` on its parent directory to persist
+    ///   the directory change.
+    ///
+    /// # When Explicit Configuration Remains Necessary
+    /// Explicit `journal.recover_from_peers` remains required in scenarios where automatic
+    /// quarantine cannot safely trigger:
+    /// - When the local log is non-empty (`last_index > 0`) but stale, corrupt, or diverged
+    ///   (such as after restoring an older backup or encountering partial disk corruption),
+    ///   and the incoming heartbeat's commit index does not exceed the local tail.
+    /// - For ordinary non-obsolete sessions where persistent state was lost, which fail closed
+    ///   with an explicit error instructing the operator to configure `recover_from_peers`.
+    /// - For operator-directed, proactive member rebuilds where quarantine must be enforced
+    ///   immediately at process startup before any network RPCs are processed.
     #[serde(default)]
     pub recover_from_peers: Option<u64>,
 }

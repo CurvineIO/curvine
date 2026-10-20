@@ -27,6 +27,24 @@
 - `journal_applied`、`journal_ufs_applied` 从实际 FSM 刷新；`journal_committed`、
   `journal_term` 从实际 HardState 刷新。快照恢复后不再依赖下一笔写入更新指标。
 
+### 自动隔离与恢复标记生命周期
+
+本机制不仅支持显式运维配置，还提供了被动安全防御与严格的标记生命周期管理：
+
+- **自动隔离触发（Automatic Quarantine Trigger）**：
+  当清空（wiped）的成员以全新会话启动重新加入集群时，只要 Leader 发来携带旧接收会话（obsolete receiver session）的心跳 RPC，且满足以下条件之一：
+  1. 心跳 commit 越界（`past_tail`）；或
+  2. 本地日志完全为空（`raw.raft.raft_log.last_index() == 0`），**即使心跳携带的 commit 为 0**（前提是握手请求包含 `leader_commit` 字段）；
+  在集群至少有 3 个既有投票成员且 Leader 支持握手协议时，节点将**自动进入恢复隔离**（quarantine），无需运维事先在配置中声明 `recover_from_peers`。在此期间，节点的投票和竞选被全面禁用，并在当前任期内持久化自投弃权票。
+- **标记生命周期（Marker Lifecycle）**：
+  - **检测/激活时原子创建**：无论是通过隐式自动检测激活，还是通过显式配置 `recover_from_peers` 启动，节点都会在 `journal_dir` 根目录下原子写入 `member-recovery-in-progress`（内容为本机 `raft_id`）并落盘。
+  - **跨重启保护**：恢复中途若节点重启，`Recovery::load` 检测到该标记仍会强制保持恢复隔离，即使配置中未包含或已移除 `recover_from_peers`。
+  - **完成时强校验并删除**：在日志和状态机追平调用 `finish()` 退出恢复时，程序**严格要求该标记在磁盘上切实存在**；若标记被运维或外部误删，`finish()` 将直接 fail-closed 报错并保持隔离状态。只有在校验通过、数据完全落盘后，程序才会通过 `remove_file()` 删除该标记文件，并对父目录调用 `sync_all()` 持久化目录变更。
+- **何时仍需显式配置 `journal.recover_from_peers`**：
+  - **本地存在非空残余日志（`last_index > 0`）**：若故障成员未完全清空（如从陈旧备份恢复或 journal 发生局部损坏/分叉，磁盘残留了部分日志），且 Leader 心跳的 commit 落在本地日志范围内（`commit <= last_index`），自动检测不会触发，必须显式配置 `recover_from_peers = <raft_id>` 强制进入隔离重建；
+  - **普通非陈旧会话丢失状态**：普通运行态会话如果出现心跳 commit 超出本地日志尾部（`past_tail && !obsolete_receiver`），系统会直接报 explicit lost-state 错误并拒绝运行，必须由运维排查后显式配置 `journal.recover_from_peers`；
+  - **运维主动控制**：在计划内的单成员停机重建或演练时，显式配置 `recover_from_peers` 可在节点启动的第一时间锁定恢复模式。
+
 这不是任意多数派数据丢失、网络分区、多份同身份进程并存或备份回滚的修复协议。
 这些场景应停止自动恢复并单独设计成员替换/灾备流程。
 
@@ -90,15 +108,18 @@ recover_from_peers = 3
 10. **正常重启验收**：在维护窗口只重启已恢复成员，确认它不再创建 marker、能正常加入
     quorum，并验证旧元数据和新增写入。
 
-恢复开始时，目标成员的 journal 根目录会生成并同步：
+恢复开始（或自动检测到隔离触发）时，目标成员的 journal 根目录会生成并同步持久化标记：
 
 ```text
 member-recovery-in-progress
 ```
 
-这个标记必须保留，文件内容是开始恢复时的本地 `raft_id`。即使进程中途重启，甚至
-target 已提前从配置删除，标记仍让该节点保持恢复模式；若共享配置被误改为另一个 target，
-该节点会拒绝启动。只有落盘和应用追平后程序才删除并同步该标记。不要手工删除它来绕过检查。
+这个标记记录开始恢复时的本地 `raft_id`。其完整生命周期与安全约束如下：
+- **生成时机**：无论是通过隐式自动检测激活，还是通过显式配置 `recover_from_peers` 启动，均在检测到隔离后由程序原子写入并 fsync。
+- **跨重启保持**：即使进程中途重启，甚至 target 已提前从配置删除，只要该标记存在，仍强制锁定在恢复模式；若共享配置被误改为另一个 target，该节点会拒绝启动。
+- **完成时强校验**：当日志与状态机追平调用 `finish()` 退出恢复时，程序**强制要求该标记文件必须切实存在于磁盘**。若被运维手工提前删除，恢复流程将直接 fail-closed 报错并拒绝退出隔离。严禁手工删除它来试图绕过检查。
+- **正常删除**：只有落盘和应用状态追平、通过当前会话验证后，程序才会在 `finish()` 中通过 `remove_file()` 删除该标记，并对父目录调用 `sync_all()` 持久化目录变更。
+
 清空目标成员重新恢复时，可以保留这个已知 marker；启动目录检查会忽略 journal 根目录中
 精确匹配的 marker，但 meta 中的 marker 或任何其他未知文件仍会被拒绝。
 
