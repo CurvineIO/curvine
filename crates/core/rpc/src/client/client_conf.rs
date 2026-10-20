@@ -42,16 +42,6 @@ pub struct ClientConf {
     pub rpc_timeout_ms: u64,
     pub data_timeout_ms: u64,
 
-    /// Upper bound on send-side silence for raw (non-buffered) connections.
-    ///
-    /// A raw client owns its frame exclusively and has no timer, so it cannot
-    /// emit heartbeats on its own: the owning write path pokes the frame from
-    /// wherever it waits for the next chunk. `None`/`0` disables the heartbeat
-    /// and preserves the previous behaviour. When enabled it must stay well
-    /// below the peer's idle timeout, otherwise the peer reaps the connection
-    /// before a heartbeat can refresh it.
-    pub heartbeat_interval_ms: u64,
-
     // How many connections can be used when connecting to share.
     pub conn_size: usize,
 
@@ -81,15 +71,6 @@ impl ClientConf {
             Duration::from_millis(self.io_retry_min_sleep_ms),
             Duration::from_millis(self.io_retry_max_sleep_ms),
         )
-    }
-
-    /// Send-side idle period after which a heartbeat is due.
-    ///
-    /// Half the peer's idle timeout is the right ratio: two heartbeats land
-    /// inside every peer window, so a single lost or delayed frame cannot get a
-    /// healthy connection reaped.
-    pub fn heartbeat_period(&self) -> Option<Duration> {
-        (self.heartbeat_interval_ms > 0).then(|| Duration::from_millis(self.heartbeat_interval_ms))
     }
 }
 
@@ -125,11 +106,6 @@ impl Default for ClientConf {
             conn_timeout_ms: 30 * 1000,
             rpc_timeout_ms: 2 * 60 * 1000,
             data_timeout_ms: 2 * 60 * 1000,
-
-            // Off by default: enabling it only matters for peers that reap
-            // idle connections, and turning it on changes the wire behaviour of
-            // every raw connection, so it stays an explicit opt-in.
-            heartbeat_interval_ms: 0,
 
             conn_size: 1,
 

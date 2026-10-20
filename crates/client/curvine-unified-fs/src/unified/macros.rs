@@ -99,15 +99,6 @@ macro_rules! impl_writer_for_enum {
                 }
             }
 
-            async fn keepalive(&mut self) -> ::curvine_error::FsResult<()> {
-                match self {
-                    $(
-                        $(#[$cfg])*
-                        Self::$variant(v) => v.keepalive().await,
-                    )+
-                }
-            }
-
             async fn complete(&mut self) -> ::curvine_error::FsResult<()> {
                 match self {
                     $(

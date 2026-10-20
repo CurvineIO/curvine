@@ -88,15 +88,6 @@ impl WriterAdapter {
         }
     }
 
-    /// Only the remote arm owns a network connection worth keeping alive; a
-    /// local write never goes idle on a socket.
-    async fn keepalive(&mut self) -> FsResult<()> {
-        match self {
-            Local(_) => Ok(()),
-            Remote(f) => f.keepalive().await,
-        }
-    }
-
     async fn complete(&mut self) -> FsResult<()> {
         match self {
             Local(f) => f.complete().await,
@@ -249,17 +240,6 @@ impl BlockWriter {
 
     pub fn blocking_write(&mut self, rt: &Runtime, chunk: DataSlice) -> FsResult<()> {
         rt.block_on(self.write(chunk))
-    }
-
-    pub async fn keepalive(&mut self) -> FsResult<()> {
-        // Purely a liveness signal: a replica whose write connection is already
-        // dead has nothing to keep alive here, and its own data path will surface
-        // the failure. Failing the whole keepalive would turn a probe into an
-        // error the caller must handle for no benefit.
-        for writer in self.inners.iter_mut() {
-            let _ = writer.keepalive().await;
-        }
-        Ok(())
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {

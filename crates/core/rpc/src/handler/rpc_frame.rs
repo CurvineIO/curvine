@@ -24,7 +24,6 @@ use curvine_sys::RawIOSlice;
 use std::io;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
@@ -42,12 +41,6 @@ pub struct RpcFrame {
     io: TcpStream,
     buf: FrameBuf,
     enable_splice: bool,
-    /// Send-side idle heartbeat period. `None` disables it (server frames and
-    /// buffer clients own their own liveness handling).
-    heartbeat: Option<Duration>,
-    /// When the last frame was written. Only touched by the send path, so the
-    /// hot path pays one relaxed clock read per write and nothing else.
-    last_write: Instant,
 }
 
 impl RpcFrame {
@@ -62,63 +55,11 @@ impl RpcFrame {
             io,
             buf: FrameBuf::new(buffer_size),
             enable_splice,
-            heartbeat: None,
-            last_write: Instant::now(),
         }
     }
 
     pub fn with_client(io: TcpStream, buffer_size: usize) -> Self {
         Self::new(io, buffer_size, false)
-    }
-
-    /// Arms the idle heartbeat with `period`, and returns the same frame.
-    ///
-    /// The period is the maximum silence the peer tolerates: the caller pokes
-    /// the frame from wherever it naturally waits for work, and a heartbeat is
-    /// emitted only once that much time has actually passed. There is no timer
-    /// thread and no per-write cost beyond one clock read.
-    pub fn with_heartbeat(mut self, period: Option<Duration>) -> Self {
-        self.heartbeat = period.filter(|period| !period.is_zero());
-        self
-    }
-
-    /// Emits a heartbeat if the send side has been idle for the whole period.
-    ///
-    /// Returns `true` when a frame was written. The peer drops heartbeats inside
-    /// its read loop and never answers, so this is strictly send-only: it must
-    /// not wait for a response, and it must not be called while another write is
-    /// in flight on the same frame.
-    pub async fn heartbeat_if_idle(&mut self) -> IOResult<bool> {
-        let Some(period) = self.heartbeat else {
-            return Ok(false);
-        };
-        if self.last_write.elapsed() < period {
-            return Ok(false);
-        }
-
-        let beat = Message::heartbeat();
-        self.write_message(&beat).await?;
-        Ok(true)
-    }
-
-    /// Writes one encoded message and stamps the send clock.
-    async fn write_message(&mut self, msg: &Message) -> IOResult<()> {
-        msg.encode_protocol(&mut self.buf);
-        self.io.write_all(&self.buf.split()).await?;
-
-        if let Some(h) = &msg.header {
-            self.io.write_all(h).await?;
-        }
-
-        self.write_region(&msg.data).await?;
-        self.io.flush().await?;
-
-        // Only a heartbeat-armed frame can ever read this stamp, so a plain
-        // server or disabled client frame pays nothing on the write path.
-        if self.heartbeat.is_some() {
-            self.last_write = Instant::now();
-        }
-        Ok(())
     }
 
     pub fn with_server(io: TcpStream, conf: &ServerConf) -> Self {
@@ -282,7 +223,20 @@ impl AsRawFd for RpcFrame {
 
 impl Frame for RpcFrame {
     async fn send(&mut self, msg: impl RefMessage) -> IOResult<()> {
-        self.write_message(msg.as_ref()).await
+        let msg = msg.as_ref();
+        msg.encode_protocol(&mut self.buf);
+        self.io.write_all(&self.buf.split()).await?;
+
+        // message header part
+        if let Some(h) = &msg.header {
+            self.io.write_all(h).await?;
+        }
+
+        // message data section.
+        self.write_region(&msg.data).await?;
+
+        self.io.flush().await?;
+        Ok(())
     }
 
     async fn receive(&mut self) -> IOResult<Message> {

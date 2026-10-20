@@ -83,12 +83,7 @@ impl RpcClient {
     }
 
     pub async fn with_raw(addr: &InetAddr, conf: &ClientConf) -> IOResult<Self> {
-        // Raw connections keep their frame whole, so this is the only place a
-        // send-side idle heartbeat can be armed. Buffered clients split the frame
-        // and heartbeat from their own sender loop instead.
-        let client = RawClient::new(addr, conf)
-            .await?
-            .with_heartbeat_period(conf.heartbeat_period());
+        let client = RawClient::new(addr, conf).await?;
         Ok(Self {
             sender: BoxSender::Frame(RawPtr::from_owned(client.frame)),
             state: Arc::new(client.state),
@@ -136,24 +131,6 @@ impl RpcClient {
 
     pub async fn timeout_rpc(&self, dur: Duration, msg: impl RefMessage) -> IOResult<Message> {
         timeout(dur, self.rpc(msg)).await?
-    }
-
-    /// Sends a heartbeat when this connection has been send-idle for the
-    /// configured period.
-    ///
-    /// Only raw connections can honour this: a frame is owned exclusively and a
-    /// buffered client already heartbeats from its own sender loop. Returns
-    /// `false` for buffered clients and for connections that are not yet due, so
-    /// callers may poke this on every idle turn without extra bookkeeping.
-    ///
-    /// The peer consumes heartbeats inside its read loop and never replies, so
-    /// this must never be treated as an RPC: it cannot wait for a response, and
-    /// the caller must not have another write in flight on the same frame.
-    pub async fn heartbeat_if_idle(&self) -> IOResult<bool> {
-        match &self.sender {
-            BoxSender::Frame(f) => f.as_mut().heartbeat_if_idle().await,
-            BoxSender::Channel(_) => Ok(false),
-        }
     }
 
     // @todo Next consider using unsafe instead of arc.

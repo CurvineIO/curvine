@@ -132,10 +132,6 @@ impl Writer for FsWriter {
         self.inner.flush().await
     }
 
-    // The idle heartbeat lives inside the buffer's writer task: it owns the block
-    // writers and is the only place that observes the wait for the next chunk. A
-    // caller-facing keepalive here would add nothing.
-
     // Write is completed, perform the following operations
     // 1. Submit the last block.
     async fn complete(&mut self) -> FsResult<()> {

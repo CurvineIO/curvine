@@ -30,7 +30,6 @@ use log::warn;
 use std::hash::BuildHasherDefault;
 use std::mem;
 use std::sync::Arc;
-use std::time::Duration;
 
 pub struct FsWriterBase {
     fs_context: Arc<FsContext>,
@@ -177,34 +176,6 @@ impl FsWriterBase {
 
     pub async fn flush(&mut self) -> FsResult<()> {
         self.complete0(true, None).await?;
-        Ok(())
-    }
-
-    /// How long the buffer may wait for work before refreshing its connections.
-    ///
-    /// `None` means no heartbeat is configured, so the wait stays unbounded and
-    /// the loop behaves exactly as before. When a heartbeat is configured the
-    /// wait uses the same period, which guarantees a refresh lands inside every
-    /// peer idle window even when the stream is completely quiet.
-    /// Read straight from the client config: this sits on the writer loop and is
-    /// evaluated once per chunk boundary, so it must not rebuild a config value.
-    pub fn keepalive_interval(&self) -> Option<Duration> {
-        let period_ms = self.fs_context.conf().client.rpc_heartbeat_interval_ms;
-        (period_ms > 0).then(|| Duration::from_millis(period_ms))
-    }
-
-    /// Keeps every in-flight block's write connection alive.
-    ///
-    /// Only writers that are still open matter: a completed block has already
-    /// handed its connection back, so poking those would add work without
-    /// protecting anything.
-    pub async fn keepalive(&mut self) -> FsResult<()> {
-        if let Some(writer) = self.cur_writer.as_mut() {
-            writer.keepalive().await?;
-        }
-        for (_, writer) in self.cache_writers.iter_mut() {
-            writer.keepalive().await?;
-        }
         Ok(())
     }
 

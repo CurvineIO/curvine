@@ -100,16 +100,6 @@ impl BlockWriterRemote {
         self.seq_id
     }
 
-    /// Keeps this block's write connection alive while the caller is busy
-    /// elsewhere (typically reading the next source chunk).
-    ///
-    /// No-op until the connection has been send-idle for the configured period,
-    /// so a caller in a read/write loop can invoke it unconditionally on the read
-    /// side without adding latency or wire traffic to the write path.
-    pub async fn keepalive(&mut self) -> FsResult<()> {
-        self.client.heartbeat_if_idle().await
-    }
-
     // Write data.
     pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
         let len = chunk.len() as i64;
