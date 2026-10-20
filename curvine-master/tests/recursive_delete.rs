@@ -156,6 +156,7 @@ fn recursive_delete_collects_nonempty_blocks_before_detaching_tree() {
             worker.startup_time_ms,
             vec![],
             None,
+            false,
         )
         .unwrap();
     let mut actual = Vec::new();

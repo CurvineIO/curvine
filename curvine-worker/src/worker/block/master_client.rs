@@ -153,16 +153,13 @@ impl MasterClient {
             req.storages.push(ProtoUtils::storage_info_to_pb(item));
         }
 
-        let rep_header: WorkerHeartbeatResponse = if matches!(
-            status,
-            HeartbeatStatus::Start | HeartbeatStatus::Running
-        ) {
-            self.fs_client
-                .rpc_blocking_all_masters(RpcCode::WorkerHeartbeat, req)?
-        } else {
-            self.fs_client
-                .rpc_blocking(RpcCode::WorkerHeartbeat, req)?
-        };
+        let rep_header: WorkerHeartbeatResponse =
+            if matches!(status, HeartbeatStatus::Start | HeartbeatStatus::Running) {
+                self.fs_client
+                    .rpc_blocking_all_masters(RpcCode::WorkerHeartbeat, req)?
+            } else {
+                self.fs_client.rpc_blocking(RpcCode::WorkerHeartbeat, req)?
+            };
         match status {
             HeartbeatStatus::Start => self.registration.mark_start(),
             HeartbeatStatus::Running => self.registration.mark_running(),

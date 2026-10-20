@@ -327,7 +327,6 @@ impl JavaFilesystem {
             pending_files: Some(status.pending_files),
             loading_files: Some(status.loading_files),
             source_type: Some(i32::from(status.source_type)),
-            transfer_job_id: status.transfer_job_id,
             tasks: status
                 .tasks
                 .into_iter()

@@ -190,6 +190,7 @@ mod tests {
     use curvine_config::RaftPeer;
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn transient_propose_failure_keeps_the_batch() {
         Master::init_test_metrics();
         let mut conf = JournalConf::default();

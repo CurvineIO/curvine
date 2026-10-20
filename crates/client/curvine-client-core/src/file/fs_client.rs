@@ -1227,11 +1227,7 @@ impl FsClient {
         let mut replies = Vec::new();
         let mut last_error = None;
         for id in ids {
-            match self
-                .connector
-                .timeout_rpc::<FsError>(id, msg.clone())
-                .await
-            {
+            match self.connector.timeout_rpc::<FsError>(id, msg.clone()).await {
                 Ok(response) => replies.push((id, response)),
                 Err((_, error)) => {
                     warn!(
@@ -1262,8 +1258,7 @@ impl FsClient {
                 self.connector
                     .change_leader(ClusterConnector::DEFAULT_LEADER_ID);
                 Err(last_error
-                    .unwrap_or_else(|| FsError::journal_unavailable("heartbeat reached no master"))
-                    .into())
+                    .unwrap_or_else(|| FsError::journal_unavailable("heartbeat reached no master")))
             }
         }
     }

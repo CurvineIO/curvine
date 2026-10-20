@@ -216,7 +216,11 @@ mod tests {
     #[test]
     fn permanent_ufs_failure_defers_and_worker_gaps_do_not() {
         assert!(should_defer_ufs("UFS permission denied", 1, 1000));
-        assert!(should_defer_ufs("export job failed: credential rejected", 1, 1000));
+        assert!(should_defer_ufs(
+            "export job failed: credential rejected",
+            1,
+            1000
+        ));
         assert!(!should_defer_ufs("No workers available", 1000, 1000));
         assert!(!should_defer_ufs("Connection refused", 1000, 1000));
         assert!(!should_defer_ufs("NotLeader", 5, 1000));
@@ -226,7 +230,11 @@ mod tests {
             1000
         ));
         assert!(!should_defer_ufs("export job failed: worker busy", 3, 1000));
-        assert!(should_defer_ufs("export job failed: worker busy", 1000, 1000));
+        assert!(should_defer_ufs(
+            "export job failed: worker busy",
+            1000,
+            1000
+        ));
     }
 
     #[test]

@@ -86,8 +86,7 @@ impl JournalWriter {
         if self.recovery.rejects_writes() {
             return Err(FsError::journal_unavailable(
                 "journal writer is not accepting writes",
-            )
-            .into());
+            ));
         }
         debug!("send_entry {:?}", entry);
         self.sender.send(entry)?;
@@ -381,8 +380,7 @@ impl JournalWriter {
         if self.recovery.rejects_writes() {
             return Err(FsError::journal_unavailable(
                 "journal writer is not accepting writes",
-            )
-            .into());
+            ));
         }
 
         let entry = UfsAppliedEntry {
@@ -404,8 +402,7 @@ impl JournalWriter {
         if self.recovery.rejects_writes() {
             return Err(FsError::journal_unavailable(
                 "journal writer is not accepting writes",
-            )
-            .into());
+            ));
         }
         self.metrics.journal_queue_len.inc();
         self.sender.send(JournalEntry::UfsDeferred(entry))?;
@@ -703,7 +700,9 @@ mod tests {
     fn safe_mode_rejects_metadata_writes() -> FsResult<()> {
         let conf = test_conf("writer_safe_mode");
         let writer = build_writer(&conf)?;
-        writer.recovery.enter_safe_mode("failed to deserialize journal batch");
+        writer
+            .recovery
+            .enter_safe_mode("failed to deserialize journal batch");
         let error = writer
             .log_ufs_applied(1, 1, 1)
             .expect_err("safe mode must reject journal writes");

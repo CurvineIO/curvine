@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockMeta, BlockStore, HeartbeatTask, MasterClient, MasterRegistration};
+use crate::worker::block::{
+    BlockMeta, BlockStore, HeartbeatTask, MasterClient, MasterRegistration,
+};
 use curvine_client_core::file::FsContext;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};

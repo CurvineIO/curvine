@@ -22,7 +22,9 @@ use crate::master::journal::*;
 use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::InodeId;
-use crate::master::{JobManager, Master, MasterMetrics, MountManager, SyncFsDir, SyncWorkerManager};
+use crate::master::{
+    JobManager, Master, MasterMetrics, MountManager, SyncFsDir, SyncWorkerManager,
+};
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, ternary, CommonResult};
 use curvine_error::FsError;
@@ -91,9 +93,9 @@ impl JournalLoader {
         let recovery = RecoveryGate::new();
         let journal_writer = Arc::new(JournalWriter::new(true, client, conf, recovery.clone())?);
         let log_store = RocksLogStorage::from_conf(conf, false);
-        let worker_manager = SyncWorkerManager::new(
-            crate::master::fs::WorkerManager::new(&curvine_config::ClusterConf::default())?,
-        );
+        let worker_manager = SyncWorkerManager::new(crate::master::fs::WorkerManager::new(
+            &curvine_config::ClusterConf::default(),
+        )?);
         Self::build(
             rt,
             fs_dir,
@@ -590,7 +592,8 @@ impl JournalLoader {
                                     Self::complete_entry_ack(msg, Err(error.into()));
                                 }
                                 ApplyDisposition::Retry => {
-                                    if !logged_skip_ignored && self.skip_failed_ufs_replay_after_retry
+                                    if !logged_skip_ignored
+                                        && self.skip_failed_ufs_replay_after_retry
                                     {
                                         error!(
                                             "skip_failed_ufs_replay_after_retry is ignored; transient apply errors keep retrying (max_retry_num={})",
@@ -735,20 +738,22 @@ impl JournalLoader {
             }
         };
         let Some(entry) = list.into_iter().next() else {
-            return UfsDrive::Retry(format!(
-                "ufs replay waiting for log entry {}",
-                cursor + 1
-            ));
+            return UfsDrive::Retry(format!("ufs replay waiting for log entry {}", cursor + 1));
         };
         if entry.index > target {
             return UfsDrive::CaughtUp;
         }
         if entry.get_entry_type() != EntryType::EntryNormal || entry.data.is_empty() {
-            return self.finish_ufs_entry(&entry, generation, AppliedIndex {
-                term: entry.term,
-                index: entry.index,
-                ..Default::default()
-            }, false);
+            return self.finish_ufs_entry(
+                &entry,
+                generation,
+                AppliedIndex {
+                    term: entry.term,
+                    index: entry.index,
+                    ..Default::default()
+                },
+                false,
+            );
         }
         let batch = match JournalBatch::decode(&entry.data) {
             Ok(batch) => batch,
@@ -757,11 +762,16 @@ impl JournalLoader {
                     "skip failed journal batch during UFS replay, entry index={}, error={}",
                     entry.index, e
                 );
-                return self.finish_ufs_entry(&entry, generation, AppliedIndex {
-                    term: entry.term,
-                    index: entry.index,
-                    ..Default::default()
-                }, false);
+                return self.finish_ufs_entry(
+                    &entry,
+                    generation,
+                    AppliedIndex {
+                        term: entry.term,
+                        index: entry.index,
+                        ..Default::default()
+                    },
+                    false,
+                );
             }
             Err(e) => {
                 self.recovery.enter_safe_mode(&e.to_string());
@@ -787,13 +797,11 @@ impl JournalLoader {
             }
         }
         if needs_worker && self.live_worker_count() == 0 {
-            self.recovery
-                .set_pending(target.saturating_sub(cursor));
+            self.recovery.set_pending(target.saturating_sub(cursor));
             return UfsDrive::WaitWorkers;
         }
         for op in &ufs_ops {
-            if generation != self.recovery.generation() || !self.is_leader.load(Ordering::Acquire)
-            {
+            if generation != self.recovery.generation() || !self.is_leader.load(Ordering::Acquire) {
                 return UfsDrive::Stopped;
             }
             if let Err(e) = self.ufs_loader.apply_entry(op).await {
@@ -802,8 +810,7 @@ impl JournalLoader {
                     self.recovery.enter_safe_mode(&message);
                     return UfsDrive::Stopped;
                 }
-                self.recovery
-                    .set_pending(target.saturating_sub(cursor));
+                self.recovery.set_pending(target.saturating_sub(cursor));
                 return UfsDrive::Retry(message);
             }
         }
@@ -940,8 +947,7 @@ impl JournalLoader {
             return UfsDrive::WaitWorkers;
         }
         for op in &ops {
-            if generation != self.recovery.generation() || !self.is_leader.load(Ordering::Acquire)
-            {
+            if generation != self.recovery.generation() || !self.is_leader.load(Ordering::Acquire) {
                 return UfsDrive::Stopped;
             }
             if let Err(e) = self.ufs_loader.apply_entry(op).await {
@@ -1611,7 +1617,10 @@ mod tests {
             state.ufs_applied.index, 0,
             "leader metadata apply must not advance the UFS watermark"
         );
-        assert_eq!(state.applied.index, 2, "leader metadata watermark still advances");
+        assert_eq!(
+            state.applied.index, 2,
+            "leader metadata watermark still advances"
+        );
 
         drop(loader);
         js.shutdown();
@@ -1630,9 +1639,7 @@ mod tests {
             .block_on(loader.apply(true, ApplyMsg::new_entry(corrupt_entry(1, 5))))
             .expect_err("corrupt batch must fail replay when ignore_reply_error is false");
         assert!(
-            error
-                .to_string()
-                .contains("failed to decode journal batch"),
+            error.to_string().contains("failed to decode journal batch"),
             "unexpected error: {}",
             error
         );

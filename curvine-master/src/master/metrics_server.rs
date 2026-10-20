@@ -398,8 +398,14 @@ mod tests {
     #[test]
     fn leader_rollout_waits_for_ufs_and_follower_does_not() {
         let leader_behind = view_for(RoleState::Leader, false, false);
-        assert_eq!(recovery_status(leader_behind).0, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(rollout_status(leader_behind).0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            recovery_status(leader_behind).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            rollout_status(leader_behind).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
 
         let leader_caught_up = view_for(RoleState::Leader, false, true);
         assert_eq!(recovery_status(leader_caught_up).0, StatusCode::OK);

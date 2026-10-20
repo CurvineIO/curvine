@@ -147,14 +147,8 @@ mod tests {
 
     #[test]
     fn readyz_requires_start_and_running_heartbeat() {
-        assert_eq!(
-            worker_ready(true, false).0,
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(
-            worker_ready(false, true).0,
-            StatusCode::SERVICE_UNAVAILABLE
-        );
+        assert_eq!(worker_ready(true, false).0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(worker_ready(false, true).0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(worker_ready(true, true).0, StatusCode::OK);
     }
 
