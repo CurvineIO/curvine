@@ -70,6 +70,13 @@ impl TaskContext {
         }
     }
 
+    /// Last progress transition timestamp, without cloning the message or the
+    /// block-location list. The retention reaper scans the whole task store on
+    /// every sweep, so it must not pay a per-task heap copy to read one number.
+    pub fn update_time(&self) -> i64 {
+        self.progress_lock().update_time
+    }
+
     pub fn set_failed(&self, message: impl Into<String>) -> JobTaskProgress {
         let mut lock = self.progress_lock();
         if self.is_cancel() {

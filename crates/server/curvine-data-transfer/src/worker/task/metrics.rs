@@ -20,6 +20,8 @@ use curvine_model::JobTaskState;
 use once_cell::sync::OnceCell;
 use std::fmt::{Debug, Formatter};
 
+use crate::worker::task::task_progress_reporter::ReportOutcome;
+
 static WORKER_TRANSFER_METRICS: OnceCell<WorkerTransferMetrics> = OnceCell::new();
 
 pub struct WorkerTransferMetrics {
@@ -35,6 +37,9 @@ pub struct WorkerTransferMetrics {
     tasks_active: Gauge,
     tasks_running: Gauge,
     tasks_queued: Gauge,
+    terminal_retained: Gauge,
+    terminal_retention_age_seconds: Gauge,
+    evicted_total: CounterVec,
     permits_available: Gauge,
     permits_max: Gauge,
     inflight_budget_bytes: Gauge,
@@ -153,6 +158,22 @@ impl WorkerTransferMetrics {
                 "Transfer tasks waiting for a worker concurrency permit",
             )
             .map_err(|err| FsError::common(err.to_string()))?,
+            terminal_retained: m::new_gauge(
+                "worker_transfer_terminal_retained_tasks",
+                "Finished transfer task contexts kept for a scheduler stale probe",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            terminal_retention_age_seconds: m::new_gauge(
+                "worker_transfer_terminal_retention_age_seconds",
+                "Age of the oldest finished transfer task context kept for a scheduler stale probe, -1 when none is retained",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            evicted_total: m::new_counter_vec(
+                "worker_transfer_task_evicted_total",
+                "Transfer task contexts evicted from the worker task store, by reason",
+                &["reason"],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
             permits_available: m::new_gauge(
                 "worker_transfer_task_permits_available",
                 "Available transfer task concurrency permits on this worker",
@@ -222,6 +243,25 @@ impl WorkerTransferMetrics {
 
     pub fn dec_active(&self) {
         self.tasks_active.dec();
+    }
+
+    /// Publishes the authoritative number of tracked task contexts.
+    ///
+    /// The gauge is reconciled from the store size rather than incremented in
+    /// place: a superseded submit replaces an entry without adding one, so
+    /// pairing `inc`/`dec` with entry mutations drifts over time.
+    pub fn set_active(&self, count: usize) {
+        self.tasks_active.set(count as i64);
+    }
+
+    pub fn set_terminal_retained(&self, count: usize, oldest_age_seconds: Option<i64>) {
+        self.terminal_retained.set(count as i64);
+        self.terminal_retention_age_seconds
+            .set(oldest_age_seconds.unwrap_or(-1));
+    }
+
+    pub fn inc_evicted(&self, reason: &str) {
+        self.evicted_total.with_label_values(&[reason]).inc();
     }
 
     pub fn inc_running(&self) {
@@ -329,18 +369,17 @@ pub fn record_task_outcome(
 }
 
 /// Records the outcome of an awaited progress report RPC.
-pub fn record_report_result(result: &FsResult<()>) {
-    record_metric(|metrics| match result {
-        Ok(()) => metrics.inc_report("success"),
-        Err(err) => {
-            let label = if err.to_string().contains("rejected") {
-                "rejected"
-            } else {
-                "failure"
-            };
-            metrics.inc_report(label);
-        }
+pub fn record_report_outcome(outcome: &FsResult<ReportOutcome>) {
+    record_metric(|metrics| match outcome {
+        Ok(ReportOutcome::Accepted) => metrics.inc_report("success"),
+        Ok(ReportOutcome::Rejected) => metrics.inc_report("rejected"),
+        Err(_) => metrics.inc_report("failure"),
     });
+}
+
+/// Records one reaped task context, by why it was evicted.
+pub fn record_task_evicted(reason: &str) {
+    record_metric(|metrics| metrics.inc_evicted(reason));
 }
 
 pub fn record_metric(f: impl FnOnce(&WorkerTransferMetrics)) {
@@ -384,16 +423,22 @@ mod tests {
     }
 
     #[test]
-    fn record_report_result_counts_only_awaited_rpc_outcomes() {
+    fn record_report_outcome_separates_fencing_from_transport_failure() {
         WorkerTransferMetrics::get().expect("register worker transfer metrics");
         let before_success = report_count("success");
+        let before_rejected = report_count("rejected");
         let before_failure = report_count("failure");
 
-        record_report_result(&Ok(()));
+        record_report_outcome(&Ok(ReportOutcome::Accepted));
         assert_eq!(report_count("success"), before_success + 1);
+        assert_eq!(report_count("rejected"), before_rejected);
         assert_eq!(report_count("failure"), before_failure);
 
-        record_report_result(&err_box!("Transfer task report timed out after 5000 ms"));
+        record_report_outcome(&Ok(ReportOutcome::Rejected));
+        assert_eq!(report_count("rejected"), before_rejected + 1);
+        assert_eq!(report_count("failure"), before_failure);
+
+        record_report_outcome(&err_box!("Transfer task report timed out after 5000 ms"));
         assert_eq!(report_count("failure"), before_failure + 1);
     }
 

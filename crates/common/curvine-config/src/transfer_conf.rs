@@ -100,6 +100,15 @@ pub struct TransferConf {
     pub task_retention: Duration,
     #[serde(default = "TransferConf::default_task_retention_str")]
     pub task_retention_str: String,
+
+    /// How long a worker keeps a finished transfer task context that could not
+    /// be reported, so the scheduler stale probe can still read the terminal
+    /// result back. Bounded on purpose: unbounded retention accumulates one
+    /// full task plan per undelivered report for the life of the process.
+    #[serde(skip)]
+    pub worker_terminal_retention: Duration,
+    #[serde(default = "TransferConf::default_worker_terminal_retention_str")]
+    pub worker_terminal_retention_str: String,
 }
 
 impl TransferConf {
@@ -109,6 +118,10 @@ impl TransferConf {
     pub const DEFAULT_CLUSTER_SNAPSHOT_MAX_STALENESS: &'static str = "60s";
     pub const DEFAULT_TERMINAL_RETENTION: &'static str = "168h";
     pub const DEFAULT_TASK_RETENTION: &'static str = "24h";
+    /// Covers several stale-probe rounds: the probe starts only after
+    /// `task_stale_timeout` (60s) and defers another `task_stale_timeout` per
+    /// unreachable attempt, so 10 minutes leaves room for retries.
+    pub const DEFAULT_WORKER_TERMINAL_RETENTION: &'static str = "10m";
     pub const DEFAULT_MAX_PLANNING_TRANSFERS: usize = 8;
     pub const DEFAULT_PLANNING_BATCH_SIZE: usize = 1000;
     pub const DEFAULT_WORKER_DISPATCH_CONCURRENCY: usize = 256;
@@ -160,6 +173,8 @@ impl TransferConf {
         self.terminal_retention =
             DurationUnit::from_str(&self.terminal_retention_str)?.as_duration();
         self.task_retention = DurationUnit::from_str(&self.task_retention_str)?.as_duration();
+        self.worker_terminal_retention =
+            DurationUnit::from_str(&self.worker_terminal_retention_str)?.as_duration();
         if self.task_retention.is_zero() || self.task_retention > self.terminal_retention {
             return Err(FsError::common(
                 "transfer.task_retention must satisfy 0 < task_retention <= terminal_retention",
@@ -400,6 +415,10 @@ impl TransferConf {
         Self::DEFAULT_TASK_RETENTION.to_string()
     }
 
+    fn default_worker_terminal_retention_str() -> String {
+        Self::DEFAULT_WORKER_TERMINAL_RETENTION.to_string()
+    }
+
     pub fn scheduler_workers(&self) -> usize {
         Self::DEFAULT_MAX_PLANNING_TRANSFERS
             .min(self.max_running_transfers.max(1))
@@ -493,6 +512,8 @@ impl Default for TransferConf {
             terminal_retention_str: Self::DEFAULT_TERMINAL_RETENTION.to_string(),
             task_retention: Duration::default(),
             task_retention_str: Self::DEFAULT_TASK_RETENTION.to_string(),
+            worker_terminal_retention: Duration::default(),
+            worker_terminal_retention_str: Self::DEFAULT_WORKER_TERMINAL_RETENTION.to_string(),
         }
     }
 }

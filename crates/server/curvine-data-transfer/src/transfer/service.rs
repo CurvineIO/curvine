@@ -658,11 +658,12 @@ where
         if state != TransferTaskState::Running {
             return Ok(false);
         }
-        match self.report_task_with_state(report, state) {
-            Ok(accepted) => Ok(accepted),
-            Err(FsError::TransferOverloaded(_)) => Ok(false),
-            Err(err) => Err(err),
-        }
+        // Overload is not a verdict. `false` means the store refused this report
+        // because the attempt lost ownership, and a worker treats that as final;
+        // a full queue is transient and must stay retryable. The batch shares one
+        // error for the whole call, so report it as an error and let the worker
+        // retry the group rather than telling it every task was fenced.
+        self.report_task_with_state(report, state)
     }
 
     fn report_task_with_state(

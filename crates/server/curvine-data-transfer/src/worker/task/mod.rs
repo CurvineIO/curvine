@@ -19,6 +19,7 @@ mod load_task_runner;
 pub use self::load_task_runner::LoadTaskRunner;
 
 mod task_progress_reporter;
+pub use self::task_progress_reporter::ReportOutcome;
 
 #[cfg(test)]
 #[path = "tests/task_progress_reporter_test.rs"]
@@ -37,8 +38,11 @@ pub use self::task_store::TaskStore;
 mod task_context;
 pub use self::task_context::TaskContext;
 
+mod task_reaper;
+pub use self::task_reaper::{reap_finished_tasks, EvictReason, TerminalRetention};
+
 mod metrics;
 pub use self::metrics::{
-    record_metric, record_report_result, record_task_outcome, transfer_kind_label,
-    WorkerTransferMetrics,
+    record_metric, record_report_outcome, record_task_evicted, record_task_outcome,
+    transfer_kind_label, WorkerTransferMetrics,
 };

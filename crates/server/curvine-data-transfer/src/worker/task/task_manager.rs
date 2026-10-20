@@ -16,7 +16,8 @@ use crate::common::UfsFactory;
 use crate::worker::task::load_task_runner::LoadTaskRunner;
 use crate::worker::task::task_progress_reporter::{TaskProgressReporter, TransferProgressBatcher};
 use crate::worker::task::{
-    record_metric, record_task_outcome, TaskContext, TaskStore, WorkerTransferMetrics,
+    reap_finished_tasks, record_metric, record_task_outcome, TaskContext, TaskStore,
+    TerminalRetention, WorkerTransferMetrics,
 };
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::ClusterConf;
@@ -56,6 +57,8 @@ pub struct TaskManager {
     task_timeout_ms: Arc<AtomicU64>,
     /// Runtime load-task progress report interval, read at submit.
     task_report_interval_ms: Arc<AtomicU64>,
+    /// Bounded retention for finished task contexts kept for a stale probe.
+    terminal_retention: TerminalRetention,
     /// Fixed transfer-report interval from conf (0 = follow the job one).
     transfer_report_interval_ms: u64,
     /// Runtime in-flight byte budget. It starts at
@@ -203,6 +206,7 @@ impl TaskManager {
                 .task_report_interval
                 .min(conf.transfer.task_report_interval)
         };
+        let terminal_retention = TerminalRetention::new(conf.transfer.worker_terminal_retention);
         let mgr = Self {
             rt,
             fs,
@@ -222,6 +226,7 @@ impl TaskManager {
                 conf.job.task_report_interval.as_millis() as u64,
             )),
             transfer_report_interval_ms: transfer_progress_interval.as_millis() as u64,
+            terminal_retention,
             inflight_budget_bytes: Arc::new(AtomicI64::new(
                 curvine_config::TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES,
             )),
@@ -230,8 +235,28 @@ impl TaskManager {
         record_metric(|metrics| {
             metrics.set_inflight_budget_bytes(mgr.transfer_inflight_budget_bytes())
         });
+        mgr.start_terminal_reaper();
 
         Ok(mgr)
+    }
+
+    /// Periodically releases finished contexts whose stale-probe window closed.
+    ///
+    /// The sweep interval is derived from the retention so it keeps the oldest
+    /// retained context at most one sweep past its window; the floor keeps a very
+    /// small window from spinning.
+    fn start_terminal_reaper(&self) {
+        let tasks = self.tasks.clone();
+        let retention = self.terminal_retention.clone();
+        let sweep = (retention.ttl() / 10)
+            .max(Duration::from_secs(10))
+            .min(Duration::from_secs(60));
+        self.rt.spawn(async move {
+            loop {
+                tokio::time::sleep(sweep).await;
+                reap_finished_tasks(&tasks, &retention);
+            }
+        });
     }
 
     /// Submits a load task for execution with concurrency control.
@@ -319,7 +344,6 @@ impl TaskManager {
                 }
             }
         };
-        let mut track_active = false;
 
         // Reserve before replacing an existing context. A capacity rejection
         // must leave the current task runnable; otherwise a rejected retry
@@ -380,14 +404,11 @@ impl TaskManager {
                     Err(result) => return Ok(result),
                 };
                 vac.insert(context.clone());
-                track_active = true;
                 byte_guard
             }
         };
         record_metric(|metrics| metrics.inc_submit_accepted());
-        if track_active {
-            record_metric(|metrics| metrics.inc_active());
-        }
+        record_metric(|metrics| metrics.set_active(self.tasks.len()));
         if let Some(report) = &context.info.transfer_report {
             info!(
                 "accepted transfer task: job={} run={} task={} attempt={} source={} target={}",
@@ -494,7 +515,7 @@ impl TaskManager {
                     .remove_if(&task_id, |_, ctx| Arc::ptr_eq(ctx, &context_this))
                     .is_some()
             {
-                record_metric(|metrics| metrics.dec_active());
+                record_metric(|metrics| metrics.set_active(tasks.len()));
             }
         });
 

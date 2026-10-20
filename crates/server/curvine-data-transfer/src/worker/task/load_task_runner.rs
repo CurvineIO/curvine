@@ -14,7 +14,10 @@
 
 use crate::common::UfsFactory;
 use crate::worker::task::task_progress_reporter::TaskProgressReporter;
-use crate::worker::task::{record_report_result, record_task_outcome, TaskContext};
+use crate::worker::task::{
+    record_report_outcome, record_task_evicted, record_task_outcome, EvictReason, ReportOutcome,
+    TaskContext,
+};
 use curvine_client_core::block::BlockWriterRemote;
 use curvine_client_core::file::{CurvineFileSystem, FsReader};
 use curvine_core_error::err_box;
@@ -202,15 +205,27 @@ impl LoadTaskRunner {
                     &e,
                 ));
                 let res = self.report_progress(progress).await;
-
-                if let Err(e) = res {
-                    warn!(
-                        "transfer task failure report failed: {} err={}",
-                        self.log_context(),
-                        e
-                    );
-                    self.record_outcome(&source_path, started, Some(failed_reason));
-                    return self.task.info.transfer_report.is_none();
+                match res {
+                    Ok(ReportOutcome::Rejected) => {
+                        record_task_evicted(EvictReason::Fenced.label());
+                        info!(
+                            "transfer task failure report was fenced; releasing the local task context: {}",
+                            self.log_context()
+                        );
+                    }
+                    Ok(ReportOutcome::Accepted) => {}
+                    Err(e) => {
+                        warn!(
+                            "transfer task failure report failed: {} err={}",
+                            self.log_context(),
+                            e
+                        );
+                        self.record_outcome(&source_path, started, Some(failed_reason));
+                        // Keep the finished context only when a stale probe could
+                        // still read the terminal result back. The state is already
+                        // `Failed`, so the reaper's window applies either way.
+                        return self.task.info.transfer_report.is_none();
+                    }
                 }
                 self.record_outcome(&source_path, started, Some(failed_reason));
                 return true;
@@ -288,28 +303,21 @@ impl LoadTaskRunner {
 
         let ufs_mtime = self.mark_committed_output(&stream).await?;
 
-        if let Err(err) = self.update_progress0(copied_bytes, reader_len, true).await {
-            if self.task.info.transfer_report.is_some() {
-                warn!(
-                    "final transfer task report failed, keep task for scheduler probe: {} err={}",
-                    self.log_context(),
-                    err
-                );
-                return Ok(false);
-            }
-            return Err(err);
+        let decided = self.terminal_report_decision(
+            "single-file",
+            self.update_progress0(copied_bytes, reader_len, true).await,
+        )?;
+        if decided {
+            info!(
+                "transfer task completed: {} ufs_mtime={} copied_bytes={} read_cost_us={} task_cost_us={}",
+                self.log_context(),
+                ufs_mtime,
+                copied_bytes,
+                read_cost_us,
+                task_cost_us,
+            );
         }
-
-        info!(
-            "transfer task completed: {} ufs_mtime={} copied_bytes={} read_cost_us={} task_cost_us={}",
-            self.log_context(),
-            ufs_mtime,
-            copied_bytes,
-            read_cost_us,
-            task_cost_us,
-        );
-
-        Ok(true)
+        Ok(decided)
     }
 
     async fn copy_and_commit_stream(
@@ -454,6 +462,48 @@ impl LoadTaskRunner {
         self.finish_canceled().await
     }
 
+    /// Applies the same retention decision to every terminal-report shape so
+    /// the four completion paths cannot drift apart.
+    ///
+    /// `Ok(true)` removes the local task, `Ok(false)` keeps it for the scheduler
+    /// stale probe, and `Err` propagates a failure that has no probe to recover
+    /// it (a task without a transfer report).
+    fn terminal_report_decision(
+        &self,
+        kind: &str,
+        result: FsResult<ReportOutcome>,
+    ) -> FsResult<bool> {
+        match result {
+            Ok(ReportOutcome::Rejected) => {
+                // Fencing means this attempt no longer owns the task row. The
+                // scheduler probes the current attempt and worker session, so it
+                // will never ask this worker about this context: keeping it can
+                // recover nothing and would hold a full task plan for the life
+                // of the process.
+                record_task_evicted(EvictReason::Fenced.label());
+                info!(
+                    "final {} transfer task report was fenced; releasing the local task context: {}",
+                    kind,
+                    self.log_context()
+                );
+                Ok(true)
+            }
+            Ok(ReportOutcome::Accepted) => Ok(true),
+            Err(err) => {
+                if self.task.info.transfer_report.is_none() {
+                    return Err(err);
+                }
+                warn!(
+                    "final {} transfer task report failed, keep task for scheduler probe: {} err={}",
+                    kind,
+                    self.log_context(),
+                    err
+                );
+                Ok(false)
+            }
+        }
+    }
+
     async fn finish_canceled(&self) -> FsResult<bool> {
         let progress = self.task.set_canceled("task canceled");
         if let Err(err) = self.report_progress(progress).await {
@@ -576,16 +626,8 @@ impl LoadTaskRunner {
         }
 
         let progress = self.task.update_progress(committed, total, true);
-        if let Err(err) = self.report_progress(progress).await {
-            if self.task.info.transfer_report.is_some() {
-                warn!(
-                    "final batch transfer task report failed, keep task for scheduler probe: {} err={}",
-                    self.log_context(),
-                    err
-                );
-                return Ok(false);
-            }
-            return Err(err);
+        if !self.terminal_report_decision("batch", self.report_progress(progress).await)? {
+            return Ok(false);
         }
         info!(
             "batch transfer task completed: {} files={} bytes={}",
@@ -800,16 +842,8 @@ impl LoadTaskRunner {
 
         self.task.push_block_location(located_block(&located));
         let progress = self.task.update_progress(written, plan.length, true);
-        if let Err(err) = self.report_progress(progress).await {
-            if self.task.info.transfer_report.is_some() {
-                warn!(
-                    "final segment transfer task report failed, keep task for scheduler probe: {} err={}",
-                    self.log_context(),
-                    err
-                );
-                return Ok(false);
-            }
-            return Err(err);
+        if !self.terminal_report_decision("segment", self.report_progress(progress).await)? {
+            return Ok(false);
         }
         info!(
             "segment transfer task completed: {} offset={} length={}",
@@ -955,16 +989,11 @@ impl LoadTaskRunner {
                     return self.finish_canceled().await;
                 }
                 let progress = self.task.update_progress(committed, group_total, true);
-                if let Err(err) = self.report_progress(progress).await {
-                    if self.task.info.transfer_report.is_some() {
-                        warn!(
-                            "final segment group transfer task report failed, keep task for scheduler probe: {} err={}",
-                            self.log_context(),
-                            err
-                        );
-                        return Ok(false);
-                    }
-                    return Err(err);
+                if !self.terminal_report_decision(
+                    "segment group",
+                    self.report_progress(progress).await,
+                )? {
+                    return Ok(false);
                 }
                 info!(
                     "segment group transfer task completed: {} segments_committed_bytes={} total={}",
@@ -1798,12 +1827,12 @@ impl LoadTaskRunner {
         loaded_size: i64,
         total_size: i64,
         is_last: bool,
-    ) -> FsResult<()> {
+    ) -> FsResult<ReportOutcome> {
         let progress = self.task.update_progress(loaded_size, total_size, is_last);
         self.report_progress(progress).await
     }
 
-    async fn report_progress(&self, progress: JobTaskProgress) -> FsResult<()> {
+    async fn report_progress(&self, progress: JobTaskProgress) -> FsResult<ReportOutcome> {
         let task = &self.task.info;
         if let Some(report_info) = &task.transfer_report {
             let Some(reporter) = &self.progress_reporter else {
@@ -1820,19 +1849,22 @@ impl LoadTaskRunner {
             };
             if progress.state.is_finish() {
                 let result = reporter.report_terminal(progress).await;
-                record_report_result(&result);
+                record_report_outcome(&result);
                 return result;
             }
             reporter.enqueue_progress(progress);
-            return Ok(());
+            return Ok(ReportOutcome::Accepted);
         }
 
         let result = self
             .master_client
             .report_task(&task.job.job_id, &task.task_id, progress)
             .await;
-        record_report_result(&result);
-        result
+        // The Master job path acknowledges or fails; it has no fencing class, so
+        // an `Ok` is always an accepted report.
+        let outcome = result.map(|()| ReportOutcome::Accepted);
+        record_report_outcome(&outcome);
+        outcome
     }
 
     const READ_CHUNK_BYTES: i64 = 16 * 1024 * 1024;

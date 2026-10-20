@@ -216,6 +216,9 @@ Each `curvine-worker` exposes its transfer-task metrics on `worker.web_port`
 worker_transfer_tasks_active
 worker_transfer_tasks_queued
 worker_transfer_tasks_running
+worker_transfer_terminal_retained_tasks
+worker_transfer_terminal_retention_age_seconds
+worker_transfer_task_evicted_total{reason}
 worker_transfer_task_permits_available
 worker_transfer_task_permits_max
 worker_transfer_task_submit_total{result}
@@ -229,6 +232,21 @@ worker_transfer_task_read_duration_us{state}
 worker_transfer_task_write_duration_us{state}
 worker_transfer_task_queue_duration_us{result}
 ```
+
+`worker_transfer_tasks_active` is reconciled from the task-store size, not
+incremented per submission, so a superseded submit cannot make it drift.
+
+A finished task stays in the store only while it can still answer a scheduler
+stale probe. A report the Store refused (fencing) released its attempt's
+ownership, so the probe will never ask about that context: it is dropped
+immediately and counted in `worker_transfer_task_evicted_total{reason="fenced"}`.
+A report that could not be delivered is retained for
+`transfer.worker_terminal_retention` (default `10m`, floor `2m`) and then reaped,
+counted as `reason="expired"`. `worker_transfer_terminal_retained_tasks` and
+`worker_transfer_terminal_retention_age_seconds` are the gauges that show that
+window: the age is `-1` when nothing is retained. Before this bound existed an
+undelivered or fenced terminal report kept a whole task context, including the
+encoded source block layout, for the life of the worker process.
 
 ### Transfer Discovery Feasibility
 

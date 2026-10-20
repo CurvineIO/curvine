@@ -34,6 +34,22 @@ pub(super) struct ProgressReport {
     pub(super) log_context: String,
 }
 
+/// Outcome of an awaited report RPC that the Store answered.
+///
+/// A report that was not delivered at all surfaces as `Err` instead: the two
+/// cases carry opposite retention obligations, and only the answered case has
+/// a Store verdict to act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportOutcome {
+    /// The Store persisted the report.
+    Accepted,
+    /// The Store refused the report because this attempt no longer owns the
+    /// task row (fencing predicate failed, or the row is gone/finished).
+    /// Nothing can be recovered for this attempt: the scheduler probes the
+    /// *current* attempt and worker session, never this one.
+    Rejected,
+}
+
 #[derive(Hash, Eq, PartialEq)]
 pub(super) struct ProgressReportKey {
     job_id: String,
@@ -121,7 +137,7 @@ impl TransferProgressBatcher {
         report_info: &TransferTaskReportInfo,
         progress: JobTaskProgress,
         log_context: &str,
-    ) -> FsResult<()> {
+    ) -> FsResult<ReportOutcome> {
         send_report(
             &self.transfer_client,
             job_id,
@@ -232,7 +248,7 @@ impl TaskProgressReporter {
         });
     }
 
-    pub async fn report_terminal(&self, progress: JobTaskProgress) -> FsResult<()> {
+    pub async fn report_terminal(&self, progress: JobTaskProgress) -> FsResult<ReportOutcome> {
         self.batcher
             .report_terminal(
                 &self.job_id,
@@ -252,7 +268,7 @@ async fn send_report(
     report_info: &TransferTaskReportInfo,
     progress: JobTaskProgress,
     log_context: &str,
-) -> FsResult<()> {
+) -> FsResult<ReportOutcome> {
     let accepted = tokio::time::timeout(
         Duration::from_millis(TRANSFER_REPORT_TIMEOUT_MS),
         transfer_client.report_task(job_id, task_id, report_info, progress),
@@ -264,11 +280,9 @@ async fn send_report(
             TRANSFER_REPORT_TIMEOUT_MS, log_context
         ))
     })??;
-    if !accepted {
-        return Err(FsError::common(format!(
-            "Transfer task report rejected: {}",
-            log_context
-        )));
-    }
-    Ok(())
+    Ok(if accepted {
+        ReportOutcome::Accepted
+    } else {
+        ReportOutcome::Rejected
+    })
 }
