@@ -196,6 +196,7 @@ mod tests {
                 create_time: 0,
                 overwrite: None,
                 source_type: Default::default(),
+                transfer_job_id: None,
             },
             task_id: task_id.to_string(),
             worker: WorkerAddress::default(),
