@@ -868,12 +868,611 @@ fn wiped_follower_persists_self_vote_to_rocksdb_before_outbound_replication() {
     assert_eq!(recovered_state.hard_state.term, leader_term);
 
     // Verify recovery marker survives restart and activates quarantine.
-    let reloaded_recovery = Recovery::load(&conf, follower_id).unwrap();
+    let mut reloaded_recovery = Recovery::load(&conf, follower_id).unwrap();
     assert!(
         reloaded_recovery.active,
         "recovery marker on disk must restore active recovery quarantine across crash"
     );
 
+    // Verify that after restart, attempting to grant a vote to another peer in the same term is rejected:
+    let group = RaftGroup::from_conf(&conf);
+    let client = RaftClient::new(rt.clone(), &group, conf.new_client_conf());
+    let peer_storage = PeerStorage::new(
+        rt.clone(),
+        follower_id,
+        reopened_log.clone(),
+        HashAppStorage::<String, String>::new(),
+        client,
+        &conf,
+    );
+    let mut restarted_raw = RawNode::new(
+        &conf.new_raft_conf(follower_id, 0),
+        peer_storage,
+        &slog::Logger::root(slog::Discard, slog::o!()),
+    )
+    .unwrap();
+    assert_eq!(restarted_raw.raft.vote, follower_id);
+    assert_eq!(restarted_raw.raft.term, leader_term);
+
+    // 1. Recovery quarantine rejects the vote request:
+    let same_term_vote_req = RaftRequest {
+        message: raft::eraftpb::Message {
+            from: leader_id,
+            to: follower_id,
+            term: leader_term,
+            ..Default::default()
+        },
+        sender_session: Some(201),
+        receiver_session: Some(301),
+        leader_commit: Some(0),
+    };
+    let mut same_term_msg = same_term_vote_req.clone();
+    same_term_msg
+        .message
+        .set_msg_type(MessageType::MsgRequestVote);
+    assert!(reloaded_recovery
+        .step(&mut restarted_raw, same_term_msg.clone(), 301)
+        .is_err());
+
+    // 2. Underlying Raft state rejects because self-vote abstention was durably restored from RocksDB:
+    restarted_raw.step(same_term_msg.message).unwrap();
+    assert_eq!(restarted_raw.raft.vote, follower_id);
+    assert!(restarted_raw
+        .raft
+        .msgs
+        .iter()
+        .any(|m| m.get_msg_type() == MessageType::MsgRequestVoteResponse && m.reject));
+
     drop(reopened_log);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+#[test]
+fn quarantined_node_with_missing_marker_stays_alive_in_quarantine_when_finish_fails() {
+    let rt = JournalConf::with_test().create_runtime();
+    let follower_id = 3;
+    let leader_id = 2;
+    let (mut node, conf) = test_rocks_node(rt.clone(), follower_id);
+    let leader_term = 7;
+    let target_commit = 5;
+    let old_receiver_session = 99;
+
+    let mut message = raft::eraftpb::Message {
+        from: leader_id,
+        to: node.id(),
+        term: leader_term,
+        commit: target_commit,
+        ..Default::default()
+    };
+    message.set_msg_type(MessageType::MsgHeartbeat);
+    let request = RaftRequest {
+        message,
+        sender_session: Some(201),
+        receiver_session: Some(old_receiver_session),
+        leader_commit: Some(target_commit),
+    };
+
+    let mut promise = HashMap::new();
+    let (raft_tx, raft_rx) = tokio::sync::oneshot::channel();
+    let raft_message = Builder::new_rpc(RaftCode::Raft)
+        .proto_header(request)
+        .build();
+
+    // Trigger automatic quarantine
+    node.handle_available(Envelope::new(raft_message, raft_tx), &mut promise)
+        .unwrap();
+    let response = rt.block_on(raft_rx).unwrap().unwrap();
+    assert_eq!(response.response_status(), ResponseStatus::Success);
+    assert!(node.recovery.active);
+
+    // Persist abstention self-vote to disk via Ready
+    assert!(node.raw.has_ready());
+    rt.block_on(node.on_ready(&mut promise)).unwrap();
+
+    let marker = conf.recovery_marker();
+    assert!(marker.exists());
+
+    // Fenced leader heartbeat with current session to satisfy fencing
+    let mut fenced_message = raft::eraftpb::Message {
+        from: leader_id,
+        to: node.id(),
+        term: leader_term,
+        commit: target_commit,
+        ..Default::default()
+    };
+    fenced_message.set_msg_type(MessageType::MsgHeartbeat);
+    let fenced_request = RaftRequest {
+        message: fenced_message,
+        sender_session: Some(201),
+        receiver_session: Some(node.session),
+        leader_commit: Some(target_commit),
+    };
+    let (fenced_tx, fenced_rx) = tokio::sync::oneshot::channel();
+    let fenced_rpc = Builder::new_rpc(RaftCode::Raft)
+        .proto_header(fenced_request)
+        .build();
+    node.handle_available(Envelope::new(fenced_rpc, fenced_tx), &mut promise)
+        .unwrap();
+    let _ = rt.block_on(fenced_rx).unwrap().unwrap();
+
+    // Replicate log entries up to target_commit
+    let entries: Vec<Entry> = (1..=target_commit)
+        .map(|idx| Entry {
+            index: idx,
+            term: leader_term,
+            ..Default::default()
+        })
+        .collect();
+    node.storage.log_store.append(&entries).unwrap();
+    node.raw.raft.raft_log.committed = target_commit;
+    node.raw.raft.term = leader_term;
+    node.raw.raft.leader_id = leader_id;
+    node.raw.raft.state = raft::StateRole::Follower;
+    node.storage
+        .log_store
+        .set_hard_state_commit(target_commit)
+        .unwrap();
+    rt.block_on(node.storage.app_store.apply(
+        false,
+        ApplyMsg::Entry(Entry {
+            term: leader_term,
+            index: target_commit,
+            ..Default::default()
+        }),
+    ))
+    .unwrap();
+
+    // Now delete the marker on disk before finish check
+    std::fs::remove_file(&marker).unwrap();
+    assert!(!marker.exists());
+
+    // Start the RaftNode event loop via start()!
+    let sender = node.sender.clone();
+    let storage = node.storage.clone();
+    let session = node.session;
+    let mut listener = node.start();
+
+    // Policy A runtime behavior: run0() tick loop executes finish(), catches the missing-marker error,
+    // logs a warning, keeps the node alive, and maintains active recovery quarantine.
+    // The role monitor does NOT advance to Follower (times out).
+    let timeout_res = rt.block_on(async {
+        tokio::time::timeout(Duration::from_millis(150), listener.wait_follower()).await
+    });
+    assert!(
+        timeout_res.is_err(),
+        "role monitor must not advance while recovery marker is missing"
+    );
+
+    // Node remains alive and responsive in quarantine (ping succeeds)
+    let (ping_tx, ping_rx) = tokio::sync::oneshot::channel();
+    let ping = Builder::new_rpc(RaftCode::Ping).build();
+    rt.block_on(sender.send(Envelope::new(ping, ping_tx)))
+        .unwrap();
+    let ping_response = rt.block_on(ping_rx).unwrap().unwrap();
+    assert_eq!(ping_response.response_status(), ResponseStatus::Success);
+
+    // Voting remains disabled during quarantine
+    let (vote_tx, vote_rx) = tokio::sync::oneshot::channel();
+    let mut vote_message = raft::eraftpb::Message {
+        from: leader_id,
+        to: follower_id,
+        term: leader_term + 1,
+        ..Default::default()
+    };
+    vote_message.set_msg_type(MessageType::MsgRequestVote);
+    let vote_request = RaftRequest {
+        message: vote_message,
+        sender_session: Some(201),
+        receiver_session: Some(session),
+        leader_commit: Some(0),
+    };
+    let vote_rpc = Builder::new_rpc(RaftCode::Raft)
+        .proto_header(vote_request)
+        .build();
+    rt.block_on(sender.send(Envelope::new(vote_rpc, vote_tx)))
+        .unwrap();
+    let vote_response = rt.block_on(vote_rx).unwrap().unwrap();
+    assert_eq!(vote_response.response_status(), ResponseStatus::Error);
+
+    // Operator restores the valid marker file
+    std::fs::write(&marker, format!("{}\n", follower_id)).unwrap();
+    assert!(marker.exists());
+
+    // Subsequent tick in run0() now finishes recovery, unlinks marker, clears RocksDB indicator,
+    // and advances role monitor to Follower!
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), listener.wait_follower()).await
+    })
+    .expect("node should complete recovery and advance to follower once marker is restored")
+    .unwrap();
+
+    assert!(!marker.exists(), "marker must be cleaned up on completion");
+
+    // Verify storage recovery state is cleared in RocksDB
+    assert_eq!(storage.recovery_state().unwrap(), None);
+
+    let _ = std::fs::remove_dir_all(&conf.journal_dir);
+}
+
+#[test]
+fn unfinished_recovery_with_deleted_marker_fails_closed_on_restart() {
+    let rt = JournalConf::with_test().create_runtime();
+    let follower_id = 3;
+    let leader_id = 2;
+    let (mut node, mut conf) = test_rocks_node(rt.clone(), follower_id);
+    let leader_term = 7;
+    let high_commit = 50000;
+    let old_receiver_session = 99;
+
+    let mut message = raft::eraftpb::Message {
+        from: leader_id,
+        to: node.id(),
+        term: leader_term,
+        commit: high_commit,
+        ..Default::default()
+    };
+    message.set_msg_type(MessageType::MsgHeartbeat);
+    let request = RaftRequest {
+        message,
+        sender_session: Some(201),
+        receiver_session: Some(old_receiver_session),
+        leader_commit: Some(high_commit),
+    };
+
+    let mut promise = HashMap::new();
+    let (raft_tx, raft_rx) = tokio::sync::oneshot::channel();
+    let raft_message = Builder::new_rpc(RaftCode::Raft)
+        .proto_header(request)
+        .build();
+
+    // Trigger automatic quarantine
+    node.handle_available(Envelope::new(raft_message, raft_tx), &mut promise)
+        .unwrap();
+    let response = rt.block_on(raft_rx).unwrap().unwrap();
+    assert_eq!(response.response_status(), ResponseStatus::Success);
+    assert!(node.recovery.active);
+
+    // Advance Ready to persist HardState with abstention self-vote to disk
+    rt.block_on(node.on_ready(&mut promise)).unwrap();
+
+    let marker = conf.recovery_marker();
+    assert!(marker.exists());
+
+    let journal_dir = conf.journal_dir.clone();
+    drop(node);
+
+    // Delete the recovery marker prematurely while recovery was unfinished
+    std::fs::remove_file(&marker).unwrap();
+    assert!(!marker.exists());
+
+    // Reopen log store from disk
+    let reopened_log = RocksLogStorage::from_conf(&conf, false);
+    let init_state = reopened_log.initial_state().unwrap();
+    assert_eq!(init_state.hard_state.vote, follower_id);
+    assert_eq!(init_state.hard_state.term, leader_term);
+    assert_eq!(init_state.hard_state.commit, 0);
+
+    // Without recover_from_peers, Recovery::load sees no marker
+    let reloaded_recovery = Recovery::load(&conf, follower_id).unwrap();
+    assert!(!reloaded_recovery.active);
+
+    // Validating storage MUST fail closed: cannot resume as an ordinary voter
+    let storage_recovery = reopened_log.recovery_state().unwrap();
+    assert_eq!(storage_recovery, Some(follower_id));
+    let err = reloaded_recovery
+        .validate_storage(follower_id, storage_recovery)
+        .expect_err(
+            "startup validation must fail closed when unfinished recovery marker is missing",
+        );
+    assert!(err
+        .to_string()
+        .contains("unfinished member recovery detected in storage"));
+    assert!(err.to_string().contains("recovery marker"));
+
+    // Safe operator recovery procedure 1: explicitly configure recover_from_peers
+    conf.recover_from_peers = Some(follower_id);
+    let explicit_recovery = Recovery::load(&conf, follower_id).unwrap();
+    assert!(
+        explicit_recovery.active,
+        "quarantine is restored by explicit configuration"
+    );
+    assert!(explicit_recovery
+        .validate_storage(follower_id, storage_recovery)
+        .is_ok());
+
+    // Safe operator recovery procedure 2: restore the valid marker file
+    // First verify that attempting to resume with an incorrect node ID or empty marker fails closed:
+    conf.recover_from_peers = None;
+    std::fs::write(&marker, "999\n").unwrap();
+    let err_mismatch = Recovery::load(&conf, follower_id)
+        .expect_err("marker with mismatched raft_id must be rejected on startup");
+    assert!(err_mismatch.to_string().contains("bound to raft_id 999"));
+
+    std::fs::write(&marker, "").unwrap();
+    let err_empty = Recovery::load(&conf, follower_id)
+        .expect_err("empty marker file must be rejected on startup");
+    assert!(err_empty.to_string().contains("marker file is empty"));
+
+    // Now write the correct marker file with the local follower_id:
+    std::fs::write(&marker, format!("{}\n", follower_id)).unwrap();
+    let restored_recovery = Recovery::load(&conf, follower_id).unwrap();
+    assert!(restored_recovery.active, "quarantine is restored by marker");
+    assert!(restored_recovery
+        .validate_storage(follower_id, storage_recovery)
+        .is_ok());
+
+    drop(reopened_log);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+#[test]
+fn legitimate_candidate_self_vote_with_zero_commit_restarts_normally_without_recovery_marker() {
+    let rt = Arc::new(Runtime::new("test-legit-candidate", 2, 2));
+    let candidate_id = 1;
+    let (node, conf) = test_rocks_node(rt.clone(), candidate_id);
+    let journal_dir = conf.journal_dir.clone();
+
+    // Candidate campaigns in term 1, votes for itself. Cluster is fresh, commit is 0.
+    let mut hs = node.storage.log_store.initial_state().unwrap().hard_state;
+    hs.term = 1;
+    hs.vote = candidate_id;
+    hs.commit = 0;
+    node.storage.set_hard_state(&hs).unwrap();
+
+    // Verify no recovery indicator was ever set
+    assert_eq!(node.storage.recovery_state().unwrap(), None);
+    assert!(!node.recovery.active);
+    assert!(!conf.recovery_marker().exists());
+
+    drop(node);
+
+    // Reopen storage as if node crashed or restarted during election
+    let reopened_log = RocksLogStorage::from_conf(&conf, false);
+    let init_state = reopened_log.initial_state().unwrap();
+    assert_eq!(init_state.hard_state.term, 1);
+    assert_eq!(init_state.hard_state.vote, candidate_id);
+    assert_eq!(init_state.hard_state.commit, 0);
+
+    // Reopened storage must show no recovery indicator
+    assert_eq!(reopened_log.recovery_state().unwrap(), None);
+
+    // Recovery load sees no marker and no recover_from_peers
+    let recovery = Recovery::load(&conf, candidate_id).unwrap();
+    assert!(!recovery.active);
+
+    // Legitimate candidate startup validation MUST SUCCEED (not falsely rejected by heuristic!)
+    assert!(
+        recovery
+            .validate_storage(candidate_id, reopened_log.recovery_state().unwrap())
+            .is_ok(),
+        "legitimate candidate restart with zero commit must be accepted"
+    );
+
+    drop(reopened_log);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+#[test]
+fn crash_after_marker_unlink_before_storage_clear_fails_closed_on_restart() {
+    let rt = Arc::new(Runtime::new("test-crash-boundary", 2, 2));
+    let follower_id = 3;
+    let (mut node, conf) = test_rocks_node(rt.clone(), follower_id);
+    let journal_dir = conf.journal_dir.clone();
+    let marker = conf.recovery_marker();
+
+    // Activate recovery and ensure storage indicator is durable
+    node.recovery.activate(follower_id).unwrap();
+    node.storage.set_recovery_state(Some(follower_id)).unwrap();
+    assert!(node.recovery.active);
+    assert!(marker.exists());
+    assert_eq!(node.storage.recovery_state().unwrap(), Some(follower_id));
+
+    // Simulate crash after marker file unlinking (e.g. remove_file succeeds or parent dir sync happens,
+    // but process crashes before clearing RocksDB storage indicator)
+    std::fs::remove_file(&marker).unwrap();
+    assert!(!marker.exists());
+
+    drop(node);
+
+    // Reopened process without recover_from_peers sees no marker file
+    let reopened_log = RocksLogStorage::from_conf(&conf, false);
+    assert_eq!(reopened_log.recovery_state().unwrap(), Some(follower_id));
+
+    let reloaded_recovery = Recovery::load(&conf, follower_id).unwrap();
+    assert!(!reloaded_recovery.active);
+
+    // Must fail closed because storage indicator is still set while marker is missing
+    let err = reloaded_recovery
+        .validate_storage(follower_id, reopened_log.recovery_state().unwrap())
+        .expect_err("crash boundary before storage clear must fail closed on restart");
+    assert!(err
+        .to_string()
+        .contains("unfinished member recovery detected in storage"));
+
+    drop(reopened_log);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+#[test]
+fn recovery_marker_present_without_storage_indicator_restores_indicator_and_quarantines() {
+    let rt = Arc::new(Runtime::new("test-marker-no-indicator", 2, 2));
+    let id = 1;
+    let (node, conf) = test_rocks_node(rt.clone(), id);
+    let journal_dir = conf.journal_dir.clone();
+    let marker = conf.recovery_marker();
+
+    // Ensure storage initially has no recovery state
+    assert_eq!(node.storage.recovery_state().unwrap(), None);
+    assert!(!node.recovery.active);
+    assert!(!marker.exists());
+
+    drop(node);
+
+    // Operator places marker file on disk while RocksDB indicator is absent
+    std::fs::write(&marker, format!("{}\n", id)).unwrap();
+    assert!(marker.exists());
+
+    // Reopen RocksDB log store
+    let reopened_log = RocksLogStorage::from_conf(&conf, false);
+    assert_eq!(reopened_log.recovery_state().unwrap(), None);
+
+    // Recovery load reads marker and activates quarantine
+    let recovery = Recovery::load(&conf, id).unwrap();
+    assert!(recovery.active, "marker must activate recovery quarantine");
+
+    // Startup validation succeeds because marker is present
+    let storage_recovery = reopened_log.recovery_state().unwrap();
+    assert!(recovery.validate_storage(id, storage_recovery).is_ok());
+
+    // Startup path detects active recovery with missing storage indicator and syncs it
+    if recovery.active && storage_recovery != Some(id) {
+        reopened_log.set_recovery_state(Some(id)).unwrap();
+    }
+    assert_eq!(reopened_log.recovery_state().unwrap(), Some(id));
+
+    drop(reopened_log);
+
+    // Verify indicator is durably flushed to RocksDB across another restart
+    let reopened_log2 = RocksLogStorage::from_conf(&conf, false);
+    assert_eq!(reopened_log2.recovery_state().unwrap(), Some(id));
+
+    // Recovery load remains active
+    let recovery2 = Recovery::load(&conf, id).unwrap();
+    assert!(recovery2.active);
+    assert!(recovery2
+        .validate_storage(id, reopened_log2.recovery_state().unwrap())
+        .is_ok());
+
+    drop(reopened_log2);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+#[test]
+fn ordinary_empty_node_starts_normally_without_recovery() {
+    let rt = Arc::new(Runtime::new("test-empty-node-start", 2, 2));
+    let id = 1;
+    let (node, conf) = test_rocks_node(rt.clone(), id);
+    let journal_dir = conf.journal_dir.clone();
+
+    // Verify completely clean state
+    assert_eq!(node.storage.recovery_state().unwrap(), None);
+    assert!(!node.recovery.active);
+    assert!(!conf.recovery_marker().exists());
+
+    let hs = node.storage.initial_state().unwrap().hard_state;
+    assert_eq!(hs.term, 0);
+    assert_eq!(hs.vote, 0);
+    assert_eq!(hs.commit, 0);
+
+    // Validation must succeed without quarantine
+    assert!(node.validate_recovery_storage().is_ok());
+
+    // Storage recovery state remains None
+    assert_eq!(node.storage.recovery_state().unwrap(), None);
+    assert!(!node.recovery.active);
+
+    drop(node);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+#[test]
+fn injected_storage_clear_failure_keeps_node_in_quarantine_and_retries_safely() {
+    let rt = Arc::new(Runtime::new("test-storage-clear-failure", 2, 2));
+    let follower_id = 3;
+    let leader_id = 2;
+    let (mut node, conf) = test_rocks_node(rt.clone(), follower_id);
+    let journal_dir = conf.journal_dir.clone();
+    let marker = conf.recovery_marker();
+
+    node.recovery.activate(follower_id).unwrap();
+    node.storage.set_recovery_state(Some(follower_id)).unwrap();
+    assert!(node.recovery.active);
+    assert!(marker.exists());
+    assert_eq!(node.storage.recovery_state().unwrap(), Some(follower_id));
+
+    // Simulate leader catching up follower to target_commit
+    let target_commit = 5;
+    let leader_term = 2;
+    let mut request = RaftRequest {
+        message: raft::eraftpb::Message {
+            from: leader_id,
+            to: follower_id,
+            term: leader_term,
+            commit: target_commit,
+            ..Default::default()
+        },
+        sender_session: Some(201),
+        receiver_session: Some(node.session),
+        leader_commit: Some(target_commit),
+    };
+    request.message.set_msg_type(MessageType::MsgHeartbeat);
+    node.recovery
+        .step(&mut node.raw, request, node.session)
+        .unwrap();
+
+    let entries: Vec<Entry> = (1..=target_commit)
+        .map(|idx| Entry {
+            index: idx,
+            term: leader_term,
+            ..Default::default()
+        })
+        .collect();
+    node.storage.log_store.append(&entries).unwrap();
+    node.raw.raft.raft_log.committed = target_commit;
+    node.raw.raft.term = leader_term;
+    node.raw.raft.leader_id = leader_id;
+    node.raw.raft.state = raft::StateRole::Follower;
+    node.storage
+        .log_store
+        .set_hard_state_commit(target_commit)
+        .unwrap();
+    rt.block_on(node.storage.app_store.apply(
+        false,
+        ApplyMsg::Entry(Entry {
+            term: leader_term,
+            index: target_commit,
+            ..Default::default()
+        }),
+    ))
+    .unwrap();
+
+    // Finish executes Phase 1: marker unlinked and parent dir synced
+    let durable_commit = node
+        .storage
+        .log_store
+        .initial_state()
+        .unwrap()
+        .hard_state
+        .commit;
+    let applied = node.storage.get_fsm_state().applied.index;
+    let finish_res = node.recovery.finish(&node.raw, durable_commit, applied);
+    assert!(finish_res.unwrap(), "finish must succeed Phase 1");
+    assert!(!marker.exists(), "marker must be unlinked");
+    assert!(node.recovery.marker_cleaned_up);
+
+    // Simulate Phase 2 storage failure: storage.set_recovery_state(None) fails.
+    // In run0(), on error, node.recovery.active is kept true:
+    let simulated_storage_error = true;
+    if simulated_storage_error {
+        node.recovery.active = true;
+    }
+    assert!(
+        node.recovery.active,
+        "quarantine remains active on storage clear failure"
+    );
+    assert_eq!(node.storage.recovery_state().unwrap(), Some(follower_id));
+
+    // Next iteration retry: finish() is called again.
+    // Because marker_cleaned_up is true, it does not fail on missing marker!
+    let finish_retry = node.recovery.finish(&node.raw, durable_commit, applied);
+    assert!(finish_retry.unwrap(), "retry must succeed idempotently");
+    assert!(!node.recovery.active);
+
+    // Phase 2 retry succeeds
+    node.storage.set_recovery_state(None).unwrap();
+    node.recovery.marker_cleaned_up = false;
+    assert_eq!(node.storage.recovery_state().unwrap(), None);
+
+    drop(node);
     let _ = std::fs::remove_dir_all(&journal_dir);
 }

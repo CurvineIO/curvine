@@ -1450,6 +1450,25 @@ fn recovery_finish_fails_closed_when_configured_marker_is_missing() {
         "recovery active must remain true when finish fails"
     );
 
+    // Voting and campaigning remain disabled after failed finish
+    for kind in [
+        MessageType::MsgRequestVote,
+        MessageType::MsgRequestPreVote,
+        MessageType::MsgHup,
+        MessageType::MsgTimeoutNow,
+    ] {
+        let mut msg = heartbeat(target_commit);
+        msg.message.set_msg_type(kind);
+        msg.receiver_session = Some(301);
+        let err = peer
+            .recovery
+            .step(&mut peer.raw, msg, 301)
+            .expect_err("voting and campaigning must remain disabled after failed finish");
+        assert!(err
+            .to_string()
+            .contains("voting and campaigning are disabled"));
+    }
+
     // If the marker is restored, finish() succeeds and sets active == false
     write_marker(&marker, 3).unwrap();
     assert!(peer
@@ -1464,4 +1483,191 @@ fn recovery_finish_fails_closed_when_configured_marker_is_missing() {
         !marker.exists(),
         "recovery marker must be removed after successful finish"
     );
+}
+
+#[test]
+fn recovery_finish_fails_closed_when_marker_unlink_fails() {
+    let mut peer = Peer::new(3, true, 301);
+    let leader_id = 1;
+    let leader_term = 10;
+    let target_commit = 5;
+
+    let mut request = heartbeat(target_commit);
+    request.message.from = leader_id;
+    request.message.term = leader_term;
+    request.receiver_session = Some(301);
+    request.leader_commit = Some(target_commit);
+    peer.recovery.step(&mut peer.raw, request, 301).unwrap();
+
+    let entries: Vec<Entry> = (1..=target_commit)
+        .map(|idx| Entry {
+            index: idx,
+            term: leader_term,
+            ..Default::default()
+        })
+        .collect();
+    peer.raw.mut_store().wl().append(&entries).unwrap();
+    peer.raw.raft.raft_log.committed = target_commit;
+    peer.raw.raft.term = leader_term;
+    peer.raw.raft.leader_id = leader_id;
+    peer.raw.raft.state = StateRole::Follower;
+
+    let marker = peer.recovery.marker.as_ref().unwrap().clone();
+    assert!(marker.exists());
+
+    // Inject marker deletion failure
+    peer.recovery.unlink_failure_injected = true;
+    let err = peer
+        .recovery
+        .finish(&peer.raw, target_commit, target_commit)
+        .expect_err("finish must fail when marker unlink fails");
+    assert!(err.to_string().contains("injected marker unlink failure"));
+    assert!(peer.recovery.active, "quarantine must remain active");
+    assert!(marker.exists(), "marker must still exist on disk");
+
+    // Voting and campaigning remain disabled
+    let mut vote_msg = heartbeat(target_commit);
+    vote_msg.message.set_msg_type(MessageType::MsgRequestVote);
+    vote_msg.receiver_session = Some(301);
+    assert!(peer.recovery.step(&mut peer.raw, vote_msg, 301).is_err());
+
+    // Unset injection: finish succeeds and cleans up marker
+    peer.recovery.unlink_failure_injected = false;
+    assert!(peer
+        .recovery
+        .finish(&peer.raw, target_commit, target_commit)
+        .unwrap());
+    assert!(!peer.recovery.active);
+    assert!(!marker.exists());
+}
+
+#[test]
+fn recovery_finish_fails_closed_when_parent_directory_sync_fails_and_retries_safely() {
+    let mut peer = Peer::new(3, true, 301);
+    let leader_id = 1;
+    let leader_term = 10;
+    let target_commit = 5;
+
+    let mut request = heartbeat(target_commit);
+    request.message.from = leader_id;
+    request.message.term = leader_term;
+    request.receiver_session = Some(301);
+    request.leader_commit = Some(target_commit);
+    peer.recovery.step(&mut peer.raw, request, 301).unwrap();
+
+    let entries: Vec<Entry> = (1..=target_commit)
+        .map(|idx| Entry {
+            index: idx,
+            term: leader_term,
+            ..Default::default()
+        })
+        .collect();
+    peer.raw.mut_store().wl().append(&entries).unwrap();
+    peer.raw.raft.raft_log.committed = target_commit;
+    peer.raw.raft.term = leader_term;
+    peer.raw.raft.leader_id = leader_id;
+    peer.raw.raft.state = StateRole::Follower;
+
+    let marker = peer.recovery.marker.as_ref().unwrap().clone();
+    assert!(marker.exists());
+
+    // Inject parent directory synchronization failure
+    peer.recovery.sync_failure_injected = true;
+    let err = peer
+        .recovery
+        .finish(&peer.raw, target_commit, target_commit)
+        .expect_err("finish must fail when parent directory sync fails");
+    assert!(err
+        .to_string()
+        .contains("injected parent directory sync failure"));
+    assert!(peer.recovery.active, "quarantine must remain active");
+    assert!(
+        peer.recovery.marker_unlinked,
+        "marker must be marked as unlinked"
+    );
+    assert!(
+        !marker.exists(),
+        "marker was unlinked before sync failure was encountered"
+    );
+
+    // Voting and campaigning remain disabled
+    let mut camp_msg = heartbeat(target_commit);
+    camp_msg.message.set_msg_type(MessageType::MsgHup);
+    camp_msg.receiver_session = Some(301);
+    assert!(peer.recovery.step(&mut peer.raw, camp_msg, 301).is_err());
+
+    // Retrying with sync_failure_injected = false must succeed without failing on missing marker
+    peer.recovery.sync_failure_injected = false;
+    assert!(peer
+        .recovery
+        .finish(&peer.raw, target_commit, target_commit)
+        .unwrap());
+    assert!(!peer.recovery.active, "recovery completed successfully");
+    assert!(!peer.recovery.marker_unlinked);
+}
+
+#[test]
+fn crash_between_durable_catchup_and_marker_cleanup_preserves_quarantine_on_restart() {
+    let root = std::env::temp_dir().join(format!(
+        "curvine-recovery-crash-catchup-{}",
+        curvine_runtime::common::Utils::rand_id()
+    ));
+    let marker = root.join("member-recovery-in-progress");
+    std::fs::create_dir_all(&root).unwrap();
+    write_marker(&marker, 3).unwrap();
+
+    let conf = JournalConf {
+        recover_from_peers: None,
+        journal_dir: root.to_str().unwrap().into(),
+        journal_addrs: (1..=3)
+            .map(|id| crate::raft::RaftPeer::new(id, "localhost", 9000 + id as u16))
+            .collect(),
+        ..Default::default()
+    };
+
+    // Even if catch-up and apply were durable, if crash occurred before marker cleanup,
+    // marker on disk forces the restarted process into active recovery quarantine.
+    let reloaded = Recovery::load(&conf, 3).unwrap();
+    assert!(reloaded.active, "restarted node must preserve quarantine");
+    assert_eq!(reloaded.marker_path(), Some(marker.as_path()));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn startup_validation_rejects_unfinished_recovery_when_marker_is_missing() {
+    let mut recovery = Recovery::new(false);
+    recovery.marker = Some(std::path::PathBuf::from("/tmp/test-marker"));
+
+    // 1. Normal fresh startup (no storage indicator): Ok
+    assert!(recovery.validate_storage(3, None).is_ok());
+
+    // 2. Legitimate candidate with self-vote in uncommitted cluster:
+    // No recovery was ever active, so storage indicator is None -> Ok
+    assert!(recovery.validate_storage(3, None).is_ok());
+
+    // 3. Normal voter restart: storage indicator is None -> Ok
+    assert!(recovery.validate_storage(3, None).is_ok());
+
+    // 4. When recovery is already active, validate_storage always passes -> Ok
+    let active_recovery = Recovery::new(true);
+    assert!(active_recovery.validate_storage(3, Some(3)).is_ok());
+
+    // 5. Unfinished recovery with missing marker (active == false, storage == Some(3)) -> Err
+    let err = recovery
+        .validate_storage(3, Some(3))
+        .expect_err("unfinished recovery with missing marker must fail closed");
+    assert!(err
+        .to_string()
+        .contains("unfinished member recovery detected in storage"));
+    assert!(err.to_string().contains("raft_id 3"));
+    assert!(err.to_string().contains("/tmp/test-marker"));
+
+    // 6. Conflicting storage recovery ID: storage indicator targets peer 2, local node is 3 -> Err
+    let err_conflict = recovery
+        .validate_storage(3, Some(2))
+        .expect_err("conflicting storage recovery target must fail closed");
+    assert!(err_conflict
+        .to_string()
+        .contains("storage recovery indicator targets raft_id 2, but local node is 3"));
 }

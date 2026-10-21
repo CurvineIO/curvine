@@ -171,17 +171,30 @@ pub struct JournalConf {
     /// - **Detection & Activation**: When recovery quarantine is activated (either
     ///   automatically or via `recover_from_peers`), a durable marker file
     ///   (`member-recovery-in-progress`) recording the local Raft ID is atomically created
-    ///   and fsynced in `journal_dir`.
-    /// - **Restart Persistence**: If the recovering member crashes or restarts before
+    ///   and fsynced in `journal_dir`, and a durable recovery indicator (`RECOVERY_KEY`)
+    ///   is committed and WAL-flushed in local Raft metadata storage.
+    /// - **Restart Persistence & Storage Validation**: If the recovering member crashes or restarts before
     ///   catch-up finishes, the presence of the marker file forces recovery quarantine
     ///   to remain active, even if `recover_from_peers` has been omitted or removed from
-    ///   the configuration.
-    /// - **Required at Finish**: During `finish()`, the configured marker file is
-    ///   strictly required to exist on disk. If the marker was deleted prematurely,
-    ///   recovery fails closed with an error and keeps quarantine active. Only upon
-    ///   verified catch-up and log/state persistence is the marker removed using
-    ///   `remove_file()`, followed by `sync_all()` on its parent directory to persist
-    ///   the directory change.
+    ///   the configuration. If the marker was deleted or lost while recovery was incomplete,
+    ///   startup validation inspects durable storage for the persisted recovery indicator
+    ///   and fails closed on startup, preventing the node from silently participating in elections
+    ///   or voting. Ordinary nodes without recovery history (including candidates in uncommitted
+    ///   clusters) have no recovery indicator and start normally.
+    /// - **Quarantine Kept Alive at Finish**: During `finish()`, the configured marker file is
+    ///   strictly required to exist on disk (unless already unlinked in a prior attempt).
+    ///   If the marker is missing or if filesystem operations fail (`remove_file` or parent directory
+    ///   `sync_all`), the Raft node remains alive in quarantine (Policy A), logging a warning while
+    ///   keeping voting and campaigning disabled, allowing subsequent recovery ticks to retry.
+    ///   Only upon verified catch-up, successful marker unlinking, parent directory `sync_all`,
+    ///   and clearing the storage recovery indicator is recovery deactivated.
+    ///
+    /// # Safe Operator Recovery Procedure
+    /// If marker removal or synchronization fails repeatedly at runtime, or if startup fails closed
+    /// due to missing recovery metadata on an incomplete node, operators should investigate filesystem
+    /// permissions/health and either configure `recover_from_peers = <raft_id>` in the configuration
+    /// or recreate the marker file `member-recovery-in-progress` containing the local Raft ID,
+    /// allowing the node to safely re-enter quarantine and finish catch-up.
     ///
     /// # When Explicit Configuration Remains Necessary
     /// Explicit `journal.recover_from_peers` remains required in scenarios where automatic
@@ -193,6 +206,7 @@ pub struct JournalConf {
     ///   with an explicit error instructing the operator to configure `recover_from_peers`.
     /// - For operator-directed, proactive member rebuilds where quarantine must be enforced
     ///   immediately at process startup before any network RPCs are processed.
+    /// - When restarting an incomplete recovery whose marker was accidentally deleted or lost.
     #[serde(default)]
     pub recover_from_peers: Option<u64>,
 }

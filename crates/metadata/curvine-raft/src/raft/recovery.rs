@@ -197,11 +197,18 @@ impl PeerSessions {
     }
 }
 
+#[derive(Debug)]
 pub(super) struct Recovery {
     pub active: bool,
     target: Option<(u64, u64, u64)>, // leader, term, committed index
     fenced: bool,
     marker: Option<PathBuf>,
+    marker_unlinked: bool,
+    pub(crate) marker_cleaned_up: bool,
+    #[cfg(test)]
+    pub(super) unlink_failure_injected: bool,
+    #[cfg(test)]
+    pub(super) sync_failure_injected: bool,
 }
 
 impl Recovery {
@@ -211,7 +218,44 @@ impl Recovery {
             target: None,
             fenced: false,
             marker: None,
+            marker_unlinked: false,
+            marker_cleaned_up: false,
+            #[cfg(test)]
+            unlink_failure_injected: false,
+            #[cfg(test)]
+            sync_failure_injected: false,
         }
+    }
+
+    pub fn marker_path(&self) -> Option<&Path> {
+        self.marker.as_deref()
+    }
+
+    pub fn validate_storage(&self, local_id: u64, storage_recovery: Option<u64>) -> RaftResult<()> {
+        if let Some(persisted_id) = storage_recovery {
+            if persisted_id != local_id {
+                return Err(RaftError::other(
+                    format!(
+                        "storage recovery indicator targets raft_id {persisted_id}, but local node is {local_id}"
+                    )
+                    .into(),
+                ));
+            }
+            if !self.active {
+                let marker_path = self
+                    .marker
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "member-recovery-in-progress".into());
+                return Err(RaftError::other(
+                    format!(
+                        "unfinished member recovery detected in storage for raft_id {local_id}: recovery marker {marker_path} is missing; member cannot safely participate as an ordinary voter; configure journal.recover_from_peers = {local_id} or restore valid recovery marker to resume recovery safely"
+                    )
+                    .into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn activate(&mut self, local_id: u64) -> RaftResult<()> {
@@ -406,18 +450,35 @@ impl Recovery {
             return Ok(false);
         }
         if let Some(marker) = &self.marker {
-            if !marker.exists() {
-                return Err(RaftError::other(
-                    format!(
-                        "cannot finish member recovery: configured recovery marker {} is missing",
-                        marker.display()
-                    )
-                    .into(),
-                ));
-            }
-            std::fs::remove_file(marker)?;
-            if let Some(parent) = marker.parent() {
-                std::fs::File::open(parent)?.sync_all()?;
+            if !self.marker_cleaned_up {
+                #[cfg(test)]
+                if self.unlink_failure_injected {
+                    return Err(RaftError::other("injected marker unlink failure".into()));
+                }
+                if !self.marker_unlinked {
+                    if !marker.try_exists()? {
+                        return Err(RaftError::other(
+                            format!(
+                                "cannot finish member recovery: configured recovery marker {} is missing",
+                                marker.display()
+                            )
+                            .into(),
+                        ));
+                    }
+                    std::fs::remove_file(marker)?;
+                    self.marker_unlinked = true;
+                }
+                #[cfg(test)]
+                if self.sync_failure_injected {
+                    return Err(RaftError::other(
+                        "injected parent directory sync failure".into(),
+                    ));
+                }
+                if let Some(parent) = marker.parent() {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+                self.marker_unlinked = false;
+                self.marker_cleaned_up = true;
             }
         }
         self.active = false;

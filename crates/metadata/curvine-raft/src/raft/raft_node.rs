@@ -127,6 +127,11 @@ where
         let max_batch_size = conf.raft_batch_size.max(1);
 
         let storage = PeerStorage::new(rt.clone(), id, log_store, app_store, client.clone(), conf);
+        let storage_recovery = storage.recovery_state()?;
+        recovery.validate_storage(id, storage_recovery)?;
+        if recovery.active && storage_recovery != Some(id) {
+            storage.set_recovery_state(Some(id))?;
+        }
         let last_applied = Self::install_snapshot(&storage, group.voters()).await?;
         let config = conf.new_raft_conf(id, last_applied);
         config.validate()?;
@@ -186,12 +191,18 @@ where
         let tick_interval = Duration::from_millis(conf.raft_tick_interval_ms);
         let max_batch_size = conf.raft_batch_size.max(1);
 
+        let storage = PeerStorage::new(rt.clone(), id, log_store, app_store, client.clone(), conf);
+        let storage_recovery = storage.recovery_state()?;
+        recovery.validate_storage(id, storage_recovery)?;
+        if recovery.active && storage_recovery != Some(id) {
+            storage.set_recovery_state(Some(id))?;
+        }
+
         // raft basic configuration.
         let config = conf.new_raft_conf(id, 0);
         config.validate()?;
 
         client.join_cluster(id, &conf.local_addr()).await?;
-        let storage = PeerStorage::new(rt.clone(), id, log_store, app_store, client.clone(), conf);
         let raw = RawNode::new(&config, storage.clone(), logger)?;
         let (session_sender, session_receiver) = mpsc::unbounded_channel();
         let node = Self {
@@ -301,6 +312,11 @@ where
         self.raw.raft.leader_id
     }
 
+    pub fn validate_recovery_storage(&self) -> RaftResult<()> {
+        let storage_recovery = self.storage.recovery_state()?;
+        self.recovery.validate_storage(self.id(), storage_recovery)
+    }
+
     pub fn start(self) -> RoleStateListener {
         let mut node = self;
         let rt = node.rt.clone();
@@ -364,22 +380,42 @@ where
             if self.recovery.active
                 && self.pending_ready.is_none()
                 && !self.storage.is_snapshot_applying()
-                && self.recovery.finish(
-                    &self.raw,
-                    self.storage.log_store.initial_state()?.hard_state.commit,
-                    self.storage.get_fsm_state().applied.index,
-                )?
             {
-                info!(
-                    "member recovery completed, raft_id {}, term {}, applied {}",
-                    self.id(),
-                    self.raw.raft.term,
-                    self.storage.get_fsm_state().applied.index
-                );
-                self.role_monitor.advance_role(&SoftState {
-                    leader_id: self.leader(),
-                    raft_state: self.raw.raft.state,
-                });
+                let durable_commit = self.storage.log_store.initial_state()?.hard_state.commit;
+                let applied = self.storage.get_fsm_state().applied.index;
+                match self.recovery.finish(&self.raw, durable_commit, applied) {
+                    Ok(true) => {
+                        if let Err(e) = self.storage.set_recovery_state(None) {
+                            warn!(
+                                "failed to clear storage recovery state for raft_id {}: {}; keeping node in quarantine",
+                                self.id(),
+                                e
+                            );
+                            self.recovery.active = true;
+                        } else {
+                            self.recovery.marker_cleaned_up = false;
+                            info!(
+                                "member recovery completed, raft_id {}, term {}, applied {}",
+                                self.id(),
+                                self.raw.raft.term,
+                                self.storage.get_fsm_state().applied.index
+                            );
+                            self.role_monitor.advance_role(&SoftState {
+                                leader_id: self.leader(),
+                                raft_state: self.raw.raft.state,
+                            });
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(
+                            "member recovery finish check failed for raft_id {}, marker {:?}: {}; keeping node in quarantine",
+                            self.id(),
+                            self.recovery.marker_path(),
+                            e
+                        );
+                    }
+                }
             }
         }
 
@@ -522,6 +558,9 @@ where
         }
         if let Err(e) = self.recovery.step(&mut self.raw, raft, self.session) {
             return Self::send_request_error(env, e);
+        }
+        if self.recovery.active && self.storage.recovery_state()? != Some(self.id()) {
+            self.storage.set_recovery_state(Some(self.id()))?;
         }
         let rep_msg = Builder::success(&env.msg)
             .proto_header(RaftResponse {

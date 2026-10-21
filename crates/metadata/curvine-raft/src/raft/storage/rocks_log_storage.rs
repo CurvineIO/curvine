@@ -119,6 +119,16 @@ impl LogStorage for RocksLogStorage {
         Ok(())
     }
 
+    fn recovery_state(&self) -> RaftResult<Option<u64>> {
+        let store = self.read();
+        Ok(store.recovery_state())
+    }
+
+    fn set_recovery_state(&self, state: Option<u64>) -> RaftResult<()> {
+        let mut store = self.write();
+        store.set_recovery_state(state)
+    }
+
     fn trigger_snap_unavailable(&mut self) {
         self.write().trigger_snap_unavailable();
     }
