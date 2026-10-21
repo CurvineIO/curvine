@@ -92,6 +92,9 @@ generate_reference_links() {
             "JDK")
                 echo -e "  - ${YELLOW}JDK${NC}: ${GREEN}https://openjdk.java.net/install/${NC}"
                 ;;
+            "NODE")
+                echo -e "  - ${YELLOW}Node.js${NC}: ${GREEN}https://nodejs.org/en/download/${NC} (CentOS 7: unofficial glibc-217 builds)"
+                ;;
             "NPM")
                 echo -e "  - ${YELLOW}npm${NC}: ${GREEN}https://nodejs.org/en/download/${NC}"
                 ;;
@@ -266,6 +269,19 @@ if [ $SKIP_JAVA_SDK -eq 0 ]; then
 else
     echo -e "${BLUE}Checking JDK...${NC}"
     print_status "OK" "JDK check skipped (--skip-java-sdk enabled)"
+fi
+
+# Check Node.js (version 22.13 or later; required for WebUI / Vite)
+echo -e "${BLUE}Checking Node.js...${NC}"
+if command -v node >/dev/null 2>&1; then
+    NODE_VERSION=$(node --version | sed 's/^v//' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+    if version_compare "$NODE_VERSION" "22.13.0"; then
+        print_status "OK" "Node.js $NODE_VERSION (>= 22.13.0 required)"
+    else
+        print_status "FAIL" "Node.js $NODE_VERSION found, but version 22.13.0 or later is required" "NODE"
+    fi
+else
+    print_status "FAIL" "Node.js not found. Please install Node.js version 22.13.0 or later" "NODE"
 fi
 
 # Check npm (version 9 or later)

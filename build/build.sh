@@ -75,6 +75,39 @@ get_fuse_version() {
   fi
 }
 
+version_ge() {
+  local version1=$1
+  local version2=$2
+  local version1_num version2_num
+  version1_num=$(echo "$version1" | sed 's/[^0-9.]//g' | awk -F. '{ printf("%d%03d%03d\n", $1,$2,$3); }')
+  version2_num=$(echo "$version2" | sed 's/[^0-9.]//g' | awk -F. '{ printf("%d%03d%03d\n", $1,$2,$3); }')
+  [ "$version1_num" -ge "$version2_num" ]
+}
+
+# Fail before long Rust builds when WebUI is requested but Node/npm are too old.
+check_web_node_toolchain() {
+  if ! command -v node >/dev/null 2>&1; then
+    echo "Error: Node.js is required to build WebUI (>= 22.13.0)." >&2
+    exit 1
+  fi
+  local node_version
+  node_version=$(node --version | sed 's/^v//' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+  if ! version_ge "$node_version" "22.13.0"; then
+    echo "Error: Node.js v${node_version} is too old for WebUI (>= 22.13.0 required)." >&2
+    exit 1
+  fi
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "Error: npm is required to build WebUI (>= 9.0.0)." >&2
+    exit 1
+  fi
+  local npm_version
+  npm_version=$(npm --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+  if ! version_ge "$npm_version" "9.0.0"; then
+    echo "Error: npm v${npm_version} is too old for WebUI (>= 9.0.0 required)." >&2
+    exit 1
+  fi
+}
+
 # maturin is a Rust tool; install via cargo so builds do not depend on pip mirrors or venv pip.
 ensure_maturin_cmd() {
   if command -v maturin >/dev/null 2>&1; then
@@ -794,6 +827,10 @@ if should_build_package "fuse" || [[ " ${PACKAGES[@]} " =~ " all " ]]; then
   if [ -z "$FUSE_VERSION" ]; then
     echo "Warn: FUSE package requested but FUSE is not available on this system" >&2
   fi
+fi
+
+if should_build_package "web" || [[ " ${PACKAGES[@]} " =~ " all " ]]; then
+  check_web_node_toolchain
 fi
 
 FEATURES=()

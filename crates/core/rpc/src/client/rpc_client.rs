@@ -23,6 +23,9 @@ use curvine_net::retry::TimeBondedRetry;
 use curvine_runtime::runtime::Runtime;
 use curvine_sys::RawPtr;
 use log::warn;
+use socket2::SockRef;
+use std::io::ErrorKind;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -196,7 +199,29 @@ impl RpcClient {
     }
 
     pub fn is_active(&self) -> bool {
-        !self.is_closed()
+        if self.is_closed() {
+            return false;
+        }
+
+        // Raw clients have no background receiver to observe an idle peer's
+        // FIN/RST. The local flag alone can therefore return a dead connection
+        // to the block pool after a Worker restarts. Tokio TCP sockets are
+        // nonblocking: peek detects an already-observed close without a network
+        // round trip or consuming any pending response bytes. This does not
+        // retry an RPC or eliminate a disconnect racing with the next request.
+        if let BoxSender::Frame(frame) = &self.sender {
+            let mut byte = [MaybeUninit::uninit(); 1];
+            match SockRef::from(frame.as_ref().io()).peek(&mut byte) {
+                Ok(0) => {}
+                Ok(_) => return true,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return true,
+                Err(_) => {}
+            }
+            self.set_closed();
+            return false;
+        }
+
+        true
     }
 
     pub fn set_closed(&self) {
@@ -217,5 +242,74 @@ impl RpcClient {
 
     pub fn take_error(&self) -> Option<IOError> {
         self.state.take_error()
+    }
+}
+
+#[cfg(test)]
+mod idle_raw_client_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn connected_pair() -> (RpcClient, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: InetAddr = listener.local_addr().unwrap().into();
+        let conf = ClientConf::default();
+        let (client, peer) = tokio::join!(RpcClient::with_raw(&addr, &conf), listener.accept());
+        (client.unwrap(), peer.unwrap().0)
+    }
+
+    async fn readable(client: &RpcClient) {
+        let BoxSender::Frame(frame) = &client.sender else {
+            panic!("raw client required")
+        };
+        timeout(Duration::from_secs(2), frame.as_ref().io().readable())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_raw_client_keeps_live_connection() {
+        let (client, _peer) = connected_pair().await;
+        assert!(client.is_active());
+    }
+
+    #[tokio::test]
+    async fn idle_raw_client_rejects_peer_closed_before_another_rpc() {
+        let (client, mut peer) = connected_pair().await;
+        peer.shutdown().await.unwrap();
+        readable(&client).await;
+        assert!(
+            !client.is_active(),
+            "pool must detect EOF before issuing another write RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_raw_client_liveness_check_preserves_pending_bytes() {
+        let (client, mut peer) = connected_pair().await;
+        peer.write_all(b"pending").await.unwrap();
+        readable(&client).await;
+        assert!(client.is_active());
+        let BoxSender::Frame(frame) = &client.sender else {
+            panic!("raw client required")
+        };
+        let mut bytes = [0; 7];
+        timeout(
+            Duration::from_secs(2),
+            frame.as_mut().io_mut().read_exact(&mut bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&bytes, b"pending");
+    }
+
+    #[tokio::test]
+    async fn idle_raw_client_respects_explicit_closed_state() {
+        let (client, _peer) = connected_pair().await;
+        client.set_closed();
+        assert!(!client.is_active());
     }
 }
