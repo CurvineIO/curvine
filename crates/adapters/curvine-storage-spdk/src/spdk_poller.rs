@@ -1333,6 +1333,40 @@ mod test {
         assert_eq!(inflight.load(Ordering::Acquire), 0);
     }
 
+    /// Regression test: while a qpair's retirement tombstone is visible,
+    /// `submit_one` must fast-fail requests instead of resurrecting a `QpairState`.
+    #[test]
+    fn submit_one_fast_fails_while_retirement_tombstone_is_still_visible() {
+        let retired = RetiredQpairRegistry::new();
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+
+        // Simulate poll_and_sweep having already force-retired this qpair,
+        // independently of any retire_qpair() call -- the tombstone is up.
+        retired.mark_must_free(qpair);
+        assert!(retired.contains(qpair as usize));
+
+        let bdev_inflight = Arc::new(AtomicUsize::new(1));
+        let completion = IoCompletion::new();
+        let req = IoRequest {
+            op: IoOp::Flush {
+                ns: std::ptr::null_mut(),
+                qpair,
+            },
+            completion: completion.clone(),
+            bdev_inflight: bdev_inflight.clone(),
+        };
+        let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
+
+        SpdkPoller::submit_one(&req, &mut qpair_state, &retired, 128);
+
+        assert_eq!(completion.wait(0), -libc::EIO);
+        assert_eq!(bdev_inflight.load(Ordering::Acquire), 0);
+        assert!(
+            qpair_state.is_empty(),
+            "no phantom QpairState should be created while the retirement tombstone is visible"
+        );
+    }
+
     #[test]
     fn submit_one_rc_error_cleans_up_pending_entry() {
         // Pre-push: entry added before SPDK submit call.
