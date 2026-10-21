@@ -52,8 +52,8 @@ pub struct MasterHandler {
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
     pub(crate) actor_rt: Arc<Runtime>,
     // Master's own version + compatibility contract, built once at startup.
-    // GetFilesystemInfo backs statfs and is called frequently, so we reuse
-    // this instead of recomputing component_version() on every call.
+    // Legacy clients still use GetFilesystemInfo for statfs, so reuse this
+    // instead of recomputing component_version() on every call.
     master_compatibility: ServerCompatibilityInfoProto,
     // Compatibility policy derived from the master configuration. Used to
     // evaluate worker heartbeats and client handshakes with diagnose/enforce
@@ -81,8 +81,8 @@ impl MasterHandler {
         metrics: &'static MasterMetrics,
     ) -> Self {
         metrics.active_connections.inc();
-        // Build the master's compatibility payload once; GetFilesystemInfo can
-        // be hot (statfs) and the underlying version metadata is immutable.
+        // Build the master's compatibility payload once; legacy statfs clients
+        // call GetFilesystemInfo frequently and the version metadata is immutable.
         let master_version = curvine_sys::version::component_version("master");
         // The advertised contract and the enforcement policy both come from
         // the configured compatibility section; defaults are lenient diagnose
@@ -504,9 +504,18 @@ impl MasterHandler {
         rx.await?
     }
 
+    pub fn get_filesystem_capacity(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let _: GetFilesystemCapacityRequest = ctx.parse_header()?;
+        let info = self.fs.filesystem_capacity();
+        ctx.response(GetFilesystemCapacityResponse {
+            capacity: info.capacity,
+            available: info.available,
+        })
+    }
+
     pub fn get_filesystem_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: GetFilesystemInfoRequest = ctx.parse_header()?;
-        // GetFilesystemInfo backs statfs and is called frequently. Only
+        // Legacy clients still use GetFilesystemInfo for statfs. Only
         // evaluate the compatibility policy when the result can actually be
         // acted upon (enforce mode, configured bounds/blocklist, or the client
         // reported component_info); otherwise a legacy client would hit a
@@ -1076,6 +1085,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::GetBlockLocations => self.get_block_locations(ctx),
                 RpcCode::GetFileBlockDetails => self.get_file_block_details(ctx),
                 RpcCode::GetFilesystemInfo => self.get_filesystem_info(ctx),
+                RpcCode::GetFilesystemCapacity => self.get_filesystem_capacity(ctx),
                 RpcCode::SetAttr => self.set_attr_retry_check(ctx),
                 RpcCode::Symlink => self.symlink_retry_check(ctx),
                 RpcCode::Link => self.link_retry_check(ctx),
@@ -1158,10 +1168,10 @@ impl MessageHandler for MasterHandler {
         }
     }
 
-    // Only WorkerHeartbeat and WorkerBlockReport are routed to actor_rt;
-    // GetFilesystemInfo (statfs) deliberately runs on the main RPC blocking pool
-    // so that FUSE/kubelet statfs bursts cannot delay heartbeats and cause workers
-    // to be marked lost.
+    // Only WorkerHeartbeat and WorkerBlockReport are routed to actor_rt.
+    // Both filesystem-info and capacity queries run on the main RPC blocking
+    // pool so FUSE/kubelet statfs bursts cannot delay heartbeats and cause
+    // workers to be marked lost.
     fn get_rt(&self, msg: &Message) -> Option<&Runtime> {
         let code = RpcCode::from(msg.code());
         if Self::uses_actor_rt(code) {

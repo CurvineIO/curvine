@@ -71,6 +71,9 @@ pub use self::file_status::{FileStatus, INTERNAL_CTIME_XATTR};
 mod filesystem_info;
 pub use self::filesystem_info::FilesystemInfo;
 
+mod filesystem_capacity;
+pub use self::filesystem_capacity::FilesystemCapacity;
+
 mod worker_command;
 pub use self::worker_command::*;
 

@@ -278,6 +278,18 @@ message GetFilesystemInfoResponse {
     optional ServerCompatibilityInfoProto compatibility = 1000;
 }
 
+// Request allocatable filesystem capacity for statfs without topology details.
+message GetFilesystemCapacityRequest {
+}
+
+// Current statfs allocatable semantics: only Live workers contribute.
+message GetFilesystemCapacityResponse {
+    // Total allocatable capacity in bytes across Live workers.
+    required int64 capacity = 1;
+    // Available allocatable bytes across Live workers, excluding scheduled bytes.
+    required int64 available = 2;
+}
+
 message SetAttrOptsProto {
     required bool recursive = 1;
     optional int32 replicas = 2;

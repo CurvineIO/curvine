@@ -559,6 +559,44 @@ impl FsClient {
         self.rpc(RpcCode::GetCvMetadataSnapshotPage, header).await
     }
 
+    /// Query only the bytes eligible for new writes, without fetching topology.
+    pub async fn get_filesystem_capacity(&self) -> FsResult<FilesystemCapacity> {
+        let response: FsResult<GetFilesystemCapacityResponse> = self
+            .rpc(
+                RpcCode::GetFilesystemCapacity,
+                GetFilesystemCapacityRequest::default(),
+            )
+            .await;
+        match response {
+            Ok(info) => Ok(FilesystemCapacity {
+                capacity: info.capacity,
+                available: info.available,
+            }),
+            Err(error) if Self::capacity_rpc_unsupported(&error) => {
+                // Older masters return a generic dispatch error for unknown RPCs.
+                // Do not cache this: failover may select a master that supports it.
+                let info = self.get_filesystem_info().await?;
+                Ok(FilesystemCapacity {
+                    capacity: info.allocatable_capacity,
+                    available: info.allocatable_available,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn capacity_rpc_unsupported(error: &FsError) -> bool {
+        match error {
+            FsError::Unsupported(_) => true,
+            // Historical MasterHandler dispatch uses err_box!, not Unsupported.
+            FsError::Common(error) => error
+                .source
+                .to_string()
+                .contains("ERROR: Unsupported operation("),
+            _ => false,
+        }
+    }
+
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
         // Attach this client's component_info only on the first
         // GetFilesystemInfo per session (the handshake). GetFilesystemInfo
