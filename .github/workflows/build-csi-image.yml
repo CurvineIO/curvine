@@ -1,32 +1,32 @@
 name: Build CSI Docker Image
 
 on:
-  push:
-    tags:
-      - 'v*'
-    paths:
-      - 'curvine-csi/**'
-      - 'curvine-cli/**'
-      - 'curvine-fuse/**'
-      - 'curvine-client/**'
-      - '.github/workflows/build-csi-image.yml'
-  workflow_dispatch:
+  # Called by release.yml as a reusable workflow.
+  workflow_call:
     inputs:
+      tag:
+        description: 'Release tag (e.g. v0.3.0). Required when called or dispatched manually.'
+        required: false
+        type: string
       push_image:
         description: 'Whether to push image to registries'
         required: false
         default: false
         type: boolean
-      image_tag:
-        description: 'Image tag (e.g., latest, v1.0.0). Leave empty to use git tag.'
+  # Standalone dispatch for rescue/rerun scenarios. Note: this workflow no
+  # longer triggers on tag push; it runs as part of the release.yml chain.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g. v0.3.0, latest). Leave empty to use the current ref.'
         required: false
         default: ''
         type: string
-      platforms:
-        description: 'Target platforms (comma-separated)'
+      push_image:
+        description: 'Whether to push image to registries'
         required: false
-        default: 'linux/amd64,linux/arm64'
-        type: string
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -47,16 +47,20 @@ jobs:
       - name: Extract metadata for Docker
         id: meta
         run: |
-          # Determine tag: use git tag if triggered by push, otherwise use input or 'latest'
-          if [ "${{ github.event_name }}" == "push" ]; then
-            # Extract tag from ref (refs/tags/v1.0.0 -> v1.0.0)
-            TAG="${GITHUB_REF#refs/tags/}"
+          # Called via workflow_call: tag comes from the orchestrator and the
+          # image is always pushed. Dispatch: use the tag input or current ref.
+          if [ "${{ github.event_name }}" == "workflow_call" ]; then
+            TAG="${{ inputs.tag }}"
             PUSH_IMAGE="true"
-            echo "Triggered by tag push: ${TAG}"
-          elif [ -n "${{ inputs.image_tag }}" ]; then
-            TAG="${{ inputs.image_tag }}"
+            echo "Called by release workflow for tag: ${TAG}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
             PUSH_IMAGE="${{ inputs.push_image }}"
             echo "Using manual tag: ${TAG}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            PUSH_IMAGE="${{ inputs.push_image }}"
+            echo "Using current ref tag: ${TAG}"
           else
             TAG="latest"
             PUSH_IMAGE="${{ inputs.push_image }}"
