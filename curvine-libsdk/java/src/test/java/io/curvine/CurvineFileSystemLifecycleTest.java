@@ -26,6 +26,7 @@ import sun.misc.Unsafe;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -76,7 +77,7 @@ public class CurvineFileSystemLifecycleTest {
     }
 
     @Test
-    public void lastCloseReleasesSharedMountExactlyOnce() throws Exception {
+    public void lastCloseKeepsMountCachedForReuse() throws Exception {
         fakeMount = newFakeMount();
         cachedMount = newCachedMount(fakeMount, 2);
 
@@ -86,22 +87,36 @@ public class CurvineFileSystemLifecycleTest {
         fs1.close();
         fs2.close();
 
-        assertEquals("last close must release the native mount exactly once", 1, fakeMount.closeCalls);
-        assertNull("cache entry must be removed after last close", cache.get(KEY));
+        // Releasing the native mount destroys the Curvine runtime, and that
+        // teardown can abort the process when it happens on a runtime worker.
+        // Mounts therefore stay cached for the lifetime of the process.
+        assertEquals("last close must not release the native mount", 0, fakeMount.closeCalls);
+        assertTrue("mount must stay cached after last close", cache.containsKey(KEY));
+        assertEquals("refcount must be clamped at zero", 0, refCount(cachedMount));
     }
 
     @Test
-    public void closeFailureIsPropagatedToCaller() throws Exception {
+    public void closeCachedMountsReleasesEveryMountOnce() throws Exception {
         fakeMount = newFakeMount();
         fakeMount.failClose = true;
+        // refCount 0: no live instance references this mount any more.
+        cachedMount = newCachedMount(fakeMount, 0);
+
+        IOException e = assertThrows(IOException.class, CurvineFileSystem::closeCachedMounts);
+        assertTrue(e.getMessage().contains("fake close failure"));
+        assertNull("cache entry must be removed by the explicit teardown", cache.get(KEY));
+        assertEquals("explicit teardown must close the mount exactly once", 1, fakeMount.closeCalls);
+    }
+
+    @Test
+    public void closeCachedMountsKeepsMountsWithLiveReferences() throws Exception {
+        fakeMount = newFakeMount();
         cachedMount = newCachedMount(fakeMount, 1);
 
-        CurvineFileSystem fs = newInstance("fs");
-
-        IOException e = assertThrows(IOException.class, fs::close);
-        assertTrue(e.getMessage().contains("fake close failure"));
-        // A failed close must not break per-instance idempotency: retry is a no-op.
-        fs.close();
+        assertEquals("mount with a live reference must not be closed", 0,
+                CurvineFileSystem.closeCachedMounts());
+        assertEquals("live mount must stay open", 0, fakeMount.closeCalls);
+        assertNotNull("cache entry must stay for the live instance", cache.get(KEY));
     }
 
     @Test

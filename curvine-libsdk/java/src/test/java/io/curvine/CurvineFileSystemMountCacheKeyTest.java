@@ -34,8 +34,6 @@ public class CurvineFileSystemMountCacheKeyTest {
         String unifiedKey = CurvineFileSystem.mountCacheKey(unified);
         String pureCvKey = CurvineFileSystem.mountCacheKey(pureCv);
 
-        assertEquals("localhost:8995|unified=true|rust_ufs=false", unifiedKey);
-        assertEquals("localhost:8995|unified=false|rust_ufs=false", pureCvKey);
         assertNotEquals(unifiedKey, pureCvKey);
     }
 
@@ -55,11 +53,22 @@ public class CurvineFileSystemMountCacheKeyTest {
         FilesystemConf second = conf("master-0:8995", true, false);
 
         assertEquals(
-                "master-0:8995|unified=true|rust_ufs=false",
-                CurvineFileSystem.mountCacheKey(first));
-        assertEquals(
                 CurvineFileSystem.mountCacheKey(first),
                 CurvineFileSystem.mountCacheKey(second));
+    }
+
+    @Test
+    public void everyConfigFieldParticipatesInKey() throws Exception {
+        // The key is derived from the serialized config that is frozen into the
+        // native mount, so a field the old hand-written key missed must still
+        // produce a distinct mount.
+        FilesystemConf base = conf("localhost:8995", true, false);
+        FilesystemConf other = conf("localhost:8995", true, false);
+        other.read_parallel = base.read_parallel + 1;
+
+        assertNotEquals(
+                CurvineFileSystem.mountCacheKey(base),
+                CurvineFileSystem.mountCacheKey(other));
     }
 
     private static FilesystemConf conf(String masterAddrs, boolean unified, boolean rustUfs)

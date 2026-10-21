@@ -18,6 +18,8 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.DirectoryNotEmptyException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -192,14 +194,31 @@ public class CurvineFileSystem extends FileSystem {
     }
 
     /**
-     * Isolate native mounts by Master address and client mode.
-     * Same master_addrs with different enable_unified_fs / enable_rust_read_ufs
-     * must not reuse a CurvineFsMount whose conf was already frozen into native.
+     * Isolate native mounts by the exact configuration frozen into native.
+     *
+     * <p>{@code CurvineFsMount} passes {@code conf.toToml()} to
+     * {@code CurvineNative.newFilesystem}, so the serialized config is what
+     * actually defines a mount. A hand-maintained field list silently missed
+     * fields and let two different configs share one native mount. Hashing the
+     * serialized form keeps the key correct by construction and avoids putting
+     * credentials or addresses in log lines.
      */
     static String mountCacheKey(FilesystemConf conf) {
-        return conf.master_addrs
-                + "|unified=" + conf.enable_unified_fs
-                + "|rust_ufs=" + conf.enable_rust_read_ufs;
+        try {
+            byte[] toml = conf.toToml().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            return hex(MessageDigest.getInstance("SHA-256").digest(toml));
+        } catch (IllegalAccessException | NoSuchAlgorithmException e) {
+            throw new IllegalStateException("cannot derive mount cache key", e);
+        }
+    }
+
+    private static String hex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+            sb.append(Character.forDigit(b & 0xF, 16));
+        }
+        return sb.toString();
     }
 
     /**
@@ -366,29 +385,68 @@ public class CurvineFileSystem extends FileSystem {
         }
     }
 
+    /**
+     * Detach this instance from the shared mount. The mount itself stays cached.
+     *
+     * <p>Closing the native mount on the last reference used to tear down the
+     * Curvine tokio runtime. CurvineClient owns that runtime and hands clones of
+     * it to background write tasks, so the teardown could run on a runtime
+     * worker thread and abort the whole process ("Cannot drop a runtime in a
+     * context where blocking is not allowed"). Keeping the mount alive also
+     * preserves the client connection pool and its worker threads across
+     * statements, which is the fast path for repeated open/write/close.
+     *
+     * <p>Use {@link #closeCachedMounts} to release unreferenced mounts
+     * explicitly, e.g. in
+     * tests or before class loader shutdown.
+     */
     @Override
     public void close() throws IOException {
         if (libFs != null && cacheKey != null) {
-            CachedMount cached;
-            boolean last;
             synchronized (MOUNT_CACHE) {
-                cached = MOUNT_CACHE.get(cacheKey);
-                last = cached != null && --cached.refCount <= 0;
-                if (last) {
-                    MOUNT_CACHE.remove(cacheKey);
+                CachedMount cached = MOUNT_CACHE.get(cacheKey);
+                if (cached != null && cached.refCount > 0) {
+                    cached.refCount--;
                 }
             }
-            try {
-                if (last) {
-                    cached.closeOnce();
-                }
-            } finally {
-                // Idempotent per instance even if the native close fails: the
-                // cache entry is already removed, so a retry is a no-op.
-                libFs = null;
-            }
+            libFs = null;
         }
         super.close();
+    }
+
+    /**
+     * Close the cached mounts that no live {@code CurvineFileSystem} still
+     * references. Intended for tests and explicit shutdown, not for the normal
+     * per-instance close path.
+     *
+     * <p>Mounts whose {@code refCount} is still positive are left in the cache:
+     * closing them would invalidate live instances and make their next call
+     * use a released native handle.
+     */
+    static int closeCachedMounts() throws IOException {
+        java.util.List<CachedMount> mounts = new java.util.ArrayList<>();
+        synchronized (MOUNT_CACHE) {
+            java.util.Iterator<Map.Entry<String, CachedMount>> it = MOUNT_CACHE.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<String, CachedMount> entry = it.next();
+                if (entry.getValue().refCount <= 0) {
+                    mounts.add(entry.getValue());
+                    it.remove();
+                }
+            }
+        }
+        IOException failure = null;
+        for (CachedMount mount : mounts) {
+            try {
+                mount.closeOnce();
+            } catch (IOException e) {
+                failure = e;
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+        return mounts.size();
     }
 
     @Override
