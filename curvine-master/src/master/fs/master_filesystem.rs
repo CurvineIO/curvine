@@ -670,9 +670,11 @@ impl MasterFilesystem {
                     return Err(e);
                 }
             };
-        self.worker_manager
-            .write()
-            .settle_committed_blocks(&settle_blocks, block_size);
+        {
+            let mut wm = self.worker_manager.write();
+            wm.settle_committed_blocks(&settle_blocks);
+            wm.bind_scheduled_blocks(&choose_workers, block.id, block_size);
+        }
         let located = LocatedBlock {
             block,
             locs: choose_workers,
@@ -743,7 +745,6 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
-        let block_size = inode.as_file_ref()?.block_size as i64;
         let settle_blocks = commit_blocks.clone();
         fs_dir.complete_file(
             path,
@@ -756,7 +757,7 @@ impl MasterFilesystem {
         )?;
         self.worker_manager
             .write()
-            .settle_committed_blocks(&settle_blocks, block_size);
+            .settle_committed_blocks(&settle_blocks);
 
         if options.only_flush && options.return_file_blocks {
             let file = inode.as_file_ref()?;
@@ -1662,7 +1663,13 @@ impl MasterFilesystem {
         };
         let block = match fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers) {
             Ok((block, assigned)) => {
-                if !assigned {
+                if assigned {
+                    self.worker_manager.write().bind_scheduled_blocks(
+                        &choose_workers,
+                        block.id,
+                        block_size,
+                    );
+                } else {
                     self.worker_manager
                         .write()
                         .unschedule_chosen_workers(&choose_workers, block_size);
