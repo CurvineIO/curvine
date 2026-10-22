@@ -29,6 +29,7 @@ use curvine_model::{
     CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict, CreateFileOpts, DeleteBlockCmd,
     DeleteResult, FileBlockDetails, FileBlocks, FileStatus, FilesystemInfo, FreeResult,
     HeartbeatStatus, ListOptions, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
+    FILESYSTEM_CAPACITY_CAPABILITY,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
@@ -83,7 +84,10 @@ impl MasterHandler {
         metrics.active_connections.inc();
         // Build the master's compatibility payload once; legacy statfs clients
         // call GetFilesystemInfo frequently and the version metadata is immutable.
-        let master_version = curvine_sys::version::component_version("master");
+        let mut master_version = curvine_sys::version::component_version("master");
+        master_version
+            .capabilities
+            .push(FILESYSTEM_CAPACITY_CAPABILITY.to_string());
         // The advertised contract and the enforcement policy both come from
         // the configured compatibility section; defaults are lenient diagnose
         // with no bounds, so old components are never rejected by default.

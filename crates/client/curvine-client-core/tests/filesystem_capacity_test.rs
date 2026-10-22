@@ -18,11 +18,11 @@ use curvine_core_error::{err_box, ErrorImpl, StringError};
 use curvine_error::{ErrorKind, FsError, FsResult};
 use curvine_fs_api::RpcCode;
 use curvine_io::DataSlice;
-use curvine_model::FilesystemCapacity;
+use curvine_model::{FilesystemCapacity, FILESYSTEM_CAPACITY_CAPABILITY};
 use curvine_net::net::{ConnState, InetAddr};
 use curvine_proto::{
-    GetFilesystemCapacityRequest, GetFilesystemCapacityResponse, GetFilesystemInfoRequest,
-    GetFilesystemInfoResponse,
+    ComponentInfoProto, GetFilesystemCapacityRequest, GetFilesystemCapacityResponse,
+    GetFilesystemInfoRequest, GetFilesystemInfoResponse, ServerCompatibilityInfoProto,
 };
 use curvine_rpc::handler::{HandlerService, MessageHandler, RpcFrame};
 use curvine_rpc::message::{Message, MessageBuilder, ResponseStatus};
@@ -37,6 +37,8 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 const LIMIT: Duration = Duration::from_secs(5);
+const INFO_RPC: i8 = RpcCode::GetFilesystemInfo as i8;
+const CAPACITY_RPC: i8 = RpcCode::GetFilesystemCapacity as i8;
 const CAPACITY: FilesystemCapacity = FilesystemCapacity {
     capacity: (1 << 42) + 17,
     available: (1 << 40) + 3,
@@ -126,6 +128,7 @@ impl Master {
                 available: 6000,
                 allocatable_capacity: allocatable.map(|v| v.0),
                 allocatable_available: allocatable.map(|v| v.1),
+                compatibility: Some(compatibility(true)),
                 ..Default::default()
             },
             calls: vec![],
@@ -166,6 +169,10 @@ impl Master {
         self.service.0.lock().unwrap().reply = reply;
     }
 
+    fn set_capability(&self, advertised: Option<bool>) {
+        self.service.0.lock().unwrap().info.compatibility = advertised.map(compatibility);
+    }
+
     fn calls(&self) -> Vec<i8> {
         self.service.0.lock().unwrap().calls.clone()
     }
@@ -176,6 +183,21 @@ impl Drop for Master {
         let _ = self.shutdown.take().unwrap().send(());
         // Join cancelled connections while this thread still owns the runtime.
         bounded(&self.rt, &mut self.task).expect("mock master shutdown");
+    }
+}
+
+fn compatibility(capacity: bool) -> ServerCompatibilityInfoProto {
+    ServerCompatibilityInfoProto {
+        server: ComponentInfoProto {
+            component: Some("master".into()),
+            capabilities: if capacity {
+                vec![FILESYSTEM_CAPACITY_CAPABILITY.into()]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }
 
@@ -213,14 +235,18 @@ fn capacity_rpc_uses_one_lazy_handshake_and_no_full_info_refresh() {
         master.set_reply(Reply::Capacity(empty));
         assert_eq!(fs.get_filesystem_capacity().await.unwrap(), empty);
     });
-    assert_eq!(master.calls(), [14, 59, 59, 59]);
+    assert_eq!(
+        master.calls(),
+        [INFO_RPC, CAPACITY_RPC, CAPACITY_RPC, CAPACITY_RPC]
+    );
 }
 
 #[test]
-fn legacy_fallback_maps_allocatable_fields_and_rediscovers_support() {
-    for reply in [Reply::Unsupported, Reply::LegacyUnsupported] {
+fn legacy_capacity_skips_probes_and_maps_allocatable_fields() {
+    for advertised in [None, Some(false)] {
         for allocatable in [Some((400, 250)), Some((0, 0)), None] {
-            let master = Master::start(reply, allocatable);
+            let master = Master::start(Reply::LegacyUnsupported, allocatable);
+            master.set_capability(advertised);
             let fs = filesystem(&[&master]);
             let (capacity, available) = allocatable.unwrap_or((9000, 6000));
             let expected = FilesystemCapacity {
@@ -228,14 +254,134 @@ fn legacy_fallback_maps_allocatable_fields_and_rediscovers_support() {
                 available,
             };
             bounded(&master.rt, async {
+                let handshake = fs.fs_client().handshake().await.unwrap();
+                assert_eq!(handshake.is_legacy(), advertised.is_none());
+                assert_eq!(master.calls(), [INFO_RPC]);
                 for _ in 0..2 {
                     assert_eq!(fs.get_filesystem_capacity().await.unwrap(), expected);
                 }
-                master.set_reply(Reply::Capacity(CAPACITY));
-                assert_eq!(fs.get_filesystem_capacity().await.unwrap(), CAPACITY);
             });
-            assert_eq!(master.calls(), [14, 59, 14, 59, 14, 59]);
+            assert_eq!(master.calls(), [INFO_RPC, INFO_RPC, INFO_RPC]);
         }
+    }
+}
+
+#[test]
+fn legacy_leader_upgrade_refreshes_capability_before_using_capacity_rpc() {
+    for advertised in [None, Some(false)] {
+        let master = Master::start(Reply::LegacyUnsupported, Some((400, 250)));
+        master.set_capability(advertised);
+        let fs = filesystem(&[&master]);
+        let expected = FilesystemCapacity {
+            capacity: 400,
+            available: 250,
+        };
+        bounded(&master.rt, async {
+            assert_eq!(fs.get_filesystem_capacity().await.unwrap(), expected);
+            assert_eq!(master.calls(), [INFO_RPC, INFO_RPC]);
+            master.set_reply(Reply::Capacity(CAPACITY));
+            master.set_capability(Some(true));
+            assert_eq!(fs.get_filesystem_capacity().await.unwrap(), expected);
+            assert_eq!(master.calls(), [INFO_RPC, INFO_RPC, INFO_RPC]);
+            assert_eq!(fs.get_filesystem_capacity().await.unwrap(), CAPACITY);
+        });
+        assert_eq!(master.calls(), [INFO_RPC, INFO_RPC, INFO_RPC, CAPACITY_RPC]);
+    }
+}
+
+#[test]
+fn new_to_old_leader_refreshes_stale_positive_capability_after_one_probe() {
+    for reply in [Reply::Unsupported, Reply::LegacyUnsupported] {
+        for advertised in [None, Some(false)] {
+            let first = Master::start(Reply::Capacity(CAPACITY), Some((400, 250)));
+            let second = Master::start(Reply::NotLeader, Some((800, 500)));
+            second.set_capability(advertised);
+            let fs = filesystem(&[&first, &second]);
+            let expected = FilesystemCapacity {
+                capacity: 800,
+                available: 500,
+            };
+            bounded(&first.rt, async {
+                assert_eq!(fs.get_filesystem_capacity().await.unwrap(), CAPACITY);
+                first.set_reply(Reply::NotLeader);
+                second.set_reply(reply);
+                assert_eq!(fs.get_filesystem_capacity().await.unwrap(), expected);
+                let calls = second.calls();
+                // Leader discovery may already have polled this former follower.
+                assert!(calls.ends_with(&[INFO_RPC]), "{calls:?}");
+                assert_eq!(
+                    calls.iter().filter(|&&code| code == CAPACITY_RPC).count(),
+                    1
+                );
+                assert_eq!(
+                    fs.fs_client().master_handshake().is_legacy(),
+                    advertised.is_none()
+                );
+                assert_eq!(fs.get_filesystem_capacity().await.unwrap(), expected);
+            });
+            let calls = second.calls();
+            assert!(calls.ends_with(&[INFO_RPC, INFO_RPC]), "{calls:?}");
+            assert_eq!(
+                calls.iter().filter(|&&code| code == CAPACITY_RPC).count(),
+                1
+            );
+            assert_eq!(
+                first
+                    .calls()
+                    .iter()
+                    .filter(|&&code| code == INFO_RPC)
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn old_to_new_leader_discovers_capacity_support_through_full_info() {
+    for advertised in [None, Some(false)] {
+        let first = Master::start(Reply::LegacyUnsupported, Some((400, 250)));
+        first.set_capability(advertised);
+        let second = Master::start(Reply::NotLeader, Some((800, 500)));
+        let fs = filesystem(&[&first, &second]);
+        bounded(&first.rt, async {
+            fs.fs_client().handshake().await.unwrap();
+            assert_eq!(
+                fs.get_filesystem_capacity().await.unwrap(),
+                FilesystemCapacity {
+                    capacity: 400,
+                    available: 250,
+                }
+            );
+            assert_eq!(first.calls(), [INFO_RPC, INFO_RPC]);
+            first.set_reply(Reply::NotLeader);
+            second.set_reply(Reply::Capacity(CAPACITY));
+            // The cached negative selects full info; only the next call uses capacity.
+            assert_eq!(
+                fs.get_filesystem_capacity().await.unwrap(),
+                FilesystemCapacity {
+                    capacity: 800,
+                    available: 500,
+                }
+            );
+            let calls = second.calls();
+            assert!(calls.ends_with(&[INFO_RPC]), "{calls:?}");
+            assert!(!calls.contains(&CAPACITY_RPC), "{calls:?}");
+            assert!(fs
+                .fs_client()
+                .master_handshake()
+                .capabilities()
+                .iter()
+                .any(|capability| capability == FILESYSTEM_CAPACITY_CAPABILITY));
+            assert_eq!(fs.get_filesystem_capacity().await.unwrap(), CAPACITY);
+        });
+        let calls = second.calls();
+        assert!(calls.ends_with(&[INFO_RPC, CAPACITY_RPC]), "{calls:?}");
+        assert_eq!(
+            calls.iter().filter(|&&code| code == CAPACITY_RPC).count(),
+            1
+        );
+        assert!(!first.calls().contains(&CAPACITY_RPC));
     }
 }
 
@@ -259,7 +405,7 @@ fn generic_server_errors_do_not_trigger_full_info_fallback() {
             _ => assert!(matches!(error, FsError::IO(_)), "{error:?}"),
         }
         assert!(error.to_string().contains(message), "{error}");
-        assert_eq!(master.calls(), [14, 59]);
+        assert_eq!(master.calls(), [INFO_RPC, CAPACITY_RPC]);
     }
 }
 
@@ -274,7 +420,21 @@ fn capacity_rpc_retries_not_leader_against_another_master() {
         second.set_reply(Reply::Capacity(CAPACITY));
         assert_eq!(fs.get_filesystem_capacity().await.unwrap(), CAPACITY);
     });
-    assert!(first.calls().iter().filter(|&&code| code == 59).count() >= 2);
-    assert!(second.calls().contains(&59));
-    assert_eq!(first.calls().iter().filter(|&&code| code == 14).count(), 1);
+    assert!(
+        first
+            .calls()
+            .iter()
+            .filter(|&&code| code == CAPACITY_RPC)
+            .count()
+            >= 2
+    );
+    assert!(second.calls().contains(&CAPACITY_RPC));
+    assert_eq!(
+        first
+            .calls()
+            .iter()
+            .filter(|&&code| code == INFO_RPC)
+            .count(),
+        1
+    );
 }

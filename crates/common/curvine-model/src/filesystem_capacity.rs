@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// Handshake capability for the capacity-only filesystem RPC.
+pub const FILESYSTEM_CAPACITY_CAPABILITY: &str = "filesystem-capacity";
+
 /// Allocatable filesystem capacity reported by `statfs(2)`.
 ///
 /// Only `Live` workers contribute, matching the current statfs semantics.

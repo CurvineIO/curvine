@@ -19,7 +19,9 @@ use curvine_fuse::fs::operator::StatFs;
 use curvine_fuse::fs::{CurvineFileSystem as FuseFileSystem, FileSystem};
 use curvine_fuse::raw::fuse_abi::fuse_in_header;
 use curvine_fuse::FUSE_UNKNOWN_INODES;
-use curvine_model::{FilesystemCapacity, WorkerAddress, WorkerInfo, WorkerStatus};
+use curvine_model::{
+    FilesystemCapacity, WorkerAddress, WorkerInfo, WorkerStatus, FILESYSTEM_CAPACITY_CAPABILITY,
+};
 use curvine_runtime::runtime::RpcRuntime;
 use curvine_tests::Testing;
 use std::time::Duration;
@@ -62,6 +64,11 @@ fn filesystem_capacity_rpc_and_fuse_statfs_use_allocatable_bytes() {
                 available: 2 * 4096 + 17,
             };
             assert_eq!(fs.get_filesystem_capacity().await.unwrap(), expected);
+            assert!(fs
+                .master_handshake()
+                .capabilities()
+                .iter()
+                .any(|capability| capability == FILESYSTEM_CAPACITY_CAPABILITY));
             let info = fs.get_filesystem_info().await.unwrap();
             assert!(info.capacity > expected.capacity);
             assert_eq!(info.allocatable_capacity, expected.capacity);

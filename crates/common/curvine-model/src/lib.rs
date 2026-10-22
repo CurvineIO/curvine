@@ -72,7 +72,7 @@ mod filesystem_info;
 pub use self::filesystem_info::FilesystemInfo;
 
 mod filesystem_capacity;
-pub use self::filesystem_capacity::FilesystemCapacity;
+pub use self::filesystem_capacity::{FilesystemCapacity, FILESYSTEM_CAPACITY_CAPABILITY};
 
 mod worker_command;
 pub use self::worker_command::*;

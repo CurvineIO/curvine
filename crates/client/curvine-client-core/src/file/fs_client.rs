@@ -561,8 +561,18 @@ impl FsClient {
 
     /// Query only the bytes eligible for new writes, without fetching topology.
     pub async fn get_filesystem_capacity(&self) -> FsResult<FilesystemCapacity> {
+        self.ensure_handshake().await;
+        let supports_capacity = self
+            .master_handshake()
+            .capabilities()
+            .iter()
+            .any(|capability| capability == FILESYSTEM_CAPACITY_CAPABILITY);
+        if !supports_capacity {
+            return self.get_filesystem_capacity_legacy().await;
+        }
+
         let response: FsResult<GetFilesystemCapacityResponse> = self
-            .rpc(
+            .raw_rpc(
                 RpcCode::GetFilesystemCapacity,
                 GetFilesystemCapacityRequest::default(),
             )
@@ -573,16 +583,20 @@ impl FsClient {
                 available: info.available,
             }),
             Err(error) if Self::capacity_rpc_unsupported(&error) => {
-                // Older masters return a generic dispatch error for unknown RPCs.
-                // Do not cache this: failover may select a master that supports it.
-                let info = self.get_filesystem_info().await?;
-                Ok(FilesystemCapacity {
-                    capacity: info.allocatable_capacity,
-                    available: info.allocatable_available,
-                })
+                // Failover may have selected an older master since the handshake.
+                // Refresh its capabilities so later queries skip the failed probe.
+                self.get_filesystem_capacity_legacy().await
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn get_filesystem_capacity_legacy(&self) -> FsResult<FilesystemCapacity> {
+        let info = self.get_filesystem_info().await?;
+        Ok(FilesystemCapacity {
+            capacity: info.allocatable_capacity,
+            available: info.allocatable_available,
+        })
     }
 
     fn capacity_rpc_unsupported(error: &FsError) -> bool {
