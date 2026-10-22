@@ -1860,6 +1860,59 @@ mod test {
         assert_eq!(env.qpair_pool.controller_stats(ctrlr as usize).0, 0);
     }
 
+    /// Regression test: a transient free failure must be retried throughout the
+    /// wait loop, not just once, so inflight still reaches 0 without leaking.
+    #[test]
+    fn wait_for_inflight_drain_retries_deferred_cleanup_until_success() {
+        let mut env = test_env();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let (retired, _, inflight) = retired_qpair_with_stale_inflight_for_test();
+
+        env.qpair_pool.register_limit(ctrlr as usize, 1);
+        assert_eq!(
+            env.qpair_pool.try_reserve(ctrlr as usize),
+            QpairReserveResult::Reserved
+        );
+        env.retired_qpairs.put_back(qpair, retired);
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+
+        // First free attempt fails; a later retry succeeds.
+        let free_calls = Arc::new(AtomicUsize::new(0));
+        let free_calls_for_hook = Arc::clone(&free_calls);
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
+            if free_calls_for_hook.fetch_add(1, Ordering::AcqRel) == 0 {
+                -libc::EIO
+            } else {
+                0
+            }
+        });
+
+        // Simulate the first attempt inside retire_qpair (as Drop::drop does
+        // before entering the wait loop): it fails and gets deferred.
+        env.retire_qpair(ctrlr, qpair);
+        assert_eq!(free_calls.load(Ordering::Acquire), 1);
+        assert_eq!(inflight.load(Ordering::Acquire), 1);
+        assert_eq!(env.deferred_qpair_count(), 1);
+
+        // Must retry within the same deadline until it succeeds, no TimedOut.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let outcome = crate::spdk_bdev::wait_for_inflight_drain(
+            &inflight,
+            Some(&env),
+            deadline,
+            "test-bdev",
+            std::time::Duration::from_millis(1),
+        );
+
+        assert_eq!(outcome, crate::spdk_bdev::DrainOutcome::Completed);
+        assert_eq!(free_calls.load(Ordering::Acquire), 2);
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+        assert_eq!(env.deferred_qpair_count(), 0);
+        assert_eq!(env.qpair_pool.controller_stats(ctrlr as usize).0, 0);
+    }
+
     #[test]
     fn retire_qpair_disconnected_defers_when_poller_not_finished() {
         let mut env = test_env();
