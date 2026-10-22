@@ -315,7 +315,17 @@ where
 
     pub async fn run(&mut self) {
         if let Err(e) = self.run0().await {
-            error!("raft node stop: {}", e);
+            if e.is_storage_fatal() {
+                error!(
+                    "raft node stop: {}. \
+                     This is a fatal local-storage failure (meta/journal directory missing, partial, or inconsistent). \
+                     Do NOT simply restart: restore a consistent meta+journal pair from a healthy voter first \
+                     (member recovery via journal.recover_from_peers), then start this node again.",
+                    e
+                );
+            } else {
+                error!("raft node stop: {}", e);
+            }
         }
         self.role_monitor.advance_exit();
     }

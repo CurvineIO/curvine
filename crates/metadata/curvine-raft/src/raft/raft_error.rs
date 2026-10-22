@@ -37,6 +37,11 @@ enum ErrorKind {
 
     #[num_enum(default)]
     Other = 5,
+
+    // Local persistent raft storage is missing, partial, or inconsistent
+    // (e.g. the meta/journal RocksDB pair was deleted or corrupted).
+    // Non-retryable: restart cannot recover; a consistent restore is required.
+    Storage = 6,
 }
 
 #[derive(Debug, Error)]
@@ -56,6 +61,12 @@ pub enum RaftError {
     #[error("{0}")]
     IO(ErrorImpl<io::Error>),
 
+    // Local persistent storage is missing, partial, or inconsistent. Restart
+    // cannot fix it: restore a consistent meta+journal pair from a healthy
+    // voter (member recovery) before restarting this node.
+    #[error("{0}")]
+    Storage(ErrorImpl<StringError>),
+
     #[error("{0}")]
     Other(ErrorImpl<StringError>),
 }
@@ -67,6 +78,13 @@ impl RaftError {
 
     pub fn io(error: io::Error) -> Self {
         IO(ErrorImpl::with_source(error))
+    }
+
+    /// A fatal local-storage state error: directories missing/partial,
+    /// meta/journal pair inconsistent, or checkpoint/restore target unusable.
+    /// Carries a remediation hint and is never retryable.
+    pub fn storage(msg: impl Into<String>) -> Self {
+        Storage(ErrorImpl::with_source(msg.into().into()))
     }
 
     pub fn not_leader(leader: NodeId, group: &RaftGroup) -> Self {
@@ -84,6 +102,13 @@ impl RaftError {
 
     pub fn retry_leader(&self) -> bool {
         matches!(self, NotLeader(_) | LeaderNotReady(_))
+    }
+
+    /// True when the error means local persistent state is missing, partial,
+    /// or inconsistent. Restarting the process cannot recover from it; the
+    /// node must be restored from a healthy voter instead.
+    pub fn is_storage_fatal(&self) -> bool {
+        matches!(self, Storage(_))
     }
 
     pub fn with_opt_msg(error: Option<Self>, msg: impl Into<String>) -> Self {
@@ -110,6 +135,7 @@ impl ErrorExt for RaftError {
             Raft(e) => Raft(e.ctx(ctx)),
             NotLeader(e) => NotLeader(e.ctx(ctx)),
             IO(e) => IO(e.ctx(ctx)),
+            Storage(e) => Storage(e.ctx(ctx)),
             Other(e) => Other(e.ctx(ctx)),
             LeaderNotReady(e) => LeaderNotReady(e.ctx(ctx)),
         }
@@ -120,6 +146,7 @@ impl ErrorExt for RaftError {
             Raft(e) => e.encode(ErrorKind::Raft),
             NotLeader(e) => e.encode(ErrorKind::NotLeader),
             IO(e) => e.encode(ErrorKind::IO),
+            Storage(e) => e.encode(ErrorKind::Storage),
             Other(e) => e.encode(ErrorKind::Other),
             LeaderNotReady(e) => e.encode(ErrorKind::LeaderNotReady),
         }
@@ -137,6 +164,7 @@ impl ErrorExt for RaftError {
 
             ErrorKind::NotLeader => NotLeader(de.into_string()),
             ErrorKind::IO => IO(de.into_io()),
+            ErrorKind::Storage => Storage(de.into_string()),
             ErrorKind::Other => Other(de.into_string()),
             ErrorKind::LeaderNotReady => LeaderNotReady(de.into_string()),
         }
@@ -146,7 +174,6 @@ impl ErrorExt for RaftError {
         self.retry_leader()
     }
 }
-
 impl From<CommonError> for RaftError {
     fn from(value: CommonError) -> Self {
         Other(ErrorImpl::with_source(value.into()))

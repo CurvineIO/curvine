@@ -26,13 +26,13 @@ use crate::master::{
     JobManager, Master, MasterMetrics, MountManager, SyncFsDir, SyncWorkerManager,
 };
 use curvine_config::JournalConf;
-use curvine_core_error::{err_box, ternary, CommonResult};
+use curvine_core_error::{err_box, ternary, CommonResult, ErrorExt};
 use curvine_error::FsError;
 use curvine_model::RenameFlags;
 use curvine_raft::conf::JournalConfExt;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData};
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg, LogStorage, RocksLogStorage};
-use curvine_raft::raft::{RaftClient, RaftResult, RaftUtils};
+use curvine_raft::raft::{RaftClient, RaftError, RaftResult, RaftUtils};
 use curvine_runtime::common::{FileUtils, TimeSpent};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
@@ -966,22 +966,80 @@ impl JournalLoader {
     }
 
     fn create_snapshot0(&self, dir_option: Option<String>) -> RaftResult<SnapshotData> {
+        Self::check_meta_data_dir(&self.fs_dir, "create_snapshot")?;
         let fsm_state = self.fsm_state_snapshot()?;
         let dir = match dir_option {
             Some(dir) => dir,
             None => {
                 let fs_dir = self.fs_dir.read();
-                fs_dir.create_checkpoint(fsm_state.applied.index)?
+                fs_dir
+                    .create_checkpoint(fsm_state.applied.index)
+                    .map_err(|e| {
+                        // create_checkpoint returns a boxed CommonError; convert
+                        // through the string form so ctx() is available and the
+                        // failure stays a typed RaftError::Storage candidate.
+                        let msg = format!(
+                            "failed to create metadata checkpoint (id {}) under meta dir {}: {}",
+                            fsm_state.applied.index,
+                            Self::meta_data_dir(&self.fs_dir),
+                            e
+                        );
+                        if Self::meta_dir_missing(e.as_ref()) {
+                            RaftError::storage(msg)
+                        } else {
+                            RaftError::from(msg)
+                        }
+                    })?
             }
         };
 
-        let data = RaftUtils::create_file_snapshot(&dir, self.node_id, fsm_state)?;
-
+        let data = RaftUtils::create_file_snapshot(&dir, self.node_id, fsm_state.clone()).map_err(
+            |e| {
+                e.ctx(format!(
+                    "failed to build file snapshot from checkpoint dir {}",
+                    dir
+                ))
+            },
+        )?;
         if let Err(e) = self.purge_checkpoint(&dir) {
             warn!("purge checkpoint: {}", e);
         }
 
         Ok(data)
+    }
+
+    /// Fail fast when the master meta data directory is missing or no longer a
+    /// valid RocksDB store (e.g. it was deleted while the process was running).
+    /// Without this check the failure surfaces later as a bare
+    /// "No such file or directory" deep inside checkpoint/restore, which gives
+    /// no clue about which directory or what remediation is required.
+    fn check_meta_data_dir(fs_dir: &SyncFsDir, op: &str) -> RaftResult<()> {
+        let data_dir = Self::meta_data_dir(fs_dir);
+        let path = Path::new(&data_dir);
+        let valid = path.is_dir() && path.join("CURRENT").is_file();
+        if !valid {
+            return Err(RaftError::storage(format!(
+                "master meta data_dir is missing or is not a valid RocksDB store: {} (operation: {}). \
+                 The local metadata was deleted, moved, or only partially restored. \
+                 Restore a consistent meta+journal pair from a healthy voter (member recovery, journal.recover_from_peers) before continuing; \
+                 restarting this node without restoring cannot recover the data.",
+                data_dir, op
+            )));
+        }
+        Ok(())
+    }
+
+    fn meta_data_dir(fs_dir: &SyncFsDir) -> String {
+        let fs_dir = fs_dir.read();
+        fs_dir.store.store().db.conf().data_dir.clone()
+    }
+
+    /// Heuristic: the checkpoint/restore layer reports a vanished underlying
+    /// directory as a bare boxed io error with no path context. Match it so we
+    /// can upgrade it to the typed storage-fatal error.
+    fn meta_dir_missing(e: &dyn std::error::Error) -> bool {
+        let msg = e.to_string();
+        msg.contains("No such file or directory") || msg.contains("os error 2")
     }
 
     fn apply_snapshot0(&self, snapshot: SnapshotData) -> RaftResult<()> {
@@ -1039,7 +1097,23 @@ impl JournalLoader {
         }
 
         let mut fs_dir = self.fs_dir.write();
-        fs_dir.restore(&restore_path, checkpoint_size)?;
+        fs_dir
+            .restore(&restore_path, checkpoint_size)
+            .map_err(|e| {
+                let msg = format!(
+                    "failed to restore metadata from checkpoint {} (checkpoint_size {} bytes); \
+                 local meta data_dir is {}: {}",
+                    restore_path,
+                    checkpoint_size,
+                    Self::meta_data_dir(&self.fs_dir),
+                    e
+                );
+                if Self::meta_dir_missing(e.as_ref()) {
+                    RaftError::storage(msg)
+                } else {
+                    RaftError::from(msg)
+                }
+            })?;
         fs_dir.update_op_id(snapshot.fsm_state.op_id());
         drop(fs_dir);
         let restore_ms = spend.used_ms();

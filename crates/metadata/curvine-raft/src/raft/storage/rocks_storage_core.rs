@@ -73,10 +73,10 @@ impl RocksStorageCore {
 
     pub fn init_state(&mut self) -> RaftResult<RaftState> {
         if let Some(error) = &self.init_error {
-            return err_box!(
+            return Err(RaftError::storage(format!(
                 "invalid local raft storage: {}. Restore a consistent master meta+journal pair from a healthy voter; do not restart this voter from an empty, partial, or corrupted local directory.",
                 error
-            );
+            )));
         }
         self.validate_hard_state_commit(self.raft_state.hard_state.commit)?;
         Ok(self.raft_state.clone())
@@ -176,14 +176,14 @@ impl RocksStorageCore {
         let lower_bound = first_index.saturating_sub(1);
         let last_index = self.last_index();
         if commit < lower_bound || commit > last_index {
-            return err_box!(
+            return Err(RaftError::storage(format!(
                 "invalid local raft storage: hard_state.commit={} is outside durable range [{}, {}], first_index={}, snapshot_index={}. Restore a consistent master meta+journal pair from a healthy voter; do not restart this voter from an empty or partial local directory.",
                 commit,
                 lower_bound,
                 last_index,
                 first_index,
                 snapshot_index
-            );
+            )));
         }
         Ok(())
     }

@@ -335,7 +335,16 @@ where
 
                 Err(e) => {
                     job_ctl.advance_state(JobState::Failed);
-                    error!("snapshot job failed: {}", e)
+                    if e.is_storage_fatal() {
+                        error!(
+                            "snapshot job failed: {}. \
+                             Local persistent storage is missing or inconsistent; \
+                             restore a consistent meta+journal pair from a healthy voter before restarting.",
+                            e
+                        )
+                    } else {
+                        error!("snapshot job failed: {}", e)
+                    }
                 }
             }
             let _ = sender.send(result);
