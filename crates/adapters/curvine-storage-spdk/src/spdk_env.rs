@@ -1268,8 +1268,7 @@ impl SpdkEnv {
     /// moves to deferred_qpairs and the pointer cannot re-enter the reusable pool.
     ///
     /// Always barriers through the poller channel first, even if already
-    /// recorded in `retired_qpairs`, so a still-queued request for this qpair
-    /// can't slip past `submit_one`'s guard after the tombstone is removed.
+    /// retired, so a queued request can't slip past `submit_one`'s guard.
     pub(crate) fn retire_qpair(
         &self,
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
@@ -1909,21 +1908,20 @@ mod test {
         env.state
             .store(SpdkEnvState::Initialized as u8, Ordering::Release);
 
-        // First free attempt fails; a later retry succeeds.
+        // First two free attempts fail (the initial one, plus retire_qpair's
+        // own trailing bonus retry); only the loop's own retry succeeds.
         let free_calls = Arc::new(AtomicUsize::new(0));
         let free_calls_for_hook = Arc::clone(&free_calls);
         env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
-            if free_calls_for_hook.fetch_add(1, Ordering::AcqRel) == 0 {
+            if free_calls_for_hook.fetch_add(1, Ordering::AcqRel) < 2 {
                 -libc::EIO
             } else {
                 0
             }
         });
 
-        // Simulate the first attempt inside retire_qpair (as Drop::drop does
-        // before entering the wait loop): it fails and gets deferred.
         env.retire_qpair(ctrlr, qpair);
-        assert_eq!(free_calls.load(Ordering::Acquire), 1);
+        assert_eq!(free_calls.load(Ordering::Acquire), 2);
         assert_eq!(inflight.load(Ordering::Acquire), 1);
         assert_eq!(env.deferred_qpair_count(), 1);
 
@@ -1938,7 +1936,7 @@ mod test {
         );
 
         assert_eq!(outcome, crate::spdk_bdev::DrainOutcome::Completed);
-        assert_eq!(free_calls.load(Ordering::Acquire), 2);
+        assert_eq!(free_calls.load(Ordering::Acquire), 3);
         assert_eq!(inflight.load(Ordering::Acquire), 0);
         assert_eq!(env.deferred_qpair_count(), 0);
         assert_eq!(env.qpair_pool.controller_stats(ctrlr as usize).0, 0);
