@@ -719,6 +719,53 @@ impl Display for SpdkBdev {
     }
 }
 
+/// Outcome of waiting for in-flight I/O to drain during `SpdkBdev::drop()`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DrainOutcome {
+    /// `inflight` reached 0 before the deadline.
+    Completed,
+    /// Deadline reached with `inflight` still non-zero; caller must poison
+    /// DMA buffers to avoid a use-after-free.
+    TimedOut,
+}
+
+/// Wait for `inflight` to reach 0, retrying deferred qpair cleanup on every
+/// iteration so a transient free failure isn't stuck until an unrelated retry.
+pub(crate) fn wait_for_inflight_drain(
+    inflight: &std::sync::atomic::AtomicUsize,
+    env: Option<&crate::spdk_env::SpdkEnv>,
+    deadline: std::time::Instant,
+    name: &str,
+    poll_interval: std::time::Duration,
+) -> DrainOutcome {
+    let mut logged = false;
+    loop {
+        let count = inflight.load(std::sync::atomic::Ordering::Acquire);
+        if count == 0 {
+            return DrainOutcome::Completed;
+        }
+        if std::time::Instant::now() >= deadline {
+            error!(
+                "SpdkBdev '{}': {} in-flight I/O(s) still pending after deadline. \
+                 Leaking DMA buffers to prevent use-after-free.",
+                name, count
+            );
+            return DrainOutcome::TimedOut;
+        }
+        if !logged {
+            warn!(
+                "SpdkBdev '{}': waiting for {} in-flight I/O(s) to complete before drop",
+                name, count
+            );
+            logged = true;
+        }
+        if let Some(env) = env {
+            env.resolve_deferred_qpairs();
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
 impl Drop for SpdkBdev {
     fn drop(&mut self) {
         // Retire the qpair first. If the poller force-completed I/O and moved
@@ -736,34 +783,18 @@ impl Drop for SpdkBdev {
             std::time::Duration::from_secs(60)
         };
         let deadline = std::time::Instant::now() + max_wait;
-        let mut logged = false;
-        loop {
-            let count = self.inflight.load(std::sync::atomic::Ordering::Acquire);
-            if count == 0 {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                error!(
-                    "SpdkBdev '{}': {} in-flight I/O(s) still pending after {}s. \
-                         Leaking DMA buffers to prevent use-after-free.",
-                    self.name,
-                    count,
-                    max_wait.as_secs()
-                );
-                // Poison pointers so DmaBuf::drop is a no-op.
-                self.read_buf.ptr = std::ptr::null_mut();
-                self.write_buf.ptr = std::ptr::null_mut();
-                // TODO: leak qpair and handle on timeout because reusing a qpair with retired callbacks causes use after free.
-                break;
-            }
-            if !logged {
-                warn!(
-                    "SpdkBdev '{}': waiting for {} in-flight I/O(s) to complete before drop",
-                    self.name, count
-                );
-                logged = true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        let outcome = wait_for_inflight_drain(
+            &self.inflight,
+            env,
+            deadline,
+            &self.name,
+            std::time::Duration::from_millis(1),
+        );
+        if outcome == DrainOutcome::TimedOut {
+            // Poison pointers so DmaBuf::drop is a no-op.
+            self.read_buf.ptr = std::ptr::null_mut();
+            self.write_buf.ptr = std::ptr::null_mut();
+            // TODO: leak qpair and handle on timeout because reusing a qpair with retired callbacks causes use after free.
         }
 
         // Release handle.
