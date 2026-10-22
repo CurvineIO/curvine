@@ -19,8 +19,9 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_model::{
-    BlockLocation, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo, StorageType,
-    TransferWorkerCapabilities, WorkerAddress, WorkerCommand, WorkerInfo, WorkerStatus,
+    BlockLocation, CommitBlock, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo,
+    StorageType, TransferWorkerCapabilities, WorkerAddress, WorkerCommand, WorkerInfo,
+    WorkerStatus,
 };
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::{ByteUnit, LocalTime};
@@ -132,6 +133,36 @@ impl WorkerManager {
 
     pub(crate) fn unschedule_chosen_workers(&mut self, workers: &[WorkerAddress], block_size: i64) {
         self.adjust_chosen_workers(workers, block_size, false);
+    }
+
+    /// Settles reservations for committed blocks.
+    ///
+    /// Allocation reserves a full `block_size` per replica, but a committed
+    /// block only occupies `block_len` bytes. The remainder would otherwise
+    /// stay reserved until the heartbeat reclaim (which only reclaims bytes
+    /// actually written) or the lost-interval expiry, so a burst of small
+    /// files could reserve the whole cluster and starve new allocations.
+    /// The `block_len` bytes left reserved are reclaimed by the heartbeat
+    /// once the worker reports the reduced available space.
+    pub(crate) fn settle_committed_blocks(
+        &mut self,
+        commit_blocks: &[CommitBlock],
+        block_size: i64,
+    ) {
+        if block_size <= 0 {
+            return;
+        }
+        for commit in commit_blocks {
+            let unused = block_size.saturating_sub(commit.block_len.max(0));
+            if unused <= 0 {
+                continue;
+            }
+            for loc in &commit.locations {
+                if let Some(worker) = self.worker_map.workers.get_mut(&loc.worker_id) {
+                    worker.unschedule_bytes(unused);
+                }
+            }
+        }
     }
 
     fn expire_scheduled_bytes(&mut self) {
@@ -505,6 +536,63 @@ mod tests {
             manager.get_worker(1).unwrap().scheduled_bytes,
             8 * block_size
         );
+    }
+
+    #[test]
+    fn settle_committed_blocks_releases_unused_reservation() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        manager.add_test_worker(worker_with_available(1, 1 << 40));
+
+        // A small file reserves a full block but only writes 4 KiB.
+        manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+
+        let commit = CommitBlock {
+            block_id: 1,
+            block_len: 4096,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        manager.settle_committed_blocks(&[commit], block_size);
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 4096);
+    }
+
+    #[test]
+    fn settle_committed_blocks_keeps_full_block_reservation() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        manager.add_test_worker(worker_with_available(1, 1 << 40));
+
+        manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+
+        // A fully written block settles nothing; the heartbeat reclaims it.
+        let commit = CommitBlock {
+            block_id: 1,
+            block_len: block_size,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        manager.settle_committed_blocks(&[commit], block_size);
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+    }
+
+    #[test]
+    fn settle_committed_blocks_ignores_unknown_worker_and_clamps_at_zero() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        manager.add_test_worker(worker_with_available(1, 1 << 40));
+
+        // Settling with no prior reservation must not go negative.
+        let commit = CommitBlock {
+            block_id: 1,
+            block_len: 0,
+            locations: vec![BlockLocation::with_id(1), BlockLocation::with_id(99)],
+        };
+        manager.settle_committed_blocks(&[commit], block_size);
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 0);
     }
 
     #[test]
