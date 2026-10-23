@@ -17,7 +17,7 @@ pub mod inode;
 
 mod fs_dir;
 pub(crate) use self::fs_dir::CacheInvalidationResult;
-pub use self::fs_dir::FsDir;
+pub use self::fs_dir::{FsDir, TrashScanPage};
 
 mod fs_stats;
 pub use self::fs_stats::FileSystemStats;
