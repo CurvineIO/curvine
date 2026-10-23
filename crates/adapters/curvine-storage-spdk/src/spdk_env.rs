@@ -1144,7 +1144,7 @@ impl SpdkEnv {
         &self,
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
-        retired: RetiredQpair,
+        mut retired: RetiredQpair,
     ) -> RetiredQpairFinish {
         if !retired.requires_free() && self.state() == SpdkEnvState::Initialized {
             match self.qpair_pool.release(ctrlr, qpair) {
@@ -1167,7 +1167,10 @@ impl SpdkEnv {
         }
         let rc = self.qpair_pool.free_io_qpair(qpair);
         if rc != 0 {
-            error!("failed to free retired SPDK qpair {:p}: rc={}", qpair, rc);
+            if !retired.free_failure_logged() {
+                error!("failed to free retired SPDK qpair {:p}: rc={}", qpair, rc);
+                retired.mark_free_failure_logged();
+            }
             self.retired_qpairs.put_back(qpair, retired);
             return RetiredQpairFinish::DeferredRetired;
         }
@@ -2531,6 +2534,67 @@ mod test {
         );
         let (active, _) = env.qpair_pool.controller_stats(ctrlr);
         assert_eq!(active, 0);
+    }
+
+    /// A a failed free is retried, but the failure is only
+    /// logged once per qpair, not once per retry.
+    #[test]
+    fn retired_free_failure_is_only_logged_once_across_repeated_retries() {
+        let ctrlr = 0x1000usize;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let free_calls = Arc::new(AtomicUsize::new(0));
+        let free_calls_for_hook = Arc::clone(&free_calls);
+
+        let mut env = SpdkEnv::new(SpdkConf::default()).unwrap();
+        env.qpair_pool.register_limit(ctrlr, 1);
+        assert_eq!(
+            env.qpair_pool.try_reserve(ctrlr),
+            QpairReserveResult::Reserved
+        );
+        let (retired, _) = retired_qpair_with_stale_callback_for_test();
+        env.retired_qpairs.put_back(qpair, retired);
+        // Always fails -- every retry hits the same `rc != 0` branch.
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
+            free_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+            -libc::EIO
+        });
+        env.test_hooks.poll_retired_qpair = Some(Arc::new(|_| RetiredQpairPollOutcome::Polled(0)));
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+
+        // First attempt (plus retire_qpair's own trailing bonus retry): the
+        // failure must be logged on the very first failed attempt.
+        env.retire_qpair(ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr, qpair);
+        assert_eq!(free_calls.load(Ordering::Acquire), 2);
+        let retired = env
+            .retired_qpairs
+            .take(qpair)
+            .expect("qpair still deferred after failed free");
+        assert!(
+            retired.free_failure_logged(),
+            "first failure must be logged"
+        );
+        env.retired_qpairs.put_back(qpair, retired);
+
+        // Further retries keep retrying the free, but must not re-log --
+        // the flag set on the first failure must stick across retries.
+        for _ in 0..3 {
+            env.resolve_deferred_qpairs();
+        }
+        assert_eq!(
+            free_calls.load(Ordering::Acquire),
+            5,
+            "retries must keep happening despite the log being suppressed"
+        );
+        let retired = env
+            .retired_qpairs
+            .take(qpair)
+            .expect("qpair still deferred after repeated failed frees");
+        assert!(
+            retired.free_failure_logged(),
+            "logged flag must still be set after further retries"
+        );
+        retired.reclaim();
     }
 
     #[test]

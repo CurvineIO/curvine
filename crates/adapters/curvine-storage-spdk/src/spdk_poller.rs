@@ -191,6 +191,8 @@ pub struct PollerConfig {
 pub(crate) struct RetiredQpair {
     state: Option<Box<QpairState>>,
     must_free: bool,
+    /// Ensures a failed free is logged once per qpair, not once per retry.
+    free_failure_logged: bool,
 }
 
 impl RetiredQpair {
@@ -206,6 +208,14 @@ impl RetiredQpair {
         if let Some(state) = self.state.as_mut() {
             state.reclaim_stale();
         }
+    }
+
+    pub(crate) fn free_failure_logged(&self) -> bool {
+        self.free_failure_logged
+    }
+
+    pub(crate) fn mark_free_failure_logged(&mut self) {
+        self.free_failure_logged = true;
     }
 }
 
@@ -255,7 +265,14 @@ impl RetiredQpairRegistry {
             return;
         }
 
-        entries.insert(key, RetiredQpair { state, must_free });
+        entries.insert(
+            key,
+            RetiredQpair {
+                state,
+                must_free,
+                free_failure_logged: false,
+            },
+        );
         self.has_entries.store(true, Ordering::Release);
     }
 
@@ -1008,6 +1025,7 @@ pub(crate) fn retired_qpair_with_stale_inflight_for_test(
         RetiredQpair {
             state: Some(qpair_state),
             must_free: true,
+            free_failure_logged: false,
         },
         ctx as *mut c_void,
         inflight,
@@ -1085,6 +1103,7 @@ mod test {
         let retired = RetiredQpair {
             state: Some(qpair_state),
             must_free: true,
+            free_failure_logged: false,
         };
 
         // Simulate free_io_qpair failure: retired remains alive, so the stale
