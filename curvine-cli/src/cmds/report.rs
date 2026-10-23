@@ -29,10 +29,7 @@ pub struct ReportCommand {
 #[derive(Subcommand, Debug)]
 pub enum ReportSubCommand {
     Json,
-    All {
-        #[clap(long, default_value = "true")]
-        show_workers: bool,
-    },
+    All,
     Capacity {
         #[clap(value_name = "WORKER_ADDRESS")]
         worker_address: Option<String>,
@@ -52,8 +49,8 @@ impl ReportCommand {
                 ReportSubCommand::Json => {
                     println!("{}", report.to_json());
                 }
-                ReportSubCommand::All { show_workers } => {
-                    println!("{}", report.simple(*show_workers));
+                ReportSubCommand::All => {
+                    println!("{}", report.simple(true));
                 }
                 ReportSubCommand::Capacity { worker_address } => {
                     if let Some(addr) = worker_address {
@@ -73,7 +70,7 @@ impl ReportCommand {
                 }
             },
             None => {
-                println!("{}", report.simple(true));
+                println!("{}", report.simple(false));
             }
         }
         Ok(())
@@ -517,6 +514,15 @@ mod tests {
     use curvine_model::WorkerAddress;
 
     #[test]
+    fn report_cli_parses_all_subcommand() {
+        let cmd = ReportCommand::try_parse_from(["report"]).unwrap();
+        assert!(cmd.action.is_none());
+
+        let cmd = ReportCommand::try_parse_from(["report", "all"]).unwrap();
+        assert!(matches!(cmd.action, Some(ReportSubCommand::All)));
+    }
+
+    #[test]
     fn simple_report_renders_worker_report_fields() {
         let startup_time_ms = 123_456;
         let worker = WorkerInfo {
@@ -617,5 +623,36 @@ mod tests {
 
         assert!(output.contains("worker-host:1234"));
         assert!(output.contains("version=0.2.0-test"));
+    }
+
+    #[test]
+    fn simple_report_hides_worker_details_when_disabled() {
+        let worker = WorkerInfo {
+            address: WorkerAddress {
+                worker_id: 9,
+                hostname: "worker-host".to_string(),
+                ip_addr: "127.0.0.1".to_string(),
+                rpc_port: 1234,
+                web_port: 5678,
+            },
+            capacity: 1024,
+            available: 512,
+            ..Default::default()
+        };
+        let report = CurvineReport {
+            info: FilesystemInfo {
+                live_workers: vec![worker],
+                ..Default::default()
+            },
+        };
+
+        let output = report.simple(false);
+
+        // Cluster-level worker counters stay visible, per-worker rows do not.
+        assert!(output.contains("live_worker_num"));
+        assert!(output.contains("lost_worker_num"));
+        assert!(!output.contains("live_worker_list"));
+        assert!(!output.contains("lost_worker_list"));
+        assert!(!output.contains("worker-host:1234"));
     }
 }
