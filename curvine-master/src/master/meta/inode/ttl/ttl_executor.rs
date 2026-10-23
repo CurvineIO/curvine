@@ -14,6 +14,7 @@
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::{InodePath, InodeView};
+use crate::master::meta::trash;
 use curvine_core_error::err_ext;
 use curvine_error::{FsError, FsResult};
 use curvine_model::TtlAction;
@@ -86,6 +87,13 @@ impl InodeTtlExecutor {
         );
 
         let path = self.get_inode_path(inode_id)?;
+        if trash::is_trash_path(&path) {
+            // Trashed entries are governed by trash retention, not TTL. Treat
+            // the action as handled so the expired entry leaves the TTL bucket.
+            debug!("skip ttl action for trash entry {} ({})", path, inode_id);
+            return Ok((true, inode));
+        }
+
         match action {
             TtlAction::Delete => {
                 // A non-empty directory stays until its children are gone.

@@ -246,7 +246,9 @@ impl MasterHandler {
             }
         }
 
-        let res = self.fs.delete(&header.path, header.recursive);
+        let res = self
+            .fs
+            .delete_with_opts(&header.path, header.recursive, false);
         self.set_req_cache(req_id, res)
     }
 
