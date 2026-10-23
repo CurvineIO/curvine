@@ -60,11 +60,7 @@ impl TrashCommand {
                 dst,
                 overwrite,
             } => {
-                let path = CurvineURI::new(path)?;
-                let dst = match dst {
-                    Some(value) => Some(CurvineURI::new(value)?),
-                    None => None,
-                };
+                let (path, dst) = parse_restore_paths(path, dst.as_deref())?;
 
                 client
                     .restore_trash(&path, dst.as_ref(), *overwrite)
@@ -86,5 +82,51 @@ impl TrashCommand {
                 Ok(())
             }
         }
+    }
+}
+
+/// Parses the restore arguments, rejecting non-Curvine URIs. The RPC serializes
+/// paths with `Path::encode()`, which drops the scheme and authority, so an
+/// `s3://bucket/data` destination would otherwise be applied to Curvine `/data`.
+fn parse_restore_paths(
+    path: &str,
+    dst: Option<&str>,
+) -> CommonResult<(CurvineURI, Option<CurvineURI>)> {
+    let path = CurvineURI::new(path)?;
+    let dst = match dst {
+        Some(value) => Some(CurvineURI::new(value)?),
+        None => None,
+    };
+
+    if !path.is_cv() || dst.as_ref().is_some_and(|dst| !dst.is_cv()) {
+        return Err("trash restore: trash path and destination must both be curvine uris".into());
+    }
+
+    Ok((path, dst))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_restore_paths;
+
+    #[test]
+    fn accepts_curvine_scheme_and_bare_paths() {
+        let (path, dst) = parse_restore_paths("/.Trash/1700000000000-42", Some("/data")).unwrap();
+        assert_eq!(path.full_path(), "/.Trash/1700000000000-42");
+        assert_eq!(dst.unwrap().full_path(), "/data");
+
+        let (path, dst) = parse_restore_paths("cv://bucket/.Trash/1700000000000-42", None).unwrap();
+        assert!(path.is_cv());
+        assert!(dst.is_none());
+    }
+
+    #[test]
+    fn rejects_non_curvine_trash_path() {
+        assert!(parse_restore_paths("s3://bucket/.Trash/1700000000000-42", None).is_err());
+    }
+
+    #[test]
+    fn rejects_non_curvine_destination() {
+        assert!(parse_restore_paths("/.Trash/1700000000000-42", Some("s3://bucket/data")).is_err());
     }
 }
