@@ -731,14 +731,17 @@ pub(crate) enum DrainOutcome {
 
 /// Wait for `inflight` to reach 0, retrying deferred qpair cleanup on every
 /// iteration so a transient free failure isn't stuck until an unrelated retry.
+/// Poll interval backs off (doubling, capped) to avoid hammering on a stuck free.
 pub(crate) fn wait_for_inflight_drain(
     inflight: &std::sync::atomic::AtomicUsize,
     env: Option<&crate::spdk_env::SpdkEnv>,
     deadline: std::time::Instant,
     name: &str,
-    poll_interval: std::time::Duration,
+    initial_poll_interval: std::time::Duration,
+    max_poll_interval: std::time::Duration,
 ) -> DrainOutcome {
     let mut logged = false;
+    let mut poll_interval = initial_poll_interval;
     loop {
         let count = inflight.load(std::sync::atomic::Ordering::Acquire);
         if count == 0 {
@@ -763,7 +766,17 @@ pub(crate) fn wait_for_inflight_drain(
             env.resolve_deferred_qpairs();
         }
         std::thread::sleep(poll_interval);
+        poll_interval = next_poll_interval(poll_interval, max_poll_interval);
     }
+}
+
+/// Doubles `current`, capped at `max`. Pulled out of the drain loop so the
+/// backoff schedule itself is directly unit-testable.
+fn next_poll_interval(
+    current: std::time::Duration,
+    max: std::time::Duration,
+) -> std::time::Duration {
+    current.saturating_mul(2).min(max)
 }
 
 impl Drop for SpdkBdev {
@@ -789,6 +802,7 @@ impl Drop for SpdkBdev {
             deadline,
             &self.name,
             std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(100),
         );
         if outcome == DrainOutcome::TimedOut {
             // Poison pointers so DmaBuf::drop is a no-op.
@@ -852,6 +866,17 @@ mod test {
             ..Default::default()
         }];
         SpdkEnv::init_global(conf).expect("SPDK init for tests");
+    }
+
+    #[test]
+    fn next_poll_interval_doubles_then_caps() {
+        let max = std::time::Duration::from_millis(100);
+        let mut interval = std::time::Duration::from_millis(1);
+        let expected_ms = [2, 4, 8, 16, 32, 64, 100, 100, 100];
+        for expected in expected_ms {
+            interval = next_poll_interval(interval, max);
+            assert_eq!(interval, std::time::Duration::from_millis(expected));
+        }
     }
 
     #[test]

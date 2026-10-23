@@ -1933,6 +1933,7 @@ mod test {
             deadline,
             "test-bdev",
             std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(100),
         );
 
         assert_eq!(outcome, crate::spdk_bdev::DrainOutcome::Completed);
