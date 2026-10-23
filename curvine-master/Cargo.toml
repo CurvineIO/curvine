@@ -19,6 +19,7 @@ curvine-config = { workspace = true }
 curvine-sys = { workspace = true }
 curvine-alloc = { workspace = true }
 curvine-model = { workspace = true }
+curvine-record = { workspace = true }
 curvine-runtime = { workspace = true }
 curvine-metrics = { workspace = true }
 curvine-rocksdb = { workspace = true }

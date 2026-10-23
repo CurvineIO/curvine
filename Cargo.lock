@@ -2638,6 +2638,7 @@ dependencies = [
  "curvine-net",
  "curvine-proto",
  "curvine-raft",
+ "curvine-record",
  "curvine-rocksdb",
  "curvine-rpc",
  "curvine-runtime",

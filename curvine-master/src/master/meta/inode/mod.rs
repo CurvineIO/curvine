@@ -29,6 +29,15 @@ pub use self::inode_path::InodePath;
 mod inodes_children;
 pub use self::inodes_children::*;
 
+mod child_item;
+pub use self::child_item::ChildItem;
+
+mod packed_iter;
+pub use self::packed_iter::PackedIter;
+
+mod packed_children;
+pub use self::packed_children::PackedChildren;
+
 pub mod ttl;
 
 pub const ROOT_INODE_ID: i64 = 1000;
