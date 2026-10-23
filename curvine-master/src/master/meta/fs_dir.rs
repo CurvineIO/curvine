@@ -85,6 +85,12 @@ impl FsDir {
         ttl_bucket_list: Arc<TtlBucketList>,
         evictor: Arc<dyn Evictor>,
     ) -> FsResult<Self> {
+        InodeChildren::set_container(conf.master.children_container)?;
+        info!(
+            "master children container: {:?}",
+            conf.master.children_container
+        );
+
         let db_conf = conf.db_conf();
 
         let store = RocksInodeStore::new(db_conf, conf.format_master)?;

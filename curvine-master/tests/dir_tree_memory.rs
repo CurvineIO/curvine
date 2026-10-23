@@ -17,13 +17,14 @@
 // Memory is reported as process RSS (working set) delta, so allocator padding,
 // Vec spare capacity and name buffers are all included.
 //
-// Layouts to measure are picked with CURVINE_MEM_TEST_LAYOUT=map|packed|both.
-// The test defaults to both, Map first, so the Packed baseline already carries
+// Layouts to measure are picked with CURVINE_MEM_TEST_LAYOUT=list|map|packed|both.
+// The test defaults to Map then Packed, so the Packed baseline already carries
 // Map's unreclaimed pages (the delta stays accurate, the baseline does not).
 //
 // Run (ignored by default because it allocates > 2 GiB):
 //   cargo test -p curvine-master --release --test dir_tree_memory -- --ignored --nocapture
 
+use curvine_config::ChildrenContainer;
 use curvine_master::master::meta::inode::{
     InodeChildren, InodeDir, InodeFile, InodePtr, InodeView, NamedDir, NamedEntry, ROOT_INODE_ID,
     ROOT_INODE_NAME,
@@ -45,26 +46,16 @@ const MIB: f64 = 1024.0 * 1024.0;
 const PACKED_FILE_HEADER: usize = 11;
 const PACKED_DIR_HEADER: usize = 15;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Layout {
-    Map,
-    Packed,
+fn label(container: ChildrenContainer) -> &'static str {
+    match container {
+        ChildrenContainer::List => "List",
+        ChildrenContainer::Map => "Map",
+        ChildrenContainer::Packed => "Packed",
+    }
 }
 
-impl Layout {
-    fn label(self) -> &'static str {
-        match self {
-            Layout::Map => "Map",
-            Layout::Packed => "Packed",
-        }
-    }
-
-    fn children(self) -> InodeChildren {
-        match self {
-            Layout::Map => InodeChildren::new_map(),
-            Layout::Packed => InodeChildren::new_packed(),
-        }
-    }
+fn children(container: ChildrenContainer) -> InodeChildren {
+    InodeChildren::new(container)
 }
 
 fn dir_name(i: usize) -> String {
@@ -95,7 +86,7 @@ struct Accounting {
     payload_bytes: usize,
 }
 
-fn account_tree(root: &InodeView, layout: Layout) -> Accounting {
+fn account_tree(root: &InodeView, container: ChildrenContainer) -> Accounting {
     let mut acc = Accounting::default();
     let mut stack: Vec<InodePtr> = vec![InodePtr::from_ref(root)];
 
@@ -104,8 +95,8 @@ fn account_tree(root: &InodeView, layout: Layout) -> Accounting {
     // additionally stores the name (and id) a second time in the record area;
     // Map keeps a second name copy as the BTreeMap key.
     let entry_overhead = size_of::<Box<InodeView>>() + size_of::<InodeView>();
-    let packed = layout == Layout::Packed;
-    let mapped = layout == Layout::Map;
+    let packed = container == ChildrenContainer::Packed;
+    let mapped = container == ChildrenContainer::Map;
 
     while let Some(node) = stack.pop() {
         let InodeView::Dir(dir) = node.as_ref() else {
@@ -161,20 +152,20 @@ fn print_struct_sizes() {
     println!("  Box<InodeView> = {}", size_of::<Box<InodeView>>());
 }
 
-fn measure(layout: Layout, dir_count: usize) {
+fn measure(container: ChildrenContainer, dir_count: usize) {
     let rss_start = rss_mib();
 
     // Phase 1: root + `dir_count` empty directories.
     let t = Instant::now();
     let mut root = InodeView::new_dir(
         ROOT_INODE_NAME.to_string(),
-        InodeDir::with_children(ROOT_INODE_ID, 0, layout.children()),
+        InodeDir::with_children(ROOT_INODE_ID, 0, children(container)),
     );
     let mut next_id: i64 = ROOT_INODE_ID + 1;
     for i in 0..dir_count {
         let dir = InodeView::new_dir(
             dir_name(i),
-            InodeDir::with_children(next_id, 0, layout.children()),
+            InodeDir::with_children(next_id, 0, children(container)),
         );
         next_id += 1;
         root.add_child(dir).unwrap();
@@ -204,7 +195,7 @@ fn measure(layout: Layout, dir_count: usize) {
     assert_eq!(file_name(0).len(), FILE_NAME_LEN);
     assert_eq!(file_name(FILES_PER_DIR - 1).len(), FILE_NAME_LEN);
 
-    let acc = account_tree(&root, layout);
+    let acc = account_tree(&root, container);
     assert_eq!(acc.dirs, dir_count);
     assert_eq!(acc.files, dir_count * FILES_PER_DIR);
     assert_eq!(root.child_len(), dir_count);
@@ -218,7 +209,7 @@ fn measure(layout: Layout, dir_count: usize) {
     println!(
         "\n=== namespace tree: {dir_count} dirs x {FILES_PER_DIR} files \
          (children = {}, dir names {DIR_NAME_LEN} B, file names {FILE_NAME_LEN} B) ===",
-        layout.label()
+        label(container)
     );
     println!("RSS baseline         : {:8.1} MiB", rss_start);
     println!(
@@ -251,11 +242,12 @@ fn measure(layout: Layout, dir_count: usize) {
     );
 }
 
-fn layouts(default: &[Layout]) -> Vec<Layout> {
+fn containers(default: &[ChildrenContainer]) -> Vec<ChildrenContainer> {
     match std::env::var("CURVINE_MEM_TEST_LAYOUT").ok().as_deref() {
-        Some("map") => vec![Layout::Map],
-        Some("packed") => vec![Layout::Packed],
-        Some("both") => vec![Layout::Map, Layout::Packed],
+        Some("list") => vec![ChildrenContainer::List],
+        Some("map") => vec![ChildrenContainer::Map],
+        Some("packed") => vec![ChildrenContainer::Packed],
+        Some("both") => vec![ChildrenContainer::Map, ChildrenContainer::Packed],
         _ => default.to_vec(),
     }
 }
@@ -264,7 +256,7 @@ fn layouts(default: &[Layout]) -> Vec<Layout> {
 #[ignore = "allocates > 2 GiB; run explicitly with --ignored --nocapture"]
 fn dir_tree_memory_10m_files() {
     print_struct_sizes();
-    for layout in layouts(&[Layout::Map, Layout::Packed]) {
-        measure(layout, DIR_COUNT);
+    for container in containers(&[ChildrenContainer::Map, ChildrenContainer::Packed]) {
+        measure(container, DIR_COUNT);
     }
 }

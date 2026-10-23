@@ -19,6 +19,18 @@ use curvine_runtime::runtime::GroupExecutor;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChildrenContainer {
+    /// Sorted `Vec` of boxed inodes, kept for A/B comparison and rollback.
+    List,
+    /// `BTreeMap` keyed by child name, kept for A/B comparison and rollback.
+    Map,
+    /// Default production layout: file edges inlined into per-directory records.
+    #[default]
+    Packed,
+}
+
 // master Configuration file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -47,6 +59,8 @@ pub struct MasterConf {
     // Metadata configuration, currently only supports rocksdb.
     // rocksdb configuration.
     pub meta_dir: String,
+
+    pub children_container: ChildrenContainer,
 
     pub min_block_size: i64,
     pub max_block_size: i64,
@@ -351,6 +365,8 @@ impl Default for MasterConf {
 
             meta_dir: dir,
 
+            children_container: ChildrenContainer::default(),
+
             min_block_size: 1024 * 1024,
             max_block_size: 100 * 1024 * 1024 * 1024,
             min_replication: 1,
@@ -554,6 +570,29 @@ mod tests {
         assert!(error
             .to_string()
             .contains("block_replication_job_timeout must be greater than zero"));
+    }
+
+    #[test]
+    fn children_container_defaults_to_packed() {
+        let conf: ClusterConf = toml::from_str("[master]").unwrap();
+        assert_eq!(conf.master.children_container, ChildrenContainer::Packed);
+    }
+
+    #[test]
+    fn children_container_parses_lowercase_names() {
+        let conf: ClusterConf = toml::from_str("[master]\nchildren_container = \"map\"").unwrap();
+        assert_eq!(conf.master.children_container, ChildrenContainer::Map);
+    }
+
+    #[test]
+    fn unknown_children_container_is_rejected() {
+        let err = toml::from_str::<ClusterConf>("[master]\nchildren_container = \"sorted\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown variant"), "{err}");
+        assert!(err.contains("list"), "{err}");
+        assert!(err.contains("map"), "{err}");
+        assert!(err.contains("packed"), "{err}");
     }
 
     #[test]

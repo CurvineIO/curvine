@@ -31,7 +31,7 @@ pub use self::dir_space_conf::{
 };
 
 mod master_conf;
-pub use self::master_conf::MasterConf;
+pub use self::master_conf::{ChildrenContainer, MasterConf};
 
 mod mds_conf;
 pub use self::mds_conf::{KvBackendType, MdsConf};

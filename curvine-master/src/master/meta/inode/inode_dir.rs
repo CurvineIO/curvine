@@ -59,7 +59,7 @@ impl InodeDir {
             nlink: *nlink,
             storage_policy: storage_policy.clone(),
             features: features.clone(),
-            children: InodeChildren::new_packed(),
+            children: InodeChildren::default(),
         }
     }
 
@@ -72,7 +72,7 @@ impl InodeDir {
     }
 
     pub fn new(id: i64, time: i64) -> Self {
-        Self::with_children(id, time, InodeChildren::new_packed())
+        Self::with_children(id, time, InodeChildren::default())
     }
 
     pub fn with_children(id: i64, time: i64, children: InodeChildren) -> Self {
@@ -104,7 +104,7 @@ impl InodeDir {
                 },
                 x_attr: opts.x_attr,
             },
-            children: InodeChildren::new_packed(),
+            children: InodeChildren::default(),
         }
     }
 
@@ -244,7 +244,7 @@ impl Decode for InodeDir {
             storage_policy: StoragePolicy::decode(reader)?,
             features: DirFeature::decode(reader)?,
             // Children are persisted as edges, not inside the inode record.
-            children: InodeChildren::new_packed(),
+            children: InodeChildren::default(),
         })
     }
 }
@@ -278,7 +278,7 @@ mod tests {
                     mode: 0o755,
                 },
             },
-            children: InodeChildren::new_packed(),
+            children: InodeChildren::default(),
         };
 
         let mut writer = Writer::new(1).unwrap();
