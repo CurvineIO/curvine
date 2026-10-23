@@ -97,6 +97,82 @@ cargo bench
 - Update documentation as needed
 - Ensure all CI checks pass
 
+## AI-Assisted Contribution Workflow
+
+Curvine keeps a set of versioned AI agent skills under [`.agents/skills/`](.agents/skills/), all prefixed with `cv-`. They encode the project's issue, implementation, pull request, and review conventions so an AI coding agent can perform the routine steps consistently. Using them is optional, but they are the canonical checklists for the workflows described above, even if you contribute manually.
+
+### How skills are delivered
+
+- `.agents/skills/<name>/SKILL.md` is the canonical source. `.claude/skills/`, `.cursor/skills/`, and `.github/skills/` are symlinks to it.
+- Invoke a skill by name where slash commands are supported (for example `/cv-create-issue` in Claude Code or GitHub Copilot); Cursor discovers the same skills automatically.
+- Skills never create issues, push commits, open pull requests, or post review comments without your explicit confirmation. They draft first and act after you approve.
+- All GitHub-facing text produced by a skill is in English and follows [`.agents/rules/workflow.md`](.agents/rules/workflow.md).
+
+### Skill map
+
+| Contribution action | Skill | What it does |
+| ------------------- | ----- | ------------ |
+| Create an issue | `cv-create-issue` | Searches for duplicates, picks the bug or feature template, drafts the body (features also get Goal / Not Goal / Test Plan), then files the issue. |
+| Resolve an issue | `cv-handle-issue` | Reads the issue, summarizes impact and risks, proposes a plan, waits for your approval, creates the branch, implements with tests, then hands off to PR creation. |
+| Break down a large change | `cv-tasks-breakdown` | Splits work estimated above ~500 lines into dependency-ordered, commit-sized tasks with tests, and creates `[SUB]` sub-issues. |
+| Submit a pull request | `cv-create-pr` | Runs `make format`, reviews the diff, commits, and drafts the PR title and body using the required sections. |
+| Review a pull request | `cv-submit-pr-review` | Reviews the diff against the live base and head: intent, tests first, dirty crates, lifecycle, contracts, compatibility, and critical-path performance. |
+| Handle review comments | `cv-address-pr-review` | Collects every comment, produces an accept/reject table for your approval, applies fixes, replies, and resolves the fixed threads. |
+| Explore the codebase | `cv-codegraph` | Uses the local CodeGraph index for symbol lookup and call-path tracing; falls back to grep and direct reads when it is unavailable. |
+| Test and CI | `cv-csi-test`, `cv-run-workflow`, `cv-test-report` | CSI integration scenarios, manual GitHub Actions dispatch, and publishing full-chain test reports. |
+| Add or update a skill | `cv-add-skills` | Documents the naming, layout, and `AGENTS.md` registry rules for new `cv-*` skills. |
+
+### 1. Create an issue
+
+Describe what you observed and ask the agent to file it:
+
+```text
+/cv-create-issue
+FUSE read of a 64 MiB file hangs after a worker restart; client version ...
+```
+
+The skill first searches open issues for duplicates, then selects `.github/ISSUE_TEMPLATE/bug_report.md` or `feature_request.md` and drafts the body. Bug reports require reproduction steps and environment details. Feature requests additionally require **Goal**, **Not Goal**, and **Test Plan** sections. Nothing is created until you review and approve the draft. Sub-issues of a parent issue use the `[SUB]` title prefix and link `Parent: #<number>`.
+
+### 2. Resolve an issue
+
+Give the agent the issue number or URL:
+
+```text
+/cv-handle-issue 123
+```
+
+The flow is: read the issue → summarize the problem, affected modules, risks, and test strategy → propose a plan → **wait for your approval** → create a `fix/123-<slug>` or `feat/123-<slug>` branch → implement the approved scope with tests → run `make format` → hand off to `cv-create-pr`. No code is written before the plan is approved.
+
+If the estimated change exceeds ~500 lines or spans several modules, the skill routes to `cv-tasks-breakdown`, which produces a dependency-ordered task table plus sub-issues; each task should land as one commit and leave the build and tests green.
+
+### 3. Submit a pull request
+
+When your commits are ready:
+
+```text
+/cv-create-pr
+```
+
+The skill runs `make format`, checks the diff, and drafts:
+
+- **Title**: `<type>(<module>): <description> (#<issueNumber>)`
+- **Body**: Summary, Issue Describe / Design, Changes table, Test verified table, Dependencies
+
+PRs are created as drafts unless you ask for a ready PR. Record the exact tests you ran in **Test verified**; a green CI job alone is not a verification story. Commit messages follow [COMMIT_CONVENTION.md](COMMIT_CONVENTION.md) and should reference the related issue as `(#number)`.
+
+### 4. Review code
+
+Two skills cover the two sides of code review:
+
+- **As a reviewer**, run `/cv-submit-pr-review <PR-number>`. The skill verifies the live base and head, reads changed tests before the implementation, maps the dirty crates, and checks correctness, concurrency and lifecycle, wire compatibility, and performance on data I/O, RPC, and metadata paths. It drafts comments with `Critical:` / `Required:` / `Optional:` prefixes plus a local verdict, and posts only after you confirm.
+- **As an author**, run `/cv-address-pr-review <PR-number>`. The skill reads every review comment, presents an accept / partial / reject table with reasons, applies the approved fixes, pushes the update, replies to each comment in English, and resolves the fixed threads.
+
+### Ground rules
+
+- You own the contribution: review everything the agent writes, run the tests yourself, and understand the change before submitting it.
+- Skills are guidance, not enforcement. CI still validates formatting, compilation, tests, and the PR title.
+- Skills must be written in English. Add or change one only through `cv-add-skills`, and keep the registry in [`AGENTS.md`](AGENTS.md) in sync.
+
 ## Architecture Overview
 
 Curvine follows a distributed architecture with the following components:
@@ -169,6 +245,8 @@ By contributing to Curvine, you agree that your contributions will be licensed u
 6. **Make your changes** following the coding guidelines
 7. **Write tests** for your changes
 8. **Submit a pull request** with a clear description
+
+If you use an AI coding agent, the [`cv-*` skills](#ai-assisted-contribution-workflow) can automate these steps and keep the issue, PR, and review formats consistent. You remain responsible for reviewing the output and verifying the change.
 
 We appreciate all contributions, big and small. Thank you for helping make Curvine better!
 
