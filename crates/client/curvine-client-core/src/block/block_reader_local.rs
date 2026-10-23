@@ -416,8 +416,15 @@ impl BlockReaderLocal {
     }
 
     // Replace `slot` with a buffered handle re-opened at `off`. On failure
-    // the old handle is left in place. Free-standing for unit tests.
+    // the old handle is left in place, rewound to `off`. Free-standing for
+    // unit tests.
     fn reopen_buffered(slot: &mut RawPtr<LocalFile>, path: &str, off: i64) -> FsResult<()> {
+        // Rewind the retained handle first: the failed direct read already
+        // advanced its pos to `off + len` even though nothing was delivered,
+        // and when the re-open below fails, the replica retry opens the next
+        // reader at self.pos() (`block_reader.rs`, BlockReader::read). Leaving
+        // the advanced pos in place would silently skip a whole chunk.
+        slot.as_mut().seek(off)?;
         let file = LocalFile::with_read(path, off as u64)?;
         *slot = RawPtr::from_owned(file);
         Ok(())
@@ -765,15 +772,49 @@ mod tests {
         slot.as_mut().read_all(&mut buf).unwrap();
         assert_eq!(&buf[..], &data[1234..2234]);
 
-        // A failed re-open propagates and leaves the old handle in place.
+        // A failed re-open propagates but leaves the old handle in place,
+        // rewound to the requested offset: the replica retry opens the next
+        // reader at pos(), which must be the failed request's offset.
         assert!(
             BlockReaderLocal::reopen_buffered(&mut slot, "/definitely/missing/dir/block", 0)
                 .is_err()
         );
-        assert_eq!(slot.pos(), 2234);
+        assert_eq!(slot.pos(), 0);
         let mut buf = vec![0u8; 8];
         slot.as_mut().read_all(&mut buf).unwrap();
-        assert_eq!(&buf[..], &data[2234..2242]);
+        assert_eq!(&buf[..], &data[..8]);
+
+        remove_file(&path).unwrap();
+    }
+
+    // Regression: a direct short read advances the handle's pos to off + len
+    // before crop_bounds rejects the result. If the buffered re-open then
+    // fails, the retained handle must report the FAILED REQUEST's offset, not
+    // the advanced one — BlockReader::read opens the next replica at pos(),
+    // and an advanced pos would silently skip a chunk that was never
+    // delivered.
+    #[test]
+    fn failed_reopen_after_short_read_restores_request_offset() {
+        let path = test_path();
+        // EOF at 6000: the window [4096, 8192) comes up short.
+        write_pattern_file(&path, 6000);
+
+        let mut file = LocalFile::with_read(&path, 0).unwrap();
+        let plan = DirectReadPlan::new(4096, 4096).unwrap();
+        assert!(BlockReaderLocal::direct_read_window(&mut file, &plan).is_err());
+        // The short read left pos advanced past the undelivered window.
+        assert_eq!(file.pos(), 8192);
+
+        let mut slot = RawPtr::from_owned(file);
+        assert!(BlockReaderLocal::reopen_buffered(
+            &mut slot,
+            "/definitely/missing/dir/block",
+            plan.off
+        )
+        .is_err());
+        // The replica retry reads pos() from the retained handle: it must be
+        // the failed request's offset so no chunk is skipped.
+        assert_eq!(slot.pos(), plan.off);
 
         remove_file(&path).unwrap();
     }

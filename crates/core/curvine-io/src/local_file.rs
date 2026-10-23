@@ -741,7 +741,15 @@ mod tests {
 
         let mut direct = match LocalFile::with_read_direct(&path, 0) {
             Ok(Some(f)) => f,
-            Ok(None) => panic!("regular filesystem must accept O_DIRECT"),
+            Ok(None) => {
+                // `Ok(None)` is a supported capability-detection result: the
+                // filesystem holding the test file (e.g. tmpfs) has no
+                // O_DIRECT. The buffered fallback is covered elsewhere; skip
+                // the direct-I/O assertions.
+                eprintln!("skipping: filesystem does not support O_DIRECT");
+                remove_file(&path).unwrap();
+                return;
+            }
             Err(e) => panic!("unexpected open error: {e}"),
         };
         assert_eq!(direct.pos(), 0);

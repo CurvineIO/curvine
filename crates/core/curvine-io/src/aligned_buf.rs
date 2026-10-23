@@ -36,9 +36,12 @@ pub struct AlignedBuf {
 impl AlignedBuf {
     /// Allocate `len` bytes with a [`DIRECT_IO_ALIGN`]-aligned base address.
     ///
-    /// Contents are uninitialized: the caller fills the exposed region via a
-    /// read before consuming it (same idiom as `LocalFile::read_full` /
-    /// `pread_full`, which `set_len` a `BytesMut` before reading into it).
+    /// Storage is zero-initialized (`vec![0; n]` lowers to `alloc_zeroed`,
+    /// which serves page-granular buffers from pre-zeroed pages), so every
+    /// byte reachable through the safe accessors is initialized even before
+    /// a read fills the window. Short-read cropping still happens at the
+    /// consumer (`DirectReadPlan::crop_bounds`): zeroed padding must never be
+    /// exposed as file data.
     pub fn alloc(len: usize) -> Self {
         if len == 0 {
             return Self {
@@ -49,21 +52,12 @@ impl AlignedBuf {
         }
 
         // Over-allocate by align - 1 so an aligned `len`-byte window always fits.
-        let mut inner: Vec<u8> = Vec::with_capacity(len + DIRECT_IO_ALIGN - 1);
+        let inner: Vec<u8> = vec![0u8; len + DIRECT_IO_ALIGN - 1];
         let off = inner.as_ptr().align_offset(DIRECT_IO_ALIGN);
         assert!(
-            off != usize::MAX && off + len <= inner.capacity(),
+            off != usize::MAX && off + len <= inner.len(),
             "{DIRECT_IO_ALIGN}-aligned window must fit the allocation"
         );
-        // SAFETY: both halves of the `set_len` contract hold.
-        // 1. `new_len <= capacity()`: we pass `capacity()` itself.
-        // 2. Fill-before-consume: elements in the exposed window
-        //    `[off, off + len)` are only read after the caller has filled them
-        //    with a successful read (e.g. `LocalFile::pread_aligned`); no
-        //    reference to them may be consumed before then. This mirrors the
-        //    crate-wide `BytesMut::with_capacity` + `set_len` idiom
-        //    (`LocalFile::read_full`/`pread_full`).
-        unsafe { inner.set_len(inner.capacity()) }
 
         Self { inner, off, len }
     }
@@ -95,9 +89,9 @@ impl AlignedBuf {
     /// Zero-copy conversion into [`Bytes`]: the underlying allocation is
     /// adopted by the returned handle, which is a view over the aligned region.
     ///
-    /// The caller must ensure `[off, off + len)` was filled by a successful
-    /// read before converting; the exposed contents are uninitialized at
-    /// allocation time (see [`AlignedBuf::alloc`]).
+    /// Bytes the caller did not fill with a read are zeros (see
+    /// [`AlignedBuf::alloc`]); the caller is responsible for cropping to the
+    /// range a read actually covered.
     pub fn into_bytes(self) -> Bytes {
         let bytes = Bytes::from(self.inner);
         bytes.slice(self.off..self.off + self.len)
@@ -153,6 +147,19 @@ mod tests {
         assert!(buf.is_empty());
         assert!(buf.as_slice().is_empty());
         assert!(buf.into_bytes().is_empty());
+    }
+
+    // The safe accessors (`as_slice`, `into_bytes`, Deref) are reachable
+    // before any read fills the buffer, so the storage must be initialized
+    // at allocation time.
+    #[test]
+    fn alloc_storage_is_zero_initialized() {
+        for len in [1usize, 4096, 10000] {
+            let buf = AlignedBuf::alloc(len);
+            assert!(buf.as_slice().iter().all(|&b| b == 0), "len={len}");
+            let bytes = buf.into_bytes();
+            assert!(bytes.iter().all(|&b| b == 0), "len={len}");
+        }
     }
 
     #[test]
