@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::master::meta::inode::PATH_SEPARATOR;
+use std::collections::HashMap;
 
 pub const TRASH_ROOT_NAME: &str = ".Trash";
 
@@ -49,6 +50,30 @@ pub fn trash_entry_path(entry_name: &str) -> String {
     format!("{}{}{}", TRASH_ROOT, PATH_SEPARATOR, entry_name)
 }
 
+// Trash entries are always direct children of the trash root.
+pub fn is_trash_entry_path(path: &str) -> bool {
+    let path = path.trim_start_matches(PATH_SEPARATOR);
+    match path.strip_prefix(TRASH_ROOT_PREFIX) {
+        Some(name) => !name.is_empty() && !name.contains(PATH_SEPARATOR),
+        None => false,
+    }
+}
+
+pub fn decode_origin(x_attr: &HashMap<String, Vec<u8>>) -> Option<String> {
+    x_attr
+        .get(TRASH_XATTR_ORIGIN)
+        .and_then(|value| String::from_utf8(value.clone()).ok())
+}
+
+pub fn decode_delete_ms(x_attr: &HashMap<String, Vec<u8>>) -> Option<i64> {
+    let bytes: [u8; 8] = x_attr
+        .get(TRASH_XATTR_DELETE_MS)?
+        .as_slice()
+        .try_into()
+        .ok()?;
+    Some(i64::from_le_bytes(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,6 +100,41 @@ mod tests {
         assert!(!is_reserved_path("/.Trashx"));
         assert!(!is_reserved_path("/a/.Trash"));
         assert!(!is_reserved_path("/foo"));
+    }
+
+    #[test]
+    fn identifies_trash_entry_paths() {
+        assert!(is_trash_entry_path("/.Trash/1700000000000-42"));
+        assert!(is_trash_entry_path(".Trash/1700000000000-42"));
+
+        assert!(!is_trash_entry_path("/.Trash"));
+        assert!(!is_trash_entry_path("/.Trash/"));
+        assert!(!is_trash_entry_path("/.Trash/a/b"));
+        assert!(!is_trash_entry_path("/plain.log"));
+        assert!(!is_trash_entry_path("/a/.Trash/entry"));
+    }
+
+    #[test]
+    fn decodes_trash_metadata() {
+        let x_attr = HashMap::from([
+            (TRASH_XATTR_ORIGIN.to_string(), b"/data/a.log".to_vec()),
+            (
+                TRASH_XATTR_DELETE_MS.to_string(),
+                1_700_000_000_000_i64.to_le_bytes().to_vec(),
+            ),
+        ]);
+
+        assert_eq!(decode_origin(&x_attr).as_deref(), Some("/data/a.log"));
+        assert_eq!(decode_delete_ms(&x_attr), Some(1_700_000_000_000));
+        assert_eq!(decode_origin(&HashMap::new()), None);
+        assert_eq!(decode_delete_ms(&HashMap::new()), None);
+        assert_eq!(
+            decode_delete_ms(&HashMap::from([(
+                TRASH_XATTR_DELETE_MS.to_string(),
+                vec![1, 2, 3],
+            )])),
+            None
+        );
     }
 
     #[test]
