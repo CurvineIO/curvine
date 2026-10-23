@@ -419,11 +419,32 @@ impl FuseConf {
             );
         }
 
+        // The state file writer refuses a directory that other users can write to
+        // or that another user owns, so report it here rather than at SIGUSR1.
+        #[cfg(unix)]
+        if let Err(e) = curvine_fs_api::check_state_dir(path) {
+            return err_box!(
+                "fuse.state_dir '{}' cannot be used for state files: {}",
+                self.state_dir,
+                e
+            );
+        }
+
         // Probe writability by creating (then removing) a temp file. Directory
         // permission bits alone can be misleading (e.g. read-only mounts), so a
-        // real create is the reliable check.
-        let probe = path.join(format!(".curvine_fuse_state_probe_{}", std::process::id()));
-        match std::fs::File::create(&probe) {
+        // real create is the reliable check. The name is random and the file is
+        // created exclusively, so a file or symlink planted at a predictable name
+        // in a shared directory is never opened or truncated.
+        let probe = path.join(format!(
+            ".curvine_fuse_state_probe_{}_{}",
+            std::process::id(),
+            Utils::rand_str(12)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
             Ok(_) => {
                 let _ = std::fs::remove_file(&probe);
                 Ok(())
@@ -1377,6 +1398,37 @@ mnt_per_task = 7
         };
         conf.validate_state_dir()
             .expect("writable directory must pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_state_dir_rejects_shared_dir_without_sticky_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("cv_state_shared_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = FuseConf {
+            state_dir: dir.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+
+        for mode in [0o775, 0o777] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = conf
+                .validate_state_dir()
+                .expect_err("a directory writable by others without sticky bit must fail");
+            assert!(
+                err.to_string().contains("sticky"),
+                "unexpected error: {}",
+                err
+            );
+        }
+
+        // The sticky bit, as on /tmp, makes a shared directory acceptable.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        conf.validate_state_dir()
+            .expect("a sticky shared directory must pass");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
