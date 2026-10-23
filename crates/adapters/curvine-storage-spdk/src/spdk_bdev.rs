@@ -935,7 +935,7 @@ mod test {
     ) {
         ensure_spdk_init();
         let block_size = 512u32;
-        let buf_size = DmaBuf::align_up(1024 * 1024, block_size as usize);
+        let buf_size = block_size as usize; // one block is enough for every I/O these tests issue
         let read_buf = DmaBuf::alloc(buf_size, block_size).unwrap();
         let write_buf = DmaBuf::alloc(buf_size, block_size).unwrap();
         let (tx, rx) = crossbeam::channel::unbounded();
