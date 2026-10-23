@@ -209,11 +209,19 @@ fn prepare_flush_file(
 }
 
 fn new_handler_for_test(test_name: &str) -> MasterHandler {
+    new_handler_with_conf(test_name, |_| {})
+}
+
+fn new_handler_with_conf(
+    test_name: &str,
+    configure: impl FnOnce(&mut ClusterConf),
+) -> MasterHandler {
     Master::init_test_metrics();
 
     let test_id = Utils::rand_str(8);
     let mut conf = ClusterConf::format();
     conf.journal.enable = false;
+    configure(&mut conf);
 
     conf.master.meta_dir =
         Utils::test_sub_dir(format!("master-fs-test/meta-{test_name}-{test_id}"));
@@ -2184,6 +2192,39 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     Ok(())
 }
 
+#[test]
+fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-skip", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    fs.create("/skip.log", true)?;
+    handler.delete0(
+        Utils::req_id(),
+        DeleteRequest {
+            path: "/skip.log".to_string(),
+            recursive: false,
+            skip_trash: Some(true),
+        },
+    )?;
+    assert!(fs.get_block_locations("/skip.log").is_err());
+    assert!(fs.list_options("/.Trash", Default::default()).is_err());
+
+    fs.create("/soft.log", true)?;
+    handler.delete0(
+        Utils::req_id(),
+        DeleteRequest {
+            path: "/soft.log".to_string(),
+            recursive: false,
+            skip_trash: Some(false),
+        },
+    )?;
+    assert!(fs.get_block_locations("/soft.log").is_err());
+    assert_eq!(fs.list_options("/.Trash", Default::default())?.len(), 1);
+
+    Ok(())
+}
+
 fn delete_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
     let msg = Builder::new_rpc(RpcCode::Mkdir)
         .proto_header(MkdirRequest {
@@ -2214,6 +2255,7 @@ fn delete_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
     let req = DeleteRequest {
         path: "/delete_file_retry".to_string(),
         recursive: true,
+        ..Default::default()
     };
 
     let f1: DeleteResult = handler.delete0(id, req.clone())?;
