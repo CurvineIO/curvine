@@ -60,12 +60,15 @@ impl TrashExpunger {
                 continue;
             }
 
-            match self.fs.delete_with_opts(&entry.path, true, true) {
-                Ok(deleted) => {
+            match self.fs.delete_with_opts_if_active(&entry.path, true, true) {
+                Ok(Some(deleted)) => {
                     result.entries += 1;
                     result.inodes += deleted.inodes;
                     result.bytes += deleted.bytes;
                 }
+                // Leadership moved elsewhere mid-sweep; a former leader must
+                // not mutate metadata or enqueue journal records.
+                Ok(None) => break,
                 // The entry was restored or emptied after the listing snapshot.
                 Err(FsError::FileNotFound(_)) => {}
                 Err(e) => warn!("failed to expunge trash entry {}: {}", entry.path, e),
@@ -139,6 +142,7 @@ mod tests {
     #[test]
     fn expunges_only_entries_past_retention() {
         let fs = test_fs("expire", "1h");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
         let expunger = TrashExpunger::new(fs.clone(), fs.master_monitor.clone());
         let delete_ms = trash_one(&fs, "/data/a.log");
         let retention_ms = fs.conf.trash_retention_ms() as i64;
@@ -180,6 +184,33 @@ mod tests {
         fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
         expunger.run().unwrap();
         assert!(fs.list_trash().unwrap().is_empty());
+    }
+
+    #[test]
+    fn demoted_master_stops_purging_mid_sweep() {
+        let fs = test_fs("demote-sweep", "1ms");
+        trash_one(&fs, "/data/a.log");
+        trash_one(&fs, "/data/b.log");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+
+        // Hold the namespace write lock so the sweep is in flight when the
+        // role changes; the delete must observe the demotion at the mutation
+        // boundary instead of purging the listing snapshot.
+        let fs_dir = fs.fs_dir();
+        let lock = fs_dir.write();
+        let sweep_fs = fs.clone();
+        let handle = std::thread::spawn(move || {
+            let expunger = TrashExpunger::new(sweep_fs.clone(), sweep_fs.master_monitor.clone());
+            expunger.expunge_expired(LocalTime::mills() as i64 + 10)
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs.master_monitor.journal_ctl.set_state(RoleState::Follower);
+        drop(lock);
+
+        let result = handle.join().unwrap().unwrap();
+        assert_eq!(result, TrashExpungeResult::default());
+        assert_eq!(fs.list_trash().unwrap().len(), 2);
     }
 
     #[test]

@@ -255,8 +255,45 @@ impl MasterFilesystem {
         recursive: bool,
         skip_trash: bool,
     ) -> FsResult<DeleteResult> {
-        let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let mut delete_res = {
+            let mut fs_dir = self.fs_dir.write();
+            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, skip_trash)?
+        };
+        self.release_deleted_blocks(&mut delete_res);
+
+        Ok(delete_res)
+    }
+
+    /// Leader-fenced variant of `delete_with_opts`. The role is re-checked
+    /// while holding the same write lock that guards the metadata mutation, so
+    /// a demotion cannot interleave between the check and the delete. Returns
+    /// `None` when this node is no longer the active master.
+    pub fn delete_with_opts_if_active<T: AsRef<str>>(
+        &self,
+        path: T,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<Option<DeleteResult>> {
+        let mut delete_res = {
+            let mut fs_dir = self.fs_dir.write();
+            if !self.master_monitor.is_active() {
+                return Ok(None);
+            }
+            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, skip_trash)?
+        };
+        self.release_deleted_blocks(&mut delete_res);
+
+        Ok(Some(delete_res))
+    }
+
+    fn delete_locked(
+        &self,
+        fs_dir: &mut FsDir,
+        path: &str,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<DeleteResult> {
+        let inp = Self::resolve_path(fs_dir, path)?;
 
         // Removing the root would orphan every trashed entry. Entries below it
         // stay permanently deletable so the recycle bin can be emptied.
@@ -270,21 +307,21 @@ impl MasterFilesystem {
         let soft_delete =
             !skip_trash && self.conf.trash_enabled && !trash::is_trash_path(inp.path());
 
-        let mut delete_res = if soft_delete {
-            fs_dir.trash(&inp, recursive)?
+        if soft_delete {
+            fs_dir.trash(&inp, recursive)
         } else {
-            fs_dir.delete(&inp, recursive)?
-        };
-        drop(fs_dir);
+            fs_dir.delete(&inp, recursive)
+        }
+    }
 
+    fn release_deleted_blocks(&self, delete_res: &mut DeleteResult) {
+        let blocks = std::mem::take(&mut delete_res.blocks);
         let mut worker_manager = self.worker_manager.write();
         worker_manager.remove_blocks(&DeleteResult {
             inodes: 0,
             bytes: 0,
-            blocks: std::mem::take(&mut delete_res.blocks),
+            blocks,
         });
-
-        Ok(delete_res)
     }
 
     pub fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
