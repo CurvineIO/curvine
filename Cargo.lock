@@ -2413,6 +2413,7 @@ dependencies = [
  "curvine-core-error",
  "curvine-runtime",
  "curvine-sys",
+ "libc",
  "serde",
  "thiserror 1.0.69",
  "tokio",

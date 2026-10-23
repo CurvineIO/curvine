@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{CacheManager, DataSlice, IOError, IOResult, ReadAheadTask};
+use crate::{AlignedBuf, CacheManager, DataSlice, IOError, IOResult, ReadAheadTask};
 use bytes::BytesMut;
 use curvine_sys::{self, RawIOSlice};
 use serde::de::DeserializeOwned;
@@ -90,6 +90,115 @@ impl LocalFile {
 
         file.seek(SeekFrom::Start(off))?;
         Self::new(path.as_ref(), file)
+    }
+
+    /// Open for direct (O_DIRECT) reading, bypassing the page cache.
+    ///
+    /// Returns `Ok(None)` when the open fails with `EINVAL`/`EOPNOTSUPP`
+    /// (filesystem or kernel without O_DIRECT support) so the caller can fall
+    /// back to buffered reads; other errors propagate. On non-Linux platforms
+    /// O_DIRECT does not exist and this always returns `Ok(None)`.
+    ///
+    /// Reads on the returned handle must go through [`Self::pread_aligned`]
+    /// with a 4096-aligned destination; unaligned buffered reads fail with
+    /// `EINVAL` under O_DIRECT.
+    pub fn with_read_direct<T: AsRef<str>>(path: T, off: u64) -> IOResult<Option<Self>> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path.as_ref());
+            let mut file = match file {
+                Ok(f) => f,
+                Err(e) => match e.raw_os_error() {
+                    Some(code) if code == libc::EINVAL || code == libc::EOPNOTSUPP => {
+                        return Ok(None)
+                    }
+                    _ => return err_box!(e),
+                },
+            };
+
+            try_err!(file.seek(SeekFrom::Start(off)));
+            Self::new(path.as_ref(), file).map(Some)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (path.as_ref(), off);
+            Ok(None)
+        }
+    }
+
+    /// Positioned aligned read for O_DIRECT mode: reads the aligned region
+    /// `[off & !0xFFF, align_up(off + len))` covering `[off, off + len)` into
+    /// `buf` (`buf.len()` must be >= the aligned length) and returns the number
+    /// of RAW bytes read. The raw count is relative to the aligned start, so
+    /// it may exceed `len`; the caller crops
+    /// `[off - aligned_start, off - aligned_start + len)`.
+    ///
+    /// Uses positioned reads, but updates `self.pos` to `off + len` — the
+    /// *requested* logical length, even when the raw read comes up short at
+    /// EOF — so sequential `pos` tracking stays coherent for the direct-read
+    /// flow (which skips `read_ahead`).
+    pub fn pread_aligned(&mut self, buf: &mut AlignedBuf, off: i64, len: usize) -> IOResult<usize> {
+        #[cfg(unix)]
+        {
+            const ALIGN: i64 = crate::DIRECT_IO_ALIGN as i64;
+
+            if off < 0 {
+                return err_box!("pread_aligned: negative offset {}", off);
+            }
+            if len == 0 {
+                return Ok(0);
+            }
+
+            let Ok(len_i64) = i64::try_from(len) else {
+                return err_box!("pread_aligned: len {} exceeds i64 range", len);
+            };
+            let Some(end) = off
+                .checked_add(len_i64)
+                .and_then(|e| e.checked_add(ALIGN - 1))
+            else {
+                return err_box!("pread_aligned: off {} + len {} overflows i64", off, len);
+            };
+
+            let aligned_start = off & !(ALIGN - 1);
+            let aligned_end = end & !(ALIGN - 1);
+            let aligned_len = (aligned_end - aligned_start) as usize;
+            if buf.len() < aligned_len {
+                return err_box!(
+                    "pread_aligned: buffer too small, need {} aligned bytes, have {}",
+                    aligned_len,
+                    buf.len()
+                );
+            }
+
+            let dst = &mut buf.as_bytes_mut()[..aligned_len];
+            let mut done = 0usize;
+            while done < aligned_len {
+                match self
+                    .inner
+                    .read_at(&mut dst[done..], aligned_start as u64 + done as u64)
+                {
+                    Ok(0) => break, // EOF: clip to a raw short read.
+                    Ok(n) => done += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return err_box!(e),
+                }
+            }
+
+            self.pos = off + len as i64;
+            Ok(done)
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (buf, off, len);
+            err_box!("pread_aligned is not supported on this platform")
+        }
     }
 
     // Open a file for writing (also requests read so the same handle can read back).
@@ -409,6 +518,7 @@ impl Write for LocalFile {
 #[cfg(all(test, unix))]
 mod tests {
     use super::LocalFile;
+    use crate::{AlignedBuf, DIRECT_IO_ALIGN};
     use curvine_runtime::common::Utils;
     use std::fs::remove_file;
 
@@ -418,6 +528,17 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         path
+    }
+
+    /// Deterministic byte pattern: `pattern[i] = i % 251`.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn write_pattern_file(path: &str, len: usize) -> Vec<u8> {
+        let data = pattern(len);
+        std::fs::write(path, &data).unwrap();
+        data
     }
 
     #[test]
@@ -492,5 +613,180 @@ mod tests {
         assert_eq!(file.pos(), 0);
 
         remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pread_aligned_matches_buffered_read() {
+        let path = test_path();
+        let data = write_pattern_file(&path, 3 * 4096);
+
+        let mut file = LocalFile::with_read(&path, 0).unwrap();
+        let mut buf = AlignedBuf::alloc(2 * 4096);
+        let n = file.pread_aligned(&mut buf, 0, 2 * 4096).unwrap();
+        assert_eq!(n, 2 * 4096);
+        assert_eq!(&buf.as_slice()[..n], &data[..2 * 4096]);
+        assert_eq!(file.pos(), 2 * 4096, "pread_aligned must advance pos");
+
+        // Second call continues sequentially when the caller tracks pos.
+        let n = file.pread_aligned(&mut buf, file.pos(), 2 * 4096).unwrap();
+        assert_eq!(&buf.as_slice()[..n], &data[2 * 4096..]);
+
+        remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pread_aligned_unaligned_offset_crops_to_buffered_bytes() {
+        let path = test_path();
+        let data = write_pattern_file(&path, 4 * 4096);
+
+        let mut file = LocalFile::with_read(&path, 0).unwrap();
+        let (off, len) = (100i64, 5000usize);
+        let mut buf = AlignedBuf::alloc(DIRECT_IO_ALIGN * 3);
+        let raw = file.pread_aligned(&mut buf, off, len).unwrap();
+
+        // Raw read spans the aligned region [0, 8192).
+        assert_eq!(raw, 2 * DIRECT_IO_ALIGN);
+        let delta = (off as usize) & (DIRECT_IO_ALIGN - 1);
+        assert_eq!(
+            &buf.as_slice()[delta..delta + len],
+            &data[off as usize..off as usize + len]
+        );
+        assert_eq!(file.pos(), off + len as i64);
+
+        remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pread_aligned_tail_short_read_clips_at_eof() {
+        let path = test_path();
+        let data = write_pattern_file(&path, 6000);
+
+        let mut file = LocalFile::with_read(&path, 0).unwrap();
+        // Request [4096, 8192) but EOF is at 6000.
+        let mut buf = AlignedBuf::alloc(2 * DIRECT_IO_ALIGN);
+        let raw = file.pread_aligned(&mut buf, 4096, 4096).unwrap();
+        assert_eq!(raw, 6000 - 4096);
+        assert_eq!(&buf.as_slice()[..raw], &data[4096..]);
+        // pos still advances by the requested logical length.
+        assert_eq!(file.pos(), 8192);
+
+        // Unaligned tail: request [4500, 8596), aligned region [4096, 12288).
+        let raw = file.pread_aligned(&mut buf, 4500, 4096).unwrap();
+        assert_eq!(raw, 6000 - 4096);
+        let delta = 4500 - 4096;
+        assert_eq!(&buf.as_slice()[delta..raw], &data[4500..]);
+
+        remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pread_aligned_rejects_too_small_buffer() {
+        let path = test_path();
+        write_pattern_file(&path, 8192);
+
+        let mut file = LocalFile::with_read(&path, 0).unwrap();
+        let mut buf = AlignedBuf::alloc(DIRECT_IO_ALIGN);
+        // len=5000 expands to the aligned region [0, 8192) which exceeds buf.
+        assert!(file.pread_aligned(&mut buf, 0, 5000).is_err());
+
+        remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pread_aligned_rejects_overflowing_region() {
+        let path = test_path();
+        write_pattern_file(&path, 4096);
+
+        let mut file = LocalFile::with_read(&path, 0).unwrap();
+        let mut buf = AlignedBuf::alloc(DIRECT_IO_ALIGN);
+        assert!(file.pread_aligned(&mut buf, i64::MAX - 10, 4096).is_err());
+        assert!(file.pread_aligned(&mut buf, -1, 4096).is_err());
+
+        remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn pread_aligned_zero_len_is_noop() {
+        let path = test_path();
+        write_pattern_file(&path, 4096);
+
+        let mut file = LocalFile::with_read(&path, 123).unwrap();
+        let mut buf = AlignedBuf::alloc(DIRECT_IO_ALIGN);
+        assert_eq!(file.pread_aligned(&mut buf, 512, 0).unwrap(), 0);
+        assert_eq!(file.pos(), 123, "zero-length read must not move pos");
+
+        remove_file(&path).unwrap();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn with_read_direct_falls_back_on_non_linux() {
+        let path = test_path();
+        write_pattern_file(&path, 4096);
+
+        match LocalFile::with_read_direct(&path, 0) {
+            Ok(None) => (),
+            Ok(Some(_)) => panic!("non-Linux O_DIRECT must report unsupported"),
+            Err(e) => panic!("non-Linux O_DIRECT must not error, got {e}"),
+        }
+
+        remove_file(&path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn with_read_direct_reads_match_buffered_reads() {
+        let path = test_path();
+        let data = write_pattern_file(&path, 4 * 4096 + 700);
+
+        let mut direct = match LocalFile::with_read_direct(&path, 0) {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                // `Ok(None)` is a supported capability-detection result: the
+                // filesystem holding the test file (e.g. tmpfs) has no
+                // O_DIRECT. The buffered fallback is covered elsewhere; skip
+                // the direct-I/O assertions.
+                eprintln!("skipping: filesystem does not support O_DIRECT");
+                remove_file(&path).unwrap();
+                return;
+            }
+            Err(e) => panic!("unexpected open error: {e}"),
+        };
+        assert_eq!(direct.pos(), 0);
+
+        // Aligned read.
+        let mut buf = AlignedBuf::alloc(2 * DIRECT_IO_ALIGN);
+        let n = direct.pread_aligned(&mut buf, 0, 2 * 4096).unwrap();
+        assert_eq!(n, 2 * 4096);
+        assert_eq!(&buf.as_slice()[..n], &data[..2 * 4096]);
+
+        // Unaligned read, cropped to the buffered equivalent.
+        let (off, len) = (100i64, 5000usize);
+        let raw = direct.pread_aligned(&mut buf, off, len).unwrap();
+        let delta = (off as usize) & (DIRECT_IO_ALIGN - 1);
+        assert_eq!(
+            &buf.as_slice()[delta..delta + len],
+            &data[off as usize..off as usize + len]
+        );
+        assert!(raw >= len);
+        assert_eq!(direct.pos(), off + len as i64);
+
+        // Non-aligned tail crossing EOF.
+        let off = 4 * 4096i64 - 100;
+        let len = 4096usize;
+        let raw = direct.pread_aligned(&mut buf, off, len).unwrap();
+        let delta = (off as usize) & (DIRECT_IO_ALIGN - 1);
+        let aligned_start = off & !(DIRECT_IO_ALIGN as i64 - 1);
+        assert_eq!(raw as i64, data.len() as i64 - aligned_start);
+        assert_eq!(&buf.as_slice()[delta..raw], &data[off as usize..]);
+
+        remove_file(&path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn with_read_direct_propagates_non_einval_errors() {
+        let res = LocalFile::with_read_direct("/definitely/missing/dir/block", 0);
+        assert!(res.is_err(), "missing file must error, not fall back");
     }
 }

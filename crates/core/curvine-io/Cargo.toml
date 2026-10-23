@@ -10,6 +10,7 @@ bytes = { workspace = true }
 curvine-sys = { workspace = true }
 curvine-core-error = { workspace = true }
 curvine-runtime = { workspace = true }
+libc = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
