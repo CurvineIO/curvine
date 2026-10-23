@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="80" viewBox="0 0 240 80">
+  <!-- Placeholder logo for OPPO. Replace this file with the official brand SVG. -->
+  <rect x="1" y="1" width="238" height="78" rx="10" fill="none" stroke="#16a34a" stroke-opacity="0.35" stroke-width="2"/>
+  <text x="120" y="50" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="30" font-weight="700" letter-spacing="6" fill="#16a34a">OPPO</text>
+</svg>
