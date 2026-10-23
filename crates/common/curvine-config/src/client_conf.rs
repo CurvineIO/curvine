@@ -497,8 +497,10 @@ mod tests {
         assert!(!conf.enable_direct_read);
 
         // Full round trip: a serialized enabled config reads back enabled.
-        let mut conf = ClientConf::default();
-        conf.enable_direct_read = true;
+        let conf = ClientConf {
+            enable_direct_read: true,
+            ..Default::default()
+        };
         let text = toml::to_string(&conf).unwrap();
         assert!(text.contains("enable_direct_read = true"));
         let conf: ClientConf = toml::from_str(&text).unwrap();
