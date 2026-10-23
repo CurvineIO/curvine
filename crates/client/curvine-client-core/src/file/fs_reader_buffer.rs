@@ -126,18 +126,24 @@ impl BufferChannel {
 
         if self.needs_drain {
             // An absorbed seek may have left residual chunks wholly below pos;
-            // skip them. The flag is cleared as soon as this drain cycle
-            // completes (the returned chunk covers pos, or is the EOF
-            // sentinel): from then on the lane is contiguous above pos, so the
-            // fail-fast alignment guard is re-armed. Leaving the flag set for
-            // the whole Sequential phase would let a lane that later produces
-            // from a stale offset without a BufferChannel::seek (error-retry,
-            // restart, refactor) be silently drained into a hang instead of
-            // tripping "read data error". A subsequent absorb re-arms the flag.
-            self.needs_drain = false;
-            recv_skipping_below(&mut self.chunk_receiver, want_pos)
+            // skip them. The flag is cleared only once this drain cycle
+            // COMPLETES (the returned chunk covers pos, or is the EOF
+            // sentinel): clearing it before the receive would lose the drain
+            // on a cancelled read future (residual chunks still queued, next
+            // read bypasses draining and trips "read data error"); keeping it
+            // armed until completion lets a cancelled read resume draining on
+            // retry. From completion on, the lane is contiguous above pos, so
+            // the fail-fast alignment guard is re-armed. Leaving the flag set
+            // for the whole Sequential phase would let a lane that later
+            // produces from a stale offset without a BufferChannel::seek
+            // (error-retry, restart, refactor) be silently drained into a hang
+            // instead of tripping "read data error". A subsequent absorb
+            // re-arms the flag.
+            let chunk = recv_skipping_below(&mut self.chunk_receiver, want_pos)
                 .await
-                .map_err(|e| self.check_error(e))
+                .map_err(|e| self.check_error(e))?;
+            self.needs_drain = false;
+            Ok(chunk)
         } else {
             self.chunk_receiver
                 .recv_check()
@@ -461,6 +467,16 @@ impl FsReaderBuffer {
         {
             return false;
         }
+        // Absorption only marks the DESTINATION lane for draining. A seek
+        // that crosses a slice boundary skips data in other lanes' queues
+        // (e.g. the tail of the current slice), and those chunks would
+        // surface later as "read data error" when the rotation returns to
+        // that lane. Reject cross-slice absorption outright: within one slice
+        // source and destination share a lane, so the single-lane drain
+        // bookkeeping is sound.
+        if self.slice_size <= 0 || pos / self.slice_size != self.pos / self.slice_size {
+            return false;
+        }
         // 随机模式选中的是 base reader(无缓冲 channel),不可吸收。
         let Some(id) = Self::select_reader_index(
             self.read_detector.is_random(),
@@ -634,7 +650,7 @@ mod tests {
     use super::*;
     use bytes::BytesMut;
     use curvine_config::ClusterConf;
-    use curvine_model::FileStatus;
+    use curvine_model::{ExtendedBlock, FileStatus, FileType, LocatedBlock, StorageType};
 
     // The seek-absorb tests assert on the process-global
     // `ClientMetrics::seek_absorbed_total` counter, which is shared across all
@@ -654,23 +670,69 @@ mod tests {
         )
     }
 
-    fn absorb_reader(file_len: i64, absorb_window_str: &str) -> (FsReaderBuffer, Arc<Runtime>) {
+    // File blocks carrying synthetic block metadata for the whole range, so
+    // reader seeks resolve through `get_read_block` without any backend: a
+    // seek never instantiates a BlockReader (only reads do), which makes lane
+    // seeks in fixtures deterministic metadata-only successes.
+    fn blocked_file_blocks(len: i64) -> FileBlocks {
+        FileBlocks::new(
+            FileStatus {
+                id: 1,
+                len,
+                is_complete: true,
+                ..Default::default()
+            },
+            vec![LocatedBlock::new(
+                ExtendedBlock::new(1, len, StorageType::Disk, FileType::File),
+                vec![],
+            )],
+        )
+    }
+
+    fn absorb_reader_conf(
+        file_len: i64,
+        absorb_window_str: &str,
+        slice_size_str: &str,
+        with_block_meta: bool,
+    ) -> (FsReaderBuffer, Arc<Runtime>) {
         let mut conf = ClusterConf::default();
         conf.client.read_parallel = 4;
         conf.client.read_chunk_num = 4;
-        conf.client.read_slice_size_str = "16MB".to_string();
+        conf.client.read_slice_size_str = slice_size_str.to_string();
         conf.client.large_file_size_str = "1GB".to_string();
         conf.client.enable_smart_prefetch = true;
         conf.client.seek_absorb_window_str = absorb_window_str.to_string();
         conf.client.init().unwrap();
 
-        let file_blocks = sparse_file_blocks(file_len);
+        let file_blocks = if with_block_meta {
+            blocked_file_blocks(file_len)
+        } else {
+            sparse_file_blocks(file_len)
+        };
         let path = Path::from_str("/absorb-test").unwrap();
         let read_detector = ReadDetector::with_conf(&conf.client, file_len);
         let fs_context = Arc::new(FsContext::new(conf).unwrap());
         let rt = fs_context.clone_runtime();
         let reader = FsReaderBuffer::new(path, fs_context, file_blocks, read_detector).unwrap();
         (reader, rt)
+    }
+
+    fn absorb_reader(file_len: i64, absorb_window_str: &str) -> (FsReaderBuffer, Arc<Runtime>) {
+        absorb_reader_conf(file_len, absorb_window_str, "16MB", false)
+    }
+
+    // Park a buffered lane's producer BEFORE it can touch the backend: the
+    // Pause command is queued ahead of the task start, and the producer's
+    // `biased` select handles queued control messages before reserving a
+    // data-channel permit, so the task deterministically pauses after a
+    // metadata-only seek to its first slice (requires blocked_file_blocks).
+    // Returns a cloned chunk sender for injecting fixture chunks.
+    fn park_lane_producer(rt: &Runtime, channel: &mut BufferChannel) -> AsyncSender<FileChunk> {
+        let tx = channel.prefetch.as_ref().unwrap().chunk_sender.clone();
+        rt.block_on(channel.task_sender.send(ReadTask::Pause((0, true))))
+            .unwrap();
+        channel.start_prefetch();
+        tx
     }
 
     #[test]
@@ -919,11 +981,14 @@ mod tests {
     }
 
     // Regression for Finding 1: the resilient flip-seek loop must process
-    // EVERY lane even when one lane's seek fails. Lane 0's seek is injected
-    // to fail; lanes 1..3 (and the base reader) must still be seeked, which
-    // for a buffered lane means its channel is drained and its watermark
-    // reset to 0. The first error is still returned to the caller (error
-    // semantics preserved) and self.pos is left unchanged.
+    // EVERY lane even when one lane's seek fails. The fixture builds FOUR
+    // buffered lanes (4MB file, 1MB slices) with block metadata so lane seeks
+    // are deterministic metadata-only successes, and parks each producer via
+    // a pre-queued Pause so no task ever touches the backend. Lane 0's seek
+    // is injected to fail; lanes 1..3 must still be seeked, which for a
+    // buffered lane means its channel is drained and its watermark reset.
+    // The first error is still returned to the caller (error semantics
+    // preserved) and self.pos is left unchanged.
     // On the unfixed code the `?` aborts the loop at lane 0, so lanes 1..3
     // keep their stale chunks and stale-high watermarks and this test is RED.
     #[test]
@@ -931,7 +996,11 @@ mod tests {
         let _lock = ABSORB_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut reader, rt) = absorb_reader(4096, "4MB");
+        let (mut reader, rt) = absorb_reader_conf(4 << 20, "4MB", "1MB", true);
+        assert_eq!(
+            reader.base_reader_index, 4,
+            "fixture must create 4 buffered lanes"
+        );
         reader.pos = 10;
 
         // Lane 0 fails its seek; lanes 1..3 carry a stale chunk each plus a
@@ -942,7 +1011,7 @@ mod tests {
                 if i == 0 {
                     channel.fail_seek = true;
                 } else {
-                    let tx = channel.prefetch.as_ref().unwrap().chunk_sender.clone();
+                    let tx = park_lane_producer(&rt, channel);
                     rt.block_on(tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..]))))
                         .unwrap();
                     channel
@@ -958,8 +1027,10 @@ mod tests {
         assert_eq!(reader.pos(), 10, "failed seek must not move pos");
 
         // Despite the error, every later lane must have been seeked: channel
-        // drained and watermark reset. The senders are dropped with the loop
-        // above, so try_recv returns None (closed and empty).
+        // drained and watermark reset. The producers are parked (paused), so
+        // the channels stay open and a single try_recv returning None proves
+        // the drain.
+        let mut checked = 0;
         for (i, adapter) in reader.readers.iter_mut().enumerate() {
             if let ReaderAdapter::Buffer(channel) = adapter {
                 if i == 0 {
@@ -987,8 +1058,10 @@ mod tests {
                     "lane {} watermark must be reset despite lane 0's failure",
                     i
                 );
+                checked += 1;
             }
         }
+        assert_eq!(checked, 3, "the later-lane assertions must actually run");
     }
 
     // Regression for Finding 2: needs_drain must be bounded to exactly one
@@ -1057,66 +1130,53 @@ mod tests {
     // base-only branch fired on the flip seek itself, leaving stale chunks and
     // a stale-high watermark in the lanes; on flip-back the next read popped a
     // chunk with off > pos -> "read data error" -> EIO (reachable at window=0
-    // defaults). On unfixed code neither the drain nor the reset happens, so
-    // the stale chunk survives and this test is RED.
+    // defaults).
+    // The fixture uses block metadata and a parked producer so every lane seek
+    // is a deterministic metadata-only success: the flip seek is REQUIRED to
+    // succeed, and since a successful BufferChannel::seek drains before
+    // returning, the lane state is asserted with a single NON-consuming
+    // try_recv (a retry loop would consume the very stale chunk it is
+    // supposed to detect, passing even when the seek skipped the drain).
     #[test]
     fn test_flip_seek_drains_lane_state() {
         let _lock = ABSORB_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut reader, rt) = absorb_reader(4096, "4MB");
+        let (mut reader, rt) = absorb_reader_conf(4096, "4MB", "16MB", true);
         // Match the flip-seek production scenario: lane prefetch has produced
         // into the channels but NO absorb has happened (this seek will flip
         // Sequential -> Random, which is exactly when stale lanes bite).
         reader.pos = 10;
 
-        // Simulate a prefetched lane whose task already started: inject a stale
-        // chunk through a CLONED sender (so the lane's own PrefetchArgs sender
-        // can be dropped below), start the task, and set a stale-high watermark.
-        let lane_tx = if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
-            let tx = channel.prefetch.as_ref().unwrap().chunk_sender.clone();
+        // Simulate a prefetched lane whose task already started: park the
+        // producer deterministically, then inject a stale chunk and a
+        // stale-high watermark.
+        if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
+            let tx = park_lane_producer(&rt, channel);
             rt.block_on(tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..]))))
                 .unwrap();
-            channel.start_prefetch();
             channel
                 .produced_end
                 .store(8, std::sync::atomic::Ordering::Release);
-            tx
         } else {
             panic!("lane 0 must be a buffered channel");
-        };
-        // Drop the test handle: the lane task's own sender is the only one
-        // left, and the channel closes when the task consumes it.
-        drop(lane_tx);
+        }
 
         // Backward full-path seek from Sequential: not absorbable (pos moves
-        // backward). BufferChannel::seek notifies the started lane task (the
-        // Seek task pauses it) and drains the channel; the lane task then
-        // consumes its own sender, closing the channel so the drain loop can
-        // terminate. The channel close propagates asynchronously (test-only;
-        // production readers read from the channels, so queued data never
-        // lingers like this), so poll the drained condition with a bounded
-        // retry instead of a fixed sleep: up to 2s at 10ms intervals.
-        let res1 = rt.block_on(reader.seek(0));
-        let res2 = rt.block_on(reader.seek(0));
-        let _ = (res1, res2); // results intentionally unused; asserts below pin lane state
+        // backward). Every lane seek is metadata-only, so the seek must
+        // succeed — and a successful seek has drained and reset the lane
+        // BEFORE returning.
+        rt.block_on(reader.seek(0)).unwrap();
+        assert_eq!(reader.pos(), 0);
 
-        // The flip seek must have drained lane state regardless of whether the
-        // backend seek succeeded.
         if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
-            let mut leftover = None;
-            for _ in 0..200 {
-                match channel.chunk_receiver.try_recv() {
-                    Ok(v) => {
-                        leftover = v;
-                        if leftover.is_none() {
-                            break;
-                        }
-                    }
-                    Err(e) => panic!("try_recv on lane channel must not fail: {:?}", e),
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            // Check the queue exactly once: the producer is parked, so the
+            // channel is open and quiescent; any chunk still queued means the
+            // flip seek skipped the drain.
+            let leftover = channel
+                .chunk_receiver
+                .try_recv()
+                .expect("try_recv on lane channel must not fail");
             assert!(
                 leftover.is_none(),
                 "flip seek must drain stale chunks from the lane channel, got {:?}",
@@ -1132,5 +1192,146 @@ mod tests {
         } else {
             panic!("lane 0 must be a buffered channel");
         }
+    }
+
+    // Regression: needs_drain must survive a cancelled read. The drain cycle
+    // clears the flag only when the receive COMPLETES; clearing it up front
+    // would lose the drain when the read future is dropped mid-receive
+    // (timeout, FUSE interrupt), and the retry would pop a residual below-pos
+    // chunk straight into "read data error".
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_absorbed_read_cancelled_mid_drain_resumes_on_retry() {
+        use std::future::Future;
+
+        let _lock = ABSORB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut reader, _rt) = absorb_reader(4096, "4MB");
+
+        // Arm the absorb with a produced watermark of 8 but an EMPTY channel:
+        // the lane's chunks arrive only after the first read is cancelled.
+        let tx = if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
+            let tx = channel.prefetch.as_ref().unwrap().chunk_sender.clone();
+            channel
+                .produced_end
+                .store(8, std::sync::atomic::Ordering::Release);
+            tx
+        } else {
+            panic!("lane 0 must be a buffered channel");
+        };
+
+        reader.seek(6).await.unwrap();
+        assert_eq!(reader.pos(), 6);
+
+        // First read: the drain cycle starts but the channel is empty, so the
+        // future parks inside the receive — cancel it right there.
+        {
+            let mut fut = Box::pin(reader.read());
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(
+                matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Pending),
+                "the read must park on the empty channel"
+            );
+        } // dropped here: cancelled mid-receive
+
+        // The lane now delivers the residual below-pos chunk and the covering
+        // chunk.
+        tx.send(FileChunk::with_buf(0, BytesMut::from(&b"aaaa"[..])))
+            .await
+            .unwrap();
+        tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..])))
+            .await
+            .unwrap();
+
+        // Retry: the flag must still be armed, so the residual [0,4) is
+        // drained and the covering [4,8) is aligned to pos 6. On the unfixed
+        // code the cancelled read already cleared the flag and this read pops
+        // [0,4) -> "read data error".
+        let data = reader.read().await.unwrap();
+        assert_eq!(data.as_slice(), b"bb");
+        assert_eq!(reader.pos(), 8);
+    }
+
+    // Regression: absorption must not cross a slice boundary. Only the
+    // destination lane is marked for draining, so a cross-slice absorb would
+    // skip over data queued in OTHER lanes (the tail of the source slice),
+    // and that stale chunk would trip "read data error" when the lane
+    // rotation returns to it. The cross-slice gate must reject the absorb
+    // even when the destination lane's watermark covers the target.
+    #[test]
+    fn test_seek_absorb_rejected_across_slice_boundary() {
+        let _lock = ABSORB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 4 buffered lanes: 4MB file, 1MB slices; slice k is lane k.
+        let (mut reader, rt) = absorb_reader_conf(4 << 20, "4MB", "1MB", false);
+        assert_eq!(reader.base_reader_index, 4);
+
+        let slice = 1i64 << 20;
+        reader.pos = slice - 4; // tail of slice 0 (lane 0)
+        let target = slice + 4; // head of slice 1 (lane 1): 8 bytes forward
+
+        // The destination lane's watermark covers the target; only the
+        // cross-slice gate stands between this seek and a bad absorb.
+        if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(1) {
+            channel
+                .produced_end
+                .store(2 * slice, std::sync::atomic::Ordering::Release);
+        } else {
+            panic!("lane 1 must be a buffered channel");
+        }
+
+        let absorbed_before = FsContext::get_metrics().seek_absorbed_total.get();
+        let res = rt.block_on(reader.seek(target));
+        // The full-path seek may fail on the sparse fixture; either way the
+        // absorb must have been refused.
+        if res.is_ok() {
+            assert_eq!(reader.pos(), target);
+        } else {
+            assert_eq!(reader.pos(), slice - 4);
+        }
+        assert!(reader.read_detector.is_random());
+        assert_eq!(
+            FsContext::get_metrics().seek_absorbed_total.get(),
+            absorbed_before,
+            "a cross-slice seek must not be absorbed"
+        );
+    }
+
+    // Companion positive case: with multiple buffered lanes, a forward seek
+    // WITHIN one slice still absorbs against that slice's lane.
+    #[test]
+    fn test_seek_absorb_same_slice_multi_lane() {
+        let _lock = ABSORB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut reader, rt) = absorb_reader_conf(4 << 20, "4MB", "1MB", false);
+        assert_eq!(reader.base_reader_index, 4);
+
+        // Seek 0 -> 6 inside slice 0 (lane 0), covered by produced data.
+        if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
+            let tx = channel.prefetch.as_ref().unwrap().chunk_sender.clone();
+            rt.block_on(tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..]))))
+                .unwrap();
+            channel
+                .produced_end
+                .store(8, std::sync::atomic::Ordering::Release);
+        } else {
+            panic!("lane 0 must be a buffered channel");
+        }
+
+        let absorbed_before = FsContext::get_metrics().seek_absorbed_total.get();
+        rt.block_on(reader.seek(6)).unwrap();
+        assert!(reader.read_detector.is_sequential());
+        assert_eq!(reader.pos(), 6);
+        assert_eq!(
+            FsContext::get_metrics().seek_absorbed_total.get(),
+            absorbed_before + 1
+        );
+
+        let data = rt.block_on(reader.read()).unwrap();
+        assert_eq!(data.as_slice(), b"bb");
+        assert_eq!(reader.pos(), 8);
     }
 }
