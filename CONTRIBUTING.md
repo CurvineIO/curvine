@@ -97,7 +97,7 @@ cargo bench
 - Update documentation as needed
 - Ensure all CI checks pass
 
-## AI-Assisted Contribution Workflow (cv-* Skills)
+## AI-Assisted Contribution Workflow
 
 Curvine keeps a set of versioned AI agent skills under [`.agents/skills/`](.agents/skills/), all prefixed with `cv-`. They encode the project's issue, implementation, pull request, and review conventions so an AI coding agent can perform the routine steps consistently. Using them is optional, but they are the canonical checklists for the workflows described above, even if you contribute manually.
 
@@ -246,7 +246,7 @@ By contributing to Curvine, you agree that your contributions will be licensed u
 7. **Write tests** for your changes
 8. **Submit a pull request** with a clear description
 
-If you use an AI coding agent, the [`cv-*` skills](#ai-assisted-contribution-workflow-cv-skills) can automate these steps and keep the issue, PR, and review formats consistent. You remain responsible for reviewing the output and verifying the change.
+If you use an AI coding agent, the [`cv-*` skills](#ai-assisted-contribution-workflow) can automate these steps and keep the issue, PR, and review formats consistent. You remain responsible for reviewing the output and verifying the change.
 
 We appreciate all contributions, big and small. Thank you for helping make Curvine better!
 
