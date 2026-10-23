@@ -120,10 +120,17 @@ message TrashEntryProto {
 }
 
 message ListTrashRequest {
+    // Continuation token from a previous ListTrashResponse.
+    optional string page_token = 1;
+    // Maximum entries per page. The server may return fewer to stay within
+    // the response byte budget.
+    optional uint32 page_size = 2 [default = 1000];
 }
 
 message ListTrashResponse {
     repeated TrashEntryProto entries = 1;
+    // Token for the next page; absent when the listing is complete.
+    optional string next_page_token = 2;
 }
 
 message RestoreTrashRequest {

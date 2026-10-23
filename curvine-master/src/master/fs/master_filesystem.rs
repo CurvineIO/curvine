@@ -316,16 +316,20 @@ impl MasterFilesystem {
 
     pub fn empty_trash(&self) -> FsResult<DeleteResult> {
         let mut fs_dir = self.fs_dir.write();
-        let mut delete_res = fs_dir.empty_trash()?;
+        let (mut delete_res, res) = fs_dir.empty_trash();
         drop(fs_dir);
 
+        // Entries deleted before a failure have already left the namespace, so
+        // their block locations must be released even when the purge fails.
         let mut worker_manager = self.worker_manager.write();
         worker_manager.remove_blocks(&DeleteResult {
             inodes: 0,
             bytes: 0,
             blocks: std::mem::take(&mut delete_res.blocks),
         });
+        drop(worker_manager);
 
+        res?;
         Ok(delete_res)
     }
 
@@ -2859,6 +2863,85 @@ mod tests {
         fs.create("/next.log", true).unwrap();
         fs.delete_with_opts("/next.log", false, false).unwrap();
         assert_eq!(fs.list_trash().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn empty_trash_releases_blocks_of_entries_purged_before_a_failure() {
+        let fs = test_fs_with_trash("trash-empty-partial");
+        let worker_id = 100;
+        let mut worker = WorkerInfo::default();
+        worker.address.worker_id = worker_id;
+        fs.add_test_worker(worker);
+
+        fs.create("/good.log", true).unwrap();
+        let block = fs
+            .add_block(
+                "/good.log",
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        let block_id = block.block.id;
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(worker_id))
+            .unwrap();
+        fs.complete_file(
+            "/good.log",
+            None,
+            1,
+            vec![CommitBlock {
+                block_id,
+                block_len: 1,
+                locations: vec![BlockLocation::with_id(worker_id)],
+            }],
+            "",
+            false,
+            None,
+        )
+        .unwrap();
+        fs.delete_with_opts("/good.log", false, false).unwrap();
+
+        fs.create("/broken.log", true).unwrap();
+        fs.delete_with_opts("/broken.log", false, false).unwrap();
+
+        // Drop the store record of one trash entry so purging it fails. The
+        // loop must still purge the other entry and report its blocks.
+        let broken_id = fs
+            .list_trash()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.origin == "/broken.log")
+            .unwrap()
+            .status
+            .id;
+        let fs_dir = fs.fs_dir.read();
+        let mut batch = fs_dir.store.new_batch();
+        batch.delete_inode(broken_id).unwrap();
+        batch.commit().unwrap();
+        drop(fs_dir);
+
+        assert!(fs.empty_trash().is_err());
+
+        let cmds = fs
+            .worker_manager
+            .write()
+            .block_map
+            .handle_heartbeat(worker_id);
+        let pending: HashSet<i64> = cmds
+            .iter()
+            .flat_map(|cmd| match cmd {
+                WorkerCommand::DeleteBlock(cmd) => cmd.blocks.clone(),
+            })
+            .collect();
+        assert!(
+            pending.contains(&block_id),
+            "block {block_id} was not queued for removal: {pending:?}"
+        );
     }
 
     #[test]

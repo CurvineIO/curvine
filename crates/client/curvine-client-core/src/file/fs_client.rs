@@ -224,13 +224,21 @@ impl FsClient {
     }
 
     pub async fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
-        let req = ListTrashRequest {};
-        let rep: ListTrashResponse = self.rpc(RpcCode::ListTrash, req).await?;
-        Ok(rep
-            .entries
-            .into_iter()
-            .map(ProtoUtils::trash_entry_from_pb)
-            .collect())
+        let mut entries = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let req = ListTrashRequest {
+                page_token: page_token.clone(),
+                page_size: None,
+            };
+            let rep: ListTrashResponse = self.rpc(RpcCode::ListTrash, req).await?;
+            entries.extend(rep.entries.into_iter().map(ProtoUtils::trash_entry_from_pb));
+            match rep.next_page_token.filter(|token| !token.is_empty()) {
+                Some(token) => page_token = Some(token),
+                None => break,
+            }
+        }
+        Ok(entries)
     }
 
     pub async fn restore_trash(

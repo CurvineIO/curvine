@@ -2247,7 +2247,7 @@ fn trash_rpc_list_restore_empty() -> CommonResult<()> {
     handler.retry_check_delete(&mut del_ctx)?;
 
     let list_msg = Builder::new_rpc(RpcCode::ListTrash)
-        .proto_header(ListTrashRequest {})
+        .proto_header(ListTrashRequest::default())
         .build();
     let mut list_ctx = RpcContext::new(&list_msg);
     let list_rep = handler
@@ -2291,6 +2291,106 @@ fn trash_rpc_list_restore_empty() -> CommonResult<()> {
         .parse_header::<EmptyTrashResponse>()?;
     assert_eq!(empty_rep.res.inodes, 1);
     assert!(fs.list_trash()?.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn trash_rpc_list_paginates() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-page", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    for i in 0..5 {
+        let path = format!("/page/f{}.log", i);
+        fs.create(&path, true)?;
+        fs.delete_with_opts(&path, false, false)?;
+    }
+    let expected: Vec<String> = fs.list_trash()?.into_iter().map(|e| e.path).collect();
+    assert_eq!(expected.len(), 5);
+
+    let mut seen = Vec::new();
+    let mut page_token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages <= expected.len());
+
+        let msg = Builder::new_rpc(RpcCode::ListTrash)
+            .proto_header(ListTrashRequest {
+                page_token: page_token.clone(),
+                page_size: Some(2),
+            })
+            .build();
+        let mut ctx = RpcContext::new(&msg);
+        let rep = handler
+            .list_trash(&mut ctx)?
+            .parse_header::<ListTrashResponse>()?;
+        assert!(!rep.entries.is_empty());
+        assert!(rep.entries.len() <= 2);
+        seen.extend(rep.entries.into_iter().map(|e| e.path));
+
+        match rep.next_page_token.filter(|token| !token.is_empty()) {
+            Some(token) => page_token = Some(token),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(seen, expected);
+
+    let msg = Builder::new_rpc(RpcCode::ListTrash)
+        .proto_header(ListTrashRequest {
+            page_token: Some("invalid-token".to_string()),
+            page_size: Some(2),
+        })
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    assert!(handler.list_trash(&mut ctx).is_err());
+
+    Ok(())
+}
+
+#[test]
+fn restore_trash_replays_as_a_single_atomic_rename() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, loader, _js2, fs2) = setup_pair_with_conf("trash-restore-replay", |conf| {
+        conf.master.trash_enabled = true;
+    });
+
+    fs.create("/data/a.log", true)?;
+    fs.delete_with_opts("/data/a.log", false, false)?;
+
+    let setup_entries = js.fs().fs_dir.read().take_entries();
+    apply_entries(&loader, &setup_entries, 1)?;
+
+    let entry = fs.list_trash()?.remove(0);
+    fs.restore_trash(&entry.path, None, false)?;
+
+    // The trash markers must be cleared by the rename mutation itself; a
+    // separate SetAttr would leave a window where the entry has no origin.
+    let restore_entries = js.fs().fs_dir.read().take_entries();
+    assert_eq!(
+        restore_entries
+            .iter()
+            .filter(|entry| matches!(entry, JournalEntry::SetAttr(_)))
+            .count(),
+        0
+    );
+    assert_eq!(
+        restore_entries
+            .iter()
+            .filter(|entry| matches!(entry, JournalEntry::Rename(_)))
+            .count(),
+        1
+    );
+
+    apply_entries(&loader, &restore_entries, setup_entries.len() as u64 + 1)?;
+
+    assert!(fs.get_block_locations("/data/a.log").is_ok());
+    assert!(fs2.get_block_locations("/data/a.log").is_ok());
+    assert!(fs.list_trash()?.is_empty());
+    assert!(fs2.list_trash()?.is_empty());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
 
     Ok(())
 }
@@ -2379,18 +2479,12 @@ fn setup_pair(
     JournalSystem,
     MasterFilesystem,
 ) {
-    setup_pair_with_conf(
-        name,
-        ClusterConf {
-            testing: true,
-            ..Default::default()
-        },
-    )
+    setup_pair_with_conf(name, |_| {})
 }
 
 fn setup_pair_with_conf(
     name: &str,
-    mut conf: ClusterConf,
+    configure: impl FnOnce(&mut ClusterConf),
 ) -> (
     MasterFilesystem,
     JournalSystem,
@@ -2399,7 +2493,11 @@ fn setup_pair_with_conf(
     MasterFilesystem,
 ) {
     Master::init_test_metrics();
-    conf.testing = true;
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    configure(&mut conf);
     let worker = WorkerInfo::default();
 
     conf.change_test_meta_dir(format!("idem-{}-leader", name));
@@ -3658,13 +3756,10 @@ fn mounted_deletes_bypass_recycle_bin() -> CommonResult<()> {
 #[test]
 fn trash_move_journals_a_single_rename_and_replays_markers() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let mut conf = ClusterConf {
-        testing: true,
-        ..Default::default()
-    };
-    conf.master.trash_enabled = true;
     let (leader, journal_system, loader, _follower_js, follower) =
-        setup_pair_with_conf("trash-single-rename", conf);
+        setup_pair_with_conf("trash-single-rename", |conf| {
+            conf.master.trash_enabled = true
+        });
 
     leader.create("/data/a.log", true)?;
     leader.complete_file("/data/a.log", None, 0, vec![], "", false, None)?;
