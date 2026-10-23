@@ -17,7 +17,7 @@ use crate::master::fs::full_block_report::{FullReportProgress, FullReportTracker
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-use crate::master::meta::{CacheInvalidationResult, FsDir};
+use crate::master::meta::{trash, CacheInvalidationResult, FsDir};
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
@@ -205,6 +205,7 @@ impl MasterFilesystem {
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        Self::check_not_reserved_path(inp.path())?;
 
         // Creation of root directory is not allowed
         if inp.is_root() {
@@ -284,6 +285,9 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let src_inp = Self::resolve_path(&fs_dir, src)?;
         let dst_inp = Self::resolve_path(&fs_dir, dst)?;
+
+        Self::check_not_reserved_path(src_inp.path())?;
+        Self::check_not_reserved_path(dst_inp.path())?;
 
         if src_inp.is_root() {
             return err_box!("Cannot rename root path");
@@ -371,6 +375,7 @@ impl MasterFilesystem {
 
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
+        Self::check_not_reserved_path(inp.path())?;
 
         let last_inode = inp.get_last_inode();
         if let Some(inode) = &last_inode {
@@ -423,6 +428,7 @@ impl MasterFilesystem {
 
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
+        Self::check_not_reserved_path(inp.path())?;
 
         let inode = match inp.get_last_inode() {
             None => {
@@ -515,6 +521,16 @@ impl MasterFilesystem {
 
     fn resolve_path(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
         InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
+    }
+
+    fn check_not_reserved_path(path: &str) -> FsResult<()> {
+        if trash::is_reserved_path(path) {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} is reserved for the recycle bin",
+                path
+            )));
+        }
+        Ok(())
     }
 
     fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {
@@ -1565,6 +1581,7 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let target = target.as_ref().to_string();
         let link = Self::resolve_path(&fs_dir, link.as_ref())?;
+        Self::check_not_reserved_path(link.path())?;
         fs_dir.symlink(target, link, force, mode, owner, group)
     }
 
@@ -1572,6 +1589,8 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let src_path = Self::resolve_path(&fs_dir, src_path.as_ref())?;
         let dst_path = Self::resolve_path(&fs_dir, dst_path.as_ref())?;
+        Self::check_not_reserved_path(src_path.path())?;
+        Self::check_not_reserved_path(dst_path.path())?;
         fs_dir.link(src_path, dst_path)
     }
 
@@ -2381,5 +2400,68 @@ mod tests {
                 .scheduled_bytes,
             0
         );
+    }
+
+    #[test]
+    fn trash_namespace_is_reserved_for_creates() {
+        let fs = test_fs("reserved-create");
+
+        let err = fs.create("/.Trash/entry.log", true).unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        let err = fs.mkdir("/.Trash/entry-dir", true).unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        // Names that merely start with the reserved prefix are allowed.
+        fs.mkdir("/.Trashy", true).unwrap();
+    }
+
+    #[test]
+    fn trash_namespace_is_reserved_for_rename() {
+        let fs = test_fs("reserved-rename");
+        fs.mkdir("/data", true).unwrap();
+
+        let err = fs
+            .rename("/data", "/.Trash/moved", RenameFlags::empty())
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        let err = fs
+            .rename("/.Trash", "/moved", RenameFlags::empty())
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn trash_namespace_is_reserved_for_links() {
+        let fs = test_fs("reserved-links");
+        fs.create("/data.log", true).unwrap();
+
+        let err = fs.link("/data.log", "/.Trash/link.log").unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        let err = fs
+            .symlink("/data.log", "/.Trash/sym.log", false, 0o777)
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn trash_namespace_rejects_writes_but_allows_reads() {
+        let fs = test_fs("reserved-write");
+        fs.create("/data.log", true).unwrap();
+
+        let err = fs
+            .open_file(
+                "/.Trash/new.log",
+                CreateFileOpts::with_create(false),
+                OpenFlags::new_create(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        // Read-only lookups do not touch the reserved namespace guard.
+        let err = fs.get_block_locations("/.Trash/absent.log").unwrap_err();
+        assert!(matches!(err, FsError::FileNotFound(_)), "got {:?}", err);
     }
 }

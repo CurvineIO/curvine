@@ -55,6 +55,15 @@ meta_dir = "testing/meta"
 # Worker selection policy: local, robin, random, load_based, or weighted.
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"
+
+# Recycle bin. When enabled, deletes move entries to /.Trash instead of removing
+# blocks immediately. The /.Trash namespace is reserved even while disabled.
+# trash_retention: how long entries are kept before the master purges them;
+#   "0" disables automatic purging.
+# trash_check_interval: how often the master scans /.Trash for expired entries.
+# trash_enabled = false
+# trash_retention = "7d"
+# trash_check_interval = "1h"
 # Log rotation applies when log_dir is a directory; stdout and stderr are not rotated.
 # max_file_size_mb: rotate when the file reaches this size in MB (default 100, 0 = no size limit).
 # time_rotation: "daily" or "hourly" (default none). Combined with max_file_size_mb, whichever
