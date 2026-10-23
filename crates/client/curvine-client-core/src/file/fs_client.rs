@@ -559,6 +559,58 @@ impl FsClient {
         self.rpc(RpcCode::GetCvMetadataSnapshotPage, header).await
     }
 
+    /// Query only the bytes eligible for new writes, without fetching topology.
+    pub async fn get_filesystem_capacity(&self) -> FsResult<FilesystemCapacity> {
+        self.ensure_handshake().await;
+        let supports_capacity = self
+            .master_handshake()
+            .capabilities()
+            .iter()
+            .any(|capability| capability == FILESYSTEM_CAPACITY_CAPABILITY);
+        if !supports_capacity {
+            return self.get_filesystem_capacity_legacy().await;
+        }
+
+        let response: FsResult<GetFilesystemCapacityResponse> = self
+            .raw_rpc(
+                RpcCode::GetFilesystemCapacity,
+                GetFilesystemCapacityRequest::default(),
+            )
+            .await;
+        match response {
+            Ok(info) => Ok(FilesystemCapacity {
+                capacity: info.capacity,
+                available: info.available,
+            }),
+            Err(error) if Self::capacity_rpc_unsupported(&error) => {
+                // Failover may have selected an older master since the handshake.
+                // Refresh its capabilities so later queries skip the failed probe.
+                self.get_filesystem_capacity_legacy().await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn get_filesystem_capacity_legacy(&self) -> FsResult<FilesystemCapacity> {
+        let info = self.get_filesystem_info().await?;
+        Ok(FilesystemCapacity {
+            capacity: info.allocatable_capacity,
+            available: info.allocatable_available,
+        })
+    }
+
+    fn capacity_rpc_unsupported(error: &FsError) -> bool {
+        match error {
+            FsError::Unsupported(_) => true,
+            // Historical MasterHandler dispatch uses err_box!, not Unsupported.
+            FsError::Common(error) => error
+                .source
+                .to_string()
+                .contains("ERROR: Unsupported operation("),
+            _ => false,
+        }
+    }
+
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
         // Attach this client's component_info only on the first
         // GetFilesystemInfo per session (the handshake). GetFilesystemInfo

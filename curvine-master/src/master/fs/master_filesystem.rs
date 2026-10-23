@@ -1026,6 +1026,23 @@ impl MasterFilesystem {
         Ok(Cow::Borrowed(inode))
     }
 
+    /// Read the statfs allocatable view without cloning worker or storage details.
+    pub fn filesystem_capacity(&self) -> FilesystemCapacity {
+        let mut info = FilesystemCapacity::default();
+        {
+            let wm = self.worker_manager.read();
+            for (_, worker) in wm.worker_map.workers() {
+                if worker.is_live() {
+                    info.capacity = info.capacity.saturating_add(worker.capacity);
+                    info.available = info
+                        .available
+                        .saturating_add(worker.allocatable_available().max(0));
+                }
+            }
+        }
+        info
+    }
+
     pub fn filesystem_info(&self) -> FsResult<FilesystemInfo> {
         let metrics = Master::get_metrics()?;
         let mut info = FilesystemInfo {
@@ -2191,6 +2208,76 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_capacity_is_zero_without_workers() {
+        let fs = test_fs("capacity-empty");
+        assert_eq!(fs.filesystem_capacity(), FilesystemCapacity::default());
+    }
+
+    #[test]
+    fn filesystem_capacity_subtracts_scheduled_bytes() {
+        let fs = test_fs("capacity-scheduled");
+        let mut worker = worker_with_status(1, WorkerStatus::Live, 1000, 800);
+        worker.scheduled_bytes = 100;
+        fs.add_test_worker(worker);
+        let mut exhausted = worker_with_status(2, WorkerStatus::Live, 1000, 100);
+        exhausted.scheduled_bytes = 200;
+        fs.add_test_worker(exhausted);
+
+        assert_eq!(
+            fs.filesystem_capacity(),
+            FilesystemCapacity {
+                capacity: 2000,
+                available: 700,
+            }
+        );
+    }
+
+    #[test]
+    fn filesystem_capacity_saturates_on_overflow() {
+        let fs = test_fs("capacity-overflow");
+        for id in 1..=2 {
+            fs.add_test_worker(worker_with_status(
+                id,
+                WorkerStatus::Live,
+                i64::MAX,
+                i64::MAX,
+            ));
+        }
+        assert_eq!(
+            fs.filesystem_capacity(),
+            FilesystemCapacity {
+                capacity: i64::MAX,
+                available: i64::MAX,
+            }
+        );
+    }
+
+    #[test]
+    fn filesystem_capacity_aggregates_large_worker_set() {
+        let fs = test_fs("capacity-large");
+        for id in 1..=1024 {
+            let mut worker = worker_with_status(id, WorkerStatus::Live, 1000, 800);
+            // Storage details must not be visited or copied by the capacity query.
+            worker.storage_map.insert(
+                "storage".into(),
+                StorageInfo {
+                    storage_id: "storage".into(),
+                    dir_path: "long-storage-path/".repeat(64),
+                    ..Default::default()
+                },
+            );
+            fs.add_test_worker(worker);
+        }
+        assert_eq!(
+            fs.filesystem_capacity(),
+            FilesystemCapacity {
+                capacity: 1_024_000,
+                available: 819_200,
+            }
+        );
+    }
+
+    #[test]
     fn filesystem_info_allocatable_only_counts_live_workers() {
         // See issue #1460: statfs must report capacity eligible for new writes,
         // i.e. only Live workers. Blacklist/Decommission workers must not
@@ -2217,6 +2304,14 @@ mod tests {
         assert_eq!(info.live_workers.len(), 1);
         assert_eq!(info.blacklist_workers.len(), 1);
         assert_eq!(info.decommission_workers.len(), 1);
+
+        assert_eq!(
+            fs.filesystem_capacity(),
+            FilesystemCapacity {
+                capacity: info.allocatable_capacity,
+                available: info.allocatable_available,
+            }
+        );
 
         // Allocatable view mirrors allocation eligibility: Live workers only.
         assert_eq!(
@@ -2270,6 +2365,13 @@ mod tests {
         assert_eq!(info.available, 800);
         assert_eq!(info.allocatable_capacity, 1000);
         assert_eq!(info.allocatable_available, 800);
+        assert_eq!(
+            fs.filesystem_capacity(),
+            FilesystemCapacity {
+                capacity: 1000,
+                available: 800,
+            }
+        );
     }
 
     #[test]
@@ -2300,6 +2402,13 @@ mod tests {
             "lost worker capacity must not leak into allocatable"
         );
         assert_eq!(info.allocatable_available, 800);
+        assert_eq!(
+            fs.filesystem_capacity(),
+            FilesystemCapacity {
+                capacity: 1000,
+                available: 800,
+            }
+        );
     }
 
     #[test]
