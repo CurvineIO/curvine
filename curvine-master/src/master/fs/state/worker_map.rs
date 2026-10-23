@@ -117,11 +117,12 @@ impl WorkerMap {
             info.add_storage(item);
         }
 
-        let previous = self.workers.get(&worker_id).map(|worker| {
+        let previous = self.workers.get_mut(&worker_id).map(|worker| {
             (
                 worker.available,
                 worker.scheduled_bytes,
                 worker.scheduled_since_ms,
+                std::mem::take(&mut worker.scheduled_blocks),
                 worker.status,
             )
         });
@@ -129,13 +130,16 @@ impl WorkerMap {
         // Decommission is operator-managed and must survive heartbeats.
         // Blacklist is heartbeat-timeout based; a new heartbeat clears it.
         info.status = match previous {
-            Some((_, _, _, status)) if status == WorkerStatus::Decommission => status,
+            Some((_, _, _, _, status)) if status == WorkerStatus::Decommission => status,
             _ => WorkerStatus::Live,
         };
 
-        if let Some((previous_available, previous_scheduled, previous_since, _)) = previous {
+        if let Some((previous_available, previous_scheduled, previous_since, previous_blocks, _)) =
+            previous
+        {
             info.scheduled_bytes = previous_scheduled;
             info.scheduled_since_ms = previous_since;
+            info.scheduled_blocks = previous_blocks;
             info.reclaim_scheduled_from_heartbeat(previous_available);
         }
 

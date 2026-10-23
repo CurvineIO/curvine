@@ -659,6 +659,7 @@ impl MasterFilesystem {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
+        let settle_blocks = commit_blocks.clone();
         let block =
             match fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len) {
                 Ok(block) => block,
@@ -669,6 +670,11 @@ impl MasterFilesystem {
                     return Err(e);
                 }
             };
+        {
+            let mut wm = self.worker_manager.write();
+            wm.settle_committed_blocks(&settle_blocks);
+            wm.bind_scheduled_blocks(&choose_workers, block.id, block_size);
+        }
         let located = LocatedBlock {
             block,
             locs: choose_workers,
@@ -739,6 +745,7 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        let settle_blocks = commit_blocks.clone();
         fs_dir.complete_file(
             path,
             &mut inode,
@@ -748,6 +755,9 @@ impl MasterFilesystem {
             options.only_flush,
             options.set_attr_opts,
         )?;
+        self.worker_manager
+            .write()
+            .settle_committed_blocks(&settle_blocks);
 
         if options.only_flush && options.return_file_blocks {
             let file = inode.as_file_ref()?;
@@ -1653,7 +1663,13 @@ impl MasterFilesystem {
         };
         let block = match fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers) {
             Ok((block, assigned)) => {
-                if !assigned {
+                if assigned {
+                    self.worker_manager.write().bind_scheduled_blocks(
+                        &choose_workers,
+                        block.id,
+                        block_size,
+                    );
+                } else {
                     self.worker_manager
                         .write()
                         .unschedule_chosen_workers(&choose_workers, block_size);
