@@ -496,8 +496,10 @@ mod tests {
 
     #[test]
     fn test_seek_absorb_window_parse() {
-        let mut conf = ClientConf::default();
-        conf.seek_absorb_window_str = "4MB".to_string();
+        let mut conf = ClientConf {
+            seek_absorb_window_str: "4MB".to_string(),
+            ..Default::default()
+        };
         conf.init().unwrap();
         assert_eq!(conf.seek_absorb_window, 4 * 1024 * 1024);
     }

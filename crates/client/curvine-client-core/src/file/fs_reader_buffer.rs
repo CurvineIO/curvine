@@ -875,25 +875,25 @@ mod tests {
         assert_eq!(reader.base_reader_index, base_index);
     }
 
-    // Convert a buffered-lane seek/read sequence into futures driven on the
-    // reader's own runtime. All four tests share the process-global
-    // seek_absorbed_total counter, so they are serialized via ABSORB_TEST_LOCK.
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_seek_absorb_drains_covered_chunks() {
+    // Drive the buffered-lane seek/read sequence with block_on on the
+    // reader's own runtime: the tests sharing the process-global
+    // seek_absorbed_total counter hold ABSORB_TEST_LOCK (a std Mutex), and a
+    // sync test keeps that guard out of async scopes (clippy:
+    // await_holding_lock).
+    #[test]
+    fn test_seek_absorb_drains_covered_chunks() {
         let _lock = ABSORB_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut reader, _rt) = absorb_reader(4096, "4MB");
+        let (mut reader, rt) = absorb_reader(4096, "4MB");
 
         // Two already-produced chunks [0,4) and [4,8); the seek target 6 is
         // covered by the second one.
         if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
             let tx = channel.prefetch.as_ref().unwrap().chunk_sender.clone();
-            tx.send(FileChunk::with_buf(0, BytesMut::from(&b"aaaa"[..])))
-                .await
+            rt.block_on(tx.send(FileChunk::with_buf(0, BytesMut::from(&b"aaaa"[..]))))
                 .unwrap();
-            tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..])))
-                .await
+            rt.block_on(tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..]))))
                 .unwrap();
             channel
                 .produced_end
@@ -902,12 +902,12 @@ mod tests {
             panic!("lane 0 must be a buffered channel");
         }
 
-        reader.seek(6).await.unwrap();
+        rt.block_on(reader.seek(6)).unwrap();
         assert!(reader.read_detector.is_sequential());
         assert_eq!(reader.pos(), 6);
 
         // The read drains chunk [0,4) (tail <= pos) and aligns [4,8) to pos 6.
-        let data = reader.read().await.unwrap();
+        let data = rt.block_on(reader.read()).unwrap();
         assert_eq!(data.as_slice(), b"bb");
         assert_eq!(reader.pos(), 8);
     }
@@ -1074,12 +1074,12 @@ mod tests {
     // On the unfixed code the flag stays set, recv_skipping_below silently
     // discards the stale chunk and returns the queued EOF sentinel, and the
     // read succeeds as Empty: this test is RED.
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_needs_drain_cleared_after_one_drain_cycle() {
+    #[test]
+    fn test_needs_drain_cleared_after_one_drain_cycle() {
         let _lock = ABSORB_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut reader, _rt) = absorb_reader(4096, "4MB");
+        let (mut reader, rt) = absorb_reader(4096, "4MB");
 
         if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
             // Post-absorb lane state: a stale residual wholly below pos, the
@@ -1088,16 +1088,13 @@ mod tests {
             // then an EOF sentinel so the unfixed silent-drain path terminates
             // instead of hanging the test.
             let tx = channel.prefetch.as_ref().unwrap().chunk_sender.clone();
-            tx.send(FileChunk::with_buf(0, BytesMut::from(&b"aaaa"[..])))
-                .await
+            rt.block_on(tx.send(FileChunk::with_buf(0, BytesMut::from(&b"aaaa"[..]))))
                 .unwrap();
-            tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..])))
-                .await
+            rt.block_on(tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..]))))
                 .unwrap();
-            tx.send(FileChunk::with_buf(0, BytesMut::from(&b"zzzz"[..])))
-                .await
+            rt.block_on(tx.send(FileChunk::with_buf(0, BytesMut::from(&b"zzzz"[..]))))
                 .unwrap();
-            tx.send(FileChunk::default()).await.unwrap();
+            rt.block_on(tx.send(FileChunk::default())).unwrap();
             channel
                 .produced_end
                 .store(8, std::sync::atomic::Ordering::Release);
@@ -1107,14 +1104,14 @@ mod tests {
 
         // Absorb the forward seek to 6; the first read drains the residual
         // [0,4) and consumes the covering chunk [4,8).
-        reader.seek(6).await.unwrap();
-        let data = reader.read().await.unwrap();
+        rt.block_on(reader.seek(6)).unwrap();
+        let data = rt.block_on(reader.read()).unwrap();
         assert_eq!(data.as_slice(), b"bb");
         assert_eq!(reader.pos(), 8);
 
         // The drain cycle is complete, so the guard is live again: the stale
         // chunk at off 0 must trip the alignment error, not be skipped.
-        let err = reader.read().await.expect_err(
+        let err = rt.block_on(reader.read()).expect_err(
             "stale below-pos chunk after the drain cycle must trip the alignment guard",
         );
         assert!(
@@ -1199,14 +1196,14 @@ mod tests {
     // would lose the drain when the read future is dropped mid-receive
     // (timeout, FUSE interrupt), and the retry would pop a residual below-pos
     // chunk straight into "read data error".
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_absorbed_read_cancelled_mid_drain_resumes_on_retry() {
+    #[test]
+    fn test_absorbed_read_cancelled_mid_drain_resumes_on_retry() {
         use std::future::Future;
 
         let _lock = ABSORB_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut reader, _rt) = absorb_reader(4096, "4MB");
+        let (mut reader, rt) = absorb_reader(4096, "4MB");
 
         // Arm the absorb with a produced watermark of 8 but an EMPTY channel:
         // the lane's chunks arrive only after the first read is cancelled.
@@ -1220,11 +1217,13 @@ mod tests {
             panic!("lane 0 must be a buffered channel");
         };
 
-        reader.seek(6).await.unwrap();
+        rt.block_on(reader.seek(6)).unwrap();
         assert_eq!(reader.pos(), 6);
 
         // First read: the drain cycle starts but the channel is empty, so the
-        // future parks inside the receive — cancel it right there.
+        // future parks inside the receive — cancel it right there. The manual
+        // poll needs no runtime: channel receives park without an ambient
+        // executor.
         {
             let mut fut = Box::pin(reader.read());
             let waker = std::task::Waker::noop();
@@ -1237,18 +1236,16 @@ mod tests {
 
         // The lane now delivers the residual below-pos chunk and the covering
         // chunk.
-        tx.send(FileChunk::with_buf(0, BytesMut::from(&b"aaaa"[..])))
-            .await
+        rt.block_on(tx.send(FileChunk::with_buf(0, BytesMut::from(&b"aaaa"[..]))))
             .unwrap();
-        tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..])))
-            .await
+        rt.block_on(tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..]))))
             .unwrap();
 
         // Retry: the flag must still be armed, so the residual [0,4) is
         // drained and the covering [4,8) is aligned to pos 6. On the unfixed
         // code the cancelled read already cleared the flag and this read pops
         // [0,4) -> "read data error".
-        let data = reader.read().await.unwrap();
+        let data = rt.block_on(reader.read()).unwrap();
         assert_eq!(data.as_slice(), b"bb");
         assert_eq!(reader.pos(), 8);
     }
