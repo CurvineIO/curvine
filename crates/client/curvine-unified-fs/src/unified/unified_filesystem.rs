@@ -29,7 +29,7 @@ use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
     CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FilesystemInfo, FreeResult,
     JobStatus, ListOptions, LoadJobCommand, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
-    OpenFlags, RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState,
+    OpenFlags, RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState, TrashEntry,
 };
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::common::Utils;
@@ -978,6 +978,63 @@ impl UnifiedFileSystem {
         };
         self.track("Delete", path.path(), "", fut).await
     }
+
+    pub async fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        self.cv.list_trash().await
+    }
+
+    pub async fn restore_trash(
+        &self,
+        path: &Path,
+        dst: Option<&Path>,
+        overwrite: bool,
+    ) -> FsResult<()> {
+        let fut = async {
+            let dst = match dst {
+                Some(dst) => dst.clone(),
+                None => {
+                    let entries = self.cv.list_trash().await?;
+                    resolve_restore_dst(&entries, path)?
+                }
+            };
+            let mount = self.get_mount(&dst, RpcCode::Rename).await?;
+            ensure_restore_dst_supported(&dst, mount.as_ref().map(|(_, mount)| mount.as_ref()))?;
+            self.cv.restore_trash(path, Some(&dst), overwrite).await
+        };
+        self.track(
+            "RestoreTrash",
+            path.path(),
+            dst.map(|dst| dst.path()).unwrap_or(""),
+            fut,
+        )
+        .await
+    }
+
+    pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
+        self.cv.empty_trash().await
+    }
+}
+
+fn resolve_restore_dst(entries: &[TrashEntry], trash_path: &Path) -> FsResult<Path> {
+    let origin = entries
+        .iter()
+        .find(|entry| entry.path == trash_path.path())
+        .map(|entry| entry.origin.as_str())
+        .ok_or_else(|| FsError::file_not_found(trash_path.path()))?;
+    Ok(Path::from_str(origin)?)
+}
+
+// Cache-mode mounts keep UFS as the source of truth, so a CV-only entry
+// restored below one would have no backing object and unified reads would
+// reject it.
+fn ensure_restore_dst_supported(dst: &Path, mount: Option<&MountValue>) -> FsResult<()> {
+    match mount {
+        Some(mount) if mount.info.is_cache_mode() => err_ext!(FsError::unsupported(format!(
+            "restore trash into cache_mode mount: {}",
+            dst.path()
+        ))),
+        _ => Ok(()),
+    }
 }
 
 struct UnifiedUtils;
@@ -1314,7 +1371,13 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsyncCacheAdmission, AsyncCachePending};
+    use super::{
+        ensure_restore_dst_supported, resolve_restore_dst, AsyncCacheAdmission, AsyncCachePending,
+        MountValue,
+    };
+    use curvine_error::FsError;
+    use curvine_fs_api::Path;
+    use curvine_model::{FileStatus, MountInfo, TrashEntry, WriteType};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1404,5 +1467,43 @@ mod tests {
         assert!(pending.paths.lock().contains("ufs://bucket/b"));
         drop(second_pending);
         assert!(pending.paths.lock().is_empty());
+    }
+
+    fn trash_entry(path: &str, origin: &str) -> TrashEntry {
+        TrashEntry {
+            path: path.to_string(),
+            origin: origin.to_string(),
+            delete_ms: 1,
+            status: FileStatus::default(),
+        }
+    }
+
+    #[test]
+    fn resolve_restore_dst_uses_the_recorded_origin() {
+        let entries = vec![trash_entry("/.Trash/1-1", "/data/a.log")];
+
+        let dst = resolve_restore_dst(&entries, &Path::from_str("/.Trash/1-1").unwrap()).unwrap();
+        assert_eq!(dst.path(), "/data/a.log");
+
+        let err =
+            resolve_restore_dst(&entries, &Path::from_str("/.Trash/unknown").unwrap()).unwrap_err();
+        assert!(matches!(err, FsError::FileNotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn ensure_restore_dst_supported_rejects_cache_mode_mounts() {
+        let dst = Path::from_str("/mnt/cache/a.log").unwrap();
+        assert!(ensure_restore_dst_supported(&dst, None).is_ok());
+
+        let fs_mode = MountValue::new(MountInfo {
+            write_type: WriteType::FsMode,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(ensure_restore_dst_supported(&dst, Some(&fs_mode)).is_ok());
+
+        let cache_mode = MountValue::new(MountInfo::default()).unwrap();
+        let err = ensure_restore_dst_supported(&dst, Some(&cache_mode)).unwrap_err();
+        assert!(matches!(err, FsError::Unsupported(_)), "got {err:?}");
     }
 }

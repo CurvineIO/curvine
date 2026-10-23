@@ -287,6 +287,50 @@ impl MasterFilesystem {
         Ok(delete_res)
     }
 
+    pub fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.list_trash()
+    }
+
+    pub fn restore_trash<T: AsRef<str>>(
+        &self,
+        path: T,
+        dst: Option<&str>,
+        overwrite: bool,
+    ) -> FsResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        let replaced = fs_dir.restore_trash(path.as_ref(), dst, overwrite)?;
+        drop(fs_dir);
+
+        // Overwriting an existing destination deletes it; release its blocks
+        // just like a regular rename-with-replace.
+        if let Some(replaced) = replaced {
+            let mut worker_manager = self.worker_manager.write();
+            worker_manager.remove_blocks(&replaced);
+        }
+
+        Ok(())
+    }
+
+    pub fn empty_trash(&self) -> FsResult<DeleteResult> {
+        let mut fs_dir = self.fs_dir.write();
+        let (mut delete_res, res) = fs_dir.empty_trash();
+        drop(fs_dir);
+
+        // Entries deleted before a failure have already left the namespace, so
+        // their block locations must be released even when the purge fails.
+        let mut worker_manager = self.worker_manager.write();
+        worker_manager.remove_blocks(&DeleteResult {
+            inodes: 0,
+            bytes: 0,
+            blocks: std::mem::take(&mut delete_res.blocks),
+        });
+        drop(worker_manager);
+
+        res?;
+        Ok(delete_res)
+    }
+
     pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
@@ -2609,6 +2653,227 @@ mod tests {
 
         assert!(handled);
         assert!(fs.get_block_locations(&trashed_path).is_ok());
+    }
+
+    #[test]
+    fn list_trash_reports_origin_time_and_status() {
+        let fs = test_fs_with_trash("trash-list");
+        fs.create("/a.log", true).unwrap();
+        fs.create("/b.log", true).unwrap();
+        fs.delete_with_opts("/a.log", false, false).unwrap();
+        fs.delete_with_opts("/b.log", false, false).unwrap();
+
+        let entries = fs.list_trash().unwrap();
+        assert_eq!(entries.len(), 2);
+
+        let mut origins: Vec<&str> = entries.iter().map(|e| e.origin.as_str()).collect();
+        origins.sort();
+        assert_eq!(origins, vec!["/a.log", "/b.log"]);
+
+        for entry in &entries {
+            assert!(entry.path.starts_with("/.Trash/"));
+            assert_eq!(entry.status.path, entry.path);
+            assert!(entry.delete_ms > 0);
+            assert!(entry
+                .status
+                .name
+                .starts_with(&format!("{}-", entry.delete_ms)));
+        }
+    }
+
+    #[test]
+    fn restore_trash_moves_entry_back_to_origin() {
+        let fs = test_fs_with_trash("trash-restore");
+        fs.create("/data/a.log", true).unwrap();
+        fs.delete_with_opts("/data/a.log", false, false).unwrap();
+
+        let entry = fs.list_trash().unwrap().remove(0);
+        assert!(fs.get_block_locations(&entry.path).is_ok());
+
+        fs.restore_trash(&entry.path, None, false).unwrap();
+
+        assert!(fs.get_block_locations("/data/a.log").is_ok());
+        assert!(fs.get_block_locations(&entry.path).is_err());
+        assert!(fs.list_trash().unwrap().is_empty());
+        let status = fs.file_status("/data/a.log").unwrap();
+        assert!(!status.x_attr.contains_key(trash::TRASH_XATTR_ORIGIN));
+        assert!(!status.x_attr.contains_key(trash::TRASH_XATTR_DELETE_MS));
+    }
+
+    #[test]
+    fn restore_trash_restores_directory_subtrees() {
+        let fs = test_fs_with_trash("trash-restore-dir");
+        fs.create("/data/child.log", true).unwrap();
+        fs.delete_with_opts("/data", true, false).unwrap();
+
+        let entry = fs.list_trash().unwrap().remove(0);
+        fs.restore_trash(&entry.path, None, false).unwrap();
+
+        assert!(fs.get_block_locations("/data/child.log").is_ok());
+        assert!(fs.list_trash().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_trash_validates_destination_and_overwrites_on_request() {
+        let fs = test_fs_with_trash("trash-restore-dst");
+        fs.create("/src.log", true).unwrap();
+        fs.delete_with_opts("/src.log", false, false).unwrap();
+        let entry = fs.list_trash().unwrap().remove(0);
+
+        let err = fs
+            .restore_trash(&entry.path, Some("/.Trash/other"), false)
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        let err = fs
+            .restore_trash(&entry.path, Some("/missing/src.log"), false)
+            .unwrap_err();
+        assert!(matches!(err, FsError::FileNotFound(_)), "got {:?}", err);
+        assert_eq!(fs.list_trash().unwrap().len(), 1);
+
+        fs.mkdir("/dst", true).unwrap();
+        fs.create("/dst/src.log", true).unwrap();
+        let err = fs
+            .restore_trash(&entry.path, Some("/dst/src.log"), false)
+            .unwrap_err();
+        assert!(
+            matches!(err, FsError::FileAlreadyExists(_)),
+            "got {:?}",
+            err
+        );
+        assert_eq!(fs.list_trash().unwrap().len(), 1);
+
+        fs.restore_trash(&entry.path, Some("/dst/src.log"), true)
+            .unwrap();
+        assert!(fs.get_block_locations("/dst/src.log").is_ok());
+        assert!(fs.list_trash().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_trash_rejects_paths_outside_the_trash() {
+        let fs = test_fs_with_trash("trash-restore-invalid");
+        fs.create("/plain.log", true).unwrap();
+
+        for path in ["/plain.log", "/.Trash", "/.Trash/", "/.Trash/a/b"] {
+            let err = fs.restore_trash(path, None, false).unwrap_err();
+            assert!(
+                matches!(err, FsError::InvalidArgument(_)),
+                "{} -> {:?}",
+                path,
+                err
+            );
+        }
+
+        let err = fs
+            .restore_trash("/.Trash/missing", None, false)
+            .unwrap_err();
+        assert!(matches!(err, FsError::FileNotFound(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn empty_trash_purges_entries_but_keeps_the_trash_root() {
+        let fs = test_fs_with_trash("trash-empty");
+
+        let empty = fs.empty_trash().unwrap();
+        assert_eq!(empty.inodes, 0);
+        assert!(fs.list_options("/.Trash", ListOptions::default()).is_err());
+
+        fs.create("/dir/child.log", true).unwrap();
+        fs.create("/keep.log", true).unwrap();
+        fs.delete_with_opts("/dir", true, false).unwrap();
+        fs.delete_with_opts("/keep.log", false, false).unwrap();
+        assert_eq!(fs.list_trash().unwrap().len(), 2);
+
+        let res = fs.empty_trash().unwrap();
+        assert_eq!(res.inodes, 2);
+        assert!(fs
+            .list_options("/.Trash", ListOptions::default())
+            .unwrap()
+            .is_empty());
+        assert!(fs.get_block_locations("/dir/child.log").is_err());
+
+        fs.create("/next.log", true).unwrap();
+        fs.delete_with_opts("/next.log", false, false).unwrap();
+        assert_eq!(fs.list_trash().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn empty_trash_releases_blocks_of_entries_purged_before_a_failure() {
+        let fs = test_fs_with_trash("trash-empty-partial");
+        let worker_id = 100;
+        let mut worker = WorkerInfo::default();
+        worker.address.worker_id = worker_id;
+        fs.add_test_worker(worker);
+
+        fs.create("/good.log", true).unwrap();
+        let block = fs
+            .add_block(
+                "/good.log",
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        let block_id = block.block.id;
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(worker_id))
+            .unwrap();
+        fs.complete_file(
+            "/good.log",
+            None,
+            1,
+            vec![CommitBlock {
+                block_id,
+                block_len: 1,
+                locations: vec![BlockLocation::with_id(worker_id)],
+            }],
+            "",
+            false,
+            None,
+        )
+        .unwrap();
+        fs.delete_with_opts("/good.log", false, false).unwrap();
+
+        fs.create("/broken.log", true).unwrap();
+        fs.delete_with_opts("/broken.log", false, false).unwrap();
+
+        // Drop the store record of one trash entry so purging it fails. The
+        // loop must still purge the other entry and report its blocks.
+        let broken_id = fs
+            .list_trash()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.origin == "/broken.log")
+            .unwrap()
+            .status
+            .id;
+        let fs_dir = fs.fs_dir.read();
+        let mut batch = fs_dir.store.new_batch();
+        batch.delete_inode(broken_id).unwrap();
+        batch.commit().unwrap();
+        drop(fs_dir);
+
+        assert!(fs.empty_trash().is_err());
+
+        let cmds = fs
+            .worker_manager
+            .write()
+            .block_map
+            .handle_heartbeat(worker_id);
+        let pending: HashSet<i64> = cmds
+            .iter()
+            .flat_map(|cmd| match cmd {
+                WorkerCommand::DeleteBlock(cmd) => cmd.blocks.clone(),
+            })
+            .collect();
+        assert!(
+            pending.contains(&block_id),
+            "block {block_id} was not queued for removal: {pending:?}"
+        );
     }
 
     #[test]

@@ -220,6 +220,45 @@ impl FsClient {
         Ok(ProtoUtils::delete_res_from_pb(rep.res.unwrap_or_default()))
     }
 
+    pub async fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        let mut entries = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let req = ListTrashRequest {
+                page_token: page_token.clone(),
+                page_size: None,
+            };
+            let rep: ListTrashResponse = self.rpc(RpcCode::ListTrash, req).await?;
+            entries.extend(rep.entries.into_iter().map(ProtoUtils::trash_entry_from_pb));
+            match rep.next_page_token.filter(|token| !token.is_empty()) {
+                Some(token) => page_token = Some(token),
+                None => break,
+            }
+        }
+        Ok(entries)
+    }
+
+    pub async fn restore_trash(
+        &self,
+        path: &Path,
+        dst: Option<&Path>,
+        overwrite: bool,
+    ) -> FsResult<()> {
+        let req = RestoreTrashRequest {
+            path: path.encode(),
+            dst: dst.map(|value| value.encode()),
+            overwrite: Some(overwrite),
+        };
+        let _: RestoreTrashResponse = self.rpc(RpcCode::RestoreTrash, req).await?;
+        Ok(())
+    }
+
+    pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
+        let req = EmptyTrashRequest {};
+        let rep: EmptyTrashResponse = self.rpc(RpcCode::EmptyTrash, req).await?;
+        Ok(ProtoUtils::delete_res_from_pb(rep.res))
+    }
+
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
         let header = FreeRequest {
             path: path.encode(),

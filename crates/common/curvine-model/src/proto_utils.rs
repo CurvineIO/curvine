@@ -902,12 +902,32 @@ impl ProtoUtils {
     pub fn delete_res_to_pb(res: DeleteResult) -> FreeResultProto {
         Self::free_res_to_pb(res.into())
     }
+
+    pub fn trash_entry_to_pb(src: TrashEntry) -> TrashEntryProto {
+        TrashEntryProto {
+            path: src.path,
+            origin: src.origin,
+            delete_ms: src.delete_ms,
+            status: Self::file_status_to_pb(src.status),
+        }
+    }
+
+    pub fn trash_entry_from_pb(src: TrashEntryProto) -> TrashEntry {
+        TrashEntry {
+            path: src.path,
+            origin: src.origin,
+            delete_ms: src.delete_ms,
+            status: Self::file_status_from_pb(src.status),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::proto::CompatibilityModeProto;
-    use crate::state::{AccessMode, FileStatus, MountInfo, MountOptions, INTERNAL_CTIME_XATTR};
+    use crate::state::{
+        AccessMode, FileStatus, MountInfo, MountOptions, TrashEntry, INTERNAL_CTIME_XATTR,
+    };
     use crate::utils::ProtoUtils;
     use curvine_sys::version::ComponentVersion;
     use std::collections::HashMap;
@@ -946,6 +966,33 @@ mod tests {
         assert_eq!(round_trip.auto_cache, Some(false));
         assert_eq!(round_trip.access_mode, Some(AccessMode::ReadWrite));
         assert_eq!(round_trip.write_cache, Some(true));
+    }
+
+    #[test]
+    fn trash_entry_proto_round_trip() {
+        let entry = TrashEntry {
+            path: "/.Trash/123-7".to_string(),
+            origin: "/data/a.log".to_string(),
+            delete_ms: 123,
+            status: FileStatus {
+                id: 7,
+                path: "/.Trash/123-7".to_string(),
+                name: "123-7".to_string(),
+                ..Default::default()
+            },
+        };
+
+        let pb = ProtoUtils::trash_entry_to_pb(entry);
+        assert_eq!(pb.path, "/.Trash/123-7");
+        assert_eq!(pb.origin, "/data/a.log");
+        assert_eq!(pb.delete_ms, 123);
+
+        let round_trip = ProtoUtils::trash_entry_from_pb(pb);
+        assert_eq!(round_trip.path, "/.Trash/123-7");
+        assert_eq!(round_trip.origin, "/data/a.log");
+        assert_eq!(round_trip.delete_ms, 123);
+        assert_eq!(round_trip.status.id, 7);
+        assert_eq!(round_trip.status.path, "/.Trash/123-7");
     }
 
     #[test]

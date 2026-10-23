@@ -26,7 +26,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TtlAction,
+    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TrashEntry, TtlAction,
     WorkerAddress, INTERNAL_CTIME_XATTR,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
@@ -471,6 +471,182 @@ impl FsDir {
         )
     }
 
+    pub fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store)?;
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return Ok(vec![]),
+        };
+
+        let dir = match inode.as_ref() {
+            Dir(d) => d,
+            _ => {
+                return err_ext!(FsError::invalid_argument(format!(
+                    "{} exists and is not a directory",
+                    trash::TRASH_ROOT
+                )))
+            }
+        };
+
+        let names: Vec<String> = dir
+            .children_iter()
+            .map(|child| child.name().to_string())
+            .collect();
+
+        let mut entries = Vec::new();
+        for name in names {
+            let path = trash::trash_entry_path(&name);
+            // Directory children can be unresolved FileEntry pointers; resolve
+            // each entry so the full inode (and its trash xattrs) is loaded.
+            let child_inp = InodePath::resolve(self.root_ptr(), &path, &self.store)?;
+            let Some(child) = child_inp.get_last_inode() else {
+                continue;
+            };
+            let Ok(x_attr) = child.x_attr() else {
+                continue;
+            };
+            let (Some(origin), Some(delete_ms)) = (
+                trash::decode_origin(x_attr),
+                trash::decode_delete_ms(x_attr),
+            ) else {
+                continue;
+            };
+
+            entries.push(TrashEntry {
+                status: child.to_file_status(&path)?,
+                path,
+                origin,
+                delete_ms,
+            });
+        }
+
+        entries.sort_by(|a, b| {
+            a.delete_ms
+                .cmp(&b.delete_ms)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        Ok(entries)
+    }
+
+    pub fn restore_trash(
+        &mut self,
+        trash_path: &str,
+        dst: Option<&str>,
+        overwrite: bool,
+    ) -> FsResult<Option<DeleteResult>> {
+        if !trash::is_trash_entry_path(trash_path) {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} is not a trash entry",
+                trash_path
+            )));
+        }
+
+        let src_inp = InodePath::resolve(self.root_ptr(), trash_path, &self.store)?;
+        let inode = match src_inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(trash_path)),
+        };
+
+        let x_attr = inode.x_attr()?;
+        let Some(origin) = trash::decode_origin(x_attr) else {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} is not a trash entry",
+                trash_path
+            )));
+        };
+
+        let dst = dst
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| origin.clone());
+        if !dst.starts_with(PATH_SEPARATOR) || trash::is_reserved_path(&dst) {
+            return err_ext!(FsError::invalid_argument(format!(
+                "invalid restore destination: {}",
+                dst
+            )));
+        }
+
+        let dst_inp = InodePath::resolve(self.root_ptr(), &dst, &self.store)?;
+        if dst_inp.get_last_inode().is_some() && !overwrite {
+            return err_ext!(FsError::file_exists(&dst));
+        }
+        if !dst_inp
+            .get_inode(-2)
+            .map(|parent| parent.is_dir())
+            .unwrap_or(false)
+        {
+            return err_ext!(FsError::file_not_found(dst_inp.get_parent_path()));
+        }
+
+        // The RESTORE rename clears the trash markers as part of the same
+        // persisted mutation, so a crash can never leave an entry inside the
+        // bin without its origin.
+        let mut flags = RenameFlags::RESTORE;
+        if !overwrite {
+            flags |= RenameFlags::NO_REPLACE;
+        }
+
+        let del_res = self.rename(&src_inp, &dst_inp, flags)?;
+        debug!("restored {} to {}", trash_path, dst);
+        Ok(del_res)
+    }
+
+    pub fn empty_trash(&mut self) -> (DeleteResult, FsResult<()>) {
+        let mut total = DeleteResult::new();
+        let inp = match InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store) {
+            Ok(v) => v,
+            Err(e) => return (total, Err(e.into())),
+        };
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return (total, Ok(())),
+        };
+        let dir = match inode.as_ref() {
+            Dir(d) => d,
+            _ => {
+                return (
+                    total,
+                    err_ext!(FsError::invalid_argument(format!(
+                        "{} exists and is not a directory",
+                        trash::TRASH_ROOT
+                    ))),
+                )
+            }
+        };
+
+        // Snapshot the names first: delete mutates the directory.
+        let names: Vec<String> = dir
+            .children_iter()
+            .map(|child| child.name().to_string())
+            .collect();
+
+        // Keep deleting the remaining entries after a failure: the caller
+        // needs the partial result to release the blocks of entries that were
+        // already removed, and those block lists cannot be recovered later.
+        let mut first_err = None;
+        for name in names {
+            let path = trash::trash_entry_path(&name);
+            let res = match InodePath::resolve(self.root_ptr(), &path, &self.store) {
+                Ok(child_inp) => self.delete(&child_inp, true),
+                Err(e) => Err(e.into()),
+            };
+            match res {
+                Ok(res) => {
+                    total.inodes += res.inodes;
+                    total.bytes += res.bytes;
+                    total.blocks.extend(res.blocks);
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+
+        (total, first_err.map_or(Ok(()), Err))
+    }
+
     pub fn free(&mut self, inp: &InodePath, recursive: bool) -> FsResult<FreeResult> {
         let op_ms = LocalTime::mills() as i64;
 
@@ -621,6 +797,16 @@ impl FsDir {
         new_inode.change_name(new_name);
         new_inode.set_parent_id(dst_parent.id());
         new_inode.update_ctime(mtime);
+
+        // Restore renames drop the trash markers in the same mutation that
+        // moves the entry. Journal replay runs this path with the same flags,
+        // so recovery cannot observe a restored entry that still lacks (or
+        // has already lost) its origin.
+        if flags.restore() && !new_inode.is_file_entry() {
+            let x_attr = new_inode.x_attr_mut()?;
+            x_attr.remove(trash::TRASH_XATTR_ORIGIN);
+            x_attr.remove(trash::TRASH_XATTR_DELETE_MS);
+        }
 
         // Update the parent directory for the last modification time.
         src_parent.update_mtime(mtime);
