@@ -108,6 +108,42 @@ message FreeResponse {
     required FreeResultProto res = 1;
 }
 
+// Recycle bin.
+message TrashEntryProto {
+    // Path of the entry inside /.Trash.
+    required string path = 1;
+    // Original absolute path recorded when the entry was deleted.
+    required string origin = 2;
+    // Deletion time in milliseconds.
+    required int64 delete_ms = 3;
+    required FileStatusProto status = 4;
+}
+
+message ListTrashRequest {
+}
+
+message ListTrashResponse {
+    repeated TrashEntryProto entries = 1;
+}
+
+message RestoreTrashRequest {
+    // Trash entry path (direct child of /.Trash).
+    required string path = 1;
+    // Restore destination; defaults to the recorded origin.
+    optional string dst = 2;
+    optional bool overwrite = 3 [default = false];
+}
+
+message RestoreTrashResponse {
+}
+
+message EmptyTrashRequest {
+}
+
+message EmptyTrashResponse {
+    required FreeResultProto res = 1;
+}
+
 message GetFileStatusRequest {
     required string path = 1;
     optional int64 inode_id = 2;

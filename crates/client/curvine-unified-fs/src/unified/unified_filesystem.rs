@@ -29,7 +29,7 @@ use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
     CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FilesystemInfo, FreeResult,
     JobStatus, ListOptions, LoadJobCommand, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
-    OpenFlags, RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState,
+    OpenFlags, RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState, TrashEntry,
 };
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::common::Utils;
@@ -977,6 +977,23 @@ impl UnifiedFileSystem {
             }
         };
         self.track("Delete", path.path(), "", fut).await
+    }
+
+    pub async fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        self.cv.list_trash().await
+    }
+
+    pub async fn restore_trash(
+        &self,
+        path: &Path,
+        dst: Option<&Path>,
+        overwrite: bool,
+    ) -> FsResult<()> {
+        self.cv.restore_trash(path, dst, overwrite).await
+    }
+
+    pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
+        self.cv.empty_trash().await
     }
 }
 

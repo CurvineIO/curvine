@@ -27,8 +27,9 @@ use curvine_model::{
 use curvine_model::{ListOptions, OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
-    CreateFileRequest, DeleteRequest, GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest,
-    MountRequest, RenameRequest,
+    CreateFileRequest, DeleteRequest, EmptyTrashRequest, EmptyTrashResponse,
+    GetFilesystemInfoRequest, ListTrashRequest, ListTrashResponse, MkdirOptsProto, MkdirRequest,
+    MountRequest, RenameRequest, RestoreTrashRequest,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -2224,6 +2225,72 @@ fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
     assert!(res.trashed);
     assert!(fs.get_block_locations("/soft.log").is_err());
     assert_eq!(fs.list_options("/.Trash", Default::default())?.len(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn trash_rpc_list_restore_empty() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-rpc", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    fs.create("/rpc/a.log", true)?;
+    let del_msg = Builder::new_rpc(RpcCode::Delete)
+        .proto_header(DeleteRequest {
+            path: "/rpc/a.log".to_string(),
+            recursive: false,
+            skip_trash: Some(false),
+        })
+        .build();
+    let mut del_ctx = RpcContext::new(&del_msg);
+    handler.retry_check_delete(&mut del_ctx)?;
+
+    let list_msg = Builder::new_rpc(RpcCode::ListTrash)
+        .proto_header(ListTrashRequest {})
+        .build();
+    let mut list_ctx = RpcContext::new(&list_msg);
+    let list_rep = handler
+        .list_trash(&mut list_ctx)?
+        .parse_header::<ListTrashResponse>()?;
+    assert_eq!(list_rep.entries.len(), 1);
+    let entry = &list_rep.entries[0];
+    assert_eq!(entry.origin, "/rpc/a.log");
+    assert!(entry.delete_ms > 0);
+    assert_eq!(entry.status.path, entry.path);
+
+    let restore_msg = Builder::new_rpc(RpcCode::RestoreTrash)
+        .proto_header(RestoreTrashRequest {
+            path: entry.path.clone(),
+            dst: None,
+            overwrite: Some(false),
+        })
+        .build();
+    let mut restore_ctx = RpcContext::new(&restore_msg);
+    handler.retry_check_restore_trash(&mut restore_ctx)?;
+    assert!(fs.get_block_locations("/rpc/a.log").is_ok());
+    assert!(fs.list_trash()?.is_empty());
+
+    fs.create("/rpc/b.log", true)?;
+    let del_msg = Builder::new_rpc(RpcCode::Delete)
+        .proto_header(DeleteRequest {
+            path: "/rpc/b.log".to_string(),
+            recursive: false,
+            skip_trash: Some(false),
+        })
+        .build();
+    let mut del_ctx = RpcContext::new(&del_msg);
+    handler.retry_check_delete(&mut del_ctx)?;
+
+    let empty_msg = Builder::new_rpc(RpcCode::EmptyTrash)
+        .proto_header(EmptyTrashRequest {})
+        .build();
+    let mut empty_ctx = RpcContext::new(&empty_msg);
+    let empty_rep = handler
+        .retry_check_empty_trash(&mut empty_ctx)?
+        .parse_header::<EmptyTrashResponse>()?;
+    assert_eq!(empty_rep.res.inodes, 1);
+    assert!(fs.list_trash()?.is_empty());
 
     Ok(())
 }
