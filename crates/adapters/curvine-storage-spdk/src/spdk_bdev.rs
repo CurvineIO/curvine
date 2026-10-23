@@ -742,6 +742,53 @@ impl Display for SpdkBdev {
     }
 }
 
+/// Outcome of waiting for in-flight I/O to drain during `SpdkBdev::drop()`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DrainOutcome {
+    /// `inflight` reached 0 before the deadline.
+    Completed,
+    /// Deadline reached with `inflight` still non-zero; caller must poison
+    /// DMA buffers to avoid a use-after-free.
+    TimedOut,
+}
+
+/// Wait for `inflight` to reach 0, retrying deferred qpair cleanup on every
+/// iteration so a transient free failure isn't stuck until an unrelated retry.
+pub(crate) fn wait_for_inflight_drain(
+    inflight: &std::sync::atomic::AtomicUsize,
+    env: Option<&crate::spdk_env::SpdkEnv>,
+    deadline: std::time::Instant,
+    name: &str,
+    poll_interval: std::time::Duration,
+) -> DrainOutcome {
+    let mut logged = false;
+    loop {
+        let count = inflight.load(std::sync::atomic::Ordering::Acquire);
+        if count == 0 {
+            return DrainOutcome::Completed;
+        }
+        if std::time::Instant::now() >= deadline {
+            error!(
+                "SpdkBdev '{}': {} in-flight I/O(s) still pending after deadline. \
+                 Leaking DMA buffers to prevent use-after-free.",
+                name, count
+            );
+            return DrainOutcome::TimedOut;
+        }
+        if !logged {
+            warn!(
+                "SpdkBdev '{}': waiting for {} in-flight I/O(s) to complete before drop",
+                name, count
+            );
+            logged = true;
+        }
+        if let Some(env) = env {
+            env.resolve_deferred_qpairs();
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
 impl Drop for SpdkBdev {
     fn drop(&mut self) {
         // Retire the qpair before waiting on `inflight` below. Retirement
@@ -774,31 +821,15 @@ impl Drop for SpdkBdev {
             std::time::Duration::from_secs(60)
         };
         let deadline = std::time::Instant::now() + max_wait;
-        let mut logged = false;
-        loop {
-            let count = self.inflight.load(std::sync::atomic::Ordering::Acquire);
-            if count == 0 {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                error!(
-                    "SpdkBdev '{}': {} in-flight I/O(s) still pending after {}s. \
-                         Deferring DMA buffer free until callbacks drain.",
-                    self.name,
-                    count,
-                    max_wait.as_secs()
-                );
-                self.defer_dma_buffers();
-                break;
-            }
-            if !logged {
-                warn!(
-                    "SpdkBdev '{}': waiting for {} in-flight I/O(s) to complete before drop",
-                    self.name, count
-                );
-                logged = true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        let outcome = wait_for_inflight_drain(
+            &self.inflight,
+            env,
+            deadline,
+            &self.name,
+            std::time::Duration::from_millis(1),
+        );
+        if outcome == DrainOutcome::TimedOut {
+            self.defer_dma_buffers();
         }
 
         if let Some(env) = env {
@@ -970,5 +1001,138 @@ mod test {
         ensure_spdk_init();
         let buf = DmaBuf::alloc(1024 * 1024, 4096).unwrap();
         drop(buf);
+    }
+
+    /// Completion always times out (channel never drained). Caller MUST
+    /// `mem::forget` it -- real `Drop` would free the dummy qpair via FFI.
+    /// Leaks 2 DmaBufs (harmless: one-shot, OS reclaims on process exit).
+    fn test_bdev_with_fake_channel(
+        writable: bool,
+    ) -> (
+        SpdkBdev,
+        crossbeam::channel::Receiver<crate::spdk_poller::IoRequest>,
+    ) {
+        ensure_spdk_init();
+        let block_size = 512u32;
+        let buf_size = block_size as usize; // one block is enough for every I/O these tests issue
+        let read_buf = DmaBuf::alloc(buf_size, block_size).unwrap();
+        let write_buf = DmaBuf::alloc(buf_size, block_size).unwrap();
+        let (tx, rx) = crossbeam::channel::unbounded();
+        let bdev = SpdkBdev {
+            name: "test-dead-qpair-bdev".to_string(),
+            size: 16 * 1024 * 1024,
+            block_size,
+            pos: 0,
+            writable,
+            read_buf: Some(read_buf),
+            write_buf: Some(write_buf),
+            ns: std::ptr::null_mut(),
+            io_channel: SpdkIoChannel {
+                qpair: 0x1234usize as *mut crate::spdk_ffi::spdk_nvme_qpair,
+                poller_tx: tx,
+                eventfd: std::sync::Arc::new(
+                    EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK).unwrap(),
+                ),
+                poller_is_sleeping: std::sync::Arc::new(AtomicBool::new(false)),
+                qpair_dead: std::sync::Arc::new(AtomicBool::new(false)),
+            },
+            ctrlr: 0x5678usize as *mut crate::spdk_ffi::spdk_nvme_ctrlr,
+            io_timeout_ms: 1,
+            inflight: Arc::new(AtomicUsize::new(0)),
+            retired_dma: RetiredDmaRegistry::new(),
+        };
+        (bdev, rx)
+    }
+
+    #[test]
+    fn spdk_read_timeout_marks_qpair_dead_and_blocks_further_submits() {
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+
+        let err = bdev.spdk_read(0, 512).expect_err("read should time out");
+        assert!(err.to_string().contains("NVMe read failed"), "{}", err);
+        assert!(bdev.io_channel.qpair_dead.load(Ordering::Acquire));
+        assert!(
+            rx.try_recv().is_ok(),
+            "the timed-out read should have submitted once"
+        );
+        assert!(rx.try_recv().is_err(), "only one submit expected");
+
+        // Every subsequent op must short-circuit on the dead flag, with no
+        // further submit to the channel.
+        let err = bdev
+            .spdk_read(0, 512)
+            .expect_err("read should short-circuit");
+        assert!(err.to_string().contains("qpair is dead"), "{}", err);
+        assert!(rx.try_recv().is_err(), "dead read must not submit");
+
+        let err = bdev
+            .spdk_write(0, &[0u8; 512])
+            .expect_err("write should short-circuit");
+        assert!(err.to_string().contains("qpair is dead"), "{}", err);
+        assert!(rx.try_recv().is_err(), "dead write must not submit");
+
+        let err = bdev.spdk_flush().expect_err("flush should short-circuit");
+        assert!(err.to_string().contains("qpair is dead"), "{}", err);
+        assert!(rx.try_recv().is_err(), "dead flush must not submit");
+
+        std::mem::forget(bdev);
+    }
+
+    #[test]
+    fn spdk_write_aligned_timeout_marks_qpair_dead() {
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+
+        // Block-aligned offset/len: no read-modify-write sub-request.
+        let err = bdev
+            .spdk_write(0, &[0u8; 512])
+            .expect_err("write should time out");
+        assert!(err.to_string().contains("NVMe write failed"), "{}", err);
+        assert!(bdev.io_channel.qpair_dead.load(Ordering::Acquire));
+        assert!(
+            rx.try_recv().is_ok(),
+            "the timed-out write should have submitted once"
+        );
+        assert!(rx.try_recv().is_err(), "only one submit expected, no RMW");
+
+        std::mem::forget(bdev);
+    }
+
+    #[test]
+    fn spdk_write_rmw_timeout_marks_qpair_dead() {
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+
+        // Unaligned offset forces the read-modify-write branch; its own read
+        // times out before the write is ever submitted.
+        let err = bdev
+            .spdk_write(1, &[0u8; 8])
+            .expect_err("RMW read should time out");
+        assert!(err.to_string().contains("Read-modify-write"), "{}", err);
+        assert!(bdev.io_channel.qpair_dead.load(Ordering::Acquire));
+        assert!(
+            rx.try_recv().is_ok(),
+            "the RMW read should have submitted once"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "write must never be submitted once the RMW read fails"
+        );
+
+        std::mem::forget(bdev);
+    }
+
+    #[test]
+    fn spdk_flush_timeout_marks_qpair_dead() {
+        let (bdev, rx) = test_bdev_with_fake_channel(true);
+
+        let err = bdev.spdk_flush().expect_err("flush should time out");
+        assert!(err.to_string().contains("NVMe flush failed"), "{}", err);
+        assert!(bdev.io_channel.qpair_dead.load(Ordering::Acquire));
+        assert!(
+            rx.try_recv().is_ok(),
+            "the timed-out flush should have submitted once"
+        );
+        assert!(rx.try_recv().is_err(), "only one submit expected");
+
+        std::mem::forget(bdev);
     }
 }

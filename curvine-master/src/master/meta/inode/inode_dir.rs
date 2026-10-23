@@ -38,6 +38,38 @@ pub struct InodeDir {
 }
 
 impl InodeDir {
+    /// Copy persisted directory fields without cloning the in-memory subtree.
+    pub(crate) fn clone_metadata(&self) -> Self {
+        let Self {
+            id,
+            parent_id,
+            mtime,
+            atime,
+            nlink,
+            storage_policy,
+            features,
+            children: _,
+        } = self;
+        Self {
+            id: *id,
+            parent_id: *parent_id,
+            mtime: *mtime,
+            atime: *atime,
+            nlink: *nlink,
+            storage_policy: storage_policy.clone(),
+            features: features.clone(),
+            children: InodeChildren::new_map(),
+        }
+    }
+
+    /// Attach the original subtree after its updated metadata has been persisted.
+    /// The caller owns the detached directory and still holds the namespace lock.
+    pub(crate) fn adopt_children(&mut self, detached: Self) {
+        debug_assert_eq!(self.id, detached.id);
+        debug_assert_eq!(self.children_len(), 0);
+        self.children = detached.children;
+    }
+
     pub fn new(id: i64, time: i64) -> Self {
         Self {
             id,
