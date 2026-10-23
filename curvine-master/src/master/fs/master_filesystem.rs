@@ -17,7 +17,7 @@ use crate::master::fs::full_block_report::{FullReportProgress, FullReportTracker
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-use crate::master::meta::{CacheInvalidationResult, FsDir};
+use crate::master::meta::{trash, CacheInvalidationResult, FsDir};
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
@@ -205,6 +205,7 @@ impl MasterFilesystem {
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        Self::check_not_reserved_path(inp.path())?;
 
         // Creation of root directory is not allowed
         if inp.is_root() {
@@ -247,6 +248,14 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
 
+        // Removing the root would orphan every trashed entry. Entries below it
+        // stay permanently deletable so the recycle bin can be emptied.
+        if inp.path() == trash::TRASH_ROOT {
+            return err_ext!(FsError::invalid_argument(
+                "the recycle bin root cannot be deleted"
+            ));
+        }
+
         let mut delete_res = fs_dir.delete(&inp, recursive)?;
         drop(fs_dir);
 
@@ -263,6 +272,7 @@ impl MasterFilesystem {
     pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        Self::check_not_reserved_path(inp.path())?;
 
         let mut free_res = fs_dir.free(&inp, recursive)?;
         drop(fs_dir);
@@ -284,6 +294,9 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let src_inp = Self::resolve_path(&fs_dir, src)?;
         let dst_inp = Self::resolve_path(&fs_dir, dst)?;
+
+        Self::check_not_reserved_path(src_inp.path())?;
+        Self::check_not_reserved_path(dst_inp.path())?;
 
         if src_inp.is_root() {
             return err_box!("Cannot rename root path");
@@ -371,6 +384,7 @@ impl MasterFilesystem {
 
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
+        Self::check_not_reserved_path(inp.path())?;
 
         let last_inode = inp.get_last_inode();
         if let Some(inode) = &last_inode {
@@ -423,6 +437,7 @@ impl MasterFilesystem {
 
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
+        Self::check_not_reserved_path(inp.path())?;
 
         let inode = match inp.get_last_inode() {
             None => {
@@ -515,6 +530,16 @@ impl MasterFilesystem {
 
     fn resolve_path(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
         InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
+    }
+
+    fn check_not_reserved_path(path: &str) -> FsResult<()> {
+        if trash::is_reserved_path(path) {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} is reserved for the recycle bin",
+                path
+            )));
+        }
+        Ok(())
     }
 
     fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {
@@ -1540,6 +1565,7 @@ impl MasterFilesystem {
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        Self::check_not_reserved_path(inp.path())?;
         fs_dir.set_attr(inp, opts)
     }
 
@@ -1565,6 +1591,7 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let target = target.as_ref().to_string();
         let link = Self::resolve_path(&fs_dir, link.as_ref())?;
+        Self::check_not_reserved_path(link.path())?;
         fs_dir.symlink(target, link, force, mode, owner, group)
     }
 
@@ -1572,6 +1599,8 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let src_path = Self::resolve_path(&fs_dir, src_path.as_ref())?;
         let dst_path = Self::resolve_path(&fs_dir, dst_path.as_ref())?;
+        Self::check_not_reserved_path(src_path.path())?;
+        Self::check_not_reserved_path(dst_path.path())?;
         fs_dir.link(src_path, dst_path)
     }
 
@@ -1588,6 +1617,7 @@ impl MasterFilesystem {
         opts.validate()?;
 
         let path = path.as_ref();
+        Self::check_not_reserved_path(path)?;
         // This snapshot only rejects individually impossible requests; it is not a
         // reservation, so concurrent fallocates may observe the same capacity.
         // Worker-side block allocation remains the hard enforcement point.
@@ -1600,6 +1630,12 @@ impl MasterFilesystem {
         let (del_res, inode_id) = {
             let mut fs_dir = self.fs_dir.write();
             let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+            if inode_id.is_some() {
+                // A by-id request may carry a stale path, so also check where
+                // the inode actually lives.
+                let live_path = fs_dir.get_inode_path(inode.id())?;
+                Self::check_not_reserved_path(&live_path)?;
+            }
             let file = inode.as_file_ref()?;
             Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
             let inode_id = inode.id();
@@ -1718,6 +1754,24 @@ mod tests {
             Utils::rand_str(6)
         ));
         JournalSystem::fs_only_for_test(&conf).unwrap()
+    }
+
+    // Seeds an entry under the reserved root through FsDir, since the public
+    // API refuses to create anything inside /.Trash.
+    fn seed_trash_entry(fs: &MasterFilesystem, name: &str) -> (String, i64) {
+        let mut fs_dir = fs.fs_dir.write();
+        let root = InodePath::resolve(fs_dir.root_ptr(), trash::TRASH_ROOT, &fs_dir.store).unwrap();
+        if !root.is_full() {
+            fs_dir.mkdir(root, MkdirOpts::with_create(true)).unwrap();
+        }
+
+        let path = format!("{}/{}", trash::TRASH_ROOT, name);
+        let inp = InodePath::resolve(fs_dir.root_ptr(), &path, &fs_dir.store).unwrap();
+        let inp = fs_dir
+            .create_file(inp, CreateFileOpts::with_create(false))
+            .unwrap();
+        let inode_id = inp.get_last_inode().unwrap().id();
+        (path, inode_id)
     }
 
     fn assert_file_not_found_roundtrip(err: &FsError) {
@@ -2381,5 +2435,155 @@ mod tests {
                 .scheduled_bytes,
             0
         );
+    }
+
+    #[test]
+    fn trash_namespace_is_reserved_for_creates() {
+        let fs = test_fs("reserved-create");
+
+        let err = fs.create("/.Trash/entry.log", true).unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        let err = fs.mkdir("/.Trash/entry-dir", true).unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        // Names that merely start with the reserved prefix are allowed.
+        fs.mkdir("/.Trashy", true).unwrap();
+    }
+
+    #[test]
+    fn trash_namespace_is_reserved_for_rename() {
+        let fs = test_fs("reserved-rename");
+        fs.mkdir("/data", true).unwrap();
+
+        let err = fs
+            .rename("/data", "/.Trash/moved", RenameFlags::empty())
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        let err = fs
+            .rename("/.Trash", "/moved", RenameFlags::empty())
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn trash_namespace_is_reserved_for_links() {
+        let fs = test_fs("reserved-links");
+        fs.create("/data.log", true).unwrap();
+
+        let err = fs.link("/data.log", "/.Trash/link.log").unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        let err = fs
+            .symlink("/data.log", "/.Trash/sym.log", false, 0o777)
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn trash_namespace_rejects_writes_but_allows_reads() {
+        let fs = test_fs("reserved-write");
+        fs.create("/data.log", true).unwrap();
+
+        let err = fs
+            .open_file(
+                "/.Trash/new.log",
+                CreateFileOpts::with_create(false),
+                OpenFlags::new_create(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        // Read-only lookups do not touch the reserved namespace guard.
+        let err = fs.get_block_locations("/.Trash/absent.log").unwrap_err();
+        assert!(matches!(err, FsError::FileNotFound(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn trash_root_cannot_be_deleted() {
+        let fs = test_fs("reserved-delete-root");
+
+        let err = fs.delete(trash::TRASH_ROOT, true).unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn trash_entries_remain_permanently_deletable() {
+        let fs = test_fs("reserved-delete-entry");
+        let (path, _) = seed_trash_entry(&fs, "entry.log");
+
+        fs.delete(&path, false).unwrap();
+
+        let err = fs.get_block_locations(&path).unwrap_err();
+        assert!(matches!(err, FsError::FileNotFound(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn trash_namespace_is_reserved_for_free_and_set_attr() {
+        let fs = test_fs("reserved-free-attr");
+        let (path, _) = seed_trash_entry(&fs, "entry.log");
+
+        for (label, err) in [
+            ("free entry", fs.free(&path, false).unwrap_err()),
+            ("free root", fs.free(trash::TRASH_ROOT, true).unwrap_err()),
+            (
+                "set_attr entry",
+                fs.set_attr(&path, SetAttrOptsBuilder::new().mode(0o600).build())
+                    .unwrap_err(),
+            ),
+            (
+                "set_attr root",
+                fs.set_attr(
+                    trash::TRASH_ROOT,
+                    SetAttrOptsBuilder::new().mode(0o600).build(),
+                )
+                .unwrap_err(),
+            ),
+        ] {
+            assert!(
+                matches!(err, FsError::InvalidArgument(_)),
+                "{}: got {:?}",
+                label,
+                err
+            );
+        }
+
+        // Regular paths keep their previous behavior.
+        fs.create("/data.log", true).unwrap();
+        fs.set_attr("/data.log", SetAttrOptsBuilder::new().mode(0o600).build())
+            .unwrap();
+        fs.free("/data.log", false).unwrap();
+    }
+
+    #[test]
+    fn trash_namespace_is_reserved_for_resize() {
+        let fs = test_fs("reserved-resize");
+        let (path, inode_id) = seed_trash_entry(&fs, "entry.log");
+
+        let err = fs
+            .resize(&path, FileAllocOpts::with_truncate(0))
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        // By-id requests may carry a stale path, so the live path is checked too.
+        let err = fs
+            .resize_by_id(
+                "/data/stale.log",
+                Some(inode_id),
+                FileAllocOpts::with_truncate(0),
+            )
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        let created = fs.create("/data.log", true).unwrap();
+        let blocks = fs
+            .resize_by_id(
+                "/data.log",
+                Some(created.id),
+                FileAllocOpts::with_truncate(128),
+            )
+            .unwrap();
+        assert_eq!(blocks.status.len, 128);
     }
 }

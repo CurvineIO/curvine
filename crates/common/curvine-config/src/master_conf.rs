@@ -119,6 +119,19 @@ pub struct MasterConf {
     #[serde(skip)]
     pub ttl_retry_interval_unit: DurationUnit,
 
+    // Recycle bin configuration.
+    // Soft-deleted entries are moved to /.Trash and purged after trash_retention.
+    // A retention of "0" keeps entries until they are purged manually.
+    pub trash_enabled: bool,
+    pub trash_retention: String,
+    #[serde(skip)]
+    pub trash_retention_unit: DurationUnit,
+
+    // How often the master scans /.Trash for expired entries.
+    pub trash_check_interval: String,
+    #[serde(skip)]
+    pub trash_check_interval_unit: DurationUnit,
+
     // Eviction configuration
     pub enable_quota_eviction: bool,
     pub quota_eviction_mode: String,
@@ -170,6 +183,8 @@ impl MasterConf {
         self.ttl_bucket_interval_unit = DurationUnit::from_str(&self.ttl_bucket_interval)?;
         self.ttl_max_retry_duration_unit = DurationUnit::from_str(&self.ttl_max_retry_duration)?;
         self.ttl_retry_interval_unit = DurationUnit::from_str(&self.ttl_retry_interval)?;
+        self.trash_retention_unit = DurationUnit::from_str(&self.trash_retention)?;
+        self.trash_check_interval_unit = DurationUnit::from_str(&self.trash_check_interval)?;
         self.block_replication_retry_interval_unit =
             DurationUnit::from_str(&self.block_replication_retry_interval)?;
         self.block_replication_submit_timeout_unit =
@@ -202,6 +217,10 @@ impl MasterConf {
 
         if self.block_replication_job_timeout_ms() == 0 {
             return err_box!("master.block_replication_job_timeout must be greater than zero");
+        }
+
+        if self.trash_check_interval_ms() == 0 {
+            return err_box!("master.trash_check_interval must be greater than zero");
         }
 
         Ok(())
@@ -264,6 +283,14 @@ impl MasterConf {
 
     pub fn lock_expire_time_ms(&self) -> u64 {
         self.lock_expire_time_unit.as_millis()
+    }
+
+    pub fn trash_retention_ms(&self) -> u64 {
+        self.trash_retention_unit.as_millis()
+    }
+
+    pub fn trash_check_interval_ms(&self) -> u64 {
+        self.trash_check_interval_unit.as_millis()
     }
 
     pub fn io_timeout_ms(&self) -> u64 {
@@ -357,6 +384,13 @@ impl Default for MasterConf {
             ttl_retry_interval: "1s".to_string(),
             ttl_retry_interval_unit: Default::default(),
 
+            trash_enabled: false,
+            trash_retention: "7d".to_string(),
+            trash_retention_unit: Default::default(),
+
+            trash_check_interval: "1h".to_string(),
+            trash_check_interval_unit: Default::default(),
+
             // Eviction configuration defaults
             enable_quota_eviction: false,
             quota_eviction_mode: "free".to_string(),
@@ -415,5 +449,40 @@ mod tests {
         assert!(error
             .to_string()
             .contains("block_replication_job_timeout must be greater than zero"));
+    }
+
+    #[test]
+    fn trash_defaults_are_disabled_with_one_week_retention() {
+        let conf = MasterConf::default();
+
+        assert!(!conf.trash_enabled);
+        assert_eq!(conf.trash_retention_ms(), 7 * 24 * 60 * 60 * 1000);
+        assert_eq!(conf.trash_check_interval_ms(), 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn zero_trash_retention_disables_auto_purge() {
+        let mut conf = MasterConf {
+            trash_retention: "0".to_string(),
+            ..Default::default()
+        };
+        conf.init().unwrap();
+
+        assert_eq!(conf.trash_retention_ms(), 0);
+    }
+
+    #[test]
+    fn trash_check_interval_must_be_positive() {
+        let mut conf = MasterConf {
+            trash_check_interval: "0ms".to_string(),
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("zero trash check interval must be rejected");
+        assert!(error
+            .to_string()
+            .contains("trash_check_interval must be greater than zero"));
     }
 }
