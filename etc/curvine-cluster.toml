@@ -56,9 +56,8 @@ meta_dir = "testing/meta"
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"
 
-# Recycle bin options. The /.Trash namespace is reserved even while disabled.
-# The recycle bin is not active yet: deletes remain permanent until soft deletion
-# lands, so the options below are documented ahead of time and have no effect.
+# Recycle bin. When enabled, deletes move entries to /.Trash instead of removing
+# blocks immediately. The /.Trash namespace is reserved even while disabled.
 # trash_retention: how long entries are kept before the master purges them;
 #   "0" disables automatic purging.
 # trash_check_interval: how often the master scans /.Trash for expired entries.

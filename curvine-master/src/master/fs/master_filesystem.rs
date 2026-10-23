@@ -244,7 +244,17 @@ impl MasterFilesystem {
         self.mkdir_with_opts(path, opts)
     }
 
+    // Permanently delete a path, bypassing the recycle bin.
     pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<DeleteResult> {
+        self.delete_with_opts(path, recursive, true)
+    }
+
+    pub fn delete_with_opts<T: AsRef<str>>(
+        &self,
+        path: T,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<DeleteResult> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
 
@@ -256,7 +266,15 @@ impl MasterFilesystem {
             ));
         }
 
-        let mut delete_res = fs_dir.delete(&inp, recursive)?;
+        // Entries already inside /.Trash are always purged permanently.
+        let soft_delete =
+            !skip_trash && self.conf.trash_enabled && !trash::is_trash_path(inp.path());
+
+        let mut delete_res = if soft_delete {
+            fs_dir.trash(&inp, recursive)?
+        } else {
+            fs_dir.delete(&inp, recursive)?
+        };
         drop(fs_dir);
 
         let mut worker_manager = self.worker_manager.write();
@@ -1774,6 +1792,25 @@ mod tests {
         (path, inode_id)
     }
 
+    fn test_fs_with_trash(name: &str) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.trash_enabled = true;
+        conf.master.meta_dir = Utils::test_sub_dir(format!(
+            "master-fs-trash-test/meta-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-trash-test/journal-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        JournalSystem::fs_only_for_test(&conf).unwrap()
+    }
+
     fn assert_file_not_found_roundtrip(err: &FsError) {
         assert!(
             matches!(err.kind(), ErrorKind::FileNotFound),
@@ -2435,6 +2472,143 @@ mod tests {
                 .scheduled_bytes,
             0
         );
+    }
+
+    #[test]
+    fn soft_delete_moves_file_into_trash_with_origin_metadata() {
+        let fs = test_fs_with_trash("soft-file");
+        fs.create("/data/a.log", true).unwrap();
+
+        fs.delete_with_opts("/data/a.log", false, false).unwrap();
+
+        assert!(matches!(
+            fs.get_block_locations("/data/a.log").unwrap_err(),
+            FsError::FileNotFound(_)
+        ));
+
+        let mut entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = entries.remove(0);
+        assert_eq!(
+            entry
+                .x_attr
+                .get(trash::TRASH_XATTR_ORIGIN)
+                .map(Vec::as_slice),
+            Some(b"/data/a.log".as_slice())
+        );
+        let delete_ms = i64::from_le_bytes(
+            entry
+                .x_attr
+                .get(trash::TRASH_XATTR_DELETE_MS)
+                .unwrap()
+                .as_slice()
+                .try_into()
+                .unwrap(),
+        );
+        assert!(delete_ms > 0);
+        assert!(entry.name.starts_with(&format!("{}-", delete_ms)));
+    }
+
+    #[test]
+    fn soft_delete_moves_directory_subtree_into_trash() {
+        let fs = test_fs_with_trash("soft-dir");
+        fs.create("/dir/child.log", true).unwrap();
+
+        let err = fs.delete_with_opts("/dir", false, false).unwrap_err();
+        assert!(matches!(err, FsError::DirNotEmpty(_)), "got {:?}", err);
+
+        fs.delete_with_opts("/dir", true, false).unwrap();
+
+        let entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        assert_eq!(entries.len(), 1);
+        let trashed_child = format!("/.Trash/{}/child.log", entries[0].name);
+        assert!(fs.get_block_locations(&trashed_child).is_ok());
+        assert!(fs.get_block_locations("/dir/child.log").is_err());
+    }
+
+    #[test]
+    fn deleting_a_hard_link_keeps_hard_unlink_semantics() {
+        let fs = test_fs_with_trash("hardlink");
+        fs.create("/a.log", true).unwrap();
+        fs.link("/a.log", "/b.log").unwrap();
+
+        fs.delete_with_opts("/a.log", false, false).unwrap();
+
+        assert!(fs.get_block_locations("/b.log").is_ok());
+        assert!(fs.list_options("/.Trash", ListOptions::default()).is_err());
+    }
+
+    #[test]
+    fn skip_trash_deletes_permanently() {
+        let fs = test_fs_with_trash("skip-trash");
+        fs.create("/keep.log", true).unwrap();
+
+        fs.delete_with_opts("/keep.log", false, true).unwrap();
+
+        assert!(fs.get_block_locations("/keep.log").is_err());
+        assert!(fs.list_options("/.Trash", ListOptions::default()).is_err());
+    }
+
+    #[test]
+    fn soft_delete_falls_back_to_hard_delete_when_disabled() {
+        let fs = test_fs("trash-disabled");
+        fs.create("/a.log", true).unwrap();
+
+        fs.delete_with_opts("/a.log", false, false).unwrap();
+
+        assert!(fs.get_block_locations("/a.log").is_err());
+        assert!(fs.list_options("/.Trash", ListOptions::default()).is_err());
+    }
+
+    #[test]
+    fn trash_root_is_protected_and_entries_are_purged_permanently() {
+        let fs = test_fs_with_trash("trash-purge");
+        fs.create("/a.log", true).unwrap();
+        fs.delete_with_opts("/a.log", false, false).unwrap();
+
+        let err = fs.delete_with_opts("/.Trash", true, false).unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        let entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        let entry_path = format!("/.Trash/{}", entries[0].name);
+        fs.delete_with_opts(&entry_path, true, false).unwrap();
+        assert!(fs
+            .list_options("/.Trash", ListOptions::default())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn ttl_does_not_expunge_trashed_entries() {
+        use crate::master::meta::inode::ttl::InodeTtlExecutor;
+
+        let fs = test_fs_with_trash("ttl-trash");
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .ttl_ms(1)
+            .ttl_action(TtlAction::Delete)
+            .build();
+        fs.create_with_opts(
+            "/ttl/expired.log",
+            opts,
+            OpenFlags::new_create().set_overwrite(true),
+        )
+        .unwrap();
+        fs.complete_file("/ttl/expired.log", None, 0, vec![], "", false, None)
+            .unwrap();
+        let inode_id = fs.file_status("/ttl/expired.log").unwrap().id;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        fs.delete_with_opts("/ttl/expired.log", false, false)
+            .unwrap();
+        let entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        let trashed_path = format!("/.Trash/{}", entries[0].name);
+
+        let executor = InodeTtlExecutor::with_managers(fs.clone());
+        let (handled, _) = executor.execute_by_id(inode_id).unwrap();
+
+        assert!(handled);
+        assert!(fs.get_block_locations(&trashed_path).is_ok());
     }
 
     #[test]
