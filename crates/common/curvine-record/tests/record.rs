@@ -259,3 +259,236 @@ fn chunks_shrink_back_to_empty() {
     assert_eq!(insert(&mut area, 7, b"again"), InsertOutcome::Inserted);
     assert_eq!(read_payload(&area, 7), Some(b"again".as_slice()));
 }
+
+#[test]
+fn layout_rejects_an_unsupported_width() {
+    // Widths are validated only by new(); the fields are private so a struct
+    // literal cannot build a layout that would hit unreachable! while framing.
+    let layout = Layout::new(2, 4);
+    assert_eq!(layout.key_len_width(), 2);
+    assert_eq!(layout.value_len_width(), 4);
+    assert_eq!(layout.header_len(), 6);
+}
+
+#[test]
+#[should_panic(expected = "key length width must be")]
+fn layout_rejects_a_three_byte_key_width() {
+    let _ = Layout::new(3, 1);
+}
+
+#[test]
+fn insert_with_writes_every_value_byte() {
+    let mut area = new_area();
+    for key in 0..500u64 {
+        let kb = key.to_be_bytes();
+        let outcome = area.insert_with(&kb, 16, |dst| {
+            dst[..4].copy_from_slice(&(key as u32).to_le_bytes());
+            dst[4..12].copy_from_slice(&key.to_be_bytes());
+            dst[12..].fill((key % 251) as u8);
+        });
+        assert_eq!(outcome, InsertOutcome::Inserted);
+    }
+    assert!(area.chunk_count() > 1, "expected the run to span chunks");
+
+    for key in 0..500u64 {
+        let value = read_payload(&area, key).expect("value present");
+        assert_eq!(value.len(), 16);
+        assert_eq!(&value[..4], (key as u32).to_le_bytes().as_slice());
+        assert_eq!(&value[4..12], key.to_be_bytes().as_slice());
+        assert!(value[12..].iter().all(|&b| b == (key % 251) as u8));
+    }
+
+    let mut seen = Vec::new();
+    walk(&area, |buf, off| seen.push(stored_key(buf, off)));
+    assert_eq!(seen, (0..500u64).collect::<Vec<_>>());
+}
+
+#[test]
+fn insert_with_underfill_leaves_zeroes_not_stale_bytes() {
+    // The slot between two existing records still holds the bytes of the record
+    // that was shifted right; zeroing it keeps a partial write from reading back
+    // as the neighbour's value.
+    let mut area = Record::with_chunk_size(Layout::new(1, 1), 64);
+    assert_eq!(area.insert(b"a", b"AAAAAAAA"), InsertOutcome::Inserted);
+    assert_eq!(area.insert(b"c", b"CCCCCCCC"), InsertOutcome::Inserted);
+
+    assert_eq!(
+        area.insert_with(b"b", 8, |dst| dst[0] = b'B'),
+        InsertOutcome::Inserted
+    );
+
+    assert_eq!(area.get(b"b"), Some(b"B\0\0\0\0\0\0\0".as_slice()));
+    assert_eq!(area.get(b"a"), Some(b"AAAAAAAA".as_slice()));
+    assert_eq!(area.get(b"c"), Some(b"CCCCCCCC".as_slice()));
+}
+
+#[test]
+fn insert_with_duplicate_never_runs_the_closure() {
+    let mut area = new_area();
+    assert_eq!(insert(&mut area, 7, b"payload"), InsertOutcome::Inserted);
+
+    let mut called = false;
+    assert_eq!(
+        area.insert_with(&7u64.to_be_bytes(), 7, |_| called = true),
+        InsertOutcome::Duplicate
+    );
+    assert!(!called, "a duplicate key must not touch the value slot");
+    assert_eq!(read_payload(&area, 7), Some(b"payload".as_slice()));
+}
+
+/// Stores `key` through `insert_with` while writing only the first four bytes of
+/// a five byte value slot, so a record that crosses a grow or a split still has
+/// to read back zero filled rather than holding whatever it was shifted onto.
+fn insert_partial(area: &mut Record, oracle: &mut BTreeMap<u64, Vec<u8>>, key: u64) {
+    let head = (key as u32).to_le_bytes();
+    let key_bytes = key.to_be_bytes();
+    assert_eq!(
+        area.insert_with(&key_bytes, 5, move |dst| dst[..4].copy_from_slice(&head)),
+        InsertOutcome::Inserted
+    );
+
+    let mut payload = head.to_vec();
+    payload.push(0);
+    oracle.insert(key, payload);
+}
+
+#[test]
+fn insert_with_locates_records_across_grow_and_split() {
+    // 16-byte records in a 128-byte chunk: the first chunk starts at CHUNK_MIN and
+    // has to grow before it can hold eight of them, and filling it with even keys
+    // before inserting odd ones forces a split. insert_with must land in the right
+    // slot and keep its own bytes after a reallocation and after a split.
+    let record_len = LAYOUT.record_len_of(8, 5);
+    assert_eq!(record_len, 16);
+
+    let mut area = Record::with_chunk_size(LAYOUT, 128);
+    let mut oracle: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+
+    // Ascending even keys fill the single chunk, which grows from CHUNK_MIN.
+    for key in (0..16u64).step_by(2) {
+        insert_partial(&mut area, &mut oracle, key);
+    }
+    assert_eq!(area.chunk_count(), 1);
+    assert_eq!(area.chunks()[0].used(), 8 * record_len);
+    assert_eq!(
+        area.allocated_bytes(),
+        128,
+        "the first chunk must have grown from CHUNK_MIN up to the chunk size"
+    );
+
+    // An odd key sorts into the middle of a full chunk, which only a split can
+    // serve: the append fast path needs the insert point at the very end.
+    insert_partial(&mut area, &mut oracle, 1);
+    assert_eq!(area.chunk_count(), 2);
+    for (ci, chunk) in area.chunks().iter().enumerate() {
+        assert!(
+            chunk.used() > record_len,
+            "split left chunk {} holding only {} bytes, which is the append path",
+            ci,
+            chunk.used()
+        );
+    }
+
+    // The remaining odd keys keep landing inside halves that split and grow again.
+    for key in (3..16u64).step_by(2) {
+        insert_partial(&mut area, &mut oracle, key);
+    }
+
+    assert_eq!(area.len(), oracle.len());
+    for (key, payload) in &oracle {
+        assert_eq!(read_payload(&area, *key), Some(payload.as_slice()));
+    }
+
+    let mut seen = Vec::new();
+    walk(&area, |buf, off| seen.push(stored_key(buf, off)));
+    let expected: Vec<u64> = oracle.keys().copied().collect();
+    assert_eq!(
+        seen, expected,
+        "records must stay globally sorted across every chunk"
+    );
+}
+
+#[test]
+fn ascending_append_keeps_chunks_near_capacity() {
+    // Appending past the end of the last chunk must start a new chunk instead of
+    // splitting the tail in half, otherwise a sorted load keeps twice as many
+    // half-full chunks as the data needs.
+    let mut area = new_area();
+    let payload = b"payload";
+    for key in 0..2_000u64 {
+        assert_eq!(insert(&mut area, key, payload), InsertOutcome::Inserted);
+    }
+
+    let record_len = LAYOUT.record_len_of(8, payload.len());
+    let total = 2_000 * record_len;
+    let chunk_size = area.chunk_size();
+    let optimal = total.div_ceil(chunk_size);
+    assert!(
+        area.chunk_count() <= optimal + 1,
+        "{} chunks for {} bytes is far above the {} chunk optimum",
+        area.chunk_count(),
+        total,
+        optimal
+    );
+
+    for chunk in &area.chunks()[..area.chunk_count() - 1] {
+        assert!(
+            chunk.used() + record_len > chunk_size,
+            "a non-tail chunk kept only {} of {} bytes",
+            chunk.used(),
+            chunk_size
+        );
+    }
+
+    let mut seen = Vec::new();
+    walk(&area, |buf, off| seen.push(stored_key(buf, off)));
+    assert_eq!(seen, (0..2_000u64).collect::<Vec<_>>());
+}
+
+#[test]
+fn allocated_bytes_reports_every_chunk() {
+    let mut area = new_area();
+    assert_eq!(area.allocated_bytes(), 0);
+
+    for key in 0..2_000u64 {
+        assert_eq!(insert(&mut area, key, b"payload"), InsertOutcome::Inserted);
+    }
+
+    let used: usize = area.chunks().iter().map(|chunk| chunk.used()).sum();
+    assert_eq!(used, 2_000 * LAYOUT.record_len_of(8, 7));
+    assert!(area.allocated_bytes() >= used);
+    assert!(
+        area.allocated_bytes() < 2 * used,
+        "the capacity ladder wasted {} bytes over {} used",
+        area.allocated_bytes(),
+        used
+    );
+
+    for key in 0..2_000u64 {
+        let kb = key.to_be_bytes();
+        let (ci, off) = area.find(&kb).expect("key present");
+        area.remove(ci, off);
+    }
+    assert_eq!(area.allocated_bytes(), 0);
+}
+
+#[test]
+#[should_panic(expected = "not a record boundary")]
+fn remove_rejects_a_misaligned_offset() {
+    // A bare (chunk, offset) pair carries no proof that it points at a record;
+    // without the boundary walk an off-by-one silently truncates the chunk.
+    let mut area = new_area();
+    for key in 0..5u64 {
+        assert_eq!(insert(&mut area, key, b"payload"), InsertOutcome::Inserted);
+    }
+    let (ci, off) = area.find(&3u64.to_be_bytes()).expect("key present");
+    area.remove(ci, off + 1);
+}
+
+#[test]
+#[should_panic(expected = "out of range")]
+fn remove_rejects_an_unknown_chunk() {
+    let mut area = new_area();
+    assert_eq!(insert(&mut area, 1, b"payload"), InsertOutcome::Inserted);
+    area.remove(1, 0);
+}

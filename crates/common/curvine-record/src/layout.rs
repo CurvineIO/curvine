@@ -24,8 +24,8 @@ use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
-    pub key_len_width: u8,
-    pub value_len_width: u8,
+    key_len_width: u8,
+    value_len_width: u8,
 }
 
 impl Default for Layout {
@@ -54,6 +54,16 @@ impl Layout {
     }
 
     #[inline]
+    pub const fn key_len_width(&self) -> u8 {
+        self.key_len_width
+    }
+
+    #[inline]
+    pub const fn value_len_width(&self) -> u8 {
+        self.value_len_width
+    }
+
+    #[inline]
     pub const fn header_len(&self) -> usize {
         self.key_len_width as usize + self.value_len_width as usize
     }
@@ -68,7 +78,6 @@ impl Layout {
         Self::max_len(self.value_len_width)
     }
 
-    /// Key length stored at the start of the record at `off`.
     #[inline]
     pub fn key_len(&self, buf: &[u8], off: usize) -> usize {
         let width = self.key_len_width as usize;
