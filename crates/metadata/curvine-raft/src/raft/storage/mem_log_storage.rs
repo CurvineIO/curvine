@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 pub struct MemLogStorage {
     core: MemStorage,
     snapshot: Arc<Mutex<Snapshot>>,
+    recovery_state: Arc<Mutex<Option<u64>>>,
 }
 
 impl Default for MemLogStorage {
@@ -39,6 +40,7 @@ impl MemLogStorage {
         Self {
             core: MemStorage::default(),
             snapshot: Arc::new(Mutex::new(Snapshot::default())),
+            recovery_state: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -91,6 +93,15 @@ impl LogStorage for MemLogStorage {
     fn compact(&self, index: u64) -> RaftResult<()> {
         let mut store = self.core.wl();
         store.compact(index)?;
+        Ok(())
+    }
+
+    fn recovery_state(&self) -> RaftResult<Option<u64>> {
+        Ok(*self.recovery_state.lock().unwrap())
+    }
+
+    fn set_recovery_state(&self, state: Option<u64>) -> RaftResult<()> {
+        *self.recovery_state.lock().unwrap() = state;
         Ok(())
     }
 

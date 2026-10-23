@@ -78,6 +78,15 @@ pub trait LogStorage: Storage + Clone + Send + Sync + 'static {
     /// When a snapshot is applied by the node, it can use the compact operation to delete old log items that are already included in the snapshot
     fn compact(&self, index: u64) -> RaftResult<()>;
 
+    /// Durable member recovery indicator in storage
+    fn recovery_state(&self) -> RaftResult<Option<u64>> {
+        Ok(None)
+    }
+
+    fn set_recovery_state(&self, _state: Option<u64>) -> RaftResult<()> {
+        Ok(())
+    }
+
     fn trigger_snap_unavailable(&mut self) {
         //empty
     }

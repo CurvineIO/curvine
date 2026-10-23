@@ -100,6 +100,14 @@ where
         self.log_store.set_conf_state(conf_state)
     }
 
+    pub fn recovery_state(&self) -> RaftResult<Option<u64>> {
+        self.log_store.recovery_state()
+    }
+
+    pub fn set_recovery_state(&self, state: Option<u64>) -> RaftResult<()> {
+        self.log_store.set_recovery_state(state)
+    }
+
     pub async fn apply_propose(&self, wait: bool, apply_msg: ApplyMsg) -> RaftResult<()> {
         self.app_store.apply(wait, apply_msg).await
     }

@@ -274,6 +274,11 @@ fn startup_rejects_corrupt_persisted_raft_metadata() {
             RocksStorageCore::CONF_STATE_KEY,
             "failed to decode raft conf state",
         ),
+        (
+            "recovery-state",
+            RocksStorageCore::RECOVERY_KEY,
+            "corrupt recovery state in storage",
+        ),
     ];
 
     for (name, key, expected) in cases {
@@ -298,5 +303,30 @@ fn startup_rejects_corrupt_persisted_raft_metadata() {
             error.contains("corrupted local directory"),
             "{name}: {error}"
         );
+    }
+}
+
+#[test]
+fn recovery_state_round_trip_and_cleanup() {
+    let conf = test_conf("recovery-state");
+    FileUtils::delete_path(&conf.base_dir, true).unwrap();
+
+    {
+        let mut storage = RocksStorageCore::new(conf.clone(), true);
+        assert_eq!(storage.recovery_state(), None);
+        storage.set_recovery_state(Some(42)).unwrap();
+        assert_eq!(storage.recovery_state(), Some(42));
+    }
+
+    {
+        let mut storage = RocksStorageCore::new(conf.clone(), false);
+        assert_eq!(storage.recovery_state(), Some(42));
+        storage.set_recovery_state(None).unwrap();
+        assert_eq!(storage.recovery_state(), None);
+    }
+
+    {
+        let storage = RocksStorageCore::new(conf, false);
+        assert_eq!(storage.recovery_state(), None);
     }
 }
