@@ -33,6 +33,7 @@ use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
 use parking_lot::Mutex;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -776,8 +777,10 @@ impl MasterFilesystem {
         fs_dir: &FsDir,
         file: &InodeFile,
     ) -> FsResult<Vec<LocatedBlock>> {
-        let wm = self.worker_manager.read();
         let file_locs = fs_dir.get_file_locations(file)?;
+        // Location reads only need the caller's namespace guard. Acquire worker
+        // state afterwards so RocksDB lookups do not delay heartbeats.
+        let wm = self.worker_manager.read();
         let mut block_locs = Vec::with_capacity(file_locs.len());
 
         for (index, meta) in file.blocks.iter().enumerate() {
@@ -985,7 +988,7 @@ impl MasterFilesystem {
             }
         }
 
-        if let InodeView::Dir(dir) = resolved {
+        if let InodeView::Dir(dir) = resolved.as_ref() {
             for child in dir.children_iter() {
                 let child_path = child_snapshot_path(path, child.name());
                 self.collect_cv_metadata_snapshot_page(
@@ -1005,14 +1008,22 @@ impl MasterFilesystem {
         Ok(())
     }
 
-    fn resolve_snapshot_inode(&self, fs_dir: &FsDir, inode: &InodeView) -> FsResult<InodeView> {
+    /// Directory children live only in the in-memory tree. Borrow that node.
+    /// `FileEntry` stores a name and id, so load the file inode for its blocks
+    /// and hard-link name. The caller holds the namespace read lock for the walk.
+    fn resolve_snapshot_inode<'a>(
+        &self,
+        fs_dir: &FsDir,
+        inode: &'a InodeView,
+    ) -> FsResult<Cow<'a, InodeView>> {
         if let InodeView::FileEntry(entry) = inode {
-            return fs_dir
+            let loaded = fs_dir
                 .store
                 .get_inode(entry.id, Some(&entry.name))?
-                .ok_or_else(|| FsError::file_not_found(entry.name.clone()));
+                .ok_or_else(|| FsError::file_not_found(entry.name.clone()))?;
+            return Ok(Cow::Owned(loaded));
         }
-        Ok(inode.clone())
+        Ok(Cow::Borrowed(inode))
     }
 
     pub fn filesystem_info(&self) -> FsResult<FilesystemInfo> {
@@ -1779,6 +1790,117 @@ mod tests {
     }
 
     #[test]
+    fn multiblock_open_preserves_order_and_filters_current_worker_state() {
+        for count in [0, 1, 16, 256] {
+            let fs = test_fs(&format!("multiblock-open-{count}"));
+            let worker = |id, status| {
+                let mut worker = WorkerInfo::default();
+                worker.address.worker_id = id;
+                worker.status = status;
+                worker
+            };
+            for id in [100, 200] {
+                fs.add_test_worker(worker(id, WorkerStatus::Live));
+            }
+            let path = "/multiblock";
+            fs.create_with_opts(
+                path,
+                CreateFileOptsBuilder::new()
+                    .block_size(1_048_576)
+                    .replicas(2)
+                    .build(),
+                OpenFlags::new_create(),
+            )
+            .unwrap();
+            let mut commits = Vec::new();
+            let mut previous = None;
+            for index in 0..count {
+                let located = fs
+                    .add_block(
+                        path,
+                        None,
+                        ClientAddress::default(),
+                        commits.clone(),
+                        vec![],
+                        index * 1_048_576,
+                        previous,
+                    )
+                    .unwrap();
+                previous = Some(located.block.clone());
+                commits.push(CommitBlock {
+                    block_id: located.block.id,
+                    block_len: 1_048_576,
+                    locations: vec![BlockLocation::with_id(100), BlockLocation::with_id(200)],
+                });
+            }
+            fs.complete_file(
+                path,
+                None,
+                count * 1_048_576,
+                commits.clone(),
+                "",
+                false,
+                None,
+            )
+            .unwrap();
+            let expected_ids = commits
+                .iter()
+                .map(|block| block.block_id)
+                .collect::<Vec<_>>();
+            let check = |blocks: FileBlocks, workers: &[u32]| {
+                assert_eq!(blocks.status.len, count * 1_048_576);
+                assert_eq!(
+                    blocks
+                        .block_locs
+                        .iter()
+                        .map(|block| block.block.id)
+                        .collect::<Vec<_>>(),
+                    expected_ids
+                );
+                for block in blocks.block_locs {
+                    assert_eq!(block.block.len, 1_048_576);
+                    assert_eq!(
+                        block
+                            .locs
+                            .iter()
+                            .map(|loc| loc.worker_id)
+                            .collect::<Vec<_>>(),
+                        workers
+                    );
+                }
+            };
+            check(fs.get_block_locations(path).unwrap(), &[100, 200]);
+            check(
+                fs.open_file(path, CreateFileOpts::with_create(false), OpenFlags::new(0))
+                    .unwrap(),
+                &[100, 200],
+            );
+            let details = fs.get_file_block_details(path).unwrap();
+            assert_eq!(
+                details
+                    .blocks
+                    .iter()
+                    .map(|block| block.block_id)
+                    .collect::<Vec<_>>(),
+                expected_ids
+            );
+
+            fs.add_test_worker(worker(100, WorkerStatus::Blacklist));
+            check(fs.get_block_locations(path).unwrap(), &[200]);
+            fs.add_test_worker(worker(200, WorkerStatus::Decommission));
+            if count == 0 {
+                check(fs.get_block_locations(path).unwrap(), &[]);
+            } else {
+                assert!(fs
+                    .get_block_locations(path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("all replicas has been lost"));
+            }
+        }
+    }
+
+    #[test]
     fn replication_state_rejects_deleted_block() {
         let fs = test_fs("replication-state-deleted");
         let path = "/replication-state-deleted.log";
@@ -1908,6 +2030,70 @@ mod tests {
         let sync_fs_dir = fs.fs_dir();
         let fs_dir = sync_fs_dir.read();
         assert_eq!(fs_dir.get_inode_path(status.id).unwrap(), "/dir/new.log");
+    }
+
+    #[test]
+    fn cv_metadata_snapshot_page_walks_live_children_and_loads_file_entries() {
+        let fs = test_fs("snapshot-page-borrow");
+        let source = fs.create("/a/b.txt", true).unwrap();
+        fs.create("/a/c/d.txt", true).unwrap();
+        fs.create("/z.txt", true).unwrap();
+        fs.link("/a/b.txt", "/a/b-link.txt").unwrap();
+
+        let mut token = None;
+        let mut paths = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = fs.cv_metadata_snapshot_page(token, 2).unwrap();
+            assert!(pages < 8, "snapshot pagination did not finish");
+            pages += 1;
+            assert!(page.entries.len() <= 2);
+            paths.extend(page.entries.iter().map(|entry| entry.status.path.clone()));
+            match page.next_page_token {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            paths,
+            vec![
+                "/".to_string(),
+                "/a".to_string(),
+                "/a/b-link.txt".to_string(),
+                "/a/b.txt".to_string(),
+                "/a/c".to_string(),
+                "/a/c/d.txt".to_string(),
+                "/z.txt".to_string(),
+            ]
+        );
+
+        let full = fs.cv_metadata_snapshot_page(None, 100).unwrap();
+        assert!(full.next_page_token.is_none());
+        let dir = full
+            .entries
+            .iter()
+            .find(|entry| entry.status.path == "/a")
+            .unwrap();
+        assert!(dir.status.is_dir);
+        assert!(dir.blocks.is_none());
+        assert_eq!(dir.status.children_num, 3);
+
+        let link = full
+            .entries
+            .iter()
+            .find(|entry| entry.status.path == "/a/b-link.txt")
+            .unwrap();
+        let file = full
+            .entries
+            .iter()
+            .find(|entry| entry.status.path == "/a/b.txt")
+            .unwrap();
+        assert_eq!(link.status.name, "b-link.txt");
+        assert_eq!(link.status.id, source.id);
+        assert_eq!(file.status.id, source.id);
+        assert!(link.blocks.is_some());
+        assert!(file.blocks.is_some());
     }
 
     #[test]
