@@ -37,6 +37,7 @@ pub struct ClientMetrics {
     pub write_time_us: Counter,
     pub read_bytes: Counter,
     pub read_time_us: Counter,
+    pub seek_absorbed_total: Counter,
     pub block_idle_conn: Gauge,
 }
 
@@ -73,6 +74,10 @@ impl ClientMetrics {
             write_time_us: m::new_counter("client_write_time_us", "write time us total")?,
             read_bytes: m::new_counter("client_read_bytes", "read bytes total")?,
             read_time_us: m::new_counter("client_read_time_us", "read time us total")?,
+            seek_absorbed_total: m::new_counter(
+                "client_seek_absorbed_total",
+                "forward seeks absorbed by prefetch buffer",
+            )?,
             block_idle_conn: m::new_gauge("client_block_idle_conn", "block idle conn total")?,
         };
 
@@ -186,5 +191,22 @@ impl ClientMetrics {
 impl Debug for ClientMetrics {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "ClientMetrics")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_seek_absorbed_total_counter() {
+        let metrics = ClientMetrics::new(&[]).unwrap();
+        assert_eq!(metrics.seek_absorbed_total.get(), 0);
+
+        metrics.seek_absorbed_total.inc();
+        assert_eq!(metrics.seek_absorbed_total.get(), 1);
+
+        metrics.seek_absorbed_total.inc_by(4);
+        assert_eq!(metrics.seek_absorbed_total.get(), 5);
     }
 }
