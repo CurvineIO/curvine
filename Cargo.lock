@@ -2638,6 +2638,7 @@ dependencies = [
  "curvine-net",
  "curvine-proto",
  "curvine-raft",
+ "curvine-record",
  "curvine-rocksdb",
  "curvine-rpc",
  "curvine-runtime",
@@ -2767,6 +2768,10 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
 ]
+
+[[package]]
+name = "curvine-record"
+version = "0.2.2"
 
 [[package]]
 name = "curvine-rocksdb"
