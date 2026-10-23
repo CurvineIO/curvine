@@ -201,9 +201,19 @@ impl FsClient {
     }
 
     pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
+        self.delete_with_opts(path, recursive, false).await
+    }
+
+    pub async fn delete_with_opts(
+        &self,
+        path: &Path,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<DeleteResult> {
         let header = DeleteRequest {
             path: path.encode(),
             recursive,
+            skip_trash: Some(skip_trash),
         };
 
         let rep: DeleteResponse = self.rpc(RpcCode::Delete, header).await?;

@@ -154,6 +154,11 @@ pub enum FsSubCommand {
             help = "Remove directories and their contents recursively"
         )]
         recursive: bool,
+        #[clap(
+            long,
+            help = "Delete permanently, bypassing the recycle bin (if enabled)"
+        )]
+        skip_trash: bool,
     },
 
     /// Stat file or directory
@@ -316,10 +321,15 @@ impl FsCommand {
                 get_cmd.execute(client).await
             }
 
-            FsSubCommand::Rm { path, recursive } => {
+            FsSubCommand::Rm {
+                path,
+                recursive,
+                skip_trash,
+            } => {
                 let rm_cmd = RmCommand::Rm {
                     path: path.clone(),
                     recursive: *recursive,
+                    skip_trash: *skip_trash,
                 };
                 rm_cmd.execute(client).await
             }
