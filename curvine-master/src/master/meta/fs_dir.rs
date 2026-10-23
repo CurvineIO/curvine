@@ -26,7 +26,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TtlAction,
+    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TrashEntry, TtlAction,
     WorkerAddress, INTERNAL_CTIME_XATTR,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
@@ -469,6 +469,200 @@ impl FsDir {
             "failed to allocate a unique trash entry name for inode {}",
             inode_id
         )
+    }
+
+    pub fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store)?;
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return Ok(vec![]),
+        };
+
+        let dir = match inode.as_ref() {
+            Dir(d) => d,
+            _ => {
+                return err_ext!(FsError::invalid_argument(format!(
+                    "{} exists and is not a directory",
+                    trash::TRASH_ROOT
+                )))
+            }
+        };
+
+        let names: Vec<String> = dir
+            .children_iter()
+            .map(|child| child.name().to_string())
+            .collect();
+
+        let mut entries = Vec::new();
+        for name in names {
+            let path = trash::trash_entry_path(&name);
+            // Directory children can be unresolved FileEntry pointers; resolve
+            // each entry so the full inode (and its trash xattrs) is loaded.
+            let child_inp = InodePath::resolve(self.root_ptr(), &path, &self.store)?;
+            let Some(child) = child_inp.get_last_inode() else {
+                continue;
+            };
+            let Ok(x_attr) = child.x_attr() else {
+                continue;
+            };
+            let (Some(origin), Some(delete_ms)) = (
+                trash::decode_origin(x_attr),
+                trash::decode_delete_ms(x_attr),
+            ) else {
+                continue;
+            };
+
+            entries.push(TrashEntry {
+                status: child.to_file_status(&path)?,
+                path,
+                origin,
+                delete_ms,
+            });
+        }
+
+        entries.sort_by(|a, b| {
+            a.delete_ms
+                .cmp(&b.delete_ms)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        Ok(entries)
+    }
+
+    pub fn restore_trash(
+        &mut self,
+        trash_path: &str,
+        dst: Option<&str>,
+        overwrite: bool,
+    ) -> FsResult<Option<DeleteResult>> {
+        if !trash::is_trash_entry_path(trash_path) {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} is not a trash entry",
+                trash_path
+            )));
+        }
+
+        let src_inp = InodePath::resolve(self.root_ptr(), trash_path, &self.store)?;
+        let inode = match src_inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(trash_path)),
+        };
+
+        let x_attr = inode.x_attr()?;
+        let Some(origin) = trash::decode_origin(x_attr) else {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} is not a trash entry",
+                trash_path
+            )));
+        };
+        let delete_ms = trash::decode_delete_ms(x_attr).unwrap_or_default();
+
+        let dst = dst
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| origin.clone());
+        if !dst.starts_with(PATH_SEPARATOR) || trash::is_reserved_path(&dst) {
+            return err_ext!(FsError::invalid_argument(format!(
+                "invalid restore destination: {}",
+                dst
+            )));
+        }
+
+        let dst_inp = InodePath::resolve(self.root_ptr(), &dst, &self.store)?;
+        if dst_inp.get_last_inode().is_some() && !overwrite {
+            return err_ext!(FsError::file_exists(&dst));
+        }
+        if !dst_inp
+            .get_inode(-2)
+            .map(|parent| parent.is_dir())
+            .unwrap_or(false)
+        {
+            return err_ext!(FsError::file_not_found(dst_inp.get_parent_path()));
+        }
+
+        // Drop the trash metadata before the rename so the restored inode
+        // looks like a regular entry again.
+        self.set_attr(
+            src_inp,
+            SetAttrOpts {
+                remove_x_attr: vec![
+                    trash::TRASH_XATTR_ORIGIN.to_string(),
+                    trash::TRASH_XATTR_DELETE_MS.to_string(),
+                ],
+                ..Default::default()
+            },
+        )?;
+
+        let src_inp = InodePath::resolve(self.root_ptr(), trash_path, &self.store)?;
+        let mut flags = RenameFlags::RESTORE;
+        if !overwrite {
+            flags |= RenameFlags::NO_REPLACE;
+        }
+
+        match self.rename(&src_inp, &dst_inp, flags) {
+            Ok(del_res) => {
+                debug!("restored {} to {}", trash_path, dst);
+                Ok(del_res)
+            }
+            Err(e) => {
+                let rollback = SetAttrOpts {
+                    add_x_attr: HashMap::from([
+                        (trash::TRASH_XATTR_ORIGIN.to_string(), origin.into_bytes()),
+                        (
+                            trash::TRASH_XATTR_DELETE_MS.to_string(),
+                            delete_ms.to_le_bytes().to_vec(),
+                        ),
+                    ]),
+                    ..Default::default()
+                };
+                match InodePath::resolve(self.root_ptr(), trash_path, &self.store) {
+                    Ok(inp) => {
+                        if let Err(rb) = self.set_attr(inp, rollback) {
+                            warn!("failed to restore trash xattrs for {}: {}", trash_path, rb);
+                        }
+                    }
+                    Err(rb) => warn!(
+                        "failed to resolve {} while restoring trash xattrs: {}",
+                        trash_path, rb
+                    ),
+                }
+                Err(e)
+            }
+        }
+    }
+
+    pub fn empty_trash(&mut self) -> FsResult<DeleteResult> {
+        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store)?;
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return Ok(DeleteResult::new()),
+        };
+        let dir = match inode.as_ref() {
+            Dir(d) => d,
+            _ => {
+                return err_ext!(FsError::invalid_argument(format!(
+                    "{} exists and is not a directory",
+                    trash::TRASH_ROOT
+                )))
+            }
+        };
+
+        // Snapshot the names first: delete mutates the directory.
+        let names: Vec<String> = dir
+            .children_iter()
+            .map(|child| child.name().to_string())
+            .collect();
+
+        let mut total = DeleteResult::new();
+        for name in names {
+            let path = trash::trash_entry_path(&name);
+            let child_inp = InodePath::resolve(self.root_ptr(), &path, &self.store)?;
+            let res = self.delete(&child_inp, true)?;
+            total.inodes += res.inodes;
+            total.bytes += res.bytes;
+            total.blocks.extend(res.blocks);
+        }
+
+        Ok(total)
     }
 
     pub fn free(&mut self, inp: &InodePath, recursive: bool) -> FsResult<FreeResult> {

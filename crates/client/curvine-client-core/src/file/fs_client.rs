@@ -220,6 +220,37 @@ impl FsClient {
         Ok(ProtoUtils::delete_res_from_pb(rep.res.unwrap_or_default()))
     }
 
+    pub async fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        let req = ListTrashRequest {};
+        let rep: ListTrashResponse = self.rpc(RpcCode::ListTrash, req).await?;
+        Ok(rep
+            .entries
+            .into_iter()
+            .map(ProtoUtils::trash_entry_from_pb)
+            .collect())
+    }
+
+    pub async fn restore_trash(
+        &self,
+        path: &Path,
+        dst: Option<&Path>,
+        overwrite: bool,
+    ) -> FsResult<()> {
+        let req = RestoreTrashRequest {
+            path: path.encode(),
+            dst: dst.map(|value| value.encode()),
+            overwrite: Some(overwrite),
+        };
+        let _: RestoreTrashResponse = self.rpc(RpcCode::RestoreTrash, req).await?;
+        Ok(())
+    }
+
+    pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
+        let req = EmptyTrashRequest {};
+        let rep: EmptyTrashResponse = self.rpc(RpcCode::EmptyTrash, req).await?;
+        Ok(ProtoUtils::delete_res_from_pb(rep.res))
+    }
+
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
         let header = FreeRequest {
             path: path.encode(),

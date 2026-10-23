@@ -263,6 +263,55 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
+    pub fn list_trash(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let _: ListTrashRequest = ctx.parse_header()?;
+
+        let entries = self
+            .fs
+            .list_trash()?
+            .into_iter()
+            .map(ProtoUtils::trash_entry_to_pb)
+            .collect();
+        ctx.response(ListTrashResponse { entries })
+    }
+
+    pub fn restore_trash0(&self, req_id: i64, header: RestoreTrashRequest) -> FsResult<()> {
+        if self.check_is_retry(req_id)? {
+            return Ok(());
+        }
+
+        let res = self
+            .fs
+            .restore_trash(&header.path, header.dst.as_deref(), header.overwrite());
+        self.set_req_cache(req_id, res)
+    }
+
+    pub fn retry_check_restore_trash(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: RestoreTrashRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), header.dst.clone());
+
+        self.restore_trash0(ctx.msg.req_id(), header)?;
+        ctx.response(RestoreTrashResponse {})
+    }
+
+    pub fn empty_trash0(&self, req_id: i64) -> FsResult<DeleteResult> {
+        if self.check_is_retry(req_id)? {
+            return Ok(DeleteResult::default());
+        }
+
+        let res = self.fs.empty_trash();
+        self.set_req_cache(req_id, res)
+    }
+
+    pub fn retry_check_empty_trash(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let _: EmptyTrashRequest = ctx.parse_header()?;
+
+        let res = self.empty_trash0(ctx.msg.req_id())?;
+        ctx.response(EmptyTrashResponse {
+            res: ProtoUtils::delete_res_to_pb(res),
+        })
+    }
+
     pub fn retry_check_free(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: FreeRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
@@ -1076,6 +1125,9 @@ impl MessageHandler for MasterHandler {
                 RpcCode::CompleteFilesBatch => self.complete_files_batch(ctx),
                 RpcCode::Exists => self.exists(ctx),
                 RpcCode::Delete => self.retry_check_delete(ctx),
+                RpcCode::ListTrash => self.list_trash(ctx),
+                RpcCode::RestoreTrash => self.retry_check_restore_trash(ctx),
+                RpcCode::EmptyTrash => self.retry_check_empty_trash(ctx),
                 RpcCode::Free => self.retry_check_free(ctx),
                 RpcCode::Rename => self.retry_check_rename(ctx),
                 RpcCode::ListStatus => self.list_status(ctx),
