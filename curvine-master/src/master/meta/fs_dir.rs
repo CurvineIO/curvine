@@ -18,7 +18,7 @@ use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
-use crate::master::meta::{BlockMeta, InodeId};
+use crate::master::meta::{trash, BlockMeta, InodeId};
 use crate::master::quota::eviction::evictor::Evictor;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
@@ -348,6 +348,127 @@ impl FsDir {
         // After deletion occurs, the target address cannot be used.
         let _ = parent.delete_child(child.id(), child_name)?;
         Ok(del_res)
+    }
+
+    // Move an entry into /.Trash instead of removing it. Blocks stay on the
+    // workers so the entry can be restored until retention expires.
+    pub fn trash(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
+        let op_ms = LocalTime::mills() as i64;
+
+        if inp.is_root() {
+            return err_box!("The root is not allowed to be deleted");
+        }
+
+        if inp.is_empty() || inp.get_last_inode().is_none() {
+            return err_ext!(FsError::file_not_found(inp.path()));
+        }
+
+        if !inp.is_empty_dir() && !recursive {
+            return err_ext!(FsError::dir_not_empty(inp.path()));
+        }
+
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        // Unlinking one name of a hard-linked file must not move the shared
+        // inode, and unresolved entries cannot be renamed, so both keep hard
+        // unlink semantics.
+        if inode.is_file_entry() || matches!(inode.as_ref(), File(f) if f.nlink() > 1) {
+            return self.delete(inp, recursive);
+        }
+
+        self.ensure_trash_root()?;
+
+        let entry_name = self.unique_trash_entry_name(op_ms, inode.id())?;
+        let dst_path = trash::trash_entry_path(&entry_name);
+        let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+
+        let src_path = inp.path().to_string();
+        let add_x_attr = HashMap::from([
+            (
+                trash::TRASH_XATTR_ORIGIN.to_string(),
+                src_path.as_bytes().to_vec(),
+            ),
+            (
+                trash::TRASH_XATTR_DELETE_MS.to_string(),
+                op_ms.to_le_bytes().to_vec(),
+            ),
+        ]);
+        let src_inp = InodePath::resolve(self.root_ptr(), &src_path, &self.store)?;
+        self.set_attr(
+            src_inp,
+            SetAttrOpts {
+                add_x_attr,
+                ..Default::default()
+            },
+        )?;
+
+        let src_inp = InodePath::resolve(self.root_ptr(), &src_path, &self.store)?;
+        match self.rename(&src_inp, &dst_inp, RenameFlags::NO_REPLACE) {
+            Ok(_) => {
+                debug!("moved {} to trash as {}", src_path, dst_path);
+                Ok(DeleteResult::new())
+            }
+            Err(e) => {
+                let rollback = SetAttrOpts {
+                    remove_x_attr: vec![
+                        trash::TRASH_XATTR_ORIGIN.to_string(),
+                        trash::TRASH_XATTR_DELETE_MS.to_string(),
+                    ],
+                    ..Default::default()
+                };
+                match InodePath::resolve(self.root_ptr(), &src_path, &self.store) {
+                    Ok(src_inp) => {
+                        if let Err(rb) = self.set_attr(src_inp, rollback) {
+                            warn!("failed to roll back trash xattrs for {}: {}", src_path, rb);
+                        }
+                    }
+                    Err(rb) => warn!(
+                        "failed to resolve {} while rolling back trash xattrs: {}",
+                        src_path, rb
+                    ),
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn ensure_trash_root(&mut self) -> FsResult<()> {
+        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store)?;
+        match inp.get_last_inode() {
+            Some(inode) if inode.is_dir() => Ok(()),
+            Some(_) => err_ext!(FsError::invalid_argument(format!(
+                "{} exists and is not a directory",
+                trash::TRASH_ROOT
+            ))),
+            None => {
+                self.mkdir(inp, MkdirOpts::with_create(false))?;
+                Ok(())
+            }
+        }
+    }
+
+    fn unique_trash_entry_name(&self, delete_ms: i64, inode_id: i64) -> FsResult<String> {
+        let base = trash::trash_entry_name(delete_ms, inode_id);
+        for seq in 0..1000 {
+            let name = if seq == 0 {
+                base.clone()
+            } else {
+                format!("{}-{}", base, seq)
+            };
+            let path = trash::trash_entry_path(&name);
+            let inp = InodePath::resolve(self.root_ptr(), &path, &self.store)?;
+            if inp.get_last_inode().is_none() {
+                return Ok(name);
+            }
+        }
+
+        err_box!(
+            "failed to allocate a unique trash entry name for inode {}",
+            inode_id
+        )
     }
 
     pub fn free(&mut self, inp: &InodePath, recursive: bool) -> FsResult<FreeResult> {
