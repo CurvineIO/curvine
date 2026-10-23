@@ -76,10 +76,11 @@ Body opening:
 ```bash
 git -C /path/to/curvine-doc fetch origin
 git -C /path/to/curvine-doc worktree add -b blog/<slug> /path/to/curvine-doc-<slug> origin/main
-ln -s /path/to/curvine-doc/node_modules /path/to/curvine-doc-<slug>/node_modules
+cd /path/to/curvine-doc-<slug>
+ln -s /path/to/curvine-doc/node_modules node_modules
 ```
 
-Check `git status` and `git worktree list` first. Never edit a dirty clone or an existing blog worktree.
+Always `cd` into the new worktree before any other command; every later step uses paths relative to it. Check `git status` and `git worktree list` first. Never edit a dirty clone or an existing blog worktree.
 
 ### 3. Create the posts
 
