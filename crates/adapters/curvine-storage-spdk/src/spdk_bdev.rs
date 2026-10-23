@@ -165,6 +165,27 @@ impl Drop for DmaBuf {
     }
 }
 
+/// Allocate a DMA buffer, reclaiming already-retired (safe-to-free) DMA
+/// buffers before the attempt, and once more on failure before retrying.
+fn alloc_dma_buf_with_reclaim<F>(
+    env: &crate::spdk_env::SpdkEnv,
+    buf_size: usize,
+    block_size: u32,
+    alloc: F,
+) -> IOResult<DmaBuf>
+where
+    F: Fn(usize, u32) -> IOResult<DmaBuf>,
+{
+    env.reclaim_retired_dma();
+    match alloc(buf_size, block_size) {
+        Ok(buf) => Ok(buf),
+        Err(_) => {
+            env.reclaim_retired_dma();
+            alloc(buf_size, block_size)
+        }
+    }
+}
+
 /// Opened SPDK block device. Analogous to LocalFile.
 /// Tracks position and size; I/O via SpdkIoChannel.
 pub struct SpdkBdev {
@@ -249,20 +270,22 @@ impl SpdkBdev {
 
             // DMA buffers (1MB each) reused across I/O — larger I/Os chunked
             let buf_size = DmaBuf::align_up(1024 * 1024, block_size as usize);
-            let read_buf = match DmaBuf::alloc(buf_size, block_size) {
-                Ok(buf) => buf,
-                Err(e) => {
-                    env.release_handle();
-                    return Err(e);
-                }
-            };
-            let write_buf = match DmaBuf::alloc(buf_size, block_size) {
-                Ok(buf) => buf,
-                Err(e) => {
-                    env.release_handle();
-                    return Err(e);
-                }
-            };
+            let read_buf =
+                match alloc_dma_buf_with_reclaim(env, buf_size, block_size, DmaBuf::alloc) {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        env.release_handle();
+                        return Err(e);
+                    }
+                };
+            let write_buf =
+                match alloc_dma_buf_with_reclaim(env, buf_size, block_size, DmaBuf::alloc) {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        env.release_handle();
+                        return Err(e);
+                    }
+                };
 
             // Recover raw SPDK pointers from BdevInfo
             let ctrlr = info.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr;
@@ -960,6 +983,51 @@ mod test {
         inflight.store(0, Ordering::Release);
         assert_eq!(retired_dma.reclaim(), 1);
         assert_eq!(retired_dma.count(), 0);
+    }
+
+    /// A reclaimable retired entry must be released before
+    /// the alloc attempt (proactive reclaim), and a failed attempt must
+    /// reclaim once more and retry before giving up.
+    #[test]
+    fn alloc_dma_buf_with_reclaim_releases_reclaimable_entry_before_retry() {
+        ensure_spdk_init();
+        let env = SpdkEnv::new(SpdkConf::default()).unwrap();
+
+        // Seed one reclaimable retired entry (inflight already 0).
+        let stale_read = DmaBuf::alloc(512, 512).unwrap();
+        let stale_write = DmaBuf::alloc(512, 512).unwrap();
+        env.retired_dma_registry().defer(
+            "stale-bdev".to_string(),
+            Some(stale_read),
+            Some(stale_write),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(env.retired_dma_registry().count(), 1);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_hook = calls.clone();
+        let registry = env.retired_dma_registry();
+        let result = alloc_dma_buf_with_reclaim(&env, 512, 512, move |size, block_size| {
+            if calls_for_hook.fetch_add(1, Ordering::AcqRel) == 0 {
+                // Proactive reclaim must have already run before this first attempt.
+                assert_eq!(
+                    registry.count(),
+                    0,
+                    "reclaimable entry must be released first"
+                );
+                err_box!("simulated alloc failure")
+            } else {
+                DmaBuf::alloc(size, block_size)
+            }
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            2,
+            "expected one retry after reclaim"
+        );
+        assert_eq!(env.retired_dma_registry().count(), 0);
     }
 
     #[test]
