@@ -19,6 +19,9 @@ use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::LoopTask;
 use log::{info, warn};
 
+// Bound on how many trash children are examined per namespace lock hold.
+const TRASH_SCAN_BATCH: usize = 256;
+
 /// Permanently removes recycle-bin entries whose retention has elapsed.
 /// Only the active master runs the purge; standbys return without touching
 /// the namespace so the journal keeps a single writer.
@@ -26,6 +29,7 @@ pub struct TrashExpunger {
     fs: MasterFilesystem,
     monitor: MasterMonitor,
     retention_ms: i64,
+    scan_batch: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -42,7 +46,14 @@ impl TrashExpunger {
             fs,
             monitor,
             retention_ms,
+            scan_batch: TRASH_SCAN_BATCH,
         }
+    }
+
+    #[cfg(test)]
+    fn with_scan_batch(mut self, scan_batch: usize) -> Self {
+        self.scan_batch = scan_batch;
+        self
     }
 
     /// Purges entries deleted at or before `now_ms - retention`. Split from the
@@ -55,23 +66,34 @@ impl TrashExpunger {
         }
 
         let cutoff_ms = now_ms.saturating_sub(self.retention_ms);
-        for entry in self.fs.list_trash()? {
-            if entry.delete_ms > cutoff_ms {
-                continue;
+        let mut start_after = None;
+        loop {
+            if !self.monitor.is_active() {
+                break;
             }
 
-            match self.fs.delete_with_opts_if_active(&entry.path, true, true) {
-                Ok(Some(deleted)) => {
-                    result.entries += 1;
-                    result.inodes += deleted.inodes;
-                    result.bytes += deleted.bytes;
+            let page =
+                self.fs
+                    .scan_expired_trash(cutoff_ms, self.scan_batch, start_after.as_deref())?;
+            for path in page.paths {
+                match self.fs.delete_with_opts_if_active(&path, true, true) {
+                    Ok(Some(deleted)) => {
+                        result.entries += 1;
+                        result.inodes += deleted.inodes;
+                        result.bytes += deleted.bytes;
+                    }
+                    // Leadership moved elsewhere mid-sweep; a former leader
+                    // must not mutate metadata or enqueue journal records.
+                    Ok(None) => return Ok(result),
+                    // The entry was restored or emptied after the scan.
+                    Err(FsError::FileNotFound(_)) => {}
+                    Err(e) => warn!("failed to expunge trash entry {}: {}", path, e),
                 }
-                // Leadership moved elsewhere mid-sweep; a former leader must
-                // not mutate metadata or enqueue journal records.
-                Ok(None) => break,
-                // The entry was restored or emptied after the listing snapshot.
-                Err(FsError::FileNotFound(_)) => {}
-                Err(e) => warn!("failed to expunge trash entry {}: {}", entry.path, e),
+            }
+
+            match page.next_after {
+                Some(next) => start_after = Some(next),
+                None => break,
             }
         }
 
@@ -183,6 +205,23 @@ mod tests {
 
         fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
         expunger.run().unwrap();
+        assert!(fs.list_trash().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sweeps_all_entries_across_multiple_scan_pages() {
+        let fs = test_fs("paged-sweep", "1ms");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        for id in 0..5 {
+            trash_one(&fs, &format!("/data/{}.log", id));
+        }
+        let expunger = TrashExpunger::new(fs.clone(), fs.master_monitor.clone()).with_scan_batch(2);
+
+        let result = expunger
+            .expunge_expired(LocalTime::mills() as i64 + 10)
+            .unwrap();
+
+        assert_eq!(result.entries, 5);
         assert!(fs.list_trash().unwrap().is_empty());
     }
 

@@ -75,6 +75,15 @@ pub(crate) struct ReplicationBlockState {
     pub locations: Vec<BlockLocation>,
 }
 
+/// One bounded page of a low-cost trash scan. Only expired entry paths are
+/// materialized; `next_after` is the cursor for the next page, or `None` when
+/// the bin has been fully scanned.
+#[derive(Debug, Default)]
+pub struct TrashScanPage {
+    pub paths: Vec<String>,
+    pub next_after: Option<String>,
+}
+
 impl FsDir {
     pub fn new(
         conf: &ClusterConf,
@@ -526,6 +535,65 @@ impl FsDir {
                 .then_with(|| a.path.cmp(&b.path))
         });
         Ok(entries)
+    }
+
+    /// Scans at most `limit` trash children after `start_after` and returns
+    /// only the expired entry paths. This avoids building full `FileStatus`
+    /// values and sorting the whole bin, and lets the caller release the
+    /// namespace lock between pages.
+    pub fn scan_expired_trash(
+        &self,
+        cutoff_ms: i64,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> FsResult<TrashScanPage> {
+        let limit = limit.max(1);
+        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store)?;
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return Ok(TrashScanPage::default()),
+        };
+        let dir = match inode.as_ref() {
+            Dir(d) => d,
+            _ => {
+                return err_ext!(FsError::invalid_argument(format!(
+                    "{} exists and is not a directory",
+                    trash::TRASH_ROOT
+                )))
+            }
+        };
+
+        let mut children = dir.list_options(&ListOptions {
+            limit: Some(limit.saturating_add(1)),
+            start_after: start_after.map(str::to_string),
+        });
+        let has_more = children.len() > limit;
+        children.truncate(limit);
+        let next_after = if has_more {
+            children.last().map(|child| child.name().to_string())
+        } else {
+            None
+        };
+
+        let mut paths = Vec::new();
+        for child in children {
+            // Files are stored as unresolved FileEntry pointers in directories;
+            // load the full inode so the trash xattrs are available.
+            let delete_ms = if child.is_file_entry() {
+                match self.store.get_inode(child.id(), Some(child.name())) {
+                    Ok(Some(inode)) => inode.x_attr().ok().and_then(trash::decode_delete_ms),
+                    _ => None,
+                }
+            } else {
+                child.x_attr().ok().and_then(trash::decode_delete_ms)
+            };
+
+            if matches!(delete_ms, Some(delete_ms) if delete_ms <= cutoff_ms) {
+                paths.push(trash::trash_entry_path(child.name()));
+            }
+        }
+
+        Ok(TrashScanPage { paths, next_after })
     }
 
     pub fn restore_trash(

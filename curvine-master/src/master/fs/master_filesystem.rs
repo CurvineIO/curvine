@@ -17,7 +17,7 @@ use crate::master::fs::full_block_report::{FullReportProgress, FullReportTracker
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-use crate::master::meta::{trash, CacheInvalidationResult, FsDir};
+use crate::master::meta::{trash, CacheInvalidationResult, FsDir, TrashScanPage};
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
@@ -327,6 +327,18 @@ impl MasterFilesystem {
     pub fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
         let fs_dir = self.fs_dir.read();
         fs_dir.list_trash()
+    }
+
+    /// Returns one bounded page of expired trash entry paths. The namespace
+    /// read lock is held only while scanning that page.
+    pub fn scan_expired_trash(
+        &self,
+        cutoff_ms: i64,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> FsResult<TrashScanPage> {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.scan_expired_trash(cutoff_ms, limit, start_after)
     }
 
     pub fn restore_trash<T: AsRef<str>>(
