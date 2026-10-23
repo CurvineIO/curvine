@@ -7,7 +7,7 @@ use crate::cmds::fs::{
     blocks::BlocksCommand, cat::CatCommand, chmod::ChmodCommand, chown::ChownCommand,
     count::CountCommand, df::DfCommand, du::DuCommand, free::FreeCommand, get::GetCommand,
     ls::LsCommand, mkdir::MkdirCommand, mv::MvCommand, put::PutCommand, rm::RmCommand,
-    stat::StatCommand, touch::TouchCommand,
+    stat::StatCommand, touch::TouchCommand, trash::TrashCommand,
 };
 
 #[derive(Parser, Debug)]
@@ -159,6 +159,12 @@ pub enum FsSubCommand {
             help = "Delete permanently, bypassing the recycle bin (if enabled)"
         )]
         skip_trash: bool,
+    },
+
+    /// Recycle bin operations
+    Trash {
+        #[clap(subcommand)]
+        command: TrashCommand,
     },
 
     /// Stat file or directory
@@ -333,6 +339,8 @@ impl FsCommand {
                 };
                 rm_cmd.execute(client).await
             }
+
+            FsSubCommand::Trash { command } => command.execute(client).await,
 
             FsSubCommand::Stat { path } => {
                 let stat_cmd = StatCommand::Stat { path: path.clone() };

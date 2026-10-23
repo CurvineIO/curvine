@@ -17,5 +17,6 @@ mod put;
 mod rm;
 mod stat;
 mod touch;
+mod trash;
 
 pub use commands::FsCommand;
