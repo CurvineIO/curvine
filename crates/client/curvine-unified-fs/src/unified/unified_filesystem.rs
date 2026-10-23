@@ -382,7 +382,7 @@ impl UnifiedFileSystem {
         if path.path() == mount.cv_path && recursive {
             for status in self.cv.list_status(path).await? {
                 let child = Path::from_str(status.path)?;
-                match self.cv.delete(&child, true).await {
+                match self.cv.delete_with_opts(&child, true, true).await {
                     Ok(res) => {
                         let res: FreeResult = res.into();
                         total.inodes += res.inodes;
@@ -395,7 +395,11 @@ impl UnifiedFileSystem {
                 }
             }
         } else {
-            total = self.cv.delete(path, recursive).await?.into();
+            total = self
+                .cv
+                .delete_with_opts(path, recursive, true)
+                .await?
+                .into();
         }
 
         Ok(total)
@@ -790,7 +794,7 @@ impl UnifiedFileSystem {
                 }
 
                 Some((ufs_path, mount)) => {
-                    if let Err(e) = self.cv.delete(path, false).await {
+                    if let Err(e) = self.cv.delete_with_opts(path, false, true).await {
                         if !matches!(e, FsError::FileNotFound(_)) {
                             warn!("failed to delete cache for {}: {}", path, e);
                         }
@@ -920,7 +924,9 @@ impl UnifiedFileSystem {
                     let dst_ufs = mount.get_ufs_path(dst)?;
                     let res = mount.ufs()?.rename(&src_ufs, &dst_ufs).await?;
 
-                    if let Err(e) = self.cv.delete(src, true).await {
+                    // The cv entry only mirrors ufs data here; purge it instead
+                    // of leaving an orphan in the recycle bin.
+                    if let Err(e) = self.cv.delete_with_opts(src, true, true).await {
                         if !matches!(e, FsError::FileNotFound(_)) {
                             warn!("failed to delete cache for {}: {}", src, e);
                         }
@@ -931,6 +937,46 @@ impl UnifiedFileSystem {
             }
         };
         self.track("Rename", src.path(), dst.path(), fut).await
+    }
+
+    pub async fn delete_with_opts(
+        &self,
+        path: &Path,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<DeleteResult> {
+        let fut = async {
+            match self.get_mount_checked(path, RpcCode::Delete).await? {
+                None => self.cv.delete_with_opts(path, recursive, skip_trash).await,
+                Some((ufs_path, mount)) => {
+                    if path.path() == mount.info.cv_path {
+                        return err_box!(
+                            "cannot delete mount point root: cv_path={}, ufs_path={}",
+                            mount.info.cv_path,
+                            mount.info.ufs_path
+                        );
+                    }
+
+                    let mut delete_res = mount.ufs()?.delete(&ufs_path, recursive).await?;
+
+                    // delete cache; cached copies are internal state, never
+                    // user data, so they are always purged permanently.
+                    match self.cv.delete_with_opts(path, recursive, true).await {
+                        Ok(res) => {
+                            delete_res.inodes += res.inodes;
+                            delete_res.bytes += res.bytes;
+                        }
+                        Err(FsError::FileNotFound(_)) => {}
+                        Err(e) => {
+                            warn!("failed to delete cache for {}: {}", path, e);
+                        }
+                    }
+
+                    Ok(delete_res)
+                }
+            }
+        };
+        self.track("Delete", path.path(), "", fut).await
     }
 }
 
@@ -1166,37 +1212,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
-        let fut = async {
-            match self.get_mount_checked(path, RpcCode::Delete).await? {
-                None => self.cv.delete(path, recursive).await,
-                Some((ufs_path, mount)) => {
-                    if path.path() == mount.info.cv_path {
-                        return err_box!(
-                            "cannot delete mount point root: cv_path={}, ufs_path={}",
-                            mount.info.cv_path,
-                            mount.info.ufs_path
-                        );
-                    }
-
-                    let mut delete_res = mount.ufs()?.delete(&ufs_path, recursive).await?;
-
-                    // delete cache
-                    match self.cv.delete(path, recursive).await {
-                        Ok(res) => {
-                            delete_res.inodes += res.inodes;
-                            delete_res.bytes += res.bytes;
-                        }
-                        Err(FsError::FileNotFound(_)) => {}
-                        Err(e) => {
-                            warn!("failed to delete cache for {}: {}", path, e);
-                        }
-                    }
-
-                    Ok(delete_res)
-                }
-            }
-        };
-        self.track("Delete", path.path(), "", fut).await
+        self.delete_with_opts(path, recursive, false).await
     }
 
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {

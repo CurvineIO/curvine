@@ -87,6 +87,8 @@ message OpenFileResponse {
 message DeleteRequest {
     required string path = 1;
     required bool recursive = 2;
+    // Permanently delete instead of moving the entry into /.Trash.
+    optional bool skip_trash = 3 [default = false];
 }
 
 message DeleteResponse {

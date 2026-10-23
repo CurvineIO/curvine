@@ -249,8 +249,9 @@ impl MasterHandler {
 
         // Mounted deletes are UFS-first on the client, so the backing object is
         // already gone when this runs and a trash entry could never be restored.
-        // Keep mounted deletes permanent until trash supports UFS routing.
-        let skip_trash = mount_info.is_some();
+        // Keep mounted deletes permanent until trash supports UFS routing; an
+        // explicit client request to skip the trash is honoured either way.
+        let skip_trash = mount_info.is_some() || header.skip_trash();
         let res = self
             .fs
             .delete_with_opts(&header.path, header.recursive, skip_trash);
