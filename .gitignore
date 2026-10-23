@@ -47,7 +47,9 @@ curvine-libsdk/java/target/
 .claude/*
 !.claude/skills
 # Repo-root design notes (keep local); allow per-crate docs/ (e.g. curvine-lancedb-rs/docs).
-/docs
+/docs/*
+# Adopter logos referenced by ADOPTERS.md must be tracked
+!/docs/adopters/
 
 __pycache__
 

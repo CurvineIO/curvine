@@ -26,6 +26,12 @@ Usage notes:
 <available_skills>
 
 <skill>
+<name>cv-add-adopter</name>
+<description>Add or update an organization entry in the Curvine ADOPTERS.md file, including company/project name, logo, and use-case description. Use when a user says their company is using Curvine, asks to add their company logo to adopters, or wants to update an existing adopter entry.</description>
+<location>project</location>
+</skill>
+
+<skill>
 <name>cv-add-skills</name>
 <description>Add or update Curvine cv-* project skills under .agents/skills/, following naming and layout conventions, and sync the AGENTS.md registry. Use when creating a new cv skill, updating an existing cv skill structure, or registering skills after changes.</description>
 <location>project</location>
