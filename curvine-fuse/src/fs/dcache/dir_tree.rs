@@ -109,13 +109,8 @@ impl DirTree {
         }
     }
 
-    pub fn lookup_valid_inode_mut(
-        &mut self,
-        ino: u64,
-        name: Option<&str>,
-        ttl: u64,
-    ) -> Option<&mut Inode> {
-        let inode = self.get_inode_mut(ino, name)?;
+    pub fn lookup_valid_inode(&self, ino: u64, name: Option<&str>, ttl: u64) -> Option<&Inode> {
+        let inode = self.get_inode(ino, name)?;
         if !inode.cache_valid(ttl) {
             return None;
         }
@@ -782,7 +777,7 @@ mod test {
             .unwrap()
             .ino;
         assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, 1);
-        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 1);
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup(), 1);
 
         t.rename(FUSE_ROOT_ID, "f", 100, "g").unwrap();
         assert!(t.get_inode(FUSE_ROOT_ID, Some("f")).is_none());
@@ -798,7 +793,7 @@ mod test {
 
         t.forget(f, 2).unwrap();
         assert!(t.get_inode(f, None::<&str>).is_some());
-        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 0);
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup(), 0);
         assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, 1);
         assert_eq!(t.get_inode(100, Some("g")).unwrap().ino, f);
 
@@ -819,12 +814,12 @@ mod test {
             .unwrap()
             .ino;
         assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, 1);
-        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 1);
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup(), 1);
         t.unlink(FUSE_ROOT_ID, "x", false).unwrap();
         // ref_ctr=0 but n_lookup=1 → should_unref() false → inode kept
         assert!(t.get_inode(f, None).is_some());
         assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, 0);
-        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 1);
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup(), 1);
 
         // forget clears n_lookup → should_unref() true → inode removed
         t.forget(f, 1).unwrap();
@@ -841,9 +836,9 @@ mod test {
         let mut t = DirTree::default();
         t.lookup(FUSE_ROOT_ID, "c", file_st("c", 200), true)
             .unwrap();
-        let n0 = t.get_inode_check(200, None).unwrap().n_lookup;
+        let n0 = t.get_inode_check(200, None).unwrap().n_lookup();
         t.forget(200, n0).unwrap();
-        assert_eq!(t.get_inode_check(200, None).unwrap().n_lookup, 0);
+        assert_eq!(t.get_inode_check(200, None).unwrap().n_lookup(), 0);
         t.unlink(FUSE_ROOT_ID, "c", false).unwrap();
         assert!(t.get_inode(200, None).is_none());
     }
@@ -860,11 +855,11 @@ mod test {
             .unwrap()
             .ino;
         assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, 1);
-        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 0);
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup(), 0);
 
         // Path A: repeat readdir on same name leaves n_lookup at 0.
         t.lookup(FUSE_ROOT_ID, "r", file_st("r", 0), false).unwrap();
-        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 0);
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup(), 0);
     }
 
     /// READDIRPLUS keeps the kernel-lookup-ref semantics of a real
@@ -876,9 +871,9 @@ mod test {
             .lookup(FUSE_ROOT_ID, "p", file_st("p", 0), true)
             .unwrap()
             .ino;
-        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 1);
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup(), 1);
         t.lookup(FUSE_ROOT_ID, "p", file_st("p", 0), true).unwrap();
-        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 2);
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup(), 2);
     }
 
     /// A file the kernel no longer references, seen only by
@@ -893,7 +888,7 @@ mod test {
             .unwrap()
             .ino;
         // No kernel lookup ref, one local dcache dentry ref.
-        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, 0);
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup(), 0);
         assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, 1);
 
         t.unlink(FUSE_ROOT_ID, "d", false).unwrap();
@@ -908,9 +903,9 @@ mod test {
         let mut t = DirTree::default();
         t.lookup(FUSE_ROOT_ID, "d", file_st("d", 300), true)
             .unwrap();
-        let n0 = t.get_inode_check(300, None).unwrap().n_lookup;
+        let n0 = t.get_inode_check(300, None).unwrap().n_lookup();
         t.forget(300, n0).unwrap();
-        assert_eq!(t.get_inode_check(300, None).unwrap().n_lookup, 0);
+        assert_eq!(t.get_inode_check(300, None).unwrap().n_lookup(), 0);
 
         t.unlink(FUSE_ROOT_ID, "d", true).unwrap();
         assert!(t.get_inode(300, None).is_some());
@@ -929,7 +924,7 @@ mod test {
         let i = t.lookup(FUSE_ROOT_ID, "p", st.clone(), true).unwrap().ino;
         t.lookup(FUSE_ROOT_ID, "p", st, true).unwrap();
         assert_eq!(t.get_inode_check(i, None).unwrap().ref_ctr, 1);
-        assert_eq!(t.get_inode_check(i, None).unwrap().n_lookup, 2);
+        assert_eq!(t.get_inode_check(i, None).unwrap().n_lookup(), 2);
     }
 
     #[test]
@@ -947,7 +942,7 @@ mod test {
         assert_eq!(inode.parent, 700);
         assert_eq!(inode.name, "b");
         assert_eq!(inode.ref_ctr, 2);
-        assert_eq!(inode.n_lookup, 2);
+        assert_eq!(inode.n_lookup(), 2);
         assert_eq!(t.try_get_path(i, None).unwrap().full_path(), "/d/b");
     }
 
@@ -1083,10 +1078,10 @@ mod test {
             .unwrap()
             .ino;
         let n_ref = t.get_inode_check(f, None).unwrap().ref_ctr;
-        let n_lookup = t.get_inode_check(f, None).unwrap().n_lookup;
+        let n_lookup = t.get_inode_check(f, None).unwrap().n_lookup();
         t.link(f, 400, "hard", file_st("hard", f as i64)).unwrap();
         assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, n_ref + 1);
-        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, n_lookup + 1);
+        assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup(), n_lookup + 1);
         assert_eq!(t.get_inode(400, Some("hard")).unwrap().ino, f);
     }
 
@@ -1166,7 +1161,7 @@ mod test {
         // ref_ctr=0 but n_lookup=2 (lookup + link), inode stays until forget
         assert!(t.get_inode(f_ino, None).is_some());
         assert_eq!(t.get_inode_check(f_ino, None).unwrap().ref_ctr, 0);
-        assert_eq!(t.get_inode_check(f_ino, None).unwrap().n_lookup, 2);
+        assert_eq!(t.get_inode_check(f_ino, None).unwrap().n_lookup(), 2);
 
         // forget clears n_lookup; inode is removed
         t.forget(f_ino, 2).unwrap();
@@ -1202,7 +1197,7 @@ mod test {
         // old dst inode kept (n_lookup=1), ref_ctr zero
         assert!(t.get_inode(dst, None).is_some());
         assert_eq!(t.get_inode_check(dst, None).unwrap().ref_ctr, 0);
-        assert_eq!(t.get_inode_check(dst, None).unwrap().n_lookup, 1);
+        assert_eq!(t.get_inode_check(dst, None).unwrap().n_lookup(), 1);
 
         // forget removes inode from dcache
         t.forget(dst, 1).unwrap();
@@ -1227,7 +1222,7 @@ mod test {
             .unwrap()
             .ino;
         assert_eq!(t.get_inode_check(dst, None).unwrap().ref_ctr, 1);
-        assert_eq!(t.get_inode_check(dst, None).unwrap().n_lookup, 2);
+        assert_eq!(t.get_inode_check(dst, None).unwrap().n_lookup(), 2);
 
         t.rename(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "dst").unwrap();
 
@@ -1237,7 +1232,7 @@ mod test {
         // old dst: ref_ctr=0, n_lookup=2 → should_unref() false → inode kept
         assert!(t.get_inode(dst, None).is_some());
         assert_eq!(t.get_inode_check(dst, None).unwrap().ref_ctr, 0);
-        assert_eq!(t.get_inode_check(dst, None).unwrap().n_lookup, 2);
+        assert_eq!(t.get_inode_check(dst, None).unwrap().n_lookup(), 2);
 
         // forget clears n_lookup; inode removed
         t.forget(dst, 2).unwrap();
@@ -1265,7 +1260,7 @@ mod test {
             .ino;
         t.unlink(FUSE_ROOT_ID, "f1", false).unwrap();
         assert_eq!(t.get_inode_check(f1, None).unwrap().ref_ctr, 0);
-        assert_eq!(t.get_inode_check(f1, None).unwrap().n_lookup, 1);
+        assert_eq!(t.get_inode_check(f1, None).unwrap().n_lookup(), 1);
         t.get_inode_mut(f1, None).unwrap().last_access = 0; // force past TTL
 
         // Case 2: still linked, fresh last_access → not evicted (per-inode TTL not expired)
