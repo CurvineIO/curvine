@@ -2327,6 +2327,26 @@ mod test {
         assert_eq!(p.try_reserve(0x2000), QpairReserveResult::Reserved);
     }
 
+    /// release() on a retiring controller must free the qpair instead of
+    /// caching it, and still release the reservation.
+    #[test]
+    fn release_on_retiring_controller_frees_without_caching() {
+        let mut p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        p.register_limit(ctrlr as usize, 2);
+        p.test_hooks.free_io_qpair = Arc::new(|_| 0);
+        assert_eq!(p.try_reserve(ctrlr as usize), QpairReserveResult::Reserved);
+
+        p.begin_controller_retire(ctrlr as usize).unwrap();
+
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let outcome = p.release(ctrlr, qpair);
+
+        assert_eq!(outcome, QpairReleaseOutcome::Destroyed);
+        assert_eq!(cnt(&p, ctrlr as usize), 0);
+        assert_eq!(p.controller_stats(ctrlr as usize).0, 0);
+    }
+
     #[test]
     fn controller_remove_requires_zero_active_reservations() {
         let p = QpairPool::new();
