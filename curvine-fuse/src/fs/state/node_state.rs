@@ -44,9 +44,6 @@ use log::{debug, error, info, warn};
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-/// Max inodes removed per dcache write-lock hold during `clear`.
-const EVICT_BATCH_SIZE: usize = 1024;
-
 pub struct NodeState {
     dir_tree: RwLock<DirTree>,
     writers: AsyncSharedMap<u64, FuseWriter>,
@@ -239,6 +236,9 @@ impl NodeState {
         Ok(attr)
     }
 
+    /// Max inodes removed per dcache write-lock hold during `clear`.
+    const EVICT_BATCH_SIZE: usize = 1024;
+
     /// Evicts expired inodes. The scan holds only the read lock, and removals
     /// take the write lock per batch so foreground metadata ops are not starved
     /// for the whole sweep.
@@ -249,7 +249,7 @@ impl NodeState {
             .evict_candidates(|ino| self.has_open_handles(ino));
 
         let mut evicted = 0;
-        for batch in candidates.chunks(EVICT_BATCH_SIZE) {
+        for batch in candidates.chunks(Self::EVICT_BATCH_SIZE) {
             evicted += self
                 .dir_write()
                 .evict(batch, |ino| self.has_open_handles(ino));
@@ -1619,7 +1619,7 @@ mod test {
         let rt = Arc::new(AsyncRuntime::single());
         let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
         let state = NodeState::new(fs).unwrap();
-        let total = 2 * super::EVICT_BATCH_SIZE + 3;
+        let total = 2 * NodeState::EVICT_BATCH_SIZE + 3;
         {
             let mut tree = state.dir_write();
             for i in 0..total {
