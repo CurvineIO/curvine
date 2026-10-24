@@ -37,12 +37,15 @@ use curvine_model::{
     CreateFileOpts, DeleteResult, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags,
     RenameFlags, SetAttrOpts,
 };
-use curvine_runtime::common::FastHashMap;
+use curvine_runtime::common::{FastHashMap, LocalTime};
 use curvine_runtime::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// Max inodes removed per dcache write-lock hold during `clear`.
+const EVICT_BATCH_SIZE: usize = 1024;
 
 pub struct NodeState {
     dir_tree: RwLock<DirTree>,
@@ -236,9 +239,29 @@ impl NodeState {
         Ok(attr)
     }
 
+    /// Evicts expired inodes. The scan holds only the read lock, and removals
+    /// take the write lock per batch so foreground metadata ops are not starved
+    /// for the whole sweep.
     pub fn clear(&self) -> FuseResult<()> {
-        let mut dir = self.dir_write();
-        dir.clear(|ino| self.has_open_handles(ino));
+        let start = LocalTime::mills();
+        let candidates = self
+            .dir_read()
+            .evict_candidates(|ino| self.has_open_handles(ino));
+
+        let mut evicted = 0;
+        for batch in candidates.chunks(EVICT_BATCH_SIZE) {
+            evicted += self
+                .dir_write()
+                .evict(batch, |ino| self.has_open_handles(ino));
+        }
+
+        info!(
+            "node_state::clear: evicted {} of {} expired inodes, remaining {}, cost {} ms",
+            evicted,
+            candidates.len(),
+            self.dir_read().inode_lens(),
+            LocalTime::mills() - start
+        );
         Ok(())
     }
 
@@ -1588,6 +1611,32 @@ mod test {
             state.dir_read().get_inode(ino, None::<&str>).is_none(),
             "the expired inode should be evicted after its directory handle is released"
         );
+    }
+
+    #[test]
+    fn clear_evicts_across_multiple_batches() {
+        crate::FuseMetrics::ensure_init().unwrap();
+        let rt = Arc::new(AsyncRuntime::single());
+        let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+        let total = 2 * super::EVICT_BATCH_SIZE + 3;
+        {
+            let mut tree = state.dir_write();
+            for i in 0..total {
+                let name = format!("f{i}");
+                let status = FileStatus::with_name(0, name.clone(), false);
+                let ino = tree.lookup(FUSE_ROOT_ID, &name, status, true).unwrap().ino;
+                tree.forget(ino, 1).unwrap();
+                tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            }
+        }
+        let before = state.dir_read().inode_lens();
+
+        state.clear().unwrap();
+
+        let dir = state.dir_read();
+        assert_eq!(dir.inode_lens(), before - total);
+        assert!(dir.get_dir_check(FUSE_ROOT_ID).unwrap().children.is_empty());
     }
 
     #[test]

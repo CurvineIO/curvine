@@ -25,7 +25,6 @@ use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{FileStatus, SetAttrOpts};
 use curvine_runtime::common::{FastHashMap, LocalTime};
 use curvine_runtime::sync::AtomicCounter;
-use log::info;
 use std::collections::hash_map::Iter;
 
 /// Snapshot of dentry state before `unlink`, used to roll back local mutations when
@@ -709,30 +708,42 @@ impl DirTree {
         self.inodes.iter()
     }
 
-    pub fn clear(&mut self, has_handle: impl Fn(u64) -> bool) {
-        let now = LocalTime::mills();
+    /// Expired inodes that may be evicted; cheap enough to run under a read lock.
+    pub fn evict_candidates(&self, has_handle: impl Fn(u64) -> bool) -> Vec<u64> {
         let ttl = self.cache_ttl;
-
-        let removed: Vec<(u64, u64, String)> = self
-            .inodes
+        self.inodes
             .values()
             .filter(|inode| inode.can_evict(ttl) && !has_handle(inode.ino))
-            .map(|i| (i.ino, i.parent, i.name.clone()))
-            .collect();
+            .map(|inode| inode.ino)
+            .collect()
+    }
 
-        for (ino, parent, name) in &removed {
-            if let Some(dir) = self.inodes.get_mut(parent) {
-                dir.remove_child(name)
+    /// Evicts `inos`, re-checking each one: the tree may have changed since
+    /// `evict_candidates` ran under a separate lock.
+    pub fn evict(&mut self, inos: &[u64], has_handle: impl Fn(u64) -> bool) -> usize {
+        let ttl = self.cache_ttl;
+        let mut evicted = 0;
+        for ino in inos {
+            let Some(inode) = self.inodes.get(ino) else {
+                continue;
+            };
+            if !inode.can_evict(ttl) || has_handle(*ino) {
+                continue;
+            }
+            let parent = inode.parent;
+            let name = inode.name.clone();
+            if let Some(dir) = self.inodes.get_mut(&parent) {
+                dir.remove_child(&name)
             }
             self.remove_inode(*ino);
+            evicted += 1;
         }
+        evicted
+    }
 
-        info!(
-            "DirTree::clear: evicted {} expired inodes, remaining {}, cost {} ms",
-            removed.len(),
-            self.inodes.len(),
-            LocalTime::mills() - now
-        );
+    pub fn clear(&mut self, has_handle: impl Fn(u64) -> bool) -> usize {
+        let candidates = self.evict_candidates(&has_handle);
+        self.evict(&candidates, &has_handle)
     }
 }
 
@@ -1378,6 +1389,40 @@ mod test {
             t0.get_inode(fx, None::<&str>).is_none(),
             "cache_ttl=0 still evicts when last_access + ttl <= now"
         );
+    }
+
+    /// `evict` runs under a different lock hold than `evict_candidates`, so it
+    /// must re-validate every candidate instead of trusting the earlier scan.
+    #[test]
+    fn evict_rechecks_candidates_changed_after_scan() {
+        let mut tree = DirTree::default();
+        let expired = |tree: &mut DirTree, name: &str| {
+            let ino = tree
+                .lookup(FUSE_ROOT_ID, name, file_st(name, 0), true)
+                .unwrap()
+                .ino;
+            tree.forget(ino, 1).unwrap();
+            tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            ino
+        };
+        let relooked = expired(&mut tree, "relooked");
+        let opened = expired(&mut tree, "opened");
+        let gone = expired(&mut tree, "gone");
+
+        let mut candidates = tree.evict_candidates(|_| false);
+        candidates.sort_unstable();
+        let mut want = vec![relooked, opened, gone];
+        want.sort_unstable();
+        assert_eq!(candidates, want);
+
+        tree.lookup(FUSE_ROOT_ID, "relooked", file_st("relooked", 0), true)
+            .unwrap();
+        assert_eq!(tree.evict(&[gone], |_| false), 1);
+
+        assert_eq!(tree.evict(&candidates, |ino| ino == opened), 0);
+        assert!(tree.get_inode(FUSE_ROOT_ID, Some("relooked")).is_some());
+        assert!(tree.get_inode(FUSE_ROOT_ID, Some("opened")).is_some());
+        assert!(tree.get_inode(gone, None::<&str>).is_none());
     }
 
     /// The kernel may continue addressing an inode by nodeid until it sends FORGET.
