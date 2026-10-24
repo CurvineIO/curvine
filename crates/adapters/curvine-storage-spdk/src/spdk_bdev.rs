@@ -1106,6 +1106,32 @@ mod test {
         assert_eq!(env.retired_dma_registry().count(), 0);
     }
 
+    /// Proves `open()` routes DMA allocs through `alloc_dma_buf_with_reclaim`.
+    #[test]
+    fn open_reclaims_retired_dma_before_allocating_buffers() {
+        ensure_spdk_init();
+        let env = SpdkEnv::global().expect("SPDK env must be initialized");
+        let bdev_name = env
+            .bdev_names()
+            .first()
+            .cloned()
+            .expect("at least one bdev must be discovered");
+
+        let calls_before = env.dma_reclaim_call_count();
+
+        let bdev = SpdkBdev::open_read(&bdev_name, 0, 0).expect("open should succeed");
+
+        // Expect 4: 2 from alloc_dma_buf_with_reclaim() + 2 from acquire_qpair().
+        assert_eq!(
+            env.dma_reclaim_call_count() - calls_before,
+            4,
+            "open() must call reclaim_retired_dma via alloc_dma_buf_with_reclaim \
+             for both DMA buffers, not just via acquire_qpair()"
+        );
+
+        drop(bdev);
+    }
+
     #[test]
     fn dma_buf_alloc_aligned() {
         ensure_spdk_init();

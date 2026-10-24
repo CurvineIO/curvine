@@ -695,6 +695,11 @@ struct SpdkEnvTestHooks {
             dyn Fn(*mut spdk_ffi::spdk_nvme_qpair) -> RetiredQpairPollOutcome + Send + Sync,
         >,
     >,
+    /// Counts calls to `reclaim_retired_dma()`, so tests can prove a code
+    /// path (e.g. `open()`'s DMA allocation) actually triggers a reclaim
+    /// attempt, rather than only checking the registry's final state (which
+    /// can be cleared by an unrelated caller, e.g. `acquire_qpair()`).
+    dma_reclaim_calls: AtomicUsize,
 }
 
 /// SPDK env lifecycle (singleton). Send + Sync
@@ -1184,12 +1189,21 @@ impl SpdkEnv {
     }
 
     pub(crate) fn reclaim_retired_dma(&self) -> usize {
+        #[cfg(test)]
+        self.test_hooks
+            .dma_reclaim_calls
+            .fetch_add(1, Ordering::Relaxed);
         self.retired_dma.reclaim()
     }
 
     #[cfg(test)]
     fn retired_dma_count(&self) -> usize {
         self.retired_dma.count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dma_reclaim_call_count(&self) -> usize {
+        self.test_hooks.dma_reclaim_calls.load(Ordering::Relaxed)
     }
 
     fn prepare_retired_qpair_for_free(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
