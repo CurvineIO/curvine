@@ -271,6 +271,40 @@ impl QpairPool {
         false
     }
 
+    /// Retry this controller's pending_destroy, releasing the reservation on
+    /// each successful free (same order as `drain_all()`).
+    fn retry_pending_destroy_for(&self, ctrlr_ptr: usize) -> bool {
+        let qpairs = self
+            .pending_destroy
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&ctrlr_ptr)
+            .unwrap_or_default();
+        let mut failed = Vec::new();
+        for qpair in qpairs {
+            let rc = self.free_io_qpair(qpair);
+            if rc != 0 {
+                error!(
+                    "QpairPool: retry failed to free pending qpair {:p} for ctrlr {:p}: rc={}",
+                    qpair, ctrlr_ptr as *const (), rc
+                );
+                failed.push(qpair);
+                continue;
+            }
+            self.release_reservation(ctrlr_ptr);
+        }
+        if failed.is_empty() {
+            return true;
+        }
+        self.pending_destroy
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(ctrlr_ptr)
+            .or_default()
+            .extend(failed);
+        false
+    }
+
     /// Remove controller accounting once no cached or active qpairs remain.
     fn finish_controller_remove(&self, ctrlr_ptr: usize) -> CommonResult<()> {
         if self
@@ -1608,6 +1642,8 @@ impl SpdkEnv {
                 target_idx
             );
         }
+        // Retry pending_destroy before the active check (same order as drain_all).
+        self.qpair_pool.retry_pending_destroy_for(ctrlr_key);
         if self.qpair_pool.controller_stats(ctrlr_key).0 != 0 {
             return err_box!(
                 "SPDK target {} still has active qpair reservations",
@@ -2357,6 +2393,57 @@ mod test {
             "unexpected error: {err}"
         );
         assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+    }
+
+    /// A failed retiring free must not permanently wedge the controller —
+    /// detach_target must retry pending_destroy, same as drain_all.
+    #[test]
+    fn detach_target_retries_pending_destroy_before_active_check() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+
+        // Seed pending_destroy as if a prior retiring free already failed.
+        assert_eq!(
+            env.qpair_pool.try_reserve(0x1000),
+            QpairReserveResult::Reserved
+        );
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        env.qpair_pool
+            .pending_destroy
+            .lock()
+            .unwrap()
+            .entry(0x1000)
+            .or_default()
+            .push(qpair);
+
+        let free_calls = Arc::new(AtomicUsize::new(0));
+        let free_calls_hook = Arc::clone(&free_calls);
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
+            if free_calls_hook.fetch_add(1, Ordering::AcqRel) == 0 {
+                -libc::EIO
+            } else {
+                0
+            }
+        });
+
+        // 1st attempt: retry_pending_destroy_for fails (free_io_qpair rc!=0),
+        // active stays non-zero, detach still correctly rejected.
+        let err = env.detach_target(0).unwrap_err().to_string();
+        assert!(
+            err.contains("active qpair reservations"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(free_calls.load(Ordering::Acquire), 1);
+        assert_eq!(env.qpair_pool.controller_stats(0x1000).0, 1);
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+
+        // 2nd attempt: free_io_qpair now returns 0, retry succeeds,
+        // release_reservation fires, active drops to 0, detach proceeds.
+        env.detach_target(0).unwrap();
+        assert_eq!(free_calls.load(Ordering::Acquire), 2);
+        assert_eq!(env.qpair_pool.controller_stats(0x1000).0, 0);
+        assert_eq!(env.controllers[0].state(), ControllerState::Detached);
     }
 
     #[test]
