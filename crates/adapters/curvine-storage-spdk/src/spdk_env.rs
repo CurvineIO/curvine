@@ -2381,7 +2381,12 @@ mod test {
     fn detach_target_rejects_missing_poller() {
         let mut env = test_env();
         add_test_controller(&mut env, 0, 0x1000);
-        env.test_hooks.nvme_detach = Some(Arc::new(|_| 0));
+        let detach_calls = Arc::new(AtomicUsize::new(0));
+        let detach_calls_hook = Arc::clone(&detach_calls);
+        env.test_hooks.nvme_detach = Some(Arc::new(move |_| {
+            detach_calls_hook.fetch_add(1, Ordering::AcqRel);
+            0
+        }));
 
         let err = env.detach_target(0).unwrap_err().to_string();
 
@@ -2390,6 +2395,7 @@ mod test {
             "unexpected error: {err}"
         );
         assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+        assert_eq!(detach_calls.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -2397,7 +2403,12 @@ mod test {
         let mut env = test_env();
         add_test_controller(&mut env, 0, 0x1000);
         env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::TimedOut));
-        env.test_hooks.nvme_detach = Some(Arc::new(|_| 0));
+        let detach_calls = Arc::new(AtomicUsize::new(0));
+        let detach_calls_hook = Arc::clone(&detach_calls);
+        env.test_hooks.nvme_detach = Some(Arc::new(move |_| {
+            detach_calls_hook.fetch_add(1, Ordering::AcqRel);
+            0
+        }));
 
         let err = env.detach_target(0).unwrap_err().to_string();
 
@@ -2407,6 +2418,7 @@ mod test {
         );
         assert!(err.contains("TimedOut"), "unexpected error: {err}");
         assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+        assert_eq!(detach_calls.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -2430,11 +2442,18 @@ mod test {
         let mut env = test_env();
         add_test_controller(&mut env, 0, 0x1000);
         set_detach_success_hooks(&mut env);
+        let detach_calls = Arc::new(AtomicUsize::new(0));
+        let detach_calls_hook = Arc::clone(&detach_calls);
+        env.test_hooks.nvme_detach = Some(Arc::new(move |_| {
+            detach_calls_hook.fetch_add(1, Ordering::AcqRel);
+            0
+        }));
 
         env.detach_target(0).unwrap();
 
         assert_eq!(env.controllers[0].state(), ControllerState::Detached);
         assert_eq!(env.qpair_pool.controller_stats(0x1000), (0, 0));
+        assert_eq!(detach_calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
