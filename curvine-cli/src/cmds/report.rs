@@ -44,36 +44,23 @@ impl ReportCommand {
     pub async fn execute(&self, fs: UnifiedFileSystem) -> CommonResult<()> {
         let rep = handle_rpc_result(fs.get_filesystem_info()).await;
         let report = CurvineReport { info: rep };
-        match &self.action {
-            Some(action) => match action {
-                ReportSubCommand::Json => {
-                    println!("{}", report.to_json());
-                }
-                ReportSubCommand::All => {
-                    println!("{}", report.simple(true));
-                }
-                ReportSubCommand::Capacity { worker_address } => {
-                    if let Some(addr) = worker_address {
-                        println!("{}", report.capacity_worker(addr));
-                    } else {
-                        println!("{}", report.capacity_cluster());
-                    }
-                }
-                ReportSubCommand::FluidSummary => {
-                    println!("{}", report.fluid_summary());
-                }
-                ReportSubCommand::Used => {
-                    println!("{}", report.used());
-                }
-                ReportSubCommand::Available => {
-                    println!("{}", report.available());
-                }
-            },
-            None => {
-                println!("{}", report.simple(false));
-            }
-        }
+        println!("{}", self.render(&report));
         Ok(())
+    }
+
+    fn render(&self, report: &CurvineReport) -> String {
+        match &self.action {
+            Some(ReportSubCommand::Json) => report.to_json(),
+            Some(ReportSubCommand::All) => report.simple(true),
+            Some(ReportSubCommand::Capacity { worker_address }) => match worker_address {
+                Some(addr) => report.capacity_worker(addr),
+                None => report.capacity_cluster(),
+            },
+            Some(ReportSubCommand::FluidSummary) => report.fluid_summary(),
+            Some(ReportSubCommand::Used) => report.used(),
+            Some(ReportSubCommand::Available) => report.available(),
+            None => report.simple(false),
+        }
     }
 }
 
@@ -646,7 +633,8 @@ mod tests {
 
     #[test]
     fn default_report_hides_worker_lists() {
-        let output = report_with_workers().simple(false);
+        let cmd = ReportCommand::try_parse_from(["report"]).unwrap();
+        let output = cmd.render(&report_with_workers());
 
         assert!(output.contains("live_worker_num: 1"));
         assert!(output.contains("lost_worker_num: 1"));
@@ -658,7 +646,8 @@ mod tests {
 
     #[test]
     fn all_report_includes_worker_lists() {
-        let output = report_with_workers().simple(true);
+        let cmd = ReportCommand::try_parse_from(["report", "all"]).unwrap();
+        let output = cmd.render(&report_with_workers());
 
         assert!(output.contains("live_worker_list"));
         assert!(output.contains("lost_worker_list"));
@@ -667,13 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn report_subcommand_selects_detail_level() {
-        let default = ReportCommand::try_parse_from(["report"]).unwrap();
-        assert!(default.action.is_none());
-
-        let all = ReportCommand::try_parse_from(["report", "all"]).unwrap();
-        assert!(matches!(all.action, Some(ReportSubCommand::All)));
-
+    fn all_subcommand_rejects_show_workers_flag() {
         assert!(ReportCommand::try_parse_from(["report", "all", "--show-workers"]).is_err());
     }
 }
