@@ -770,8 +770,9 @@ impl Display for SpdkBdev {
 pub(crate) enum DrainOutcome {
     /// `inflight` reached 0 before the deadline.
     Completed,
-    /// Deadline reached with `inflight` still non-zero; caller must poison
-    /// DMA buffers to avoid a use-after-free.
+    /// Deadline reached with `inflight` still non-zero; caller must defer the
+    /// DMA buffers (`defer_dma_buffers`) instead of dropping them, since a
+    /// late completion may still write into them.
     TimedOut,
 }
 
@@ -796,7 +797,7 @@ pub(crate) fn wait_for_inflight_drain(
         if std::time::Instant::now() >= deadline {
             error!(
                 "SpdkBdev '{}': {} in-flight I/O(s) still pending after deadline. \
-                 Leaking DMA buffers to prevent use-after-free.",
+                 Deferring DMA buffers until in-flight I/O drains.",
                 name, count
             );
             return DrainOutcome::TimedOut;
