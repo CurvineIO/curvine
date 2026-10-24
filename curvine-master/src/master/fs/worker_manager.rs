@@ -25,7 +25,7 @@ use curvine_model::{
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::{ByteUnit, LocalTime};
 use log::{info, warn};
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 
 pub struct WorkerManager {
@@ -316,57 +316,75 @@ impl WorkerManager {
     }
 
     pub fn add_dcm(&mut self, list: Vec<String>) -> Vec<String> {
-        let set: HashSet<String> = list.into_iter().collect();
-        self.worker_map
-            .decommissioned_hosts
-            .extend(set.iter().cloned());
-
-        for worker in self.worker_map.lost_workers.values_mut() {
-            if set.contains(&worker.address.hostname) {
-                worker.status = WorkerStatus::Decommission;
-            }
-        }
-
+        let hosts: BTreeSet<String> = list.into_iter().collect();
         let mut res = vec![];
-        for worker in self.worker_map.workers.values_mut() {
-            if set.contains(&worker.address.hostname) {
+        for host in hosts {
+            for worker in self.host_workers_mut(&host) {
                 worker.status = WorkerStatus::Decommission;
-                res.push(worker.simple_string());
             }
+            res.extend(self.host_dcm_entries(&host, WorkerStatus::Decommission));
+            self.worker_map.decommissioned_hosts.insert(host);
         }
         res
     }
 
     pub fn get_dcm(&self) -> Vec<String> {
+        let hosts: BTreeSet<&String> = self.worker_map.decommissioned_hosts.iter().collect();
+        hosts
+            .into_iter()
+            .flat_map(|host| self.host_dcm_entries(host, WorkerStatus::Decommission))
+            .collect()
+    }
+
+    pub fn remove_dcm(&mut self, list: Vec<String>) -> Vec<String> {
+        let hosts: BTreeSet<String> = list.into_iter().collect();
         let mut res = vec![];
-        for (_, worker) in self.worker_map.workers.iter() {
-            if worker.status == WorkerStatus::Decommission {
-                res.push(worker.simple_string());
+        for host in hosts {
+            if !self.worker_map.decommissioned_hosts.remove(&host) {
+                continue;
             }
+            for worker in self.host_workers_mut(&host) {
+                if worker.status == WorkerStatus::Decommission {
+                    worker.status = WorkerStatus::Live;
+                }
+            }
+            res.extend(self.host_dcm_entries(&host, WorkerStatus::Live));
         }
         res
     }
 
-    pub fn remove_dcm(&mut self, list: Vec<String>) -> Vec<String> {
-        let set: HashSet<String> = list.into_iter().collect();
-        self.worker_map
-            .decommissioned_hosts
-            .retain(|host| !set.contains(host));
+    fn host_workers_mut<'a>(
+        &'a mut self,
+        host: &'a str,
+    ) -> impl Iterator<Item = &'a mut WorkerInfo> + 'a {
+        let wm = &mut self.worker_map;
+        wm.workers
+            .values_mut()
+            .chain(wm.lost_workers.values_mut())
+            .filter(move |worker| worker.address.hostname == host)
+    }
 
-        for worker in self.worker_map.lost_workers.values_mut() {
-            if set.contains(&worker.address.hostname) && worker.status == WorkerStatus::Decommission
-            {
-                worker.status = WorkerStatus::Live;
-            }
+    // Offline hosts fall back to lost entries, then to "-,<host>,<status>" in the same shape.
+    fn host_dcm_entries(&self, host: &str, status: WorkerStatus) -> Vec<String> {
+        let on_host = |worker: &&WorkerInfo| worker.address.hostname == host;
+        let mut res: Vec<String> = self
+            .worker_map
+            .workers
+            .values()
+            .filter(on_host)
+            .map(|worker| worker.simple_string())
+            .collect();
+        if res.is_empty() {
+            res = self
+                .worker_map
+                .lost_workers
+                .values()
+                .filter(on_host)
+                .map(|worker| worker.simple_string())
+                .collect();
         }
-
-        let mut res = vec![];
-        for worker in self.worker_map.workers.values_mut() {
-            if set.contains(&worker.address.hostname) && worker.status == WorkerStatus::Decommission
-            {
-                worker.status = WorkerStatus::Live;
-                res.push(worker.simple_string());
-            }
+        if res.is_empty() {
+            res.push(format!("-,{},{:?}", host, status));
         }
         res
     }
@@ -756,12 +774,46 @@ mod tests {
     #[test]
     fn decommission_applies_to_worker_registered_later() {
         let mut manager = robin_manager();
-        assert!(manager.add_dcm(vec!["a".to_string()]).is_empty());
+        assert_eq!(
+            manager.add_dcm(vec!["a".to_string()]),
+            vec!["-,a,Decommission"]
+        );
+        assert_eq!(manager.get_dcm(), vec!["-,a,Decommission"]);
 
         send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(1, "a"));
         send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(2, "b"));
         assert_eq!(status_of(&manager, 1), WorkerStatus::Decommission);
         assert_eq!(status_of(&manager, 2), WorkerStatus::Live);
+        assert_eq!(manager.get_dcm(), vec!["1,a:8997,Decommission"]);
+    }
+
+    #[test]
+    fn dcm_reports_lost_and_unregistered_hosts() {
+        let mut manager = robin_manager();
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(1, "a"));
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(2, "b"));
+        manager.remove_expired_worker(1).unwrap();
+
+        let added = manager.add_dcm(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            added,
+            vec![
+                "1,a:8997,Decommission",
+                "2,b:8997,Decommission",
+                "-,c,Decommission"
+            ]
+        );
+        assert_eq!(manager.get_dcm(), added);
+
+        // The CLI matches requested hosts on the hostname in field 1.
+        for (entry, host) in added.iter().zip(["a", "b", "c"]) {
+            let addr = entry.split(',').nth(1).unwrap();
+            assert_eq!(addr.split(':').next(), Some(host));
+        }
+
+        let removed = manager.remove_dcm(vec!["a".to_string(), "c".to_string(), "d".to_string()]);
+        assert_eq!(removed, vec!["1,a:8997,Live", "-,c,Live"]);
+        assert_eq!(manager.get_dcm(), vec!["2,b:8997,Decommission"]);
     }
 
     #[test]
@@ -772,7 +824,10 @@ mod tests {
         manager.add_dcm(vec!["a".to_string()]);
         manager.remove_expired_worker(1).unwrap();
 
-        manager.remove_dcm(vec!["a".to_string()]);
+        assert_eq!(
+            manager.remove_dcm(vec!["a".to_string()]),
+            vec!["1,a:8997,Live"]
+        );
         assert_eq!(status_of(&manager, 1), WorkerStatus::Live);
 
         restart(&mut manager, addr);
