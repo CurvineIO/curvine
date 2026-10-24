@@ -835,6 +835,8 @@ pub struct SpdkEnv {
     deferred_qpairs: Mutex<HashMap<usize, usize>>,
     retired_dma: Arc<RetiredDmaRegistry>,
     lifecycle: Mutex<()>,
+    /// Rejects a second concurrent `shutdown()` call (lifecycle alone no longer blocks it).
+    shutdown_in_progress: AtomicBool,
     #[cfg(test)]
     test_hooks: SpdkEnvTestHooks,
 }
@@ -842,6 +844,15 @@ pub struct SpdkEnv {
 // SAFETY: Fields are either immutable after init (conf, bdevs) or atomic (state).
 unsafe impl Send for SpdkEnv {}
 unsafe impl Sync for SpdkEnv {}
+
+/// Clears `shutdown_in_progress` on drop, even on panic unwind.
+struct ShutdownInProgressGuard<'a>(&'a AtomicBool);
+
+impl Drop for ShutdownInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 impl SpdkEnv {
     /// Create in Created state
@@ -868,6 +879,7 @@ impl SpdkEnv {
             deferred_qpairs: Mutex::new(HashMap::new()),
             retired_dma: RetiredDmaRegistry::new(),
             lifecycle: Mutex::new(()),
+            shutdown_in_progress: AtomicBool::new(false),
             #[cfg(test)]
             test_hooks: SpdkEnvTestHooks::default(),
         })
@@ -1059,6 +1071,16 @@ impl SpdkEnv {
 
     /// Shutdown: detach controllers, free hugepages
     pub fn shutdown(&self) {
+        // Reject a second, concurrent shutdown() call outright. Needed
+        // because `lifecycle` is no longer held across the drain-wait loop
+        // below, so without this guard two threads could both pass
+        // begin_shutdown_attempt()'s retry check and run teardown twice.
+        if self.shutdown_in_progress.swap(true, Ordering::AcqRel) {
+            warn!("SpdkEnv::shutdown() already in progress on another thread");
+            return;
+        }
+        let _shutdown_guard = ShutdownInProgressGuard(&self.shutdown_in_progress);
+
         {
             // Only hold `lifecycle` for the CAS — holding it across the drain
             // wait would block a concurrent acquire_handle() for up to
@@ -3218,6 +3240,55 @@ mod test {
         // Let the original handle "close" and allow shutdown() to finish cleanly.
         env.open_handles.store(0, Ordering::Release);
         shutdown_handle.join().unwrap();
+        assert_eq!(detach_calls.load(Ordering::Acquire), 1);
+        assert_eq!(fini_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn concurrent_shutdown_calls_do_not_run_teardown_twice() {
+        let mut env = SpdkEnv::new(SpdkConf::default()).unwrap();
+        let detach_calls = Arc::new(AtomicUsize::new(0));
+        let fini_calls = Arc::new(AtomicUsize::new(0));
+        let detach_calls_hook = Arc::clone(&detach_calls);
+        let fini_calls_hook = Arc::clone(&fini_calls);
+        env.test_hooks.detach_controllers = Some(Arc::new(move || {
+            detach_calls_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.test_hooks.env_fini = Some(Arc::new(move || {
+            fini_calls_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+        // Keep the first shutdown() mid-drain for a while.
+        env.open_handles.store(1, Ordering::Release);
+
+        let env = Arc::new(env);
+        let env_for_first = Arc::clone(&env);
+        let first_shutdown = thread::spawn(move || env_for_first.shutdown());
+
+        // Give the first call time to win begin_shutdown_attempt() and enter
+        // its drain-wait loop (lifecycle is already released by then).
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(env.state(), SpdkEnvState::ShutDown);
+
+        // A second concurrent shutdown() call must bail out immediately,
+        // not re-run its own drain/teardown alongside the first call.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let env_for_second = Arc::clone(&env);
+        thread::spawn(move || {
+            env_for_second.shutdown();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_millis(500))
+            .expect("second concurrent shutdown() call must return immediately");
+
+        // The second call must not have run any teardown step.
+        assert_eq!(detach_calls.load(Ordering::Acquire), 0);
+        assert_eq!(fini_calls.load(Ordering::Acquire), 0);
+
+        // Let the first call's drain finish and complete teardown normally.
+        env.open_handles.store(0, Ordering::Release);
+        first_shutdown.join().unwrap();
         assert_eq!(detach_calls.load(Ordering::Acquire), 1);
         assert_eq!(fini_calls.load(Ordering::Acquire), 1);
     }
