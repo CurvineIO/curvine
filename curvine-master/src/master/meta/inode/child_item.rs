@@ -38,32 +38,6 @@ impl<'a> ChildItem<'a> {
     }
 
     #[inline]
-    pub fn view(&self) -> Option<&'a InodeView> {
-        match self {
-            ChildItem::View(view) => Some(view),
-            ChildItem::FileEntry { .. } => None,
-        }
-    }
-
-    #[inline]
-    pub fn is_dir(&self) -> bool {
-        matches!(self, ChildItem::View(InodeView::Dir(_)))
-    }
-
-    #[inline]
-    pub fn is_file_entry(&self) -> bool {
-        matches!(self, ChildItem::FileEntry { .. })
-    }
-
-    #[inline]
-    pub fn into_view(self) -> InodeView {
-        match self {
-            ChildItem::View(view) => view.clone(),
-            ChildItem::FileEntry { name, id } => InodeView::new_entry(name.to_string(), id),
-        }
-    }
-
-    #[inline]
     pub fn as_ptr(self) -> InodePtr {
         match self {
             ChildItem::View(view) => InodePtr::from_ref(view),

@@ -14,14 +14,26 @@
 
 //! `Packed` child edges: file edges are inlined as variable-length byte records
 //! inside capacity-graded chunks and directory objects live in a side vector,
-//! cutting a file edge from ~124 B down to ~30 B. See
-//! `docs/design/inode-children-packed-arena.md`.
+//! cutting a file edge from ~124 B down to ~30 B.
 //!
 //! Pointer contract: `InodePtr` is a raw pointer without lifetime tracking.
 //! Bytes inside the packed record area must never be exposed as `&InodeView` or
 //! `InodePtr` because records move on insert/delete/split. File hits only expose
 //! `name + id` (load the full inode from the store); directory pointers always
 //! point at `Box`es owned by the side vector, whose addresses never move.
+//!
+//! Growing, splitting and compacting only move the `Box` value inside the side
+//! vector, never the directory it points at, so a directory pointer outlives
+//! every one of those. Only these three drop the pointee and must be treated as
+//! the invalidation points, because none of them is visible in a signature:
+//!
+//! * `delete_child` on that name moves the directory out and frees the `Box`;
+//! * cloning the container deep-copies the side vector, so a pointer handed out
+//!   by one copy never addresses the other;
+//! * cloning a file pointer clears `RawPtr::owned`, so the copy dangles once the
+//!   original is dropped. File edges can only be handed out as owned pointers,
+//!   which makes `Vec<InodePtr>` a mix of owned and borrowed elements: move them
+//!   into queues and stacks instead of cloning them.
 
 use crate::master::meta::inode::ChildItem;
 use crate::master::meta::inode::PackedIter;
@@ -69,7 +81,7 @@ impl PackedChildren {
     const DIR_VALUE_LEN: usize = Self::DIR_IDX_OFFSET + 4;
     const KIND_FILE: u8 = 0;
     const KIND_DIR: u8 = 1;
-    const NAME_MAX: usize = u8::MAX as usize;
+    const NAME_MAX: usize = Self::LAYOUT.max_key_len();
     const HOLE_RATIO: usize = 4;
     const HOLE_LIMIT: usize = 1024;
 
@@ -91,6 +103,8 @@ impl PackedChildren {
     #[inline]
     fn record_name(buf: &[u8], off: usize) -> &str {
         let key = &buf[Self::LAYOUT.key_range(buf, off)];
+        // SAFETY: every key in the area was written by `add_child` from a `&str`
+        // name, so the key bytes are always valid UTF-8.
         unsafe { std::str::from_utf8_unchecked(key) }
     }
 
@@ -118,11 +132,12 @@ impl PackedChildren {
     ) -> ChildItem<'a> {
         let buf = chunk.buf();
         if Self::record_kind(buf, off) == Self::KIND_DIR {
-            if let Some(view) = dirs
+            match dirs
                 .get(Self::record_dir_idx(buf, off) as usize)
                 .and_then(|slot| slot.as_deref())
             {
-                return ChildItem::View(view);
+                Some(view) => return ChildItem::View(view),
+                None => debug_assert!(false, "dir record points at a missing side-vector slot"),
             }
         }
         ChildItem::FileEntry {
@@ -156,20 +171,20 @@ impl PackedChildren {
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<InodePtr> {
+    pub fn get_child(&self, name: &str) -> Option<InodePtr> {
         let (ci, off) = self.area.find(name.as_bytes()).ok()?;
         Some(Self::packed_item(&self.dirs, &self.area.chunks()[ci], off).as_ptr())
     }
 
     pub fn add_child(&mut self, inode: InodeView) -> CommonResult<InodePtr> {
-        let name = inode.name().to_string();
-        if name.len() > Self::NAME_MAX {
+        if inode.name().len() > Self::NAME_MAX {
             return err_box!(
                 "Child name too long: {} bytes (max {})",
-                name.len(),
+                inode.name().len(),
                 Self::NAME_MAX
             );
         }
+        let name = inode.name().to_string();
         let id = inode.id();
 
         if inode.is_dir() {
@@ -229,8 +244,8 @@ impl PackedChildren {
 
         if Self::record_kind(chunk.buf(), off) == Self::KIND_DIR {
             let slot = Self::record_dir_idx(chunk.buf(), off) as usize;
-            let Some(boxed) = self.dirs[slot].take() else {
-                return err_box!("Packed dir slot {} is empty", slot);
+            let Some(boxed) = self.dirs.get_mut(slot).and_then(Option::take) else {
+                return err_box!("Packed dir slot {} is missing or empty", slot);
             };
             self.free_slots.push(slot as u32);
             self.area.remove(ci, off);
@@ -243,7 +258,7 @@ impl PackedChildren {
     }
 
     pub fn iter(&self) -> PackedIter<'_> {
-        PackedIter::new(&self.dirs, self.area.chunks())
+        PackedIter::new(&self.dirs, self.area.chunks(), self.area.len())
     }
 
     pub fn list_options(&self, opts: &ListOptions) -> Vec<InodePtr> {
@@ -272,13 +287,11 @@ impl PackedChildren {
         out
     }
 
-    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Option<Vec<InodePtr>> {
-        Some(
-            self.iter()
-                .filter(|item| glob_pattern.matches(item.name()))
-                .map(|item| item.as_ptr())
-                .collect(),
-        )
+    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodePtr> {
+        self.iter()
+            .filter(|item| glob_pattern.matches(item.name()))
+            .map(|item| item.as_ptr())
+            .collect()
     }
 
     fn maybe_compact(&mut self) {
@@ -290,7 +303,8 @@ impl PackedChildren {
 
     fn compact_dirs(&mut self) {
         let mut remap = vec![u32::MAX; self.dirs.len()];
-        let mut dirs = Vec::with_capacity(self.dirs.len() - self.free_slots.len());
+        let live = self.dirs.len().saturating_sub(self.free_slots.len());
+        let mut dirs = Vec::with_capacity(live);
         for (old_idx, slot) in self.dirs.drain(..).enumerate() {
             if let Some(boxed) = slot {
                 remap[old_idx] = dirs.len() as u32;
@@ -303,8 +317,14 @@ impl PackedChildren {
             if value[Self::KIND_OFFSET] == Self::KIND_DIR {
                 let mut slot = [0u8; 4];
                 slot.copy_from_slice(&value[Self::DIR_IDX_OFFSET..Self::DIR_VALUE_LEN]);
-                let new = remap[u32::from_le_bytes(slot) as usize];
-                debug_assert_ne!(new, u32::MAX);
+                // A slot outside the remap table means the record no longer owns
+                // a live directory. Keep the sentinel instead of the stale index:
+                // the stale index would silently resolve to another real dir.
+                let new = remap
+                    .get(u32::from_le_bytes(slot) as usize)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                debug_assert_ne!(new, u32::MAX, "dir record points at a dead slot");
                 let slot_end = Self::DIR_VALUE_LEN;
                 value[Self::DIR_IDX_OFFSET..slot_end].copy_from_slice(&new.to_le_bytes());
             }

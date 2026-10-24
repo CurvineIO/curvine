@@ -22,15 +22,21 @@ pub struct PackedIter<'a> {
     chunks: &'a [Chunk],
     ci: usize,
     off: usize,
+    remaining: usize,
 }
 
 impl<'a> PackedIter<'a> {
-    pub(super) fn new(dirs: &'a [Option<Box<InodeView>>], chunks: &'a [Chunk]) -> Self {
+    pub(super) fn new(
+        dirs: &'a [Option<Box<InodeView>>],
+        chunks: &'a [Chunk],
+        remaining: usize,
+    ) -> Self {
         Self {
             dirs,
             chunks,
             ci: 0,
             off: 0,
+            remaining,
         }
     }
 }
@@ -48,7 +54,14 @@ impl<'a> Iterator for PackedIter<'a> {
             }
             let off = self.off;
             self.off += PackedChildren::record_len(chunk.buf(), off);
+            // Saturating because the workspace builds release with panic=abort:
+            // an underflow here would take the whole master process down.
+            self.remaining = self.remaining.saturating_sub(1);
             return Some(PackedChildren::packed_item(self.dirs, chunk, off));
         }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.remaining))
     }
 }
