@@ -896,18 +896,16 @@ impl NodeState {
             return Ok(None);
         }
 
-        let status = if add_lookup {
-            let mut dir = self.dir_write();
-            dir.check_deleted_child(ino, name)?;
-
-            dir.lookup_valid_inode_mut(ino, name, self.meta_cache_ttl)
-                .map(|inode| inode.status.clone())
-        } else {
+        let status = {
             let dir = self.dir_read();
             dir.check_deleted_child(ino, name)?;
 
-            dir.get_valid_inode(ino, name, self.meta_cache_ttl)
-                .map(|inode| inode.status.clone())
+            let inode = if add_lookup {
+                dir.lookup_valid_inode(ino, name, self.meta_cache_ttl)
+            } else {
+                dir.get_valid_inode(ino, name, self.meta_cache_ttl)
+            };
+            inode.map(|inode| inode.status.clone())
         };
 
         // Hit/miss recorded the moment the cache read resolves (before any backend
@@ -1622,6 +1620,46 @@ mod test {
     }
 
     #[test]
+    fn cached_lookup_counts_concurrent_hits_under_read_lock() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = true;
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let ino = state
+            .dir_write()
+            .lookup(
+                FUSE_ROOT_ID,
+                "f",
+                FileStatus::with_name(9, "f".to_string(), false),
+                true,
+            )
+            .unwrap()
+            .ino;
+
+        let (threads, per_thread) = (8, 100);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    for _ in 0..per_thread {
+                        let hit = state.get_cached_status(FUSE_ROOT_ID, Some("f"), true);
+                        assert!(hit.unwrap().is_some());
+                    }
+                });
+            }
+        });
+
+        let n_lookup = state
+            .dir_read()
+            .get_inode_check(ino, None)
+            .unwrap()
+            .n_lookup();
+        assert_eq!(n_lookup, 1 + threads * per_thread);
+    }
+
+    #[test]
     fn invalidating_parent_status_drops_stale_nlink() {
         let rt = Arc::new(AsyncRuntime::single());
         let mut conf = ClusterConf::default();
@@ -1697,7 +1735,7 @@ mod test {
                     .dir_read()
                     .get_inode_check(ino, None)
                     .unwrap()
-                    .n_lookup,
+                    .n_lookup(),
                 1
             );
         });
