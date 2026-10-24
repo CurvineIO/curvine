@@ -38,6 +38,24 @@ impl FuseDirentList {
         self.buf
     }
 
+    pub fn remaining(&self) -> usize {
+        self.max_size.saturating_sub(self.buf.len())
+    }
+
+    /// Bytes `add_dirent` will consume for `name`, including 8-byte alignment padding.
+    pub fn dirent_len(plus: bool, name: &str) -> usize {
+        let header = if plus {
+            size_of::<fuse_direntplus>()
+        } else {
+            size_of::<fuse_dirent>()
+        };
+        Self::aligned(header + FFIUtils::get_os_bytes(name).len())
+    }
+
+    fn aligned(len: usize) -> usize {
+        (len + size_of::<u64>() - 1) & !(size_of::<u64>() - 1)
+    }
+
     pub fn add(&mut self, off: u64, status: &FileStatus, entry: fuse_entry_out) -> bool {
         let typ = entry.attr.mode >> 12;
         let name = FFIUtils::get_os_bytes(&status.name);
@@ -87,8 +105,7 @@ impl FuseDirentList {
         let bytes = FuseUtils::struct_as_bytes(data);
 
         let data_len = bytes.len() + name.len();
-        // 8-byte (u64) aligned
-        let align_len = (data_len + size_of::<u64>() - 1) & !(size_of::<u64>() - 1);
+        let align_len = Self::aligned(data_len);
 
         if self.buf.len() + align_len > self.max_size {
             return false;

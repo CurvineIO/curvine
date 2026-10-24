@@ -52,6 +52,13 @@ const FUSE_TIME_GRANULARITY_NS: u32 = 1_000_000;
 /// Fragment size used by FUSE statfs block counters.
 const STATFS_FRAGMENT_SIZE: u32 = 4 * ByteUnit::KB as u32;
 
+struct ReaddirEntry {
+    status: Arc<FileStatus>,
+    attr: fuse_attr,
+    is_child: bool,
+    dirty: Option<FileStatus>,
+}
+
 pub struct CurvineFileSystem {
     fs: UnifiedFileSystem,
     state: Arc<NodeState>,
@@ -469,33 +476,66 @@ impl CurvineFileSystem {
         let mut batch = handle
             .get_batch(arg.offset as usize, &path, || self.state.list_stream(&path))
             .await?;
+
+        // Only entries that fit in the reply may touch the dcache: READDIRPLUS
+        // bumps n_lookup, and an entry the kernel never receives never gets a
+        // FORGET, which would pin its inode forever.
+        let mut budget = res.remaining();
+        let mut pending = Vec::with_capacity(batch.len());
+        while let Some(status) = batch.pop_front() {
+            let len = FuseDirentList::dirent_len(plus, &status.name);
+            if len > budget {
+                break;
+            }
+            budget -= len;
+            let attr = FuseUtils::status_to_attr(&self.conf, &status)?;
+            let is_child = status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR;
+            pending.push(ReaddirEntry {
+                status,
+                attr,
+                is_child,
+                dirty: None,
+            });
+        }
+
         {
             let mut dir = self.state.dir_write();
-            while let Some(status) = batch.pop_front() {
-                let status = status.as_ref();
-                let attr = if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
-                    // READDIRPLUS takes a kernel lookup ref (kernel caches the
-                    // dentry and will send a FORGET); plain READDIR must not
-                    // (kernel returns names only, no lookup count, no FORGET).
-                    let inode = dir.lookup(header.nodeid, &status.name, status.clone(), plus)?;
-                    let attr = FuseUtils::status_to_attr(&self.conf, &inode.status)?;
-                    // readdir materializes the child into the dcache; count it as a
-                    // status-cache put (mirrors the pre-refactor read_dir_common).
-                    self.state.record_status_put();
-                    attr
-                } else {
-                    FuseUtils::status_to_attr(&self.conf, status)?
-                };
-
-                let entry = FuseUtils::create_entry_out(&self.conf, attr);
-                // dirent `off` is the resume cookie = position of the NEXT entry.
-                // See `readdir_next_cookie` (the infinite-loop guard).
-                let next_off = Self::readdir_next_cookie(index);
-                if !res.add_dirent(plus, next_off, status, entry) {
-                    break;
+            for entry in pending.iter_mut().filter(|e| e.is_child) {
+                // READDIRPLUS takes a kernel lookup ref (kernel caches the
+                // dentry and will send a FORGET); plain READDIR must not
+                // (kernel returns names only, no lookup count, no FORGET).
+                let inode = dir.lookup(
+                    header.nodeid,
+                    &entry.status.name,
+                    entry.status.as_ref().clone(),
+                    plus,
+                )?;
+                entry.attr.ino = inode.ino;
+                // A dirty inode keeps its local status; report that instead.
+                if inode.is_dirty() {
+                    entry.dirty = Some(inode.status.clone());
                 }
-                index += 1;
             }
+        }
+
+        for entry in pending {
+            let mut attr = entry.attr;
+            if entry.is_child {
+                // readdir materializes the child into the dcache; count it as a
+                // status-cache put (mirrors the pre-refactor read_dir_common).
+                self.state.record_status_put();
+                if let Some(status) = &entry.dirty {
+                    attr = FuseUtils::status_to_attr(&self.conf, status)?;
+                }
+            }
+
+            let out = FuseUtils::create_entry_out(&self.conf, attr);
+            // dirent `off` is the resume cookie = position of the NEXT entry.
+            // See `readdir_next_cookie` (the infinite-loop guard).
+            let next_off = Self::readdir_next_cookie(index);
+            let added = res.add_dirent(plus, next_off, &entry.status, out);
+            debug_assert!(added, "readdir entry was pre-sized to fit");
+            index += 1;
         }
         let entries = index.saturating_sub(arg.offset);
         Ok((res, entries))
@@ -3422,6 +3462,70 @@ mod tests {
         assert!(CurvineFileSystem::parse_rename2_flags(4).is_err());
         assert!(CurvineFileSystem::parse_rename2_flags(3).is_err());
         assert!(CurvineFileSystem::parse_rename2_flags(1 << 6).is_err());
+    }
+
+    #[test]
+    fn readdirplus_only_counts_entries_returned_to_kernel() {
+        use super::CurvineFileSystem;
+        use crate::fs::state::DirHandle;
+        use crate::raw::fuse_abi::fuse_read_in;
+        use crate::raw::FuseDirentList;
+        use crate::FUSE_ROOT_ID;
+        use curvine_config::ClusterConf;
+        use curvine_fs_api::ListStream;
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+        use std::sync::Arc;
+
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.metrics_enabled = false;
+        let fs = CurvineFileSystem::new(conf, rt.clone()).unwrap();
+
+        let names = ["a", "b", "c"];
+        let children = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| FileStatus::with_name(100 + i as i64, n.to_string(), false))
+            .collect();
+        let path = fs.state.get_path(FUSE_ROOT_ID).unwrap();
+        let fh = 7;
+        fs.state.insert_dir_handle(Arc::new(DirHandle::new(
+            FUSE_ROOT_ID,
+            fh,
+            &path,
+            16,
+            ListStream::from_vec(children),
+        )));
+
+        // Room for exactly two dirents; the third overflows the reply.
+        let size: usize = names[..2]
+            .iter()
+            .map(|n| FuseDirentList::dirent_len(true, n))
+            .sum();
+        let arg = fuse_read_in {
+            fh,
+            offset: 0,
+            size: size as u32,
+            ..Default::default()
+        };
+        let mut header = hdr(0, 0, 0);
+        header.nodeid = FUSE_ROOT_ID;
+
+        let (res, emitted) = rt
+            .block_on(fs.read_dir_common_inner(&header, &arg, true))
+            .unwrap();
+        assert_eq!(emitted, 2);
+        assert_eq!(res.take().len(), size);
+
+        let dir = fs.state.dir_read();
+        for name in &names[..2] {
+            let inode = dir.get_inode(FUSE_ROOT_ID, Some(name)).unwrap();
+            assert_eq!(inode.n_lookup, 1, "{name} was returned once");
+        }
+        assert!(
+            dir.get_inode(FUSE_ROOT_ID, Some("c")).is_none(),
+            "an entry the kernel never received must not take a lookup ref"
+        );
     }
 
     mod readdir_termination {
