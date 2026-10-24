@@ -29,10 +29,7 @@ pub struct ReportCommand {
 #[derive(Subcommand, Debug)]
 pub enum ReportSubCommand {
     Json,
-    All {
-        #[clap(long, default_value = "true")]
-        show_workers: bool,
-    },
+    All,
     Capacity {
         #[clap(value_name = "WORKER_ADDRESS")]
         worker_address: Option<String>,
@@ -52,8 +49,8 @@ impl ReportCommand {
                 ReportSubCommand::Json => {
                     println!("{}", report.to_json());
                 }
-                ReportSubCommand::All { show_workers } => {
-                    println!("{}", report.simple(*show_workers));
+                ReportSubCommand::All => {
+                    println!("{}", report.simple(true));
                 }
                 ReportSubCommand::Capacity { worker_address } => {
                     if let Some(addr) = worker_address {
@@ -73,7 +70,7 @@ impl ReportCommand {
                 }
             },
             None => {
-                println!("{}", report.simple(true));
+                println!("{}", report.simple(false));
             }
         }
         Ok(())
@@ -617,5 +614,66 @@ mod tests {
 
         assert!(output.contains("worker-host:1234"));
         assert!(output.contains("version=0.2.0-test"));
+    }
+
+    fn report_with_workers() -> CurvineReport {
+        CurvineReport {
+            info: FilesystemInfo {
+                live_workers: vec![WorkerInfo {
+                    address: WorkerAddress {
+                        worker_id: 1,
+                        hostname: "live-host".to_string(),
+                        ip_addr: "127.0.0.1".to_string(),
+                        rpc_port: 1234,
+                        web_port: 5678,
+                    },
+                    ..Default::default()
+                }],
+                lost_workers: vec![WorkerInfo {
+                    address: WorkerAddress {
+                        worker_id: 2,
+                        hostname: "lost-host".to_string(),
+                        ip_addr: "127.0.0.2".to_string(),
+                        rpc_port: 1234,
+                        web_port: 5678,
+                    },
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn default_report_hides_worker_lists() {
+        let output = report_with_workers().simple(false);
+
+        assert!(output.contains("live_worker_num: 1"));
+        assert!(output.contains("lost_worker_num: 1"));
+        assert!(!output.contains("live_worker_list"));
+        assert!(!output.contains("lost_worker_list"));
+        assert!(!output.contains("live-host:1234"));
+        assert!(!output.contains("lost-host:1234"));
+    }
+
+    #[test]
+    fn all_report_includes_worker_lists() {
+        let output = report_with_workers().simple(true);
+
+        assert!(output.contains("live_worker_list"));
+        assert!(output.contains("lost_worker_list"));
+        assert!(output.contains("live-host:1234"));
+        assert!(output.contains("lost-host:1234"));
+    }
+
+    #[test]
+    fn report_subcommand_selects_detail_level() {
+        let default = ReportCommand::try_parse_from(["report"]).unwrap();
+        assert!(default.action.is_none());
+
+        let all = ReportCommand::try_parse_from(["report", "all"]).unwrap();
+        assert!(matches!(all.action, Some(ReportSubCommand::All)));
+
+        assert!(ReportCommand::try_parse_from(["report", "all", "--show-workers"]).is_err());
     }
 }
