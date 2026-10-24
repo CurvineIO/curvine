@@ -15,6 +15,7 @@
 use crate::fs::dcache::DirTree;
 use crate::fs::state::file_handle::FileHandle;
 use crate::fs::state::DirHandle;
+use crate::fs::state::{DirTreeLock, DirTreeReadGuard, DirTreeWriteGuard};
 use crate::fs::{FuseReader, FuseWriter};
 use crate::fuse_metrics::{
     StateStageTimer, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT, CACHE_STATUS,
@@ -42,10 +43,10 @@ use curvine_runtime::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHas
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use std::borrow::Cow;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::Arc;
 
 pub struct NodeState {
-    dir_tree: RwLock<DirTree>,
+    dir_tree: DirTreeLock,
     writers: AsyncSharedMap<u64, FuseWriter>,
     handles: RwLockHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
     dir_handles: RwLockHashMap<u64, FastHashMap<u64, Arc<DirHandle>>>,
@@ -64,7 +65,7 @@ impl NodeState {
         let enable_meta_cache = conf.enable_meta_cache;
 
         let state = Self {
-            dir_tree: RwLock::new(DirTree::new(conf.clone())),
+            dir_tree: DirTreeLock::new(DirTree::new(conf.clone()), conf.metrics_enabled),
             writers: AsyncSharedMap::default(),
             handles: RwLockHashMap::default(),
             dir_handles: RwLockHashMap::default(),
@@ -84,12 +85,12 @@ impl NodeState {
         Ok(state)
     }
 
-    pub fn dir_write(&self) -> RwLockWriteGuard<'_, DirTree> {
-        self.dir_tree.write().unwrap()
+    pub fn dir_write(&self) -> DirTreeWriteGuard<'_> {
+        self.dir_tree.write()
     }
 
-    pub fn dir_read(&self) -> RwLockReadGuard<'_, DirTree> {
-        self.dir_tree.read().unwrap()
+    pub fn dir_read(&self) -> DirTreeReadGuard<'_> {
+        self.dir_tree.read()
     }
 
     pub fn client_conf(&self) -> &ClientConf {
