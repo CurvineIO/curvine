@@ -52,6 +52,11 @@ pub enum IoOp {
         ctrlr: CtrlHandle,
         ack: mpsc::Sender<()>,
     },
+    /// Resume admin polling after a detach attempt failed partway.
+    RegisterCtrlr {
+        ctrlr: CtrlHandle,
+        ack: mpsc::Sender<()>,
+    },
     /// Poll a retired qpair once before retrying free on the owner thread.
     PollRetiredQpair {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
@@ -448,6 +453,27 @@ impl SpdkPoller {
         }
     }
 
+    /// Resume admin polling after a failed detach; counterpart to `unregister_ctrlr`.
+    pub(crate) fn register_ctrlr(&self, ctrlr: CtrlHandle) -> UnregisterResult {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let req = IoRequest {
+            op: IoOp::RegisterCtrlr { ctrlr, ack: ack_tx },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+        let Some(tx) = &self.tx else {
+            return UnregisterResult::Disconnected;
+        };
+        if tx.send(req).is_err() {
+            return UnregisterResult::Disconnected;
+        }
+        let _ = self.eventfd.write(1);
+        match ack_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(()) => UnregisterResult::Acked,
+            Err(err) => unregister_ack_error_to_result(err),
+        }
+    }
+
     pub(crate) fn poll_retired_qpair(
         &self,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
@@ -540,6 +566,9 @@ impl SpdkPoller {
                         IoOp::UnregisterCtrlr { .. } => {
                             Self::handle_unregister_ctrlr(&req, &mut active_ctrlrs);
                         }
+                        IoOp::RegisterCtrlr { .. } => {
+                            Self::handle_register_ctrlr(&req, &mut active_ctrlrs);
+                        }
                         IoOp::PollRetiredQpair { .. } => {
                             Self::handle_poll_retired(&req);
                         }
@@ -631,6 +660,9 @@ impl SpdkPoller {
                                 }
                                 IoOp::UnregisterCtrlr { .. } => {
                                     Self::handle_unregister_ctrlr(&req, &mut active_ctrlrs);
+                                }
+                                IoOp::RegisterCtrlr { .. } => {
+                                    Self::handle_register_ctrlr(&req, &mut active_ctrlrs);
                                 }
                                 IoOp::PollRetiredQpair { .. } => {
                                     Self::handle_poll_retired(&req);
@@ -735,6 +767,16 @@ impl SpdkPoller {
         }
     }
 
+    /// Dedup-guarded: a no-op if the controller is already registered.
+    fn handle_register_ctrlr(req: &IoRequest, active_ctrlrs: &mut Vec<CtrlHandle>) {
+        if let IoOp::RegisterCtrlr { ctrlr, ack } = &req.op {
+            if !active_ctrlrs.iter().any(|active| active.0 == ctrlr.0) {
+                active_ctrlrs.push(*ctrlr);
+            }
+            let _ = ack.send(());
+        }
+    }
+
     fn handle_poll_retired(req: &IoRequest) {
         if let IoOp::PollRetiredQpair { qpair, ack } = &req.op {
             let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0) };
@@ -758,6 +800,9 @@ impl SpdkPoller {
             }
             IoOp::UnregisterCtrlr { .. } => {
                 unreachable!("UnregisterCtrlr handled by handle_unregister_ctrlr")
+            }
+            IoOp::RegisterCtrlr { .. } => {
+                unreachable!("RegisterCtrlr handled by handle_register_ctrlr")
             }
         };
 
@@ -850,6 +895,9 @@ impl SpdkPoller {
             }
             IoOp::UnregisterCtrlr { .. } => {
                 unreachable!("UnregisterCtrlr handled by handle_unregister_ctrlr")
+            }
+            IoOp::RegisterCtrlr { .. } => {
+                unreachable!("RegisterCtrlr handled by handle_register_ctrlr")
             }
         };
 

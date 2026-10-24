@@ -846,6 +846,7 @@ struct SpdkEnvTestHooks {
     poller_stop: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     unregister_qpair: Option<std::sync::Arc<dyn Fn() -> UnregisterResult + Send + Sync>>,
     unregister_ctrlr: Option<std::sync::Arc<dyn Fn() -> UnregisterResult + Send + Sync>>,
+    register_ctrlr: Option<std::sync::Arc<dyn Fn() -> UnregisterResult + Send + Sync>>,
     nvme_detach:
         Option<std::sync::Arc<dyn Fn(*mut spdk_ffi::spdk_nvme_ctrlr) -> i32 + Send + Sync>>,
     poll_retired_qpair: Option<
@@ -1675,6 +1676,14 @@ impl SpdkEnv {
         Self::validate_detach_preconditions(target_idx, self.open_handles.load(Ordering::Acquire))?;
         let rc = self.nvme_detach_ctrlr(ctrlr);
         if rc != 0 {
+            // Detach never happened; resume keep-alive polling for this
+            // still-attached controller instead of leaving it silently stuck.
+            if self.register_ctrlr_with_poller(CtrlHandle(ctrlr)) != UnregisterResult::Acked {
+                warn!(
+                    "SPDK target {}: failed to resume admin polling after nvme_detach failure",
+                    target_idx
+                );
+            }
             return err_box!(
                 "spdk_nvme_detach failed for target {}: rc={}",
                 target_idx,
@@ -1770,6 +1779,21 @@ impl SpdkEnv {
         let poller = self.poller.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(poller) = poller.as_ref() {
             poller.unregister_ctrlr(ctrlr)
+        } else {
+            UnregisterResult::Disconnected
+        }
+    }
+
+    /// Resume admin polling for a controller whose detach failed partway.
+    pub(crate) fn register_ctrlr_with_poller(&self, ctrlr: CtrlHandle) -> UnregisterResult {
+        #[cfg(test)]
+        if let Some(hook) = &self.test_hooks.register_ctrlr {
+            return hook();
+        }
+
+        let poller = self.poller.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(poller) = poller.as_ref() {
+            poller.register_ctrlr(ctrlr)
         } else {
             UnregisterResult::Disconnected
         }
@@ -2524,6 +2548,31 @@ mod test {
         assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
     }
 
+    /// A failed nvme_detach must resume admin polling, otherwise keep-alive
+    /// completions stop forever for a controller that is still attached.
+    #[test]
+    fn detach_target_requeues_poller_on_nvme_detach_failure() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::Acked));
+        env.test_hooks.nvme_detach = Some(Arc::new(|_| -libc::EIO));
+        let register_calls = Arc::new(AtomicUsize::new(0));
+        let register_calls_hook = Arc::clone(&register_calls);
+        env.test_hooks.register_ctrlr = Some(Arc::new(move || {
+            register_calls_hook.fetch_add(1, Ordering::AcqRel);
+            UnregisterResult::Acked
+        }));
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("spdk_nvme_detach failed"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+        assert_eq!(register_calls.load(Ordering::Acquire), 1);
+    }
+
     #[test]
     fn detach_target_success_marks_controller_detached() {
         let mut env = test_env();
@@ -2535,12 +2584,19 @@ mod test {
             detach_calls_hook.fetch_add(1, Ordering::AcqRel);
             0
         }));
+        let register_calls = Arc::new(AtomicUsize::new(0));
+        let register_calls_hook = Arc::clone(&register_calls);
+        env.test_hooks.register_ctrlr = Some(Arc::new(move || {
+            register_calls_hook.fetch_add(1, Ordering::AcqRel);
+            UnregisterResult::Acked
+        }));
 
         env.detach_target(0).unwrap();
 
         assert_eq!(env.controllers[0].state(), ControllerState::Detached);
         assert_eq!(env.qpair_pool.controller_stats(0x1000), (0, 0));
         assert_eq!(detach_calls.load(Ordering::Acquire), 1);
+        assert_eq!(register_calls.load(Ordering::Acquire), 0);
     }
 
     #[test]
