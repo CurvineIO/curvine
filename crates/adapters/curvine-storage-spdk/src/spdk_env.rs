@@ -847,6 +847,8 @@ struct SpdkEnvTestHooks {
     unregister_qpair: Option<std::sync::Arc<dyn Fn() -> UnregisterResult + Send + Sync>>,
     unregister_ctrlr: Option<std::sync::Arc<dyn Fn() -> UnregisterResult + Send + Sync>>,
     register_ctrlr: Option<std::sync::Arc<dyn Fn() -> UnregisterResult + Send + Sync>>,
+    /// Test-only override to avoid waiting out the real multi-second deadline.
+    ctrlr_poller_ack_retry_deadline: Option<Duration>,
     nvme_detach:
         Option<std::sync::Arc<dyn Fn(*mut spdk_ffi::spdk_nvme_ctrlr) -> i32 + Send + Sync>>,
     poll_retired_qpair: Option<
@@ -1103,6 +1105,10 @@ impl SpdkEnv {
 
     /// Maximum time `shutdown()` will wait for in-flight handles to close.
     const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Bound on retrying a ctrlr register/unregister ack (a single 100ms wait
+    /// can be missed under load, since the poller drains its whole queue first).
+    const CTRLR_POLLER_ACK_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// Shutdown: detach controllers, free hugepages
     pub fn shutdown(&self) {
@@ -1658,7 +1664,7 @@ impl SpdkEnv {
                 target_idx
             );
         }
-        let unregister_result = self.unregister_ctrlr_from_poller(CtrlHandle(ctrlr));
+        let unregister_result = self.unregister_ctrlr_from_poller_until_acked(CtrlHandle(ctrlr));
         match unregister_result {
             UnregisterResult::Acked => {}
             UnregisterResult::Disconnected if self.poller.lock().unwrap().is_none() => {
@@ -1678,7 +1684,9 @@ impl SpdkEnv {
         if rc != 0 {
             // Detach never happened; resume keep-alive polling for this
             // still-attached controller instead of leaving it silently stuck.
-            if self.register_ctrlr_with_poller(CtrlHandle(ctrlr)) != UnregisterResult::Acked {
+            if self.register_ctrlr_with_poller_until_acked(CtrlHandle(ctrlr))
+                != UnregisterResult::Acked
+            {
                 warn!(
                     "SPDK target {}: failed to resume admin polling after nvme_detach failure",
                     target_idx
@@ -1784,6 +1792,33 @@ impl SpdkEnv {
         }
     }
 
+    /// Retry a ctrlr unregister ack instead of giving up on one missed 100ms window.
+    fn unregister_ctrlr_from_poller_until_acked(&self, ctrlr: CtrlHandle) -> UnregisterResult {
+        self.retry_ctrlr_poller_ack_until_acked(|| self.unregister_ctrlr_from_poller(ctrlr))
+    }
+
+    /// Shared retry loop: only `TimedOut` is retried, `Disconnected` returns immediately.
+    fn retry_ctrlr_poller_ack_until_acked(
+        &self,
+        mut attempt: impl FnMut() -> UnregisterResult,
+    ) -> UnregisterResult {
+        #[cfg(test)]
+        let retry_timeout = self
+            .test_hooks
+            .ctrlr_poller_ack_retry_deadline
+            .unwrap_or(Self::CTRLR_POLLER_ACK_RETRY_TIMEOUT);
+        #[cfg(not(test))]
+        let retry_timeout = Self::CTRLR_POLLER_ACK_RETRY_TIMEOUT;
+
+        let deadline = Instant::now() + retry_timeout;
+        loop {
+            let result = attempt();
+            if result != UnregisterResult::TimedOut || Instant::now() >= deadline {
+                return result;
+            }
+        }
+    }
+
     /// Resume admin polling for a controller whose detach failed partway.
     pub(crate) fn register_ctrlr_with_poller(&self, ctrlr: CtrlHandle) -> UnregisterResult {
         #[cfg(test)]
@@ -1797,6 +1832,11 @@ impl SpdkEnv {
         } else {
             UnregisterResult::Disconnected
         }
+    }
+
+    /// Retry a ctrlr register ack; symmetric with the unregister-side retry.
+    fn register_ctrlr_with_poller_until_acked(&self, ctrlr: CtrlHandle) -> UnregisterResult {
+        self.retry_ctrlr_poller_ack_until_acked(|| self.register_ctrlr_with_poller(ctrlr))
     }
 
     fn nvme_detach_ctrlr(&self, ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr) -> i32 {
@@ -2513,6 +2553,8 @@ mod test {
     fn detach_target_rejects_unregister_ctrlr_timeout() {
         let mut env = test_env();
         add_test_controller(&mut env, 0, 0x1000);
+        // Shrink the retry budget so this always-TimedOut hook gives up fast.
+        env.test_hooks.ctrlr_poller_ack_retry_deadline = Some(Duration::from_millis(50));
         env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::TimedOut));
         let detach_calls = Arc::new(AtomicUsize::new(0));
         let detach_calls_hook = Arc::clone(&detach_calls);
@@ -2530,6 +2572,28 @@ mod test {
         assert!(err.contains("TimedOut"), "unexpected error: {err}");
         assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
         assert_eq!(detach_calls.load(Ordering::Acquire), 0);
+    }
+
+    /// A single missed ack window must not be treated as final.
+    #[test]
+    fn detach_target_retries_unregister_ctrlr_until_acked() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+        let unregister_calls = Arc::new(AtomicUsize::new(0));
+        let unregister_calls_hook = Arc::clone(&unregister_calls);
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(move || {
+            if unregister_calls_hook.fetch_add(1, Ordering::AcqRel) < 2 {
+                UnregisterResult::TimedOut
+            } else {
+                UnregisterResult::Acked
+            }
+        }));
+
+        env.detach_target(0).unwrap();
+
+        assert_eq!(env.controllers[0].state(), ControllerState::Detached);
+        assert_eq!(unregister_calls.load(Ordering::Acquire), 3);
     }
 
     #[test]
@@ -2571,6 +2635,32 @@ mod test {
         );
         assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
         assert_eq!(register_calls.load(Ordering::Acquire), 1);
+    }
+
+    /// Register side mirrors the unregister-side retry-until-acked guarantee.
+    #[test]
+    fn detach_target_retries_register_ctrlr_until_acked() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::Acked));
+        env.test_hooks.nvme_detach = Some(Arc::new(|_| -libc::EIO));
+        let register_calls = Arc::new(AtomicUsize::new(0));
+        let register_calls_hook = Arc::clone(&register_calls);
+        env.test_hooks.register_ctrlr = Some(Arc::new(move || {
+            if register_calls_hook.fetch_add(1, Ordering::AcqRel) < 2 {
+                UnregisterResult::TimedOut
+            } else {
+                UnregisterResult::Acked
+            }
+        }));
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("spdk_nvme_detach failed"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(register_calls.load(Ordering::Acquire), 3);
     }
 
     #[test]
