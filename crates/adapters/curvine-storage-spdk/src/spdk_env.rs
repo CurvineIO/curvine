@@ -1586,6 +1586,7 @@ impl SpdkEnv {
             ControllerState::Detached => return Ok(()),
             ControllerState::Detaching => {}
             ControllerState::Active => {
+                // Fast-fail only; the real guard is the check before nvme_detach below.
                 Self::validate_detach_preconditions(
                     target_idx,
                     self.open_handles.load(Ordering::Acquire),
@@ -1634,6 +1635,8 @@ impl SpdkEnv {
                 );
             }
         }
+        // Re-check every attempt (a retry may have a newly-opened handle).
+        Self::validate_detach_preconditions(target_idx, self.open_handles.load(Ordering::Acquire))?;
         let rc = self.nvme_detach_ctrlr(ctrlr);
         if rc != 0 {
             return err_box!(
@@ -2310,6 +2313,30 @@ mod test {
             err.contains("still has deferred qpairs"),
             "unexpected error: {err}"
         );
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+    }
+
+    /// A retry must still reject a newly-opened handle, not reach nvme_detach.
+    #[test]
+    fn detach_target_retry_rechecks_open_handles_before_nvme_detach() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+        env.deferred_qpairs.lock().unwrap().insert(0x2000, 0x1000);
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+        assert!(
+            err.contains("still has deferred qpairs"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+
+        // Clear the first failure and simulate a handle opening before retry.
+        env.deferred_qpairs.lock().unwrap().clear();
+        env.open_handles.store(1, Ordering::Release);
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+        assert!(err.contains("while 1 handle"), "unexpected error: {err}");
         assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
     }
 
