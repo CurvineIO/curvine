@@ -1059,13 +1059,17 @@ impl SpdkEnv {
 
     /// Shutdown: detach controllers, free hugepages
     pub fn shutdown(&self) {
-        let _lifecycle = self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if !self.begin_shutdown_attempt() {
-            return;
+        {
+            // Only hold `lifecycle` for the CAS — holding it across the drain
+            // wait would block a concurrent acquire_handle() for up to
+            // SHUTDOWN_DRAIN_TIMEOUT, so open_handles could never reach 0.
+            let _lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !self.begin_shutdown_attempt() {
+                return;
+            }
         }
 
         info!(
@@ -1089,6 +1093,10 @@ impl SpdkEnv {
                     count,
                     Self::SHUTDOWN_DRAIN_TIMEOUT.as_secs()
                 );
+                let _lifecycle = self
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 self.resolve_deferred_qpairs();
                 return;
             }
@@ -1101,6 +1109,13 @@ impl SpdkEnv {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+
+        // Re-acquire lifecycle for the teardown phase, to stay serialized
+        // against a concurrent detach_target().
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // First resolve records already retired while the poller can still drain
         // completions before a retrying free. Stopping first would make a busy
@@ -1283,12 +1298,12 @@ impl SpdkEnv {
     // Handle tracking, which is used by SpdkBdev open/drop
     /// Register SpdkBdev handle. Returns Err if not Initialized.
     pub fn acquire_handle(&self) -> CommonResult<()> {
+        // Increment before locking so shutdown sees this open while blocked.
+        self.open_handles.fetch_add(1, Ordering::AcqRel);
         let _lifecycle = self
             .lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Increment first so shutdown() sees us in the drain loop.
-        self.open_handles.fetch_add(1, Ordering::AcqRel);
         // Now verify the state — if shutdown already won the CAS, undo.
         if self.state() != SpdkEnvState::Initialized {
             self.open_handles.fetch_sub(1, Ordering::AcqRel);
@@ -3159,6 +3174,52 @@ mod test {
         drop(guard);
         handle.join().unwrap();
         assert!(entered.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn acquire_handle_does_not_block_behind_shutdown_drain_wait() {
+        let mut env = SpdkEnv::new(SpdkConf::default()).unwrap();
+        let detach_calls = Arc::new(AtomicUsize::new(0));
+        let fini_calls = Arc::new(AtomicUsize::new(0));
+        let detach_calls_hook = Arc::clone(&detach_calls);
+        let fini_calls_hook = Arc::clone(&fini_calls);
+        env.test_hooks.detach_controllers = Some(Arc::new(move || {
+            detach_calls_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.test_hooks.env_fini = Some(Arc::new(move || {
+            fini_calls_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+        // Simulate a handle that is already open and won't close for a while
+        // — forces shutdown()'s drain-wait loop to keep sleeping.
+        env.open_handles.store(1, Ordering::Release);
+
+        let env = Arc::new(env);
+        let env_for_shutdown = Arc::clone(&env);
+        let shutdown_handle = thread::spawn(move || env_for_shutdown.shutdown());
+
+        // Give shutdown() time to win the CAS and enter the drain-wait loop.
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(env.state(), SpdkEnvState::ShutDown);
+
+        // Simulate a nested open() during shutdown's drain; before the fix
+        // this blocked on the same lock for the whole drain wait.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let env_for_probe = Arc::clone(&env);
+        thread::spawn(move || {
+            let _ = tx.send(env_for_probe.acquire_handle());
+        });
+        let probe_result = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("acquire_handle must not block behind shutdown's drain-wait loop");
+        assert!(probe_result.is_err());
+
+        // Let the original handle "close" and allow shutdown() to finish cleanly.
+        env.open_handles.store(0, Ordering::Release);
+        shutdown_handle.join().unwrap();
+        assert_eq!(detach_calls.load(Ordering::Acquire), 1);
+        assert_eq!(fini_calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
