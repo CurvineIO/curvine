@@ -866,9 +866,7 @@ impl Drop for SpdkBdev {
             std::time::Duration::from_millis(1),
             std::time::Duration::from_millis(100),
         );
-        if outcome == DrainOutcome::TimedOut {
-            self.defer_dma_buffers();
-        }
+        self.handle_drain_outcome(outcome);
 
         if let Some(env) = env {
             env.release_handle();
@@ -882,6 +880,15 @@ impl Drop for SpdkBdev {
 }
 
 impl SpdkBdev {
+    /// Apply the result of waiting for in-flight I/O to drain during drop:
+    /// on timeout, defer DMA buffers into the retired registry instead of
+    /// dropping them, since a late completion may still write into them.
+    fn handle_drain_outcome(&mut self, outcome: DrainOutcome) {
+        if outcome == DrainOutcome::TimedOut {
+            self.defer_dma_buffers();
+        }
+    }
+
     fn defer_dma_buffers(&mut self) {
         self.retired_dma.defer(
             self.name.clone(),
@@ -972,13 +979,15 @@ mod test {
         assert_eq!(inflight.load(Ordering::Acquire), 0);
     }
 
-    #[test]
-    fn defer_dma_buffers_moves_bdev_buffers_to_retired_registry() {
+    /// Builds a fake `SpdkBdev` (no real FFI pointers) for testing the DMA
+    /// buffer drain/defer wiring in isolation.
+    fn fake_bdev_for_drain_test(
+        inflight: Arc<AtomicUsize>,
+        retired_dma: Arc<RetiredDmaRegistry>,
+    ) -> ManuallyDrop<SpdkBdev> {
         let (tx, _rx) = crossbeam::channel::unbounded();
-        let retired_dma = RetiredDmaRegistry::new();
-        let inflight = Arc::new(AtomicUsize::new(1));
         let eventfd = Arc::new(EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK).unwrap());
-        let mut bdev = ManuallyDrop::new(SpdkBdev {
+        ManuallyDrop::new(SpdkBdev {
             name: "test-bdev".to_string(),
             size: 4096,
             block_size: 4096,
@@ -996,9 +1005,16 @@ mod test {
             },
             ctrlr: std::ptr::null_mut(),
             io_timeout_ms: 1,
-            inflight: inflight.clone(),
-            retired_dma: retired_dma.clone(),
-        });
+            inflight,
+            retired_dma,
+        })
+    }
+
+    #[test]
+    fn defer_dma_buffers_moves_bdev_buffers_to_retired_registry() {
+        let retired_dma = RetiredDmaRegistry::new();
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let mut bdev = fake_bdev_for_drain_test(inflight.clone(), retired_dma.clone());
 
         bdev.defer_dma_buffers();
 
@@ -1009,6 +1025,40 @@ mod test {
         inflight.store(0, Ordering::Release);
         assert_eq!(retired_dma.reclaim(), 1);
         assert_eq!(retired_dma.count(), 0);
+    }
+
+    /// Guards `Drop::drop()`'s wiring: calls `handle_drain_outcome` directly, so
+    /// this fails if TimedOut ever stops deferring the DMA buffers.
+    #[test]
+    fn handle_drain_outcome_defers_on_timeout() {
+        let retired_dma = RetiredDmaRegistry::new();
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let mut bdev = fake_bdev_for_drain_test(inflight.clone(), retired_dma.clone());
+
+        bdev.handle_drain_outcome(DrainOutcome::TimedOut);
+
+        assert_eq!(retired_dma.count(), 1);
+        assert!(bdev.read_buf.is_none());
+        assert!(bdev.write_buf.is_none());
+        assert_eq!(retired_dma.reclaim(), 0);
+        inflight.store(0, Ordering::Release);
+        assert_eq!(retired_dma.reclaim(), 1);
+        assert_eq!(retired_dma.count(), 0);
+    }
+
+    /// Complementary guard: on `Completed`, buffers must NOT be deferred —
+    /// catches a regression that defers unconditionally regardless of outcome.
+    #[test]
+    fn handle_drain_outcome_keeps_buffers_on_completed() {
+        let retired_dma = RetiredDmaRegistry::new();
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let mut bdev = fake_bdev_for_drain_test(inflight, retired_dma.clone());
+
+        bdev.handle_drain_outcome(DrainOutcome::Completed);
+
+        assert_eq!(retired_dma.count(), 0);
+        assert!(bdev.read_buf.is_some());
+        assert!(bdev.write_buf.is_some());
     }
 
     /// A reclaimable retired entry must be released before
