@@ -44,6 +44,11 @@ use log::{debug, error, info, warn};
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+enum StatProbe {
+    Hit(FileStatus),
+    Miss(Path),
+}
+
 pub struct NodeState {
     dir_tree: RwLock<DirTree>,
     writers: AsyncSharedMap<u64, FuseWriter>,
@@ -1023,20 +1028,46 @@ impl NodeState {
             .map(|inode| inode.clone_status())
     }
 
-    pub async fn fs_stat(&self, ino: u64, name: Option<&str>) -> FuseResult<FileStatus> {
-        // An unlinked inode can remain addressable by nodeid until the kernel
-        // releases its lookup/open references. Its former path no longer exists.
-        if name.is_none() {
-            if let Some(status) = self.unlinked_status(ino) {
-                return Ok(status);
+    /// Resolve unlinked status, cached status, or the backend path under one read guard.
+    fn probe_status(&self, ino: u64, name: Option<&str>) -> FuseResult<StatProbe> {
+        let cached = {
+            let dir = self.dir_read();
+            // An unlinked inode can remain addressable by nodeid until the kernel
+            // releases its lookup/open references. Its former path no longer exists.
+            if name.is_none() {
+                if let Some(inode) = dir.get_inode(ino, None).filter(|i| i.is_unlinked()) {
+                    return Ok(StatProbe::Hit(inode.clone_status()));
+                }
             }
-        }
 
-        if let Some(status) = self.get_cached_status(ino, name, false)? {
-            return Ok(status);
-        }
+            dir.check_deleted_child(ino, name)?;
+            let cached = if self.enable_meta_cache {
+                dir.get_valid_inode(ino, name, self.meta_cache_ttl)
+                    .map(|inode| inode.status.clone())
+            } else {
+                None
+            };
+            cached.ok_or_else(|| dir.get_path_common(ino, name))
+        };
 
-        let path = self.get_path_common(ino, name)?;
+        if self.enable_meta_cache {
+            self.record_status_cache(if cached.is_ok() {
+                CACHE_RESULT_HIT
+            } else {
+                CACHE_RESULT_MISS
+            });
+        }
+        match cached {
+            Ok(status) => Ok(StatProbe::Hit(status)),
+            Err(path) => Ok(StatProbe::Miss(path?)),
+        }
+    }
+
+    pub async fn fs_stat(&self, ino: u64, name: Option<&str>) -> FuseResult<FileStatus> {
+        let path = match self.probe_status(ino, name)? {
+            StatProbe::Hit(status) => return Ok(status),
+            StatProbe::Miss(path) => path,
+        };
         let status = self.fs.get_status(&path).await?;
 
         self.cache_resolved_status(ino, name, &status);
@@ -1045,14 +1076,10 @@ impl NodeState {
     }
 
     pub async fn fs_stat_guarded(&self, ino: u64) -> FuseResult<FileStatus> {
-        if let Some(status) = self.unlinked_status(ino) {
-            return Ok(status);
-        }
-        if let Some(status) = self.get_cached_status(ino, None, false)? {
-            return Ok(status);
-        }
-
-        let path = self.get_path(ino)?;
+        let path = match self.probe_status(ino, None)? {
+            StatProbe::Hit(status) => return Ok(status),
+            StatProbe::Miss(path) => path,
+        };
         let _guard = self.lock_path(&path).await;
         if let Some(status) = self.unlinked_status(ino) {
             return Ok(status);
