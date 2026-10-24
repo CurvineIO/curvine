@@ -63,6 +63,7 @@ impl VfsDir {
         let stats = FsStats::new(&stg_dir);
 
         // SPDK: skip filesystem (no local dir, version file, or filesystem checks).
+        // TODO(spdk): persist dir_id for SpdkDisk too; it's regenerated randomly every restart, breaking the dir_id-to-bdev binding.
         if conf.storage_type != StorageType::SpdkDisk {
             FileUtils::create_dir(stats.path(), true)?;
             stats.check_dir()?;
@@ -73,30 +74,30 @@ impl VfsDir {
 
         // SPDK: resolve bdev name from global SpdkEnv (one bdev per data_dir)
         #[cfg(feature = "spdk")]
-        let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::SpdkDisk {
-            use curvine_storage_spdk::SpdkEnv;
+        let bdev_name: Option<(String, i64, i64)> = if conf.storage_type == StorageType::SpdkDisk {
             let env = SpdkEnv::global().ok_or_else(|| {
                 curvine_core_error::err_msg!(
                     "StorageType::SpdkDisk dir '{}' requires SPDK environment, but it is not initialized",
                     conf.path
                 )
             })?;
-            let names = env.bdev_names();
-            if names.is_empty() {
+            let slot_count = env.bdev_slot_count();
+            if slot_count == 0 {
                 return curvine_core_error::err_box!(
                     "StorageType::SpdkDisk dir '{}' but no bdevs discovered from SPDK targets",
                     conf.path
                 );
             }
-            let idx = version.dir_id as usize % names.len();
-            let name = names[idx].clone();
-            let bdev_info = env.get_bdev(&name);
-            let bdev_cap = bdev_info.map(|b| b.size_bytes as i64).unwrap_or(0);
+            let idx = version.dir_id as usize % slot_count;
+            let bdev_info = env.active_bdev_at_slot(idx)?;
+            let name = bdev_info.name.clone();
+            let bdev_cap = bdev_info.size_bytes as i64;
+            let bdev_block_size = bdev_info.block_size as i64;
             info!(
-                "SPDK dir '{}' (dir_id={}) mapped to bdev '{}' (capacity={})",
-                conf.path, version.dir_id, name, bdev_cap
+                "SPDK dir '{}' (dir_id={}) mapped to bdev slot {} '{}' (capacity={})",
+                conf.path, version.dir_id, idx, name, bdev_cap
             );
-            Some((name, bdev_cap))
+            Some((name, bdev_cap, bdev_block_size))
         } else {
             None
         };
@@ -109,16 +110,7 @@ impl VfsDir {
             None
         };
         let (bdev_name_str, bdev_capacity, bdev_block_size) = match bdev_name {
-            Some((name, cap)) => {
-                #[cfg(feature = "spdk")]
-                let bs = SpdkEnv::global()
-                    .and_then(|env: &curvine_storage_spdk::SpdkEnv| env.get_bdev(&name))
-                    .map(|b| b.block_size as i64)
-                    .unwrap_or(DEFAULT_BLOCK_ALIGN);
-                #[cfg(not(feature = "spdk"))]
-                let bs = DEFAULT_BLOCK_ALIGN;
-                (Some(name), cap, bs)
-            }
+            Some((name, cap, bs)) => (Some(name), cap, bs),
             None => (None, 0, DEFAULT_BLOCK_ALIGN),
         };
 
