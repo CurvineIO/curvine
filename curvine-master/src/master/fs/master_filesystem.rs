@@ -275,6 +275,7 @@ impl MasterFilesystem {
         } else {
             fs_dir.delete(&inp, recursive)?
         };
+        delete_res.trashed = soft_delete;
         drop(fs_dir);
 
         let mut worker_manager = self.worker_manager.write();
@@ -282,6 +283,7 @@ impl MasterFilesystem {
             inodes: 0,
             bytes: 0,
             blocks: std::mem::take(&mut delete_res.blocks),
+            trashed: false,
         });
 
         Ok(delete_res)
@@ -300,6 +302,7 @@ impl MasterFilesystem {
             inodes: 0,
             bytes: 0,
             blocks: std::mem::take(&mut free_res.blocks),
+            trashed: false,
         });
 
         Ok(free_res)

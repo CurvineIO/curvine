@@ -217,7 +217,10 @@ impl FsClient {
         };
 
         let rep: DeleteResponse = self.rpc(RpcCode::Delete, header).await?;
-        Ok(ProtoUtils::delete_res_from_pb(rep.res.unwrap_or_default()))
+        let trashed = rep.trashed();
+        let mut res = ProtoUtils::delete_res_from_pb(rep.res.unwrap_or_default());
+        res.trashed = trashed;
+        Ok(res)
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {

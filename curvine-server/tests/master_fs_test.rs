@@ -2200,7 +2200,7 @@ fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
     let fs = handler.clone_fs();
 
     fs.create("/skip.log", true)?;
-    handler.delete0(
+    let res = handler.delete0(
         Utils::req_id(),
         DeleteRequest {
             path: "/skip.log".to_string(),
@@ -2208,11 +2208,12 @@ fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
             skip_trash: Some(true),
         },
     )?;
+    assert!(!res.trashed);
     assert!(fs.get_block_locations("/skip.log").is_err());
     assert!(fs.list_options("/.Trash", Default::default()).is_err());
 
     fs.create("/soft.log", true)?;
-    handler.delete0(
+    let res = handler.delete0(
         Utils::req_id(),
         DeleteRequest {
             path: "/soft.log".to_string(),
@@ -2220,6 +2221,7 @@ fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
             skip_trash: Some(false),
         },
     )?;
+    assert!(res.trashed);
     assert!(fs.get_block_locations("/soft.log").is_err());
     assert_eq!(fs.list_options("/.Trash", Default::default())?.len(), 1);
 
