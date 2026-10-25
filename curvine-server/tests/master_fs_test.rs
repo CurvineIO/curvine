@@ -29,7 +29,7 @@ use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
     CreateFileRequest, DeleteRequest, EmptyTrashRequest, EmptyTrashResponse,
     GetFilesystemInfoRequest, ListTrashRequest, ListTrashResponse, MkdirOptsProto, MkdirRequest,
-    MountRequest, RenameRequest, RestoreTrashRequest,
+    MountRequest, RenameRequest, RestoreTrashRequest, RestoreTrashResponse,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -2267,7 +2267,17 @@ fn trash_rpc_list_restore_empty() -> CommonResult<()> {
         })
         .build();
     let mut restore_ctx = RpcContext::new(&restore_msg);
-    handler.retry_check_restore_trash(&mut restore_ctx)?;
+    let restore_rep = handler
+        .retry_check_restore_trash(&mut restore_ctx)?
+        .parse_header::<RestoreTrashResponse>()?;
+    assert_eq!(restore_rep.dst.as_deref(), Some("/rpc/a.log"));
+    assert_eq!(
+        restore_rep
+            .status
+            .as_ref()
+            .map(|status| status.path.as_str()),
+        Some("/rpc/a.log")
+    );
     assert!(fs.get_block_locations("/rpc/a.log").is_ok());
     assert!(fs.list_trash()?.is_empty());
 
@@ -2301,25 +2311,25 @@ fn trash_rpc_list_paginates() -> CommonResult<()> {
     let handler = new_handler_with_conf("trash-page", |conf| conf.master.trash_enabled = true);
     let fs = handler.clone_fs();
 
-    for i in 0..5 {
+    for i in 0..250 {
         let path = format!("/page/f{}.log", i);
         fs.create(&path, true)?;
         fs.delete_with_opts(&path, false, false)?;
     }
     let expected: Vec<String> = fs.list_trash()?.into_iter().map(|e| e.path).collect();
-    assert_eq!(expected.len(), 5);
+    assert_eq!(expected.len(), 250);
 
     let mut seen = Vec::new();
     let mut page_token: Option<String> = None;
     let mut pages = 0;
     loop {
         pages += 1;
-        assert!(pages <= expected.len());
+        assert!(pages <= 3);
 
         let msg = Builder::new_rpc(RpcCode::ListTrash)
             .proto_header(ListTrashRequest {
                 page_token: page_token.clone(),
-                page_size: Some(2),
+                page_size: Some(100),
             })
             .build();
         let mut ctx = RpcContext::new(&msg);
@@ -2327,7 +2337,7 @@ fn trash_rpc_list_paginates() -> CommonResult<()> {
             .list_trash(&mut ctx)?
             .parse_header::<ListTrashResponse>()?;
         assert!(!rep.entries.is_empty());
-        assert!(rep.entries.len() <= 2);
+        assert!(rep.entries.len() <= 100);
         seen.extend(rep.entries.into_iter().map(|e| e.path));
 
         match rep.next_page_token.filter(|token| !token.is_empty()) {
@@ -2338,14 +2348,116 @@ fn trash_rpc_list_paginates() -> CommonResult<()> {
     assert_eq!(pages, 3);
     assert_eq!(seen, expected);
 
+    // Page sizes below the minimum are clamped so a listing cannot degenerate
+    // into one RPC per entry.
+    let msg = Builder::new_rpc(RpcCode::ListTrash)
+        .proto_header(ListTrashRequest {
+            page_token: None,
+            page_size: Some(1),
+        })
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    let rep = handler
+        .list_trash(&mut ctx)?
+        .parse_header::<ListTrashResponse>()?;
+    assert_eq!(rep.entries.len(), 100);
+    assert!(rep.next_page_token.is_some());
+
     let msg = Builder::new_rpc(RpcCode::ListTrash)
         .proto_header(ListTrashRequest {
             page_token: Some("invalid-token".to_string()),
-            page_size: Some(2),
+            page_size: Some(100),
         })
         .build();
     let mut ctx = RpcContext::new(&msg);
     assert!(handler.list_trash(&mut ctx).is_err());
+
+    Ok(())
+}
+
+#[test]
+fn restore_trash_checks_the_effective_destination_mount() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-restore-mount", |conf| {
+        conf.master.trash_enabled = true
+    });
+    let fs = handler.clone_fs();
+
+    for (cv_path, write_type) in [
+        ("/cache-mode", WriteType::CacheMode),
+        ("/fs-mode", WriteType::FsMode),
+    ] {
+        mount_for_test(&handler, cv_path, write_type)?;
+    }
+
+    fs.create("/data/a.log", true)?;
+    fs.delete_with_opts("/data/a.log", false, false)?;
+    let entry = fs.list_trash()?.remove(0);
+
+    let err = handler
+        .restore_trash0(
+            1,
+            RestoreTrashRequest {
+                path: entry.path.clone(),
+                dst: Some("/cache-mode/a.log".to_string()),
+                overwrite: Some(false),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, FsError::Unsupported(_)), "got {err:?}");
+
+    let err = handler
+        .restore_trash0(
+            2,
+            RestoreTrashRequest {
+                path: entry.path.clone(),
+                dst: Some("/fs-mode".to_string()),
+                overwrite: Some(false),
+            },
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("mount point root"), "got {err}");
+
+    // fs-mode reads fall back to CV blocks, so restoring below such a mount is
+    // safe even when the client names the destination.
+    let restored = handler
+        .restore_trash0(
+            3,
+            RestoreTrashRequest {
+                path: entry.path.clone(),
+                dst: Some("/fs-mode/a.log".to_string()),
+                overwrite: Some(false),
+            },
+        )
+        .unwrap();
+    assert_eq!(restored.dst.as_deref(), Some("/fs-mode/a.log"));
+    assert_eq!(
+        restored.status.as_ref().map(|status| status.path.as_str()),
+        Some("/fs-mode/a.log")
+    );
+    assert!(fs.list_trash()?.is_empty());
+
+    // A default restore resolves the recorded origin on the master, so a direct
+    // RPC cannot bypass the cache-mode check by omitting dst.
+    fs.create("/cache-mode/b.log", true)?;
+    fs.delete_with_opts("/cache-mode/b.log", false, false)?;
+    let cache_entry = fs
+        .list_trash()?
+        .into_iter()
+        .find(|entry| entry.origin == "/cache-mode/b.log")
+        .unwrap();
+    let err = handler
+        .restore_trash0(
+            4,
+            RestoreTrashRequest {
+                path: cache_entry.path,
+                dst: None,
+                overwrite: Some(false),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, FsError::Unsupported(_)), "got {err:?}");
+    assert_eq!(fs.list_trash()?.len(), 1);
 
     Ok(())
 }

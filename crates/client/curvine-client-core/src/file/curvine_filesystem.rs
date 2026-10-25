@@ -27,7 +27,7 @@ use curvine_model::{CommitBlock, DeleteResult, FreeResult, ListOptions};
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     FilesystemInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
-    SetAttrOpts, TrashEntry,
+    RestoreTrashResult, SetAttrOpts, TrashEntry,
 };
 use curvine_proto::GetCvMetadataSnapshotPageResponse;
 use curvine_rpc::client::ClientConf;
@@ -199,6 +199,14 @@ impl CurvineFileSystem {
             .await
     }
 
+    pub async fn list_trash_page(
+        &self,
+        page_token: Option<String>,
+        page_size: Option<u32>,
+    ) -> FsResult<(Vec<TrashEntry>, Option<String>)> {
+        self.fs_client.list_trash_page(page_token, page_size).await
+    }
+
     pub async fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
         self.fs_client.list_trash().await
     }
@@ -208,7 +216,7 @@ impl CurvineFileSystem {
         path: &Path,
         dst: Option<&Path>,
         overwrite: bool,
-    ) -> FsResult<()> {
+    ) -> FsResult<RestoreTrashResult> {
         self.fs_client.restore_trash(path, dst, overwrite).await
     }
 
