@@ -20,11 +20,12 @@ use crate::master::meta::inode::InodeView;
 use crate::master::quota::eviction::evictor::Evictor;
 use crate::master::quota::eviction::types::EvictPlan;
 use crate::master::quota::eviction::EvictionConf;
-use crate::master::quota::eviction::EvictionMode;
 use crate::master::Master;
+use curvine_error::FsError;
 use curvine_model::FilesystemInfo;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use parking_lot::RwLock;
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -134,57 +135,29 @@ impl QuotaManager {
             curvine_used, curvine_quota, (curvine_used as f64 / curvine_quota as f64) * 100.0, plan.target_free_bytes
         );
 
-        loop {
-            let step_free = plan.target_free_bytes;
-
-            if step_free <= 0 {
-                log::debug!("cluster-evict: step_free <= 0, stopping eviction");
-                break;
-            }
-
-            let inode_ids = self
-                .evictor
-                .select_victims(self.eviction_conf.candidate_scan_page);
-
-            if inode_ids.is_empty() {
-                log::debug!("cluster-evict: no more victims available, stopping eviction");
-                break;
-            }
-
-            if self.eviction_conf.dry_run {
-                log::debug!(
-                    "cluster-evict: dry_run=true, would process inode_ids_step={}",
-                    inode_ids.len()
-                );
-                break;
-            }
-
-            let total_freed = {
-                let fs_guard = self.fs.fs_dir.read();
-                let freed = inode_ids
-                    .iter()
-                    .filter_map(|&inode_id| fs_guard.store.get_inode(inode_id, None).ok().flatten())
-                    .map(|inode_view| match &inode_view {
-                        InodeView::File(f) => f.len.max(0),
-                        _ => 0,
-                    })
-                    .sum::<i64>();
-                freed
-            };
-
-            if total_freed <= 0 {
-                log::debug!("cluster-evict: total_freed <= 0, stopping eviction");
-                break;
-            }
-
-            self.execute_eviction(self.eviction_conf.eviction_mode, &inode_ids);
-
-            plan.target_free_bytes = plan.target_free_bytes.saturating_sub(total_freed);
-
-            if plan.target_free_bytes <= 0 {
-                log::info!("cluster-evict: reached target_free_bytes, stopping eviction");
-                break;
-            }
+        // Quota eviction is a scan, not a single page: keep moving the cursor
+        // past candidates that cannot be reclaimed yet (live files, trash) and
+        // stop only when the target is met, the candidate set is exhausted, or
+        // the per-trigger scan budget is spent.
+        let ttl_executor_guard = self.ttl_executor.read();
+        let Some(ttl_executor) = ttl_executor_guard.as_ref() else {
+            log::warn!("cluster-evict: ttl_executor not initialized, skipping eviction");
+            return;
+        };
+        let (examined, reclaimed) = run_eviction_plan(
+            &self.fs,
+            self.evictor.as_ref(),
+            ttl_executor,
+            &self.eviction_conf,
+            &mut plan,
+        );
+        if reclaimed > 0 {
+            log::info!(
+                "cluster-evict: trigger finished, examined={}, reclaimed={}, target_left={}",
+                examined,
+                reclaimed,
+                plan.target_free_bytes
+            );
         }
     }
 
@@ -213,75 +186,325 @@ impl QuotaManager {
             target_free_bytes,
         })
     }
+}
 
-    fn execute_eviction(&self, _mode: EvictionMode, inode_ids: &[i64]) {
-        let ttl_executor_guard = self.ttl_executor.read();
-        let Some(ttl_executor) = ttl_executor_guard.as_ref() else {
-            log::warn!("cluster-evict: ttl_executor not initialized, skipping eviction");
-            return;
-        };
+/// Runs one eviction trigger and returns `(examined, reclaimed_bytes)`.
+///
+/// `evictor.select_victims` always returns the same coldest prefix, so the loop
+/// advances with an explicit skip set: candidates that are not reclaimable now
+/// stay in the evictor but are not revisited within this trigger. Only bytes
+/// that were actually released count toward the target.
+fn run_eviction_plan(
+    fs: &MasterFilesystem,
+    evictor: &dyn Evictor,
+    ttl_executor: &InodeTtlExecutor,
+    conf: &EvictionConf,
+    plan: &mut EvictPlan,
+) -> (usize, i64) {
+    let mut skipped: HashSet<i64> = HashSet::new();
+    let mut examined = 0usize;
+    let mut total_reclaimed = 0i64;
 
-        let metrics = match Master::get_metrics() {
-            Ok(metrics) => metrics,
-            Err(e) => {
-                log::warn!("cluster-evict: master metrics unavailable: {}", e);
-                return;
-            }
-        };
-        let mut successfully_evicted = Vec::with_capacity(inode_ids.len());
-        let mut total_bytes_freed = 0_i64;
-
-        // Get file sizes before deletion
-        let file_sizes: Vec<(i64, i64)> = {
-            let fs_guard = self.fs.fs_dir.read();
-            inode_ids
-                .iter()
-                .filter_map(|&inode_id| {
-                    fs_guard
-                        .store
-                        .get_inode(inode_id, None)
-                        .ok()
-                        .flatten()
-                        .and_then(|inode_view| match &inode_view {
-                            InodeView::File(f) => Some((inode_id, f.len.max(0))),
-                            _ => None,
-                        })
-                })
-                .collect()
-        };
-
-        for (inode_id, file_size) in file_sizes {
-            let res = ttl_executor.execute_by_id(inode_id);
-
-            match res {
-                Ok(_) => {
-                    successfully_evicted.push(inode_id);
-                    total_bytes_freed += file_size;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "cluster-evict: executor failed for inode_id={}, err={}",
-                        inode_id,
-                        e
-                    );
-                }
-            }
+    loop {
+        if plan.target_free_bytes <= 0 {
+            log::debug!("cluster-evict: reached target_free_bytes, stopping eviction");
+            break;
         }
 
-        if !successfully_evicted.is_empty() {
-            self.evictor.remove_victims(&successfully_evicted);
-
-            // Update metrics
-            metrics
-                .eviction_files_deleted
-                .inc_by(successfully_evicted.len() as i64);
-            metrics.eviction_bytes_freed.inc_by(total_bytes_freed);
-
+        if conf.max_scan > 0 && examined >= conf.max_scan {
             log::info!(
-                "cluster-evict: deleted {} files, freed {} bytes",
-                successfully_evicted.len(),
-                total_bytes_freed
+                "cluster-evict: scan limit reached (examined={}, max_scan={}), target_left={}",
+                examined,
+                conf.max_scan,
+                plan.target_free_bytes
             );
+            break;
         }
+
+        let inode_ids = evictor.select_victims_excluding(conf.candidate_scan_page, &skipped);
+
+        if inode_ids.is_empty() {
+            log::debug!("cluster-evict: candidate set exhausted, stopping eviction");
+            break;
+        }
+
+        if conf.dry_run {
+            log::debug!(
+                "cluster-evict: dry_run=true, would process inode_ids_step={}",
+                inode_ids.len()
+            );
+            break;
+        }
+
+        examined += inode_ids.len();
+        let step = execute_eviction_step(fs, evictor, ttl_executor, &inode_ids);
+        plan.target_free_bytes = plan.target_free_bytes.saturating_sub(step.reclaimed_bytes);
+        total_reclaimed += step.reclaimed_bytes;
+        skipped.extend(step.skipped);
+    }
+
+    (examined, total_reclaimed)
+}
+
+/// Consumes one page of candidates.
+///
+/// Handled victims leave the evictor: purged file names reclaim their bytes,
+/// while trash entries report zero reclamation because only a purge or the
+/// retention expunge may release their blocks. Candidates that are not
+/// expirable yet, and directories, are reported as skipped so the caller can
+/// advance past them without dropping them from the evictor.
+fn execute_eviction_step(
+    fs: &MasterFilesystem,
+    evictor: &dyn Evictor,
+    ttl_executor: &InodeTtlExecutor,
+    inode_ids: &[i64],
+) -> EvictionStep {
+    let mut step = EvictionStep::default();
+    let mut reclaimed_files = 0i64;
+
+    let mut file_inode_ids = Vec::with_capacity(inode_ids.len());
+    {
+        let fs_guard = fs.fs_dir.read();
+        for &inode_id in inode_ids {
+            match fs_guard.store.get_inode(inode_id, None) {
+                Ok(Some(InodeView::File(_))) => file_inode_ids.push(inode_id),
+                // A missing inode is already gone; drop it from the evictor.
+                Ok(None) => step.consumed.push(inode_id),
+                Ok(Some(_)) | Err(_) => step.skipped.push(inode_id),
+            }
+        }
+    }
+
+    for inode_id in file_inode_ids {
+        match ttl_executor.execute_by_id(inode_id) {
+            Ok((true, _, reclaimed)) => {
+                step.consumed.push(inode_id);
+                if reclaimed > 0 {
+                    reclaimed_files += 1;
+                    step.reclaimed_bytes += reclaimed;
+                }
+            }
+            // Not expirable yet, or a hard-linked name that keeps its blocks:
+            // leave it in the evictor for a later trigger.
+            Ok((false, _, _)) => step.skipped.push(inode_id),
+            Err(FsError::FileNotFound(_)) => step.consumed.push(inode_id),
+            Err(e) => {
+                log::warn!(
+                    "cluster-evict: executor failed for inode_id={}, err={}",
+                    inode_id,
+                    e
+                );
+                step.skipped.push(inode_id);
+            }
+        }
+    }
+
+    if !step.consumed.is_empty() {
+        evictor.remove_victims(&step.consumed);
+    }
+
+    if reclaimed_files > 0 {
+        if let Ok(metrics) = Master::get_metrics() {
+            metrics.eviction_files_deleted.inc_by(reclaimed_files);
+            metrics.eviction_bytes_freed.inc_by(step.reclaimed_bytes);
+        }
+
+        log::info!(
+            "cluster-evict: reclaimed {} files, freed {} bytes",
+            reclaimed_files,
+            step.reclaimed_bytes
+        );
+    }
+
+    step
+}
+
+#[derive(Debug, Default)]
+struct EvictionStep {
+    /// Candidates removed from the evictor (purged, excluded, or gone).
+    consumed: Vec<i64>,
+    /// Candidates examined but still eligible on a later trigger.
+    skipped: Vec<i64>,
+    /// Bytes actually released by this step.
+    reclaimed_bytes: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::journal::JournalSystem;
+    use crate::master::meta::inode::ttl::InodeTtlExecutor;
+    use crate::master::quota::eviction::evictor::LRUEvictor;
+    use crate::master::quota::eviction::{EvictionConf, EvictionMode, EvictionPolicy};
+    use crate::master::Master;
+    use curvine_config::ClusterConf;
+    use curvine_model::{CreateFileOptsBuilder, ListOptions, OpenFlags, TtlAction};
+    use curvine_runtime::common::Utils;
+    use std::time::Duration;
+
+    fn test_fs(name: &str, trash_enabled: bool) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.trash_enabled = trash_enabled;
+        conf.master.meta_dir = Utils::test_sub_dir(format!(
+            "quota-evict-test/meta-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "quota-evict-test/journal-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        JournalSystem::fs_only_for_test(&conf).unwrap()
+    }
+
+    fn eviction_conf(page: usize, max_scan: usize) -> EvictionConf {
+        EvictionConf {
+            enable_quota_eviction: true,
+            eviction_mode: EvictionMode::DeleteFile,
+            policy: EvictionPolicy::Lru,
+            high_watermark: 0.8,
+            low_watermark: 0.6,
+            candidate_scan_page: page,
+            max_scan,
+            dry_run: false,
+            capacity: 1_000,
+        }
+    }
+
+    fn plan_with_target(target: i64) -> EvictPlan {
+        EvictPlan {
+            trigger_used: 0,
+            quota_size: 0,
+            target_free_bytes: target,
+        }
+    }
+
+    fn create_expired_file(fs: &MasterFilesystem, path: &str) -> i64 {
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .ttl_ms(1)
+            .ttl_action(TtlAction::Delete)
+            .build();
+        let status = fs
+            .create_with_opts(path, opts, OpenFlags::new_create().set_overwrite(true))
+            .unwrap();
+        fs.complete_file(path, None, 0, vec![], "", false, None)
+            .unwrap();
+        status.id
+    }
+
+    // A trigger must not stop at the first page: the default two-entry page
+    // used to end the scan while the coldest inodes were live files, so an
+    // expired file deeper in the LRU was never reclaimed.
+    #[test]
+    fn eviction_scan_continues_past_live_candidates() {
+        let fs = test_fs("past-live", false);
+        let live_a = fs.create("/scan/live-a.log", true).unwrap().id;
+        let live_b = fs.create("/scan/live-b.log", true).unwrap().id;
+        let expired = create_expired_file(&fs, "/scan/expired.log");
+        std::thread::sleep(Duration::from_millis(10));
+
+        let conf = eviction_conf(2, 0);
+        let evictor = LRUEvictor::new(conf.clone());
+        evictor.on_access(live_a);
+        evictor.on_access(live_b);
+        evictor.on_access(expired);
+
+        let executor = InodeTtlExecutor::with_managers(fs.clone());
+        let mut plan = plan_with_target(1);
+        let (examined, reclaimed) = run_eviction_plan(&fs, &evictor, &executor, &conf, &mut plan);
+
+        assert!(
+            fs.file_status("/scan/expired.log").is_err(),
+            "the expired file behind the live page must still be purged"
+        );
+        assert!(fs.file_status("/scan/live-a.log").is_ok());
+        assert!(fs.file_status("/scan/live-b.log").is_ok());
+        assert_eq!(examined, 3, "both live candidates plus the expired one");
+        assert_eq!(reclaimed, 0, "an empty file releases no bytes");
+    }
+
+    // Trash entries are not eviction candidates: they are consumed (removed
+    // from the evictor) so they cannot stall the scan, but they must not be
+    // reported as reclaimed space.
+    #[test]
+    fn eviction_consumes_trash_candidates_without_counting_them() {
+        let fs = test_fs("trash-consumed", true);
+        let victim = fs.create("/trash/victim.log", true).unwrap().id;
+        fs.delete_with_opts("/trash/victim.log", false, false)
+            .unwrap();
+
+        let mut entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        assert_eq!(entries.len(), 1, "the delete must have been recycled");
+        let entry_path = entries.remove(0).path;
+
+        let conf = eviction_conf(1, 0);
+        let evictor = LRUEvictor::new(conf);
+        evictor.on_access(victim);
+
+        let executor = InodeTtlExecutor::with_managers(fs.clone());
+        let step = execute_eviction_step(&fs, &evictor, &executor, &[victim]);
+
+        assert_eq!(step.reclaimed_bytes, 0, "a trashed file frees nothing");
+        assert_eq!(
+            step.consumed,
+            vec![victim],
+            "the trash entry must leave the eviction candidate set"
+        );
+        assert!(step.skipped.is_empty());
+        assert!(
+            fs.exists(entry_path).unwrap(),
+            "eviction must not purge trash entries ahead of retention"
+        );
+    }
+
+    // Live candidates are skipped, not consumed: they must stay in the evictor
+    // for a later trigger while the scan advances past them.
+    #[test]
+    fn eviction_skips_live_candidates_without_dropping_them() {
+        let fs = test_fs("live-skipped", false);
+        let live = fs.create("/scan/live.log", true).unwrap().id;
+
+        let conf = eviction_conf(1, 0);
+        let evictor = LRUEvictor::new(conf);
+        evictor.on_access(live);
+
+        let executor = InodeTtlExecutor::with_managers(fs.clone());
+        let step = execute_eviction_step(&fs, &evictor, &executor, &[live]);
+
+        assert_eq!(step.reclaimed_bytes, 0);
+        assert!(step.consumed.is_empty());
+        assert_eq!(step.skipped, vec![live]);
+        assert_eq!(evictor.cache_size(), 1, "the live file stays a candidate");
+    }
+
+    #[test]
+    fn eviction_scan_is_bounded_by_max_scan() {
+        let fs = test_fs("scan-cap", false);
+        let conf = eviction_conf(1, 2);
+        let evictor = LRUEvictor::new(conf.clone());
+        for i in 0..5 {
+            let status = fs.create(format!("/cap/f{}.log", i), true).unwrap();
+            evictor.on_access(status.id);
+        }
+
+        let executor = InodeTtlExecutor::with_managers(fs.clone());
+        let mut plan = plan_with_target(1_000_000);
+        let (examined, reclaimed) = run_eviction_plan(&fs, &evictor, &executor, &conf, &mut plan);
+
+        assert_eq!(
+            examined, 2,
+            "the scan budget must bound the per-trigger work"
+        );
+        assert_eq!(reclaimed, 0);
+        assert_eq!(
+            evictor.cache_size(),
+            5,
+            "skipped candidates remain for a later trigger"
+        );
     }
 }

@@ -34,6 +34,10 @@ bitflags! {
 
         /// Restore from trash (internal use)
         const RESTORE = 1 << 5;
+
+        /// Move into trash (internal use). The rename itself records the
+        /// original path and the journaled timestamp on the moved inode.
+        const TRASH = 1 << 6;
     }
 }
 
@@ -60,6 +64,16 @@ impl RenameFlags {
 
     pub fn restore(&self) -> bool {
         self.contains(RenameFlags::RESTORE)
+    }
+
+    pub fn trash(&self) -> bool {
+        self.contains(RenameFlags::TRASH)
+    }
+
+    /// Flags that only the master may set on a rename. Client RPCs carrying
+    /// them are rejected so the internal move semantics cannot be forged.
+    pub fn internal_mask() -> RenameFlags {
+        RenameFlags::RESTORE | RenameFlags::TRASH
     }
 
     pub fn exchange_mode(&self) -> bool {

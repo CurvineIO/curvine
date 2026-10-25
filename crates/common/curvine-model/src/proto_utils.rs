@@ -224,10 +224,9 @@ impl ProtoUtils {
     pub fn file_status_to_pb(mut status: FileStatus) -> FileStatusProto {
         let has_ctime = status.x_attr.contains_key(INTERNAL_CTIME_XATTR);
         let ctime = status.ctime();
-        // Internal master-owned markers (ctime, ttl-type) stay on the master;
-        // clients only see the ctime value via its dedicated proto field.
-        status.x_attr.remove(INTERNAL_CTIME_XATTR);
-        status.x_attr.remove(INTERNAL_TTL_TYPE_XATTR);
+        // Internal master-owned markers (ctime, ttl-type, trash markers) stay on
+        // the master; clients only see the ctime value via its dedicated proto field.
+        status.x_attr.retain(|key, _| !key.starts_with('\0'));
         FileStatusProto {
             id: status.id,
             path: status.path,
@@ -1123,6 +1122,26 @@ mod tests {
 
         pb.ctime = None;
         assert_eq!(ProtoUtils::file_status_from_pb(pb).ctime(), 1_000);
+    }
+
+    #[test]
+    fn file_status_proto_filters_all_internal_xattrs() {
+        let status = FileStatus {
+            x_attr: HashMap::from([
+                ("user.visible".to_string(), b"v".to_vec()),
+                ("\0curvine.trash.origin".to_string(), b"/a".to_vec()),
+                (
+                    "\0curvine.trash.delete_ms".to_string(),
+                    1_i64.to_le_bytes().to_vec(),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::file_status_to_pb(status);
+
+        assert_eq!(pb.x_attr.len(), 1);
+        assert!(pb.x_attr.contains_key("user.visible"));
     }
 
     #[test]

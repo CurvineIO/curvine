@@ -36,6 +36,8 @@ pub struct EvictionConf {
     pub high_watermark: f64,
     pub low_watermark: f64,
     pub candidate_scan_page: usize,
+    /// Candidates examined per trigger before giving up (0 = unlimited).
+    pub max_scan: usize,
     pub dry_run: bool,
     pub capacity: usize,
 }
@@ -65,6 +67,7 @@ impl EvictionConf {
             high_watermark: master_conf.quota_eviction_high_rate,
             low_watermark: master_conf.quota_eviction_low_rate,
             candidate_scan_page: master_conf.quota_eviction_scan_page as usize,
+            max_scan: master_conf.quota_eviction_max_scan.max(0) as usize,
             dry_run: master_conf.quota_eviction_dry_run,
             capacity: master_conf.quota_eviction_capacity,
         }
