@@ -56,16 +56,14 @@ meta_dir = "testing/meta"
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"
 
-# Recycle bin (experimental). While enabled, deletes on Curvine-native paths move
-# entries to /.Trash instead of freeing blocks immediately. Mounted paths
-# (cache_mode / fs_mode) always bypass the bin, because the client removes the
-# UFS object first and a trash entry could never be restored. The /.Trash
-# namespace is reserved even while disabled.
-# NOT IMPLEMENTED YET: automatic retention purging. trash_retention and
-#   trash_check_interval are accepted but currently have no effect, so the blocks
-#   of trashed entries stay allocated until a later release purges them. While
-#   trash is enabled, deletes therefore do not relieve a cluster that is above
-#   its quota high watermark.
+# Recycle bin. While enabled, deletes on Curvine-native paths move entries to
+# /.Trash instead of freeing blocks immediately. Mounted paths (cache_mode /
+# fs_mode) always bypass the bin, because the client removes the UFS object
+# first and a trash entry could never be restored. The /.Trash namespace is
+# reserved even while disabled.
+# trash_retention: how long entries stay in the bin before the master purges
+#   them; "0" disables automatic purging.
+# trash_check_interval: how often the master scans /.Trash for expired entries.
 # trash_enabled = false
 # trash_retention = "7d"
 # trash_check_interval = "1h"

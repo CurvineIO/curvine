@@ -18,7 +18,7 @@ use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
 use crate::master::meta::{
-    trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing,
+    trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
 };
 
 use crate::master::fs::DeleteResult;
@@ -257,8 +257,45 @@ impl MasterFilesystem {
         recursive: bool,
         skip_trash: bool,
     ) -> FsResult<DeleteResult> {
-        let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let mut delete_res = {
+            let mut fs_dir = self.fs_dir.write();
+            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, skip_trash)?
+        };
+        self.release_deleted_blocks(&mut delete_res);
+
+        Ok(delete_res)
+    }
+
+    /// Leader-fenced variant of `delete_with_opts`. The role is re-checked
+    /// while holding the same write lock that guards the metadata mutation, so
+    /// a demotion cannot interleave between the check and the delete. Returns
+    /// `None` when this node is no longer the active master.
+    pub fn delete_with_opts_if_active<T: AsRef<str>>(
+        &self,
+        path: T,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<Option<DeleteResult>> {
+        let mut delete_res = {
+            let mut fs_dir = self.fs_dir.write();
+            if !self.master_monitor.is_active() {
+                return Ok(None);
+            }
+            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, skip_trash)?
+        };
+        self.release_deleted_blocks(&mut delete_res);
+
+        Ok(Some(delete_res))
+    }
+
+    fn delete_locked(
+        &self,
+        fs_dir: &mut FsDir,
+        path: &str,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<DeleteResult> {
+        let inp = Self::resolve_path(fs_dir, path)?;
 
         // Removing the root would orphan every trashed entry. Entries below it
         // stay permanently deletable so the recycle bin can be emptied.
@@ -278,17 +315,18 @@ impl MasterFilesystem {
             fs_dir.delete(&inp, recursive)?
         };
         delete_res.trashed = soft_delete;
-        drop(fs_dir);
+        Ok(delete_res)
+    }
 
+    fn release_deleted_blocks(&self, delete_res: &mut DeleteResult) {
+        let blocks = std::mem::take(&mut delete_res.blocks);
         let mut worker_manager = self.worker_manager.write();
         worker_manager.remove_blocks(&DeleteResult {
             inodes: 0,
             bytes: 0,
-            blocks: std::mem::take(&mut delete_res.blocks),
+            blocks,
             trashed: false,
         });
-
-        Ok(delete_res)
     }
 
     pub fn list_trash_page(
@@ -317,6 +355,18 @@ impl MasterFilesystem {
     pub fn restore_dst<T: AsRef<str>>(&self, path: T, dst: Option<&str>) -> FsResult<String> {
         let fs_dir = self.fs_dir.read();
         fs_dir.restore_dst(path.as_ref(), dst)
+    }
+
+    /// Returns one bounded page of expired trash entry paths. The namespace
+    /// read lock is held only while scanning that page.
+    pub fn scan_expired_trash(
+        &self,
+        cutoff_ms: i64,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> FsResult<TrashScanPage> {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.scan_expired_trash(cutoff_ms, limit, start_after)
     }
 
     pub fn restore_trash<T: AsRef<str>>(
