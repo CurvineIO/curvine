@@ -1718,10 +1718,17 @@ impl SpdkEnv {
                 rc
             );
         }
-        self.qpair_pool.finish_controller_remove(ctrlr_key)?;
+        // Mark Detached before the fallible cleanup so a retry can't double-detach.
         controller
             .state
             .store(ControllerState::Detached as u8, Ordering::Release);
+        if let Err(e) = self.qpair_pool.finish_controller_remove(ctrlr_key) {
+            // Log only: the detach itself already succeeded and is irreversible.
+            error!(
+                "SPDK target {} detached but qpair-pool bookkeeping cleanup failed: {}",
+                target_idx, e
+            );
+        }
         info!("Detached SPDK target {} (ctrlr={:p})", target_idx, ctrlr);
         Ok(())
     }
@@ -2725,6 +2732,34 @@ mod test {
         assert_eq!(env.qpair_pool.controller_stats(0x1000), (0, 0));
         assert_eq!(detach_calls.load(Ordering::Acquire), 1);
         assert_eq!(register_calls.load(Ordering::Acquire), 0);
+    }
+
+    /// Regression: Detached must stick even if finish_controller_remove() fails, to avoid a double-detach retry.
+    #[test]
+    fn detach_target_marks_detached_even_if_bookkeeping_cleanup_fails() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+
+        // Simulate finish_controller_remove() failing after nvme_detach succeeds.
+        let qpair_pool_ptr = &env.qpair_pool as *const QpairPool as usize;
+        env.test_hooks.nvme_detach = Some(Arc::new(move |_| {
+            let pool = unsafe { &*(qpair_pool_ptr as *const QpairPool) };
+            pool.inner
+                .lock()
+                .unwrap()
+                .entry(0x1000)
+                .or_default()
+                .push(0x9999usize as *mut spdk_ffi::spdk_nvme_qpair);
+            0
+        }));
+
+        env.detach_target(0).unwrap();
+
+        assert_eq!(env.controllers[0].state(), ControllerState::Detached);
+
+        // Clean up the injected stale entry so it doesn't leak into drop/teardown.
+        env.qpair_pool.inner.lock().unwrap().remove(&0x1000);
     }
 
     #[test]
