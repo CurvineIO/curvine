@@ -1216,14 +1216,12 @@ impl SpdkEnv {
         self.qpair_pool.publish_metrics();
     }
 
-    /// Names of all discovered bdevs.
+    /// Names of currently active bdevs (not stable across detach).
     pub fn bdev_names(&self) -> Vec<String> {
         self.active_bdevs().map(|b| b.name.clone()).collect()
     }
 
-    /// All discovered bdev metadata, borrowed. Filtering requires a fresh
-    /// `Vec` on every call, but returning references avoids cloning each
-    /// `BdevInfo`'s `String` fields (name, target_endpoint).
+    /// Currently active bdev metadata, borrowed (not stable across detach).
     pub fn bdevs(&self) -> Vec<&BdevInfo> {
         self.active_bdevs().collect()
     }
@@ -1276,7 +1274,7 @@ impl SpdkEnv {
         self.active_bdevs().find(|b| b.name == name)
     }
 
-    /// Total capacity across all bdevs, in bytes.
+    /// Total capacity across currently active bdevs, in bytes.
     pub fn total_capacity(&self) -> u64 {
         self.active_bdevs().map(|b| b.size_bytes).sum()
     }
