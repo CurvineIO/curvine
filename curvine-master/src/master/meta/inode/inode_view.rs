@@ -28,7 +28,8 @@ use curvine_model::{
 };
 use curvine_runtime::common::{LocalTime, Utils};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, LinkedList};
+use std::collections::HashMap;
+use std::collections::LinkedList;
 use std::fmt::{Debug, Formatter};
 use std::ops::{Deref, DerefMut};
 
@@ -249,15 +250,11 @@ impl InodeView {
         path.starts_with(PATH_SEPARATOR)
     }
 
-    pub fn get_child(&self, name: &str) -> Option<&InodeView> {
-        match self {
-            File(_) => None,
-            Dir(d) => d.get_child(name),
-            FileEntry(_) => None,
-        }
+    pub fn get_child(&self, name: &str) -> Option<InodePtr> {
+        self.get_child_ptr(name)
     }
 
-    pub fn get_child_ptr(&mut self, name: &str) -> Option<InodePtr> {
+    pub fn get_child_ptr(&self, name: &str) -> Option<InodePtr> {
         match self {
             File(_) => None,
             Dir(d) => d.get_child_ptr(name),
@@ -265,16 +262,22 @@ impl InodeView {
         }
     }
 
-    // Test and print for use. Memory copying occurs.
-    pub fn children(&self) -> Vec<&InodeView> {
+    // Test and print for use.
+    pub fn children(&self) -> Vec<InodePtr> {
         let mut vec = Vec::with_capacity(8);
         if let Dir(d) = self {
-            for item in d.children_iter() {
-                vec.push(item)
-            }
+            vec.extend(d.children_iter());
         }
 
         vec
+    }
+
+    // Owned snapshot of the children; packed file edges become `FileEntry` views.
+    pub fn children_vec(&self) -> Vec<InodeView> {
+        match self {
+            Dir(d) => d.children_vec(),
+            _ => vec![],
+        }
     }
 
     pub fn child_len(&self) -> usize {
@@ -683,10 +686,10 @@ impl InodeView {
     pub fn sum_hash(&self) -> CommonResult<u128> {
         let mut res: u128 = 0;
         let mut stack = LinkedList::new();
-        stack.push_back(self);
+        stack.push_back(InodePtr::from_ref(self));
 
         while let Some(v) = stack.pop_front() {
-            let bytes = MetadataCodec::encode(v)?;
+            let bytes = MetadataCodec::encode(v.as_ref())?;
             if !v.is_root() {
                 let hash = Utils::crc32(&bytes) as u128;
                 res += hash
@@ -766,6 +769,7 @@ impl Decode for InodeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    
 
     #[test]
     fn ttl_expires_on_mtime_by_default() {

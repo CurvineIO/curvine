@@ -416,7 +416,7 @@ impl FsDir {
                 Dir(d) => {
                     if recursive {
                         for child in d.children_iter() {
-                            stack.push_back(InodePtr::from_ref(child));
+                            stack.push_back(child);
                         }
                     }
                 }
@@ -1358,7 +1358,7 @@ impl FsDir {
             match cur_inode.as_mut() {
                 Dir(dir) if opts.recursive => {
                     for child in dir.children_iter() {
-                        stack.push_back(InodePtr::from_ref(child));
+                        stack.push_back(child);
                     }
                 }
 

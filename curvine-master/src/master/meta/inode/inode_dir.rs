@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::meta::feature::{AclFeature, DirFeature};
-use crate::master::meta::inode::inodes_children::InodeChildren;
+use crate::master::meta::inode::InodeChildren;
 use crate::master::meta::inode::{
     ChildrenIter, Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID,
 };
@@ -59,7 +59,7 @@ impl InodeDir {
             nlink: *nlink,
             storage_policy: storage_policy.clone(),
             features: features.clone(),
-            children: InodeChildren::new_map(),
+            children: InodeChildren::new_packed(),
         }
     }
 
@@ -72,6 +72,10 @@ impl InodeDir {
     }
 
     pub fn new(id: i64, time: i64) -> Self {
+        Self::with_children(id, time, InodeChildren::new_packed())
+    }
+
+    pub fn with_children(id: i64, time: i64, children: InodeChildren) -> Self {
         Self {
             id,
             parent_id: EMPTY_PARENT_ID,
@@ -80,7 +84,7 @@ impl InodeDir {
             nlink: 2,
             storage_policy: Default::default(),
             features: Default::default(),
-            children: InodeChildren::new_map(),
+            children,
         }
     }
 
@@ -100,7 +104,7 @@ impl InodeDir {
                 },
                 x_attr: opts.x_attr,
             },
-            children: InodeChildren::new_map(),
+            children: InodeChildren::new_packed(),
         }
     }
 
@@ -110,20 +114,20 @@ impl InodeDir {
         self.children.add_child(inode)
     }
 
-    /// Get the child node of the specified inode name.
-    pub fn get_child(&self, name: &str) -> Option<&InodeView> {
+    pub fn get_child(&self, name: &str) -> Option<InodePtr> {
+        self.get_child_ptr(name)
+    }
+
+    pub fn get_child_ptr(&self, name: &str) -> Option<InodePtr> {
         self.children.get_child(name)
     }
 
-    pub fn get_child_ptr(&mut self, name: &str) -> Option<InodePtr> {
-        self.children.get_child_ptr(name)
+    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Option<Vec<InodePtr>> {
+        self.children.get_child_by_glob_pattern(glob_pattern)
     }
 
-    pub fn get_child_ptr_by_glob_pattern(
-        &mut self,
-        glob_pattern: &Pattern,
-    ) -> Option<Vec<InodePtr>> {
-        self.children.get_child_ptr_by_glob_pattern(glob_pattern)
+    pub fn get_child_ptr_by_glob_pattern(&self, glob_pattern: &Pattern) -> Option<Vec<InodePtr>> {
+        self.get_child_by_glob_pattern(glob_pattern)
     }
 
     pub fn update_mtime(&mut self, time: i64) {
@@ -158,12 +162,15 @@ impl InodeDir {
         self.children.iter()
     }
 
-    pub fn list_options(&self, options: &ListOptions) -> Vec<&InodeView> {
+    pub fn list_options(&self, options: &ListOptions) -> Vec<InodePtr> {
         self.children.list_options(options)
     }
 
     pub fn children_vec(&self) -> Vec<InodeView> {
-        self.children.iter().cloned().collect()
+        self.children
+            .iter()
+            .map(|item| item.as_ref().clone())
+            .collect()
     }
 
     pub fn children_len(&self) -> usize {
@@ -245,7 +252,7 @@ impl Decode for InodeDir {
             storage_policy: StoragePolicy::decode(reader)?,
             features: DirFeature::decode(reader)?,
             // Children are persisted as edges, not inside the inode record.
-            children: InodeChildren::new_map(),
+            children: InodeChildren::new_packed(),
         })
     }
 }
@@ -279,7 +286,7 @@ mod tests {
                     mode: 0o755,
                 },
             },
-            children: InodeChildren::new_map(),
+            children: InodeChildren::new_packed(),
         };
 
         let mut writer = Writer::new(1).unwrap();

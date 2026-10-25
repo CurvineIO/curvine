@@ -1077,7 +1077,7 @@ impl MasterFilesystem {
                 let child_path = child_snapshot_path(path, child.name());
                 self.collect_cv_metadata_snapshot_page(
                     fs_dir,
-                    child,
+                    child.as_ref(),
                     &child_path,
                     start_after,
                     limit,

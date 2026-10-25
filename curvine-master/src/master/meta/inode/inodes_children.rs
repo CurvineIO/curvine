@@ -12,6 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Directory children containers.
+//!
+//! `List` and `Map` keep a full `Box<InodeView>` per child and are retained for
+//! benchmarks and rollback. `Packed` delegates to [`PackedChildren`], which
+//! inlines file edges as variable-length byte records and keeps directory
+//! objects in a side vector.
+
+use crate::master::meta::inode::PackedChildren;
+use crate::master::meta::inode::PackedIter;
 use crate::master::meta::inode::{InodePtr, InodeView};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::ListOptions;
@@ -20,12 +29,12 @@ use std::collections::btree_map::{Entry, Values};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::slice::Iter;
-use std::vec;
 
 #[derive(Debug, Clone)]
 pub enum InodeChildren {
     List(Vec<Box<InodeView>>),
     Map(BTreeMap<String, Box<InodeView>>),
+    Packed(PackedChildren),
 }
 
 impl InodeChildren {
@@ -37,63 +46,43 @@ impl InodeChildren {
         InodeChildren::Map(BTreeMap::new())
     }
 
+    pub fn new_packed() -> Self {
+        InodeChildren::Packed(PackedChildren::new())
+    }
+
     // Search for whether the current inode name exists.
     fn search_by_name(list: &[Box<InodeView>], name: &str) -> Result<usize, usize> {
         list.binary_search_by(|f| f.name().cmp(name))
     }
 
     /// Get children matching glob pattern (e.g., "*.txt", "dir*")
-    pub fn get_child_by_glob_pattern<'a>(
-        &'a self,
-        glob_pattern: &'a Pattern,
-    ) -> Option<Vec<&'a InodeView>> {
+    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Option<Vec<InodePtr>> {
         match self {
-            InodeChildren::List(list) => {
-                let mut matches: Vec<&'a InodeView> = Vec::new();
-                for child in list {
-                    if glob_pattern.matches(child.name()) {
-                        matches.push(child.as_ref());
-                    }
-                }
-                Some(matches)
-            }
-            InodeChildren::Map(map) => {
-                let mut matches: Vec<&'a InodeView> = Vec::new();
-                for child in map.values() {
-                    if glob_pattern.matches(child.name()) {
-                        matches.push(child.as_ref());
-                    }
-                }
-                Some(matches)
-            }
+            InodeChildren::List(list) => Some(
+                list.iter()
+                    .filter(|child| glob_pattern.matches(child.name()))
+                    .map(|child| InodePtr::from_ref(child.as_ref()))
+                    .collect(),
+            ),
+            InodeChildren::Map(map) => Some(
+                map.values()
+                    .filter(|child| glob_pattern.matches(child.name()))
+                    .map(|child| InodePtr::from_ref(child.as_ref()))
+                    .collect(),
+            ),
+            InodeChildren::Packed(packed) => Some(packed.get_child_by_glob_pattern(glob_pattern)),
         }
     }
 
-    pub fn get_child_ptr_by_glob_pattern(&self, glob_pattern: &Pattern) -> Option<Vec<InodePtr>> {
-        self.get_child_by_glob_pattern(glob_pattern)
-            .map(|children| {
-                children
-                    .iter()
-                    .map(|child_ref| InodePtr::from_ref(*child_ref)) // Deref &&InodeView -> &InodeView
-                    .collect()
-            })
-    }
-
-    pub fn get_child(&self, name: &str) -> Option<&InodeView> {
+    pub fn get_child(&self, name: &str) -> Option<InodePtr> {
         match self {
             InodeChildren::List(list) => {
-                let index = Self::search_by_name(list, name);
-                match index {
-                    Err(_) => None,
-                    Ok(v) => Some(&list[v]),
-                }
+                let index = Self::search_by_name(list, name).ok()?;
+                Some(InodePtr::from_ref(list[index].as_ref()))
             }
-            InodeChildren::Map(map) => map.get(name).map(|x| x.as_ref()),
+            InodeChildren::Map(map) => map.get(name).map(|view| InodePtr::from_ref(view.as_ref())),
+            InodeChildren::Packed(packed) => packed.get_child(name),
         }
-    }
-
-    pub fn get_child_ptr(&self, name: &str) -> Option<InodePtr> {
-        self.get_child(name).map(InodePtr::from_ref)
     }
 
     pub fn delete_child(&mut self, child_id: i64, child_name: &str) -> CommonResult<InodeView> {
@@ -107,6 +96,9 @@ impl InodeChildren {
             }
 
             InodeChildren::Map(map) => map.remove(child_name),
+            InodeChildren::Packed(packed) => {
+                return packed.delete_child(child_id, child_name);
+            }
         };
 
         match removed {
@@ -125,7 +117,7 @@ impl InodeChildren {
         }
     }
 
-    pub fn list_options(&self, opts: &ListOptions) -> Vec<&InodeView> {
+    pub fn list_options(&self, opts: &ListOptions) -> Vec<InodePtr> {
         match self {
             InodeChildren::List(list) => {
                 let start = opts
@@ -138,7 +130,11 @@ impl InodeChildren {
                     .unwrap_or(0);
                 let slice = &list[start..];
                 let n = opts.limit.unwrap_or(slice.len());
-                slice.iter().take(n).map(|b| b.as_ref()).collect()
+                slice
+                    .iter()
+                    .take(n)
+                    .map(|b| InodePtr::from_ref(b.as_ref()))
+                    .collect()
             }
 
             InodeChildren::Map(map) => {
@@ -147,27 +143,38 @@ impl InodeChildren {
                     |a| map.range::<str, _>((Bound::Excluded(a.as_str()), Bound::Unbounded)),
                 );
                 let n = opts.limit.unwrap_or(usize::MAX);
-                range.take(n).map(|(_, v)| v.as_ref()).collect()
+                range
+                    .take(n)
+                    .map(|(_, v)| InodePtr::from_ref(v.as_ref()))
+                    .collect()
             }
+
+            InodeChildren::Packed(packed) => packed.list_options(opts),
         }
     }
 
     pub fn add_child(&mut self, inode: InodeView) -> CommonResult<InodePtr> {
-        let inode = Box::new(inode);
         // Assert that it should not be FileEntry
         match self {
             InodeChildren::List(list) => {
                 let index = Self::search_by_name(list, inode.name());
                 match index {
                     Err(v) => {
-                        list.insert(v, inode);
-                        let cur_node = list[v].as_ref();
-                        Ok(InodePtr::from_ref(cur_node))
+                        if inode.is_file() {
+                            let entry = Box::new(InodeView::new_entry(
+                                inode.name().to_string(),
+                                inode.id(),
+                            ));
+                            list.insert(v, entry);
+                            Ok(InodePtr::from_owned(inode))
+                        } else {
+                            let boxed = Box::new(inode);
+                            list.insert(v, boxed);
+                            Ok(InodePtr::from_ref(list[v].as_ref()))
+                        }
                     }
 
-                    Ok(_) => {
-                        err_box!("Child {} already exists", inode.name())
-                    }
+                    Ok(_) => err_box!("Child {} already exists", inode.name()),
                 }
             }
 
@@ -175,23 +182,22 @@ impl InodeChildren {
                 Entry::Vacant(v) => {
                     if inode.is_file() {
                         // Store lightweight FileEntry in map
-                        v.insert(Box::new(InodeView::new_entry(
-                            inode.name().to_string(),
-                            inode.id(),
-                        )));
+                        let name = inode.name().to_string();
+                        let id = inode.id();
+                        v.insert(Box::new(InodeView::new_entry(name, id)));
                         // But return owned pointer to complete object
-                        Ok(InodePtr::from_owned(*inode))
+                        Ok(InodePtr::from_owned(inode))
                     } else {
                         // Directory: move ownership into the map and return a reference.
-                        let inserted = v.insert(inode);
+                        let inserted = v.insert(Box::new(inode));
                         Ok(InodePtr::from_ref(inserted.as_ref()))
                     }
                 }
 
-                Entry::Occupied(_) => {
-                    err_box!("Child {} already exists", inode.name())
-                }
+                Entry::Occupied(_) => err_box!("Child {} already exists", inode.name()),
             },
+
+            InodeChildren::Packed(packed) => packed.add_child(inode),
         }
     }
 
@@ -206,6 +212,11 @@ impl InodeChildren {
                 len: map.len(),
                 inner: InnerIter::Map(map.values()),
             },
+
+            InodeChildren::Packed(packed) => ChildrenIter {
+                len: packed.len(),
+                inner: InnerIter::Packed(packed.iter()),
+            },
         }
     }
 
@@ -213,6 +224,7 @@ impl InodeChildren {
         match self {
             InodeChildren::List(list) => list.len(),
             InodeChildren::Map(map) => map.len(),
+            InodeChildren::Packed(packed) => packed.len(),
         }
     }
 
@@ -223,13 +235,14 @@ impl InodeChildren {
 
 impl Default for InodeChildren {
     fn default() -> Self {
-        Self::new_map()
+        Self::new_packed()
     }
 }
 
 enum InnerIter<'a> {
     List(Iter<'a, Box<InodeView>>),
     Map(Values<'a, String, Box<InodeView>>),
+    Packed(PackedIter<'a>),
 }
 
 pub struct ChildrenIter<'a> {
@@ -243,18 +256,18 @@ impl ChildrenIter<'_> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len == 0
     }
 }
 
-impl<'a> Iterator for ChildrenIter<'a> {
-    type Item = &'a InodeView;
+impl Iterator for ChildrenIter<'_> {
+    type Item = InodePtr;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next = match &mut self.inner {
-            InnerIter::List(list) => list.next(),
-            InnerIter::Map(map) => map.next(),
-        };
-        next.map(|x| x.as_ref())
+        match &mut self.inner {
+            InnerIter::List(list) => list.next().map(|child| InodePtr::from_ref(child.as_ref())),
+            InnerIter::Map(map) => map.next().map(|child| InodePtr::from_ref(child.as_ref())),
+            InnerIter::Packed(iter) => iter.next().map(|item| item.as_ptr()),
+        }
     }
 }

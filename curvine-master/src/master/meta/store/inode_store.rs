@@ -186,34 +186,35 @@ impl InodeStore {
 
         let mut stack = LinkedList::new();
         // The caller keeps the namespace stable until this batch commits.
-        // Borrow nodes while walking instead of repeatedly cloning subtrees.
-        stack.push_back((parent.id(), del_name, del));
+        // Borrow nodes while walking instead of repeatedly cloning subtrees:
+        stack.push_back((parent.id(), del_name.to_string(), InodePtr::from_ref(del)));
         let mut del_res = DeleteResult::new();
         let mut deleted_files = 0i64;
         let mut deleted_dirs = 0i64;
         let mut file_link_counts: HashMap<i64, u32> = HashMap::new();
 
-        while let Some((parent_id, edge_name, inode)) = stack.pop_front() {
+        while let Some((parent_id, edge_name, item)) = stack.pop_front() {
             // Delete inode edges
-            batch.delete_child(parent_id, edge_name)?;
+            batch.delete_child(parent_id, &edge_name)?;
 
-            match inode {
+            let inode_id = item.id();
+            match item.as_ref() {
                 InodeView::Dir(dir) => {
-                    batch.delete_inode(inode.id())?;
-                    self.ttl_bucket_list.remove(inode);
+                    batch.delete_inode(inode_id)?;
+                    self.ttl_bucket_list.remove(item.as_ref());
 
                     // Don't count root directory
                     if dir.id != ROOT_INODE_ID {
                         deleted_dirs += 1;
                     }
-                    for item in dir.children_iter() {
-                        stack.push_back((inode.id(), item.name(), item))
+                    for child in dir.children_iter() {
+                        stack.push_back((inode_id, child.name().to_string(), child));
                     }
                 }
 
                 _ => {
                     deleted_files += 1;
-                    let links = file_link_counts.entry(inode.id()).or_default();
+                    let links = file_link_counts.entry(inode_id).or_default();
                     *links = links.saturating_add(1);
                 }
             }
@@ -880,7 +881,7 @@ impl InodeStore {
     pub fn batched_get_inodes(
         &self,
         inp: &InodePath,
-        list: Vec<&InodeView>,
+        list: Vec<InodePtr>,
     ) -> CommonResult<Vec<FileStatus>> {
         if list.is_empty() {
             return Ok(vec![]);
@@ -890,11 +891,14 @@ impl InodeStore {
         let mut scan_inodes = Vec::with_capacity(list.len());
 
         for (index, inode) in list.iter().enumerate() {
-            if inode.is_file_entry() {
-                scan_inodes.push((index, RocksUtils::i64_to_bytes(inode.id())));
-            } else {
-                let child_path = inp.child_path(inode.name());
-                out[index] = Some(inode.to_file_status(&child_path)?);
+            match inode.as_ref() {
+                InodeView::FileEntry(e) => {
+                    scan_inodes.push((index, RocksUtils::i64_to_bytes(e.id)));
+                }
+                view => {
+                    let child_path = inp.child_path(view.name());
+                    out[index] = Some(view.to_file_status(&child_path)?);
+                }
             }
         }
 
@@ -1163,10 +1167,10 @@ mod tests {
         )?;
 
         let (_, restored) = store.create_tree()?;
-        let names: Vec<&str> = restored
+        let names: Vec<String> = restored
             .children()
             .into_iter()
-            .map(|child| child.name())
+            .map(|child| child.name().to_string())
             .collect();
         assert_eq!(names, vec!["renamed"]);
 
@@ -1189,7 +1193,11 @@ mod tests {
         }
 
         let (_, restored) = store.create_tree()?;
-        let names: Vec<&str> = restored.children().into_iter().map(|c| c.name()).collect();
+        let names: Vec<String> = restored
+            .children()
+            .into_iter()
+            .map(|c| c.name().to_string())
+            .collect();
         assert_eq!(names, vec!["a"]);
 
         let edge_count = store.store.edges_iter(ROOT_INODE_ID)?.count();
@@ -1249,7 +1257,11 @@ mod tests {
         }
 
         let (_, restored) = store.create_tree()?;
-        let names: Vec<&str> = restored.children().into_iter().map(|c| c.name()).collect();
+        let names: Vec<String> = restored
+            .children()
+            .into_iter()
+            .map(|c| c.name().to_string())
+            .collect();
         // Only the real directory should be in the tree; both orphaned edges are skipped.
         assert_eq!(names, vec!["real-dir"]);
 
@@ -1278,11 +1290,12 @@ mod tests {
         let (_, mut root) = store.create_tree()?;
         root.add_child(InodeView::new_entry("missing.txt".to_string(), missing_id))?;
 
-        let children: Vec<InodeView> = root.children().into_iter().cloned().collect();
-        let child_refs: Vec<&InodeView> = children.iter().collect();
+        // Resolve first: `children` borrows the tree, so the owning pointer has to
+        // be moved into the path before iterating children.
         let inp = InodePath::resolve(InodePtr::from_owned(root), "/", &store)?;
-
-        let result = store.batched_get_inodes(&inp, child_refs)?;
+        let root_ptr = inp.get_last_inode().expect("resolved root missing");
+        let children = root_ptr.children();
+        let result = store.batched_get_inodes(&inp, children)?;
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "good.txt");
         assert_eq!(result[0].id, good_file_id);
@@ -1333,9 +1346,9 @@ mod tests {
             batch.commit()?;
         }
 
-        let (_, mut restored) = store.create_tree()?;
+        let (_, restored) = store.create_tree()?;
         let dir = restored
-            .get_child_ptr("dir")
+            .get_child("dir")
             .expect("restored directory should exist");
         dir.as_mut()
             .add_child(InodeView::new_entry("stale.txt".to_string(), missing_id))?;
@@ -1375,6 +1388,7 @@ mod tests {
         let dir = restored
             .get_child("dir")
             .expect("restored directory should exist")
+            .as_ref()
             .clone();
 
         let result = store.apply_delete(&restored, &dir, "dir", 100)?;
@@ -1403,7 +1417,11 @@ mod tests {
         }
 
         let (_, restored) = store.create_tree()?;
-        let names: Vec<&str> = restored.children().into_iter().map(|c| c.name()).collect();
+        let names: Vec<String> = restored
+            .children()
+            .into_iter()
+            .map(|c| c.name().to_string())
+            .collect();
         // Only the real directory should be in the tree; orphaned edge is skipped.
         assert_eq!(names, vec!["real-dir"]);
 
