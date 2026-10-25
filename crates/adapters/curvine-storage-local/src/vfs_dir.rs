@@ -102,7 +102,7 @@ impl VfsDir {
             None
         };
         #[cfg(not(feature = "spdk"))]
-        let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::SpdkDisk {
+        let bdev_name: Option<(String, i64, i64)> = if conf.storage_type == StorageType::SpdkDisk {
             return curvine_core_error::err_box!(
                 "StorageType::SpdkDisk is not available. Compile with --features spdk"
             );
