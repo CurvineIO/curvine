@@ -2843,6 +2843,34 @@ mod test {
         assert!(env.get_bdev("nvme-0").is_none());
     }
 
+    /// Regression: Detached must stick even if finish_controller_remove() fails, to avoid a double-detach retry.
+    #[test]
+    fn detach_target_marks_detached_even_if_bookkeeping_cleanup_fails() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+
+        // Simulate finish_controller_remove() failing after nvme_detach succeeds.
+        let qpair_pool_ptr = &env.qpair_pool as *const QpairPool as usize;
+        env.test_hooks.nvme_detach = Some(Arc::new(move |_| {
+            let pool = unsafe { &*(qpair_pool_ptr as *const QpairPool) };
+            pool.inner
+                .lock()
+                .unwrap()
+                .entry(0x1000)
+                .or_default()
+                .push(0x9999usize as *mut spdk_ffi::spdk_nvme_qpair);
+            0
+        }));
+
+        env.detach_target(0).unwrap();
+
+        assert_eq!(env.controllers[0].state(), ControllerState::Detached);
+
+        // Clean up the injected stale entry so it doesn't leak into drop/teardown.
+        env.qpair_pool.inner.lock().unwrap().remove(&0x1000);
+    }
+
     #[test]
     fn release_returns_qpair_to_pool() {
         let p = QpairPool::new();
