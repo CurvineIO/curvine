@@ -57,6 +57,16 @@ impl InodeTtlExecutor {
         Ok(inode)
     }
 
+    fn is_trash_entry(inode: &InodeView) -> bool {
+        if inode.is_file_entry() {
+            return false;
+        }
+        inode
+            .x_attr()
+            .map(|x_attr| x_attr.contains_key(trash::TRASH_XATTR_ORIGIN))
+            .unwrap_or(false)
+    }
+
     pub fn is_active(&self) -> bool {
         self.filesystem.master_monitor.is_active()
     }
@@ -78,6 +88,17 @@ impl InodeTtlExecutor {
             return err_ext!(FsError::file_not_found(format!("inode_id={}", inode_id)));
         };
 
+        // Trash entries are governed by trash retention, not TTL or quota
+        // eviction. Detect them from the internal marker before the expiry
+        // check: the marker is cheap (no path walk) and makes a trashed entry
+        // report `handled` with zero reclaimed bytes even when it has no TTL,
+        // so eviction drops it from the candidate set without counting it as
+        // progress. Blocks stay allocated until a purge reclaims them.
+        if Self::is_trash_entry(&inode) {
+            debug!("skip ttl action for trash entry inode_id={}", inode_id);
+            return Ok((true, inode, 0));
+        }
+
         if !inode.is_expired()? {
             return Ok((false, inode, 0));
         }
@@ -91,10 +112,9 @@ impl InodeTtlExecutor {
 
         let path = self.get_inode_path(inode_id)?;
         if trash::is_trash_path(&path) {
-            // Trashed entries are governed by trash retention, not TTL. Treat
-            // the action as handled so the expired entry leaves the TTL bucket,
-            // but report no reclamation: the blocks stay allocated.
-            debug!("skip ttl action for trash entry {} ({})", path, inode_id);
+            // Entries placed under /.Trash without the internal marker (for
+            // example restored/foreign entries) are still not TTL candidates.
+            debug!("skip ttl action for trash path {} ({})", path, inode_id);
             return Ok((true, inode, 0));
         }
 

@@ -561,22 +561,10 @@ impl MasterFilesystem {
     }
 
     // NUL-prefixed keys are master-owned (ctime, trash markers) and never
-    // surface in FileStatus, so a client cannot legitimately send them.
+    // surface in FileStatus, so a client cannot legitimately send them. The
+    // check itself lives on `FsDir` so every client-facing writer shares it.
     fn check_not_internal_x_attr(opts: &SetAttrOpts) -> FsResult<()> {
-        let reserved = opts
-            .add_x_attr
-            .keys()
-            .map(String::as_str)
-            .chain(opts.remove_x_attr.iter().map(String::as_str))
-            .find(|key| key.starts_with('\0'));
-
-        match reserved {
-            Some(key) => err_ext!(FsError::invalid_argument(format!(
-                "xattr {} is reserved for internal master metadata",
-                key.escape_default()
-            ))),
-            None => Ok(()),
-        }
+        FsDir::check_not_internal_x_attr(opts)
     }
 
     fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {

@@ -385,54 +385,18 @@ impl FsDir {
         let dst_path = trash::trash_entry_path(&entry_name);
         let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
 
-        let src_path = inp.path().to_string();
-        let add_x_attr = HashMap::from([
-            (
-                trash::TRASH_XATTR_ORIGIN.to_string(),
-                src_path.as_bytes().to_vec(),
-            ),
-            (
-                trash::TRASH_XATTR_DELETE_MS.to_string(),
-                op_ms.to_le_bytes().to_vec(),
-            ),
-        ]);
-        let src_inp = InodePath::resolve(self.root_ptr(), &src_path, &self.store)?;
-        self.set_attr(
-            src_inp,
-            SetAttrOpts {
-                add_x_attr,
-                ..Default::default()
-            },
+        // The TRASH rename records the origin and the deletion time on the
+        // moved inode as part of the same persisted mutation, so a hard delete
+        // still costs one journal record instead of SetAttr + Rename, and a
+        // failure can never leave markers on a live inode.
+        self.rename_with_mtime(
+            inp,
+            &dst_inp,
+            RenameFlags::NO_REPLACE | RenameFlags::TRASH,
+            op_ms,
         )?;
-
-        let src_inp = InodePath::resolve(self.root_ptr(), &src_path, &self.store)?;
-        match self.rename(&src_inp, &dst_inp, RenameFlags::NO_REPLACE) {
-            Ok(_) => {
-                debug!("moved {} to trash as {}", src_path, dst_path);
-                Ok(DeleteResult::new())
-            }
-            Err(e) => {
-                let rollback = SetAttrOpts {
-                    remove_x_attr: vec![
-                        trash::TRASH_XATTR_ORIGIN.to_string(),
-                        trash::TRASH_XATTR_DELETE_MS.to_string(),
-                    ],
-                    ..Default::default()
-                };
-                match InodePath::resolve(self.root_ptr(), &src_path, &self.store) {
-                    Ok(src_inp) => {
-                        if let Err(rb) = self.set_attr(src_inp, rollback) {
-                            warn!("failed to roll back trash xattrs for {}: {}", src_path, rb);
-                        }
-                    }
-                    Err(rb) => warn!(
-                        "failed to resolve {} while rolling back trash xattrs: {}",
-                        src_path, rb
-                    ),
-                }
-                Err(e)
-            }
-        }
+        debug!("moved {} to trash as {}", inp.path(), dst_path);
+        Ok(DeleteResult::new())
     }
 
     fn ensure_trash_root(&mut self) -> FsResult<()> {
@@ -538,7 +502,20 @@ impl FsDir {
         dst_inp: &InodePath,
         flags: RenameFlags,
     ) -> FsResult<Option<DeleteResult>> {
-        let op_ms = LocalTime::mills();
+        let op_ms = LocalTime::mills() as i64;
+        self.rename_with_mtime(src_inp, dst_inp, flags, op_ms)
+    }
+
+    /// Rename with an explicit operation timestamp. Internal moves that store
+    /// the timestamp on the inode (trash) or derive a name from it reuse the
+    /// same value that the journal records, so replay is bit-identical.
+    fn rename_with_mtime(
+        &mut self,
+        src_inp: &InodePath,
+        dst_inp: &InodePath,
+        flags: RenameFlags,
+        op_ms: i64,
+    ) -> FsResult<Option<DeleteResult>> {
         let exchange_pre_swap_ids = if flags.exchange_mode() {
             let src_id = src_inp
                 .get_last_inode()
@@ -552,13 +529,12 @@ impl FsDir {
         } else {
             None
         };
-        let res =
-            self.unprotected_rename(src_inp, dst_inp, op_ms as i64, flags, exchange_pre_swap_ids)?;
+        let res = self.unprotected_rename(src_inp, dst_inp, op_ms, flags, exchange_pre_swap_ids)?;
         self.journal_writer.log_rename(
             self,
             src_inp.path(),
             dst_inp.path(),
-            op_ms as i64,
+            op_ms,
             flags,
             exchange_pre_swap_ids,
         )?;
@@ -621,6 +597,23 @@ impl FsDir {
         new_inode.change_name(new_name);
         new_inode.set_parent_id(dst_parent.id());
         new_inode.update_ctime(mtime);
+
+        // A trash move records the pre-move path and the deletion time on the
+        // moved inode in the same persisted mutation as the rename. Journal
+        // replay runs this path with the same flags and timestamp, so a crash
+        // cannot leave an entry inside the bin without its origin, and the
+        // delete still costs a single journal record.
+        if flags.trash() && !new_inode.is_file_entry() {
+            let x_attr = new_inode.x_attr_mut()?;
+            x_attr.insert(
+                trash::TRASH_XATTR_ORIGIN.to_string(),
+                src_inp.path().as_bytes().to_vec(),
+            );
+            x_attr.insert(
+                trash::TRASH_XATTR_DELETE_MS.to_string(),
+                mtime.to_le_bytes().to_vec(),
+            );
+        }
 
         // Update the parent directory for the last modification time.
         src_parent.update_mtime(mtime);
@@ -951,7 +944,11 @@ impl FsDir {
         // Only apply set_attr_opts on real complete/close, not on flush.
         // Flush semantics should remain narrow (durability only).
         if !only_flush {
-            if let Some(opts) = set_attr_opts {
+            if let Some(mut opts) = set_attr_opts {
+                // `complete_file` is a client-facing mutation: apply the same
+                // internal-xattr guard and ctime normalization as `set_attr`.
+                Self::check_not_internal_x_attr(&opts)?;
+                Self::normalize_internal_x_attrs(&mut opts);
                 inode.set_attr(opts)?;
             }
         }
@@ -1329,6 +1326,35 @@ impl FsDir {
 
         // Internal metadata is master-owned. Persist the operation timestamp in the
         // journal so replay restores it without changing the bincode inode layout.
+        Self::normalize_internal_x_attrs(&mut opts);
+        self.unprotected_set_attr(inode.clone(), opts.clone())?;
+        self.journal_writer.log_set_attr(self, &inp, opts)?;
+        Ok(inode.to_file_status(inp.path())?)
+    }
+
+    /// Master-owned xattrs (ctime, trash markers) are never client-writable.
+    /// Every client-facing mutation that forwards a `SetAttrOpts` must call
+    /// this, so a new caller cannot silently gain write access to them.
+    pub(crate) fn check_not_internal_x_attr(opts: &SetAttrOpts) -> FsResult<()> {
+        let reserved = opts
+            .add_x_attr
+            .keys()
+            .map(String::as_str)
+            .chain(opts.remove_x_attr.iter().map(String::as_str))
+            .find(|key| key.starts_with('\0'));
+
+        match reserved {
+            Some(key) => err_ext!(FsError::invalid_argument(format!(
+                "xattr {} is reserved for internal master metadata",
+                key.escape_default()
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Clients may not set ctime, and every mutation refreshes it. Shared by
+    /// `set_attr` and `complete_file` so both paths behave identically.
+    fn normalize_internal_x_attrs(opts: &mut SetAttrOpts) {
         opts.add_x_attr.remove(INTERNAL_CTIME_XATTR);
         opts.remove_x_attr.retain(|key| key != INTERNAL_CTIME_XATTR);
         let ctime = LocalTime::mills() as i64;
@@ -1336,9 +1362,6 @@ impl FsDir {
             INTERNAL_CTIME_XATTR.to_string(),
             ctime.to_le_bytes().to_vec(),
         );
-        self.unprotected_set_attr(inode.clone(), opts.clone())?;
-        self.journal_writer.log_set_attr(self, &inp, opts)?;
-        Ok(inode.to_file_status(inp.path())?)
     }
 
     pub fn unprotected_set_attr(&mut self, inode: InodePtr, opts: SetAttrOpts) -> FsResult<()> {

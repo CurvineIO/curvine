@@ -26,9 +26,16 @@ fn eviction_cache_capacity(configured_capacity: usize) -> NonZeroUsize {
     })
 }
 
+use std::collections::HashSet;
+
 pub trait Evictor: Send + Sync {
     fn on_access(&self, inode_id: i64);
     fn select_victims(&self, limit: usize) -> Vec<i64>;
+    /// Coldest candidates first, skipping ids already examined in this
+    /// eviction round. `select_victims` alone cannot make progress: it always
+    /// returns the same prefix until those entries are removed, so a trigger
+    /// that finds nothing expirable would stop after one page.
+    fn select_victims_excluding(&self, limit: usize, skip: &HashSet<i64>) -> Vec<i64>;
     fn remove_victims(&self, inode_ids: &[i64]);
     fn cache_size(&self) -> usize;
 }
@@ -49,12 +56,17 @@ impl LRUEvictor {
     }
 
     fn peek_victims(&self, limit: usize) -> Vec<i64> {
+        self.peek_victims_excluding(limit, &HashSet::new())
+    }
+
+    fn peek_victims_excluding(&self, limit: usize, skip: &HashSet<i64>) -> Vec<i64> {
         if let Ok(caches) = self.caches.lock() {
             caches
                 .iter()
                 .rev()
-                .take(limit)
                 .map(|(&inode_id, _)| inode_id)
+                .filter(|inode_id| !skip.contains(inode_id))
+                .take(limit)
                 .collect()
         } else {
             Vec::new()
@@ -83,6 +95,10 @@ impl Evictor for LRUEvictor {
 
     fn select_victims(&self, limit: usize) -> Vec<i64> {
         self.peek_victims(limit)
+    }
+
+    fn select_victims_excluding(&self, limit: usize, skip: &HashSet<i64>) -> Vec<i64> {
+        self.peek_victims_excluding(limit, skip)
     }
 
     fn remove_victims(&self, inode_ids: &[i64]) {
@@ -114,8 +130,17 @@ impl LFUEvictor {
     }
 
     fn peek_victims(&self, limit: usize) -> Vec<i64> {
+        self.peek_victims_excluding(limit, &HashSet::new())
+    }
+
+    fn peek_victims_excluding(&self, limit: usize, skip: &HashSet<i64>) -> Vec<i64> {
         if let Ok(caches) = self.caches.lock() {
-            caches.iter().take(limit).copied().collect()
+            caches
+                .iter()
+                .filter(|inode_id| !skip.contains(inode_id))
+                .take(limit)
+                .copied()
+                .collect()
         } else {
             Vec::new()
         }
@@ -143,6 +168,10 @@ impl Evictor for LFUEvictor {
 
     fn select_victims(&self, limit: usize) -> Vec<i64> {
         self.peek_victims(limit)
+    }
+
+    fn select_victims_excluding(&self, limit: usize, skip: &HashSet<i64>) -> Vec<i64> {
+        self.peek_victims_excluding(limit, skip)
     }
 
     fn remove_victims(&self, inode_ids: &[i64]) {

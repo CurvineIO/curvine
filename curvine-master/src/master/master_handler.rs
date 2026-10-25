@@ -19,7 +19,7 @@ use crate::master::replication::master_replication_manager::MasterReplicationMan
 use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_config::ClusterConf;
-use curvine_core_error::err_box;
+use curvine_core_error::{err_box, err_ext};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
@@ -292,6 +292,14 @@ impl MasterHandler {
             return Ok(true);
         }
         let flags = RenameFlags::new(header.flags);
+        // Trash/restore moves carry master-internal semantics (they rewrite
+        // the internal xattrs). Reject forged client requests instead of
+        // silently masking the bits.
+        if flags.intersects(RenameFlags::internal_mask()) {
+            return err_ext!(FsError::invalid_argument(
+                "rename flags contain a master-internal bit"
+            ));
+        }
         let res = self.fs.rename(&header.src, &header.dst, flags);
         self.set_req_cache(req_id, res)
     }

@@ -24,7 +24,7 @@ use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, LocatedBlock,
     MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo, WorkerStatus, WriteType,
 };
-use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
+use curvine_model::{ListOptions, OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
     CreateFileRequest, DeleteRequest, GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest,
@@ -43,6 +43,7 @@ use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
+use curvine_server::master::meta::trash;
 use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
@@ -2275,11 +2276,27 @@ fn setup_pair(
     JournalSystem,
     MasterFilesystem,
 ) {
+    setup_pair_with_conf(
+        name,
+        ClusterConf {
+            testing: true,
+            ..Default::default()
+        },
+    )
+}
+
+fn setup_pair_with_conf(
+    name: &str,
+    mut conf: ClusterConf,
+) -> (
+    MasterFilesystem,
+    JournalSystem,
+    JournalLoader,
+    JournalSystem,
+    MasterFilesystem,
+) {
     Master::init_test_metrics();
-    let mut conf = ClusterConf {
-        testing: true,
-        ..Default::default()
-    };
+    conf.testing = true;
     let worker = WorkerInfo::default();
 
     conf.change_test_meta_dir(format!("idem-{}-leader", name));
@@ -3526,6 +3543,189 @@ fn mounted_deletes_bypass_recycle_bin() -> CommonResult<()> {
         1,
         "unmounted deletes must land in the recycle bin"
     );
+
+    Ok(())
+}
+
+// A soft delete must cost one journaled mutation, not SetAttr + Rename, and the
+// markers must exist on the follower after replay (they are written by the
+// rename itself, using the journaled timestamp).
+#[test]
+fn trash_move_journals_a_single_rename_and_replays_markers() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.master.trash_enabled = true;
+    let (leader, journal_system, loader, _follower_js, follower) =
+        setup_pair_with_conf("trash-single-rename", conf);
+
+    leader.create("/data/a.log", true)?;
+    leader.complete_file("/data/a.log", None, 0, vec![], "", false, None)?;
+    leader.delete_with_opts("/data/a.log", false, false)?;
+
+    let entries = journal_system.fs().fs_dir.read().take_entries();
+    let renames = entries
+        .iter()
+        .filter(|entry| matches!(entry, JournalEntry::Rename(_)))
+        .count();
+    let set_attrs = entries
+        .iter()
+        .filter(|entry| matches!(entry, JournalEntry::SetAttr(_)))
+        .count();
+    assert_eq!(renames, 1, "a soft delete must journal exactly one rename");
+    assert_eq!(
+        set_attrs, 0,
+        "trash markers must be recorded by the rename, not a separate SetAttr"
+    );
+
+    apply_entries(&loader, &entries, 1)?;
+    // `sum_hash` is deliberately not asserted here: resolving a path during
+    // replay can persist a lazily loaded FileEntry record, so the inode store
+    // hash may differ from the leader even when the namespace agrees. The
+    // replayed entry is compared field by field below instead.
+
+    let mut follower_entries = follower.list_options("/.Trash", ListOptions::default())?;
+    assert_eq!(follower_entries.len(), 1, "replay must recreate the entry");
+    let entry = follower_entries.remove(0);
+    assert_eq!(
+        entry
+            .x_attr
+            .get(trash::TRASH_XATTR_ORIGIN)
+            .map(Vec::as_slice),
+        Some(b"/data/a.log".as_slice()),
+        "replay must restore the recorded origin"
+    );
+    let delete_ms = i64::from_le_bytes(
+        entry
+            .x_attr
+            .get(trash::TRASH_XATTR_DELETE_MS)
+            .expect("delete_ms marker must be replayed")
+            .as_slice()
+            .try_into()
+            .unwrap(),
+    );
+    assert!(
+        entry.name.starts_with(&format!("{}-", delete_ms)),
+        "the entry name and the journaled delete_ms must come from the same timestamp"
+    );
+
+    Ok(())
+}
+
+// complete_file forwards client SetAttrOpts, so it must enforce the same
+// internal-xattr guard and ctime normalization as set_attr.
+#[test]
+fn complete_file_rejects_internal_xattrs() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "complete-internal-xattr");
+    let path = "/complete_internal_xattr.log";
+    fs.create(path, true)?;
+
+    for (key, value) in [
+        (trash::TRASH_XATTR_ORIGIN, b"/forged.log".to_vec()),
+        (
+            curvine_model::INTERNAL_CTIME_XATTR,
+            1i64.to_le_bytes().to_vec(),
+        ),
+    ] {
+        let opts = SetAttrOptsBuilder::new()
+            .add_x_attr(key.to_string(), value)
+            .build();
+        let err = fs
+            .complete_file(path, None, 0, vec![], "", false, Some(opts))
+            .expect_err("client-supplied internal xattrs must be rejected");
+        assert!(
+            matches!(err, FsError::InvalidArgument(_)),
+            "expected InvalidArgument for {}, got {:?}",
+            key.escape_default(),
+            err
+        );
+    }
+
+    // Removing a marker is just as dangerous as adding one.
+    let opts = SetAttrOptsBuilder::new()
+        .remove_x_attr(trash::TRASH_XATTR_ORIGIN.to_string())
+        .build();
+    let err = fs
+        .complete_file(path, None, 0, vec![], "", false, Some(opts))
+        .expect_err("removing internal xattrs via complete_file must be rejected");
+    assert!(matches!(err, FsError::InvalidArgument(_)));
+
+    Ok(())
+}
+
+// complete_file must record the master-side ctime like set_attr does, instead
+// of leaving the inode without one (or trusting a client value).
+#[test]
+fn complete_file_records_fresh_ctime() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "complete-ctime");
+    let path = "/complete_ctime.log";
+    fs.create(path, true)?;
+
+    let before = LocalTime::mills() as i64;
+    let opts = SetAttrOptsBuilder::new()
+        .add_x_attr("user.tag".to_string(), b"v1".to_vec())
+        .build();
+    fs.complete_file(path, None, 0, vec![], "", false, Some(opts))?;
+
+    let status = fs.file_status(path)?;
+    let ctime = i64::from_le_bytes(
+        status
+            .x_attr
+            .get(curvine_model::INTERNAL_CTIME_XATTR)
+            .expect("complete_file must record an internal ctime")
+            .as_slice()
+            .try_into()
+            .unwrap(),
+    );
+    assert!(
+        ctime >= before,
+        "ctime {} must be refreshed by the master, not copied from the client",
+        ctime
+    );
+    assert_eq!(status.x_attr.get("user.tag"), Some(&b"v1".to_vec()));
+
+    Ok(())
+}
+
+// An internal TRASH rename rewrites master-owned xattrs, so a client RPC that
+// sets the bit must be rejected instead of silently moving the entry.
+#[test]
+fn rename_rejects_master_internal_flags() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("rename-internal-flags", |_| {});
+    let fs = handler.clone_fs();
+    fs.create("/internal-flag.log", true)?;
+
+    let err = handler
+        .rename0(
+            Utils::req_id(),
+            RenameRequest {
+                src: "/internal-flag.log".to_string(),
+                dst: "/internal-flag-moved.log".to_string(),
+                flags: RenameFlags::TRASH.value(),
+            },
+        )
+        .expect_err("client renames must not carry the internal TRASH bit");
+    assert!(
+        matches!(err, FsError::InvalidArgument(_)),
+        "expected InvalidArgument, got {:?}",
+        err
+    );
+    assert!(fs.exists("/internal-flag.log")?);
+
+    handler.rename0(
+        Utils::req_id(),
+        RenameRequest {
+            src: "/internal-flag.log".to_string(),
+            dst: "/internal-flag-moved.log".to_string(),
+            flags: RenameFlags::empty().value(),
+        },
+    )?;
+    assert!(fs.exists("/internal-flag-moved.log")?);
 
     Ok(())
 }
