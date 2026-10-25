@@ -258,7 +258,7 @@ fn mirror_create_opts(mut opts: CreateFileOpts) -> CreateFileOpts {
 }
 
 async fn cleanup_write_cache_file(cv: CurvineFileSystem, cv_path: Path) {
-    if let Err(e) = cv.delete(&cv_path, false).await {
+    if let Err(e) = cv.delete_with_opts(&cv_path, false, true).await {
         if !matches!(e, FsError::FileNotFound(_)) {
             warn!("failed to cleanup write cache mirror {}: {}", cv_path, e);
         }

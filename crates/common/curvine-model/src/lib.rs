@@ -131,6 +131,9 @@ pub use self::content_summary::{
 mod result;
 pub use self::result::*;
 
+mod trash_entry;
+pub use self::trash_entry::*;
+
 mod proto_utils;
 pub use self::proto_utils::ProtoUtils;
 

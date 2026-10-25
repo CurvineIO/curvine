@@ -105,6 +105,11 @@ pub enum RpcCode {
     GetRuntimeConfig = 63,
     ResetRuntimeConfig = 64,
 
+    // recycle bin.
+    ListTrash = 61,
+    RestoreTrash = 62,
+    EmptyTrash = 63,
+
     // block interface.
     WriteBlock = 80,
     ReadBlock = 81,

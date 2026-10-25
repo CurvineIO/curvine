@@ -37,6 +37,8 @@ pub struct DeleteResult {
     pub inodes: u64,
     pub bytes: u64,
     pub blocks: HashMap<i64, Vec<BlockLocation>>,
+    // True when the entry was moved into /.Trash instead of being purged.
+    pub trashed: bool,
 }
 
 impl DeleteResult {
@@ -45,6 +47,7 @@ impl DeleteResult {
             inodes: 0,
             bytes: 0,
             blocks: Default::default(),
+            trashed: false,
         }
     }
 }
@@ -65,6 +68,7 @@ impl From<FreeResult> for DeleteResult {
             inodes: u64::try_from(value.inodes).unwrap_or(0),
             bytes: u64::try_from(value.bytes).unwrap_or(0),
             blocks: value.blocks,
+            trashed: false,
         }
     }
 }
@@ -79,6 +83,7 @@ mod tests {
             inodes: i64::MAX as u64 + 1,
             bytes: u64::MAX,
             blocks: HashMap::new(),
+            trashed: false,
         };
 
         let free_result: FreeResult = delete_result.into();
