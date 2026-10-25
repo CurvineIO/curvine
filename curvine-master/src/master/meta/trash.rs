@@ -1,0 +1,92 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::master::meta::inode::PATH_SEPARATOR;
+
+pub const TRASH_ROOT_NAME: &str = ".Trash";
+
+pub const TRASH_ROOT: &str = "/.Trash";
+
+const TRASH_ROOT_PREFIX: &str = ".Trash/";
+
+// Internal xattr keys. The NUL prefix keeps them out of client-visible
+// xattr listings, matching the convention used for \0curvine.ctime.
+pub const TRASH_XATTR_ORIGIN: &str = "\0curvine.trash.origin";
+
+pub const TRASH_XATTR_DELETE_MS: &str = "\0curvine.trash.delete_ms";
+
+// True for the trash root itself and every path below it.
+pub fn is_trash_path(path: &str) -> bool {
+    match path.strip_prefix(TRASH_ROOT) {
+        Some(rest) => rest.is_empty() || rest.starts_with(PATH_SEPARATOR),
+        None => false,
+    }
+}
+
+// The trash namespace is reserved even while the recycle bin is disabled, so
+// enabling it later cannot collide with user data.
+pub fn is_reserved_path(path: &str) -> bool {
+    let path = path.trim_start_matches(PATH_SEPARATOR);
+    path == TRASH_ROOT_NAME || path.starts_with(TRASH_ROOT_PREFIX)
+}
+
+pub fn trash_entry_name(delete_ms: i64, inode_id: i64) -> String {
+    format!("{}-{}", delete_ms, inode_id)
+}
+
+pub fn trash_entry_path(entry_name: &str) -> String {
+    format!("{}{}{}", TRASH_ROOT, PATH_SEPARATOR, entry_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifies_trash_paths() {
+        assert!(is_trash_path(TRASH_ROOT));
+        assert!(is_trash_path("/.Trash/entry"));
+        assert!(is_trash_path("/.Trash/a/b"));
+
+        assert!(!is_trash_path("/"));
+        assert!(!is_trash_path("/.Trashy"));
+        assert!(!is_trash_path("/a/.Trash"));
+    }
+
+    #[test]
+    fn identifies_reserved_paths() {
+        assert!(is_reserved_path(TRASH_ROOT));
+        assert!(is_reserved_path("/.Trash/"));
+        assert!(is_reserved_path("/.Trash/a/b"));
+        assert!(is_reserved_path(".Trash"));
+
+        assert!(!is_reserved_path("/"));
+        assert!(!is_reserved_path("/.Trashx"));
+        assert!(!is_reserved_path("/a/.Trash"));
+        assert!(!is_reserved_path("/foo"));
+    }
+
+    #[test]
+    fn entry_names_include_delete_time_and_inode_id() {
+        assert_eq!(trash_entry_name(1_700_000_000_000, 42), "1700000000000-42");
+        assert_ne!(
+            trash_entry_name(1_700_000_000_000, 1),
+            trash_entry_name(1_700_000_000_000, 2)
+        );
+        assert_eq!(
+            trash_entry_path(&trash_entry_name(1_700_000_000_000, 42)),
+            "/.Trash/1700000000000-42"
+        );
+    }
+}
