@@ -1290,11 +1290,11 @@ mod tests {
         let (_, mut root) = store.create_tree()?;
         root.add_child(InodeView::new_entry("missing.txt".to_string(), missing_id))?;
 
-        // Resolve first: `children` borrows the tree, so the owning pointer has to
-        // be moved into the path before iterating children.
-        let inp = InodePath::resolve(InodePtr::from_owned(root), "/", &store)?;
-        let root_ptr = inp.get_last_inode().expect("resolved root missing");
-        let children = root_ptr.children();
+        // Keep `root` alive and resolve through a borrowed pointer: `resolve`
+        // clones the root InodePtr and RawPtr::clone clears the owned flag, so
+        // handing it an owned root would free the tree once `resolve` returns.
+        let children = root.children();
+        let inp = InodePath::resolve(InodePtr::from_ref(&root), "/", &store)?;
         let result = store.batched_get_inodes(&inp, children)?;
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "good.txt");

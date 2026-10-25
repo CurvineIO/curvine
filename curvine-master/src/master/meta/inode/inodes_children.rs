@@ -56,21 +56,19 @@ impl InodeChildren {
     }
 
     /// Get children matching glob pattern (e.g., "*.txt", "dir*")
-    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Option<Vec<InodePtr>> {
+    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodePtr> {
         match self {
-            InodeChildren::List(list) => Some(
-                list.iter()
-                    .filter(|child| glob_pattern.matches(child.name()))
-                    .map(|child| InodePtr::from_ref(child.as_ref()))
-                    .collect(),
-            ),
-            InodeChildren::Map(map) => Some(
-                map.values()
-                    .filter(|child| glob_pattern.matches(child.name()))
-                    .map(|child| InodePtr::from_ref(child.as_ref()))
-                    .collect(),
-            ),
-            InodeChildren::Packed(packed) => Some(packed.get_child_by_glob_pattern(glob_pattern)),
+            InodeChildren::List(list) => list
+                .iter()
+                .filter(|child| glob_pattern.matches(child.name()))
+                .map(|child| InodePtr::from_ref(child.as_ref()))
+                .collect(),
+            InodeChildren::Map(map) => map
+                .values()
+                .filter(|child| glob_pattern.matches(child.name()))
+                .map(|child| InodePtr::from_ref(child.as_ref()))
+                .collect(),
+            InodeChildren::Packed(packed) => packed.get_child_by_glob_pattern(glob_pattern),
         }
     }
 

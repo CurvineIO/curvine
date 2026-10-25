@@ -115,19 +115,11 @@ impl InodeDir {
     }
 
     pub fn get_child(&self, name: &str) -> Option<InodePtr> {
-        self.get_child_ptr(name)
-    }
-
-    pub fn get_child_ptr(&self, name: &str) -> Option<InodePtr> {
         self.children.get_child(name)
     }
 
-    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Option<Vec<InodePtr>> {
+    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodePtr> {
         self.children.get_child_by_glob_pattern(glob_pattern)
-    }
-
-    pub fn get_child_ptr_by_glob_pattern(&self, glob_pattern: &Pattern) -> Option<Vec<InodePtr>> {
-        self.get_child_by_glob_pattern(glob_pattern)
     }
 
     pub fn update_mtime(&mut self, time: i64) {

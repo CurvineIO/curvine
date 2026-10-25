@@ -28,8 +28,7 @@ use curvine_model::{
 };
 use curvine_runtime::common::{LocalTime, Utils};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::collections::LinkedList;
+use std::collections::{HashMap, LinkedList};
 use std::fmt::{Debug, Formatter};
 use std::ops::{Deref, DerefMut};
 
@@ -251,13 +250,9 @@ impl InodeView {
     }
 
     pub fn get_child(&self, name: &str) -> Option<InodePtr> {
-        self.get_child_ptr(name)
-    }
-
-    pub fn get_child_ptr(&self, name: &str) -> Option<InodePtr> {
         match self {
             File(_) => None,
-            Dir(d) => d.get_child_ptr(name),
+            Dir(d) => d.get_child(name),
             FileEntry(_) => None,
         }
     }
@@ -270,14 +265,6 @@ impl InodeView {
         }
 
         vec
-    }
-
-    // Owned snapshot of the children; packed file edges become `FileEntry` views.
-    pub fn children_vec(&self) -> Vec<InodeView> {
-        match self {
-            Dir(d) => d.children_vec(),
-            _ => vec![],
-        }
     }
 
     pub fn child_len(&self) -> usize {
@@ -769,7 +756,6 @@ impl Decode for InodeView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     #[test]
     fn ttl_expires_on_mtime_by_default() {

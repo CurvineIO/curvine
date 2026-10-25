@@ -74,7 +74,7 @@ impl InodePath {
             let child_name: &str = components[index].as_str();
             match cur_inode.as_mut() {
                 Dir(d) => {
-                    if let Some(child) = d.get_child_ptr(child_name) {
+                    if let Some(child) = d.get_child(child_name) {
                         cur_inode = child;
                     } else {
                         // The directory has not been created, so there is no need to search again.
@@ -220,16 +220,12 @@ impl InodePath {
                         let Some(glob_pattern) = glob_pattern else {
                             return err_box!("invalid glob pattern: {}", child_name_str);
                         };
-                        if let Some(children) = d.get_child_ptr_by_glob_pattern(&glob_pattern) {
-                            for child_ptr in children {
-                                parent_map.insert(
-                                    child_ptr.as_ref().id(),
-                                    (curr_index + 1, curr_node.id()),
-                                );
-                                queue.push_back((curr_index + 1, child_ptr));
-                            }
+                        for child_ptr in d.get_child_by_glob_pattern(&glob_pattern) {
+                            parent_map
+                                .insert(child_ptr.as_ref().id(), (curr_index + 1, curr_node.id()));
+                            queue.push_back((curr_index + 1, child_ptr));
                         }
-                    } else if let Some(child) = d.get_child_ptr(child_name_str) {
+                    } else if let Some(child) = d.get_child(child_name_str) {
                         parent_map.insert(child.id(), (curr_index + 1, curr_node.id()));
                         queue.push_back((curr_index + 1, child));
                     }
