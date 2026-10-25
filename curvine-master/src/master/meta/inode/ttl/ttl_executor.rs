@@ -68,7 +68,10 @@ impl InodeTtlExecutor {
         Ok(inp.is_empty_dir())
     }
 
-    pub fn execute_by_id(&self, inode_id: i64) -> FsResult<(bool, InodeView)> {
+    // Returns (handled, inode, reclaimed_bytes). `handled` drives TTL bucket
+    // bookkeeping; `reclaimed_bytes` lets quota eviction count only space that
+    // was actually released.
+    pub fn execute_by_id(&self, inode_id: i64) -> FsResult<(bool, InodeView, i64)> {
         let inode = if let Some(inode) = self.get_inode_from_store(inode_id)? {
             inode
         } else {
@@ -76,7 +79,7 @@ impl InodeTtlExecutor {
         };
 
         if !inode.is_expired()? {
-            return Ok((false, inode));
+            return Ok((false, inode, 0));
         }
 
         let action = inode.storage_policy()?.ttl_action;
@@ -89,31 +92,42 @@ impl InodeTtlExecutor {
         let path = self.get_inode_path(inode_id)?;
         if trash::is_trash_path(&path) {
             // Trashed entries are governed by trash retention, not TTL. Treat
-            // the action as handled so the expired entry leaves the TTL bucket.
+            // the action as handled so the expired entry leaves the TTL bucket,
+            // but report no reclamation: the blocks stay allocated.
             debug!("skip ttl action for trash entry {} ({})", path, inode_id);
-            return Ok((true, inode));
+            return Ok((true, inode, 0));
         }
 
         match action {
             TtlAction::Delete => {
                 // A non-empty directory stays until its children are gone.
-                // Returning (false, inode) puts it back in its TTL bucket.
+                // Returning (false, inode, ..) puts it back in its TTL bucket.
                 // Free is not gated here: it drops cached blocks and leaves children.
                 if inode.is_dir() && !self.is_empty_dir(&path)? {
                     debug!("skip ttl delete for non-empty directory {}", inode_id);
-                    return Ok((false, inode));
+                    return Ok((false, inode, 0));
                 }
+                // Unlinking one name of a hard-linked file keeps the shared
+                // blocks, so only the last link reclaims the file size.
+                let reclaimed = match &inode {
+                    InodeView::File(f) if f.nlink() <= 1 => f.len.max(0),
+                    _ => 0,
+                };
                 self.filesystem.delete(&path, true)?;
                 debug!("ttl delete {} {:?}", path, inode);
-                Ok((true, inode))
+                Ok((true, inode, reclaimed))
             }
             TtlAction::Free => {
+                let reclaimed = match &inode {
+                    InodeView::File(f) => f.len.max(0),
+                    _ => 0,
+                };
                 self.filesystem.free(&path, true)?;
                 debug!("ttl free {} {:?}", path, inode);
-                Ok((true, inode))
+                Ok((true, inode, reclaimed))
             }
 
-            _ => Ok((true, inode)),
+            _ => Ok((true, inode, 0)),
         }
     }
 }

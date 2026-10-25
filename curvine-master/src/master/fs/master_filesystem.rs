@@ -560,6 +560,25 @@ impl MasterFilesystem {
         Ok(())
     }
 
+    // NUL-prefixed keys are master-owned (ctime, trash markers) and never
+    // surface in FileStatus, so a client cannot legitimately send them.
+    fn check_not_internal_x_attr(opts: &SetAttrOpts) -> FsResult<()> {
+        let reserved = opts
+            .add_x_attr
+            .keys()
+            .map(String::as_str)
+            .chain(opts.remove_x_attr.iter().map(String::as_str))
+            .find(|key| key.starts_with('\0'));
+
+        match reserved {
+            Some(key) => err_ext!(FsError::invalid_argument(format!(
+                "xattr {} is reserved for internal master metadata",
+                key.escape_default()
+            ))),
+            None => Ok(()),
+        }
+    }
+
     fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {
         InodePath::resolve_for_glob_pattern(fs_dir.root_ptr(), path, &fs_dir.store)
     }
@@ -1584,6 +1603,7 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         Self::check_not_reserved_path(inp.path())?;
+        Self::check_not_internal_x_attr(&opts)?;
         fs_dir.set_attr(inp, opts)
     }
 
@@ -2561,6 +2581,59 @@ mod tests {
     }
 
     #[test]
+    fn trash_move_and_purge_transfer_directory_link_counts() {
+        let fs = test_fs_with_trash("trash-nlink");
+        fs.mkdir("/parent", true).unwrap();
+        fs.mkdir("/parent/child", true).unwrap();
+        let parent_nlink = fs.file_status("/parent").unwrap().nlink;
+
+        fs.delete_with_opts("/parent/child", true, false).unwrap();
+
+        assert_eq!(
+            fs.file_status("/parent").unwrap().nlink,
+            parent_nlink - 1,
+            "the source parent must drop the moved directory link"
+        );
+        let mut entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        let trash_nlink = fs.file_status("/.Trash").unwrap().nlink;
+        let entry_path = format!("/.Trash/{}", entries.remove(0).name);
+
+        fs.delete_with_opts(&entry_path, true, false).unwrap();
+
+        assert_eq!(
+            fs.file_status("/.Trash").unwrap().nlink,
+            trash_nlink - 1,
+            "purging the entry must drop the trash root link"
+        );
+    }
+
+    #[test]
+    fn client_set_attr_cannot_touch_internal_xattrs() {
+        let fs = test_fs("internal-xattr");
+        fs.create("/a.log", true).unwrap();
+
+        for key in [trash::TRASH_XATTR_ORIGIN, trash::TRASH_XATTR_DELETE_MS] {
+            let err = fs
+                .set_attr(
+                    "/a.log",
+                    SetAttrOptsBuilder::new()
+                        .add_x_attr(key, b"x".to_vec())
+                        .build(),
+                )
+                .unwrap_err();
+            assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+            let err = fs
+                .set_attr(
+                    "/a.log",
+                    SetAttrOptsBuilder::new().remove_x_attr(key).build(),
+                )
+                .unwrap_err();
+            assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+        }
+    }
+
+    #[test]
     fn trash_root_is_protected_and_entries_are_purged_permanently() {
         let fs = test_fs_with_trash("trash-purge");
         fs.create("/a.log", true).unwrap();
@@ -2605,9 +2678,13 @@ mod tests {
         let trashed_path = format!("/.Trash/{}", entries[0].name);
 
         let executor = InodeTtlExecutor::with_managers(fs.clone());
-        let (handled, _) = executor.execute_by_id(inode_id).unwrap();
+        let (handled, _, reclaimed) = executor.execute_by_id(inode_id).unwrap();
 
         assert!(handled);
+        assert_eq!(
+            reclaimed, 0,
+            "a skipped trash entry must not report reclaimed bytes"
+        );
         assert!(fs.get_block_locations(&trashed_path).is_ok());
     }
 

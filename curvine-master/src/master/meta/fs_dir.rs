@@ -626,6 +626,13 @@ impl FsDir {
         src_parent.update_mtime(mtime);
         dst_parent.update_mtime(mtime);
 
+        // A directory is a link from each parent; cross-parent moves must
+        // transfer it so live execution and journal replay agree.
+        if src_parent.id() != dst_parent.id() && src_inode.is_dir() {
+            src_parent.dec_nlink(mtime);
+            dst_parent.incr_nlink(mtime);
+        }
+
         // Update state.
         self.store.apply_rename(
             src_parent.as_ref(),

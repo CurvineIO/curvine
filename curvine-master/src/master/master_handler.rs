@@ -240,15 +240,20 @@ impl MasterHandler {
         }
 
         let path = Path::from_str(&header.path)?;
-        if let Some(info) = self.mount_manager.get_mount_info(&path)? {
+        let mount_info = self.mount_manager.get_mount_info(&path)?;
+        if let Some(info) = &mount_info {
             if path.path() == info.cv_path {
                 return err_box!("cannot delete mount point root: {}", info.cv_path);
             }
         }
 
+        // Mounted deletes are UFS-first on the client, so the backing object is
+        // already gone when this runs and a trash entry could never be restored.
+        // Keep mounted deletes permanent until trash supports UFS routing.
+        let skip_trash = mount_info.is_some();
         let res = self
             .fs
-            .delete_with_opts(&header.path, header.recursive, false);
+            .delete_with_opts(&header.path, header.recursive, skip_trash);
         self.set_req_cache(req_id, res)
     }
 
@@ -785,7 +790,7 @@ impl MasterHandler {
         self.fs.clone()
     }
 
-    fn mount(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub fn mount(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: MountRequest = ctx.parse_header()?;
         let mnt_opt = ProtoUtils::mount_options_from_pb(request.mount_options);
 

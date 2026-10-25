@@ -22,13 +22,13 @@ use curvine_model::ProtoUtils;
 use curvine_model::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
     CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, LocatedBlock,
-    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo, WorkerStatus,
+    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo, WorkerStatus, WriteType,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
     CreateFileRequest, DeleteRequest, GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest,
-    RenameRequest,
+    MountRequest, RenameRequest,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -209,11 +209,19 @@ fn prepare_flush_file(
 }
 
 fn new_handler_for_test(test_name: &str) -> MasterHandler {
+    new_handler_with_conf(test_name, |_| {})
+}
+
+fn new_handler_with_conf(
+    test_name: &str,
+    configure: impl FnOnce(&mut ClusterConf),
+) -> MasterHandler {
     Master::init_test_metrics();
 
     let test_id = Utils::rand_str(8);
     let mut conf = ClusterConf::format();
     conf.journal.enable = false;
+    configure(&mut conf);
 
     conf.master.meta_dir =
         Utils::test_sub_dir(format!("master-fs-test/meta-{test_name}-{test_id}"));
@@ -1042,7 +1050,7 @@ fn ttl_executor_deletes_nested_expired_inode() -> CommonResult<()> {
 
     std::thread::sleep(Duration::from_millis(10));
     let executor = InodeTtlExecutor::with_managers(fs.clone());
-    let (processed, inode) = executor.execute_by_id(status.id)?;
+    let (processed, inode, _) = executor.execute_by_id(status.id)?;
 
     assert!(
         processed,
@@ -1129,7 +1137,7 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
     let dir_mtime_before_child_delete = fs.file_status("/ttl/expired-dir")?.mtime;
     let executor = InodeTtlExecutor::with_managers(fs.clone());
 
-    let (file_processed, _) = executor.execute_by_id(file.id)?;
+    let (file_processed, _, _) = executor.execute_by_id(file.id)?;
     assert!(
         file_processed,
         "expired child file should be processed by TTL executor"
@@ -1144,7 +1152,7 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
         "TTL child delete must not refresh an already-expired parent directory mtime"
     );
 
-    let (dir_processed, inode) = executor.execute_by_id(dir.id)?;
+    let (dir_processed, inode, _) = executor.execute_by_id(dir.id)?;
     assert!(
         dir_processed,
         "expired directory should still be processed after its child file is deleted"
@@ -1187,7 +1195,7 @@ fn ttl_executor_skips_non_empty_expired_directory() -> CommonResult<()> {
     let dir_mtime = fs.file_status("/ttl/live-children")?.mtime;
     let executor = InodeTtlExecutor::with_managers(fs.clone());
 
-    let (dir_processed, inode) = executor.execute_by_id(dir.id)?;
+    let (dir_processed, inode, _) = executor.execute_by_id(dir.id)?;
     assert!(
         !dir_processed,
         "expired directory with a live child must be deferred"
@@ -1204,7 +1212,7 @@ fn ttl_executor_skips_non_empty_expired_directory() -> CommonResult<()> {
     );
 
     fs.delete("/ttl/live-children/file.log", false)?;
-    let (dir_processed, _) = executor.execute_by_id(dir.id)?;
+    let (dir_processed, _, _) = executor.execute_by_id(dir.id)?;
     assert!(
         dir_processed,
         "expired directory should be deleted once it is empty"
@@ -1259,7 +1267,7 @@ fn ttl_executor_frees_child_blocks_of_expired_directory() -> CommonResult<()> {
 
     std::thread::sleep(Duration::from_millis(10));
     let executor = InodeTtlExecutor::with_managers(fs.clone());
-    let (processed, inode) = executor.execute_by_id(dir.id)?;
+    let (processed, inode, _) = executor.execute_by_id(dir.id)?;
     assert!(
         processed,
         "directory TTL Free should run while a child file is still present"
@@ -1332,7 +1340,7 @@ fn ttl_path_resolution_no_reentrant_deadlock_under_writers() -> CommonResult<()>
     let _ = writer.join();
     let _ = resolver.join();
 
-    let (processed, inode) = result
+    let (processed, inode, _) = result
         .expect("TTL path resolution deadlocked: no result within 10s under concurrent writers")?;
     assert!(processed, "expired inode should be processed");
     assert_eq!(inode.id(), status.id);
@@ -3451,5 +3459,73 @@ fn reset_full_block_report_forgets_completed_round() -> CommonResult<()> {
     assert_eq!(fs.full_report_completed_round(0), None);
     let res = fs.block_report(full_report_batch(5, 1, block_id), None)?;
     assert_eq!(res.delete_blocks, vec![block_id]);
+    Ok(())
+}
+
+fn mount_for_test(
+    handler: &MasterHandler,
+    cv_path: &str,
+    write_type: WriteType,
+) -> CommonResult<()> {
+    let msg = Builder::new_rpc(RpcCode::Mount)
+        .proto_header(MountRequest {
+            cv_path: cv_path.to_string(),
+            ufs_path: format!("oss://bucket{cv_path}"),
+            mount_options: ProtoUtils::mount_options_to_pb(
+                MountOptions::builder().write_type(write_type).build(),
+            ),
+        })
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    handler.mount(&mut ctx)?;
+    Ok(())
+}
+
+#[test]
+fn mounted_deletes_bypass_recycle_bin() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-mounted", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    for (cv_path, write_type) in [
+        ("/cache-mode", WriteType::CacheMode),
+        ("/fs-mode", WriteType::FsMode),
+    ] {
+        mount_for_test(&handler, cv_path, write_type)?;
+        let file = format!("{cv_path}/data.log");
+        fs.create(&file, true)?;
+
+        let res = handler.delete0(
+            Utils::req_id(),
+            DeleteRequest {
+                path: file.clone(),
+                recursive: false,
+            },
+        )?;
+
+        assert_eq!(res.inodes, 1, "{file} should be deleted");
+        assert!(!fs.exists(&file)?, "{file} should be gone");
+        assert!(
+            !fs.exists("/.Trash")?,
+            "{cv_path} delete must bypass the recycle bin"
+        );
+    }
+
+    // Unmounted deletes still land in the recycle bin.
+    fs.create("/plain.log", true)?;
+    handler.delete0(
+        Utils::req_id(),
+        DeleteRequest {
+            path: "/plain.log".to_string(),
+            recursive: false,
+        },
+    )?;
+    assert!(!fs.exists("/plain.log")?);
+    assert_eq!(
+        fs.list_status("/.Trash")?.len(),
+        1,
+        "unmounted deletes must land in the recycle bin"
+    );
+
     Ok(())
 }

@@ -159,27 +159,17 @@ impl QuotaManager {
                 break;
             }
 
-            let total_freed = {
-                let fs_guard = self.fs.fs_dir.read();
-                let freed = inode_ids
-                    .iter()
-                    .filter_map(|&inode_id| fs_guard.store.get_inode(inode_id, None).ok().flatten())
-                    .map(|inode_view| match &inode_view {
-                        InodeView::File(f) => f.len.max(0),
-                        _ => 0,
-                    })
-                    .sum::<i64>();
-                freed
-            };
+            let (processed, reclaimed) =
+                self.execute_eviction(self.eviction_conf.eviction_mode, &inode_ids);
 
-            if total_freed <= 0 {
-                log::debug!("cluster-evict: total_freed <= 0, stopping eviction");
+            // Only space that was actually released counts toward the target.
+            // Trashed victims free nothing, so eviction keeps scanning live files.
+            plan.target_free_bytes = plan.target_free_bytes.saturating_sub(reclaimed);
+
+            if processed == 0 {
+                log::debug!("cluster-evict: no victim made progress, stopping eviction");
                 break;
             }
-
-            self.execute_eviction(self.eviction_conf.eviction_mode, &inode_ids);
-
-            plan.target_free_bytes = plan.target_free_bytes.saturating_sub(total_freed);
 
             if plan.target_free_bytes <= 0 {
                 log::info!("cluster-evict: reached target_free_bytes, stopping eviction");
@@ -214,25 +204,29 @@ impl QuotaManager {
         })
     }
 
-    fn execute_eviction(&self, _mode: EvictionMode, inode_ids: &[i64]) {
+    // Returns (processed, reclaimed_bytes). Processed victims leave the evictor
+    // even when they reclaim nothing, but only real reclamation counts toward
+    // quota targets and metrics.
+    fn execute_eviction(&self, _mode: EvictionMode, inode_ids: &[i64]) -> (usize, i64) {
         let ttl_executor_guard = self.ttl_executor.read();
         let Some(ttl_executor) = ttl_executor_guard.as_ref() else {
             log::warn!("cluster-evict: ttl_executor not initialized, skipping eviction");
-            return;
+            return (0, 0);
         };
 
         let metrics = match Master::get_metrics() {
             Ok(metrics) => metrics,
             Err(e) => {
                 log::warn!("cluster-evict: master metrics unavailable: {}", e);
-                return;
+                return (0, 0);
             }
         };
-        let mut successfully_evicted = Vec::with_capacity(inode_ids.len());
+        let mut processed = Vec::with_capacity(inode_ids.len());
+        let mut reclaimed_files = 0_i64;
         let mut total_bytes_freed = 0_i64;
 
-        // Get file sizes before deletion
-        let file_sizes: Vec<(i64, i64)> = {
+        // Only file inodes can be reclaimed; directories stay in the evictor.
+        let file_inode_ids: Vec<i64> = {
             let fs_guard = self.fs.fs_dir.read();
             inode_ids
                 .iter()
@@ -243,21 +237,23 @@ impl QuotaManager {
                         .ok()
                         .flatten()
                         .and_then(|inode_view| match &inode_view {
-                            InodeView::File(f) => Some((inode_id, f.len.max(0))),
+                            InodeView::File(_) => Some(inode_id),
                             _ => None,
                         })
                 })
                 .collect()
         };
 
-        for (inode_id, file_size) in file_sizes {
-            let res = ttl_executor.execute_by_id(inode_id);
-
-            match res {
-                Ok(_) => {
-                    successfully_evicted.push(inode_id);
-                    total_bytes_freed += file_size;
+        for inode_id in file_inode_ids {
+            match ttl_executor.execute_by_id(inode_id) {
+                Ok((true, _, reclaimed)) => {
+                    processed.push(inode_id);
+                    if reclaimed > 0 {
+                        reclaimed_files += 1;
+                        total_bytes_freed += reclaimed;
+                    }
                 }
+                Ok((false, _, _)) => {}
                 Err(e) => {
                     log::warn!(
                         "cluster-evict: executor failed for inode_id={}, err={}",
@@ -268,20 +264,21 @@ impl QuotaManager {
             }
         }
 
-        if !successfully_evicted.is_empty() {
-            self.evictor.remove_victims(&successfully_evicted);
+        if !processed.is_empty() {
+            self.evictor.remove_victims(&processed);
+        }
 
-            // Update metrics
-            metrics
-                .eviction_files_deleted
-                .inc_by(successfully_evicted.len() as i64);
+        if reclaimed_files > 0 {
+            metrics.eviction_files_deleted.inc_by(reclaimed_files);
             metrics.eviction_bytes_freed.inc_by(total_bytes_freed);
 
             log::info!(
-                "cluster-evict: deleted {} files, freed {} bytes",
-                successfully_evicted.len(),
+                "cluster-evict: reclaimed {} files, freed {} bytes",
+                reclaimed_files,
                 total_bytes_freed
             );
         }
+
+        (processed.len(), total_bytes_freed)
     }
 }
