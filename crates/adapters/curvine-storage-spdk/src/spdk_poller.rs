@@ -85,6 +85,7 @@ fn poll_ack_error_to_outcome(err: RecvTimeoutError) -> RetiredQpairPollOutcome {
     }
 }
 
+// TODO(spdk): split silent ctrlr-retry logging from qpair unregister logging.
 fn unregister_ack_error_to_result(err: RecvTimeoutError) -> UnregisterResult {
     match err {
         RecvTimeoutError::Timeout => {
