@@ -27,9 +27,10 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
 use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
-    CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FilesystemInfo, FreeResult,
-    JobStatus, ListOptions, LoadJobCommand, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
-    OpenFlags, RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState,
+    CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FilesystemCapacity,
+    FilesystemInfo, FreeResult, JobStatus, ListOptions, LoadJobCommand, MkdirOpts,
+    MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags, SetAttrOpts,
+    TransferCommand, TransferKind, TransferState,
 };
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::common::Utils;
@@ -259,6 +260,12 @@ impl UnifiedFileSystem {
             Some(v) if v.1.info.is_cache_mode() => Ok(Some(v)),
             _ => Ok(None),
         }
+    }
+
+    /// Return the statfs allocatable view without fetching cluster topology.
+    pub async fn get_filesystem_capacity(&self) -> FsResult<FilesystemCapacity> {
+        let fut = async { self.cv.get_filesystem_capacity().await };
+        self.track("GetFilesystemCapacity", "", "", fut).await
     }
 
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
