@@ -15,13 +15,22 @@ pub enum RmCommand {
             help = "Remove directories and their contents recursively"
         )]
         recursive: bool,
+        #[clap(
+            long,
+            help = "Delete permanently, bypassing the recycle bin (if enabled)"
+        )]
+        skip_trash: bool,
     },
 }
 
 impl RmCommand {
     pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
-            RmCommand::Rm { path, recursive } => {
+            RmCommand::Rm {
+                path,
+                recursive,
+                skip_trash,
+            } => {
                 let path = CurvineURI::new(path)?;
 
                 // Check if the path exists
@@ -34,9 +43,16 @@ impl RmCommand {
                         }
 
                         // Delete the file or directory
-                        match client.delete(&path, *recursive).await {
-                            Ok(_) => {
-                                println!("Deleted {}", path.full_path());
+                        match client
+                            .delete_with_opts(&path, *recursive, *skip_trash)
+                            .await
+                        {
+                            Ok(res) => {
+                                if res.trashed {
+                                    println!("Moved to /.Trash: {}", path.full_path());
+                                } else {
+                                    println!("Deleted permanently: {}", path.full_path());
+                                }
                                 Ok(())
                             }
                             Err(e) => {
