@@ -196,6 +196,18 @@ impl WorkerManager {
         res
     }
 
+    // Rebuilds the heartbeat baseline when this node becomes the active master.
+    // Worker heartbeats are answered with NotLeader while the node is a follower,
+    // so last_update keeps the demotion time; expiring on those timestamps would
+    // treat live workers as blacklisted or lost. Returns the refreshed count.
+    pub fn refresh_last_heartbeat(&mut self, now: u64) -> usize {
+        let refreshed = self.worker_map.workers.len();
+        for worker in self.worker_map.workers.values_mut() {
+            worker.last_update = now;
+        }
+        refreshed
+    }
+
     pub fn available_bytes(&self) -> i64 {
         self.worker_map
             .workers()
