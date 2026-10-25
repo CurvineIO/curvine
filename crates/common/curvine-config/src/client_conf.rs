@@ -85,6 +85,14 @@ pub struct ClientConf {
     #[client_cli]
     pub short_circuit: bool,
 
+    // Whether to use O_DIRECT for short-circuit local block reads, bypassing
+    // the OS page cache (NVMe DMA straight into an aligned user buffer).
+    // Falls back to buffered reads when direct I/O is unavailable or fails.
+    // Disabled by default: direct reads skip the page cache, so repeated
+    // (warm) reads of the same block no longer hit it.
+    #[client_cli]
+    pub enable_direct_read: bool,
+
     #[serde(skip)]
     pub storage_type: StorageType,
     #[serde(alias = "storage_type")]
@@ -386,6 +394,7 @@ impl Default for ClientConf {
             max_cache_block_handles: 10,
 
             short_circuit: true,
+            enable_direct_read: false,
 
             storage_type: StorageType::Disk,
             storage_type_str: "disk".to_string(),
@@ -465,5 +474,48 @@ impl Default for ClientConf {
 
         conf.init().unwrap();
         conf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{ClientConf, ClientConfCliOverrides};
+
+    #[test]
+    fn enable_direct_read_defaults_to_false() {
+        assert!(!ClientConf::default().enable_direct_read);
+    }
+
+    #[test]
+    fn enable_direct_read_toml_round_trip() {
+        // Present in the config file: honored.
+        let conf: ClientConf = toml::from_str("enable_direct_read = true").unwrap();
+        assert!(conf.enable_direct_read);
+
+        // Absent from the config file: serde(default) keeps it disabled.
+        let conf: ClientConf = toml::from_str("").unwrap();
+        assert!(!conf.enable_direct_read);
+
+        // Full round trip: a serialized enabled config reads back enabled.
+        let conf = ClientConf {
+            enable_direct_read: true,
+            ..Default::default()
+        };
+        let text = toml::to_string(&conf).unwrap();
+        assert!(text.contains("enable_direct_read = true"));
+        let conf: ClientConf = toml::from_str(&text).unwrap();
+        assert!(conf.enable_direct_read);
+    }
+
+    #[test]
+    fn enable_direct_read_cli_override_applies() {
+        let mut conf = ClientConf::default();
+        let overrides = ClientConfCliOverrides {
+            enable_direct_read: Some(true),
+            ..Default::default()
+        };
+        overrides.apply_to(&mut conf).unwrap();
+        conf.init().unwrap();
+        assert!(conf.enable_direct_read);
     }
 }

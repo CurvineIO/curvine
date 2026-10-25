@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod aligned_buf;
+pub use self::aligned_buf::{AlignedBuf, DIRECT_IO_ALIGN};
+
 mod block_io;
 pub use self::block_io::{BlockDevice, BlockIO};
 
@@ -35,14 +38,15 @@ pub type IOResult<T> = Result<T, IOError>;
 #[cfg(test)]
 mod tests {
     use super::{
-        BdevInfo, BlockDevice, BlockIO, CacheManager, DataSlice, IOError, IOResult, LocalFile,
-        NvmeTarget, ReadAheadTask, SpdkConf,
+        AlignedBuf, BdevInfo, BlockDevice, BlockIO, CacheManager, DataSlice, IOError, IOResult,
+        LocalFile, NvmeTarget, ReadAheadTask, SpdkConf,
     };
 
     #[test]
     fn exports_generic_io_api() {
         fn assert_send<T: Send>() {}
 
+        assert_send::<AlignedBuf>();
         assert_send::<BlockDevice>();
         assert_send::<BdevInfo>();
         assert_send::<CacheManager>();
