@@ -99,16 +99,16 @@ pub enum RpcCode {
     GetContentSummary = 68,
     GetDirSpaceStatus = 69,
 
+    // recycle bin (70-72: main-next uses 61-64 for batch/runtime RPCs).
+    ListTrash = 70,
+    RestoreTrash = 71,
+    EmptyTrash = 72,
+
     MetricsReport = 60,
     GetBlockLocationsBatch = 61,
     UpdateRuntimeConfig = 62,
     GetRuntimeConfig = 63,
     ResetRuntimeConfig = 64,
-
-    // recycle bin.
-    ListTrash = 61,
-    RestoreTrash = 62,
-    EmptyTrash = 63,
 
     // block interface.
     WriteBlock = 80,

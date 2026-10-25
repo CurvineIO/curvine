@@ -3050,7 +3050,7 @@ mod tests {
         };
 
         // 1) An expired but still-writing file must not be touched.
-        let (executed, _) = executor.execute_by_id(inode_id).unwrap();
+        let (executed, _, _) = executor.execute_by_id(inode_id).unwrap();
         assert!(
             !executed,
             "TTL must not touch a file that is still being written"
@@ -3066,7 +3066,7 @@ mod tests {
         // session to be closed.
         fs.complete_file(path, Some(inode_id), 0, vec![], "", false, None)
             .unwrap();
-        let (executed, _) = executor.execute_by_id(inode_id).unwrap();
+        let (executed, _, _) = executor.execute_by_id(inode_id).unwrap();
         assert!(
             !executed,
             "a just-completed file must have a fresh TTL window, not be born expired"
@@ -3075,7 +3075,7 @@ mod tests {
 
         // 3) Once that window lapses, the checker deletes it normally.
         std::thread::sleep(std::time::Duration::from_millis(150));
-        let (executed, _) = executor.execute_by_id(inode_id).unwrap();
+        let (executed, _, _) = executor.execute_by_id(inode_id).unwrap();
         assert!(executed, "expired completed file must be reclaimed");
         assert!(
             fs.file_status(path).is_err(),

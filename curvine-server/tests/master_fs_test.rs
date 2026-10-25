@@ -1230,7 +1230,7 @@ fn ttl_executor_deletes_nested_expired_inode() -> CommonResult<()> {
 
     std::thread::sleep(Duration::from_millis(10));
     let executor = InodeTtlExecutor::with_managers(fs.clone());
-    let (processed, inode) = executor.execute_by_id(status.id)?;
+    let (processed, inode, _) = executor.execute_by_id(status.id)?;
 
     assert!(
         processed,
@@ -1317,7 +1317,7 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
     let dir_mtime_before_child_delete = fs.file_status("/ttl/expired-dir")?.mtime;
     let executor = InodeTtlExecutor::with_managers(fs.clone());
 
-    let (file_processed, _) = executor.execute_by_id(file.id)?;
+    let (file_processed, _, _) = executor.execute_by_id(file.id)?;
     assert!(
         file_processed,
         "expired child file should be processed by TTL executor"
@@ -1332,7 +1332,7 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
         "TTL child delete must not refresh an already-expired parent directory mtime"
     );
 
-    let (dir_processed, inode) = executor.execute_by_id(dir.id)?;
+    let (dir_processed, inode, _) = executor.execute_by_id(dir.id)?;
     assert!(
         dir_processed,
         "expired directory should still be processed after its child file is deleted"
@@ -1375,7 +1375,7 @@ fn ttl_executor_skips_non_empty_expired_directory() -> CommonResult<()> {
     let dir_mtime = fs.file_status("/ttl/live-children")?.mtime;
     let executor = InodeTtlExecutor::with_managers(fs.clone());
 
-    let (dir_processed, inode) = executor.execute_by_id(dir.id)?;
+    let (dir_processed, inode, _) = executor.execute_by_id(dir.id)?;
     assert!(
         !dir_processed,
         "expired directory with a live child must be deferred"
@@ -1392,7 +1392,7 @@ fn ttl_executor_skips_non_empty_expired_directory() -> CommonResult<()> {
     );
 
     fs.delete("/ttl/live-children/file.log", false)?;
-    let (dir_processed, _) = executor.execute_by_id(dir.id)?;
+    let (dir_processed, _, _) = executor.execute_by_id(dir.id)?;
     assert!(
         dir_processed,
         "expired directory should be deleted once it is empty"
@@ -1447,7 +1447,7 @@ fn ttl_executor_frees_child_blocks_of_expired_directory() -> CommonResult<()> {
 
     std::thread::sleep(Duration::from_millis(10));
     let executor = InodeTtlExecutor::with_managers(fs.clone());
-    let (processed, inode) = executor.execute_by_id(dir.id)?;
+    let (processed, inode, _) = executor.execute_by_id(dir.id)?;
     assert!(
         processed,
         "directory TTL Free should run while a child file is still present"
@@ -1520,7 +1520,7 @@ fn ttl_path_resolution_no_reentrant_deadlock_under_writers() -> CommonResult<()>
     let _ = writer.join();
     let _ = resolver.join();
 
-    let (processed, inode) = result
+    let (processed, inode, _) = result
         .expect("TTL path resolution deadlocked: no result within 10s under concurrent writers")?;
     assert!(processed, "expired inode should be processed");
     assert_eq!(inode.id(), status.id);
@@ -2403,6 +2403,7 @@ fn delete_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
     let req = DeleteRequest {
         path: "/delete_file_retry".to_string(),
         recursive: true,
+        skip_trash: None,
         client_context: None,
     };
 
