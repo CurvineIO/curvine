@@ -18,7 +18,7 @@ use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
-use crate::master::meta::{BlockMeta, InodeId};
+use crate::master::meta::{trash, BlockMeta, InodeId};
 use crate::master::quota::eviction::evictor::Evictor;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
@@ -350,6 +350,91 @@ impl FsDir {
         Ok(del_res)
     }
 
+    // Move an entry into /.Trash instead of removing it. Blocks stay on the
+    // workers so the entry can be restored until retention expires.
+    pub fn trash(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
+        let op_ms = LocalTime::mills() as i64;
+
+        if inp.is_root() {
+            return err_box!("The root is not allowed to be deleted");
+        }
+
+        if inp.is_empty() || inp.get_last_inode().is_none() {
+            return err_ext!(FsError::file_not_found(inp.path()));
+        }
+
+        if !inp.is_empty_dir() && !recursive {
+            return err_ext!(FsError::dir_not_empty(inp.path()));
+        }
+
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        // Unlinking one name of a hard-linked file must not move the shared
+        // inode, and unresolved entries cannot be renamed, so both keep hard
+        // unlink semantics.
+        if inode.is_file_entry() || matches!(inode.as_ref(), File(f) if f.nlink() > 1) {
+            return self.delete(inp, recursive);
+        }
+
+        self.ensure_trash_root()?;
+
+        let entry_name = self.unique_trash_entry_name(op_ms, inode.id())?;
+        let dst_path = trash::trash_entry_path(&entry_name);
+        let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+
+        // The TRASH rename records the origin and the deletion time on the
+        // moved inode as part of the same persisted mutation, so a hard delete
+        // still costs one journal record instead of SetAttr + Rename, and a
+        // failure can never leave markers on a live inode.
+        self.rename_with_mtime(
+            inp,
+            &dst_inp,
+            RenameFlags::NO_REPLACE | RenameFlags::TRASH,
+            op_ms,
+        )?;
+        debug!("moved {} to trash as {}", inp.path(), dst_path);
+        Ok(DeleteResult::new())
+    }
+
+    fn ensure_trash_root(&mut self) -> FsResult<()> {
+        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store)?;
+        match inp.get_last_inode() {
+            Some(inode) if inode.is_dir() => Ok(()),
+            Some(_) => err_ext!(FsError::invalid_argument(format!(
+                "{} exists and is not a directory",
+                trash::TRASH_ROOT
+            ))),
+            None => {
+                self.mkdir(inp, MkdirOpts::with_create(false))?;
+                Ok(())
+            }
+        }
+    }
+
+    fn unique_trash_entry_name(&self, delete_ms: i64, inode_id: i64) -> FsResult<String> {
+        let base = trash::trash_entry_name(delete_ms, inode_id);
+        for seq in 0..1000 {
+            let name = if seq == 0 {
+                base.clone()
+            } else {
+                format!("{}-{}", base, seq)
+            };
+            let path = trash::trash_entry_path(&name);
+            let inp = InodePath::resolve(self.root_ptr(), &path, &self.store)?;
+            if inp.get_last_inode().is_none() {
+                return Ok(name);
+            }
+        }
+
+        err_box!(
+            "failed to allocate a unique trash entry name for inode {}",
+            inode_id
+        )
+    }
+
     pub fn free(&mut self, inp: &InodePath, recursive: bool) -> FsResult<FreeResult> {
         let op_ms = LocalTime::mills() as i64;
 
@@ -417,7 +502,20 @@ impl FsDir {
         dst_inp: &InodePath,
         flags: RenameFlags,
     ) -> FsResult<Option<DeleteResult>> {
-        let op_ms = LocalTime::mills();
+        let op_ms = LocalTime::mills() as i64;
+        self.rename_with_mtime(src_inp, dst_inp, flags, op_ms)
+    }
+
+    /// Rename with an explicit operation timestamp. Internal moves that store
+    /// the timestamp on the inode (trash) or derive a name from it reuse the
+    /// same value that the journal records, so replay is bit-identical.
+    fn rename_with_mtime(
+        &mut self,
+        src_inp: &InodePath,
+        dst_inp: &InodePath,
+        flags: RenameFlags,
+        op_ms: i64,
+    ) -> FsResult<Option<DeleteResult>> {
         let exchange_pre_swap_ids = if flags.exchange_mode() {
             let src_id = src_inp
                 .get_last_inode()
@@ -431,13 +529,12 @@ impl FsDir {
         } else {
             None
         };
-        let res =
-            self.unprotected_rename(src_inp, dst_inp, op_ms as i64, flags, exchange_pre_swap_ids)?;
+        let res = self.unprotected_rename(src_inp, dst_inp, op_ms, flags, exchange_pre_swap_ids)?;
         self.journal_writer.log_rename(
             self,
             src_inp.path(),
             dst_inp.path(),
-            op_ms as i64,
+            op_ms,
             flags,
             exchange_pre_swap_ids,
         )?;
@@ -501,9 +598,33 @@ impl FsDir {
         new_inode.set_parent_id(dst_parent.id());
         new_inode.update_ctime(mtime);
 
+        // A trash move records the pre-move path and the deletion time on the
+        // moved inode in the same persisted mutation as the rename. Journal
+        // replay runs this path with the same flags and timestamp, so a crash
+        // cannot leave an entry inside the bin without its origin, and the
+        // delete still costs a single journal record.
+        if flags.trash() && !new_inode.is_file_entry() {
+            let x_attr = new_inode.x_attr_mut()?;
+            x_attr.insert(
+                trash::TRASH_XATTR_ORIGIN.to_string(),
+                src_inp.path().as_bytes().to_vec(),
+            );
+            x_attr.insert(
+                trash::TRASH_XATTR_DELETE_MS.to_string(),
+                mtime.to_le_bytes().to_vec(),
+            );
+        }
+
         // Update the parent directory for the last modification time.
         src_parent.update_mtime(mtime);
         dst_parent.update_mtime(mtime);
+
+        // A directory is a link from each parent; cross-parent moves must
+        // transfer it so live execution and journal replay agree.
+        if src_parent.id() != dst_parent.id() && src_inode.is_dir() {
+            src_parent.dec_nlink(mtime);
+            dst_parent.incr_nlink(mtime);
+        }
 
         // Update state.
         self.store.apply_rename(
@@ -823,7 +944,11 @@ impl FsDir {
         // Only apply set_attr_opts on real complete/close, not on flush.
         // Flush semantics should remain narrow (durability only).
         if !only_flush {
-            if let Some(opts) = set_attr_opts {
+            if let Some(mut opts) = set_attr_opts {
+                // `complete_file` is a client-facing mutation: apply the same
+                // internal-xattr guard and ctime normalization as `set_attr`.
+                Self::check_not_internal_x_attr(&opts)?;
+                Self::normalize_internal_x_attrs(&mut opts);
                 inode.set_attr(opts)?;
             }
         }
@@ -1201,6 +1326,35 @@ impl FsDir {
 
         // Internal metadata is master-owned. Persist the operation timestamp in the
         // journal so replay restores it without changing the bincode inode layout.
+        Self::normalize_internal_x_attrs(&mut opts);
+        self.unprotected_set_attr(inode.clone(), opts.clone())?;
+        self.journal_writer.log_set_attr(self, &inp, opts)?;
+        Ok(inode.to_file_status(inp.path())?)
+    }
+
+    /// Master-owned xattrs (ctime, trash markers) are never client-writable.
+    /// Every client-facing mutation that forwards a `SetAttrOpts` must call
+    /// this, so a new caller cannot silently gain write access to them.
+    pub(crate) fn check_not_internal_x_attr(opts: &SetAttrOpts) -> FsResult<()> {
+        let reserved = opts
+            .add_x_attr
+            .keys()
+            .map(String::as_str)
+            .chain(opts.remove_x_attr.iter().map(String::as_str))
+            .find(|key| key.starts_with('\0'));
+
+        match reserved {
+            Some(key) => err_ext!(FsError::invalid_argument(format!(
+                "xattr {} is reserved for internal master metadata",
+                key.escape_default()
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Clients may not set ctime, and every mutation refreshes it. Shared by
+    /// `set_attr` and `complete_file` so both paths behave identically.
+    fn normalize_internal_x_attrs(opts: &mut SetAttrOpts) {
         opts.add_x_attr.remove(INTERNAL_CTIME_XATTR);
         opts.remove_x_attr.retain(|key| key != INTERNAL_CTIME_XATTR);
         let ctime = LocalTime::mills() as i64;
@@ -1208,9 +1362,6 @@ impl FsDir {
             INTERNAL_CTIME_XATTR.to_string(),
             ctime.to_le_bytes().to_vec(),
         );
-        self.unprotected_set_attr(inode.clone(), opts.clone())?;
-        self.journal_writer.log_set_attr(self, &inp, opts)?;
-        Ok(inode.to_file_status(inp.path())?)
     }
 
     pub fn unprotected_set_attr(&mut self, inode: InodePtr, opts: SetAttrOpts) -> FsResult<()> {

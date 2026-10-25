@@ -139,6 +139,10 @@ pub struct MasterConf {
     pub quota_eviction_high_rate: f64,
     pub quota_eviction_low_rate: f64,
     pub quota_eviction_scan_page: i32,
+    /// Maximum number of eviction candidates examined per trigger. 0 means
+    /// unlimited (a full scan of the candidate set). Bounds the work done when
+    /// a large part of the cache is not reclaimable (live files, trash).
+    pub quota_eviction_max_scan: i32,
     pub quota_eviction_dry_run: bool,
     pub quota_eviction_capacity: usize,
 
@@ -398,6 +402,7 @@ impl Default for MasterConf {
             quota_eviction_high_rate: 0.8,
             quota_eviction_low_rate: 0.6,
             quota_eviction_scan_page: 2,
+            quota_eviction_max_scan: 10_000,
             quota_eviction_dry_run: false,
             quota_eviction_capacity: 5_000_000, // Default: 5 million entries (~250MB)
 
