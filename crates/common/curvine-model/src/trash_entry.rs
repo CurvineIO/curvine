@@ -22,3 +22,12 @@ pub struct TrashEntry {
     pub delete_ms: i64,
     pub status: FileStatus,
 }
+
+// Result of a restore. Both fields are absent on a retry-cache hit: the
+// original attempt already moved the entry, so the master cannot resolve
+// either value a second time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RestoreTrashResult {
+    pub dst: Option<String>,
+    pub status: Option<FileStatus>,
+}

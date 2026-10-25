@@ -29,7 +29,8 @@ use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
     CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FilesystemInfo, FreeResult,
     JobStatus, ListOptions, LoadJobCommand, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
-    OpenFlags, RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState, TrashEntry,
+    OpenFlags, RenameFlags, RestoreTrashResult, SetAttrOpts, TransferCommand, TransferKind,
+    TransferState, TrashEntry,
 };
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::common::Utils;
@@ -979,6 +980,14 @@ impl UnifiedFileSystem {
         self.track("Delete", path.path(), "", fut).await
     }
 
+    pub async fn list_trash_page(
+        &self,
+        page_token: Option<String>,
+        page_size: Option<u32>,
+    ) -> FsResult<(Vec<TrashEntry>, Option<String>)> {
+        self.cv.list_trash_page(page_token, page_size).await
+    }
+
     pub async fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
         self.cv.list_trash().await
     }
@@ -988,18 +997,15 @@ impl UnifiedFileSystem {
         path: &Path,
         dst: Option<&Path>,
         overwrite: bool,
-    ) -> FsResult<()> {
+    ) -> FsResult<RestoreTrashResult> {
         let fut = async {
-            let dst = match dst {
-                Some(dst) => dst.clone(),
-                None => {
-                    let entries = self.cv.list_trash().await?;
-                    resolve_restore_dst(&entries, path)?
-                }
-            };
-            let mount = self.get_mount(&dst, RpcCode::Rename).await?;
-            ensure_restore_dst_supported(&dst, mount.as_ref().map(|(_, mount)| mount.as_ref()))?;
-            self.cv.restore_trash(path, Some(&dst), overwrite).await
+            // The master also checks the destination it resolves for a default
+            // restore; an explicit destination can be rejected before the RPC.
+            if let Some(dst) = dst {
+                let mount = self.get_mount(dst, RpcCode::Rename).await?;
+                ensure_restore_dst_supported(dst, mount.as_ref().map(|(_, mount)| mount.as_ref()))?;
+            }
+            self.cv.restore_trash(path, dst, overwrite).await
         };
         self.track(
             "RestoreTrash",
@@ -1013,15 +1019,6 @@ impl UnifiedFileSystem {
     pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
         self.cv.empty_trash().await
     }
-}
-
-fn resolve_restore_dst(entries: &[TrashEntry], trash_path: &Path) -> FsResult<Path> {
-    let origin = entries
-        .iter()
-        .find(|entry| entry.path == trash_path.path())
-        .map(|entry| entry.origin.as_str())
-        .ok_or_else(|| FsError::file_not_found(trash_path.path()))?;
-    Ok(Path::from_str(origin)?)
 }
 
 // Cache-mode mounts keep UFS as the source of truth, so a CV-only entry
@@ -1371,13 +1368,10 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ensure_restore_dst_supported, resolve_restore_dst, AsyncCacheAdmission, AsyncCachePending,
-        MountValue,
-    };
+    use super::{ensure_restore_dst_supported, AsyncCacheAdmission, AsyncCachePending, MountValue};
     use curvine_error::FsError;
     use curvine_fs_api::Path;
-    use curvine_model::{FileStatus, MountInfo, TrashEntry, WriteType};
+    use curvine_model::{MountInfo, WriteType};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1467,27 +1461,6 @@ mod tests {
         assert!(pending.paths.lock().contains("ufs://bucket/b"));
         drop(second_pending);
         assert!(pending.paths.lock().is_empty());
-    }
-
-    fn trash_entry(path: &str, origin: &str) -> TrashEntry {
-        TrashEntry {
-            path: path.to_string(),
-            origin: origin.to_string(),
-            delete_ms: 1,
-            status: FileStatus::default(),
-        }
-    }
-
-    #[test]
-    fn resolve_restore_dst_uses_the_recorded_origin() {
-        let entries = vec![trash_entry("/.Trash/1-1", "/data/a.log")];
-
-        let dst = resolve_restore_dst(&entries, &Path::from_str("/.Trash/1-1").unwrap()).unwrap();
-        assert_eq!(dst.path(), "/data/a.log");
-
-        let err =
-            resolve_restore_dst(&entries, &Path::from_str("/.Trash/unknown").unwrap()).unwrap_err();
-        assert!(matches!(err, FsError::FileNotFound(_)), "got {err:?}");
     }
 
     #[test]

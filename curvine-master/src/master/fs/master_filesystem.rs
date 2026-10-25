@@ -17,7 +17,9 @@ use crate::master::fs::full_block_report::{FullReportProgress, FullReportTracker
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-use crate::master::meta::{trash, CacheInvalidationResult, FsDir};
+use crate::master::meta::{
+    trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing,
+};
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
@@ -289,9 +291,32 @@ impl MasterFilesystem {
         Ok(delete_res)
     }
 
-    pub fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+    pub fn list_trash_page(
+        &self,
+        after: Option<&trash::TrashCursor>,
+        limit: usize,
+    ) -> FsResult<TrashListing> {
         let fs_dir = self.fs_dir.read();
-        fs_dir.list_trash()
+        fs_dir.list_trash(after, limit)
+    }
+
+    pub fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        const PAGE_SIZE: usize = 1000;
+        let mut entries = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.list_trash_page(cursor.as_ref(), PAGE_SIZE)?;
+            entries.extend(page.entries);
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(entries),
+            }
+        }
+    }
+
+    pub fn restore_dst<T: AsRef<str>>(&self, path: T, dst: Option<&str>) -> FsResult<String> {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.restore_dst(path.as_ref(), dst)
     }
 
     pub fn restore_trash<T: AsRef<str>>(
@@ -299,38 +324,59 @@ impl MasterFilesystem {
         path: T,
         dst: Option<&str>,
         overwrite: bool,
-    ) -> FsResult<()> {
+    ) -> FsResult<RestoredTrashEntry> {
         let mut fs_dir = self.fs_dir.write();
-        let replaced = fs_dir.restore_trash(path.as_ref(), dst, overwrite)?;
+        let restored = fs_dir.restore_trash(path.as_ref(), dst, overwrite)?;
         drop(fs_dir);
 
         // Overwriting an existing destination deletes it; release its blocks
         // just like a regular rename-with-replace.
-        if let Some(replaced) = replaced {
+        if let Some(replaced) = &restored.replaced {
             let mut worker_manager = self.worker_manager.write();
-            worker_manager.remove_blocks(&replaced);
+            worker_manager.remove_blocks(replaced);
         }
 
-        Ok(())
+        Ok(restored)
     }
 
     pub fn empty_trash(&self) -> FsResult<DeleteResult> {
-        let mut fs_dir = self.fs_dir.write();
-        let (mut delete_res, res) = fs_dir.empty_trash();
-        drop(fs_dir);
+        // Snapshot the names once so the purge releases the write lock between
+        // batches instead of blocking every metadata mutation for the whole
+        // purge. Entries added after the snapshot stay for the next purge.
+        const BATCH_SIZE: usize = 1000;
+        let names = self.fs_dir.read().trash_entry_names()?;
 
-        // Entries deleted before a failure have already left the namespace, so
-        // their block locations must be released even when the purge fails.
-        let mut worker_manager = self.worker_manager.write();
-        worker_manager.remove_blocks(&DeleteResult {
-            inodes: 0,
-            bytes: 0,
-            blocks: std::mem::take(&mut delete_res.blocks),
-        });
-        drop(worker_manager);
+        let mut total = DeleteResult::new();
+        let mut first_err = None;
+        for batch in names.chunks(BATCH_SIZE) {
+            let (mut delete_res, res) = {
+                let mut fs_dir = self.fs_dir.write();
+                fs_dir.empty_trash_batch(batch)
+            };
 
-        res?;
-        Ok(delete_res)
+            // Entries deleted before a failure have already left the namespace,
+            // so their block locations must be released even when the purge
+            // fails partway through the batch.
+            self.worker_manager.write().remove_blocks(&DeleteResult {
+                inodes: 0,
+                bytes: 0,
+                blocks: std::mem::take(&mut delete_res.blocks),
+                trashed: false,
+            });
+
+            total.inodes += delete_res.inodes;
+            total.bytes += delete_res.bytes;
+            if let Err(e) = res {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(total),
+        }
     }
 
     pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
@@ -2747,6 +2793,86 @@ mod tests {
                 .name
                 .starts_with(&format!("{}-", entry.delete_ms)));
         }
+    }
+
+    #[test]
+    fn list_trash_page_resumes_without_repeating_entries() {
+        let fs = test_fs_with_trash("trash-list-page");
+        for i in 0..250 {
+            fs.create(format!("/p-{}.log", i), true).unwrap();
+        }
+        for i in 0..250 {
+            fs.delete_with_opts(format!("/p-{}.log", i), false, false)
+                .unwrap();
+        }
+
+        let mut page_sizes = Vec::new();
+        let mut paths = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = fs.list_trash_page(cursor.as_ref(), 100).unwrap();
+            page_sizes.push(page.entries.len());
+            paths.extend(page.entries.into_iter().map(|entry| entry.path));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        assert_eq!(page_sizes, vec![100, 100, 50]);
+        assert_eq!(paths.len(), 250);
+        let unique: HashSet<&String> = paths.iter().collect();
+        assert_eq!(unique.len(), 250, "a page must not repeat an entry");
+
+        assert_eq!(fs.list_trash().unwrap().len(), 250);
+    }
+
+    #[test]
+    fn restore_trash_reports_the_effective_destination_and_status() {
+        let fs = test_fs_with_trash("trash-restore-outcome");
+        fs.create("/a.log", true).unwrap();
+        fs.delete_with_opts("/a.log", false, false).unwrap();
+        let entry = fs.list_trash().unwrap().remove(0);
+
+        assert_eq!(fs.restore_dst(&entry.path, None).unwrap(), "/a.log");
+        assert_eq!(
+            fs.restore_dst(&entry.path, Some("/b.log")).unwrap(),
+            "/b.log"
+        );
+
+        let restored = fs.restore_trash(&entry.path, None, false).unwrap();
+        assert_eq!(restored.dst, "/a.log");
+        assert_eq!(restored.status.path, "/a.log");
+        assert!(restored.replaced.is_none());
+        assert!(fs.list_trash().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_trash_without_dst_reports_a_missing_origin_parent() {
+        let fs = test_fs_with_trash("trash-restore-missing-parent");
+        fs.mkdir("/data", true).unwrap();
+        fs.create("/data/a.log", true).unwrap();
+        fs.delete_with_opts("/data/a.log", false, false).unwrap();
+        fs.delete_with_opts("/data", true, false).unwrap();
+
+        let entry = fs
+            .list_trash()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.origin == "/data/a.log")
+            .unwrap();
+
+        let err = fs.restore_trash(&entry.path, None, false).unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("parent directory"),
+            "message should explain the missing parent, got {err}"
+        );
+
+        let err = fs
+            .restore_trash(&entry.path, Some("/data/a.log"), false)
+            .unwrap_err();
+        assert!(matches!(err, FsError::FileNotFound(_)), "got {err:?}");
     }
 
     #[test]

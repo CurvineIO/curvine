@@ -920,13 +920,28 @@ impl ProtoUtils {
             status: Self::file_status_from_pb(src.status),
         }
     }
+
+    pub fn restore_trash_res_to_pb(src: RestoreTrashResult) -> RestoreTrashResponse {
+        RestoreTrashResponse {
+            dst: src.dst,
+            status: src.status.map(Self::file_status_to_pb),
+        }
+    }
+
+    pub fn restore_trash_res_from_pb(src: RestoreTrashResponse) -> RestoreTrashResult {
+        RestoreTrashResult {
+            dst: src.dst,
+            status: src.status.map(Self::file_status_from_pb),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::proto::CompatibilityModeProto;
     use crate::state::{
-        AccessMode, FileStatus, MountInfo, MountOptions, TrashEntry, INTERNAL_CTIME_XATTR,
+        AccessMode, FileStatus, MountInfo, MountOptions, RestoreTrashResult, TrashEntry,
+        INTERNAL_CTIME_XATTR,
     };
     use crate::utils::ProtoUtils;
     use curvine_sys::version::ComponentVersion;
@@ -993,6 +1008,30 @@ mod tests {
         assert_eq!(round_trip.delete_ms, 123);
         assert_eq!(round_trip.status.id, 7);
         assert_eq!(round_trip.status.path, "/.Trash/123-7");
+    }
+
+    #[test]
+    fn restore_trash_result_proto_round_trip() {
+        let restored = RestoreTrashResult {
+            dst: Some("/data/a.log".to_string()),
+            status: Some(FileStatus {
+                id: 7,
+                path: "/data/a.log".to_string(),
+                ..Default::default()
+            }),
+        };
+
+        let pb = ProtoUtils::restore_trash_res_to_pb(restored);
+        assert_eq!(pb.dst.as_deref(), Some("/data/a.log"));
+
+        let round_trip = ProtoUtils::restore_trash_res_from_pb(pb);
+        assert_eq!(round_trip.dst.as_deref(), Some("/data/a.log"));
+        assert_eq!(round_trip.status.unwrap().id, 7);
+
+        // Retry-cache hits carry neither field.
+        let empty = ProtoUtils::restore_trash_res_from_pb(Default::default());
+        assert!(empty.dst.is_none());
+        assert!(empty.status.is_none());
     }
 
     #[test]

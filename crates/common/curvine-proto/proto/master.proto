@@ -122,8 +122,8 @@ message TrashEntryProto {
 message ListTrashRequest {
     // Continuation token from a previous ListTrashResponse.
     optional string page_token = 1;
-    // Maximum entries per page. The server may return fewer to stay within
-    // the response byte budget.
+    // Requested entries per page. The server may return fewer to stay within
+    // the response byte budget, and clamps values outside [100, 10000].
     optional uint32 page_size = 2 [default = 1000];
 }
 
@@ -142,8 +142,18 @@ message RestoreTrashRequest {
 }
 
 message RestoreTrashResponse {
+    // Effective destination (the recorded origin when the request omitted
+    // dst). Absent only when a retried request is answered from the retry
+    // cache, because the successful original attempt already moved the entry.
+    optional string dst = 1;
+    // Status of the restored entry, matching the entry shape in
+    // ListTrashResponse. Absent on retry-cache hits.
+    optional FileStatusProto status = 2;
 }
 
+// Empty the recycle bin in one call. This is not a convenience wrapper over
+// list + delete: only the master can return a partial DeleteResult and release
+// the blocks of entries it already purged when a later entry fails.
 message EmptyTrashRequest {
 }
 
