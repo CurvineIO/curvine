@@ -108,6 +108,59 @@ message FreeResponse {
     required FreeResultProto res = 1;
 }
 
+// Recycle bin.
+message TrashEntryProto {
+    // Path of the entry inside /.Trash.
+    required string path = 1;
+    // Original absolute path recorded when the entry was deleted.
+    required string origin = 2;
+    // Deletion time in milliseconds.
+    required int64 delete_ms = 3;
+    required FileStatusProto status = 4;
+}
+
+message ListTrashRequest {
+    // Continuation token from a previous ListTrashResponse.
+    optional string page_token = 1;
+    // Requested entries per page. The server may return fewer to stay within
+    // the response byte budget, and clamps values outside [100, 10000].
+    optional uint32 page_size = 2 [default = 1000];
+}
+
+message ListTrashResponse {
+    repeated TrashEntryProto entries = 1;
+    // Token for the next page; absent when the listing is complete.
+    optional string next_page_token = 2;
+}
+
+message RestoreTrashRequest {
+    // Trash entry path (direct child of /.Trash).
+    required string path = 1;
+    // Restore destination; defaults to the recorded origin.
+    optional string dst = 2;
+    optional bool overwrite = 3 [default = false];
+}
+
+message RestoreTrashResponse {
+    // Effective destination (the recorded origin when the request omitted
+    // dst). Absent only when a retried request is answered from the retry
+    // cache, because the successful original attempt already moved the entry.
+    optional string dst = 1;
+    // Status of the restored entry, matching the entry shape in
+    // ListTrashResponse. Absent on retry-cache hits.
+    optional FileStatusProto status = 2;
+}
+
+// Empty the recycle bin in one call. This is not a convenience wrapper over
+// list + delete: only the master can return a partial DeleteResult and release
+// the blocks of entries it already purged when a later entry fails.
+message EmptyTrashRequest {
+}
+
+message EmptyTrashResponse {
+    required FreeResultProto res = 1;
+}
+
 message GetFileStatusRequest {
     required string path = 1;
     optional int64 inode_id = 2;

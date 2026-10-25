@@ -26,7 +26,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TtlAction,
+    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TrashEntry, TtlAction,
     WorkerAddress, INTERNAL_CTIME_XATTR,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
@@ -67,6 +67,21 @@ impl CacheInvalidationResult {
         self.invalidated_block_ids
             .extend(other.invalidated_block_ids);
     }
+}
+
+// One page of a trash listing. `next` is the sort key of the last scanned
+// entry and is set only when more names remain, so the caller can resume
+// without rescanning what it already received.
+pub struct TrashListing {
+    pub entries: Vec<TrashEntry>,
+    pub next: Option<trash::TrashCursor>,
+}
+
+#[derive(Debug)]
+pub struct RestoredTrashEntry {
+    pub dst: String,
+    pub status: FileStatus,
+    pub replaced: Option<DeleteResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +450,274 @@ impl FsDir {
         )
     }
 
+    pub fn list_trash(
+        &self,
+        after: Option<&trash::TrashCursor>,
+        limit: usize,
+    ) -> FsResult<TrashListing> {
+        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store)?;
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => {
+                return Ok(TrashListing {
+                    entries: vec![],
+                    next: None,
+                })
+            }
+        };
+
+        let dir = match inode.as_ref() {
+            Dir(d) => d,
+            _ => {
+                return err_ext!(FsError::invalid_argument(format!(
+                    "{} exists and is not a directory",
+                    trash::TRASH_ROOT
+                )))
+            }
+        };
+
+        // Entry names start with their delete time, so ordering names is enough
+        // to resume a listing; only the entries inside the page load their
+        // inode and build a FileStatus.
+        let mut names: Vec<(i64, String)> = dir
+            .children_iter()
+            .filter_map(|child| {
+                let name = child.name();
+                Some((trash::parse_entry_delete_ms(name)?, name.to_string()))
+            })
+            .collect();
+        names.sort();
+
+        let start = match after {
+            Some(cursor) => {
+                let cursor_name = cursor
+                    .path
+                    .strip_prefix(trash::TRASH_ROOT)
+                    .and_then(|rest| rest.strip_prefix(PATH_SEPARATOR))
+                    .filter(|name| !name.is_empty() && !name.contains(PATH_SEPARATOR))
+                    .ok_or_else(|| {
+                        FsError::invalid_argument(format!(
+                            "invalid trash cursor path: {}",
+                            cursor.path
+                        ))
+                    })?;
+                names.partition_point(|(delete_ms, name)| {
+                    (*delete_ms, name.as_str()) <= (cursor.delete_ms, cursor_name)
+                })
+            }
+            None => 0,
+        };
+
+        let limit = limit.max(1);
+        let mut entries = Vec::new();
+        let mut index = start;
+        while index < names.len() && entries.len() < limit {
+            let (delete_ms, name) = &names[index];
+            index += 1;
+
+            let path = trash::trash_entry_path(name);
+            // Directory children can be unresolved FileEntry pointers; resolve
+            // each entry so the full inode (and its trash xattrs) is loaded.
+            let child_inp = InodePath::resolve(self.root_ptr(), &path, &self.store)?;
+            let Some(child) = child_inp.get_last_inode() else {
+                continue;
+            };
+            let Ok(x_attr) = child.x_attr() else {
+                continue;
+            };
+            let (Some(origin), Some(stored_delete_ms)) = (
+                trash::decode_origin(x_attr),
+                trash::decode_delete_ms(x_attr),
+            ) else {
+                continue;
+            };
+            // A name that disagrees with its metadata is not a valid entry;
+            // skipping it keeps the name-derived cursor consistent.
+            if stored_delete_ms != *delete_ms {
+                continue;
+            }
+
+            entries.push(TrashEntry {
+                status: child.to_file_status(&path)?,
+                path,
+                origin,
+                delete_ms: stored_delete_ms,
+            });
+        }
+
+        // Only reachable after filling the page, so the last scanned name is
+        // the final returned entry and a valid resume key.
+        let next = if index < names.len() {
+            let (delete_ms, name) = &names[index - 1];
+            Some(trash::TrashCursor {
+                delete_ms: *delete_ms,
+                path: trash::trash_entry_path(name),
+            })
+        } else {
+            None
+        };
+
+        Ok(TrashListing { entries, next })
+    }
+
+    fn resolve_restore_dst(&self, src_inp: &InodePath, dst: Option<&str>) -> FsResult<String> {
+        let inode = match src_inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(src_inp.path())),
+        };
+
+        let x_attr = inode.x_attr()?;
+        let Some(origin) = trash::decode_origin(x_attr) else {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} is not a trash entry",
+                src_inp.path()
+            )));
+        };
+
+        let dst = dst
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .unwrap_or(origin);
+        if !dst.starts_with(PATH_SEPARATOR) || trash::is_reserved_path(&dst) {
+            return err_ext!(FsError::invalid_argument(format!(
+                "invalid restore destination: {}",
+                dst
+            )));
+        }
+        Ok(dst)
+    }
+
+    // Resolve the effective restore destination without moving anything, so
+    // the master can validate mount destinations before an RPC restore.
+    pub fn restore_dst(&self, trash_path: &str, dst: Option<&str>) -> FsResult<String> {
+        if !trash::is_trash_entry_path(trash_path) {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} is not a trash entry",
+                trash_path
+            )));
+        }
+        let src_inp = InodePath::resolve(self.root_ptr(), trash_path, &self.store)?;
+        self.resolve_restore_dst(&src_inp, dst)
+    }
+
+    pub fn restore_trash(
+        &mut self,
+        trash_path: &str,
+        dst: Option<&str>,
+        overwrite: bool,
+    ) -> FsResult<RestoredTrashEntry> {
+        if !trash::is_trash_entry_path(trash_path) {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} is not a trash entry",
+                trash_path
+            )));
+        }
+
+        let src_inp = InodePath::resolve(self.root_ptr(), trash_path, &self.store)?;
+        let default_dst = dst.is_none() || dst.is_some_and(|value| value.is_empty());
+        let dst = self.resolve_restore_dst(&src_inp, dst)?;
+
+        let dst_inp = InodePath::resolve(self.root_ptr(), &dst, &self.store)?;
+        if dst_inp.get_last_inode().is_some() && !overwrite {
+            return err_ext!(FsError::file_exists(&dst));
+        }
+        if !dst_inp
+            .get_inode(-2)
+            .map(|parent| parent.is_dir())
+            .unwrap_or(false)
+        {
+            if default_dst {
+                // The origin's parent may have been removed independently;
+                // name the action that unblocks the restore instead of only
+                // reporting a parent path the caller never mentioned.
+                return err_ext!(FsError::invalid_argument(format!(
+                    "cannot restore {} to its origin {}: parent directory {} does not exist; restore the parent directory first",
+                    trash_path,
+                    dst,
+                    dst_inp.get_parent_path()
+                )));
+            }
+            return err_ext!(FsError::file_not_found(dst_inp.get_parent_path()));
+        }
+
+        // The RESTORE rename clears the trash markers as part of the same
+        // persisted mutation, so a crash can never leave an entry inside the
+        // bin without its origin.
+        let mut flags = RenameFlags::RESTORE;
+        if !overwrite {
+            flags |= RenameFlags::NO_REPLACE;
+        }
+
+        let replaced = self.rename(&src_inp, &dst_inp, flags)?;
+
+        let restored_inp = InodePath::resolve(self.root_ptr(), &dst, &self.store)?;
+        let status = match restored_inp.get_last_inode() {
+            Some(inode) => inode.to_file_status(&dst)?,
+            None => return err_ext!(FsError::file_not_found(&dst)),
+        };
+
+        debug!("restored {} to {}", trash_path, dst);
+        Ok(RestoredTrashEntry {
+            dst,
+            status,
+            replaced,
+        })
+    }
+
+    pub fn trash_entry_names(&self) -> FsResult<Vec<String>> {
+        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store)?;
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return Ok(vec![]),
+        };
+        let dir = match inode.as_ref() {
+            Dir(d) => d,
+            _ => {
+                return err_ext!(FsError::invalid_argument(format!(
+                    "{} exists and is not a directory",
+                    trash::TRASH_ROOT
+                )))
+            }
+        };
+        Ok(dir
+            .children_iter()
+            .map(|child| child.name().to_string())
+            .collect())
+    }
+
+    // Purge one batch of names. Keeping the loop in the caller lets the
+    // write lock be released between batches instead of blocking every
+    // metadata mutation for the whole purge.
+    pub fn empty_trash_batch(&mut self, names: &[String]) -> (DeleteResult, FsResult<()>) {
+        let mut total = DeleteResult::new();
+
+        // Keep deleting the remaining entries after a failure: the caller
+        // needs the partial result to release the blocks of entries that were
+        // already removed, and those block lists cannot be recovered later.
+        let mut first_err = None;
+        for name in names {
+            let path = trash::trash_entry_path(name);
+            let res = match InodePath::resolve(self.root_ptr(), &path, &self.store) {
+                Ok(child_inp) => self.delete(&child_inp, true),
+                Err(e) => Err(e.into()),
+            };
+            match res {
+                Ok(res) => {
+                    total.inodes += res.inodes;
+                    total.bytes += res.bytes;
+                    total.blocks.extend(res.blocks);
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+
+        (total, first_err.map_or(Ok(()), Err))
+    }
+
     pub fn free(&mut self, inp: &InodePath, recursive: bool) -> FsResult<FreeResult> {
         let op_ms = LocalTime::mills() as i64;
 
@@ -598,21 +881,28 @@ impl FsDir {
         new_inode.set_parent_id(dst_parent.id());
         new_inode.update_ctime(mtime);
 
-        // A trash move records the pre-move path and the deletion time on the
-        // moved inode in the same persisted mutation as the rename. Journal
-        // replay runs this path with the same flags and timestamp, so a crash
-        // cannot leave an entry inside the bin without its origin, and the
-        // delete still costs a single journal record.
-        if flags.trash() && !new_inode.is_file_entry() {
-            let x_attr = new_inode.x_attr_mut()?;
-            x_attr.insert(
-                trash::TRASH_XATTR_ORIGIN.to_string(),
-                src_inp.path().as_bytes().to_vec(),
-            );
-            x_attr.insert(
-                trash::TRASH_XATTR_DELETE_MS.to_string(),
-                mtime.to_le_bytes().to_vec(),
-            );
+        // Trash and restore renames rewrite the markers on the moved inode in
+        // the same persisted mutation as the rename. Journal replay runs this
+        // path with the same flags and timestamp, so a crash can neither leave
+        // an entry inside the bin without its origin nor restore an entry that
+        // keeps stale markers, and a soft delete still costs one journal
+        // record.
+        if !new_inode.is_file_entry() {
+            if flags.trash() {
+                let x_attr = new_inode.x_attr_mut()?;
+                x_attr.insert(
+                    trash::TRASH_XATTR_ORIGIN.to_string(),
+                    src_inp.path().as_bytes().to_vec(),
+                );
+                x_attr.insert(
+                    trash::TRASH_XATTR_DELETE_MS.to_string(),
+                    mtime.to_le_bytes().to_vec(),
+                );
+            } else if flags.restore() {
+                let x_attr = new_inode.x_attr_mut()?;
+                x_attr.remove(trash::TRASH_XATTR_ORIGIN);
+                x_attr.remove(trash::TRASH_XATTR_DELETE_MS);
+            }
         }
 
         // Update the parent directory for the last modification time.

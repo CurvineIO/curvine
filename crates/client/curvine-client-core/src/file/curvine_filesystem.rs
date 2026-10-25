@@ -27,7 +27,7 @@ use curvine_model::{CommitBlock, DeleteResult, FreeResult, ListOptions};
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     FilesystemInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
-    SetAttrOpts,
+    RestoreTrashResult, SetAttrOpts, TrashEntry,
 };
 use curvine_proto::GetCvMetadataSnapshotPageResponse;
 use curvine_rpc::client::ClientConf;
@@ -197,6 +197,31 @@ impl CurvineFileSystem {
         self.fs_client
             .delete_with_opts(path, recursive, skip_trash)
             .await
+    }
+
+    pub async fn list_trash_page(
+        &self,
+        page_token: Option<String>,
+        page_size: Option<u32>,
+    ) -> FsResult<(Vec<TrashEntry>, Option<String>)> {
+        self.fs_client.list_trash_page(page_token, page_size).await
+    }
+
+    pub async fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        self.fs_client.list_trash().await
+    }
+
+    pub async fn restore_trash(
+        &self,
+        path: &Path,
+        dst: Option<&Path>,
+        overwrite: bool,
+    ) -> FsResult<RestoreTrashResult> {
+        self.fs_client.restore_trash(path, dst, overwrite).await
+    }
+
+    pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
+        self.fs_client.empty_trash().await
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
