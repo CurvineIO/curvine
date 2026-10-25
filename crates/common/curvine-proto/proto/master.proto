@@ -87,12 +87,16 @@ message OpenFileResponse {
 message DeleteRequest {
     required string path = 1;
     required bool recursive = 2;
-    // Permanently delete instead of moving the entry into /.Trash.
+    // Permanently delete instead of moving the entry into /.Trash. Clients also
+    // set it for cache entries whose UFS object is already gone, covering the
+    // window where a mount is unregistered between the UFS and CV deletes.
     optional bool skip_trash = 3 [default = false];
 }
 
 message DeleteResponse {
     optional FreeResultProto res = 1;
+    // True when the master moved the entry into /.Trash instead of purging it.
+    optional bool trashed = 2 [default = false];
 }
 
 message FreeRequest {

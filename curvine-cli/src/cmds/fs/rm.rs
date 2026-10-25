@@ -47,8 +47,12 @@ impl RmCommand {
                             .delete_with_opts(&path, *recursive, *skip_trash)
                             .await
                         {
-                            Ok(_) => {
-                                println!("Deleted {}", path.full_path());
+                            Ok(res) => {
+                                if res.trashed {
+                                    println!("Moved to /.Trash: {}", path.full_path());
+                                } else {
+                                    println!("Deleted permanently: {}", path.full_path());
+                                }
                                 Ok(())
                             }
                             Err(e) => {
