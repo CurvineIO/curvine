@@ -28,6 +28,7 @@ pub struct RocksStorageCore {
     db: DBEngine,
     first_index: Option<u64>,
     last_index: Option<u64>,
+    recovery_state: Option<u64>,
     init_error: Option<String>,
 
     pub(crate) trigger_snap_unavailable: bool,
@@ -44,6 +45,7 @@ impl RocksStorageCore {
     pub const INDEX_KEY: &'static [u8] = &[0x02u8];
     pub const STATE_KEY: &'static [u8] = &[0x03u8];
     pub const CONF_STATE_KEY: &'static [u8] = &[0x04u8];
+    pub const RECOVERY_KEY: &'static [u8] = &[0x05u8];
 
     pub fn new(conf: DBConf, format: bool) -> Self {
         let conf = conf
@@ -58,6 +60,7 @@ impl RocksStorageCore {
             db,
             first_index: None,
             last_index: None,
+            recovery_state: None,
             init_error: None,
             trigger_snap_unavailable: false,
             trigger_log_unavailable: false,
@@ -118,6 +121,23 @@ impl RocksStorageCore {
         {
             self.raft_state.conf_state = ConfState::decode(data.as_ref())
                 .map_err(|error| RaftError::from(error).ctx("failed to decode raft conf state"))?;
+        }
+
+        if let Some(data) = self
+            .db
+            .get_cf(Self::CF_META, Self::RECOVERY_KEY)
+            .map_err(|error| RaftError::from(error).ctx("failed to read raft recovery state"))?
+        {
+            if data.len() == 8 {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&data[..8]);
+                self.recovery_state = Some(u64::from_be_bytes(bytes));
+            } else {
+                return err_box!(
+                    "corrupt recovery state in storage: expected 8 bytes, got {}",
+                    data.len()
+                );
+            }
         }
 
         Ok(())
@@ -202,6 +222,19 @@ impl RocksStorageCore {
         batch.commit()?;
 
         self.raft_state.conf_state = cs;
+        Ok(())
+    }
+
+    pub fn recovery_state(&self) -> Option<u64> {
+        self.recovery_state
+    }
+
+    pub fn set_recovery_state(&mut self, state: Option<u64>) -> RaftResult<()> {
+        let mut batch = StoreWriteBatch::new(&self.db);
+        batch.set_recovery_state(state)?;
+        batch.commit()?;
+
+        self.recovery_state = state;
         Ok(())
     }
 
@@ -531,6 +564,23 @@ impl<'a> StoreWriteBatch<'a> {
             RocksStorageCore::STATE_KEY,
             state.encode_to_vec(),
         )?;
+        Ok(())
+    }
+
+    fn set_recovery_state(&mut self, state: Option<u64>) -> CommonResult<()> {
+        match state {
+            Some(id) => {
+                self.0.put_cf(
+                    RocksStorageCore::CF_META,
+                    RocksStorageCore::RECOVERY_KEY,
+                    id.to_be_bytes(),
+                )?;
+            }
+            None => {
+                self.0
+                    .delete_cf(RocksStorageCore::CF_META, RocksStorageCore::RECOVERY_KEY)?;
+            }
+        }
         Ok(())
     }
 

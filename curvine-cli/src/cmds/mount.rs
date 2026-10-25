@@ -469,7 +469,7 @@ impl MountCommand {
                         continue;
                     }
 
-                    if let Err(e) = client.delete(&cv_path, false).await {
+                    if let Err(e) = client.delete_with_opts(&cv_path, false, true).await {
                         stats.failed += 1;
                         eprintln!("[resync] failed to delete {}: {}", cv_path, e);
                         progress.tick(&stats, queue.len());

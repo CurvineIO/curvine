@@ -145,6 +145,7 @@ ls -la .github/skills .cursor/skills .claude/skills
 
 | Skill | Stage |
 | ----- | ----- |
+| `cv-add-blog` | Docs — publish paired EN/ZH blog posts to curvine-doc |
 | `cv-add-skills` | Meta — add/update skills |
 | `cv-codegraph` | Code exploration — CodeGraph setup and usage |
 | `cv-create-issue` | Issue |

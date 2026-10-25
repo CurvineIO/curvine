@@ -12,4 +12,4 @@ The current maintainers of Curvine project consists of:
 | John | hellojlong@163.com| @jlon | Maintainer | OPPO |
 | Le Dac Thuong | ledacthuong2210@gmail.com | @thuongle2210 | Committer | Home Credit Vietnam |
 | yangcx000 | chunxin.ycx@gmail.com | @yangcx000 | Committer | LiAuto |
-
+| gongxun0928 | gongxun0928@gmail.com | @gongxun0928 | Committer | Kwai |

@@ -52,6 +52,11 @@ pub enum IoOp {
         ctrlr: CtrlHandle,
         ack: mpsc::Sender<()>,
     },
+    /// Resume admin polling after a detach attempt failed partway.
+    RegisterCtrlr {
+        ctrlr: CtrlHandle,
+        ack: mpsc::Sender<()>,
+    },
     /// Poll a retired qpair once before retrying free on the owner thread.
     PollRetiredQpair {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
@@ -80,6 +85,7 @@ fn poll_ack_error_to_outcome(err: RecvTimeoutError) -> RetiredQpairPollOutcome {
     }
 }
 
+// TODO(spdk): split silent ctrlr-retry logging from qpair unregister logging.
 fn unregister_ack_error_to_result(err: RecvTimeoutError) -> UnregisterResult {
     match err {
         RecvTimeoutError::Timeout => {
@@ -197,6 +203,8 @@ pub struct PollerConfig {
 pub(crate) struct RetiredQpair {
     state: Option<Box<QpairState>>,
     must_free: bool,
+    /// Ensures a failed free is logged once per qpair, not once per retry.
+    free_failure_logged: bool,
 }
 
 impl RetiredQpair {
@@ -212,6 +220,14 @@ impl RetiredQpair {
         if let Some(state) = self.state.as_mut() {
             state.reclaim_stale();
         }
+    }
+
+    pub(crate) fn free_failure_logged(&self) -> bool {
+        self.free_failure_logged
+    }
+
+    pub(crate) fn mark_free_failure_logged(&mut self) {
+        self.free_failure_logged = true;
     }
 }
 
@@ -261,7 +277,14 @@ impl RetiredQpairRegistry {
             return;
         }
 
-        entries.insert(key, RetiredQpair { state, must_free });
+        entries.insert(
+            key,
+            RetiredQpair {
+                state,
+                must_free,
+                free_failure_logged: false,
+            },
+        );
         self.has_entries.store(true, Ordering::Release);
     }
 
@@ -448,6 +471,27 @@ impl SpdkPoller {
         }
     }
 
+    /// Resume admin polling after a failed detach; counterpart to `unregister_ctrlr`.
+    pub(crate) fn register_ctrlr(&self, ctrlr: CtrlHandle) -> UnregisterResult {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let req = IoRequest {
+            op: IoOp::RegisterCtrlr { ctrlr, ack: ack_tx },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+        let Some(tx) = &self.tx else {
+            return UnregisterResult::Disconnected;
+        };
+        if tx.send(req).is_err() {
+            return UnregisterResult::Disconnected;
+        }
+        let _ = self.eventfd.write(1);
+        match ack_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(()) => UnregisterResult::Acked,
+            Err(err) => unregister_ack_error_to_result(err),
+        }
+    }
+
     pub(crate) fn poll_retired_qpair(
         &self,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
@@ -540,6 +584,9 @@ impl SpdkPoller {
                         IoOp::UnregisterCtrlr { .. } => {
                             Self::handle_unregister_ctrlr(&req, &mut active_ctrlrs);
                         }
+                        IoOp::RegisterCtrlr { .. } => {
+                            Self::handle_register_ctrlr(&req, &mut active_ctrlrs);
+                        }
                         IoOp::PollRetiredQpair { .. } => {
                             Self::handle_poll_retired(&req);
                         }
@@ -631,6 +678,9 @@ impl SpdkPoller {
                                 }
                                 IoOp::UnregisterCtrlr { .. } => {
                                     Self::handle_unregister_ctrlr(&req, &mut active_ctrlrs);
+                                }
+                                IoOp::RegisterCtrlr { .. } => {
+                                    Self::handle_register_ctrlr(&req, &mut active_ctrlrs);
                                 }
                                 IoOp::PollRetiredQpair { .. } => {
                                     Self::handle_poll_retired(&req);
@@ -735,6 +785,16 @@ impl SpdkPoller {
         }
     }
 
+    /// Dedup-guarded: a no-op if the controller is already registered.
+    fn handle_register_ctrlr(req: &IoRequest, active_ctrlrs: &mut Vec<CtrlHandle>) {
+        if let IoOp::RegisterCtrlr { ctrlr, ack } = &req.op {
+            if !active_ctrlrs.iter().any(|active| active.0 == ctrlr.0) {
+                active_ctrlrs.push(*ctrlr);
+            }
+            let _ = ack.send(());
+        }
+    }
+
     fn handle_poll_retired(req: &IoRequest) {
         if let IoOp::PollRetiredQpair { qpair, ack } = &req.op {
             let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0) };
@@ -758,6 +818,9 @@ impl SpdkPoller {
             }
             IoOp::UnregisterCtrlr { .. } => {
                 unreachable!("UnregisterCtrlr handled by handle_unregister_ctrlr")
+            }
+            IoOp::RegisterCtrlr { .. } => {
+                unreachable!("RegisterCtrlr handled by handle_register_ctrlr")
             }
         };
 
@@ -850,6 +913,9 @@ impl SpdkPoller {
             }
             IoOp::UnregisterCtrlr { .. } => {
                 unreachable!("UnregisterCtrlr handled by handle_unregister_ctrlr")
+            }
+            IoOp::RegisterCtrlr { .. } => {
+                unreachable!("RegisterCtrlr handled by handle_register_ctrlr")
             }
         };
 
@@ -1060,6 +1126,7 @@ pub(crate) fn retired_qpair_with_stale_inflight_for_test(
         RetiredQpair {
             state: Some(qpair_state),
             must_free: true,
+            free_failure_logged: false,
         },
         ctx as *mut c_void,
         inflight,
@@ -1137,6 +1204,7 @@ mod test {
         let retired = RetiredQpair {
             state: Some(qpair_state),
             must_free: true,
+            free_failure_logged: false,
         };
 
         // Simulate free_io_qpair failure: retired remains alive, so the stale
@@ -1383,6 +1451,40 @@ mod test {
         // Hot path always signals completion and decrements inflight.
         assert_eq!(completion.wait(0), 42);
         assert_eq!(inflight.load(Ordering::Acquire), 0);
+    }
+
+    /// Regression test: while a qpair's retirement tombstone is visible,
+    /// `submit_one` must fast-fail requests instead of resurrecting a `QpairState`.
+    #[test]
+    fn submit_one_fast_fails_while_retirement_tombstone_is_still_visible() {
+        let retired = RetiredQpairRegistry::new();
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+
+        // Simulate poll_and_sweep having already force-retired this qpair,
+        // independently of any retire_qpair() call -- the tombstone is up.
+        retired.mark_must_free(qpair);
+        assert!(retired.contains(qpair as usize));
+
+        let bdev_inflight = Arc::new(AtomicUsize::new(1));
+        let completion = IoCompletion::new();
+        let req = IoRequest {
+            op: IoOp::Flush {
+                ns: std::ptr::null_mut(),
+                qpair,
+            },
+            completion: completion.clone(),
+            bdev_inflight: bdev_inflight.clone(),
+        };
+        let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
+
+        SpdkPoller::submit_one(&req, &mut qpair_state, &retired, 128);
+
+        assert_eq!(completion.wait(0), -libc::EIO);
+        assert_eq!(bdev_inflight.load(Ordering::Acquire), 0);
+        assert!(
+            qpair_state.is_empty(),
+            "no phantom QpairState should be created while the retirement tombstone is visible"
+        );
     }
 
     #[test]
