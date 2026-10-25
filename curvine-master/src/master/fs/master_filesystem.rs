@@ -3042,6 +3042,34 @@ mod tests {
     }
 
     #[test]
+    fn empty_trash_does_not_purge_foreign_children() {
+        let fs = test_fs_with_trash("trash-empty-foreign");
+
+        fs.create("/keep.log", true).unwrap();
+        fs.delete_with_opts("/keep.log", false, false).unwrap();
+        assert_eq!(fs.list_trash().unwrap().len(), 1);
+
+        // A child whose name is not a trash entry name is not shown by
+        // ListTrash, so EmptyTrash must leave it alone instead of deleting it
+        // silently and without an undo path.
+        let (foreign_path, _) = seed_trash_entry(&fs, "not-a-trash-entry");
+
+        let res = fs.empty_trash().unwrap();
+        assert_eq!(res.inodes, 1);
+        assert!(fs.get_block_locations(&foreign_path).is_ok());
+        let children = fs
+            .list_options(trash::TRASH_ROOT, ListOptions::default())
+            .unwrap();
+        assert!(
+            children
+                .iter()
+                .any(|child| child.name == "not-a-trash-entry"),
+            "foreign child must survive EmptyTrash: {:?}",
+            children.iter().map(|child| &child.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn empty_trash_releases_blocks_of_entries_purged_before_a_failure() {
         let fs = test_fs_with_trash("trash-empty-partial");
         let worker_id = 100;

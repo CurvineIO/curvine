@@ -1164,24 +1164,41 @@ fn parse_trash_page_token(token: &str) -> FsResult<TrashCursor> {
     })
 }
 
-// Encode one page of already-resolved entries. The last returned entry is the
+// Encode one page of already-resolved entries. The last consumed entry is the
 // resume key when the byte budget cuts the page short; otherwise the listing's
-// scan cursor is used so a fully returned page is not rescanned.
+// scan cursor is used so a fully consumed page is not rescanned.
 fn encode_trash_page(
     listing: TrashListing,
     max_encoded_bytes: usize,
 ) -> (Vec<TrashEntryProto>, Option<String>) {
     let mut protos = Vec::with_capacity(listing.entries.len());
     let mut encoded_bytes = 0usize;
+    // Token of the last entry consumed, whether it was returned or skipped. A
+    // truncated page must resume after it, never before it.
+    let mut consumed: Option<String> = None;
 
     for entry in listing.entries {
         let proto = ProtoUtils::trash_entry_to_pb(entry);
         let size = proto.encoded_len();
-        if !protos.is_empty() && encoded_bytes + size > max_encoded_bytes {
-            let next = protos.last().map(trash_page_token);
-            return (protos, next);
+        if size > max_encoded_bytes {
+            // The budget has to bound every entry, including the first one: an
+            // entry that cannot fit any page would make the response
+            // impossible to encode, and a client retrying the same token would
+            // never get past it. Skip it and advance the cursor instead.
+            log::warn!(
+                "skipping trash entry {} ({} bytes) that exceeds the ListTrash page budget of {} bytes",
+                proto.path,
+                size,
+                max_encoded_bytes
+            );
+            consumed = Some(trash_page_token(&proto));
+            continue;
+        }
+        if encoded_bytes + size > max_encoded_bytes {
+            return (protos, consumed);
         }
         encoded_bytes += size;
+        consumed = Some(trash_page_token(&proto));
         protos.push(proto);
     }
 
@@ -1822,15 +1839,37 @@ mod tests {
         let (page, token) = encode_trash_page(listing, first_size);
         assert_eq!(trash_paths(&page), vec!["/.Trash/1-a"]);
         assert_eq!(token.as_deref(), Some("10:/.Trash/1-a"));
+    }
 
-        // A single entry is always emitted even if it alone exceeds the budget.
+    #[test]
+    fn encode_trash_page_skips_entries_that_cannot_fit_any_page() {
+        let normal = trash_entry("/.Trash/2-a", 20);
+        let normal_size = ProtoUtils::trash_entry_to_pb(normal.clone()).encoded_len();
+        let mut oversized = trash_entry("/.Trash/1-a", 10);
+        oversized.origin = format!("/data/{}", "x".repeat(normal_size));
+
+        // The first entry alone exceeds the budget: it is skipped, the page
+        // still returns the entries that fit, and the cursor moves past it.
         let listing = TrashListing {
-            entries: vec![trash_entry("/.Trash/1-a", 10)],
+            entries: vec![oversized.clone(), normal.clone()],
             next: None,
         };
-        let (page, token) = encode_trash_page(listing, 0);
-        assert_eq!(page.len(), 1);
+        let (page, token) = encode_trash_page(listing, normal_size);
+        assert_eq!(trash_paths(&page), vec!["/.Trash/2-a"]);
         assert!(token.is_none());
+
+        // A skipped entry must never be handed back as the first entry of the
+        // next page: the resume key comes from the scan cursor.
+        let listing = TrashListing {
+            entries: vec![oversized],
+            next: Some(TrashCursor {
+                delete_ms: 10,
+                path: "/.Trash/1-a".to_string(),
+            }),
+        };
+        let (page, token) = encode_trash_page(listing, normal_size);
+        assert!(page.is_empty());
+        assert_eq!(token.as_deref(), Some("10:/.Trash/1-a"));
     }
 
     #[test]
