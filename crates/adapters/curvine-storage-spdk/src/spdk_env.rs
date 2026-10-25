@@ -1688,6 +1688,8 @@ impl SpdkEnv {
                 return err_box!("SPDK poller is not running; refusing runtime detach");
             }
             result => {
+                // TODO(spdk): on sustained timeout, defer+reconcile via a
+                // deferred_ctrlrs map + CtrlrAckRegistry instead of leaking it.
                 return err_box!(
                     "poller did not acknowledge SPDK target {} removal: {:?}",
                     target_idx,
@@ -1704,6 +1706,7 @@ impl SpdkEnv {
             if self.register_ctrlr_with_poller_until_acked(CtrlHandle(ctrlr))
                 != UnregisterResult::Acked
             {
+                // TODO(spdk): same deferred_ctrlrs + CtrlrAckRegistry gap as above.
                 warn!(
                     "SPDK target {}: failed to resume admin polling after nvme_detach failure",
                     target_idx
