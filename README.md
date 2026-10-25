@@ -72,16 +72,43 @@ Curvine is a high-performance distributed cache file system built in Rust. It la
 - **Raft Consensus**: Master metadata is replicated via Raft for consistency and high availability.
 - **Observability**: Built-in metrics system and Web UI for per-component performance monitoring.
 
+Access the Web UI after a local cluster is up:
+
+```
+# Master Web (cluster console)
+http://your-hostname:9001
+
+# Worker Web (local metrics)
+http://your-hostname:9002
+```
+
 ## 📈 Use Cases
 
 ![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.png)
 
 - **Case 1 — AI Agent Platform Storage**: Backing tens of thousands of stateful Agent Pods on Kubernetes with isolated POSIX workspaces, millisecond provisioning, and no per-node volume limits.
+
+  <img src="images/use-cases/01-ai-agent-platform-storage.gif" alt="AI Agent Platform Storage" width="720">
+
 - **Case 2 — LLM Training Acceleration**: Caching training datasets and checkpoints close to GPU nodes to shorten training cycles.
+
+  <img src="images/use-cases/02-llm-training-acceleration.gif" alt="LLM Training Acceleration" width="720">
+
 - **Case 3 — LLM Model Distribution Acceleration**: Fast multi-region model artifact distribution through the distributed cache.
+
+  <img src="images/use-cases/03-llm-model-distribution.gif" alt="LLM Model Distribution Acceleration" width="720">
+
 - **Case 4 — Multimodal Data Lake Access Acceleration**: POSIX access over multimodal lakes without copying data locally.
+
+  <img src="images/use-cases/04-multimodal-data-lake.gif" alt="Multimodal Data Lake Access Acceleration" width="720">
+
 - **Case 5 — OLAP Query Acceleration**: Accelerating compute-storage separated OLAP engines with a hot data cache.
+
+  <img src="images/use-cases/05-olap-query-acceleration.gif" alt="OLAP Query Acceleration" width="720">
+
 - **Case 6 — Multi-Cloud Data Caching**: A unified cache layer across multi-cloud object storage backends.
+
+  <img src="images/use-cases/06-multi-cloud-data-caching.gif" alt="Multi-Cloud Data Caching" width="720">
 
 
 ## 📊 Performance

@@ -203,6 +203,8 @@ pub struct PollerConfig {
 pub(crate) struct RetiredQpair {
     state: Option<Box<QpairState>>,
     must_free: bool,
+    /// Ensures a failed free is logged once per qpair, not once per retry.
+    free_failure_logged: bool,
 }
 
 impl RetiredQpair {
@@ -218,6 +220,14 @@ impl RetiredQpair {
         if let Some(state) = self.state.as_mut() {
             state.reclaim_stale();
         }
+    }
+
+    pub(crate) fn free_failure_logged(&self) -> bool {
+        self.free_failure_logged
+    }
+
+    pub(crate) fn mark_free_failure_logged(&mut self) {
+        self.free_failure_logged = true;
     }
 }
 
@@ -267,7 +277,14 @@ impl RetiredQpairRegistry {
             return;
         }
 
-        entries.insert(key, RetiredQpair { state, must_free });
+        entries.insert(
+            key,
+            RetiredQpair {
+                state,
+                must_free,
+                free_failure_logged: false,
+            },
+        );
         self.has_entries.store(true, Ordering::Release);
     }
 
@@ -1109,6 +1126,7 @@ pub(crate) fn retired_qpair_with_stale_inflight_for_test(
         RetiredQpair {
             state: Some(qpair_state),
             must_free: true,
+            free_failure_logged: false,
         },
         ctx as *mut c_void,
         inflight,
@@ -1186,6 +1204,7 @@ mod test {
         let retired = RetiredQpair {
             state: Some(qpair_state),
             must_free: true,
+            free_failure_logged: false,
         };
 
         // Simulate free_io_qpair failure: retired remains alive, so the stale
@@ -1432,6 +1451,40 @@ mod test {
         // Hot path always signals completion and decrements inflight.
         assert_eq!(completion.wait(0), 42);
         assert_eq!(inflight.load(Ordering::Acquire), 0);
+    }
+
+    /// Regression test: while a qpair's retirement tombstone is visible,
+    /// `submit_one` must fast-fail requests instead of resurrecting a `QpairState`.
+    #[test]
+    fn submit_one_fast_fails_while_retirement_tombstone_is_still_visible() {
+        let retired = RetiredQpairRegistry::new();
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+
+        // Simulate poll_and_sweep having already force-retired this qpair,
+        // independently of any retire_qpair() call -- the tombstone is up.
+        retired.mark_must_free(qpair);
+        assert!(retired.contains(qpair as usize));
+
+        let bdev_inflight = Arc::new(AtomicUsize::new(1));
+        let completion = IoCompletion::new();
+        let req = IoRequest {
+            op: IoOp::Flush {
+                ns: std::ptr::null_mut(),
+                qpair,
+            },
+            completion: completion.clone(),
+            bdev_inflight: bdev_inflight.clone(),
+        };
+        let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
+
+        SpdkPoller::submit_one(&req, &mut qpair_state, &retired, 128);
+
+        assert_eq!(completion.wait(0), -libc::EIO);
+        assert_eq!(bdev_inflight.load(Ordering::Acquire), 0);
+        assert!(
+            qpair_state.is_empty(),
+            "no phantom QpairState should be created while the retirement tombstone is visible"
+        );
     }
 
     #[test]

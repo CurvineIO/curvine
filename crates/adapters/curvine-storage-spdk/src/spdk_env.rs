@@ -856,6 +856,11 @@ struct SpdkEnvTestHooks {
             dyn Fn(*mut spdk_ffi::spdk_nvme_qpair) -> RetiredQpairPollOutcome + Send + Sync,
         >,
     >,
+    /// Counts calls to `reclaim_retired_dma()`, so tests can prove a code
+    /// path (e.g. `open()`'s DMA allocation) actually triggers a reclaim
+    /// attempt, rather than only checking the registry's final state (which
+    /// can be cleared by an unrelated caller, e.g. `acquire_qpair()`).
+    dma_reclaim_calls: AtomicUsize,
 }
 
 /// SPDK env lifecycle (singleton). Send + Sync
@@ -1397,12 +1402,21 @@ impl SpdkEnv {
     }
 
     pub(crate) fn reclaim_retired_dma(&self) -> usize {
+        #[cfg(test)]
+        self.test_hooks
+            .dma_reclaim_calls
+            .fetch_add(1, Ordering::Relaxed);
         self.retired_dma.reclaim()
     }
 
     #[cfg(test)]
     fn retired_dma_count(&self) -> usize {
         self.retired_dma.count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dma_reclaim_call_count(&self) -> usize {
+        self.test_hooks.dma_reclaim_calls.load(Ordering::Relaxed)
     }
 
     fn prepare_retired_qpair_for_free(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
@@ -1449,7 +1463,7 @@ impl SpdkEnv {
         &self,
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
-        retired: RetiredQpair,
+        mut retired: RetiredQpair,
     ) -> RetiredQpairFinish {
         if !retired.requires_free() && self.state() == SpdkEnvState::Initialized {
             match self.qpair_pool.release(ctrlr, qpair) {
@@ -1474,7 +1488,10 @@ impl SpdkEnv {
         }
         let rc = self.qpair_pool.free_io_qpair(qpair);
         if rc != 0 {
-            error!("failed to free retired SPDK qpair {:p}: rc={}", qpair, rc);
+            if !retired.free_failure_logged() {
+                error!("failed to free retired SPDK qpair {:p}: rc={}", qpair, rc);
+                retired.mark_free_failure_logged();
+            }
             self.retired_qpairs.put_back(qpair, retired);
             return RetiredQpairFinish::DeferredRetired;
         }
@@ -1719,16 +1736,14 @@ impl SpdkEnv {
 
     /// Transfer a closing qpair out of a bdev. On unregister timeout, ownership
     /// moves to deferred_qpairs and the pointer cannot re-enter the reusable pool.
+    ///
+    /// Always barriers through the poller channel first, even if already
+    /// retired, so a queued request can't slip past `submit_one`'s guard.
     pub(crate) fn retire_qpair(
         &self,
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) {
-        if let Some(retired) = self.retired_qpairs.take(qpair) {
-            self.finish_or_defer_retired_qpair(ctrlr, qpair, retired);
-            return;
-        }
-
         match self.unregister_qpair_from_poller(qpair) {
             UnregisterResult::Acked => {
                 if let Some(retired) = self.retired_qpairs.take(qpair) {
@@ -2831,6 +2846,38 @@ mod test {
         assert!(env.retired_qpairs.take(qpair).is_none());
     }
 
+    /// Regression test: the barrier must run even when the qpair is already
+    /// recorded in `retired_qpairs` (e.g. force-retired by a keep-alive poll).
+    #[test]
+    fn retire_qpair_barriers_through_poller_even_when_already_retired() {
+        let mut env = test_env();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+
+        // Simulate poll_and_sweep having already force-retired this qpair
+        // before SpdkBdev::drop() ever calls retire_qpair() for it.
+        env.retired_qpairs.mark_must_free(qpair);
+        assert!(env.retired_qpairs.contains(qpair as usize));
+
+        // Avoid the real FFI free call against this fake pointer once the
+        // barrier round-trip (below) lets retire_qpair proceed to free it.
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(|_| 0);
+
+        let unregister_called = Arc::new(AtomicUsize::new(0));
+        let unregister_called2 = unregister_called.clone();
+        env.test_hooks.unregister_qpair = Some(Arc::new(move || {
+            unregister_called2.fetch_add(1, Ordering::SeqCst);
+            UnregisterResult::Acked
+        }));
+
+        env.retire_qpair(ctrlr, qpair);
+
+        // The channel barrier must have been consulted, not skipped via a
+        // direct take() of the already-present tombstone.
+        assert_eq!(unregister_called.load(Ordering::SeqCst), 1);
+        assert!(env.retired_qpairs.take(qpair).is_none());
+    }
+
     #[test]
     fn retire_qpair_reclaims_stale_inflight_before_drop_wait() {
         let mut env = test_env();
@@ -2852,6 +2899,59 @@ mod test {
 
         env.retire_qpair(ctrlr, qpair);
 
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+        assert_eq!(env.deferred_qpair_count(), 0);
+        assert_eq!(env.qpair_pool.controller_stats(ctrlr as usize).0, 0);
+    }
+
+    /// Regression test: a transient free failure must be retried throughout the
+    /// wait loop, not just once, so inflight still reaches 0 without leaking.
+    #[test]
+    fn wait_for_inflight_drain_retries_deferred_cleanup_until_success() {
+        let mut env = test_env();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let (retired, _, inflight) = retired_qpair_with_stale_inflight_for_test();
+
+        env.qpair_pool.register_limit(ctrlr as usize, 1);
+        assert_eq!(
+            env.qpair_pool.try_reserve(ctrlr as usize),
+            QpairReserveResult::Reserved
+        );
+        env.retired_qpairs.put_back(qpair, retired);
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+
+        // First two free attempts fail (the initial one, plus retire_qpair's
+        // own trailing bonus retry); only the loop's own retry succeeds.
+        let free_calls = Arc::new(AtomicUsize::new(0));
+        let free_calls_for_hook = Arc::clone(&free_calls);
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
+            if free_calls_for_hook.fetch_add(1, Ordering::AcqRel) < 2 {
+                -libc::EIO
+            } else {
+                0
+            }
+        });
+
+        env.retire_qpair(ctrlr, qpair);
+        assert_eq!(free_calls.load(Ordering::Acquire), 2);
+        assert_eq!(inflight.load(Ordering::Acquire), 1);
+        assert_eq!(env.deferred_qpair_count(), 1);
+
+        // Must retry within the same deadline until it succeeds, no TimedOut.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let outcome = crate::spdk_bdev::wait_for_inflight_drain(
+            &inflight,
+            Some(&env),
+            deadline,
+            "test-bdev",
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(100),
+        );
+
+        assert_eq!(outcome, crate::spdk_bdev::DrainOutcome::Completed);
+        assert_eq!(free_calls.load(Ordering::Acquire), 3);
         assert_eq!(inflight.load(Ordering::Acquire), 0);
         assert_eq!(env.deferred_qpair_count(), 0);
         assert_eq!(env.qpair_pool.controller_stats(ctrlr as usize).0, 0);
@@ -3364,8 +3464,10 @@ mod test {
         );
         let (retired, stale_callback) = retired_qpair_with_stale_callback_for_test();
         env.retired_qpairs.put_back(qpair, retired);
+        // Threshold raised by 1: retire_qpair() now always does a bonus retry
+        // via its trailing resolve_deferred_qpairs() call.
         env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
-            if free_calls_for_hook.fetch_add(1, Ordering::AcqRel) < 2 {
+            if free_calls_for_hook.fetch_add(1, Ordering::AcqRel) < 3 {
                 -libc::EIO
             } else if poll_calls_for_free.load(Ordering::Acquire) > 0 {
                 0
@@ -3378,7 +3480,7 @@ mod test {
             RetiredQpairPollOutcome::Polled(0)
         }));
         env.test_hooks.poller_stop = Some(Arc::new(move |_| {
-            assert_eq!(poll_calls_for_poller_stop.load(Ordering::Acquire), 3);
+            assert_eq!(poll_calls_for_poller_stop.load(Ordering::Acquire), 4);
         }));
         env.test_hooks.detach_controllers = Some(Arc::new(move || {
             detach_calls_for_hook.fetch_add(1, Ordering::AcqRel);
@@ -3391,8 +3493,10 @@ mod test {
 
         env.retire_qpair(ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr, qpair);
 
-        assert_eq!(free_calls.load(Ordering::Acquire), 1);
-        assert_eq!(poll_calls.load(Ordering::Acquire), 1);
+        // Two attempts happen inside this single call: the initial one, plus
+        // one bonus retry via the trailing resolve_deferred_qpairs().
+        assert_eq!(free_calls.load(Ordering::Acquire), 2);
+        assert_eq!(poll_calls.load(Ordering::Acquire), 2);
         assert!(env.retired_qpairs.has_entries());
         assert_eq!(env.deferred_qpair_count(), 1);
         assert_eq!(
@@ -3413,8 +3517,8 @@ mod test {
 
         env.shutdown();
 
-        assert_eq!(free_calls.load(Ordering::Acquire), 2);
-        assert_eq!(poll_calls.load(Ordering::Acquire), 2);
+        assert_eq!(free_calls.load(Ordering::Acquire), 3);
+        assert_eq!(poll_calls.load(Ordering::Acquire), 3);
         assert_eq!(detach_calls.load(Ordering::Acquire), 0);
         assert_eq!(fini_calls.load(Ordering::Acquire), 0);
         assert!(!env.shutdown_complete.load(Ordering::Acquire));
@@ -3423,8 +3527,8 @@ mod test {
 
         env.shutdown();
 
-        assert_eq!(free_calls.load(Ordering::Acquire), 3);
-        assert_eq!(poll_calls.load(Ordering::Acquire), 3);
+        assert_eq!(free_calls.load(Ordering::Acquire), 4);
+        assert_eq!(poll_calls.load(Ordering::Acquire), 4);
         assert_eq!(detach_calls.load(Ordering::Acquire), 1);
         assert_eq!(fini_calls.load(Ordering::Acquire), 1);
         assert!(env.shutdown_complete.load(Ordering::Acquire));
@@ -3441,6 +3545,67 @@ mod test {
         );
         let (active, _) = env.qpair_pool.controller_stats(ctrlr);
         assert_eq!(active, 0);
+    }
+
+    /// A a failed free is retried, but the failure is only
+    /// logged once per qpair, not once per retry.
+    #[test]
+    fn retired_free_failure_is_only_logged_once_across_repeated_retries() {
+        let ctrlr = 0x1000usize;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let free_calls = Arc::new(AtomicUsize::new(0));
+        let free_calls_for_hook = Arc::clone(&free_calls);
+
+        let mut env = SpdkEnv::new(SpdkConf::default()).unwrap();
+        env.qpair_pool.register_limit(ctrlr, 1);
+        assert_eq!(
+            env.qpair_pool.try_reserve(ctrlr),
+            QpairReserveResult::Reserved
+        );
+        let (retired, _) = retired_qpair_with_stale_callback_for_test();
+        env.retired_qpairs.put_back(qpair, retired);
+        // Always fails -- every retry hits the same `rc != 0` branch.
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
+            free_calls_for_hook.fetch_add(1, Ordering::AcqRel);
+            -libc::EIO
+        });
+        env.test_hooks.poll_retired_qpair = Some(Arc::new(|_| RetiredQpairPollOutcome::Polled(0)));
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+
+        // First attempt (plus retire_qpair's own trailing bonus retry): the
+        // failure must be logged on the very first failed attempt.
+        env.retire_qpair(ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr, qpair);
+        assert_eq!(free_calls.load(Ordering::Acquire), 2);
+        let retired = env
+            .retired_qpairs
+            .take(qpair)
+            .expect("qpair still deferred after failed free");
+        assert!(
+            retired.free_failure_logged(),
+            "first failure must be logged"
+        );
+        env.retired_qpairs.put_back(qpair, retired);
+
+        // Further retries keep retrying the free, but must not re-log --
+        // the flag set on the first failure must stick across retries.
+        for _ in 0..3 {
+            env.resolve_deferred_qpairs();
+        }
+        assert_eq!(
+            free_calls.load(Ordering::Acquire),
+            5,
+            "retries must keep happening despite the log being suppressed"
+        );
+        let retired = env
+            .retired_qpairs
+            .take(qpair)
+            .expect("qpair still deferred after repeated failed frees");
+        assert!(
+            retired.free_failure_logged(),
+            "logged flag must still be set after further retries"
+        );
+        retired.reclaim();
     }
 
     #[test]
