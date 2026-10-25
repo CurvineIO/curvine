@@ -29,7 +29,8 @@ use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
     CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FilesystemInfo, FreeResult,
     JobStatus, ListOptions, LoadJobCommand, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
-    OpenFlags, RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState,
+    OpenFlags, RenameFlags, RestoreTrashResult, SetAttrOpts, TransferCommand, TransferKind,
+    TransferState, TrashEntry,
 };
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::common::Utils;
@@ -382,7 +383,7 @@ impl UnifiedFileSystem {
         if path.path() == mount.cv_path && recursive {
             for status in self.cv.list_status(path).await? {
                 let child = Path::from_str(status.path)?;
-                match self.cv.delete(&child, true).await {
+                match self.cv.delete_with_opts(&child, true, true).await {
                     Ok(res) => {
                         let res: FreeResult = res.into();
                         total.inodes += res.inodes;
@@ -395,7 +396,11 @@ impl UnifiedFileSystem {
                 }
             }
         } else {
-            total = self.cv.delete(path, recursive).await?.into();
+            total = self
+                .cv
+                .delete_with_opts(path, recursive, true)
+                .await?
+                .into();
         }
 
         Ok(total)
@@ -790,7 +795,7 @@ impl UnifiedFileSystem {
                 }
 
                 Some((ufs_path, mount)) => {
-                    if let Err(e) = self.cv.delete(path, false).await {
+                    if let Err(e) = self.cv.delete_with_opts(path, false, true).await {
                         if !matches!(e, FsError::FileNotFound(_)) {
                             warn!("failed to delete cache for {}: {}", path, e);
                         }
@@ -920,7 +925,9 @@ impl UnifiedFileSystem {
                     let dst_ufs = mount.get_ufs_path(dst)?;
                     let res = mount.ufs()?.rename(&src_ufs, &dst_ufs).await?;
 
-                    if let Err(e) = self.cv.delete(src, true).await {
+                    // The cv entry only mirrors ufs data here; purge it instead
+                    // of leaving an orphan in the recycle bin.
+                    if let Err(e) = self.cv.delete_with_opts(src, true, true).await {
                         if !matches!(e, FsError::FileNotFound(_)) {
                             warn!("failed to delete cache for {}: {}", src, e);
                         }
@@ -931,6 +938,99 @@ impl UnifiedFileSystem {
             }
         };
         self.track("Rename", src.path(), dst.path(), fut).await
+    }
+
+    pub async fn delete_with_opts(
+        &self,
+        path: &Path,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<DeleteResult> {
+        let fut = async {
+            match self.get_mount_checked(path, RpcCode::Delete).await? {
+                None => self.cv.delete_with_opts(path, recursive, skip_trash).await,
+                Some((ufs_path, mount)) => {
+                    if path.path() == mount.info.cv_path {
+                        return err_box!(
+                            "cannot delete mount point root: cv_path={}, ufs_path={}",
+                            mount.info.cv_path,
+                            mount.info.ufs_path
+                        );
+                    }
+
+                    let mut delete_res = mount.ufs()?.delete(&ufs_path, recursive).await?;
+
+                    // delete cache; cached copies are internal state, never
+                    // user data, so they are always purged permanently.
+                    match self.cv.delete_with_opts(path, recursive, true).await {
+                        Ok(res) => {
+                            delete_res.inodes += res.inodes;
+                            delete_res.bytes += res.bytes;
+                        }
+                        Err(FsError::FileNotFound(_)) => {}
+                        Err(e) => {
+                            warn!("failed to delete cache for {}: {}", path, e);
+                        }
+                    }
+
+                    Ok(delete_res)
+                }
+            }
+        };
+        self.track("Delete", path.path(), "", fut).await
+    }
+
+    pub async fn list_trash_page(
+        &self,
+        page_token: Option<String>,
+        page_size: Option<u32>,
+    ) -> FsResult<(Vec<TrashEntry>, Option<String>)> {
+        self.cv.list_trash_page(page_token, page_size).await
+    }
+
+    pub async fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        self.cv.list_trash().await
+    }
+
+    pub async fn restore_trash(
+        &self,
+        path: &Path,
+        dst: Option<&Path>,
+        overwrite: bool,
+    ) -> FsResult<RestoreTrashResult> {
+        let fut = async {
+            // The master also checks the destination it resolves for a default
+            // restore; an explicit destination can be rejected before the RPC.
+            if let Some(dst) = dst {
+                let mount = self.get_mount(dst, RpcCode::Rename).await?;
+                ensure_restore_dst_supported(dst, mount.as_ref().map(|(_, mount)| mount.as_ref()))?;
+            }
+            self.cv.restore_trash(path, dst, overwrite).await
+        };
+        self.track(
+            "RestoreTrash",
+            path.path(),
+            dst.map(|dst| dst.path()).unwrap_or(""),
+            fut,
+        )
+        .await
+    }
+
+    pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
+        self.cv.empty_trash().await
+    }
+}
+
+// Cache-mode mounts keep UFS as the source of truth, so a CV-only entry
+// restored below one would have no backing object and unified reads would
+// reject it.
+fn ensure_restore_dst_supported(dst: &Path, mount: Option<&MountValue>) -> FsResult<()> {
+    match mount {
+        Some(mount) if mount.info.is_cache_mode() => err_ext!(FsError::unsupported(format!(
+            "restore trash into cache_mode mount: {}",
+            dst.path()
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -1166,37 +1266,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
-        let fut = async {
-            match self.get_mount_checked(path, RpcCode::Delete).await? {
-                None => self.cv.delete(path, recursive).await,
-                Some((ufs_path, mount)) => {
-                    if path.path() == mount.info.cv_path {
-                        return err_box!(
-                            "cannot delete mount point root: cv_path={}, ufs_path={}",
-                            mount.info.cv_path,
-                            mount.info.ufs_path
-                        );
-                    }
-
-                    let mut delete_res = mount.ufs()?.delete(&ufs_path, recursive).await?;
-
-                    // delete cache
-                    match self.cv.delete(path, recursive).await {
-                        Ok(res) => {
-                            delete_res.inodes += res.inodes;
-                            delete_res.bytes += res.bytes;
-                        }
-                        Err(FsError::FileNotFound(_)) => {}
-                        Err(e) => {
-                            warn!("failed to delete cache for {}: {}", path, e);
-                        }
-                    }
-
-                    Ok(delete_res)
-                }
-            }
-        };
-        self.track("Delete", path.path(), "", fut).await
+        self.delete_with_opts(path, recursive, false).await
     }
 
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
@@ -1298,7 +1368,10 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsyncCacheAdmission, AsyncCachePending};
+    use super::{ensure_restore_dst_supported, AsyncCacheAdmission, AsyncCachePending, MountValue};
+    use curvine_error::FsError;
+    use curvine_fs_api::Path;
+    use curvine_model::{MountInfo, WriteType};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1388,5 +1461,22 @@ mod tests {
         assert!(pending.paths.lock().contains("ufs://bucket/b"));
         drop(second_pending);
         assert!(pending.paths.lock().is_empty());
+    }
+
+    #[test]
+    fn ensure_restore_dst_supported_rejects_cache_mode_mounts() {
+        let dst = Path::from_str("/mnt/cache/a.log").unwrap();
+        assert!(ensure_restore_dst_supported(&dst, None).is_ok());
+
+        let fs_mode = MountValue::new(MountInfo {
+            write_type: WriteType::FsMode,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(ensure_restore_dst_supported(&dst, Some(&fs_mode)).is_ok());
+
+        let cache_mode = MountValue::new(MountInfo::default()).unwrap();
+        let err = ensure_restore_dst_supported(&dst, Some(&cache_mode)).unwrap_err();
+        assert!(matches!(err, FsError::Unsupported(_)), "got {err:?}");
     }
 }

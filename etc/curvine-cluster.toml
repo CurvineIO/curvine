@@ -56,11 +56,13 @@ meta_dir = "testing/meta"
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"
 
-# Recycle bin options. The /.Trash namespace is reserved even while disabled.
-# The recycle bin is not active yet: deletes remain permanent until soft deletion
-# lands, so the options below are documented ahead of time and have no effect.
-# trash_retention: how long entries are kept before the master purges them;
-#   "0" disables automatic purging.
+# Recycle bin. While enabled, deletes on Curvine-native paths move entries to
+# /.Trash instead of freeing blocks immediately. Mounted paths (cache_mode /
+# fs_mode) always bypass the bin, because the client removes the UFS object
+# first and a trash entry could never be restored. The /.Trash namespace is
+# reserved even while disabled.
+# trash_retention: how long entries stay in the bin before the master purges
+#   them; "0" disables automatic purging.
 # trash_check_interval: how often the master scans /.Trash for expired entries.
 # trash_enabled = false
 # trash_retention = "7d"

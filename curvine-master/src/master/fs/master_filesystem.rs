@@ -17,7 +17,9 @@ use crate::master::fs::full_block_report::{FullReportProgress, FullReportTracker
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-use crate::master::meta::{trash, CacheInvalidationResult, FsDir};
+use crate::master::meta::{
+    trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
+};
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
@@ -244,9 +246,56 @@ impl MasterFilesystem {
         self.mkdir_with_opts(path, opts)
     }
 
+    // Permanently delete a path, bypassing the recycle bin.
     pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<DeleteResult> {
-        let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        self.delete_with_opts(path, recursive, true)
+    }
+
+    pub fn delete_with_opts<T: AsRef<str>>(
+        &self,
+        path: T,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<DeleteResult> {
+        let mut delete_res = {
+            let mut fs_dir = self.fs_dir.write();
+            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, skip_trash)?
+        };
+        self.release_deleted_blocks(&mut delete_res);
+
+        Ok(delete_res)
+    }
+
+    /// Leader-fenced variant of `delete_with_opts`. The role is re-checked
+    /// while holding the same write lock that guards the metadata mutation, so
+    /// a demotion cannot interleave between the check and the delete. Returns
+    /// `None` when this node is no longer the active master.
+    pub fn delete_with_opts_if_active<T: AsRef<str>>(
+        &self,
+        path: T,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<Option<DeleteResult>> {
+        let mut delete_res = {
+            let mut fs_dir = self.fs_dir.write();
+            if !self.master_monitor.is_active() {
+                return Ok(None);
+            }
+            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, skip_trash)?
+        };
+        self.release_deleted_blocks(&mut delete_res);
+
+        Ok(Some(delete_res))
+    }
+
+    fn delete_locked(
+        &self,
+        fs_dir: &mut FsDir,
+        path: &str,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<DeleteResult> {
+        let inp = Self::resolve_path(fs_dir, path)?;
 
         // Removing the root would orphan every trashed entry. Entries below it
         // stay permanently deletable so the recycle bin can be emptied.
@@ -256,17 +305,128 @@ impl MasterFilesystem {
             ));
         }
 
-        let mut delete_res = fs_dir.delete(&inp, recursive)?;
-        drop(fs_dir);
+        // Entries already inside /.Trash are always purged permanently.
+        let soft_delete =
+            !skip_trash && self.conf.trash_enabled && !trash::is_trash_path(inp.path());
 
+        let mut delete_res = if soft_delete {
+            fs_dir.trash(&inp, recursive)?
+        } else {
+            fs_dir.delete(&inp, recursive)?
+        };
+        delete_res.trashed = soft_delete;
+        Ok(delete_res)
+    }
+
+    fn release_deleted_blocks(&self, delete_res: &mut DeleteResult) {
+        let blocks = std::mem::take(&mut delete_res.blocks);
         let mut worker_manager = self.worker_manager.write();
         worker_manager.remove_blocks(&DeleteResult {
             inodes: 0,
             bytes: 0,
-            blocks: std::mem::take(&mut delete_res.blocks),
+            blocks,
+            trashed: false,
         });
+    }
 
-        Ok(delete_res)
+    pub fn list_trash_page(
+        &self,
+        after: Option<&trash::TrashCursor>,
+        limit: usize,
+    ) -> FsResult<TrashListing> {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.list_trash(after, limit)
+    }
+
+    pub fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        const PAGE_SIZE: usize = 1000;
+        let mut entries = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.list_trash_page(cursor.as_ref(), PAGE_SIZE)?;
+            entries.extend(page.entries);
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(entries),
+            }
+        }
+    }
+
+    pub fn restore_dst<T: AsRef<str>>(&self, path: T, dst: Option<&str>) -> FsResult<String> {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.restore_dst(path.as_ref(), dst)
+    }
+
+    /// Returns one bounded page of expired trash entry paths. The namespace
+    /// read lock is held only while scanning that page.
+    pub fn scan_expired_trash(
+        &self,
+        cutoff_ms: i64,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> FsResult<TrashScanPage> {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.scan_expired_trash(cutoff_ms, limit, start_after)
+    }
+
+    pub fn restore_trash<T: AsRef<str>>(
+        &self,
+        path: T,
+        dst: Option<&str>,
+        overwrite: bool,
+    ) -> FsResult<RestoredTrashEntry> {
+        let mut fs_dir = self.fs_dir.write();
+        let restored = fs_dir.restore_trash(path.as_ref(), dst, overwrite)?;
+        drop(fs_dir);
+
+        // Overwriting an existing destination deletes it; release its blocks
+        // just like a regular rename-with-replace.
+        if let Some(replaced) = &restored.replaced {
+            let mut worker_manager = self.worker_manager.write();
+            worker_manager.remove_blocks(replaced);
+        }
+
+        Ok(restored)
+    }
+
+    pub fn empty_trash(&self) -> FsResult<DeleteResult> {
+        // Snapshot the names once so the purge releases the write lock between
+        // batches instead of blocking every metadata mutation for the whole
+        // purge. Entries added after the snapshot stay for the next purge.
+        const BATCH_SIZE: usize = 1000;
+        let names = self.fs_dir.read().trash_entry_names()?;
+
+        let mut total = DeleteResult::new();
+        let mut first_err = None;
+        for batch in names.chunks(BATCH_SIZE) {
+            let (mut delete_res, res) = {
+                let mut fs_dir = self.fs_dir.write();
+                fs_dir.empty_trash_batch(batch)
+            };
+
+            // Entries deleted before a failure have already left the namespace,
+            // so their block locations must be released even when the purge
+            // fails partway through the batch.
+            self.worker_manager.write().remove_blocks(&DeleteResult {
+                inodes: 0,
+                bytes: 0,
+                blocks: std::mem::take(&mut delete_res.blocks),
+                trashed: false,
+            });
+
+            total.inodes += delete_res.inodes;
+            total.bytes += delete_res.bytes;
+            if let Err(e) = res {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(total),
+        }
     }
 
     pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
@@ -282,6 +442,7 @@ impl MasterFilesystem {
             inodes: 0,
             bytes: 0,
             blocks: std::mem::take(&mut free_res.blocks),
+            trashed: false,
         });
 
         Ok(free_res)
@@ -540,6 +701,13 @@ impl MasterFilesystem {
             )));
         }
         Ok(())
+    }
+
+    // NUL-prefixed keys are master-owned (ctime, trash markers) and never
+    // surface in FileStatus, so a client cannot legitimately send them. The
+    // check itself lives on `FsDir` so every client-facing writer shares it.
+    fn check_not_internal_x_attr(opts: &SetAttrOpts) -> FsResult<()> {
+        FsDir::check_not_internal_x_attr(opts)
     }
 
     fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {
@@ -1566,6 +1734,7 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         Self::check_not_reserved_path(inp.path())?;
+        Self::check_not_internal_x_attr(&opts)?;
         fs_dir.set_attr(inp, opts)
     }
 
@@ -1772,6 +1941,25 @@ mod tests {
             .unwrap();
         let inode_id = inp.get_last_inode().unwrap().id();
         (path, inode_id)
+    }
+
+    fn test_fs_with_trash(name: &str) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.trash_enabled = true;
+        conf.master.meta_dir = Utils::test_sub_dir(format!(
+            "master-fs-trash-test/meta-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-trash-test/journal-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        JournalSystem::fs_only_for_test(&conf).unwrap()
     }
 
     fn assert_file_not_found_roundtrip(err: &FsError) {
@@ -2434,6 +2622,501 @@ mod tests {
                 .unwrap()
                 .scheduled_bytes,
             0
+        );
+    }
+
+    #[test]
+    fn soft_delete_moves_file_into_trash_with_origin_metadata() {
+        let fs = test_fs_with_trash("soft-file");
+        fs.create("/data/a.log", true).unwrap();
+
+        fs.delete_with_opts("/data/a.log", false, false).unwrap();
+
+        assert!(matches!(
+            fs.get_block_locations("/data/a.log").unwrap_err(),
+            FsError::FileNotFound(_)
+        ));
+
+        let mut entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = entries.remove(0);
+        assert_eq!(
+            entry
+                .x_attr
+                .get(trash::TRASH_XATTR_ORIGIN)
+                .map(Vec::as_slice),
+            Some(b"/data/a.log".as_slice())
+        );
+        let delete_ms = i64::from_le_bytes(
+            entry
+                .x_attr
+                .get(trash::TRASH_XATTR_DELETE_MS)
+                .unwrap()
+                .as_slice()
+                .try_into()
+                .unwrap(),
+        );
+        assert!(delete_ms > 0);
+        assert!(entry.name.starts_with(&format!("{}-", delete_ms)));
+    }
+
+    #[test]
+    fn soft_delete_moves_directory_subtree_into_trash() {
+        let fs = test_fs_with_trash("soft-dir");
+        fs.create("/dir/child.log", true).unwrap();
+
+        let err = fs.delete_with_opts("/dir", false, false).unwrap_err();
+        assert!(matches!(err, FsError::DirNotEmpty(_)), "got {:?}", err);
+
+        fs.delete_with_opts("/dir", true, false).unwrap();
+
+        let entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        assert_eq!(entries.len(), 1);
+        let trashed_child = format!("/.Trash/{}/child.log", entries[0].name);
+        assert!(fs.get_block_locations(&trashed_child).is_ok());
+        assert!(fs.get_block_locations("/dir/child.log").is_err());
+    }
+
+    #[test]
+    fn deleting_a_hard_link_keeps_hard_unlink_semantics() {
+        let fs = test_fs_with_trash("hardlink");
+        fs.create("/a.log", true).unwrap();
+        fs.link("/a.log", "/b.log").unwrap();
+
+        fs.delete_with_opts("/a.log", false, false).unwrap();
+
+        assert!(fs.get_block_locations("/b.log").is_ok());
+        assert!(fs.list_options("/.Trash", ListOptions::default()).is_err());
+    }
+
+    #[test]
+    fn skip_trash_deletes_permanently() {
+        let fs = test_fs_with_trash("skip-trash");
+        fs.create("/keep.log", true).unwrap();
+
+        fs.delete_with_opts("/keep.log", false, true).unwrap();
+
+        assert!(fs.get_block_locations("/keep.log").is_err());
+        assert!(fs.list_options("/.Trash", ListOptions::default()).is_err());
+    }
+
+    #[test]
+    fn soft_delete_falls_back_to_hard_delete_when_disabled() {
+        let fs = test_fs("trash-disabled");
+        fs.create("/a.log", true).unwrap();
+
+        fs.delete_with_opts("/a.log", false, false).unwrap();
+
+        assert!(fs.get_block_locations("/a.log").is_err());
+        assert!(fs.list_options("/.Trash", ListOptions::default()).is_err());
+    }
+
+    #[test]
+    fn trash_move_and_purge_transfer_directory_link_counts() {
+        let fs = test_fs_with_trash("trash-nlink");
+        fs.mkdir("/parent", true).unwrap();
+        fs.mkdir("/parent/child", true).unwrap();
+        let parent_nlink = fs.file_status("/parent").unwrap().nlink;
+
+        fs.delete_with_opts("/parent/child", true, false).unwrap();
+
+        assert_eq!(
+            fs.file_status("/parent").unwrap().nlink,
+            parent_nlink - 1,
+            "the source parent must drop the moved directory link"
+        );
+        let mut entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        let trash_nlink = fs.file_status("/.Trash").unwrap().nlink;
+        let entry_path = format!("/.Trash/{}", entries.remove(0).name);
+
+        fs.delete_with_opts(&entry_path, true, false).unwrap();
+
+        assert_eq!(
+            fs.file_status("/.Trash").unwrap().nlink,
+            trash_nlink - 1,
+            "purging the entry must drop the trash root link"
+        );
+    }
+
+    #[test]
+    fn client_set_attr_cannot_touch_internal_xattrs() {
+        let fs = test_fs("internal-xattr");
+        fs.create("/a.log", true).unwrap();
+
+        for key in [trash::TRASH_XATTR_ORIGIN, trash::TRASH_XATTR_DELETE_MS] {
+            let err = fs
+                .set_attr(
+                    "/a.log",
+                    SetAttrOptsBuilder::new()
+                        .add_x_attr(key, b"x".to_vec())
+                        .build(),
+                )
+                .unwrap_err();
+            assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+            let err = fs
+                .set_attr(
+                    "/a.log",
+                    SetAttrOptsBuilder::new().remove_x_attr(key).build(),
+                )
+                .unwrap_err();
+            assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+        }
+    }
+
+    #[test]
+    fn trash_root_is_protected_and_entries_are_purged_permanently() {
+        let fs = test_fs_with_trash("trash-purge");
+        fs.create("/a.log", true).unwrap();
+        fs.delete_with_opts("/a.log", false, false).unwrap();
+
+        let err = fs.delete_with_opts("/.Trash", true, false).unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        let entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        let entry_path = format!("/.Trash/{}", entries[0].name);
+        fs.delete_with_opts(&entry_path, true, false).unwrap();
+        assert!(fs
+            .list_options("/.Trash", ListOptions::default())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn ttl_does_not_expunge_trashed_entries() {
+        use crate::master::meta::inode::ttl::InodeTtlExecutor;
+
+        let fs = test_fs_with_trash("ttl-trash");
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .ttl_ms(1)
+            .ttl_action(TtlAction::Delete)
+            .build();
+        fs.create_with_opts(
+            "/ttl/expired.log",
+            opts,
+            OpenFlags::new_create().set_overwrite(true),
+        )
+        .unwrap();
+        fs.complete_file("/ttl/expired.log", None, 0, vec![], "", false, None)
+            .unwrap();
+        let inode_id = fs.file_status("/ttl/expired.log").unwrap().id;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        fs.delete_with_opts("/ttl/expired.log", false, false)
+            .unwrap();
+        let entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        let trashed_path = format!("/.Trash/{}", entries[0].name);
+
+        let executor = InodeTtlExecutor::with_managers(fs.clone());
+        let (handled, _, reclaimed) = executor.execute_by_id(inode_id).unwrap();
+
+        assert!(handled);
+        assert_eq!(
+            reclaimed, 0,
+            "a skipped trash entry must not report reclaimed bytes"
+        );
+        assert!(fs.get_block_locations(&trashed_path).is_ok());
+    }
+
+    #[test]
+    fn list_trash_reports_origin_time_and_status() {
+        let fs = test_fs_with_trash("trash-list");
+        fs.create("/a.log", true).unwrap();
+        fs.create("/b.log", true).unwrap();
+        fs.delete_with_opts("/a.log", false, false).unwrap();
+        fs.delete_with_opts("/b.log", false, false).unwrap();
+
+        let entries = fs.list_trash().unwrap();
+        assert_eq!(entries.len(), 2);
+
+        let mut origins: Vec<&str> = entries.iter().map(|e| e.origin.as_str()).collect();
+        origins.sort();
+        assert_eq!(origins, vec!["/a.log", "/b.log"]);
+
+        for entry in &entries {
+            assert!(entry.path.starts_with("/.Trash/"));
+            assert_eq!(entry.status.path, entry.path);
+            assert!(entry.delete_ms > 0);
+            assert!(entry
+                .status
+                .name
+                .starts_with(&format!("{}-", entry.delete_ms)));
+        }
+    }
+
+    #[test]
+    fn list_trash_page_resumes_without_repeating_entries() {
+        let fs = test_fs_with_trash("trash-list-page");
+        for i in 0..250 {
+            fs.create(format!("/p-{}.log", i), true).unwrap();
+        }
+        for i in 0..250 {
+            fs.delete_with_opts(format!("/p-{}.log", i), false, false)
+                .unwrap();
+        }
+
+        let mut page_sizes = Vec::new();
+        let mut paths = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = fs.list_trash_page(cursor.as_ref(), 100).unwrap();
+            page_sizes.push(page.entries.len());
+            paths.extend(page.entries.into_iter().map(|entry| entry.path));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        assert_eq!(page_sizes, vec![100, 100, 50]);
+        assert_eq!(paths.len(), 250);
+        let unique: HashSet<&String> = paths.iter().collect();
+        assert_eq!(unique.len(), 250, "a page must not repeat an entry");
+
+        assert_eq!(fs.list_trash().unwrap().len(), 250);
+    }
+
+    #[test]
+    fn restore_trash_reports_the_effective_destination_and_status() {
+        let fs = test_fs_with_trash("trash-restore-outcome");
+        fs.create("/a.log", true).unwrap();
+        fs.delete_with_opts("/a.log", false, false).unwrap();
+        let entry = fs.list_trash().unwrap().remove(0);
+
+        assert_eq!(fs.restore_dst(&entry.path, None).unwrap(), "/a.log");
+        assert_eq!(
+            fs.restore_dst(&entry.path, Some("/b.log")).unwrap(),
+            "/b.log"
+        );
+
+        let restored = fs.restore_trash(&entry.path, None, false).unwrap();
+        assert_eq!(restored.dst, "/a.log");
+        assert_eq!(restored.status.path, "/a.log");
+        assert!(restored.replaced.is_none());
+        assert!(fs.list_trash().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_trash_without_dst_reports_a_missing_origin_parent() {
+        let fs = test_fs_with_trash("trash-restore-missing-parent");
+        fs.mkdir("/data", true).unwrap();
+        fs.create("/data/a.log", true).unwrap();
+        fs.delete_with_opts("/data/a.log", false, false).unwrap();
+        fs.delete_with_opts("/data", true, false).unwrap();
+
+        let entry = fs
+            .list_trash()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.origin == "/data/a.log")
+            .unwrap();
+
+        let err = fs.restore_trash(&entry.path, None, false).unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("parent directory"),
+            "message should explain the missing parent, got {err}"
+        );
+
+        let err = fs
+            .restore_trash(&entry.path, Some("/data/a.log"), false)
+            .unwrap_err();
+        assert!(matches!(err, FsError::FileNotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn restore_trash_moves_entry_back_to_origin() {
+        let fs = test_fs_with_trash("trash-restore");
+        fs.create("/data/a.log", true).unwrap();
+        fs.delete_with_opts("/data/a.log", false, false).unwrap();
+
+        let entry = fs.list_trash().unwrap().remove(0);
+        assert!(fs.get_block_locations(&entry.path).is_ok());
+
+        fs.restore_trash(&entry.path, None, false).unwrap();
+
+        assert!(fs.get_block_locations("/data/a.log").is_ok());
+        assert!(fs.get_block_locations(&entry.path).is_err());
+        assert!(fs.list_trash().unwrap().is_empty());
+        let status = fs.file_status("/data/a.log").unwrap();
+        assert!(!status.x_attr.contains_key(trash::TRASH_XATTR_ORIGIN));
+        assert!(!status.x_attr.contains_key(trash::TRASH_XATTR_DELETE_MS));
+    }
+
+    #[test]
+    fn restore_trash_restores_directory_subtrees() {
+        let fs = test_fs_with_trash("trash-restore-dir");
+        fs.create("/data/child.log", true).unwrap();
+        fs.delete_with_opts("/data", true, false).unwrap();
+
+        let entry = fs.list_trash().unwrap().remove(0);
+        fs.restore_trash(&entry.path, None, false).unwrap();
+
+        assert!(fs.get_block_locations("/data/child.log").is_ok());
+        assert!(fs.list_trash().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_trash_validates_destination_and_overwrites_on_request() {
+        let fs = test_fs_with_trash("trash-restore-dst");
+        fs.create("/src.log", true).unwrap();
+        fs.delete_with_opts("/src.log", false, false).unwrap();
+        let entry = fs.list_trash().unwrap().remove(0);
+
+        let err = fs
+            .restore_trash(&entry.path, Some("/.Trash/other"), false)
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        let err = fs
+            .restore_trash(&entry.path, Some("/missing/src.log"), false)
+            .unwrap_err();
+        assert!(matches!(err, FsError::FileNotFound(_)), "got {:?}", err);
+        assert_eq!(fs.list_trash().unwrap().len(), 1);
+
+        fs.mkdir("/dst", true).unwrap();
+        fs.create("/dst/src.log", true).unwrap();
+        let err = fs
+            .restore_trash(&entry.path, Some("/dst/src.log"), false)
+            .unwrap_err();
+        assert!(
+            matches!(err, FsError::FileAlreadyExists(_)),
+            "got {:?}",
+            err
+        );
+        assert_eq!(fs.list_trash().unwrap().len(), 1);
+
+        fs.restore_trash(&entry.path, Some("/dst/src.log"), true)
+            .unwrap();
+        assert!(fs.get_block_locations("/dst/src.log").is_ok());
+        assert!(fs.list_trash().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_trash_rejects_paths_outside_the_trash() {
+        let fs = test_fs_with_trash("trash-restore-invalid");
+        fs.create("/plain.log", true).unwrap();
+
+        for path in ["/plain.log", "/.Trash", "/.Trash/", "/.Trash/a/b"] {
+            let err = fs.restore_trash(path, None, false).unwrap_err();
+            assert!(
+                matches!(err, FsError::InvalidArgument(_)),
+                "{} -> {:?}",
+                path,
+                err
+            );
+        }
+
+        let err = fs
+            .restore_trash("/.Trash/missing", None, false)
+            .unwrap_err();
+        assert!(matches!(err, FsError::FileNotFound(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn empty_trash_purges_entries_but_keeps_the_trash_root() {
+        let fs = test_fs_with_trash("trash-empty");
+
+        let empty = fs.empty_trash().unwrap();
+        assert_eq!(empty.inodes, 0);
+        assert!(fs.list_options("/.Trash", ListOptions::default()).is_err());
+
+        fs.create("/dir/child.log", true).unwrap();
+        fs.create("/keep.log", true).unwrap();
+        fs.delete_with_opts("/dir", true, false).unwrap();
+        fs.delete_with_opts("/keep.log", false, false).unwrap();
+        assert_eq!(fs.list_trash().unwrap().len(), 2);
+
+        let res = fs.empty_trash().unwrap();
+        assert_eq!(res.inodes, 2);
+        assert!(fs
+            .list_options("/.Trash", ListOptions::default())
+            .unwrap()
+            .is_empty());
+        assert!(fs.get_block_locations("/dir/child.log").is_err());
+
+        fs.create("/next.log", true).unwrap();
+        fs.delete_with_opts("/next.log", false, false).unwrap();
+        assert_eq!(fs.list_trash().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn empty_trash_releases_blocks_of_entries_purged_before_a_failure() {
+        let fs = test_fs_with_trash("trash-empty-partial");
+        let worker_id = 100;
+        let mut worker = WorkerInfo::default();
+        worker.address.worker_id = worker_id;
+        fs.add_test_worker(worker);
+
+        fs.create("/good.log", true).unwrap();
+        let block = fs
+            .add_block(
+                "/good.log",
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        let block_id = block.block.id;
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(worker_id))
+            .unwrap();
+        fs.complete_file(
+            "/good.log",
+            None,
+            1,
+            vec![CommitBlock {
+                block_id,
+                block_len: 1,
+                locations: vec![BlockLocation::with_id(worker_id)],
+            }],
+            "",
+            false,
+            None,
+        )
+        .unwrap();
+        fs.delete_with_opts("/good.log", false, false).unwrap();
+
+        fs.create("/broken.log", true).unwrap();
+        fs.delete_with_opts("/broken.log", false, false).unwrap();
+
+        // Drop the store record of one trash entry so purging it fails. The
+        // loop must still purge the other entry and report its blocks.
+        let broken_id = fs
+            .list_trash()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.origin == "/broken.log")
+            .unwrap()
+            .status
+            .id;
+        let fs_dir = fs.fs_dir.read();
+        let mut batch = fs_dir.store.new_batch();
+        batch.delete_inode(broken_id).unwrap();
+        batch.commit().unwrap();
+        drop(fs_dir);
+
+        assert!(fs.empty_trash().is_err());
+
+        let cmds = fs
+            .worker_manager
+            .write()
+            .block_map
+            .handle_heartbeat(worker_id);
+        let pending: HashSet<i64> = cmds
+            .iter()
+            .flat_map(|cmd| match cmd {
+                WorkerCommand::DeleteBlock(cmd) => cmd.blocks.clone(),
+            })
+            .collect();
+        assert!(
+            pending.contains(&block_id),
+            "block {block_id} was not queued for removal: {pending:?}"
         );
     }
 

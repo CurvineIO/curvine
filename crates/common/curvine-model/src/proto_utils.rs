@@ -221,7 +221,9 @@ impl ProtoUtils {
     pub fn file_status_to_pb(mut status: FileStatus) -> FileStatusProto {
         let has_ctime = status.x_attr.contains_key(INTERNAL_CTIME_XATTR);
         let ctime = status.ctime();
-        status.x_attr.remove(INTERNAL_CTIME_XATTR);
+        // NUL cannot appear in a client xattr name, so every such key is
+        // master-owned metadata (ctime, trash markers) and must not leak out.
+        status.x_attr.retain(|key, _| !key.starts_with('\0'));
         FileStatusProto {
             id: status.id,
             path: status.path,
@@ -900,12 +902,47 @@ impl ProtoUtils {
     pub fn delete_res_to_pb(res: DeleteResult) -> FreeResultProto {
         Self::free_res_to_pb(res.into())
     }
+
+    pub fn trash_entry_to_pb(src: TrashEntry) -> TrashEntryProto {
+        TrashEntryProto {
+            path: src.path,
+            origin: src.origin,
+            delete_ms: src.delete_ms,
+            status: Self::file_status_to_pb(src.status),
+        }
+    }
+
+    pub fn trash_entry_from_pb(src: TrashEntryProto) -> TrashEntry {
+        TrashEntry {
+            path: src.path,
+            origin: src.origin,
+            delete_ms: src.delete_ms,
+            status: Self::file_status_from_pb(src.status),
+        }
+    }
+
+    pub fn restore_trash_res_to_pb(src: RestoreTrashResult) -> RestoreTrashResponse {
+        RestoreTrashResponse {
+            dst: src.dst,
+            status: src.status.map(Self::file_status_to_pb),
+        }
+    }
+
+    pub fn restore_trash_res_from_pb(src: RestoreTrashResponse) -> RestoreTrashResult {
+        RestoreTrashResult {
+            dst: src.dst,
+            status: src.status.map(Self::file_status_from_pb),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::proto::CompatibilityModeProto;
-    use crate::state::{AccessMode, FileStatus, MountInfo, MountOptions, INTERNAL_CTIME_XATTR};
+    use crate::state::{
+        AccessMode, FileStatus, MountInfo, MountOptions, RestoreTrashResult, TrashEntry,
+        INTERNAL_CTIME_XATTR,
+    };
     use crate::utils::ProtoUtils;
     use curvine_sys::version::ComponentVersion;
     use std::collections::HashMap;
@@ -947,6 +984,57 @@ mod tests {
     }
 
     #[test]
+    fn trash_entry_proto_round_trip() {
+        let entry = TrashEntry {
+            path: "/.Trash/123-7".to_string(),
+            origin: "/data/a.log".to_string(),
+            delete_ms: 123,
+            status: FileStatus {
+                id: 7,
+                path: "/.Trash/123-7".to_string(),
+                name: "123-7".to_string(),
+                ..Default::default()
+            },
+        };
+
+        let pb = ProtoUtils::trash_entry_to_pb(entry);
+        assert_eq!(pb.path, "/.Trash/123-7");
+        assert_eq!(pb.origin, "/data/a.log");
+        assert_eq!(pb.delete_ms, 123);
+
+        let round_trip = ProtoUtils::trash_entry_from_pb(pb);
+        assert_eq!(round_trip.path, "/.Trash/123-7");
+        assert_eq!(round_trip.origin, "/data/a.log");
+        assert_eq!(round_trip.delete_ms, 123);
+        assert_eq!(round_trip.status.id, 7);
+        assert_eq!(round_trip.status.path, "/.Trash/123-7");
+    }
+
+    #[test]
+    fn restore_trash_result_proto_round_trip() {
+        let restored = RestoreTrashResult {
+            dst: Some("/data/a.log".to_string()),
+            status: Some(FileStatus {
+                id: 7,
+                path: "/data/a.log".to_string(),
+                ..Default::default()
+            }),
+        };
+
+        let pb = ProtoUtils::restore_trash_res_to_pb(restored);
+        assert_eq!(pb.dst.as_deref(), Some("/data/a.log"));
+
+        let round_trip = ProtoUtils::restore_trash_res_from_pb(pb);
+        assert_eq!(round_trip.dst.as_deref(), Some("/data/a.log"));
+        assert_eq!(round_trip.status.unwrap().id, 7);
+
+        // Retry-cache hits carry neither field.
+        let empty = ProtoUtils::restore_trash_res_from_pb(Default::default());
+        assert!(empty.dst.is_none());
+        assert!(empty.status.is_none());
+    }
+
+    #[test]
     fn file_status_proto_preserves_ctime_and_falls_back_for_legacy_peers() {
         let status = FileStatus {
             mtime: 1_000,
@@ -964,6 +1052,26 @@ mod tests {
 
         pb.ctime = None;
         assert_eq!(ProtoUtils::file_status_from_pb(pb).ctime(), 1_000);
+    }
+
+    #[test]
+    fn file_status_proto_filters_all_internal_xattrs() {
+        let status = FileStatus {
+            x_attr: HashMap::from([
+                ("user.visible".to_string(), b"v".to_vec()),
+                ("\0curvine.trash.origin".to_string(), b"/a".to_vec()),
+                (
+                    "\0curvine.trash.delete_ms".to_string(),
+                    1_i64.to_le_bytes().to_vec(),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::file_status_to_pb(status);
+
+        assert_eq!(pb.x_attr.len(), 1);
+        assert!(pb.x_attr.contains_key("user.visible"));
     }
 
     #[test]

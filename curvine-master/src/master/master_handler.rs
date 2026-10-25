@@ -14,12 +14,14 @@
 
 use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
+use crate::master::meta::trash::TrashCursor;
+use crate::master::meta::TrashListing;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_config::ClusterConf;
-use curvine_core_error::err_box;
+use curvine_core_error::{err_box, err_ext};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
@@ -28,7 +30,8 @@ use curvine_model::ProtoUtils;
 use curvine_model::{
     CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict, CreateFileOpts, DeleteBlockCmd,
     DeleteResult, FileBlockDetails, FileBlocks, FileStatus, FilesystemInfo, FreeResult,
-    HeartbeatStatus, ListOptions, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
+    HeartbeatStatus, ListOptions, OpenFlags, RenameFlags, RestoreTrashResult, WorkerCommand,
+    WorkerInfo,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
@@ -36,6 +39,7 @@ use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::Message;
 use curvine_runtime::runtime::{GroupExecutor, Runtime};
 use dashmap::DashMap;
+use prost::Message as _;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -240,13 +244,21 @@ impl MasterHandler {
         }
 
         let path = Path::from_str(&header.path)?;
-        if let Some(info) = self.mount_manager.get_mount_info(&path)? {
+        let mount_info = self.mount_manager.get_mount_info(&path)?;
+        if let Some(info) = &mount_info {
             if path.path() == info.cv_path {
                 return err_box!("cannot delete mount point root: {}", info.cv_path);
             }
         }
 
-        let res = self.fs.delete(&header.path, header.recursive);
+        // Mounted deletes are UFS-first on the client, so the backing object is
+        // already gone when this runs and a trash entry could never be restored.
+        // Keep mounted deletes permanent until trash supports UFS routing; an
+        // explicit client request to skip the trash is honoured either way.
+        let skip_trash = mount_info.is_some() || header.skip_trash();
+        let res = self
+            .fs
+            .delete_with_opts(&header.path, header.recursive, skip_trash);
         self.set_req_cache(req_id, res)
     }
 
@@ -255,10 +267,114 @@ impl MasterHandler {
         ctx.set_audit(Some(header.path.to_string()), None);
 
         let res = self.delete0(ctx.msg.req_id(), header)?;
+        let trashed = res.trashed;
         let rep_header = DeleteResponse {
             res: Some(ProtoUtils::delete_res_to_pb(res)),
+            trashed: Some(trashed),
         };
         ctx.response(rep_header)
+    }
+
+    pub fn list_trash(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: ListTrashRequest = ctx.parse_header()?;
+        let cursor = header
+            .page_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(parse_trash_page_token)
+            .transpose()?;
+        let page_size = header
+            .page_size()
+            .clamp(LIST_TRASH_MIN_PAGE_SIZE, LIST_TRASH_MAX_PAGE_SIZE)
+            as usize;
+        let listing = self.fs.list_trash_page(cursor.as_ref(), page_size)?;
+        let (entries, next_page_token) = encode_trash_page(listing, LIST_TRASH_MAX_ENCODED_BYTES);
+        ctx.response(ListTrashResponse {
+            entries,
+            next_page_token,
+        })
+    }
+
+    pub fn restore_trash0(
+        &self,
+        req_id: i64,
+        header: RestoreTrashRequest,
+    ) -> FsResult<RestoreTrashResult> {
+        if self.check_is_retry(req_id)? {
+            // The original attempt already moved the entry and the retry cache
+            // only records the operation status, so neither the effective
+            // destination nor the restored status can be rebuilt.
+            return Ok(RestoreTrashResult {
+                dst: header.dst.clone(),
+                status: None,
+            });
+        }
+
+        // Resolve the destination before mutating anything: mounted
+        // destination checks need the effective path even when the client
+        // relies on the recorded origin.
+        let dst = self.fs.restore_dst(&header.path, header.dst.as_deref())?;
+        self.check_restore_dst_mount(&dst)?;
+
+        let restored =
+            self.fs
+                .restore_trash(&header.path, header.dst.as_deref(), header.overwrite())?;
+        let res = RestoreTrashResult {
+            dst: Some(restored.dst),
+            status: Some(restored.status),
+        };
+        self.set_req_cache(req_id, Ok(res))
+    }
+
+    // Cache-mode reads validate against UFS and never consult the CV namespace,
+    // so restoring a CV-only entry there would leave it invisible. fs-mode reads
+    // fall back to the CV blocks, so they remain valid.
+    fn check_restore_dst_mount(&self, dst: &str) -> FsResult<()> {
+        let path = Path::from_str(dst)?;
+        let Some(info) = self.mount_manager.get_mount_info(&path)? else {
+            return Ok(());
+        };
+
+        if path.path() == info.cv_path {
+            return err_box!(
+                "cannot restore trash onto mount point root: {}",
+                info.cv_path
+            );
+        }
+        if info.is_cache_mode() {
+            return err_ext!(FsError::unsupported(format!(
+                "restore trash into cache_mode mount: {}",
+                dst
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub fn retry_check_restore_trash(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: RestoreTrashRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), header.dst.clone());
+
+        let res = self.restore_trash0(ctx.msg.req_id(), header)?;
+        ctx.response(ProtoUtils::restore_trash_res_to_pb(res))
+    }
+
+    pub fn empty_trash0(&self, req_id: i64) -> FsResult<DeleteResult> {
+        if self.check_is_retry(req_id)? {
+            return Ok(DeleteResult::default());
+        }
+
+        let res = self.fs.empty_trash();
+        self.set_req_cache(req_id, res)
+    }
+
+    pub fn retry_check_empty_trash(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let _: EmptyTrashRequest = ctx.parse_header()?;
+
+        let res = self.empty_trash0(ctx.msg.req_id())?;
+        ctx.response(EmptyTrashResponse {
+            res: ProtoUtils::delete_res_to_pb(res),
+        })
     }
 
     pub fn retry_check_free(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -285,6 +401,14 @@ impl MasterHandler {
             return Ok(true);
         }
         let flags = RenameFlags::new(header.flags);
+        // Trash/restore moves carry master-internal semantics (they rewrite
+        // the internal xattrs). Reject forged client requests instead of
+        // silently masking the bits.
+        if flags.intersects(RenameFlags::internal_mask()) {
+            return err_ext!(FsError::invalid_argument(
+                "rename flags contain a master-internal bit"
+            ));
+        }
         let res = self.fs.rename(&header.src, &header.dst, flags);
         self.set_req_cache(req_id, res)
     }
@@ -783,7 +907,7 @@ impl MasterHandler {
         self.fs.clone()
     }
 
-    fn mount(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub fn mount(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: MountRequest = ctx.parse_header()?;
         let mnt_opt = ProtoUtils::mount_options_from_pb(request.mount_options);
 
@@ -1017,6 +1141,56 @@ impl MasterHandler {
     }
 }
 
+// Keep each trash page well below the 16 MiB RPC frame limit even when every
+// entry carries a long original path.
+const LIST_TRASH_MAX_ENCODED_BYTES: usize = 8 * 1024 * 1024;
+const LIST_TRASH_MIN_PAGE_SIZE: u32 = 100;
+const LIST_TRASH_MAX_PAGE_SIZE: u32 = 10_000;
+
+fn trash_page_token(entry: &TrashEntryProto) -> String {
+    format!("{}:{}", entry.delete_ms, entry.path)
+}
+
+fn parse_trash_page_token(token: &str) -> FsResult<TrashCursor> {
+    let invalid = || FsError::invalid_argument(format!("invalid trash page token: {}", token));
+    let (delete_ms, path) = token.split_once(':').ok_or_else(invalid)?;
+    let delete_ms = delete_ms.parse::<i64>().map_err(|_| invalid())?;
+    if !path.starts_with('/') {
+        return Err(invalid());
+    }
+    Ok(TrashCursor {
+        delete_ms,
+        path: path.to_string(),
+    })
+}
+
+// Encode one page of already-resolved entries. The last returned entry is the
+// resume key when the byte budget cuts the page short; otherwise the listing's
+// scan cursor is used so a fully returned page is not rescanned.
+fn encode_trash_page(
+    listing: TrashListing,
+    max_encoded_bytes: usize,
+) -> (Vec<TrashEntryProto>, Option<String>) {
+    let mut protos = Vec::with_capacity(listing.entries.len());
+    let mut encoded_bytes = 0usize;
+
+    for entry in listing.entries {
+        let proto = ProtoUtils::trash_entry_to_pb(entry);
+        let size = proto.encoded_len();
+        if !protos.is_empty() && encoded_bytes + size > max_encoded_bytes {
+            let next = protos.last().map(trash_page_token);
+            return (protos, next);
+        }
+        encoded_bytes += size;
+        protos.push(proto);
+    }
+
+    let next = listing
+        .next
+        .map(|cursor| format!("{}:{}", cursor.delete_ms, cursor.path));
+    (protos, next)
+}
+
 impl Drop for MasterHandler {
     fn drop(&mut self) {
         self.metrics.active_connections.dec();
@@ -1074,6 +1248,9 @@ impl MessageHandler for MasterHandler {
                 RpcCode::CompleteFilesBatch => self.complete_files_batch(ctx),
                 RpcCode::Exists => self.exists(ctx),
                 RpcCode::Delete => self.retry_check_delete(ctx),
+                RpcCode::ListTrash => self.list_trash(ctx),
+                RpcCode::RestoreTrash => self.retry_check_restore_trash(ctx),
+                RpcCode::EmptyTrash => self.retry_check_empty_trash(ctx),
                 RpcCode::Free => self.retry_check_free(ctx),
                 RpcCode::Rename => self.retry_check_rename(ctx),
                 RpcCode::ListStatus => self.list_status(ctx),
@@ -1181,7 +1358,7 @@ impl MessageHandler for MasterHandler {
 mod tests {
     use super::*;
     use crate::master::journal::JournalSystem;
-    use curvine_model::WorkerAddress;
+    use curvine_model::{TrashEntry, WorkerAddress};
     use curvine_runtime::common::Utils;
 
     #[test]
@@ -1586,5 +1763,87 @@ mod tests {
     fn test_metrics() -> &'static MasterMetrics {
         Master::init_test_metrics();
         Master::get_metrics().unwrap()
+    }
+
+    fn trash_entry(path: &str, delete_ms: i64) -> TrashEntry {
+        TrashEntry {
+            path: path.to_string(),
+            origin: path.to_string(),
+            delete_ms,
+            status: FileStatus::default(),
+        }
+    }
+
+    fn trash_paths(entries: &[TrashEntryProto]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.path.as_str()).collect()
+    }
+
+    #[test]
+    fn encode_trash_page_carries_the_scan_cursor_only_when_more_entries_remain() {
+        let listing = TrashListing {
+            entries: vec![
+                trash_entry("/.Trash/1-a", 10),
+                trash_entry("/.Trash/2-a", 20),
+            ],
+            next: Some(TrashCursor {
+                delete_ms: 20,
+                path: "/.Trash/2-a".to_string(),
+            }),
+        };
+
+        let (page, token) = encode_trash_page(listing, usize::MAX);
+        assert_eq!(trash_paths(&page), vec!["/.Trash/1-a", "/.Trash/2-a"]);
+        assert_eq!(token.as_deref(), Some("20:/.Trash/2-a"));
+
+        let listing = TrashListing {
+            entries: vec![trash_entry("/.Trash/3-a", 30)],
+            next: None,
+        };
+        let (page, token) = encode_trash_page(listing, usize::MAX);
+        assert_eq!(trash_paths(&page), vec!["/.Trash/3-a"]);
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn encode_trash_page_enforces_the_encoded_byte_budget() {
+        let entries = vec![
+            trash_entry("/.Trash/1-a", 10),
+            trash_entry("/.Trash/2-a", 20),
+        ];
+        let first_size = ProtoUtils::trash_entry_to_pb(entries[0].clone()).encoded_len();
+
+        let listing = TrashListing {
+            entries,
+            next: Some(TrashCursor {
+                delete_ms: 20,
+                path: "/.Trash/2-a".to_string(),
+            }),
+        };
+        let (page, token) = encode_trash_page(listing, first_size);
+        assert_eq!(trash_paths(&page), vec!["/.Trash/1-a"]);
+        assert_eq!(token.as_deref(), Some("10:/.Trash/1-a"));
+
+        // A single entry is always emitted even if it alone exceeds the budget.
+        let listing = TrashListing {
+            entries: vec![trash_entry("/.Trash/1-a", 10)],
+            next: None,
+        };
+        let (page, token) = encode_trash_page(listing, 0);
+        assert_eq!(page.len(), 1);
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn parse_trash_page_token_rejects_invalid_tokens() {
+        for token in ["invalid", "10:no-leading-slash", "abc:/.Trash/1-a"] {
+            assert!(
+                parse_trash_page_token(token).is_err(),
+                "token {token} should be rejected"
+            );
+        }
+
+        let cursor = parse_trash_page_token("10:/.Trash/1-a").unwrap();
+        assert_eq!(cursor.delete_ms, 10);
+        assert_eq!(cursor.path, "/.Trash/1-a");
     }
 }
