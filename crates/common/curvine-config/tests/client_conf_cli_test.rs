@@ -330,3 +330,12 @@ fn rejects_invalid_octal_umask() {
 fn default_master_conn_pool_size_is_one() {
     assert_eq!(ClientConf::default().master_conn_pool_size, 1);
 }
+
+#[test]
+fn default_block_size_is_4mb() {
+    let mut conf = ClientConf::default();
+    conf.init().unwrap();
+
+    assert_eq!(conf.block_size, 4 * 1024 * 1024);
+    assert_eq!(conf.block_size_str, "4MB");
+}

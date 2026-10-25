@@ -21,13 +21,16 @@ import java.net.InetAddress;
 import java.util.Set;
 
 public class FilesystemConf {
+    // Mirrors curvine_model::DEFAULT_BLOCK_SIZE in the Rust SDK.
+    private static final String DEFAULT_BLOCK_SIZE = "4MB";
+
     // Master address list
     public String master_addrs;
     public String client_hostname;
     public int io_threads = 16;
     public int worker_threads = Math.max(16, 2 * Runtime.getRuntime().availableProcessors());
     public int replicas = 1;
-    public String block_size = "128MB";
+    public String block_size = DEFAULT_BLOCK_SIZE;
     public boolean short_circuit = true;
 
     public String write_chunk_size = "128KB";
@@ -136,7 +139,7 @@ public class FilesystemConf {
         }
 
         for(Field field : getClass().getDeclaredFields())  {
-            if (isTransferField(field)) {
+            if (Modifier.isStatic(field.getModifiers()) || isTransferField(field)) {
                 continue;
             }
             String key = String.format("%s.%s", PREFIX, field.getName());

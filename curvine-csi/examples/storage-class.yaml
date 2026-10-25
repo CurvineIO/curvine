@@ -42,5 +42,5 @@ parameters:
   # io-threads: "4"
   # worker-threads: "8"
   # entry-timeout: "1.0"
-  # client.block-size: "128MB"
+  # client.block-size: "64MB"  # override the 4MB default for large sequential files
   # client.umask: "022"  # octal notation; also accepts 0o22

@@ -17,8 +17,9 @@
 use curvine_config::{ClientConf, ClusterConf, TransferConf};
 use curvine_core_error::{err_box, try_err};
 use curvine_error::FsResult;
+use curvine_model::DEFAULT_BLOCK_SIZE;
 use curvine_net::net::InetAddr;
-use curvine_runtime::common::LogConf;
+use curvine_runtime::common::{ByteUnit, LogConf};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -166,7 +167,7 @@ impl FilesystemConf {
             conn_timeout_ms: 30_000,
             rpc_timeout_ms: 120_000,
             data_timeout_ms: 120_000,
-            block_size: "128MB".to_string(),
+            block_size: ByteUnit::new(DEFAULT_BLOCK_SIZE as u64).to_string(),
             write_chunk_size: "128KB".to_string(),
             read_chunk_size: "128KB".to_string(),
             read_slice_size: "0".to_string(),
@@ -322,6 +323,15 @@ mod tests {
 
         let cluster = conf.into_cluster_conf().unwrap();
         assert_eq!(cluster.client.master_conn_pool_size, 1);
+    }
+
+    #[test]
+    fn default_block_size_is_4mb() {
+        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        assert_eq!(cluster.client.block_size, 4 * 1024 * 1024);
+        assert_eq!(cluster.client.block_size_str, "4MB");
     }
 
     #[test]

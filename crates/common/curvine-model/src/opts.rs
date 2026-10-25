@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use crate::state::*;
-use crate::{ClientConfDefaults, DEFAULT_FILE_SYSTEM_MODE};
-use curvine_runtime::common::ByteUnit;
+use crate::{ClientConfDefaults, DEFAULT_BLOCK_SIZE, DEFAULT_FILE_SYSTEM_MODE};
 use curvine_sys as sys;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -41,7 +40,7 @@ impl CreateFileOpts {
         Self {
             file_type: FileType::File,
             replicas: 1,
-            block_size: ByteUnit::MB as i64 * 64,
+            block_size: DEFAULT_BLOCK_SIZE,
             x_attr: Default::default(),
             storage_policy: Default::default(),
             create_parent,
@@ -93,7 +92,7 @@ impl CreateFileOptsBuilder {
         Self {
             create_parent: false,
             replicas: 1,
-            block_size: (64 * ByteUnit::MB) as i64,
+            block_size: DEFAULT_BLOCK_SIZE,
             file_type: FileType::File,
             x_attr: HashMap::new(),
             storage_policy: StoragePolicy::default(),
@@ -546,5 +545,23 @@ impl fmt::Display for ListOptions {
             (None, Some(s)) => write!(f, "none-{}", s),
             (None, None) => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CreateFileOpts, CreateFileOptsBuilder};
+    use crate::DEFAULT_BLOCK_SIZE;
+
+    #[test]
+    fn create_opts_default_to_4mb_blocks() {
+        assert_eq!(
+            CreateFileOpts::with_create(false).block_size,
+            DEFAULT_BLOCK_SIZE
+        );
+        assert_eq!(
+            CreateFileOptsBuilder::new().build().block_size,
+            DEFAULT_BLOCK_SIZE
+        );
     }
 }

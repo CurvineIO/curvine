@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_runtime::common::ByteUnit;
+
 pub use curvine_error::{FsError, FsResult, MAX_FILE_SIZE};
 
 pub const UFS_INODE_ID: i64 = 0;
+pub const DEFAULT_BLOCK_SIZE: i64 = 4 * ByteUnit::MB as i64;
 pub const DEFAULT_FILE_SYSTEM_MODE: u32 = 0o777;
 
 pub trait ClientConfDefaults {

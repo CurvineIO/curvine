@@ -15,6 +15,7 @@
 use crate::state::{StorageType, TtlAction};
 use curvine_common_macros::ClientCliArgs;
 use curvine_core_error::CommonResult;
+use curvine_model::DEFAULT_BLOCK_SIZE;
 use curvine_net::net::InetAddr;
 use curvine_rpc::client::ClientConf as RpcConf;
 use curvine_runtime::common::{ByteUnit, DurationUnit, Utils};
@@ -371,7 +372,7 @@ impl Default for ClientConf {
 
             replicas: 1,
             block_size: 0,
-            block_size_str: "128MB".to_owned(),
+            block_size_str: ByteUnit::new(DEFAULT_BLOCK_SIZE as u64).to_string(),
 
             write_chunk_size: 0,
             write_chunk_size_str: "128KB".to_owned(),
