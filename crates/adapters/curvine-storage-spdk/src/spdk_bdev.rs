@@ -216,6 +216,8 @@ pub struct SpdkBdev {
     io_timeout_ms: u64,
     inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     retired_dma: Arc<RetiredDmaRegistry>,
+    /// Set on write/flush `ETIMEDOUT` (unconfirmed completion); sticky like `qpair_dead`.
+    uncertain_writes: AtomicBool,
 }
 
 // SAFETY: owns qpair and DMA buffers exclusively
@@ -326,6 +328,7 @@ impl SpdkBdev {
                 io_timeout_ms,
                 inflight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 retired_dma,
+                uncertain_writes: AtomicBool::new(false),
             })
         }
     }
@@ -586,6 +589,10 @@ impl SpdkBdev {
                 if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                     self.io_channel.qpair_dead.store(true, Ordering::Release);
                 }
+                if rc == -libc::ETIMEDOUT {
+                    // Write may still complete later; not a confirmed failure.
+                    self.uncertain_writes.store(true, Ordering::Release);
+                }
                 return err_box!(
                     "NVMe write failed on '{}' at offset={}, len={}: {}",
                     self.name,
@@ -622,6 +629,10 @@ impl SpdkBdev {
         if rc != 0 {
             if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                 self.io_channel.qpair_dead.store(true, Ordering::Release);
+            }
+            if rc == -libc::ETIMEDOUT {
+                // Flush may still complete later; not a confirmed failure.
+                self.uncertain_writes.store(true, Ordering::Release);
             }
             return err_box!(
                 "NVMe flush failed on '{}': {}",
@@ -712,6 +723,10 @@ impl BlockIO for SpdkBdev {
     /// Flush writes to NVMe device.
     fn flush(&mut self) -> IOResult<()> {
         self.spdk_flush()
+    }
+
+    fn has_uncertain_writes(&self) -> bool {
+        self.uncertain_writes.load(Ordering::Acquire)
     }
 
     /// Seek to absolute offset.
@@ -1008,6 +1023,7 @@ mod test {
             io_timeout_ms: 1,
             inflight,
             retired_dma,
+            uncertain_writes: AtomicBool::new(false),
         })
     }
 
@@ -1211,6 +1227,7 @@ mod test {
             io_timeout_ms: 1,
             inflight: Arc::new(AtomicUsize::new(0)),
             retired_dma: RetiredDmaRegistry::new(),
+            uncertain_writes: AtomicBool::new(false),
         };
         (bdev, rx)
     }
@@ -1246,6 +1263,9 @@ mod test {
         assert!(err.to_string().contains("qpair is dead"), "{}", err);
         assert!(rx.try_recv().is_err(), "dead flush must not submit");
 
+        // Read timeout must not mark writes as uncertain.
+        assert!(!bdev.has_uncertain_writes());
+
         std::mem::forget(bdev);
     }
 
@@ -1259,6 +1279,7 @@ mod test {
             .expect_err("write should time out");
         assert!(err.to_string().contains("NVMe write failed"), "{}", err);
         assert!(bdev.io_channel.qpair_dead.load(Ordering::Acquire));
+        assert!(bdev.has_uncertain_writes(), "timed-out write is uncertain");
         assert!(
             rx.try_recv().is_ok(),
             "the timed-out write should have submitted once"
@@ -1279,6 +1300,8 @@ mod test {
             .expect_err("RMW read should time out");
         assert!(err.to_string().contains("Read-modify-write"), "{}", err);
         assert!(bdev.io_channel.qpair_dead.load(Ordering::Acquire));
+        // RMW pre-read timeout means the write was never submitted.
+        assert!(!bdev.has_uncertain_writes());
         assert!(
             rx.try_recv().is_ok(),
             "the RMW read should have submitted once"
@@ -1298,10 +1321,38 @@ mod test {
         let err = bdev.spdk_flush().expect_err("flush should time out");
         assert!(err.to_string().contains("NVMe flush failed"), "{}", err);
         assert!(bdev.io_channel.qpair_dead.load(Ordering::Acquire));
+        assert!(bdev.has_uncertain_writes(), "timed-out flush is uncertain");
         assert!(
             rx.try_recv().is_ok(),
             "the timed-out flush should have submitted once"
         );
+        assert!(rx.try_recv().is_err(), "only one submit expected");
+
+        std::mem::forget(bdev);
+    }
+
+    /// Control: confirmed EIO (not a timeout) must not mark uncertain.
+    #[test]
+    fn spdk_write_eio_does_not_mark_uncertain() {
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+
+        let responder = std::thread::spawn(move || {
+            let req = rx.recv().expect("write should submit exactly once");
+            assert!(req.completion.complete(-libc::EIO));
+            rx
+        });
+
+        let err = bdev
+            .spdk_write(0, &[0u8; 512])
+            .expect_err("write should fail with a confirmed EIO");
+        assert!(err.to_string().contains("NVMe write failed"), "{}", err);
+        assert!(bdev.io_channel.qpair_dead.load(Ordering::Acquire));
+        assert!(
+            !bdev.has_uncertain_writes(),
+            "confirmed EIO is not uncertain"
+        );
+
+        let rx = responder.join().expect("responder thread must not panic");
         assert!(rx.try_recv().is_err(), "only one submit expected");
 
         std::mem::forget(bdev);
