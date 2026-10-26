@@ -969,6 +969,7 @@ impl FsClient {
         T: PMessage + Default,
         R: PMessage + Default,
     {
+        self.context.ensure_master_discovery().await?;
         self.connector
             .proto_rpc::<T, R, FsError>(code, header)
             .await
@@ -977,6 +978,7 @@ impl FsClient {
     /// Raw bytes master RPC without the lazy handshake guard; see
     /// [`Self::raw_rpc`].
     async fn raw_rpc_bytes(&self, code: RpcCode, header: impl PMessage) -> FsResult<BytesMut> {
+        self.context.ensure_master_discovery().await?;
         let msg = MessageBuilder::new_rpc(code).proto_header(header).build();
 
         let msg = self.connector.rpc::<FsError>(msg).await?;
