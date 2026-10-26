@@ -2178,6 +2178,7 @@ name = "curvine-client-core"
 version = "0.2.2"
 dependencies = [
  "async-stream",
+ "async-trait",
  "bytes",
  "curvine-config",
  "curvine-core-error",

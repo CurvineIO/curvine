@@ -38,6 +38,9 @@ fxhash = { workspace = true }
 linked-hash-map = { workspace = true }
 rand = { workspace = true }
 
+[dev-dependencies]
+async-trait = { workspace = true }
+
 [features]
 default = []
 discovery-etcd = ["curvine-service-discovery/etcd"]

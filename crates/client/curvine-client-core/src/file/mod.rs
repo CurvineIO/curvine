@@ -45,6 +45,11 @@ pub use self::fs_reader_buffer::FsReaderBuffer;
 mod fs_reader_parallel;
 pub use self::fs_reader_parallel::FsReaderParallel;
 
+#[cfg(any(feature = "discovery-etcd", test))]
+mod master_discovery;
+#[cfg(feature = "discovery-etcd")]
+pub(crate) use self::master_discovery::ClientDiscovery;
+
 mod fs_writer_buffer;
 pub use self::fs_writer_buffer::FsWriterBuffer;
 

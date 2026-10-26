@@ -626,6 +626,7 @@ impl FsClient {
     }
 
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
+        self.context.ensure_master_discovery().await?;
         // Attach this client's component_info only on the first
         // GetFilesystemInfo per session (the handshake). GetFilesystemInfo
         // backs FUSE statfs and may be called frequently by the kernel, so
@@ -698,6 +699,7 @@ impl FsClient {
     }
 
     pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
+        self.context.ensure_master_discovery().await?;
         let (header, mut guard) = self.get_filesystem_info_request();
         let bytes = self
             .raw_rpc_bytes(RpcCode::GetFilesystemInfo, header)
@@ -938,6 +940,7 @@ impl FsClient {
         T: PMessage + Default,
         R: PMessage + Default,
     {
+        self.context.ensure_master_discovery().await?;
         // Best-effort one-time handshake before the first ordinary master RPC
         // so every client path (CLI, SDK, data-transfer, direct
         // CurvineFileSystem/UnifiedFileSystem users) reports component_info
@@ -951,6 +954,7 @@ impl FsClient {
     }
 
     pub async fn rpc_bytes(&self, code: RpcCode, header: impl PMessage) -> FsResult<BytesMut> {
+        self.context.ensure_master_discovery().await?;
         if code != RpcCode::GetFilesystemInfo {
             self.ensure_handshake().await;
         }
