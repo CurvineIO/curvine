@@ -296,7 +296,12 @@ impl JournalSystem {
         }
 
         let role_monitor = RoleMonitor::new();
-        let master_monitor = MasterMonitor::new(role_monitor.read_ctl(), StateCtl::new(0));
+        let follower_readiness = role_monitor.follower_readiness();
+        let master_monitor = MasterMonitor::with_follower_readiness(
+            role_monitor.read_ctl(),
+            StateCtl::new(0),
+            follower_readiness.clone(),
+        );
         let parts = Self::build_fs_parts(conf, rt.clone(), master_monitor.clone())?;
 
         let raft_journal = MetaRaftJournal::new(
@@ -310,6 +315,7 @@ impl JournalSystem {
                 parts.job_manager.clone(),
                 log_store,
                 parts.journal_writer.clone(),
+                follower_readiness,
             )?,
             conf.journal.clone(),
             role_monitor,

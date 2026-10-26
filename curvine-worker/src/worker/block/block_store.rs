@@ -476,6 +476,11 @@ impl BlockStore {
         Ok(state.all_blocks())
     }
 
+    pub fn block_count(&self) -> CommonResult<usize> {
+        let state = self.read()?;
+        Ok(state.num_blocks())
+    }
+
     pub fn remove_block(&self, id: i64) -> CommonResult<()> {
         let _block_lock = self.block_lock(id, "remove");
         self.check_replication_owner(id)?;

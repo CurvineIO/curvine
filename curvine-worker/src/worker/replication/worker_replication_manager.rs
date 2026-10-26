@@ -20,9 +20,10 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_model::{ExtendedBlock, FileType};
+use curvine_model::{BlockReportInfo, BlockReportStatus, ExtendedBlock, FileType};
 use curvine_proto::{ReportBlockReplicationRequest, ReportBlockReplicationResponse};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+use dashmap::DashMap;
 use log::{error, info, warn};
 use once_cell::sync::OnceCell;
 use std::future::Future;
@@ -87,6 +88,7 @@ pub struct WorkerReplicationManager {
     jobs_queue_sender: Arc<Sender<ReplicationJob>>,
     fs_client_context: Arc<FsContext>,
     master_client: OnceCell<MasterClient>,
+    report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
     replicate_chunk_size: usize,
     // todo: add more metrics to track
 }
@@ -98,6 +100,7 @@ impl WorkerReplicationManager {
         conf: &ClusterConf,
         fs_client_context: &Arc<FsContext>,
         session_id: String,
+        report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
     ) -> Arc<Self> {
         let (send, recv) = tokio::sync::mpsc::channel(Semaphore::MAX_PERMITS);
         let handler = Self {
@@ -112,6 +115,7 @@ impl WorkerReplicationManager {
             jobs_queue_sender: Arc::new(send),
             fs_client_context: fs_client_context.clone(),
             master_client: Default::default(),
+            report_blocks,
             replicate_chunk_size: conf.worker.block_replication_chunk_size,
         };
         let handler = Arc::new(handler);
@@ -284,18 +288,49 @@ impl WorkerReplicationManager {
     pub fn with_master_client(&self, master_client: MasterClient) {
         let _ = self.master_client.set(master_client);
     }
+
+    pub(crate) fn queue_finalized_replica_report(&self, block_id: i64) {
+        match self.block_store.get_block(block_id) {
+            Ok(meta) if meta.is_final() => {
+                self.report_blocks.insert(
+                    block_id,
+                    BlockReportInfo::new(
+                        block_id,
+                        BlockReportStatus::Finalized,
+                        meta.storage_type,
+                        meta.len,
+                    ),
+                );
+            }
+            Ok(_) => warn!(
+                "released replication target block {} is not finalized",
+                block_id
+            ),
+            Err(error) => warn!(
+                "released replication target block {} is unavailable for report: {}",
+                block_id, error
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_report_request, finish_replication_with_cleanup};
+    use super::{build_report_request, finish_replication_with_cleanup, WorkerReplicationManager};
+    use crate::worker::block::BlockStore;
     use crate::worker::replication::replication_job::ReplicationJob;
+    use crate::worker::replication::replication_target::ReplicationTarget;
+    use curvine_client_core::file::FsContext;
+    use curvine_config::{ClusterConf, WorkerConf};
     use curvine_core_error::{err_box, CommonResult};
     use curvine_error::FsError;
-    use curvine_model::{StorageType, WorkerAddress};
+    use curvine_model::{BlockReportStatus, ExtendedBlock, StorageType, WorkerAddress};
     use curvine_proto::StorageTypeProto;
+    use curvine_runtime::runtime::Runtime;
+    use dashmap::DashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
     fn job(storage_type: Option<StorageType>) -> ReplicationJob {
         ReplicationJob {
@@ -335,6 +370,59 @@ mod tests {
         assert!(request.success);
         assert_eq!(request.storage_type, StorageTypeProto::Ssd as i32);
         assert_eq!(request.attempt_id.as_deref(), Some("attempt-7"));
+        Ok(())
+    }
+
+    #[test]
+    fn released_replica_queues_its_own_finalized_local_report() -> CommonResult<()> {
+        let runtime = Arc::new(Runtime::new("replica-local-report", 1, 1));
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                dir_reserved: "0".into(),
+                data_dir: vec![format!(
+                    "[MEM:4MB]../testing/replica-local-report-{}",
+                    curvine_runtime::common::Utils::uuid()
+                )],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        let store = BlockStore::new("test", &conf)?;
+        let block = ExtendedBlock::with_mem(1, "4B")?;
+        let writing = store.open_block(&block)?;
+        let path = store
+            .short_circuit(&writing)?
+            .expect("memory block should have a local path");
+        std::fs::write(path, b"data")?;
+        let finalized = store.finalize_block(&block)?;
+
+        let fs_client_context = Arc::new(FsContext::with_rt(conf.clone(), runtime.clone())?);
+        let (jobs_queue_sender, _jobs_queue_receiver) = tokio::sync::mpsc::channel(1);
+        let report_blocks = Arc::new(DashMap::new());
+        let manager = WorkerReplicationManager {
+            block_store: store.clone(),
+            target: Arc::new(ReplicationTarget::new(store.clone(), "session".into())),
+            replication_semaphore: Arc::new(Semaphore::new(1)),
+            jobs_queue_sender: Arc::new(jobs_queue_sender),
+            fs_client_context,
+            master_client: Default::default(),
+            report_blocks: report_blocks.clone(),
+            replicate_chunk_size: 1,
+        };
+
+        manager.queue_finalized_replica_report(1);
+        let report = report_blocks.get(&1).expect("finalized block queued");
+        assert_eq!(report.status, BlockReportStatus::Finalized);
+        assert_eq!(report.storage_type, finalized.storage_type);
+        assert_eq!(report.block_size, finalized.len);
+        drop(report);
+
+        // A preparing or failed attempt must not be advertised as a readable replica.
+        let unfinalized = ExtendedBlock::with_mem(2, "4B")?;
+        store.open_block(&unfinalized)?;
+        manager.queue_finalized_replica_report(2);
+        assert!(!report_blocks.contains_key(&2));
         Ok(())
     }
 

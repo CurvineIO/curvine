@@ -19,9 +19,14 @@ pub use self::block_store::BlockStore;
 
 mod master_client;
 pub use self::master_client::MasterClient;
+pub(crate) use self::master_client::MasterClientConfig;
+
+mod worker_peer_fanout;
+pub(crate) use worker_peer_fanout::FullReportSnapshot;
 
 mod block_actor;
 pub use self::block_actor::BlockActor;
+pub(crate) use self::block_actor::BlockActorConfig;
 
 mod heartbeat_task;
 pub use self::heartbeat_task::HeartbeatTask;

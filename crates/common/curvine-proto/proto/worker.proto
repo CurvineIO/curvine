@@ -133,6 +133,8 @@ message BlockReportListRequest {
     repeated BlockReportInfoProto blocks = 5;
     // Identifies one full report round so the master can recognize a resent batch.
     optional uint64 report_id = 6;
+    // Binds the report to the registration session that produced it.
+    optional string worker_session_id = 7;
 }
 
 message BlockReportListResponse {

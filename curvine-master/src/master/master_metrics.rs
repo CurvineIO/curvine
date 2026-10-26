@@ -114,6 +114,8 @@ impl ClientCompatTracker {
 pub struct MasterMetrics {
     pub(crate) rpc_request_total_count: Counter,
     pub(crate) rpc_request_total_time: Counter,
+    pub(crate) follower_read_accepted_total: CounterVec,
+    pub(crate) follower_read_refused_total: CounterVec,
     pub(crate) active_connections: Gauge,
 
     pub(crate) capacity: Gauge,
@@ -216,6 +218,16 @@ impl MasterMetrics {
             rpc_request_total_time: m::new_counter(
                 "rpc_request_time",
                 "Rpc request time duration(ms)",
+            )?,
+            follower_read_accepted_total: m::new_counter_vec(
+                "master_follower_read_accepted_total",
+                "Follower read RPCs served after freshness and location readiness checks",
+                &["rpc_code"],
+            )?,
+            follower_read_refused_total: m::new_counter_vec(
+                "master_follower_read_refused_total",
+                "Follower RPCs refused by the allowlist or freshness/readiness checks",
+                &["rpc_code", "reason"],
             )?,
             active_connections: m::new_gauge(
                 "master_active_connections",

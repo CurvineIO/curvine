@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockMeta, BlockStore, HeartbeatTask, MasterClient};
+use crate::worker::block::{
+    BlockMeta, BlockStore, HeartbeatTask, MasterClient, MasterClientConfig,
+};
 use curvine_client_core::file::FsContext;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
@@ -30,6 +32,14 @@ use log::{info, warn};
 use std::mem::size_of_val;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub(crate) struct BlockActorConfig {
+    pub(crate) worker_addr: WorkerAddress,
+    pub(crate) worker_session_id: String,
+    pub(crate) worker_ctl: StateCtl,
+    pub(crate) startup_time_ms: u64,
+    pub(crate) report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
+}
 
 /// Attempts per full block report batch, including the first one.
 ///
@@ -133,26 +143,33 @@ pub struct BlockActor {
 }
 
 impl BlockActor {
-    pub fn new(
+    pub(crate) fn new(
         rt: Arc<Runtime>,
         conf: &ClusterConf,
-        worker_addr: WorkerAddress,
-        worker_session_id: String,
         store: BlockStore,
-        worker_ctl: StateCtl,
-        startup_time_ms: u64,
+        config: BlockActorConfig,
     ) -> CommonResult<BlockActor> {
-        let context = FsContext::with_rt(conf.clone(), rt)?;
+        let BlockActorConfig {
+            worker_addr,
+            worker_session_id,
+            worker_ctl,
+            startup_time_ms,
+            report_blocks,
+        } = config;
+        let context = FsContext::with_rt(conf.clone(), rt.clone())?;
         let context = Arc::new(context);
         let client = MasterClient::new(
             context.clone(),
-            store.cluster_id()?,
-            store.worker_id()?,
-            worker_addr,
-            conf.worker.weight,
-            worker_session_id,
-            startup_time_ms,
-        );
+            MasterClientConfig {
+                cluster_id: store.cluster_id()?,
+                worker_id: store.worker_id()?,
+                worker_addr,
+                worker_weight: conf.worker.weight,
+                worker_session_id,
+                startup_time_ms,
+                worker_conf: conf.worker.clone(),
+            },
+        )?;
         let executor = GroupExecutor::new(
             "worker-block-executor",
             conf.worker.executor_threads,
@@ -167,7 +184,7 @@ impl BlockActor {
             heartbeat_interval_ms,
             worker_ctl,
             block_report_limit,
-            report_blocks: Arc::new(DashMap::new()),
+            report_blocks,
             pending_deletes: Arc::new(DashSet::new()),
         })
     }
@@ -187,12 +204,15 @@ impl BlockActor {
         );
 
         Self::start_heartbeat(
-            self.executor.clone(),
-            self.worker_ctl.clone(),
-            self.client.clone(),
-            self.store.clone(),
-            self.report_blocks.clone(),
-            self.pending_deletes.clone(),
+            HeartbeatTask {
+                executor: self.executor.clone(),
+                worker_ctl: self.worker_ctl.clone(),
+                client: self.client.clone(),
+                store: self.store.clone(),
+                report_blocks: self.report_blocks.clone(),
+                pending_deletes: self.pending_deletes.clone(),
+                block_report_limit: self.block_report_limit,
+            },
             self.heartbeat_interval_ms,
         )?;
         Ok(())
@@ -207,6 +227,13 @@ impl BlockActor {
     }
 
     pub fn full_block_report(&self) -> CommonResult<usize> {
+        self.client.begin_initial_full_report();
+        let result = self.full_block_report_inner();
+        self.client.end_initial_full_report();
+        result
+    }
+
+    fn full_block_report_inner(&self) -> CommonResult<usize> {
         let blocks = self.store.all_blocks()?;
         let report_id = new_report_id();
         if blocks.is_empty() {
@@ -262,26 +289,11 @@ impl BlockActor {
         )
     }
 
-    pub fn start_heartbeat(
-        executor: Arc<GroupExecutor>,
-        worker_ctl: StateCtl,
-        client: MasterClient,
-        store: BlockStore,
-        report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
-        pending_deletes: Arc<DashSet<i64>>,
+    pub(crate) fn start_heartbeat(
+        task: HeartbeatTask,
         heartbeat_interval_ms: u64,
     ) -> CommonResult<()> {
         let scheduler = ScheduledExecutor::new("worker-heartbeat", heartbeat_interval_ms);
-
-        let task = HeartbeatTask {
-            executor,
-            worker_ctl,
-            client,
-            store,
-            report_blocks,
-            pending_deletes,
-        };
-
         scheduler.start(task)?;
         Ok(())
     }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockStore, MasterClient};
+use crate::worker::block::{BlockStore, FullReportSnapshot, MasterClient};
 use crate::worker::storage::Dataset;
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -32,6 +32,7 @@ pub struct HeartbeatTask {
     pub(crate) store: BlockStore,
     pub(crate) report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
     pub(crate) pending_deletes: Arc<DashSet<i64>>,
+    pub(crate) block_report_limit: usize,
 }
 
 impl HeartbeatTask {
@@ -157,6 +158,23 @@ impl LoopTask for HeartbeatTask {
                 return Ok(());
             }
         };
+
+        if self.client.needs_follower_resync() {
+            let client = self.client.clone();
+            let store = self.store.clone();
+            let block_report_limit = self.block_report_limit;
+            if let Err(e) = self.client.resync_follower_reports(|max_inventory_bytes| {
+                let block_count = store.block_count()?;
+                if FullReportSnapshot::minimum_inventory_bytes(block_count) > max_inventory_bytes {
+                    return Ok(None);
+                }
+                let blocks = store.all_blocks()?;
+                let snapshot = client.full_report_snapshot(blocks, block_report_limit);
+                Ok(Some(snapshot))
+            }) {
+                warn!("build follower worker full report failed: {}", e);
+            }
+        }
 
         // Execute block report
         let report_blocks = self.get_report_blocks();
