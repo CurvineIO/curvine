@@ -40,6 +40,15 @@ impl ServiceWatch {
     pub async fn recv(&mut self) -> Option<DiscoveryResult<ServiceWatchEvent>> {
         self.events.recv().await
     }
+
+    /// Take the channel receiver and drop its lifecycle owner on this caller.
+    ///
+    /// Use this only when another owner keeps the resolver/provider alive.
+    /// The returned receiver is safe to move into a task running on a
+    /// provider-owned runtime.
+    pub fn into_receiver(self) -> mpsc::Receiver<DiscoveryResult<ServiceWatchEvent>> {
+        self.events
+    }
 }
 
 pub struct ServiceResolverHandle {
@@ -84,6 +93,22 @@ impl ServiceResolverHandle {
         (self.reader, self.events)
     }
 
+    /// Split the resolver state into cache-only/read-channel handles.
+    ///
+    /// Both lifecycle owners are dropped on the caller side. The caller must
+    /// keep the underlying resolver/provider alive separately while the
+    /// returned reader or receiver is in use. This is useful when the
+    /// receiver is moved into a task running on the provider's own runtime.
+    pub fn into_detached_parts(
+        self,
+    ) -> (
+        SnapshotReader,
+        mpsc::Receiver<DiscoveryResult<ServiceWatchEvent>>,
+    ) {
+        let Self { reader, events, .. } = self;
+        (reader.cache_reader(), events.into_receiver())
+    }
+
     pub async fn next_event(&mut self) -> Option<DiscoveryResult<ServiceWatchEvent>> {
         self.events.recv().await
     }
@@ -126,7 +151,6 @@ impl SnapshotReader {
     ///
     /// External readers keep the runtime alive, but its own background task
     /// must not retain the last runtime owner and drop it on an async worker.
-    #[cfg(feature = "etcd")]
     pub(crate) fn cache_reader(&self) -> Self {
         Self {
             cache: self.cache.clone(),
@@ -241,5 +265,32 @@ mod tests {
         assert_eq!(Arc::strong_count(&owner), 2);
         drop(events);
         assert_eq!(Arc::strong_count(&owner), 1);
+    }
+
+    #[tokio::test]
+    async fn detached_parts_drop_lifecycle_owners_and_preserve_state_and_events() {
+        let owner = Arc::new(());
+        let (tx, rx) = mpsc::channel(1);
+        let reader =
+            SnapshotReader::with_lifecycle_owner(snapshot(false), true, Some(owner.clone()));
+        let handle = ServiceResolverHandle::with_lifecycle_owner(
+            ServiceKind::try_new("mds").unwrap(),
+            reader,
+            rx,
+            Some(owner.clone()),
+        );
+        assert_eq!(Arc::strong_count(&owner), 4);
+
+        let (reader, mut events) = handle.into_detached_parts();
+
+        assert_eq!(Arc::strong_count(&owner), 1);
+        assert_eq!(reader.snapshot().await.unwrap(), snapshot(false));
+        tx.send(Ok(ServiceWatchEvent::Reset(snapshot(false))))
+            .await
+            .unwrap();
+        assert_eq!(
+            events.recv().await.unwrap().unwrap(),
+            ServiceWatchEvent::Reset(snapshot(false))
+        );
     }
 }
