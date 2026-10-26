@@ -16,6 +16,7 @@ curvine-proto = { workspace = true }
 curvine-model = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-config = { workspace = true }
+curvine-service-discovery = { workspace = true }
 curvine-metrics = { workspace = true }
 once_cell = { workspace = true }
 hyper = { workspace = true }
@@ -39,3 +40,4 @@ rand = { workspace = true }
 
 [features]
 default = []
+discovery-etcd = ["curvine-service-discovery/etcd"]
