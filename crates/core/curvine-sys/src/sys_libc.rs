@@ -619,7 +619,7 @@ pub fn get_username_by_uid(uid: u32) -> Option<String> {
                 None
             } else {
                 let c_str = CStr::from_ptr((*passwd).pw_name);
-                Some(c_str.to_string_lossy().into_owned().into())
+                Some(c_str.to_string_lossy().into_owned())
             }
         })
     }
@@ -662,7 +662,7 @@ pub fn get_groupname_by_gid(gid: u32) -> Option<String> {
                 None
             } else {
                 let c_str = CStr::from_ptr((*group).gr_name);
-                Some(c_str.to_string_lossy().into_owned().into())
+                Some(c_str.to_string_lossy().into_owned())
             }
         })
     }
