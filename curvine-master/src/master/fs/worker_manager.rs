@@ -221,6 +221,20 @@ impl WorkerManager {
         self.worker_map.remove_expired(id)
     }
 
+    pub fn remove_expired_worker_if_stale(
+        &mut self,
+        id: u32,
+        now: u64,
+        lost_ms: u64,
+    ) -> Option<WorkerInfo> {
+        match self.worker_map.workers.get(&id) {
+            Some(worker) if now > worker.last_update + lost_ms => {
+                self.worker_map.remove_expired(id)
+            }
+            _ => None,
+        }
+    }
+
     pub fn add_blacklist_worker(&mut self, id: u32) -> Option<WorkerInfo> {
         match self.worker_map.workers.get_mut(&id) {
             Some(v) if v.status != WorkerStatus::Blacklist => {

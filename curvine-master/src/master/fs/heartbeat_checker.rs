@@ -74,7 +74,7 @@ impl LoopTask for HeartbeatChecker {
         }
 
         let mut blacklisted_workers = Vec::new();
-        let mut removed_workers = Vec::new();
+        let mut expired_workers = Vec::new();
         {
             let mut wm = self.fs.worker_manager.write();
             if !self.monitor.is_active() {
@@ -111,9 +111,7 @@ impl LoopTask for HeartbeatChecker {
 
                 if now > last_update + self.worker_lost_ms {
                     // Heartbeat timeout
-                    if let Some(worker) = wm.remove_expired_worker(id) {
-                        removed_workers.push((id, worker.address, worker.last_update));
-                    }
+                    expired_workers.push(id);
                 }
             }
         }
@@ -125,19 +123,34 @@ impl LoopTask for HeartbeatChecker {
             );
         }
 
-        for (id, address, last_update) in removed_workers {
+        for id in expired_workers {
+            let removed = {
+                let mut wm = self.fs.worker_manager.write();
+                if self.monitor.is_active() {
+                    wm.remove_expired_worker_if_stale(id, now, self.worker_lost_ms)
+                } else {
+                    None
+                }
+            };
+
+            let worker = match removed {
+                Some(worker) => worker,
+                None => {
+                    if !self.monitor.is_active() {
+                        warn!(
+                            "Skip lost-worker {} cleanup: node is no longer the active master",
+                            id
+                        );
+                        break;
+                    }
+                    continue;
+                }
+            };
+
             warn!(
                 "Worker {} ({}) last heartbeat {} has exceeded lost timeout {} ms and will be removed",
-                id, address, last_update, self.worker_lost_ms
+                id, worker.address, worker.last_update, self.worker_lost_ms
             );
-
-            if !self.monitor.is_active() {
-                warn!(
-                    "Skip lost-worker {} cleanup: node is no longer the active master",
-                    id
-                );
-                continue;
-            }
 
             // Asynchronously delete all block location data.
             let fs = self.fs.clone();
@@ -260,6 +273,14 @@ mod tests {
         fs.worker_manager.read().get_worker(WORKER_ID).is_some()
     }
 
+    fn worker_live(fs: &MasterFilesystem) -> bool {
+        fs.worker_manager
+            .read()
+            .worker_map
+            .workers
+            .contains_key(&WORKER_ID)
+    }
+
     fn location_count(fs: &MasterFilesystem) -> usize {
         fs.fs_dir()
             .read()
@@ -298,6 +319,24 @@ mod tests {
             location_count(&fs),
             1,
             "a standby tick must not delete block locations"
+        );
+        forget_checker(checker);
+    }
+
+    // The re-basing branches must not disable loss detection: a regular active tick
+    // still expires a worker whose heartbeat is older than the lost timeout.
+    #[test]
+    fn active_tick_expires_worker_past_lost_timeout() {
+        let (fs, checker) = fixture("active-expiry");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        checker.run().unwrap();
+
+        set_heartbeat_age(&fs, fs.conf.worker_lost_interval_ms() * 2);
+        checker.run().unwrap();
+
+        assert!(
+            !worker_live(&fs),
+            "a regular active tick must expire a worker past the lost timeout"
         );
         forget_checker(checker);
     }
