@@ -277,8 +277,9 @@ impl PendingTrashPurger {
         }
     }
 
-    #[cfg(test)]
-    fn with_scan_batch(mut self, scan_batch: usize) -> Self {
+    /// Overrides the scan page size. Test hook, mirroring `MasterMonitor::set_role_for_test`:
+    /// a small page makes `drain_pending` walk the staging directory over several pages.
+    pub fn with_scan_batch(mut self, scan_batch: usize) -> Self {
         self.scan_batch = scan_batch.max(1);
         self
     }

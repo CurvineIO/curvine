@@ -145,7 +145,9 @@ fn pending_purger_reclaims_staged_entries() {
         .unwrap();
     assert_eq!(pending_entries(&fs).len(), 1);
 
+    // A one-entry page walks the staging directory over more than one page.
     let (entries, inodes, _bytes) = PendingTrashPurger::new(fs.clone(), fs.master_monitor.clone())
+        .with_scan_batch(1)
         .drain_pending()
         .unwrap()
         .expect("the purger must stay active");
