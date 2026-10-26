@@ -43,19 +43,42 @@ export function availableDurations(capability: ProfileCapability | null): number
   return allowed.length ? allowed : [max]
 }
 
-/** Reads the process's profiling capability; null when unavailable. */
+/**
+ * Why the capability probe produced no answer.
+ *
+ * Reported to the operator instead of silently leaving the Memory option
+ * greyed out: an unavailable option with no explanation is indistinguishable
+ * from a broken feature, which is exactly the confusion this probe exists to
+ * prevent.
+ */
+export type CapabilityFailure = 'unreachable' | 'unsupported'
+
+/**
+ * Reads the process's profiling capability.
+ *
+ * Returns `null` capability plus a reason when the probe fails. The CPU graph
+ * still works in that case (its defaults are a safe superset the server
+ * clamps), so a failure must not disable the dialog — only the features that
+ * depend on the probe.
+ */
 export async function fetchProfileCapability(
   host: string,
   webPort: number
-): Promise<ProfileCapability | null> {
+): Promise<{ capability: ProfileCapability | null; failure: CapabilityFailure | null }> {
+  const url = `http://${host}:${webPort}/api/v1/profiling/cpu/status`
   try {
-    const response = await fetch(`http://${host}:${webPort}/api/v1/profiling/cpu/status`)
-    if (!response.ok) return null
-    return (await response.json()) as ProfileCapability
+    const response = await fetch(url)
+    // 404 means the process runs without profiling compiled in; anything else
+    // non-OK means it is up but refused the probe.
+    if (response.status === 404) {
+      return { capability: null, failure: 'unsupported' }
+    }
+    if (!response.ok) return { capability: null, failure: 'unreachable' }
+    return { capability: (await response.json()) as ProfileCapability, failure: null }
   } catch {
-    // A cross-origin or offline process must not break the dialog; the
-    // default presets are a safe superset that the server clamps anyway.
-    return null
+    // Cross-origin block, DNS, connection refused: the operator needs to know
+    // the console could not reach the process, not that memory is unsupported.
+    return { capability: null, failure: 'unreachable' }
   }
 }
 /** Sampling frequency in Hz. Lower than the server default keeps the SVG small. */
@@ -169,6 +192,7 @@ export function ProfileDialog({ host, webPort, target, open, onOpenChange }: Pro
   const [seconds, setSeconds] = useState<number>(DEFAULT_PROFILE_SECONDS)
   const [kind, setKind] = useState<ProfileKind>('cpu')
   const [capability, setCapability] = useState<ProfileCapability | null>(null)
+  const [capabilityFailure, setCapabilityFailure] = useState<CapabilityFailure | null>(null)
   // The sampler blocks for the whole window, so the iframe stays blank until
   // the response arrives. Track load state so that wait is explained.
   const [loaded, setLoaded] = useState(false)
@@ -179,11 +203,24 @@ export function ProfileDialog({ host, webPort, target, open, onOpenChange }: Pro
 
   // Ask the process what it can serve, then size the picker to that instead of
   // offering windows the server would clamp.
+  // Reset per-target state when the dialog opens on a different process, so a
+  // prior target's Memory selection or probe failure does not leak into this
+  // one.
+  useEffect(() => {
+    if (!open) return
+    setCapability(null)
+    setCapabilityFailure(null)
+    setKind('cpu')
+    setSeconds(DEFAULT_PROFILE_SECONDS)
+  }, [open, host, webPort])
+
   useEffect(() => {
     if (!open || !host || !webPort) return
     let cancelled = false
-    void fetchProfileCapability(host, webPort).then((next) => {
-      if (!cancelled) setCapability(next)
+    void fetchProfileCapability(host, webPort).then(({ capability: next, failure }) => {
+      if (cancelled) return
+      setCapability(next)
+      setCapabilityFailure(failure)
     })
     return () => {
       cancelled = true
@@ -312,6 +349,17 @@ export function ProfileDialog({ host, webPort, target, open, onOpenChange }: Pro
                 )}
               </Button>
             </div>
+
+            {capabilityFailure && !memoryReady && (
+              <p
+                className="text-xs text-muted-foreground"
+                data-testid="profile-capability-note"
+              >
+                {capabilityFailure === 'unreachable'
+                  ? t('workers.profile.capabilityUnreachable', { host: host ?? '' })
+                  : t('workers.profile.capabilityUnsupported')}
+              </p>
+            )}
 
             <div
               ref={frameRef}

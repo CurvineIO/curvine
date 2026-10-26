@@ -39,7 +39,7 @@
 //! operator-triggered.
 
 use axum::extract::Query;
-use axum::http::{header, StatusCode};
+use axum::http::{header, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -47,6 +47,7 @@ use curvine_config::ProfilingConf;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 /// Path of the flame-graph endpoint.
 pub const CPU_PROFILE_PATH: &str = "/api/v1/profiling/cpu";
@@ -120,6 +121,21 @@ pub fn mount(router: Router, conf: &ProfilingConf) -> Router {
                 }
             }),
         )
+        // These endpoints are served by the *sampled* process, so the console
+        // necessarily calls them cross-origin (e.g. console :19000 -> worker
+        // :19002). The iframe loads without CORS, but the capability probe is
+        // a `fetch`, so without this header the console cannot learn whether
+        // the heap graph is available and leaves the Memory option disabled.
+        //
+        // `Any` origin rather than a fixed list: the console's address is not
+        // known to the worker at startup, and these routes expose only a
+        // capability record and a flame graph. They are gated by the same
+        // record/replay-free access rules as `/metrics` on the same port.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::any())
+                .allow_methods([Method::GET]),
+        )
 }
 
 /// Per-router state.
@@ -164,6 +180,10 @@ async fn memory_flamegraph(state: Arc<ProfileRouteState>, query: SampleQuery) ->
                 curvine_profiling::MemoryProfileError::NotActivated => {
                     StatusCode::SERVICE_UNAVAILABLE
                 }
+                // Normal early-life state, not a fault: with a 512 KiB sampling
+                // interval a freshly started process has recorded nothing yet.
+                // Retryable once traffic arrives.
+                curvine_profiling::MemoryProfileError::NoSamples => StatusCode::SERVICE_UNAVAILABLE,
                 curvine_profiling::MemoryProfileError::NotEnabled
                 | curvine_profiling::MemoryProfileError::FeatureDisabled => StatusCode::NOT_FOUND,
                 curvine_profiling::MemoryProfileError::Sampler(_) => {

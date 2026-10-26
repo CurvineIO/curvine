@@ -12,20 +12,25 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-//! Opt-in CPU flame-graph sampling.
+//! Opt-in process profiling: CPU time and, separately, live heap bytes.
 //!
-//! Fully gated:
+//! Both signals are gated, and both default to off:
 //!
-//! - Without the `profiling` Cargo feature no sampler is compiled in.
-//! - With the feature, sampling still requires
-//!   [`ProfilingConf::cpu_enabled`]; the HTTP routes are registered from
-//!   that same flag.
+//! - **CPU** needs the `profiling` Cargo feature plus
+//!   [`ProfilingConf::cpu_enabled`]. Sampling is process-global: `pprof`
+//!   keeps one profiler behind a global lock, so a second concurrent session
+//!   is rejected rather than queued — a queued request would occupy a thread
+//!   for the duration of the first sample and then report a window the caller
+//!   never asked for.
+//! - **Heap** needs `memory-profiling` (which compiles jemalloc with
+//!   `--enable-prof`) plus [`ProfilingConf::memory_enabled`]. It has no
+//!   observation window: jemalloc samples as the program allocates, so a dump
+//!   only walks samples that already exist. It also cannot be turned on for a
+//!   process that started without the `malloc_conf` symbol — that is reported
+//!   as [`MemoryProfileError::NotActivated`], not as an empty graph.
 //!
-//! Sampling is process-global: `pprof` keeps one profiler behind a global
-//! lock, so a second concurrent session cannot run. The second caller is
-//! rejected rather than queued — a queued request would occupy a thread for
-//! the duration of the first sample and then report a window the caller
-//! never asked for.
+//! The two locks are independent, so a heap dump can run while a CPU window
+//! is sampling; neither reads the other's state.
 
 use curvine_config::ProfilingConf;
 
@@ -116,12 +121,49 @@ pub fn available() -> bool {
 /// operator would believe samples are available when the endpoint simply
 /// does not exist. Failing here makes the mismatch visible where it can be
 /// acted on.
-pub fn check_startup(conf: &ProfilingConf) -> Result<(), ProfilingError> {
+pub fn check_startup(conf: &ProfilingConf) -> Result<(), StartupError> {
     if conf.cpu_enabled && !available() {
-        return Err(ProfilingError::FeatureDisabled);
+        return Err(StartupError::CpuFeatureMissing);
+    }
+    // Same contract for the heap graph: asking for it on a build without the
+    // sampler must fail loudly. Silently mounting no route would leave an
+    // operator believing heap profiles are available.
+    if conf.memory_enabled && !memory_available() {
+        return Err(StartupError::MemoryFeatureMissing);
     }
     Ok(())
 }
+
+/// Why a profiling configuration cannot be honoured by this build.
+///
+/// Separate from [`ProfilingError`] because the message names a *rebuild*
+/// action, and naming the wrong one ("CPU" when the operator configured the
+/// heap graph) sends them after the wrong feature.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StartupError {
+    /// `cpu_enabled = true` but the build lacks `profiling`.
+    CpuFeatureMissing,
+    /// `memory_enabled = true` but the build lacks `memory-profiling`.
+    MemoryFeatureMissing,
+}
+
+impl std::fmt::Display for StartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CpuFeatureMissing => write!(
+                f,
+                "profiling.cpu_enabled=true requires a build with the `profiling` feature"
+            ),
+            Self::MemoryFeatureMissing => write!(
+                f,
+                "profiling.memory_enabled=true requires a build with the \
+                 `memory-profiling` feature"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StartupError {}
 
 /// Samples CPU and returns a rendered SVG flame graph.
 ///
@@ -327,11 +369,26 @@ mod test {
             Ok(()) => assert!(available(), "a build without the sampler must reject it"),
             Err(err) => {
                 assert!(!available());
-                assert_eq!(err, ProfilingError::FeatureDisabled);
+                assert_eq!(err, StartupError::CpuFeatureMissing);
             }
         }
         // A disabled config is always accepted, whatever the build.
         assert!(check_startup(&ProfilingConf::default()).is_ok());
+
+        // The heap switch gets its own message so the operator rebuilds the
+        // right feature.
+        let heap_only = ProfilingConf {
+            cpu_enabled: false,
+            memory_enabled: true,
+            ..Default::default()
+        };
+        match check_startup(&heap_only) {
+            Ok(()) => assert!(memory_available()),
+            Err(err) => {
+                assert!(!memory_available());
+                assert_eq!(err, StartupError::MemoryFeatureMissing);
+            }
+        }
     }
 
     #[test]
@@ -392,6 +449,12 @@ pub enum MemoryProfileError {
     NotActivated,
     /// Another dump is already running.
     Busy,
+    /// jemalloc has recorded no allocation samples yet.
+    ///
+    /// Reported separately from `Sampler` because it is a normal early-life
+    /// state, not a fault: with `lg_prof_sample = 19` a process must allocate
+    /// roughly 512 KiB between samples before the first one lands.
+    NoSamples,
     /// Reading or converting the profile failed.
     Sampler(String),
 }
@@ -415,6 +478,10 @@ impl std::fmt::Display for MemoryProfileError {
                  with `memory-profiling` so `malloc_conf` activates profiling"
             ),
             Self::Busy => write!(f, "another heap profile dump is already running"),
+            Self::NoSamples => write!(
+                f,
+                "no heap samples recorded yet; the process has not allocated enough                  since start to reach the sampling interval"
+            ),
             Self::Sampler(reason) => write!(f, "heap profiling failed: {reason}"),
         }
     }
@@ -534,20 +601,20 @@ mod memory_imp {
         let mut options = memory_flamegraph_options(theme);
         let svg = guard
             .dump_flamegraph_with_options(&mut options)
-            .map_err(|e| MemoryProfileError::Sampler(e.to_string()))?;
+            .map_err(|e| {
+                // jemalloc_pprof surfaces "nothing sampled yet" as a plain
+                // error string. Map it to its own variant so callers can tell
+                // "wait for traffic" from "the sampler is broken".
+                let text = e.to_string();
+                if text.contains("No stack counts found") {
+                    MemoryProfileError::NoSamples
+                } else {
+                    MemoryProfileError::Sampler(text)
+                }
+            })?;
 
-        if svg.len() <= 512 {
-            return Err(MemoryProfileError::Sampler(
-                "heap profile contained no samples; the process has not allocated \
-                 enough since start to trigger the sampling interval"
-                    .into(),
-            ));
-        }
         Ok(MemoryProfileOutput { svg })
     }
 }
 
-#[cfg(all(feature = "memory-profiling", target_os = "linux"))]
-use memory_imp as imp_memory;
-#[cfg(not(all(feature = "memory-profiling", target_os = "linux")))]
 use memory_imp as imp_memory;

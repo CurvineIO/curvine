@@ -86,6 +86,8 @@ export default {
       kind: 'Profile type',
       kindCpu: 'CPU',
       kindMemory: 'Memory',
+      capabilityUnreachable: 'Could not probe profiling capability on {host} (cross-origin or unreachable); the memory view is unavailable.',
+      capabilityUnsupported: 'This process was built without profiling support; the memory view is unavailable.',
       memoryDescription: 'Bytes still held, attributed to the allocating call site. jemalloc samples continuously from startup, so there is no window to wait for.',
       fullscreen: 'Fullscreen',
       exitFullscreen: 'Exit fullscreen',

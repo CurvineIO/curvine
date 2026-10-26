@@ -85,6 +85,8 @@ export default {
       kind: '剖面类型',
       kindCpu: 'CPU',
       kindMemory: '内存',
+      capabilityUnreachable: '无法探测 {host} 的 profiling 能力（可能是跨域或网络不通），内存视图不可用。',
+      capabilityUnsupported: '该进程未编译 profiling 支持，内存视图不可用。',
       memoryDescription: '按分配点展示仍持有的内存，宽度即字节数。jemalloc 自进程启动起持续采样，无需等待。',
       fullscreen: '全屏',
       exitFullscreen: '退出全屏',
