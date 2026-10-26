@@ -20,7 +20,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::{GroupExecutor, LoopTask};
-use curvine_runtime::sync::AtomicBool;
+use curvine_runtime::sync::{AtomicBool, AtomicCounter};
 use log::{error, info, warn};
 use std::sync::Arc;
 
@@ -32,9 +32,8 @@ pub struct HeartbeatChecker {
     worker_lost_ms: u64,
     replication_manager: Arc<MasterReplicationManager>,
     quota_manager: Arc<QuotaManager>,
-    // Whether the previous tick ran under leadership. The first active tick after
-    // a promotion rebuilds heartbeat timestamps instead of judging them.
     last_active: AtomicBool,
+    last_tick_ms: AtomicCounter,
 }
 
 impl HeartbeatChecker {
@@ -56,6 +55,7 @@ impl HeartbeatChecker {
             replication_manager,
             quota_manager,
             last_active: AtomicBool::new(false),
+            last_tick_ms: AtomicCounter::new(0),
         }
     }
 }
@@ -64,6 +64,10 @@ impl LoopTask for HeartbeatChecker {
     type Error = FsError;
 
     fn run(&self) -> FsResult<()> {
+        let now = LocalTime::mills();
+        let previous_tick = self.last_tick_ms.get();
+        self.last_tick_ms.set(now);
+
         if !self.monitor.is_active() {
             self.last_active.set(false);
             return Ok(());
@@ -78,12 +82,17 @@ impl LoopTask for HeartbeatChecker {
                 return Ok(());
             }
 
-            if self.last_active.compare_and_set(false, true) {
-                let refreshed = wm.refresh_last_heartbeat(LocalTime::mills());
+            let promoted = self.last_active.compare_and_set(false, true);
+            let missed_role_change =
+                previous_tick != 0 && now.saturating_sub(previous_tick) > self.worker_lost_ms;
+            if promoted || missed_role_change {
+                let refreshed = wm.refresh_last_heartbeat(now);
                 if refreshed > 0 {
                     warn!(
-                        "Promotion detected: refreshed last heartbeat of {} workers, \
-                         expiration check resumes on the next tick",
+                        "Promotion detected (promoted: {}, tick gap {} ms): refreshed last \
+                         heartbeat of {} workers, expiration check resumes on the next tick",
+                        promoted,
+                        now.saturating_sub(previous_tick),
                         refreshed
                     );
                 }
@@ -91,7 +100,6 @@ impl LoopTask for HeartbeatChecker {
             }
 
             let workers = wm.get_last_heartbeat();
-            let now = LocalTime::mills();
 
             for (id, last_update) in workers {
                 if now > last_update + self.worker_blacklist_ms {
@@ -290,6 +298,34 @@ mod tests {
             location_count(&fs),
             1,
             "a standby tick must not delete block locations"
+        );
+        forget_checker(checker);
+    }
+
+    // A stalled checker can miss an entire follower period and then observe leadership
+    // without any visible transition: the resumed tick must rebuild the baseline
+    // instead of judging timestamps that froze while the node was a follower.
+    #[test]
+    fn resumed_tick_after_missed_promotion_rebases_instead_of_expiring() {
+        let (fs, checker) = fixture("missed-promotion");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        checker.run().unwrap();
+
+        set_heartbeat_age(&fs, fs.conf.worker_lost_interval_ms() * 2);
+        let stalled_tick = LocalTime::mills().saturating_sub(fs.conf.worker_lost_interval_ms() * 2);
+        checker.last_tick_ms.set(stalled_tick);
+
+        checker.run().unwrap();
+        assert!(
+            worker_present(&fs),
+            "a resumed tick must rebuild the baseline instead of expiring workers"
+        );
+        assert_eq!(location_count(&fs), 1);
+
+        checker.run().unwrap();
+        assert!(
+            worker_present(&fs),
+            "the rebased worker must survive the next judgment"
         );
         forget_checker(checker);
     }
