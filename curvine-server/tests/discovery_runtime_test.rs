@@ -49,9 +49,11 @@ fn test_config(etcd: String) -> (TestDirectory, ClusterConf, PathBuf) {
     )));
     fs::create_dir_all(directory.0.join("master-log")).unwrap();
     fs::create_dir_all(directory.0.join("worker-log")).unwrap();
-    let mut conf = ClusterConf::default();
-    conf.format_master = true;
-    conf.cluster_id = format!("discovery-runtime-{}", ports[0]);
+    let mut conf = ClusterConf {
+        format_master: true,
+        cluster_id: format!("discovery-runtime-{}", ports[0]),
+        ..Default::default()
+    };
     conf.master.hostname = "127.0.0.1".to_string();
     conf.master.rpc_port = ports[0];
     conf.master.web_port = ports[1];
