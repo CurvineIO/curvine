@@ -24,6 +24,7 @@ tokio = { workspace = true }
 
 [features]
 default = []
+discovery-etcd = ["curvine-client-core/discovery-etcd", "curvine-job-client/discovery-etcd"]
 opendal = ["dep:curvine-ufs-opendal"]
 opendal-s3 = ["opendal", "curvine-ufs-opendal/opendal-s3"]
 opendal-oss = ["opendal", "curvine-ufs-opendal/opendal-oss"]

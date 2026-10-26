@@ -16,6 +16,12 @@ oss-hdfs = ["curvine-client/oss-hdfs"]
 # --fdb / --features fdb to build the test harness with the libfdb_c
 # link-time dependency.
 default = []
+discovery-etcd = [
+    "curvine-server/discovery-etcd",
+    "curvine-client/discovery-etcd",
+    "curvine-cli/discovery-etcd",
+    "curvine-fuse/discovery-etcd",
+]
 fault-injection = ["curvine-server/fault-injection", "curvine-fault/fault-injection"]
 fdb = ["curvine-server/fdb"]
 lancedb = [

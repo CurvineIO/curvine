@@ -6,6 +6,10 @@ license.workspace = true
 
 [features]
 default = []
+discovery-etcd = [
+    "curvine-service-discovery/etcd",
+    "curvine-client-core/discovery-etcd",
+]
 spdk = [
     "dep:curvine-storage-spdk",
     "curvine-storage-spdk/spdk",
@@ -29,6 +33,7 @@ curvine-io = { workspace = true }
 curvine-proto = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-config = { workspace = true }
+curvine-service-discovery = { workspace = true }
 curvine-sys = { workspace = true }
 curvine-alloc = { workspace = true }
 curvine-model = { workspace = true }
@@ -37,6 +42,8 @@ curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-metrics = { workspace = true }
 curvine-client-core = { workspace = true }
 curvine-data-transfer = { workspace = true, features = ["opendal-s3"] }
+async-trait = { workspace = true }
+prost = { workspace = true }
 curvine-web = { workspace = true }
 curvine-fault = { workspace = true }
 curvine-storage-local = { workspace = true }
@@ -51,4 +58,3 @@ bytes = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-prost = { workspace = true }

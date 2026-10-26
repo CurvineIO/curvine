@@ -794,7 +794,24 @@ check_minimal_artifact_deps() {
 libsdk_features() {
   local sdk_feature="$1"
   local features="${sdk_feature}"
+  local extra_feature
+  local discovery_etcd=0
   local ufs
+
+  # Discovery is a runtime option exposed by the SDK wrapper. The generic
+  # feature list is also routed to the server/client/CLI package builds above,
+  # so forward this supported feature explicitly to the SDK invocation.
+  for extra_feature in "${EXTRA_FEATURES[@]}"; do
+    case "$extra_feature" in
+      discovery-etcd)
+        discovery_etcd=1
+        ;;
+    esac
+  done
+  if [ "$discovery_etcd" -eq 1 ]; then
+    features="${features},discovery-etcd"
+  fi
+
   for ufs in "${SDK_UFS_TYPES[@]}"; do
     case "$ufs" in
       *[!a-zA-Z0-9_-]*|"")

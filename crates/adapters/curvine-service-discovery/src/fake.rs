@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch, RwLock};
 
 #[derive(Default, Clone)]
-struct FakeDiscovery {
+pub(crate) struct FakeDiscovery {
     store: Arc<RwLock<HashMap<ServiceKind, BTreeMap<String, ServiceEndpoint>>>>,
 }
 

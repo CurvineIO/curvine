@@ -20,6 +20,8 @@ pub enum DiscoveryError {
     InvalidRegistrationOptions(String),
     #[error("invalid discovery config: {0}")]
     InvalidDiscoveryConfig(String),
+    #[error("discovery provider unavailable: {0}")]
+    ProviderUnavailable(String),
     #[error("service registration already exists: {0}")]
     RegistrationAlreadyExists(String),
     #[error("etcd unavailable: {0}")]
@@ -30,6 +32,10 @@ pub enum DiscoveryError {
     StaleCache,
     #[error("service registration lost: {0}")]
     RegistrationLost(String),
+    #[error("service registration startup timed out after {timeout_ms} ms: {last_error}")]
+    RegistrationStartupTimeout { timeout_ms: u64, last_error: String },
+    #[error("registration supervisor task failed: {0}")]
+    RegistrationSupervisorFailed(String),
 }
 
 #[cfg(feature = "etcd")]

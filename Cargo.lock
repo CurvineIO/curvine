@@ -2178,6 +2178,7 @@ name = "curvine-client-core"
 version = "0.2.2"
 dependencies = [
  "async-stream",
+ "async-trait",
  "bytes",
  "curvine-config",
  "curvine-core-error",
@@ -2190,6 +2191,7 @@ dependencies = [
  "curvine-proto",
  "curvine-rpc",
  "curvine-runtime",
+ "curvine-service-discovery",
  "curvine-sys",
  "dashmap 5.5.3",
  "futures",
@@ -2532,6 +2534,7 @@ dependencies = [
  "curvine-rocksdb",
  "curvine-rpc",
  "curvine-runtime",
+ "curvine-service-discovery",
  "curvine-sys",
  "curvine-ufs-api",
  "curvine-unified-fs",
@@ -2773,6 +2776,7 @@ dependencies = [
  "curvine-rocksdb",
  "curvine-rpc",
  "curvine-runtime",
+ "curvine-service-discovery",
  "curvine-storage-local",
  "curvine-sys",
  "curvine-ufs-api",
@@ -3021,6 +3025,7 @@ dependencies = [
 name = "curvine-worker"
 version = "0.2.2"
 dependencies = [
+ "async-trait",
  "axum 0.7.9",
  "bytes",
  "curvine-alloc",
@@ -3038,6 +3043,7 @@ dependencies = [
  "curvine-proto",
  "curvine-rpc",
  "curvine-runtime",
+ "curvine-service-discovery",
  "curvine-storage-local",
  "curvine-storage-spdk",
  "curvine-sys",

@@ -4,6 +4,7 @@ use serde::de::{Error as DeError, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::IpAddr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ServiceKind(String);
@@ -114,6 +115,16 @@ impl ServiceEndpoint {
         if self.host.trim() != self.host || self.host.chars().any(char::is_whitespace) {
             return Err(DiscoveryError::InvalidEndpointValue(
                 "host must not contain whitespace".to_string(),
+            ));
+        }
+        if self.host == "*"
+            || self
+                .host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_unspecified())
+        {
+            return Err(DiscoveryError::InvalidEndpointValue(
+                "host must be a reachable address, not a wildcard or unspecified IP".to_string(),
             ));
         }
         if self.rpc_port == 0 {
@@ -284,6 +295,28 @@ mod tests {
 
         endpoint.host = "mds.default svc".to_string();
         assert!(endpoint.validate().is_err());
+    }
+
+    #[test]
+    fn endpoint_validation_rejects_wildcard_hosts() {
+        for host in ["*", "0.0.0.0", "::"] {
+            let mut value = ServiceEndpoint {
+                kind: ServiceKind::try_new("mds").unwrap(),
+                id: "mds-1".to_string(),
+                host: "mds.default.svc".to_string(),
+                rpc_port: 9100,
+                web_port: None,
+                component_info: component_info("mds"),
+                start_time_ms: 1,
+                status: ServiceStatus::Serving,
+                metadata: None,
+            };
+            value.host = host.to_string();
+            assert!(matches!(
+                value.validate(),
+                Err(DiscoveryError::InvalidEndpointValue(_))
+            ));
+        }
     }
 
     #[test]
