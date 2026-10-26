@@ -499,6 +499,16 @@ mod tests {
         status_senders: Mutex<Vec<watch::Sender<RegistrationStatus>>>,
     }
 
+    impl TestRegistryState {
+        fn consume_status_update_failure(&self) -> bool {
+            self.fail_status_updates
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        }
+    }
+
     #[derive(Clone, Default)]
     struct TestRegistry(Arc<TestRegistryState>);
 
@@ -544,14 +554,6 @@ mod tests {
         fn consume_failure(&self) -> bool {
             self.0
                 .fail_next
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-        }
-
-        fn consume_status_update_failure(&self) -> bool {
-            self.fail_status_updates
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
