@@ -24,6 +24,7 @@ use crate::master::meta::{
     trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
 };
 
+use crate::master::fs::worker_manager::WorkerManager;
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
@@ -33,6 +34,7 @@ use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::*;
+use curvine_raft::raft::{FollowerReadRefusal, FollowerReadinessSnapshot, RoleState};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
@@ -998,6 +1000,15 @@ impl MasterFilesystem {
         // Location reads only need the caller's namespace guard. Acquire worker
         // state afterwards so RocksDB lookups do not delay heartbeats.
         let wm = self.worker_manager.read();
+        Self::get_block_locs_from_locations(path, file, &file_locs, &wm)
+    }
+
+    fn get_block_locs_from_locations(
+        path: &str,
+        file: &InodeFile,
+        file_locs: &HashMap<i64, Vec<BlockLocation>>,
+        wm: &WorkerManager,
+    ) -> FsResult<Vec<LocatedBlock>> {
         let mut block_locs = Vec::with_capacity(file_locs.len());
 
         for (index, meta) in file.blocks.iter().enumerate() {
@@ -1336,6 +1347,19 @@ impl MasterFilesystem {
         self.conf.follower_worker_state_enabled || self.conf.follower_reads_enabled
     }
 
+    /// Evaluate the configured follower-read freshness policy against one
+    /// immutable Raft/journal observation.
+    pub fn follower_read_refusal(
+        &self,
+        snapshot: &FollowerReadinessSnapshot,
+    ) -> Option<FollowerReadRefusal> {
+        snapshot.refusal_reason(
+            Duration::from_millis(self.follower_read_contact_timeout_ms),
+            self.conf.follower_read_max_commit_lag,
+            Duration::from_millis(self.conf.follower_read_apply_stall_timeout_ms()),
+        )
+    }
+
     /// Caller holds `follower_block_report_lock`.
     fn reset_passive_view_for_current_term(&self) {
         let snapshot = self.master_monitor.follower_readiness_snapshot();
@@ -1369,8 +1393,8 @@ impl MasterFilesystem {
             .map(|(id, _)| id)
             .collect();
         if status == HeartbeatStatus::Start {
-            // Start removes the worker from WorkerManager until its first
-            // Running heartbeat, but its new session still needs a full report.
+            // A provisional Start may not yet be visible in WorkerManager,
+            // but its new session still needs a full report.
             retained_workers.insert(worker_id);
         }
         for stale_worker in self
@@ -1411,70 +1435,93 @@ impl MasterFilesystem {
         self.follower_block_report_state.forget_worker(worker_id);
     }
 
-    /// Check whether a particular nonempty file can be served from the local
-    /// follower location view. Every recorded replica must belong to a worker
-    /// whose full report completed, and no deferred report may still affect one
-    /// of the requested blocks. Empty files need no worker state. The caller
-    /// must also apply the Raft/journal freshness policy before serving the RPC.
-    pub fn follower_block_locations_ready<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
-        if !self.follower_worker_state_enabled() {
-            return Ok(false);
-        }
-
-        let _serial = self.follower_block_report_lock.lock();
-        if self.master_monitor.is_active()
-            || self.master_monitor.follower_readiness_snapshot().role
-                != curvine_raft::raft::RoleState::Follower
-        {
-            return Ok(false);
-        }
-        self.reset_passive_view_for_current_term();
-
-        let path = path.as_ref();
-        let fs_dir = self.fs_dir.read();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-        let Some(inode) = inp.get_last_inode() else {
-            return Ok(true);
-        };
-        let Ok(file) = inode.as_file_ref() else {
-            // Preserve the normal GetBlockLocations type error path.
-            return Ok(true);
-        };
+    fn follower_file_locations_ready(
+        &self,
+        file: &InodeFile,
+        file_locations: &HashMap<i64, Vec<BlockLocation>>,
+        worker_manager: &WorkerManager,
+    ) -> bool {
         if file.blocks.is_empty() {
             // Empty files and UFS-only files legitimately have no Curvine
             // block locations. A nonempty Curvine-backed file does not.
-            return Ok(file.len == 0 || file.storage_policy.ufs_only());
+            return file.len == 0 || file.storage_policy.ufs_only();
         }
 
-        let file_locations = fs_dir.get_file_locations(file)?;
-        let worker_manager = self.worker_manager.read();
-        for block in &file.blocks {
+        file.blocks.iter().all(|block| {
             if self
                 .follower_block_report_state
                 .has_deferred_block(block.id)
             {
-                return Ok(false);
+                return false;
             }
             let Some(locations) = file_locations.get(&block.id) else {
-                return Ok(false);
+                return false;
             };
-            if locations.is_empty() {
-                return Ok(false);
-            }
-            for location in locations {
-                if !self
-                    .follower_block_report_state
-                    .worker_ready(location.worker_id)
-                    || !worker_manager
-                        .get_worker(location.worker_id)
-                        .is_some_and(WorkerInfo::is_live)
-                {
-                    return Ok(false);
-                }
-            }
+            !locations.is_empty()
+                && locations.iter().all(|location| {
+                    self.follower_block_report_state
+                        .worker_ready(location.worker_id)
+                        && worker_manager
+                            .get_worker(location.worker_id)
+                            .is_some_and(WorkerInfo::is_live)
+                })
+        })
+    }
+
+    /// Return a block-location snapshot only when both the Raft/journal state
+    /// and every replica in the local follower view are ready. The follower
+    /// report lock, namespace read guard, and worker-state read guard remain
+    /// held through construction and the final readiness/epoch check, so a
+    /// Start or report cannot invalidate the view between validation and reply.
+    /// `None` tells the RPC layer to fall back to the leader.
+    pub fn follower_get_block_locations_if_ready<T: AsRef<str>>(
+        &self,
+        path: T,
+    ) -> FsResult<Option<FileBlocks>> {
+        if !self.follower_worker_state_enabled() {
+            return Ok(None);
         }
 
-        Ok(true)
+        let _serial = self.follower_block_report_lock.lock();
+        let initial_snapshot = self.master_monitor.follower_readiness_snapshot();
+        if initial_snapshot.role != RoleState::Follower
+            || self.follower_read_refusal(&initial_snapshot).is_some()
+        {
+            return Ok(None);
+        }
+        self.reset_passive_view_for_current_term();
+
+        let fs_dir = self.fs_dir.read();
+        let worker_manager = self.worker_manager.read();
+        let path = path.as_ref();
+        let result: FsResult<Option<FileBlocks>> = (|| {
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let Some(inode) = inp.get_last_inode() else {
+                return Err(FsError::file_not_found(path));
+            };
+            let file = inode.as_file_ref()?;
+            let file_locations = fs_dir.get_file_locations(file)?;
+            if !self.follower_file_locations_ready(file, &file_locations, &worker_manager) {
+                return Ok(None);
+            }
+            let block_locs =
+                Self::get_block_locs_from_locations(path, file, &file_locations, &worker_manager)?;
+            Ok(Some(FileBlocks {
+                status: inode.to_file_status(path)?,
+                block_locs,
+            }))
+        })();
+
+        let final_snapshot = self.master_monitor.follower_readiness_snapshot();
+        if self.master_monitor.is_active()
+            || initial_snapshot.leadership_epoch != final_snapshot.leadership_epoch
+            || final_snapshot.role != RoleState::Follower
+            || self.follower_read_refusal(&final_snapshot).is_some()
+        {
+            return Ok(None);
+        }
+
+        result
     }
 
     pub fn reset_full_block_report(&self, worker_id: u32) {
@@ -2574,19 +2621,31 @@ mod tests {
             fs.observe_passive_worker_heartbeat(HeartbeatStatus::Running, worker_id);
         }
 
-        assert!(!fs.follower_block_locations_ready(file_path).unwrap());
+        assert!(fs
+            .follower_get_block_locations_if_ready(file_path)
+            .unwrap()
+            .is_none());
         fs.follower_block_report_state
             .mark_full_report_complete(100);
-        assert!(fs.follower_block_locations_ready(file_path).unwrap());
+        assert!(fs
+            .follower_get_block_locations_if_ready(file_path)
+            .unwrap()
+            .is_some());
 
         fs.fs_dir
             .write()
             .add_block_location(block_id, BlockLocation::with_id(200))
             .unwrap();
-        assert!(!fs.follower_block_locations_ready(file_path).unwrap());
+        assert!(fs
+            .follower_get_block_locations_if_ready(file_path)
+            .unwrap()
+            .is_none());
         fs.follower_block_report_state
             .mark_full_report_complete(200);
-        assert!(fs.follower_block_locations_ready(file_path).unwrap());
+        assert!(fs
+            .follower_get_block_locations_if_ready(file_path)
+            .unwrap()
+            .is_some());
 
         assert!(fs
             .create_with_opts(
@@ -2595,7 +2654,10 @@ mod tests {
                 OpenFlags::new_create(),
             )
             .is_ok());
-        assert!(fs.follower_block_locations_ready("/empty.log").unwrap());
+        assert!(fs
+            .follower_get_block_locations_if_ready("/empty.log")
+            .unwrap()
+            .is_some());
     }
 
     // Seeds an entry under the reserved root through FsDir, since the public

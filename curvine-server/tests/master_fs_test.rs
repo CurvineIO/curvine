@@ -625,6 +625,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
         .collect();
 
     let req = BlockReportListRequest {
+        worker_session_id: None,
         report_id: None,
         cluster_id: "curvine".into(),
         worker_id,

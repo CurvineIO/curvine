@@ -456,6 +456,7 @@ impl WorkerPeerFanout {
             .any(|peer| peer.mailbox.needs_resync())
     }
 
+    #[cfg(test)]
     fn has_stale_peer_state(&self) -> bool {
         lock(&self.peers)
             .values()
@@ -949,6 +950,7 @@ impl PeerMailbox {
         state.needs_resync && !state.resync_in_progress
     }
 
+    #[cfg(test)]
     fn is_stale(&self) -> bool {
         lock(&self.state).needs_resync
     }
