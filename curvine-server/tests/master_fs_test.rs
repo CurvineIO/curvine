@@ -23,8 +23,8 @@ use curvine_model::{
     AccessMode, BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress,
     CommitBlock, ContentSummary, CreateFileOpts, CreateFileOptsBuilder, DeleteResult,
     FileAllocOpts, HeartbeatStatus, ListOptions, LocatedBlock, MkdirOpts, MkdirOptsBuilder,
-    MountInfo, Provider, StorageType, TtlAction, TtlType, WorkerAddress, WorkerCommand,
-    WorkerInfo, WorkerStatus, WriteType,
+    MountInfo, Provider, StorageType, TtlAction, TtlType, WorkerAddress, WorkerCommand, WorkerInfo,
+    WorkerStatus, WriteType,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
@@ -2422,6 +2422,7 @@ fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
             path: "/skip.log".to_string(),
             recursive: false,
             skip_trash: Some(true),
+            client_context: None,
         },
     )?;
     assert!(!res.trashed);
@@ -2435,6 +2436,7 @@ fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
             path: "/soft.log".to_string(),
             recursive: false,
             skip_trash: Some(false),
+            client_context: None,
         },
     )?;
     assert!(res.trashed);
@@ -2456,6 +2458,7 @@ fn trash_rpc_list_restore_empty() -> CommonResult<()> {
             path: "/rpc/a.log".to_string(),
             recursive: false,
             skip_trash: Some(false),
+            client_context: None,
         })
         .build();
     let mut del_ctx = RpcContext::new(&del_msg);
@@ -2502,6 +2505,7 @@ fn trash_rpc_list_restore_empty() -> CommonResult<()> {
             path: "/rpc/b.log".to_string(),
             recursive: false,
             skip_trash: Some(false),
+            client_context: None,
         })
         .build();
     let mut del_ctx = RpcContext::new(&del_msg);
@@ -2603,6 +2607,7 @@ fn trash_rpc_dispatches_through_handle() -> CommonResult<()> {
             path: "/dispatch/a.log".to_string(),
             recursive: false,
             skip_trash: Some(false),
+            client_context: None,
         })
         .build();
     let delete_rep = handler.handle(&delete_msg)?;
@@ -4569,3 +4574,4 @@ fn trash_move_journals_a_single_rename_and_replays_markers() -> CommonResult<()>
     );
 
     Ok(())
+}
