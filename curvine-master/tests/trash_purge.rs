@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_config::ClusterConf;
-use curvine_master::master::fs::MasterFilesystem;
+use curvine_master::master::fs::{DeleteMode, MasterFilesystem};
 use curvine_master::master::journal::JournalSystem;
 use curvine_master::Master;
 use curvine_runtime::common::{LocalTime, Utils};
@@ -44,7 +44,8 @@ fn trash_dir(fs: &MasterFilesystem, entry: &str) -> String {
     fs.create(format!("{entry}/a/file-a"), true).unwrap();
     fs.create(format!("{entry}/a/file-b"), true).unwrap();
     fs.create(format!("{entry}/b/file-c"), true).unwrap();
-    fs.delete_with_opts(entry, true, false).unwrap();
+    fs.delete_with_mode(entry, true, DeleteMode::Default)
+        .unwrap();
     fs.list_trash().unwrap().remove(0).path
 }
 

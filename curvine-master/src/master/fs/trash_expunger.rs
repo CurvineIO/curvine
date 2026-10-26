@@ -133,6 +133,7 @@ impl LoopTask for TrashExpunger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::master::fs::DeleteMode;
     use crate::master::journal::JournalSystem;
     use crate::master::Master;
     use curvine_config::ClusterConf;
@@ -162,7 +163,8 @@ mod tests {
 
     fn trash_one(fs: &MasterFilesystem, path: &str) -> i64 {
         fs.create(path, true).unwrap();
-        fs.delete_with_opts(path, false, false).unwrap();
+        fs.delete_with_mode(path, false, DeleteMode::Default)
+            .unwrap();
         let entry = fs.list_trash().unwrap().remove(0);
         entry.delete_ms
     }

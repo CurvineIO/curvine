@@ -45,7 +45,7 @@ use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use curvine_runtime::sync::StateCtl;
-use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
+use curvine_server::master::fs::{DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
 use curvine_server::master::meta::trash;
@@ -2235,6 +2235,7 @@ fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
             path: "/skip.log".to_string(),
             recursive: false,
             skip_trash: Some(true),
+            async_delete: None,
         },
     )?;
     assert!(!res.trashed);
@@ -2248,6 +2249,7 @@ fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
             path: "/soft.log".to_string(),
             recursive: false,
             skip_trash: Some(false),
+            async_delete: None,
         },
     )?;
     assert!(res.trashed);
@@ -2269,6 +2271,7 @@ fn trash_rpc_list_restore_empty() -> CommonResult<()> {
             path: "/rpc/a.log".to_string(),
             recursive: false,
             skip_trash: Some(false),
+            async_delete: None,
         })
         .build();
     let mut del_ctx = RpcContext::new(&del_msg);
@@ -2315,6 +2318,7 @@ fn trash_rpc_list_restore_empty() -> CommonResult<()> {
             path: "/rpc/b.log".to_string(),
             recursive: false,
             skip_trash: Some(false),
+            async_delete: None,
         })
         .build();
     let mut del_ctx = RpcContext::new(&del_msg);
@@ -2342,7 +2346,7 @@ fn trash_rpc_list_paginates() -> CommonResult<()> {
     for i in 0..250 {
         let path = format!("/page/f{}.log", i);
         fs.create(&path, true)?;
-        fs.delete_with_opts(&path, false, false)?;
+        fs.delete_with_mode(&path, false, DeleteMode::Default)?;
     }
     let expected: Vec<String> = fs.list_trash()?.into_iter().map(|e| e.path).collect();
     assert_eq!(expected.len(), 250);
@@ -2416,6 +2420,7 @@ fn trash_rpc_dispatches_through_handle() -> CommonResult<()> {
             path: "/dispatch/a.log".to_string(),
             recursive: false,
             skip_trash: Some(false),
+            async_delete: None,
         })
         .build();
     let delete_rep = handler.handle(&delete_msg)?;
@@ -2449,7 +2454,7 @@ fn trash_rpc_dispatches_through_handle() -> CommonResult<()> {
     assert!(fs.list_trash()?.is_empty());
 
     fs.create("/dispatch/b.log", true)?;
-    fs.delete_with_opts("/dispatch/b.log", false, false)?;
+    fs.delete_with_mode("/dispatch/b.log", false, DeleteMode::Default)?;
     let empty_msg = Builder::new_rpc(RpcCode::EmptyTrash)
         .proto_header(EmptyTrashRequest {})
         .build();
@@ -2471,7 +2476,7 @@ fn restore_trash_overwrite_releases_replaced_blocks() -> CommonResult<()> {
     let fs = handler.clone_fs();
 
     fs.create("/overwrite/a.log", true)?;
-    fs.delete_with_opts("/overwrite/a.log", false, false)?;
+    fs.delete_with_mode("/overwrite/a.log", false, DeleteMode::Default)?;
     let entry = fs.list_trash()?.remove(0);
 
     // The destination that gets replaced owns a committed block on the test
@@ -2561,7 +2566,7 @@ fn restore_trash_checks_the_effective_destination_mount() -> CommonResult<()> {
     }
 
     fs.create("/data/a.log", true)?;
-    fs.delete_with_opts("/data/a.log", false, false)?;
+    fs.delete_with_mode("/data/a.log", false, DeleteMode::Default)?;
     let entry = fs.list_trash()?.remove(0);
 
     let err = handler
@@ -2610,7 +2615,7 @@ fn restore_trash_checks_the_effective_destination_mount() -> CommonResult<()> {
     // A default restore resolves the recorded origin on the master, so a direct
     // RPC cannot bypass the cache-mode check by omitting dst.
     fs.create("/cache-mode/b.log", true)?;
-    fs.delete_with_opts("/cache-mode/b.log", false, false)?;
+    fs.delete_with_mode("/cache-mode/b.log", false, DeleteMode::Default)?;
     let cache_entry = fs
         .list_trash()?
         .into_iter()
@@ -2640,7 +2645,7 @@ fn restore_trash_replays_as_a_single_atomic_rename() -> CommonResult<()> {
     });
 
     fs.create("/data/a.log", true)?;
-    fs.delete_with_opts("/data/a.log", false, false)?;
+    fs.delete_with_mode("/data/a.log", false, DeleteMode::Default)?;
 
     let setup_entries = js.fs().fs_dir.read().take_entries();
     apply_entries(&loader, &setup_entries, 1)?;
@@ -4045,7 +4050,7 @@ fn trash_move_journals_a_single_rename_and_replays_markers() -> CommonResult<()>
 
     leader.create("/data/a.log", true)?;
     leader.complete_file("/data/a.log", None, 0, vec![], "", false, None)?;
-    leader.delete_with_opts("/data/a.log", false, false)?;
+    leader.delete_with_mode("/data/a.log", false, DeleteMode::Default)?;
 
     let entries = journal_system.fs().fs_dir.read().take_entries();
     let renames = entries

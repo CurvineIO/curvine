@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
+use crate::master::fs::{DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
 use crate::master::meta::trash::TrashCursor;
 use crate::master::meta::TrashListing;
@@ -255,10 +255,16 @@ impl MasterHandler {
         // already gone when this runs and a trash entry could never be restored.
         // Keep mounted deletes permanent until trash supports UFS routing; an
         // explicit client request to skip the trash is honoured either way.
-        let skip_trash = mount_info.is_some() || header.skip_trash();
+        let mode = if mount_info.is_some() || header.skip_trash() {
+            DeleteMode::SkipTrash
+        } else if header.async_delete() {
+            DeleteMode::AsyncPurge
+        } else {
+            DeleteMode::Default
+        };
         let res = self
             .fs
-            .delete_with_opts(&header.path, header.recursive, skip_trash);
+            .delete_with_mode(&header.path, header.recursive, mode);
         self.set_req_cache(req_id, res)
     }
 
@@ -268,9 +274,11 @@ impl MasterHandler {
 
         let res = self.delete0(ctx.msg.req_id(), header)?;
         let trashed = res.trashed;
+        let purge_pending = res.purge_pending;
         let rep_header = DeleteResponse {
             res: Some(ProtoUtils::delete_res_to_pb(res)),
             trashed: Some(trashed),
+            purge_pending: Some(purge_pending),
         };
         ctx.response(rep_header)
     }
