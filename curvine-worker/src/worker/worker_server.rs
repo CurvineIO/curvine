@@ -12,31 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockActor, BlockStore};
+use crate::worker::block::{BlockActor, BlockActorConfig, BlockStore};
 use crate::worker::handler::{ConnectionPeer, WorkerHandler, WorkerRouterHandler};
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use crate::worker::task::TaskManager;
 use crate::worker::WorkerMetrics;
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, DiscoveryConf};
 use curvine_core_error::StringError;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
-use curvine_model::{CompatibilityPolicy, HeartbeatStatus, WorkerAddress};
+use curvine_model::ProtoUtils;
+use curvine_model::{BlockReportInfo, CompatibilityPolicy, HeartbeatStatus, WorkerAddress};
 use curvine_net::net::ConnState;
 use curvine_rpc::handler::HandlerService;
-use curvine_rpc::server::{RpcServer, ServerStateListener};
+use curvine_rpc::server::{RpcServer, ServerState, ServerStateListener};
 use curvine_runtime::common::Utils;
 use curvine_runtime::common::{LocalTime, Logger};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::FastMutex;
+#[cfg(feature = "discovery-etcd")]
+use curvine_service_discovery::{connect_etcd, EtcdDiscoveryConfig};
+use curvine_service_discovery::{
+    ensure_provider_available, DiscoveryProvider, RegistrationOptions, RegistrationRetryPolicy,
+    RegistrationSupervisor, ServiceEndpoint, ServiceKind, ServiceStatus,
+};
 #[cfg(feature = "spdk")]
 use curvine_storage_spdk::SpdkEnv;
 use curvine_web::server::{WebHandlerService, WebServer};
-use log::info;
+use dashmap::DashMap;
+use log::{info, warn};
 use once_cell::sync::OnceCell;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 static CLUSTER_CONF: OnceCell<ClusterConf> = OnceCell::new();
 
@@ -49,6 +58,7 @@ pub struct WorkerService {
     task_manager: Arc<TaskManager>,
     rt: Arc<Runtime>,
     replication_manager: Arc<WorkerReplicationManager>,
+    report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
     fault_http: FaultHttpControl,
     /// Compatibility policy applied to client peers on data-plane connections.
     /// Built once from `worker.compatibility` config (diagnose by default) and
@@ -66,6 +76,7 @@ impl WorkerService {
         let fault_http = FaultHttpControl::from_env(&conf.fault_injection)
             .map_err(|error| CommonError::from(error.to_string()))?;
         let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
+        let report_blocks = Arc::new(DashMap::new());
 
         let task_manager = TaskManager::with_rt(rt.clone(), conf, worker_session_id.clone())?;
 
@@ -75,6 +86,7 @@ impl WorkerService {
             conf,
             &task_manager.get_fs_context(),
             worker_session_id,
+            report_blocks.clone(),
         );
 
         let ws = Self {
@@ -83,6 +95,7 @@ impl WorkerService {
             task_manager: Arc::new(task_manager),
             rt,
             replication_manager,
+            report_blocks,
             fault_http,
             compatibility_policy: Arc::new(conf.worker.compatibility.to_policy()),
         };
@@ -137,14 +150,24 @@ pub struct Worker {
     pub start_ms: u64,
     pub worker_id: u32,
     pub addr: WorkerAddress,
+    cluster_id: String,
+    discovery_conf: DiscoveryConf,
+    worker_session_id: String,
     rpc_server: Option<RpcServer<WorkerService>>,
     web_server: Option<WebServer<WorkerService>>,
     block_actor: BlockActor,
+    registration_slot: Arc<Mutex<Option<RegistrationSupervisor>>>,
 }
 
 impl Worker {
     #[cfg_attr(not(feature = "spdk"), allow(unused_mut))]
     pub fn with_conf(mut conf: ClusterConf) -> CommonResult<Self> {
+        if conf.discovery.enabled {
+            ensure_provider_available(&conf.discovery.provider)
+                .map_err(|error| CommonError::from(error.to_string()))?;
+        }
+        conf.worker.validate_follower_reports()?;
+
         Logger::init(conf.worker.log.clone());
 
         // Init SPDK before WorkerService - enables BlockMeta to open SPDK bdevs
@@ -212,6 +235,8 @@ impl Worker {
 
         let rt = Arc::new(conf.worker_server_conf().create_runtime());
         let worker_session_id = Utils::uuid();
+        let cluster_id = conf.cluster_id.clone();
+        let discovery_conf = conf.discovery.clone();
         let service: WorkerService =
             WorkerService::with_conf(&conf, rt.clone(), worker_session_id.clone())?;
         let worker_id = service.store.worker_id()?;
@@ -239,11 +264,14 @@ impl Worker {
         let block_actor = BlockActor::new(
             rt.clone(),
             &conf,
-            addr.clone(),
-            worker_session_id,
             block_store.clone(),
-            rpc_server.new_state_ctl(),
-            start_ms,
+            BlockActorConfig {
+                worker_addr: addr.clone(),
+                worker_session_id: worker_session_id.clone(),
+                worker_ctl: rpc_server.new_state_ctl(),
+                startup_time_ms: start_ms,
+                report_blocks: service.report_blocks.clone(),
+            },
         )?;
 
         let master_client = block_actor.client.clone();
@@ -252,9 +280,22 @@ impl Worker {
             .with_master_client(master_client.clone());
 
         let spdk_enabled = conf.worker.spdk_disk.enabled;
+        let registration_slot: Arc<Mutex<Option<RegistrationSupervisor>>> =
+            Arc::new(Mutex::new(None));
+        let shutdown_slot = registration_slot.clone();
+        let shutdown_rt = rpc_server.clone_rt();
         rpc_server.add_shutdown_hook(move || {
             if let Err(e) = master_client.heartbeat(HeartbeatStatus::End, vec![]) {
                 info!("error unregister {}", e)
+            }
+            let supervisor = shutdown_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(mut supervisor) = supervisor {
+                if let Err(error) = shutdown_rt.block_on(supervisor.shutdown()) {
+                    warn!("failed to revoke worker discovery registration: {error}");
+                }
             }
             if spdk_enabled {
                 info!("Shutting down SPDK environment");
@@ -267,15 +308,89 @@ impl Worker {
             start_ms,
             worker_id,
             addr,
+            cluster_id,
+            discovery_conf,
+            worker_session_id,
             rpc_server: Some(rpc_server),
             web_server: Some(web_server),
             block_actor,
+            registration_slot,
         };
 
         Ok(worker)
     }
 
     pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
+        let result = self.start_inner().await;
+        if result.is_err() {
+            shutdown_registration_on_start_failure(self.registration_slot.clone()).await;
+        }
+        result
+    }
+
+    async fn start_inner(&mut self) -> CommonResult<ServerStateListener> {
+        let (rpc_ctl, discovery_provider, discovery_endpoint) = {
+            let rpc_server = self
+                .rpc_server
+                .as_ref()
+                .expect("worker rpc server must be initialized before startup");
+            let rpc_ctl = rpc_server.new_state_ctl();
+            let discovery_provider = connect_discovery_provider(
+                &self.discovery_conf,
+                &self.cluster_id,
+                rpc_server.clone_rt(),
+            )
+            .await?;
+            let discovery_endpoint = if discovery_provider.is_some() {
+                Some(worker_discovery_endpoint(
+                    &self.addr,
+                    &self.worker_session_id,
+                    self.start_ms,
+                )?)
+            } else {
+                None
+            };
+            (rpc_ctl, discovery_provider, discovery_endpoint)
+        };
+
+        if let (Some(provider), Some(endpoint)) = (discovery_provider, discovery_endpoint) {
+            let retry_policy = RegistrationRetryPolicy {
+                startup_timeout_ms: self
+                    .discovery_conf
+                    .connect_timeout_ms
+                    .saturating_add(self.discovery_conf.request_timeout_ms),
+                retry_min_ms: self.discovery_conf.watch_reconnect_min_ms,
+                retry_max_ms: self.discovery_conf.watch_reconnect_max_ms,
+            };
+            let supervisor = RegistrationSupervisor::start(
+                provider.registry.clone(),
+                endpoint,
+                RegistrationOptions::default(),
+                retry_policy,
+            )
+            .await
+            .map_err(|error| CommonError::from(error.to_string()))?;
+            let mut pending = Some(supervisor);
+            {
+                let mut slot = self
+                    .registration_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Keep the entry Starting until the RPC, web, and block actor
+                // have reached readiness. Retain the live guard before any
+                // subsequent startup wait so shutdown can revoke it.
+                if rpc_ctl.value() < ServerState::Shutdown as i8 {
+                    *slot = pending.take();
+                }
+            }
+            if let Some(mut supervisor) = pending {
+                shutdown_registration(&mut supervisor, "worker").await;
+                return curvine_core_error::err_box!(
+                    "worker shut down during discovery registration"
+                );
+            }
+        }
+
         // step 3: Start rpc server
         let rpc_server = self
             .rpc_server
@@ -296,14 +411,33 @@ impl Worker {
 
         // step 5: Start block heartbeat check service
         let block_actor = self.block_actor.clone();
-        thread::spawn(move || block_actor.start())
-            .join()
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        thread::spawn(move || {
+            let _ = startup_tx.send(block_actor.start());
+        });
+        // The actor's synchronous client needs this same I/O runtime. Joining
+        // its thread here blocks startup forever with a single I/O worker.
+        startup_rx
+            .await
             .map_err(|_| {
                 CommonError::from(StringError::from(
                     "worker block actor startup thread panicked",
                 ))
             })
             .and_then(|result| result)?;
+
+        {
+            let slot = self
+                .registration_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if rpc_ctl.value() >= ServerState::Shutdown as i8 {
+                return curvine_core_error::err_box!("worker shut down during startup");
+            }
+            if let Some(supervisor) = slot.as_ref() {
+                supervisor.set_desired_status(ServiceStatus::Serving);
+            }
+        }
 
         Ok(rpc_status)
     }
@@ -344,5 +478,130 @@ impl Worker {
             .as_ref()
             .expect("worker rpc server must be initialized")
             .service()
+    }
+}
+
+async fn connect_discovery_provider(
+    discovery_conf: &DiscoveryConf,
+    cluster_id: &str,
+    rt: Arc<Runtime>,
+) -> CommonResult<Option<DiscoveryProvider>> {
+    if !discovery_conf.enabled {
+        return Ok(None);
+    }
+
+    ensure_provider_available(&discovery_conf.provider)
+        .map_err(|error| CommonError::from(error.to_string()))?;
+
+    #[cfg(feature = "discovery-etcd")]
+    {
+        let etcd_conf = EtcdDiscoveryConfig::from((discovery_conf, cluster_id));
+        let provider = connect_etcd(etcd_conf, rt)
+            .await
+            .map_err(|error| CommonError::from(error.to_string()))?;
+        Ok(Some(provider))
+    }
+
+    #[cfg(not(feature = "discovery-etcd"))]
+    {
+        let _ = (cluster_id, rt);
+        Ok(None)
+    }
+}
+
+async fn shutdown_registration_on_start_failure(slot: Arc<Mutex<Option<RegistrationSupervisor>>>) {
+    let supervisor = slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(mut supervisor) = supervisor {
+        shutdown_registration(&mut supervisor, "worker").await;
+    }
+}
+
+async fn shutdown_registration(supervisor: &mut RegistrationSupervisor, role: &str) {
+    match tokio::time::timeout(Duration::from_secs(2), supervisor.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!("failed to revoke {role} discovery registration: {error}"),
+        Err(_) => warn!("timed out revoking {role} discovery registration during startup"),
+    }
+}
+
+fn worker_discovery_endpoint(
+    addr: &WorkerAddress,
+    session_id: &str,
+    start_time_ms: u64,
+) -> CommonResult<ServiceEndpoint> {
+    let kind =
+        ServiceKind::try_new("worker").map_err(|error| CommonError::from(error.to_string()))?;
+    let rpc_port = u16::try_from(addr.rpc_port)
+        .map_err(|error| CommonError::from(format!("invalid worker RPC port: {error}")))?;
+    let web_port = if addr.web_port == 0 {
+        None
+    } else {
+        Some(
+            u16::try_from(addr.web_port)
+                .map_err(|error| CommonError::from(format!("invalid worker web port: {error}")))?,
+        )
+    };
+    let endpoint = ServiceEndpoint {
+        kind: kind.clone(),
+        id: format!("worker-{}-{session_id}", addr.worker_id),
+        host: addr.ip_addr.clone(),
+        rpc_port,
+        web_port,
+        component_info: ProtoUtils::component_version_to_pb(
+            &curvine_sys::version::component_version(kind.as_str()),
+        ),
+        start_time_ms,
+        status: ServiceStatus::Starting,
+        metadata: None,
+    };
+    endpoint
+        .validate()
+        .map_err(|error| CommonError::from(error.to_string()))?;
+    Ok(endpoint)
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn worker_endpoint_matches_heartbeat_address_and_session_identity() {
+        let addr = WorkerAddress {
+            worker_id: 11,
+            hostname: "worker-11.default.svc".to_string(),
+            ip_addr: "192.0.2.11".to_string(),
+            rpc_port: 9100,
+            web_port: 9101,
+        };
+        let endpoint = worker_discovery_endpoint(&addr, "session-abcd", 456).unwrap();
+        let heartbeat_addr = addr.inet_addr();
+
+        assert_eq!(endpoint.kind.as_str(), "worker");
+        assert_eq!(endpoint.id, "worker-11-session-abcd");
+        assert_eq!(endpoint.host, heartbeat_addr.hostname);
+        assert_eq!(endpoint.rpc_port, heartbeat_addr.port);
+        assert_eq!(
+            format!("{}:{}", endpoint.host, endpoint.rpc_port),
+            addr.connect_addr()
+        );
+        assert_eq!(endpoint.web_port, Some(addr.web_port as u16));
+        assert_eq!(endpoint.start_time_ms, 456);
+        assert_eq!(endpoint.status, ServiceStatus::Starting);
+    }
+
+    #[test]
+    fn worker_endpoint_rejects_wildcard_heartbeat_address() {
+        let addr = WorkerAddress {
+            worker_id: 11,
+            hostname: "worker-11.default.svc".to_string(),
+            ip_addr: "0.0.0.0".to_string(),
+            rpc_port: 9100,
+            web_port: 9101,
+        };
+
+        assert!(worker_discovery_endpoint(&addr, "session-abcd", 456).is_err());
     }
 }
