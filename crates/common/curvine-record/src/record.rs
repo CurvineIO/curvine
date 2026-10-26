@@ -129,12 +129,6 @@ impl Record {
         let chunk = &self.chunks[ci];
         let buf = chunk.buf();
         let used = buf.len();
-        let last = chunk.last_off();
-        match self.key_at(buf, last).cmp(key) {
-            Ordering::Less => return Err((ci, used)),
-            Ordering::Equal => return Ok((ci, last)),
-            Ordering::Greater => {}
-        }
 
         let mut off = 0usize;
         while off < used {
@@ -253,17 +247,17 @@ impl Record {
 
         let mut new_chunk = Chunk::new(Self::next_capacity(tail));
         new_chunk.buf_mut()[..tail].copy_from_slice(&self.chunks[ci].buf()[split..used]);
-        new_chunk.set_used(tail, layout);
+        new_chunk.set_used(tail);
 
         let old_cap = self.chunks[ci].cap();
         let prefix_cap = Self::next_capacity(split);
         if prefix_cap < old_cap {
             let mut prefix = Chunk::new(prefix_cap);
             prefix.buf_mut()[..split].copy_from_slice(&self.chunks[ci].buf()[..split]);
-            prefix.set_used(split, layout);
+            prefix.set_used(split);
             self.chunks[ci] = prefix;
         } else {
-            self.chunks[ci].set_used(split, layout);
+            self.chunks[ci].set_used(split);
         }
 
         self.chunks.insert(ci + 1, new_chunk);
@@ -308,7 +302,7 @@ impl Record {
             used
         );
 
-        self.chunks[ci].remove_at(off, record_len, layout);
+        self.chunks[ci].remove_at(off, record_len);
         if self.chunks[ci].used() == 0 {
             self.chunks.remove(ci);
         }
