@@ -95,6 +95,11 @@ pub struct RegistrationSupervisor {
     _provider_owner: Arc<dyn ServiceRegistry>,
 }
 
+struct SupervisorControl {
+    stop_rx: watch::Receiver<bool>,
+    desired_status_rx: watch::Receiver<ServiceStatus>,
+}
+
 impl RegistrationSupervisor {
     /// Registers once before returning, with bounded retries for startup.
     ///
@@ -127,8 +132,10 @@ impl RegistrationSupervisor {
             registration_options,
             retry_policy,
             guard,
-            stop_rx,
-            desired_status_rx,
+            SupervisorControl {
+                stop_rx,
+                desired_status_rx,
+            },
             status_tx,
         ));
 
@@ -233,10 +240,13 @@ async fn supervise_registration(
     registration_options: RegistrationOptions,
     retry_policy: RegistrationRetryPolicy,
     mut guard: RegistrationGuard,
-    mut stop_rx: watch::Receiver<bool>,
-    mut desired_status_rx: watch::Receiver<ServiceStatus>,
+    control: SupervisorControl,
     status_tx: watch::Sender<RegistrationSupervisorStatus>,
 ) -> DiscoveryResult<()> {
+    let SupervisorControl {
+        mut stop_rx,
+        mut desired_status_rx,
+    } = control;
     let mut retry_delay = retry_policy.retry_min();
     // A timeout or provider error leaves the remote value uncertain: the
     // provider may have committed the write before its response was lost.
