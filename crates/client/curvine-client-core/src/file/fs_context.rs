@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use crate::block::{BlockClient, BlockClientPool};
-use crate::file::{FsClient, MasterHandshake, WorkerPrecheck};
+#[cfg(feature = "discovery-etcd")]
+use crate::file::ClientDiscovery;
+use crate::file::{FsClient, MasterHandshake, SessionPathTracker, WorkerPrecheck};
 use crate::ClientMetrics;
 use curvine_config::ClusterConf;
-use curvine_error::FsResult;
+use curvine_core_error::err_box;
+use curvine_error::{FsError, FsResult};
 use curvine_io::CacheManager;
 use curvine_io::IOResult;
 use curvine_model::ProtoUtils;
@@ -41,6 +44,10 @@ use std::time::Duration;
 
 static CLIENT_METRICS: OnceCell<ClientMetrics> = OnceCell::new();
 
+// Bound sticky-path state per client session. SessionPathTracker caps retained
+// keys at 4 KiB each and conservatively pins all reads to the leader on overflow.
+const SESSION_PATH_TRACKER_CAPACITY: usize = 1_024;
+
 // The core feature of the file system is thread-safe, which can be shared between multiple threads through Arc.
 // 1. The cluster configuration file is saved.
 // 2. Create client.
@@ -52,6 +59,9 @@ pub struct FsContext {
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
     pub(crate) block_pool: Arc<BlockClientPool>,
+    session_path_tracker: SessionPathTracker,
+    #[cfg(feature = "discovery-etcd")]
+    master_discovery: Option<ClientDiscovery>,
     // Client-master handshake result: the master's advertised version /
     // protocol / capabilities (or a legacy marker when the master does not
     // advertise a compatibility contract). Populated by the first
@@ -91,6 +101,12 @@ impl FsContext {
 
     pub fn with_rt(conf: impl Into<ClusterConf>, rt: Arc<Runtime>) -> FsResult<Self> {
         let conf = conf.into();
+        if conf.client.follower_reads_enabled && conf.client.follower_write_sticky_ms == 0 {
+            return err_box!(
+                "client.follower_write_sticky_ms must be greater than zero when follower reads are enabled"
+            );
+        }
+
         let hostname = conf.client.hostname.to_owned();
         let ip = NetUtils::local_ip(&hostname);
         let client_addr = ClientAddress {
@@ -103,9 +119,50 @@ impl FsContext {
         CLIENT_METRICS
             .get_or_init(|| ClientMetrics::new(&conf.client.metadata_operation_buckets).unwrap());
 
-        let connector = ClusterConnector::with_rt(conf.client_rpc_conf(), rt.clone());
-        for node in conf.master_nodes() {
-            connector.add_node(node)?;
+        let connector = Arc::new(ClusterConnector::with_rt(
+            conf.client_rpc_conf(),
+            rt.clone(),
+        ));
+        #[cfg(feature = "discovery-etcd")]
+        let master_discovery;
+        if conf.discovery.enabled {
+            curvine_service_discovery::ensure_provider_available(&conf.discovery.provider)
+                .map_err(|error| FsError::common(error.to_string()))?;
+
+            #[cfg(feature = "discovery-etcd")]
+            {
+                let discovery_config = curvine_service_discovery::EtcdDiscoveryConfig::from((
+                    &conf.discovery,
+                    conf.cluster_id.as_str(),
+                ));
+                let ready_timeout_ms = conf
+                    .discovery
+                    .connect_timeout_ms
+                    .saturating_add(conf.discovery.request_timeout_ms)
+                    .max(1);
+                connector.reconcile_nodes(Vec::new())?;
+                master_discovery = Some(ClientDiscovery::start_etcd(
+                    rt.clone(),
+                    discovery_config,
+                    Arc::downgrade(&connector),
+                    Duration::from_millis(ready_timeout_ms),
+                )?);
+            }
+
+            #[cfg(not(feature = "discovery-etcd"))]
+            {
+                return Err(FsError::common(
+                    "discovery is enabled but Etcd support is not compiled into this client; rebuild with the discovery-etcd feature",
+                ));
+            }
+        } else {
+            for node in conf.master_nodes() {
+                connector.add_node(node)?;
+            }
+            #[cfg(feature = "discovery-etcd")]
+            {
+                master_discovery = None;
+            }
         }
 
         let os_cache = CacheManager::new(
@@ -125,14 +182,21 @@ impl FsContext {
             conf.client.block_conn_idle_size,
             conf.client.block_conn_idle_time_ms,
         ));
+        let session_path_tracker = SessionPathTracker::new(
+            SESSION_PATH_TRACKER_CAPACITY,
+            Duration::from_millis(conf.client.follower_write_sticky_ms),
+        );
 
         let context = Self {
             conf,
-            connector: Arc::new(connector),
+            connector,
             client_addr,
             os_cache,
             failed_workers: exclude_workers,
             block_pool,
+            session_path_tracker,
+            #[cfg(feature = "discovery-etcd")]
+            master_discovery,
             master_handshake: FastRwLock::new(MasterHandshake::default()),
             live_workers: FastRwLock::new(HashMap::new()),
             worker_precheck: FastRwLock::new(WorkerPrecheck::default()),
@@ -160,6 +224,10 @@ impl FsContext {
     /// successful handshake so no component is rejected by default.
     pub fn master_handshake(&self) -> MasterHandshake {
         self.master_handshake.read().clone()
+    }
+
+    pub(crate) fn session_path_tracker(&self) -> &SessionPathTracker {
+        &self.session_path_tracker
     }
 
     /// Atomically claim the one-time right to attach this client's
@@ -213,6 +281,16 @@ impl FsContext {
 
     pub fn rt(&self) -> &Runtime {
         self.connector.rt()
+    }
+
+    /// Ensure runtime discovery has supplied a usable master snapshot before
+    /// any metadata RPC, including the first compatibility handshake.
+    pub(crate) async fn ensure_master_discovery(&self) -> FsResult<()> {
+        #[cfg(feature = "discovery-etcd")]
+        if let Some(discovery) = &self.master_discovery {
+            discovery.ensure_ready_for_rpc().await?;
+        }
+        Ok(())
     }
 
     pub fn is_local_worker(&self, addr: &WorkerAddress) -> bool {

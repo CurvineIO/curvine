@@ -18,6 +18,8 @@ pub use self::curvine_filesystem::*;
 mod fs_client;
 pub use self::fs_client::FsClient;
 
+mod master_peer_rpc;
+
 mod handshake;
 pub use self::handshake::MasterHandshake;
 
@@ -33,6 +35,10 @@ pub use self::fs_writer::FsWriter;
 mod fs_context;
 pub use self::fs_context::FsContext;
 
+mod session_path_tracker;
+pub(crate) use self::session_path_tracker::SessionMutationGuard;
+pub use self::session_path_tracker::SessionPathTracker;
+
 mod fs_reader_base;
 pub use self::fs_reader_base::FsReaderBase;
 
@@ -44,6 +50,11 @@ pub use self::fs_reader_buffer::FsReaderBuffer;
 
 mod fs_reader_parallel;
 pub use self::fs_reader_parallel::FsReaderParallel;
+
+#[cfg(any(feature = "discovery-etcd", test))]
+mod master_discovery;
+#[cfg(feature = "discovery-etcd")]
+pub(crate) use self::master_discovery::ClientDiscovery;
 
 mod fs_writer_buffer;
 pub use self::fs_writer_buffer::FsWriterBuffer;
