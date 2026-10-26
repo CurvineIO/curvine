@@ -62,26 +62,34 @@ pub(crate) struct ClientDiscovery {
 struct DiscoverySupervisor {
     stop: watch::Sender<bool>,
     thread: Option<JoinHandle<()>>,
+    runtime_owner: Option<Arc<Runtime>>,
 }
 
 impl Drop for DiscoverySupervisor {
     fn drop(&mut self) {
         self.stop.send_replace(true);
-        let Some(thread) = self.thread.take() else {
-            return;
-        };
-
-        if thread.is_finished() {
-            let _ = thread.join();
-        } else {
-            // Joining a thread that drives the shared Tokio runtime can block
-            // that runtime's only worker. Keep cleanup explicit while moving
-            // the join itself off the caller/runtime thread.
-            let _ = thread::Builder::new()
-                .name("curvine-discovery-reaper".to_string())
-                .spawn(move || {
+        let thread = self.thread.take();
+        let runtime_owner = self.runtime_owner.take();
+        let fallback_owner = runtime_owner.clone();
+        // The final runtime owner must be released off a Tokio worker even if
+        // the supervisor already finished before this Drop call. Keep cleanup
+        // explicit while moving both join and runtime release to a reaper.
+        let reaper = thread::Builder::new()
+            .name("curvine-discovery-reaper".to_string())
+            .spawn(move || {
+                if let Some(thread) = thread {
                     let _ = thread.join();
-                });
+                }
+                drop(runtime_owner);
+            });
+        if reaper.is_err() {
+            // The failed spawn drops its closure on this thread. Retain an
+            // owner if that happened inside Tokio so it cannot become the
+            // last Runtime reference here; the supervisor still receives the
+            // stop signal and can release its own reference externally.
+            if let Some(runtime_owner) = fallback_owner {
+                std::mem::forget(runtime_owner);
+            }
         }
     }
 }
@@ -130,12 +138,13 @@ impl ClientDiscovery {
         let (readiness_tx, readiness_rx) = watch::channel(Readiness::Starting { last_error: None });
         let (stop_tx, stop_rx) = watch::channel(false);
         let thread_cache = cache.clone();
+        let thread_runtime = runtime.clone();
 
         let thread = match thread::Builder::new()
             .name("curvine-master-discovery".to_string())
             .spawn(move || {
                 supervise(
-                    runtime,
+                    thread_runtime,
                     provider_factory,
                     connector,
                     kind,
@@ -162,6 +171,7 @@ impl ClientDiscovery {
             _supervisor: DiscoverySupervisor {
                 stop: stop_tx,
                 thread: Some(thread),
+                runtime_owner: Some(runtime),
             },
         })
     }
@@ -1055,5 +1065,52 @@ mod tests {
         runtime.block_on(wait_for(|| provider_dropped.load(Ordering::SeqCst)));
         drop(connector);
         drop(runtime);
+    }
+
+    #[test]
+    fn dropping_last_discovery_runtime_owner_inside_async_uses_the_reaper() {
+        let (runtime, connector, discovery, events, provider_dropped) = start_test_discovery(
+            test_snapshot(vec![test_endpoint("91", "127.0.0.91", 9091)]),
+            Vec::new(),
+            false,
+            false,
+            Duration::from_millis(250),
+        );
+        runtime.block_on(async {
+            discovery.snapshot_for_rpc().await.unwrap();
+        });
+        drop(events);
+
+        // Stop and wait for the supervisor thread to release its own runtime
+        // Arc. The discovery owner must retain one until cleanup is handed to
+        // the external reaper.
+        discovery._supervisor.stop.send_replace(true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !discovery
+            ._supervisor
+            .thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(discovery
+            ._supervisor
+            .thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished()));
+        assert!(provider_dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            drop(discovery);
+            drop(connector);
+            dropped_tx.send(()).unwrap();
+        });
+        drop(runtime);
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dropping discovery and its last runtime owner blocked or panicked");
     }
 }
