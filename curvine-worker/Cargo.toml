@@ -6,7 +6,10 @@ license.workspace = true
 
 [features]
 default = []
-discovery-etcd = ["curvine-service-discovery/etcd"]
+discovery-etcd = [
+    "curvine-service-discovery/etcd",
+    "curvine-client-core/discovery-etcd",
+]
 spdk = [
     "dep:curvine-storage-spdk",
     "curvine-storage-spdk/spdk",
