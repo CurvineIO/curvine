@@ -304,6 +304,10 @@ impl JournalLoader {
 
                 JournalEntry::CacheInvalidation(_) | JournalEntry::UfsApplied(_) => (),
 
+                // A purge only touches the local trash namespace, so it owes no
+                // UFS acknowledgement record.
+                JournalEntry::TrashPurge(_) => (),
+
                 _ => has_ufs_affecting = true,
             }
 
@@ -678,8 +682,26 @@ impl JournalLoader {
 
             JournalEntry::UfsApplied(e) => self.ufs_applied(e),
 
+            JournalEntry::TrashPurge(e) => self.trash_purge(e),
+
             _ => Ok(()),
         }
+    }
+
+    fn trash_purge(&self, entry: TrashPurgeEntry) -> CommonResult<()> {
+        debug!(
+            "TrashPurge: entry={} paths={}",
+            entry.entry,
+            entry.paths.len()
+        );
+
+        let mut fs_dir = self.fs_dir.write();
+        let res = fs_dir.purge_paths(&entry.paths, entry.mtime)?;
+        debug!(
+            "TrashPurge: entry={} removed inodes={} bytes={}",
+            entry.entry, res.inodes, res.bytes
+        );
+        Ok(())
     }
 
     fn cache_invalidation(&self, entry: CacheInvalidationEntry) -> CommonResult<()> {
@@ -1112,6 +1134,46 @@ mod tests {
             data: b"corrupt".to_vec(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn trash_purge_entry_removes_its_paths_idempotently() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("trash-purge", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let fs = js.fs();
+        let loader = js.journal_loader();
+
+        fs.create("/victim/a/file-a", true)?;
+        fs.create("/victim/a/file-b", true)?;
+        fs.create("/victim/b/file-c", true)?;
+
+        let batch = JournalEntry::TrashPurge(TrashPurgeEntry {
+            op_id: 77,
+            rpc_id: 0,
+            entry: "/victim".to_string(),
+            mtime: 5,
+            paths: vec![
+                "/victim/a/file-a".to_string(),
+                "/victim/a/file-b".to_string(),
+            ],
+        });
+
+        loader.apply_entry(batch.clone())?;
+        assert!(!fs.exists("/victim/a/file-a")?);
+        assert!(!fs.exists("/victim/a/file-b")?);
+        // Unlisted siblings and the entry root survive the batch.
+        assert!(fs.exists("/victim/b/file-c")?);
+        assert!(fs.exists("/victim")?);
+
+        // A replayed batch is a no-op instead of failing on removed paths.
+        loader.apply_entry(batch)?;
+        assert!(fs.exists("/victim/b/file-c")?);
+
+        drop(loader);
+        drop(fs);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     fn valid_entry(index: u64, term: u64) -> Entry {
