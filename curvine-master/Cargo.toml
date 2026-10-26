@@ -6,10 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-discovery-etcd = [
-    "curvine-service-discovery/etcd",
-    "curvine-client-core/discovery-etcd",
-]
+discovery-etcd = ["curvine-service-discovery/etcd"]
 fault-injection = ["curvine-fault/http-server"]
 
 [dependencies]
