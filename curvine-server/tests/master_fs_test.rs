@@ -21,18 +21,21 @@ use curvine_model::MountOptions;
 use curvine_model::ProtoUtils;
 use curvine_model::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
-    CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, LocatedBlock,
-    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo, WorkerStatus, WriteType,
+    CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, HeartbeatStatus,
+    LocatedBlock, MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerCommand,
+    WorkerInfo, WorkerStatus, WriteType,
 };
 use curvine_model::{ListOptions, OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
     CreateFileRequest, DeleteRequest, EmptyTrashRequest, EmptyTrashResponse,
     GetFilesystemInfoRequest, ListTrashRequest, ListTrashResponse, MkdirOptsProto, MkdirRequest,
-    MountRequest, RenameRequest, RestoreTrashRequest, RestoreTrashResponse,
+    MountRequest, RenameRequest, RestoreTrashRequest, RestoreTrashResponse, WorkerHeartbeatRequest,
+    WorkerHeartbeatResponse,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
+use curvine_raft::raft::RoleState;
 use curvine_rpc::handler::MessageHandler;
 #[cfg(feature = "fault-injection")]
 use curvine_rpc::message::ResponseStatus;
@@ -41,15 +44,19 @@ use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
+use curvine_runtime::sync::StateCtl;
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
 use curvine_server::master::meta::trash;
 use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
-use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
+use curvine_server::master::{
+    JobHandler, JobManager, Master, MasterHandler, MasterMonitor, RpcContext,
+};
 use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -218,6 +225,23 @@ fn new_handler_with_conf(
     test_name: &str,
     configure: impl FnOnce(&mut ClusterConf),
 ) -> MasterHandler {
+    new_handler_with_role(test_name, configure, false)
+}
+
+// MasterHandler::handle refuses to dispatch on a standby master, so tests that
+// exercise the real RPC path stand in for raft leader election.
+fn new_handler_with_active_master(
+    test_name: &str,
+    configure: impl FnOnce(&mut ClusterConf),
+) -> MasterHandler {
+    new_handler_with_role(test_name, configure, true)
+}
+
+fn new_handler_with_role(
+    test_name: &str,
+    configure: impl FnOnce(&mut ClusterConf),
+    active: bool,
+) -> MasterHandler {
     Master::init_test_metrics();
 
     let test_id = Utils::rand_str(8);
@@ -231,7 +255,11 @@ fn new_handler_with_conf(
         Utils::test_sub_dir(format!("master-fs-test/journal-{test_name}-{test_id}"));
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
-    let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    let mut fs = MasterFilesystem::with_js(&conf, &journal_system);
+    if active {
+        fs.master_monitor =
+            MasterMonitor::new(StateCtl::new(RoleState::Leader.into()), StateCtl::new(0));
+    }
     fs.add_test_worker(WorkerInfo::default());
     let retry_cache = FsRetryCache::with_conf(&conf.master)
         .expect("test master retry cache configuration should be valid");
@@ -2371,6 +2399,148 @@ fn trash_rpc_list_paginates() -> CommonResult<()> {
         .build();
     let mut ctx = RpcContext::new(&msg);
     assert!(handler.list_trash(&mut ctx).is_err());
+
+    Ok(())
+}
+
+#[test]
+fn trash_rpc_dispatches_through_handle() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler =
+        new_handler_with_active_master("trash-dispatch", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    fs.create("/dispatch/a.log", true)?;
+    let delete_msg = Builder::new_rpc(RpcCode::Delete)
+        .proto_header(DeleteRequest {
+            path: "/dispatch/a.log".to_string(),
+            recursive: false,
+            skip_trash: Some(false),
+        })
+        .build();
+    let delete_rep = handler.handle(&delete_msg)?;
+    assert!(delete_rep.is_success(), "{}", delete_rep.to_error_msg());
+
+    // Drive ListTrash through the real dispatch path so the RpcCode branch,
+    // header parsing and response encoding are covered, not just the handler
+    // method.
+    let list_msg = Builder::new_rpc(RpcCode::ListTrash)
+        .proto_header(ListTrashRequest::default())
+        .build();
+    let list_rep = handler.handle(&list_msg)?;
+    assert!(list_rep.is_success(), "{}", list_rep.to_error_msg());
+    let list_rep: ListTrashResponse = list_rep.parse_header()?;
+    assert_eq!(list_rep.entries.len(), 1);
+    let entry = &list_rep.entries[0];
+    assert_eq!(entry.origin, "/dispatch/a.log");
+
+    let restore_msg = Builder::new_rpc(RpcCode::RestoreTrash)
+        .proto_header(RestoreTrashRequest {
+            path: entry.path.clone(),
+            dst: None,
+            overwrite: Some(false),
+        })
+        .build();
+    let restore_rep = handler.handle(&restore_msg)?;
+    assert!(restore_rep.is_success(), "{}", restore_rep.to_error_msg());
+    let restore_rep: RestoreTrashResponse = restore_rep.parse_header()?;
+    assert_eq!(restore_rep.dst.as_deref(), Some("/dispatch/a.log"));
+    assert!(fs.get_block_locations("/dispatch/a.log").is_ok());
+    assert!(fs.list_trash()?.is_empty());
+
+    fs.create("/dispatch/b.log", true)?;
+    fs.delete_with_opts("/dispatch/b.log", false, false)?;
+    let empty_msg = Builder::new_rpc(RpcCode::EmptyTrash)
+        .proto_header(EmptyTrashRequest {})
+        .build();
+    let empty_rep = handler.handle(&empty_msg)?;
+    assert!(empty_rep.is_success(), "{}", empty_rep.to_error_msg());
+    let empty_rep: EmptyTrashResponse = empty_rep.parse_header()?;
+    assert_eq!(empty_rep.res.inodes, 1);
+    assert!(fs.list_trash()?.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn restore_trash_overwrite_releases_replaced_blocks() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-restore-overwrite", |conf| {
+        conf.master.trash_enabled = true
+    });
+    let fs = handler.clone_fs();
+
+    fs.create("/overwrite/a.log", true)?;
+    fs.delete_with_opts("/overwrite/a.log", false, false)?;
+    let entry = fs.list_trash()?.remove(0);
+
+    // The destination that gets replaced owns a committed block on the test
+    // worker, so an overwrite restore has blocks to reclaim.
+    fs.create("/overwrite/a.log", true)?;
+    let replaced = fs.add_block(
+        "/overwrite/a.log",
+        None,
+        ClientAddress::default(),
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    let replaced_block = replaced.block.id;
+    let worker_address = replaced.locs[0].clone();
+    fs.fs_dir.write().add_block_location(
+        replaced_block,
+        BlockLocation::with_id(worker_address.worker_id),
+    )?;
+    fs.complete_file(
+        "/overwrite/a.log",
+        None,
+        1,
+        vec![CommitBlock {
+            block_id: replaced_block,
+            block_len: 1,
+            locations: vec![BlockLocation::with_id(worker_address.worker_id)],
+        }],
+        "",
+        false,
+        None,
+    )?;
+
+    let restored = fs.restore_trash(&entry.path, Some("/overwrite/a.log"), true)?;
+    assert_eq!(restored.dst, "/overwrite/a.log");
+    assert!(
+        restored.replaced.is_some(),
+        "overwrite restore must report the replaced entry"
+    );
+
+    // The replaced entry left the namespace, so remove_blocks is the only
+    // place that reclaims its blocks; assert the worker delete was queued.
+    let heartbeat = Builder::new_rpc(RpcCode::WorkerHeartbeat)
+        .proto_header(WorkerHeartbeatRequest {
+            cluster_id: ClusterConf::format().cluster_id,
+            worker_id: worker_address.worker_id,
+            fs_ctime: 0,
+            address: ProtoUtils::worker_address_to_pb(&worker_address),
+            failed_dirs: 0,
+            status: HeartbeatStatus::Running.into(),
+            software_version: String::new(),
+            ..Default::default()
+        })
+        .build();
+    let mut heartbeat_ctx = RpcContext::new(&heartbeat);
+    let heartbeat_rep: WorkerHeartbeatResponse = handler
+        .worker_heartbeat(&mut heartbeat_ctx)?
+        .parse_header()?;
+    let pending: HashSet<i64> = ProtoUtils::worker_cmd_from_pb(heartbeat_rep.cmds)
+        .into_iter()
+        .flat_map(|cmd| match cmd {
+            WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+        })
+        .collect();
+    assert!(
+        pending.contains(&replaced_block),
+        "block {replaced_block} was not queued for removal: {pending:?}"
+    );
 
     Ok(())
 }

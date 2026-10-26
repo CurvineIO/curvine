@@ -749,7 +749,21 @@ impl FsDir {
         };
         Ok(dir
             .children_iter()
-            .map(|child| child.name().to_string())
+            .filter_map(|child| {
+                let name = child.name();
+                // Keep the purge scope identical to the listing scope: a child
+                // whose name is not a trash entry name is invisible to
+                // ListTrash, so EmptyTrash must not delete it silently.
+                if trash::parse_entry_delete_ms(name).is_none() {
+                    warn!(
+                        "skipping foreign child under {}: {}",
+                        trash::TRASH_ROOT,
+                        name
+                    );
+                    return None;
+                }
+                Some(name.to_string())
+            })
             .collect())
     }
 
