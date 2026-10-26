@@ -87,6 +87,7 @@ pub enum RegistrationSupervisorStatus {
 pub struct RegistrationSupervisor {
     stop_tx: watch::Sender<bool>,
     status_rx: watch::Receiver<RegistrationSupervisorStatus>,
+    desired_status_tx: watch::Sender<ServiceStatus>,
     task: Option<JoinHandle<DiscoveryResult<()>>>,
     // Keep the provider alive outside the async supervisor task. Some
     // providers own their runtime, and dropping the last runtime handle from
@@ -119,6 +120,7 @@ impl RegistrationSupervisor {
 
         let (stop_tx, stop_rx) = watch::channel(false);
         let (status_tx, status_rx) = watch::channel(RegistrationSupervisorStatus::Registered);
+        let (desired_status_tx, desired_status_rx) = watch::channel(endpoint.status.clone());
         let task = tokio::spawn(supervise_registration(
             registry.clone(),
             endpoint,
@@ -126,12 +128,14 @@ impl RegistrationSupervisor {
             retry_policy,
             guard,
             stop_rx,
+            desired_status_rx,
             status_tx,
         ));
 
         Ok(Self {
             stop_tx,
             status_rx,
+            desired_status_tx,
             task: Some(task),
             _provider_owner: registry,
         })
@@ -143,6 +147,16 @@ impl RegistrationSupervisor {
 
     pub fn subscribe_status(&self) -> watch::Receiver<RegistrationSupervisorStatus> {
         self.status_rx.clone()
+    }
+
+    /// Change the status this service should eventually publish.
+    ///
+    /// The update is delivered locally without waiting for a provider request.
+    /// The supervisor applies it with a bounded request timeout, reports
+    /// `Reconnecting` while an update is failing, and retains the desired value
+    /// for the next registration attempt if the current lease is lost.
+    pub fn set_desired_status(&self, status: ServiceStatus) {
+        self.desired_status_tx.send_replace(status);
     }
 
     /// Cancels recovery, marks the endpoint draining, and explicitly revokes it.
@@ -215,14 +229,18 @@ impl Drop for RegistrationSupervisor {
 
 async fn supervise_registration(
     registry: Arc<dyn ServiceRegistry>,
-    endpoint: ServiceEndpoint,
+    mut endpoint: ServiceEndpoint,
     registration_options: RegistrationOptions,
     retry_policy: RegistrationRetryPolicy,
     mut guard: RegistrationGuard,
     mut stop_rx: watch::Receiver<bool>,
+    mut desired_status_rx: watch::Receiver<ServiceStatus>,
     status_tx: watch::Sender<RegistrationSupervisorStatus>,
 ) -> DiscoveryResult<()> {
     let mut retry_delay = retry_policy.retry_min();
+    // A timeout or provider error leaves the remote value uncertain: the
+    // provider may have committed the write before its response was lost.
+    let mut status_synced = true;
 
     loop {
         let mut registration_status = guard.subscribe_status();
@@ -234,15 +252,113 @@ async fn supervise_registration(
             let current_status = registration_status.borrow().clone();
             match current_status {
                 RegistrationStatus::Registered => {
-                    tokio::select! {
+                    let desired_status = desired_status_rx.borrow().clone();
+                    if status_synced && endpoint.status == desired_status {
+                        if !matches!(
+                            *status_tx.borrow(),
+                            RegistrationSupervisorStatus::Registered
+                        ) {
+                            let _ = status_tx.send(RegistrationSupervisorStatus::Registered);
+                            retry_delay = retry_policy.retry_min();
+                        }
+                        tokio::select! {
+                            changed = stop_rx.changed() => {
+                                if changed.is_err() || *stop_rx.borrow() {
+                                    return shutdown_guard(guard, &status_tx).await;
+                                }
+                            }
+                            changed = registration_status.changed() => {
+                                if changed.is_err() {
+                                    return shutdown_guard(guard, &status_tx).await;
+                                }
+                            }
+                            changed = desired_status_rx.changed() => {
+                                if changed.is_err() {
+                                    return shutdown_guard(guard, &status_tx).await;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    let register_timeout =
+                        Duration::from_millis(registration_options.register_timeout_ms);
+                    status_synced = false;
+                    let update = tokio::select! {
                         changed = stop_rx.changed() => {
                             if changed.is_err() || *stop_rx.borrow() {
                                 return shutdown_guard(guard, &status_tx).await;
                             }
+                            continue;
                         }
                         changed = registration_status.changed() => {
                             if changed.is_err() {
                                 return shutdown_guard(guard, &status_tx).await;
+                            }
+                            continue;
+                        }
+                        changed = desired_status_rx.changed() => {
+                            if changed.is_err() {
+                                return shutdown_guard(guard, &status_tx).await;
+                            }
+                            continue;
+                        }
+                        result = timeout(register_timeout, guard.update_status(desired_status.clone())) => result,
+                    };
+
+                    match update {
+                        Ok(Ok(())) => {
+                            endpoint.status = desired_status;
+                            status_synced = true;
+                            retry_delay = retry_policy.retry_min();
+                            let _ = status_tx.send(RegistrationSupervisorStatus::Registered);
+                        }
+                        Ok(Err(error)) => {
+                            let _ = status_tx.send(RegistrationSupervisorStatus::Reconnecting {
+                                last_error: error.to_string(),
+                            });
+                            retry_delay = next_delay(retry_delay, retry_policy.retry_max());
+                            tokio::select! {
+                                changed = stop_rx.changed() => {
+                                    if changed.is_err() || *stop_rx.borrow() {
+                                        return shutdown_guard(guard, &status_tx).await;
+                                    }
+                                }
+                                changed = registration_status.changed() => {
+                                    if changed.is_err() {
+                                        return shutdown_guard(guard, &status_tx).await;
+                                    }
+                                }
+                                changed = desired_status_rx.changed() => {
+                                    if changed.is_err() {
+                                        return shutdown_guard(guard, &status_tx).await;
+                                    }
+                                }
+                                _ = sleep(retry_delay) => {}
+                            }
+                        }
+                        Err(_) => {
+                            let _ = status_tx.send(RegistrationSupervisorStatus::Reconnecting {
+                                last_error: "service status update timed out".to_string(),
+                            });
+                            retry_delay = next_delay(retry_delay, retry_policy.retry_max());
+                            tokio::select! {
+                                changed = stop_rx.changed() => {
+                                    if changed.is_err() || *stop_rx.borrow() {
+                                        return shutdown_guard(guard, &status_tx).await;
+                                    }
+                                }
+                                changed = registration_status.changed() => {
+                                    if changed.is_err() {
+                                        return shutdown_guard(guard, &status_tx).await;
+                                    }
+                                }
+                                changed = desired_status_rx.changed() => {
+                                    if changed.is_err() {
+                                        return shutdown_guard(guard, &status_tx).await;
+                                    }
+                                }
+                                _ = sleep(retry_delay) => {}
                             }
                         }
                     }
@@ -277,16 +393,30 @@ async fn supervise_registration(
                         return Ok(());
                     }
                 }
+                changed = desired_status_rx.changed() => {
+                    if changed.is_err() {
+                        let _ = status_tx.send(RegistrationSupervisorStatus::Stopped);
+                        return Ok(());
+                    }
+                }
                 _ = sleep(retry_delay) => {}
             }
 
             let register_timeout = Duration::from_millis(registration_options.register_timeout_ms);
+            endpoint.status = desired_status_rx.borrow().clone();
             tokio::select! {
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
                         let _ = status_tx.send(RegistrationSupervisorStatus::Stopped);
                         return Ok(());
                     }
+                }
+                changed = desired_status_rx.changed() => {
+                    if changed.is_err() {
+                        let _ = status_tx.send(RegistrationSupervisorStatus::Stopped);
+                        return Ok(());
+                    }
+                    continue;
                 }
                 result = timeout(
                     register_timeout,
@@ -298,6 +428,7 @@ async fn supervise_registration(
                                 return shutdown_guard(new_guard, &status_tx).await;
                             }
                             guard = new_guard;
+                            status_synced = true;
                             retry_delay = retry_policy.retry_min();
                             let _ = status_tx.send(RegistrationSupervisorStatus::Registered);
                             break;
@@ -351,8 +482,10 @@ mod tests {
         calls: AtomicUsize,
         next_lease_id: AtomicI64,
         fail_next: AtomicUsize,
+        fail_status_updates: AtomicUsize,
         shutdowns: AtomicUsize,
         active: Mutex<HashMap<String, i64>>,
+        endpoints: Mutex<HashMap<String, ServiceEndpoint>>,
         status_senders: Mutex<Vec<watch::Sender<RegistrationStatus>>>,
     }
 
@@ -362,6 +495,10 @@ mod tests {
     impl TestRegistry {
         fn fail_next(&self, count: usize) {
             self.0.fail_next.store(count, Ordering::SeqCst);
+        }
+
+        fn fail_status_updates(&self, count: usize) {
+            self.0.fail_status_updates.store(count, Ordering::SeqCst);
         }
 
         async fn lose_latest(&self) {
@@ -384,9 +521,27 @@ mod tests {
             self.0.active.lock().await.get(&key).copied()
         }
 
+        async fn active_status(&self, endpoint: &ServiceEndpoint) -> Option<ServiceStatus> {
+            let key = format!("{}/{}", endpoint.kind, endpoint.id);
+            self.0
+                .endpoints
+                .lock()
+                .await
+                .get(&key)
+                .map(|endpoint| endpoint.status.clone())
+        }
+
         fn consume_failure(&self) -> bool {
             self.0
                 .fail_next
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        }
+
+        fn consume_status_update_failure(&self) -> bool {
+            self.fail_status_updates
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
@@ -407,7 +562,15 @@ mod tests {
             Ok(())
         }
 
-        async fn update_status(&self, _status: ServiceStatus) -> DiscoveryResult<()> {
+        async fn update_status(&self, status: ServiceStatus) -> DiscoveryResult<()> {
+            if self.state.consume_status_update_failure() {
+                return Err(DiscoveryError::EtcdUnavailable(
+                    "injected status update failure".to_string(),
+                ));
+            }
+            if let Some(endpoint) = self.state.endpoints.lock().await.get_mut(&self.key) {
+                endpoint.status = status;
+            }
             Ok(())
         }
 
@@ -417,6 +580,7 @@ mod tests {
             if active.get(&self.key) == Some(&self.lease_id) {
                 active.remove(&self.key);
             }
+            self.state.endpoints.lock().await.remove(&self.key);
             let _ = self.status_tx.send(RegistrationStatus::Revoked);
             Ok(())
         }
@@ -446,6 +610,11 @@ mod tests {
             }
             active.insert(key.clone(), lease_id);
             drop(active);
+            self.0
+                .endpoints
+                .lock()
+                .await
+                .insert(key.clone(), endpoint.clone());
 
             let (status_tx, status_rx) = watch::channel(RegistrationStatus::Registered);
             self.0.status_senders.lock().await.push(status_tx.clone());
@@ -483,7 +652,7 @@ mod tests {
                 capabilities: Vec::new(),
             },
             start_time_ms: 1,
-            status: ServiceStatus::Serving,
+            status: ServiceStatus::Starting,
             metadata: None,
         }
     }
@@ -529,6 +698,105 @@ mod tests {
         supervisor.shutdown().await.unwrap();
         assert_eq!(registry.shutdowns(), 2);
         assert_eq!(supervisor.status(), RegistrationSupervisorStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn desired_status_updates_a_starting_registration_to_serving() {
+        let registry = TestRegistry::default();
+        let endpoint = test_endpoint();
+        let mut supervisor = RegistrationSupervisor::start(
+            Arc::new(registry.clone()),
+            endpoint.clone(),
+            RegistrationOptions::default(),
+            test_retry_policy(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            registry.active_status(&endpoint).await,
+            Some(ServiceStatus::Starting)
+        );
+        supervisor.set_desired_status(ServiceStatus::Serving);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if registry.active_status(&endpoint).await == Some(ServiceStatus::Serving) {
+                    break;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn desired_status_retries_and_survives_lease_recovery() {
+        let registry = TestRegistry::default();
+        let endpoint = test_endpoint();
+        let mut supervisor = RegistrationSupervisor::start(
+            Arc::new(registry.clone()),
+            endpoint.clone(),
+            RegistrationOptions::default(),
+            test_retry_policy(),
+        )
+        .await
+        .unwrap();
+        registry.fail_status_updates(usize::MAX);
+        supervisor.set_desired_status(ServiceStatus::Serving);
+
+        let mut status = supervisor.subscribe_status();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    *status.borrow(),
+                    RegistrationSupervisorStatus::Reconnecting { .. }
+                ) {
+                    break;
+                }
+                status.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            registry.active_status(&endpoint).await,
+            Some(ServiceStatus::Starting)
+        );
+
+        registry.fail_status_updates(0);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if registry.active_status(&endpoint).await == Some(ServiceStatus::Serving)
+                    && matches!(*status.borrow(), RegistrationSupervisorStatus::Registered)
+                {
+                    break;
+                }
+                status.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        registry.lose_latest().await;
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if registry.calls() >= 2
+                    && registry.active_status(&endpoint).await == Some(ServiceStatus::Serving)
+                    && matches!(*status.borrow(), RegistrationSupervisorStatus::Registered)
+                {
+                    break;
+                }
+                status.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        supervisor.shutdown().await.unwrap();
     }
 
     #[tokio::test]
