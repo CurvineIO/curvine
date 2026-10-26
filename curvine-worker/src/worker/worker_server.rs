@@ -18,10 +18,11 @@ use crate::worker::replication::worker_replication_handler::WorkerReplicationHan
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use crate::worker::task::TaskManager;
 use crate::worker::WorkerMetrics;
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, DiscoveryConf};
 use curvine_core_error::StringError;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
+use curvine_model::ProtoUtils;
 use curvine_model::{CompatibilityPolicy, HeartbeatStatus, WorkerAddress};
 use curvine_net::net::ConnState;
 use curvine_rpc::handler::HandlerService;
@@ -30,12 +31,18 @@ use curvine_runtime::common::Utils;
 use curvine_runtime::common::{LocalTime, Logger};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::FastMutex;
+#[cfg(feature = "discovery-etcd")]
+use curvine_service_discovery::{connect_etcd, EtcdDiscoveryConfig};
+use curvine_service_discovery::{
+    ensure_provider_available, DiscoveryProvider, RegistrationOptions, RegistrationRetryPolicy,
+    RegistrationSupervisor, ServiceEndpoint, ServiceKind, ServiceStatus,
+};
 #[cfg(feature = "spdk")]
 use curvine_storage_spdk::SpdkEnv;
 use curvine_web::server::{WebHandlerService, WebServer};
-use log::info;
+use log::{info, warn};
 use once_cell::sync::OnceCell;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 static CLUSTER_CONF: OnceCell<ClusterConf> = OnceCell::new();
@@ -137,14 +144,23 @@ pub struct Worker {
     pub start_ms: u64,
     pub worker_id: u32,
     pub addr: WorkerAddress,
+    cluster_id: String,
+    discovery_conf: DiscoveryConf,
+    worker_session_id: String,
     rpc_server: Option<RpcServer<WorkerService>>,
     web_server: Option<WebServer<WorkerService>>,
     block_actor: BlockActor,
+    registration_slot: Arc<Mutex<Option<RegistrationSupervisor>>>,
 }
 
 impl Worker {
     #[cfg_attr(not(feature = "spdk"), allow(unused_mut))]
     pub fn with_conf(mut conf: ClusterConf) -> CommonResult<Self> {
+        if conf.discovery.enabled {
+            ensure_provider_available(&conf.discovery.provider)
+                .map_err(|error| CommonError::from(error.to_string()))?;
+        }
+
         Logger::init(conf.worker.log.clone());
 
         // Init SPDK before WorkerService - enables BlockMeta to open SPDK bdevs
@@ -212,6 +228,8 @@ impl Worker {
 
         let rt = Arc::new(conf.worker_server_conf().create_runtime());
         let worker_session_id = Utils::uuid();
+        let cluster_id = conf.cluster_id.clone();
+        let discovery_conf = conf.discovery.clone();
         let service: WorkerService =
             WorkerService::with_conf(&conf, rt.clone(), worker_session_id.clone())?;
         let worker_id = service.store.worker_id()?;
@@ -240,7 +258,7 @@ impl Worker {
             rt.clone(),
             &conf,
             addr.clone(),
-            worker_session_id,
+            worker_session_id.clone(),
             block_store.clone(),
             rpc_server.new_state_ctl(),
             start_ms,
@@ -252,9 +270,22 @@ impl Worker {
             .with_master_client(master_client.clone());
 
         let spdk_enabled = conf.worker.spdk_disk.enabled;
+        let registration_slot: Arc<Mutex<Option<RegistrationSupervisor>>> =
+            Arc::new(Mutex::new(None));
+        let shutdown_slot = registration_slot.clone();
+        let shutdown_rt = rpc_server.clone_rt();
         rpc_server.add_shutdown_hook(move || {
             if let Err(e) = master_client.heartbeat(HeartbeatStatus::End, vec![]) {
                 info!("error unregister {}", e)
+            }
+            let supervisor = shutdown_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(mut supervisor) = supervisor {
+                if let Err(error) = shutdown_rt.block_on(supervisor.shutdown()) {
+                    warn!("failed to revoke worker discovery registration: {error}");
+                }
             }
             if spdk_enabled {
                 info!("Shutting down SPDK environment");
@@ -267,20 +298,40 @@ impl Worker {
             start_ms,
             worker_id,
             addr,
+            cluster_id,
+            discovery_conf,
+            worker_session_id,
             rpc_server: Some(rpc_server),
             web_server: Some(web_server),
             block_actor,
+            registration_slot,
         };
 
         Ok(worker)
     }
 
     pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
-        // step 3: Start rpc server
         let rpc_server = self
             .rpc_server
             .take()
             .expect("worker rpc server must be initialized before startup");
+        let discovery_provider = connect_discovery_provider(
+            &self.discovery_conf,
+            &self.cluster_id,
+            rpc_server.clone_rt(),
+        )
+        .await?;
+        let discovery_endpoint = if discovery_provider.is_some() {
+            Some(worker_discovery_endpoint(
+                &self.addr,
+                &self.worker_session_id,
+                self.start_ms,
+            )?)
+        } else {
+            None
+        };
+
+        // step 3: Start rpc server
         let mut rpc_status = rpc_server.start();
         rpc_status.wait_running().await?;
 
@@ -304,6 +355,29 @@ impl Worker {
                 ))
             })
             .and_then(|result| result)?;
+
+        if let (Some(provider), Some(endpoint)) = (discovery_provider, discovery_endpoint) {
+            let retry_policy = RegistrationRetryPolicy {
+                startup_timeout_ms: self
+                    .discovery_conf
+                    .connect_timeout_ms
+                    .saturating_add(self.discovery_conf.request_timeout_ms),
+                retry_min_ms: self.discovery_conf.watch_reconnect_min_ms,
+                retry_max_ms: self.discovery_conf.watch_reconnect_max_ms,
+            };
+            let supervisor = RegistrationSupervisor::start(
+                provider.registry.clone(),
+                endpoint,
+                RegistrationOptions::default(),
+                retry_policy,
+            )
+            .await
+            .map_err(|error| CommonError::from(error.to_string()))?;
+            *self
+                .registration_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(supervisor);
+        }
 
         Ok(rpc_status)
     }
@@ -344,5 +418,112 @@ impl Worker {
             .as_ref()
             .expect("worker rpc server must be initialized")
             .service()
+    }
+}
+
+async fn connect_discovery_provider(
+    discovery_conf: &DiscoveryConf,
+    cluster_id: &str,
+    rt: Arc<Runtime>,
+) -> CommonResult<Option<DiscoveryProvider>> {
+    if !discovery_conf.enabled {
+        return Ok(None);
+    }
+
+    ensure_provider_available(&discovery_conf.provider)
+        .map_err(|error| CommonError::from(error.to_string()))?;
+
+    #[cfg(feature = "discovery-etcd")]
+    {
+        let etcd_conf = EtcdDiscoveryConfig::from((discovery_conf, cluster_id));
+        let provider = connect_etcd(etcd_conf, rt)
+            .await
+            .map_err(|error| CommonError::from(error.to_string()))?;
+        Ok(Some(provider))
+    }
+
+    #[cfg(not(feature = "discovery-etcd"))]
+    {
+        let _ = (cluster_id, rt);
+        Ok(None)
+    }
+}
+
+fn worker_discovery_endpoint(
+    addr: &WorkerAddress,
+    session_id: &str,
+    start_time_ms: u64,
+) -> CommonResult<ServiceEndpoint> {
+    let kind =
+        ServiceKind::try_new("worker").map_err(|error| CommonError::from(error.to_string()))?;
+    let rpc_port = u16::try_from(addr.rpc_port)
+        .map_err(|error| CommonError::from(format!("invalid worker RPC port: {error}")))?;
+    let web_port = if addr.web_port == 0 {
+        None
+    } else {
+        Some(
+            u16::try_from(addr.web_port)
+                .map_err(|error| CommonError::from(format!("invalid worker web port: {error}")))?,
+        )
+    };
+    let endpoint = ServiceEndpoint {
+        kind: kind.clone(),
+        id: format!("worker-{}-{session_id}", addr.worker_id),
+        host: addr.ip_addr.clone(),
+        rpc_port,
+        web_port,
+        component_info: ProtoUtils::component_version_to_pb(
+            &curvine_sys::version::component_version(kind.as_str()),
+        ),
+        start_time_ms,
+        status: ServiceStatus::Serving,
+        metadata: None,
+    };
+    endpoint
+        .validate()
+        .map_err(|error| CommonError::from(error.to_string()))?;
+    Ok(endpoint)
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn worker_endpoint_matches_heartbeat_address_and_session_identity() {
+        let addr = WorkerAddress {
+            worker_id: 11,
+            hostname: "worker-11.default.svc".to_string(),
+            ip_addr: "192.0.2.11".to_string(),
+            rpc_port: 9100,
+            web_port: 9101,
+        };
+        let endpoint = worker_discovery_endpoint(&addr, "session-abcd", 456).unwrap();
+        let heartbeat_addr = addr.inet_addr();
+
+        assert_eq!(endpoint.kind.as_str(), "worker");
+        assert_eq!(endpoint.id, "worker-11-session-abcd");
+        assert_eq!(endpoint.host, heartbeat_addr.hostname);
+        assert_eq!(endpoint.rpc_port, heartbeat_addr.port);
+        assert_eq!(
+            format!("{}:{}", endpoint.host, endpoint.rpc_port),
+            addr.connect_addr()
+        );
+        assert_eq!(endpoint.web_port, Some(addr.web_port as u16));
+        assert_eq!(endpoint.start_time_ms, 456);
+        assert_eq!(endpoint.status, ServiceStatus::Serving);
+    }
+
+    #[test]
+    fn worker_endpoint_rejects_wildcard_heartbeat_address() {
+        let addr = WorkerAddress {
+            worker_id: 11,
+            hostname: "worker-11.default.svc".to_string(),
+            ip_addr: "0.0.0.0".to_string(),
+            rpc_port: 9100,
+            web_port: 9101,
+        };
+
+        assert!(worker_discovery_endpoint(&addr, "session-abcd", 456).is_err());
     }
 }
