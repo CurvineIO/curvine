@@ -15,6 +15,7 @@
 use curvine_core_error::CommonResult;
 use curvine_server::master::quota::eviction::evictor::{Evictor, LRUEvictor};
 use curvine_server::master::quota::eviction::types::{EvictionConf, EvictionMode, EvictionPolicy};
+use std::collections::HashSet;
 
 // ============================================================================
 // Helper Functions
@@ -28,6 +29,7 @@ fn create_test_eviction_conf() -> EvictionConf {
         high_watermark: 0.8,
         low_watermark: 0.6,
         candidate_scan_page: 10,
+        max_scan: 0,
         dry_run: false,
         capacity: 1_000_000,
     }
@@ -125,6 +127,40 @@ fn test_lru_remove_victims() -> CommonResult<()> {
         new_victims,
         vec![3, 4],
         "Removed victims should not appear again"
+    );
+
+    Ok(())
+}
+
+// The eviction loop needs a cursor: without it the coldest page is returned
+// forever and a trigger that finds nothing reclaimable stops after it.
+#[test]
+fn test_lru_select_victims_excluding_advances_the_cursor() -> CommonResult<()> {
+    let evictor = LRUEvictor::new(create_test_eviction_conf());
+
+    for i in 1..=5 {
+        evictor.on_access(i);
+    }
+
+    let mut skip = HashSet::new();
+    assert_eq!(
+        evictor.select_victims_excluding(2, &skip),
+        vec![1, 2],
+        "first page is the coldest prefix"
+    );
+
+    // Candidates that were examined but not reclaimed stay in the evictor and
+    // must not be returned again within the same trigger.
+    skip.extend([1, 2]);
+    assert_eq!(evictor.select_victims_excluding(2, &skip), vec![3, 4]);
+
+    skip.extend([3, 4]);
+    assert_eq!(evictor.select_victims_excluding(2, &skip), vec![5]);
+
+    skip.insert(5);
+    assert!(
+        evictor.select_victims_excluding(2, &skip).is_empty(),
+        "an exhausted candidate set must return nothing instead of repeating"
     );
 
     Ok(())

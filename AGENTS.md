@@ -26,6 +26,12 @@ Usage notes:
 <available_skills>
 
 <skill>
+<name>cv-add-blog</name>
+<description>Publish a paired English and Chinese blog post with localized images to the CurvineIO/curvine-doc Docusaurus site, including frontmatter, cover, i18n directory, local build validation, and PR creation. Use when the user asks to submit an article to the Curvine blog, publish an EN/ZH blog post, or convert a Markdown article into a curvine-doc post.</description>
+<location>project</location>
+</skill>
+
+<skill>
 <name>cv-add-skills</name>
 <description>Add or update Curvine cv-* project skills under .agents/skills/, following naming and layout conventions, and sync the AGENTS.md registry. Use when creating a new cv skill, updating an existing cv skill structure, or registering skills after changes.</description>
 <location>project</location>

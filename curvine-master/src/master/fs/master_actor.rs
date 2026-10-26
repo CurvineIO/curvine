@@ -14,7 +14,7 @@
 
 use crate::master::fs::heartbeat_checker::HeartbeatChecker;
 use crate::master::fs::master_filesystem::MasterFilesystem;
-use crate::master::fs::FsDirWatchdog;
+use crate::master::fs::{FsDirWatchdog, TrashExpunger};
 use crate::master::meta::inode::ttl::TtlHeartbeatChecker;
 use crate::master::meta::inode::ttl::TtlHeartbeatConfig;
 use crate::master::meta::inode::ttl::{InodeTtlExecutor, InodeTtlManager};
@@ -67,6 +67,28 @@ impl MasterActor {
             self.quota_manager.clone(),
         )?;
         Self::start_fs_dir_watchdog(self.fs.clone())?;
+        self.start_trash_expunger()?;
+        Ok(())
+    }
+
+    fn start_trash_expunger(&mut self) -> CommonResult<()> {
+        let retention_ms = self.fs.conf.trash_retention_ms();
+        if !self.fs.conf.trash_enabled || retention_ms == 0 {
+            info!(
+                "trash expunger disabled (trash_enabled={}, retention={} ms)",
+                self.fs.conf.trash_enabled, retention_ms
+            );
+            return Ok(());
+        }
+
+        let interval_ms = self.fs.conf.trash_check_interval_ms();
+        let scheduler = ScheduledExecutor::new("trash-expunger", interval_ms);
+        let expunger = TrashExpunger::new(self.fs.clone(), self.master_monitor.clone());
+        scheduler.start(expunger)?;
+        info!(
+            "trash expunger started, interval {} ms, retention {} ms",
+            interval_ms, retention_ms
+        );
         Ok(())
     }
 
