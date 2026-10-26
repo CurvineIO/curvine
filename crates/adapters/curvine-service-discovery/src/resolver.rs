@@ -122,6 +122,19 @@ impl SnapshotReader {
         }
     }
 
+    /// Share only the cache with a task running on the owned runtime.
+    ///
+    /// External readers keep the runtime alive, but its own background task
+    /// must not retain the last runtime owner and drop it on an async worker.
+    #[cfg(feature = "etcd")]
+    pub(crate) fn cache_reader(&self) -> Self {
+        Self {
+            cache: self.cache.clone(),
+            allow_stale_cache: self.allow_stale_cache,
+            _lifecycle_owner: None,
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn replace_snapshot(&self, snapshot: ServiceSnapshot) {
         *self.cache.write().await = snapshot;

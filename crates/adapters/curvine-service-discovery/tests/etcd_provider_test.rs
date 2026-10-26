@@ -174,6 +174,36 @@ fn etcd_resolver_watch_emits_initial_reset() {
 
 #[test]
 #[ignore = "requires CURVINE_ETCD_ADDR and a running etcd cluster"]
+fn etcd_watch_task_does_not_own_runtime_after_consumers_drop() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let resolver = rt
+        .block_on(EtcdServiceResolver::connect(
+            EtcdDiscoveryConfig::new(
+                vec![etcd_endpoint()],
+                unique_prefix("watch-runtime-owner"),
+                "test-cluster",
+            ),
+            rt.clone(),
+        ))
+        .unwrap();
+    let handle = rt
+        .block_on(resolver.watch(ServiceKind::try_new("mds").unwrap()))
+        .unwrap();
+
+    // Consumer ownership must keep the injected runtime alive after the
+    // provider goes away; the task itself must not be a runtime owner.
+    drop(resolver);
+    assert!(Arc::strong_count(&rt) > 1);
+    drop(handle);
+    assert_eq!(
+        Arc::strong_count(&rt),
+        1,
+        "the background watch retained a runtime after its consumers dropped"
+    );
+}
+
+#[test]
+#[ignore = "requires CURVINE_ETCD_ADDR and a running etcd cluster"]
 fn etcd_resolver_watch_emits_incremental_changes() {
     let etcd_addr = etcd_endpoint();
 

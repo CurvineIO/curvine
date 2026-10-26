@@ -451,7 +451,7 @@ impl ServiceResolver for EtcdServiceResolver {
             .map_err(|error| DiscoveryError::EtcdUnavailable(error.to_string()))?;
 
         let config = self.config.clone();
-        let reader_for_task = reader.clone();
+        let reader_for_task = reader.cache_reader();
         let watch_kind = kind.clone();
         let jitter_seed = WATCH_JITTER_SEED.fetch_add(1, Ordering::Relaxed);
         self.rt.spawn(async move {
