@@ -842,37 +842,85 @@ mod tests {
         assert_eq!(reader.pos(), 8);
     }
 
-    // 随机模式 seek 只重定位 base reader:seek 到两个不同远端位置后,
-    // get_reader() 仍指向 base、detector 保持 Random、pos 生效。
-    // (行为优化而非语义变化;作为回归保护防止退化回 N+1 全量重定位。)
+    // Random 模式 seek 只重定位 base reader,lane 保持原样直到翻回 Sequential。
+    // 用确定性 fixture(块元数据 + 停住的 producer)让两次 seek 必然成功,
+    // 然后以 lane 状态的"存活性"区分两条路径:flip 之后向 lane 注入 chunk
+    // 和水位,第二次 Random seek 若走 base-only 路径则 lane 原封不动;若退化
+    // 回全量循环,lane 的 BufferChannel::seek 会 drain 掉 chunk 并清零水位,
+    // 本测试即红。(负向对照:禁用 base-only 分支时本测试失败。)
     #[test]
     fn test_random_mode_seek_repositions_base_only() {
-        let (mut reader, rt) = absorb_reader(4096, "4MB");
+        let _lock = ABSORB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut reader, rt) = absorb_reader_conf(4096, "4MB", "16MB", true);
         let base_index = reader.base_reader_index;
+        assert_eq!(base_index, 1, "fixture must create one buffered lane");
 
-        // First full-path seek flips Sequential -> Random. The sparse file has
-        // no backing blocks, so reader-side seeks may fail; the detector must
-        // already be Random either way (record_seek runs before repositioning).
-        let res = rt.block_on(reader.seek(1024));
-        assert!(reader.read_detector.is_random());
-        if res.is_ok() {
-            assert_eq!(reader.pos(), 1024);
+        // Park the lane producer before anything can race it: the flip seek
+        // below must deterministically succeed.
+        let lane_tx = if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
+            park_lane_producer(&rt, channel)
         } else {
-            assert_eq!(reader.pos(), 0);
+            panic!("lane 0 must be a buffered channel");
+        };
+
+        // First seek flips Sequential -> Random via the full loop: every lane
+        // is seeked/drained/watermark-reset, the detector flips.
+        rt.block_on(reader.seek(1024)).unwrap();
+        assert!(reader.read_detector.is_random());
+        assert_eq!(reader.pos(), 1024);
+        assert!(reader.get_reader().is_ok());
+
+        // Seed the (already flipped) lane with a chunk and a watermark: the
+        // sentinel state that a base-only seek must NOT touch.
+        if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
+            rt.block_on(lane_tx.send(FileChunk::with_buf(4, BytesMut::from(&b"bbbb"[..]))))
+                .unwrap();
+            channel
+                .produced_end
+                .store(8, std::sync::atomic::Ordering::Release);
+        } else {
+            panic!("lane 0 must be a buffered channel");
         }
+
+        // Second seek while already Random: must take the base-only branch.
+        rt.block_on(reader.seek(3072)).unwrap();
+        assert!(reader.read_detector.is_random());
+        assert_eq!(reader.pos(), 3072);
         assert!(reader.get_reader().is_ok());
         assert_eq!(reader.base_reader_index, base_index);
 
-        // Second seek while already Random: base-only path must keep semantics.
-        let res = rt.block_on(reader.seek(3072));
-        assert!(reader.read_detector.is_random());
-        if res.is_ok() {
-            assert_eq!(reader.pos(), 3072);
+        // The base reader really was repositioned...
+        if let Some(ReaderAdapter::Base(base)) = reader.readers.get(base_index) {
+            assert_eq!(base.pos(), 3072, "base reader must be repositioned");
         } else {
-            assert_eq!(reader.pos(), 0);
+            panic!("reader {} must be the base reader", base_index);
         }
-        assert!(reader.get_reader().is_ok());
-        assert_eq!(reader.base_reader_index, base_index);
+
+        // ...and the lane was NOT: its chunk and watermark survive. On a
+        // regression to the full N+1 loop the lane seek drains the chunk and
+        // resets the watermark, failing both assertions.
+        if let Some(ReaderAdapter::Buffer(channel)) = reader.readers.get_mut(0) {
+            let leftover = channel
+                .chunk_receiver
+                .try_recv()
+                .expect("try_recv on lane channel must not fail");
+            assert_eq!(
+                leftover.map(|c| (c.off, c.len())),
+                Some((4, 4)),
+                "Random-mode seek must leave lane chunks untouched"
+            );
+            assert_eq!(
+                channel
+                    .produced_end
+                    .load(std::sync::atomic::Ordering::Acquire),
+                8,
+                "Random-mode seek must leave the lane watermark untouched"
+            );
+        } else {
+            panic!("lane 0 must be a buffered channel");
+        }
     }
 
     // Drive the buffered-lane seek/read sequence with block_on on the

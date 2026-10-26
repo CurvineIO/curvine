@@ -266,8 +266,13 @@ pub struct ClientConf {
     // Forward-seek absorption window size (bytes). When a forward seek lands within
     // this distance of the prefetch buffer, the read is served from the buffer
     // instead of discarding it. Default is 0 (disabled).
-    // Absorption requires enable_smart_prefetch = true; with smart prefetch off
-    // the window is ignored.
+    // Preconditions: absorption requires enable_smart_prefetch = true AND
+    // read_chunk_num > 1 (buffered lanes); with either missing the window is
+    // silently ignored and no seek is ever absorbed.
+    // Side effect: any non-zero window also changes Random-mode seeks to
+    // reposition only the base reader (lanes are drained once on the
+    // sequential->random flip and left idle until the pattern flips back),
+    // instead of repositioning every lane on every seek.
     #[serde(skip)]
     pub seek_absorb_window: i64,
     #[serde(alias = "seek_absorb_window")]
