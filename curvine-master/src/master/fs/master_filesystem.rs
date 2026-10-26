@@ -318,7 +318,7 @@ impl MasterFilesystem {
         Ok(delete_res)
     }
 
-    fn release_deleted_blocks(&self, delete_res: &mut DeleteResult) {
+    pub(crate) fn release_deleted_blocks(&self, delete_res: &mut DeleteResult) {
         let blocks = std::mem::take(&mut delete_res.blocks);
         let mut worker_manager = self.worker_manager.write();
         worker_manager.remove_blocks(&DeleteResult {
@@ -327,6 +327,35 @@ impl MasterFilesystem {
             blocks,
             trashed: false,
         });
+    }
+
+    /// Journals and applies one bounded trash purge batch.
+    ///
+    /// The batch is journaled before it is applied: a batch is self-contained
+    /// and idempotent, so a leader that fails after journaling still converges
+    /// on replay, while journaling after a partial apply could leave the
+    /// standbys without the batch the leader already applied. Returns `None`
+    /// when this node is no longer the active master.
+    pub(crate) fn purge_trash_batch(
+        &self,
+        entry: &str,
+        paths: &[String],
+    ) -> FsResult<Option<(u64, u64)>> {
+        let mut delete_res = {
+            let mut fs_dir = self.fs_dir.write();
+            if !self.master_monitor.is_active() {
+                return Ok(None);
+            }
+
+            let mtime = LocalTime::mills() as i64;
+            let writer = fs_dir.journal_writer.clone();
+            writer.log_trash_purge(&fs_dir, entry, mtime, paths.to_vec())?;
+
+            fs_dir.purge_paths(paths, mtime)?
+        };
+
+        self.release_deleted_blocks(&mut delete_res);
+        Ok(Some((delete_res.inodes, delete_res.bytes)))
     }
 
     pub fn list_trash_page(

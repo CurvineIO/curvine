@@ -91,8 +91,10 @@ fn purge_paths_removes_only_the_listed_batch() {
     assert_eq!(res.inodes, 0);
     assert!(!fs.exists(&entry).unwrap());
     assert!(fs.exists("/.Trash").unwrap());
-    let counts = fs.get_file_counts();
-    assert_eq!(counts.0 + 3, before.0, "purged files must leave fs_stats");
+    // `get_file_counts` is (dirs, files): the entry, its two subdirectories and
+    // the three files are gone, so only the trash root remains.
+    assert_eq!(before, (4, 3));
+    assert_eq!(fs.get_file_counts(), (1, 0));
 }
 
 #[test]

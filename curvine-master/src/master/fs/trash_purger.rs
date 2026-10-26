@@ -1,0 +1,249 @@
+// Copyright 2026 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::master::fs::MasterFilesystem;
+use crate::master::meta::inode::{InodePath, InodeView, PATH_SEPARATOR};
+use crate::master::meta::FsDir;
+use crate::master::MasterMonitor;
+use curvine_error::FsResult;
+use curvine_model::ListOptions;
+use log::debug;
+use std::time::Duration;
+
+// Bound on how many children one directory page examines per namespace lock
+// hold. Keeps a directory with millions of children from building the whole
+// listing in memory while the lock is held.
+const CHILD_PAGE: usize = 256;
+
+/// One directory still being enumerated. `after` is the last child already
+/// accounted for, so a batch that ends mid-directory resumes from the next
+/// name instead of rescanning the directory from the start.
+#[derive(Debug, Clone)]
+struct Frame {
+    path: String,
+    after: Option<String>,
+}
+
+/// What one directory page of the walk found.
+enum ChildPage {
+    /// The path no longer resolves: restored, emptied or already purged.
+    Missing,
+    /// The path resolves but is not a directory. A trashed entry can be a single
+    /// file or link, so the root frame is emitted without descending.
+    Leaf,
+    Children(Vec<PurgeChild>),
+}
+
+/// A child seen while walking a trashed subtree.
+struct PurgeChild {
+    name: String,
+    path: String,
+    is_dir: bool,
+    has_children: bool,
+}
+
+/// Result of purging one trash entry.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PurgeOutcome {
+    /// Number of batches applied. Exposed for tests that assert the purge is
+    /// actually bounded rather than one large batch.
+    pub batches: u64,
+    pub inodes: u64,
+    pub bytes: u64,
+}
+
+/// Reclaims trashed entries in bounded batches.
+///
+/// Each batch removes at most `trash_purge_batch_inodes` inodes, is journaled
+/// as one [`crate::master::journal::TrashPurgeEntry`], and then releases the
+/// namespace write lock for `trash_purge_yield_ms`. A trashed directory with
+/// millions of inodes therefore never blocks metadata operations for longer
+/// than one batch.
+///
+/// The walk is a depth-first post-order traversal: children are removed before
+/// their parent, so every emitted path is a file or an empty directory and
+/// removing it cannot touch inodes that a later batch still needs. Batches are
+/// journaled before they are applied; a batch is idempotent, so a leader that
+/// fails halfway converges when the batch is replayed and retried.
+pub struct TrashPurger {
+    fs: MasterFilesystem,
+    monitor: MasterMonitor,
+    batch_inodes: usize,
+    yield_ms: u64,
+}
+
+impl TrashPurger {
+    pub fn new(fs: MasterFilesystem, monitor: MasterMonitor) -> Self {
+        let batch_inodes = fs.conf.trash_purge_batch_inodes.max(1);
+        let yield_ms = fs.conf.trash_purge_yield_ms;
+        Self {
+            fs,
+            monitor,
+            batch_inodes,
+            yield_ms,
+        }
+    }
+
+    /// Purges `entry` completely. Returns `None` when this node lost leadership
+    /// mid-purge; the entry then stays in the trash for the next active master.
+    pub fn purge_entry(&self, entry: &str) -> FsResult<Option<PurgeOutcome>> {
+        let mut frames = vec![Frame {
+            path: entry.to_string(),
+            after: None,
+        }];
+        let mut outcome = PurgeOutcome::default();
+
+        loop {
+            if !self.monitor.is_active() {
+                return Ok(None);
+            }
+
+            // The walk only reads metadata, and the batch it produces is bounded,
+            // so the read lock is held for one page of children at most.
+            let batch = {
+                let fs_dir = self.fs.fs_dir();
+                let fs_dir = fs_dir.read();
+                Self::next_batch(&fs_dir, &mut frames, self.batch_inodes)?
+            };
+            if batch.is_empty() {
+                return Ok(Some(outcome));
+            }
+
+            let Some((inodes, bytes)) = self.fs.purge_trash_batch(entry, &batch)? else {
+                return Ok(None);
+            };
+            outcome.batches += 1;
+            outcome.inodes += inodes;
+            outcome.bytes += bytes;
+            debug!(
+                "trash purge: entry={} batch={} paths={} removed={}",
+                entry,
+                outcome.batches,
+                batch.len(),
+                inodes
+            );
+
+            if self.yield_ms > 0 {
+                std::thread::sleep(Duration::from_millis(self.yield_ms));
+            }
+        }
+    }
+
+    /// Collects the next bounded batch of leaf paths, deepest first.
+    fn next_batch(fs_dir: &FsDir, frames: &mut Vec<Frame>, limit: usize) -> FsResult<Vec<String>> {
+        let limit = limit.max(1);
+        let mut batch = Vec::with_capacity(limit.min(CHILD_PAGE));
+
+        while batch.len() < limit {
+            let Some(frame) = frames.last() else {
+                break;
+            };
+            let frame_index = frames.len() - 1;
+            let page_size = (limit - batch.len()).min(CHILD_PAGE);
+
+            let children = match Self::children_of(
+                fs_dir,
+                &frame.path,
+                frames[frame_index].after.as_deref(),
+                page_size,
+            )? {
+                ChildPage::Children(children) => children,
+                // Emit a non-directory frame (a trashed single file) and stay
+                // silent for a path that is already gone, so a finished or
+                // restored entry never journals a no-op batch.
+                ChildPage::Leaf => {
+                    let leaf = frames.pop().expect("frame was checked above");
+                    batch.push(leaf.path);
+                    continue;
+                }
+                ChildPage::Missing => {
+                    frames.pop();
+                    continue;
+                }
+            };
+
+            if children.is_empty() {
+                // Every child is accounted for, so this directory is either
+                // already empty or becomes empty when this batch is applied.
+                let done = frames.pop().expect("frame was checked above");
+                batch.push(done.path);
+                continue;
+            }
+
+            let mut descended = false;
+            for child in children {
+                // Leave the cursor on the first child this batch cannot hold so
+                // the next batch starts exactly here.
+                if batch.len() >= limit {
+                    break;
+                }
+
+                frames[frame_index].after = Some(child.name.clone());
+                if child.is_dir && child.has_children {
+                    frames.push(Frame {
+                        path: child.path,
+                        after: None,
+                    });
+                    descended = true;
+                    break;
+                }
+
+                batch.push(child.path);
+            }
+
+            if descended {
+                continue;
+            }
+        }
+
+        Ok(batch)
+    }
+
+    /// One name-ordered page of `path`'s children.
+    fn children_of(
+        fs_dir: &FsDir,
+        path: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> FsResult<ChildPage> {
+        let inp = match InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store) {
+            Ok(inp) => inp,
+            Err(_) => return Ok(ChildPage::Missing),
+        };
+        let Some(inode) = inp.get_last_inode() else {
+            return Ok(ChildPage::Missing);
+        };
+        let InodeView::Dir(dir) = inode.as_ref() else {
+            return Ok(ChildPage::Leaf);
+        };
+
+        let options = ListOptions {
+            limit: Some(limit),
+            start_after: after.map(str::to_string),
+        };
+        let prefix = path.trim_end_matches(PATH_SEPARATOR);
+
+        Ok(ChildPage::Children(
+            dir.list_options(&options)
+                .into_iter()
+                .map(|child| PurgeChild {
+                    name: child.name().to_string(),
+                    path: format!("{}{}{}", prefix, PATH_SEPARATOR, child.name()),
+                    is_dir: child.is_dir(),
+                    has_children: matches!(child, InodeView::Dir(d) if d.children_len() > 0),
+                })
+                .collect(),
+        ))
+    }
+}
