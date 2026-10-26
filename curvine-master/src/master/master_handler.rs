@@ -367,21 +367,27 @@ impl MasterHandler {
         ctx.response(ProtoUtils::restore_trash_res_to_pb(res))
     }
 
-    pub fn empty_trash0(&self, req_id: i64) -> FsResult<DeleteResult> {
+    pub fn empty_trash0(&self, req_id: i64, wait: bool) -> FsResult<(u64, DeleteResult)> {
         if self.check_is_retry(req_id)? {
-            return Ok(DeleteResult::default());
+            return Ok((0, DeleteResult::default()));
         }
 
-        let res = self.fs.empty_trash();
+        // Both modes stage the entries; only the wait mode blocks for the
+        // reclamation, and both go through the same bounded purger.
+        let res = self.fs.empty_trash0(wait).map(|(accepted, res)| {
+            let res = if wait { res } else { DeleteResult::default() };
+            (accepted, res)
+        });
         self.set_req_cache(req_id, res)
     }
 
     pub fn retry_check_empty_trash(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let _: EmptyTrashRequest = ctx.parse_header()?;
+        let header: EmptyTrashRequest = ctx.parse_header()?;
 
-        let res = self.empty_trash0(ctx.msg.req_id())?;
+        let (accepted, res) = self.empty_trash0(ctx.msg.req_id(), header.wait())?;
         ctx.response(EmptyTrashResponse {
             res: ProtoUtils::delete_res_to_pb(res),
+            accepted: Some(accepted),
         })
     }
 

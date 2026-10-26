@@ -290,10 +290,24 @@ impl FsClient {
         Ok(ProtoUtils::restore_trash_res_from_pb(rep))
     }
 
+    /// Empties the recycle bin and waits for the reclamation, reporting the real
+    /// counts. Callers that can proceed while the purger works should use
+    /// [`Self::empty_trash_async`] instead.
     pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
-        let req = EmptyTrashRequest {};
+        Ok(self.empty_trash_mode(true).await?.1)
+    }
+
+    /// Empties the recycle bin by staging the entries for the background purger
+    /// and returns `(accepted, reclaimed)`; reclamation still reports zeros
+    /// because the purge has not run yet.
+    pub async fn empty_trash_async(&self) -> FsResult<(u64, DeleteResult)> {
+        self.empty_trash_mode(false).await
+    }
+
+    async fn empty_trash_mode(&self, wait: bool) -> FsResult<(u64, DeleteResult)> {
+        let req = EmptyTrashRequest { wait: Some(wait) };
         let rep: EmptyTrashResponse = self.rpc(RpcCode::EmptyTrash, req).await?;
-        Ok(ProtoUtils::delete_res_from_pb(rep.res))
+        Ok((rep.accepted(), ProtoUtils::delete_res_from_pb(rep.res)))
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
