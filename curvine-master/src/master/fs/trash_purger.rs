@@ -16,9 +16,10 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::{InodePath, InodeView, PATH_SEPARATOR};
 use crate::master::meta::FsDir;
 use crate::master::MasterMonitor;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_model::ListOptions;
-use log::debug;
+use curvine_runtime::runtime::LoopTask;
+use log::{debug, info, warn};
 use std::time::Duration;
 
 // Bound on how many children one directory page examines per namespace lock
@@ -245,5 +246,105 @@ impl TrashPurger {
                 })
                 .collect(),
         ))
+    }
+}
+
+// Bound on how many pending entries one drain cycle dequeues per scan page.
+const PENDING_SCAN_BATCH: usize = 64;
+
+/// Drains `/.Trash/.pending`, the staging directory written by `async_delete`.
+///
+/// This runs regardless of `trash_enabled` and of `trash_retention`: an async
+/// delete promises reclamation without a retention window, so its entries are
+/// reclaimed as soon as this task sees them. The task is an accelerator, not the
+/// durable state — a pending entry that survives a restart is simply picked up
+/// by the next cycle.
+pub struct PendingTrashPurger {
+    fs: MasterFilesystem,
+    monitor: MasterMonitor,
+    purger: TrashPurger,
+    scan_batch: usize,
+}
+
+impl PendingTrashPurger {
+    pub fn new(fs: MasterFilesystem, monitor: MasterMonitor) -> Self {
+        let purger = TrashPurger::new(fs.clone(), monitor.clone());
+        Self {
+            fs,
+            monitor,
+            purger,
+            scan_batch: PENDING_SCAN_BATCH,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_scan_batch(mut self, scan_batch: usize) -> Self {
+        self.scan_batch = scan_batch.max(1);
+        self
+    }
+
+    /// Purges every currently staged entry, page by page. Returns the number of
+    /// entries reclaimed, or `None` when the master was demoted mid-cycle.
+    pub fn drain_pending(&self) -> FsResult<Option<(u64, u64, u64)>> {
+        let mut entries = 0u64;
+        let mut inodes = 0u64;
+        let mut bytes = 0u64;
+        let mut start_after = None;
+
+        loop {
+            if !self.monitor.is_active() {
+                return Ok(None);
+            }
+
+            let page = self
+                .fs
+                .scan_pending_trash(self.scan_batch, start_after.as_deref())?;
+            for path in page.paths {
+                // An entry staged after this page was scanned is picked up by the
+                // next cycle; a restored or already purged one resolves to a
+                // no-op inside the purger.
+                match self.purger.purge_entry(&path) {
+                    Ok(Some(outcome)) => {
+                        entries += 1;
+                        inodes += outcome.inodes;
+                        bytes += outcome.bytes;
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(FsError::FileNotFound(_)) => {}
+                    Err(e) => warn!("failed to purge pending trash entry {}: {}", path, e),
+                }
+            }
+
+            match page.next_after {
+                Some(next) => start_after = Some(next),
+                None => break,
+            }
+        }
+
+        Ok(Some((entries, inodes, bytes)))
+    }
+}
+
+impl LoopTask for PendingTrashPurger {
+    type Error = FsError;
+
+    fn run(&self) -> FsResult<()> {
+        if !self.monitor.is_active() {
+            return Ok(());
+        }
+
+        if let Some((entries, inodes, bytes)) = self.drain_pending()? {
+            if entries > 0 {
+                info!(
+                    "trash purger reclaimed {} async-deleted entries ({} inodes, {} bytes)",
+                    entries, inodes, bytes
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn terminate(&self) -> bool {
+        self.monitor.is_stop()
     }
 }

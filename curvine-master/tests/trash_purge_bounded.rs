@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_config::ClusterConf;
-use curvine_master::master::fs::{MasterFilesystem, TrashPurger};
+use curvine_master::master::fs::{DeleteMode, MasterFilesystem, TrashPurger};
 use curvine_master::master::journal::JournalSystem;
 use curvine_master::Master;
 use curvine_raft::raft::RoleState;
@@ -55,7 +55,8 @@ fn trash_tree(fs: &MasterFilesystem, path: &str, dirs: usize, per_dir: usize) ->
             fs.create(format!("{path}/d{dir}/f{file}"), true).unwrap();
         }
     }
-    fs.delete_with_opts(path, true, false).unwrap();
+    fs.delete_with_mode(path, true, DeleteMode::Default)
+        .unwrap();
     let entries = fs.list_trash().unwrap();
     assert_eq!(entries.len(), 1, "expected a single trash entry");
     entries[0].path.clone()
@@ -183,7 +184,8 @@ fn purges_a_trashed_single_file_entry() {
     let _serial = TEST_LOCK.lock().unwrap();
     let fs = trash_fs("single-file", 8, 0);
     fs.create("/data/a.log", true).unwrap();
-    fs.delete_with_opts("/data/a.log", false, false).unwrap();
+    fs.delete_with_mode("/data/a.log", false, DeleteMode::Default)
+        .unwrap();
     let entry = fs.list_trash().unwrap().remove(0).path;
 
     // A trashed entry can be a plain file: the walk must emit the root itself
