@@ -95,6 +95,46 @@ fn test_node(rt: Arc<Runtime>, id: u64) -> RaftNode<MemLogStorage, HashAppStorag
     }
 }
 
+#[test]
+fn only_current_leader_replication_messages_can_refresh_contact() {
+    assert!(is_leader_contact_message(MessageType::MsgAppend));
+    assert!(is_leader_contact_message(MessageType::MsgHeartbeat));
+    assert!(is_leader_contact_message(MessageType::MsgSnapshot));
+
+    assert!(!is_leader_contact_message(MessageType::MsgRequestVote));
+    assert!(!is_leader_contact_message(MessageType::MsgRequestPreVote));
+    assert!(!is_leader_contact_message(MessageType::MsgAppendResponse));
+    assert!(!is_leader_contact_message(
+        MessageType::MsgHeartbeatResponse
+    ));
+}
+
+#[test]
+fn snapshot_readiness_is_invalidated_only_for_real_or_malformed_snapshot_state() {
+    let placeholder = SnapshotData::default();
+    let snapshot = Snapshot {
+        data: placeholder.encode_to_vec(),
+        ..Default::default()
+    };
+    assert!(!snapshot_carries_metadata(&snapshot));
+
+    let materialized = Snapshot {
+        data: SnapshotData {
+            snapshot_id: 1,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        ..Default::default()
+    };
+    assert!(snapshot_carries_metadata(&materialized));
+
+    let malformed = Snapshot {
+        data: vec![0xff],
+        ..Default::default()
+    };
+    assert!(snapshot_carries_metadata(&malformed));
+}
+
 fn test_rocks_node(
     rt: Arc<Runtime>,
     id: u64,
