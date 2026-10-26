@@ -286,6 +286,10 @@ pub trait TransferStore: Send + Sync + 'static {
         limit: usize,
     ) -> FsResult<Vec<TransferTaskRecord>>;
 
+    /// Lists every failed task for a run. Recovery uses this to let a
+    /// terminal failure take precedence over bounded transient redelivery.
+    fn list_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>>;
+
     fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool>;
 
     fn has_recoverable_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool>;

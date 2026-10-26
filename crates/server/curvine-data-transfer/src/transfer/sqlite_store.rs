@@ -1376,6 +1376,28 @@ impl TransferStore for SqliteTransferStore {
         collect_sqlite_rows(rows)
     }
 
+    fn list_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "select job_id, run_id, task_id, attempt_id, source_path, target_path,
+                        worker_id, worker_session_id, source_read_plan_json, report_target_json,
+                        state, progress_json, retry_count, attempt_started_at, last_report_at,
+                        stale_deadline_at, updated_at
+                 from transfer_tasks
+                 where job_id = ?1 and run_id = ?2 and state = ?3
+                 order by task_id asc",
+            )
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(
+                params![job_id, run_id as i64, TransferTaskState::Failed as i32],
+                sqlite_task_row,
+            )
+            .map_err(sqlite_err)?;
+        collect_sqlite_rows(rows)
+    }
+
     fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
         self.conn
             .lock()

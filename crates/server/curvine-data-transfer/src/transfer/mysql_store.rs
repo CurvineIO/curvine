@@ -1268,6 +1268,17 @@ impl TransferStore for MysqlTransferStore {
         )
     }
 
+    fn list_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        select_tasks(
+            &mut self.conn()?,
+            job_id,
+            run_id,
+            Some(TransferTaskState::Failed),
+            None,
+            self.task_runtime_projection_ready(),
+        )
+    }
+
     fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
         let result: Option<u8> = self
             .conn()?

@@ -2143,6 +2143,17 @@ impl TransferStore for PostgresTransferStore {
         select_tasks(&mut *conn, job_id, run_id, Some(state), Some(limit))
     }
 
+    fn list_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        let mut conn = self.conn()?;
+        select_tasks(
+            &mut *conn,
+            job_id,
+            run_id,
+            Some(TransferTaskState::Failed),
+            None,
+        )
+    }
+
     fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
         let run_id = db_u64(run_id)?;
         self.conn()?

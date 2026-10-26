@@ -740,6 +740,18 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
+    fn list_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        self.record_store_operation("list_failed_tasks", || match self {
+            Self::Memory(store) => store.list_failed_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.list_failed_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.list_failed_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.list_failed_tasks(job_id, run_id),
+        })
+    }
+
     fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
         self.record_store_operation("has_failed_tasks", || match self {
             Self::Memory(store) => store.has_failed_tasks(job_id, run_id),

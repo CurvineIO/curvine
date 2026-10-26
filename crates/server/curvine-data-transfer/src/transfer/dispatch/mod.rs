@@ -1423,40 +1423,36 @@ where
     }
 
     /// Redeliver transiently failed tasks instead of failing the job.
-    /// Returns true while any retryable failed task remains (requeued this
-    /// tick or waiting inside its backoff window); the job must not fail
-    /// during that window. Budget and backoff reuse the stale-retry
-    /// machinery so recovery cadence stays bounded.
+    /// Returns true when this recovery batch has retryable failures but no
+    /// terminal failure. Budget and backoff reuse the stale-retry machinery
+    /// so recovery cadence stays bounded.
     async fn recover_transient_failed_tasks(
         &self,
         job: &TransferJobRecord,
         lease: &TransferLease,
         now: i64,
     ) -> FsResult<bool> {
-        let failed = self.store.list_tasks_by_state(
-            &job.job_id,
-            job.run_id,
-            TransferTaskState::Failed,
-            self.conf.task_probe_concurrency(),
-        )?;
-        let mut retryable_remaining = false;
-        for task in failed {
-            if !is_task_retryable(&task) {
-                continue;
-            }
-            if task.retry_count as usize >= self.conf.task_max_retries {
-                continue;
-            }
-            // Same backoff cadence as stale redelivery: do not hammer a
-            // throttled/limited substrate every tick. A task inside its
-            // backoff window still counts as retryable-remaining: the job
-            // must NOT fail while a transient failure is merely waiting to
-            // be redelivered.
-            let last_attempt_ms = task.progress.update_time.max(task.updated_at);
-            if now.saturating_sub(last_attempt_ms) < stale_retry_backoff_ms(task.retry_count) {
-                retryable_remaining = true;
-                continue;
-            }
+        let failed = self.store.list_failed_tasks(&job.job_id, job.run_id)?;
+        if failed.iter().any(|task| {
+            !is_task_retryable(task) || task.retry_count as usize >= self.conf.task_max_retries
+        }) {
+            return Ok(false);
+        }
+
+        // Every failure here is retryable and still inside the retry budget,
+        // so the job must not fail this tick: tasks waiting out their backoff
+        // window are simply not redelivered yet.
+        let retryable_remaining = !failed.is_empty();
+        // Same backoff cadence as stale redelivery: do not hammer a
+        // throttled/limited substrate every tick.
+        for task in failed
+            .into_iter()
+            .filter(|task| {
+                let last_attempt_ms = task.progress.update_time.max(task.updated_at);
+                now.saturating_sub(last_attempt_ms) >= stale_retry_backoff_ms(task.retry_count)
+            })
+            .take(self.conf.task_probe_concurrency())
+        {
             if !self.store.update_task_state(TransferTaskStateUpdate {
                 job_id: task.job_id.clone(),
                 run_id: task.run_id,
@@ -1471,7 +1467,6 @@ where
             })? {
                 return Ok(retryable_remaining);
             }
-            retryable_remaining = true;
             record_metric(|metrics| {
                 metrics.inc_stale_retry("transient_retry");
                 metrics.inc_requeue("transient_retry");
@@ -1583,16 +1578,15 @@ where
         // loss) are redelivered automatically within the retry budget instead
         // of failing the whole job; permanent failures fall through to
         // finish_failed_transfer below.
-        if self
+        let retryable_failed = self
             .recover_transient_failed_tasks(&job, &lease, now)
-            .await?
-        {
-            return Ok(());
-        }
+            .await?;
 
         if self.store.has_failed_tasks(&job.job_id, job.run_id)? {
-            self.finish_failed_transfer(&job, &lease).await?;
-            return Ok(());
+            if !retryable_failed {
+                self.finish_failed_transfer(&job, &lease).await?;
+                return Ok(());
+            }
         }
 
         if !self
@@ -1611,7 +1605,7 @@ where
             return Ok(());
         }
 
-        if self.store.has_recoverable_tasks(&job.job_id, job.run_id)? {
+        if retryable_failed || self.store.has_recoverable_tasks(&job.job_id, job.run_id)? {
             // acquire_runnable_transfer already refreshed this lease for the current tick.
             return Ok(());
         }
@@ -3028,4 +3022,7 @@ mod tests {
             Duration::from_millis(50)
         );
     }
+
+    #[path = "dispatch_recovery_test.rs"]
+    mod dispatch_recovery_test;
 }
