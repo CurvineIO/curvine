@@ -120,3 +120,32 @@ impl FuseDirentList {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `dirent_len` is the budget READDIR uses to decide which entries fit, so it must agree with
+    /// what `add_dirent` actually writes, including the 8-byte alignment padding.
+    #[test]
+    fn dirent_len_matches_bytes_add_dirent_writes() {
+        let arg = fuse_read_in {
+            size: 1 << 16,
+            ..Default::default()
+        };
+        // 1, 7, 8 and 9 bytes cover the padding boundaries of both dirent headers.
+        for plus in [false, true] {
+            for name in ["a", "abcdefg", "abcdefgh", "abcdefghi"] {
+                let mut list = FuseDirentList::new(&arg);
+                let status = FileStatus::with_name(2, name.to_string(), false);
+                let before = list.remaining();
+                assert!(list.add_dirent(plus, 1, &status, fuse_entry_out::default()));
+                assert_eq!(
+                    FuseDirentList::dirent_len(plus, name),
+                    before - list.remaining(),
+                    "plus={plus} name={name}"
+                );
+            }
+        }
+    }
+}

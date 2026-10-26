@@ -504,6 +504,8 @@ impl CurvineFileSystem {
                 // READDIRPLUS takes a kernel lookup ref (kernel caches the
                 // dentry and will send a FORGET); plain READDIR must not
                 // (kernel returns names only, no lookup count, no FORGET).
+                // `lookup` fails before it bumps that ref (see `DirTree::lookup`),
+                // so bailing out below cannot leave a ref the kernel never repays.
                 let inode = dir.lookup(
                     header.nodeid,
                     &entry.status.name,
@@ -534,7 +536,14 @@ impl CurvineFileSystem {
             // See `readdir_next_cookie` (the infinite-loop guard).
             let next_off = Self::readdir_next_cookie(index);
             let added = res.add_dirent(plus, next_off, &entry.status, out);
+            // Entries are pre-sized with `dirent_len`, which shares the alignment
+            // computation with `add_dirent` (covered by a unit test), so a rejection
+            // is a bug. Keep the cookie from advancing even then: the kernel then
+            // re-requests this position instead of silently losing the name.
             debug_assert!(added, "readdir entry was pre-sized to fit");
+            if !added {
+                break;
+            }
             index += 1;
         }
         let entries = index.saturating_sub(arg.offset);
