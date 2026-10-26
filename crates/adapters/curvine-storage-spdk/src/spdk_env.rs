@@ -1642,18 +1642,15 @@ impl SpdkEnv {
             .ok_or_else(|| err_msg!("SPDK target index {} is not attached", target_idx))?;
         match controller.state() {
             ControllerState::Detached => return Ok(()),
-            ControllerState::Detaching => {}
-            ControllerState::Active => {
-                // Fast-fail only; the real guard is the check before nvme_detach below.
-                Self::validate_detach_preconditions(
-                    target_idx,
-                    self.open_handles.load(Ordering::Acquire),
-                )?;
-                // TODO(spdk): define retry/revert policy for failures after entering Detaching.
-                controller
-                    .state
-                    .store(ControllerState::Detaching as u8, Ordering::Release);
-            }
+            ControllerState::Detaching | ControllerState::Active => {}
+        }
+        // Checked once, before any poller side effect, so an abort has nothing to revert.
+        Self::validate_detach_preconditions(target_idx, self.open_handles.load(Ordering::Acquire))?;
+        if controller.state() == ControllerState::Active {
+            // TODO(spdk): define retry/revert policy for failures after entering Detaching.
+            controller
+                .state
+                .store(ControllerState::Detaching as u8, Ordering::Release);
         }
 
         let ctrlr_key = controller.ctrlr;
@@ -1697,8 +1694,6 @@ impl SpdkEnv {
                 );
             }
         }
-        // Re-check every attempt (a retry may have a newly-opened handle).
-        Self::validate_detach_preconditions(target_idx, self.open_handles.load(Ordering::Acquire))?;
         let rc = self.nvme_detach_ctrlr(ctrlr);
         if rc != 0 {
             // Detach never happened; resume keep-alive polling for this
@@ -2461,7 +2456,7 @@ mod test {
         assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
     }
 
-    /// A retry must still reject a newly-opened handle, not reach nvme_detach.
+    /// A retry must reject a newly-opened handle before touching the poller, not just before nvme_detach.
     #[test]
     fn detach_target_retry_rechecks_open_handles_before_nvme_detach() {
         let mut env = test_env();
@@ -2480,9 +2475,25 @@ mod test {
         env.deferred_qpairs.lock().unwrap().clear();
         env.open_handles.store(1, Ordering::Release);
 
+        let unregister_calls = Arc::new(AtomicUsize::new(0));
+        let unregister_calls_hook = Arc::clone(&unregister_calls);
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(move || {
+            unregister_calls_hook.fetch_add(1, Ordering::AcqRel);
+            UnregisterResult::Acked
+        }));
+        let register_calls = Arc::new(AtomicUsize::new(0));
+        let register_calls_hook = Arc::clone(&register_calls);
+        env.test_hooks.register_ctrlr = Some(Arc::new(move || {
+            register_calls_hook.fetch_add(1, Ordering::AcqRel);
+            UnregisterResult::Acked
+        }));
+
         let err = env.detach_target(0).unwrap_err().to_string();
         assert!(err.contains("while 1 handle"), "unexpected error: {err}");
         assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+        // Must abort before touching the poller, else the controller is left stuck.
+        assert_eq!(unregister_calls.load(Ordering::Acquire), 0);
+        assert_eq!(register_calls.load(Ordering::Acquire), 0);
     }
 
     #[test]
