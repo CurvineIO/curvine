@@ -37,6 +37,9 @@ pub struct WorkerManager {
     pub(crate) conf: ClusterConf,
 }
 
+/// A committed replica to settle: `(block_id, block_len, worker_id)`.
+pub(crate) type SettleEntry = (i64, i64, u32);
+
 impl WorkerManager {
     pub fn new(conf: &ClusterConf) -> FsResult<Self> {
         let worker_policy = WorkerPolicyAdapter::from_conf(conf)?;
@@ -164,21 +167,34 @@ impl WorkerManager {
     /// above its final length. Credit a heartbeat already reclaimed, or
     /// absent because the commit never re-reserved (`FsWriterBase` reopening
     /// an existing block, repeated flushes), settles nothing, so other
-    /// blocks' reservations stay intact. SPDK replicas keep their credit: the
-    /// bdev extent stays fully allocated regardless of `block_len`
-    /// (`BlockMeta::with_final_spdk`), and the heartbeat reclaims it once the
-    /// worker reports the reduced available space.
-    pub(crate) fn settle_committed_blocks(&mut self, commit_blocks: &[CommitBlock]) {
-        for commit in commit_blocks {
-            for loc in &commit.locations {
-                if loc.storage_type == StorageType::SpdkDisk {
-                    continue;
-                }
-                if let Some(worker) = self.worker_map.workers.get_mut(&loc.worker_id) {
-                    worker.settle_scheduled_block(commit.block_id, commit.block_len);
-                }
+    /// blocks' reservations stay intact.
+    pub(crate) fn settle_committed_blocks(&mut self, settles: &[SettleEntry]) {
+        for &(block_id, block_len, worker_id) in settles {
+            if let Some(worker) = self.worker_map.workers.get_mut(&worker_id) {
+                worker.settle_scheduled_block(block_id, block_len);
             }
         }
+    }
+
+    /// Builds the settlement snapshot for committed blocks: one flat
+    /// allocation regardless of block count, so callers can snapshot under
+    /// the namespace write lock before `commit_blocks` is moved into the
+    /// journal. SPDK replicas are filtered out here and keep their credit:
+    /// the bdev extent stays fully allocated regardless of `block_len`
+    /// (`BlockMeta::with_final_spdk`), so the reservation is left for the
+    /// heartbeat to reclaim once the worker reports the reduced available
+    /// space.
+    pub(crate) fn settle_snapshot(commit_blocks: &[CommitBlock]) -> Vec<SettleEntry> {
+        commit_blocks
+            .iter()
+            .flat_map(|commit| {
+                commit
+                    .locations
+                    .iter()
+                    .filter(|loc| loc.storage_type != StorageType::SpdkDisk)
+                    .map(move |loc| (commit.block_id, commit.block_len, loc.worker_id))
+            })
+            .collect()
     }
 
     fn expire_scheduled_bytes(&mut self) {
@@ -572,7 +588,7 @@ mod tests {
             block_len: 4096,
             locations: vec![BlockLocation::with_id(1)],
         };
-        manager.settle_committed_blocks(&[commit]);
+        manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
         assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 4096);
     }
 
@@ -593,7 +609,7 @@ mod tests {
             block_len: block_size,
             locations: vec![BlockLocation::with_id(1)],
         };
-        manager.settle_committed_blocks(&[commit]);
+        manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
         assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
     }
 
@@ -617,7 +633,7 @@ mod tests {
             block_len: 0,
             locations: vec![BlockLocation::with_id(1), BlockLocation::with_id(99)],
         };
-        manager.settle_committed_blocks(&[commit]);
+        manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
         assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
     }
 
@@ -667,7 +683,7 @@ mod tests {
             block_len: 4096,
             locations: vec![BlockLocation::with_id(1)],
         };
-        manager.settle_committed_blocks(&[commit]);
+        manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
         assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
     }
 
@@ -690,7 +706,7 @@ mod tests {
                 block_len,
                 locations: vec![BlockLocation::with_id(1)],
             };
-            manager.settle_committed_blocks(&[commit]);
+            manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
         }
         assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 4096);
     }
@@ -713,7 +729,7 @@ mod tests {
             block_len: 4096,
             locations: vec![BlockLocation::new(1, StorageType::SpdkDisk)],
         };
-        manager.settle_committed_blocks(&[commit]);
+        manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
         assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
     }
 

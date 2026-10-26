@@ -78,11 +78,21 @@ pub struct WorkerInfo {
     pub scheduled_bytes: i64,
     #[serde(skip)]
     pub scheduled_since_ms: u64,
-    /// Per-block share of `scheduled_bytes`, keyed by block id. The sum of
-    /// these credits never exceeds `scheduled_bytes`; the difference is
-    /// reservation not yet bound to a block.
+    /// Per-block share of `scheduled_bytes`, keyed by block id. The value is
+    /// `(allocation sequence, credit bytes)`: block ids group by file
+    /// creation order (`InodeId::create_block_id`), so reclaim trimming
+    /// orders by the sequence, which tracks reservation age. The credit sum
+    /// (`scheduled_block_bytes`) never exceeds `scheduled_bytes`; the
+    /// difference is reservation not yet bound to a block.
     #[serde(skip)]
-    pub scheduled_blocks: BTreeMap<i64, i64>,
+    pub scheduled_blocks: BTreeMap<i64, (u64, i64)>,
+    /// Running sum of `scheduled_blocks` credits, so the anonymous remainder
+    /// and the reclaim excess are O(1) on the allocation and commit paths.
+    #[serde(skip)]
+    pub scheduled_block_bytes: i64,
+    /// Monotonic allocation sequence for `scheduled_blocks` values.
+    #[serde(skip)]
+    pub scheduled_seq: u64,
 }
 
 impl WorkerInfo {
@@ -111,6 +121,8 @@ impl WorkerInfo {
             scheduled_bytes: 0,
             scheduled_since_ms: 0,
             scheduled_blocks: BTreeMap::new(),
+            scheduled_block_bytes: 0,
+            scheduled_seq: 0,
         }
     }
 
@@ -175,25 +187,26 @@ impl WorkerInfo {
         self.adjust_scheduled_bytes(bytes.saturating_neg());
     }
 
-    fn scheduled_block_total(&self) -> i64 {
-        self.scheduled_blocks
-            .values()
-            .fold(0i64, |acc, v| acc.saturating_add(*v))
-    }
-
     /// Binds part of the anonymous reservation to a block, so a later commit
     /// settles exactly the credit this block still owns. Credit a heartbeat
     /// already reclaimed is gone and cannot be bound.
     pub fn bind_scheduled_block(&mut self, block_id: i64, bytes: i64) {
         let anonymous = self
             .scheduled_bytes
-            .saturating_sub(self.scheduled_block_total());
+            .saturating_sub(self.scheduled_block_bytes);
         let credit = bytes.min(anonymous);
         if credit <= 0 {
             return;
         }
-        let entry = self.scheduled_blocks.entry(block_id).or_insert(0);
-        *entry = entry.saturating_add(credit);
+        self.scheduled_seq += 1;
+        // A rebind of the same block keeps its original sequence: the oldest
+        // reservation age is the correct trim priority.
+        let entry = self
+            .scheduled_blocks
+            .entry(block_id)
+            .or_insert((self.scheduled_seq, 0));
+        entry.1 = entry.1.saturating_add(credit);
+        self.scheduled_block_bytes = self.scheduled_block_bytes.saturating_add(credit);
     }
 
     /// Releases the committed block's credit above its final length. A block
@@ -203,16 +216,19 @@ impl WorkerInfo {
     /// credit is left for the heartbeat to reclaim once the worker reports
     /// the reduced available space.
     pub fn settle_scheduled_block(&mut self, block_id: i64, block_len: i64) {
-        let Some(credit) = self.scheduled_blocks.get_mut(&block_id) else {
+        let Some(&(seq, credit)) = self.scheduled_blocks.get(&block_id) else {
             return;
         };
-        let keep = block_len.clamp(0, *credit);
-        let release = *credit - keep;
+        let keep = block_len.clamp(0, credit);
+        let release = credit - keep;
         if keep == 0 {
             self.scheduled_blocks.remove(&block_id);
         } else {
-            *credit = keep;
+            self.scheduled_blocks.insert(block_id, (seq, keep));
         }
+        // Reduce the credit sum first: the aggregate adjustment below then
+        // sees the invariant already restored and skips the trim scan.
+        self.scheduled_block_bytes = self.scheduled_block_bytes.saturating_sub(release).max(0);
         if release > 0 {
             self.adjust_scheduled_bytes(release.saturating_neg());
         }
@@ -234,27 +250,42 @@ impl WorkerInfo {
     }
 
     /// Keeps the per-block credit sum within `scheduled_bytes` after a
-    /// reclaim, consuming the anonymous remainder first and then the oldest
-    /// blocks (smallest id).
+    /// reclaim, consuming the anonymous remainder first and then block
+    /// credits by reservation age (allocation sequence), oldest first. The
+    /// running sum makes the no-excess case O(1); the sort only runs when a
+    /// heartbeat reclaimed more than the anonymous remainder.
     fn shrink_block_credits(&mut self) {
         if self.scheduled_bytes == 0 {
             self.scheduled_blocks.clear();
+            self.scheduled_block_bytes = 0;
             return;
         }
         let mut excess = self
-            .scheduled_block_total()
+            .scheduled_block_bytes
             .saturating_sub(self.scheduled_bytes);
-        while excess > 0 {
-            let Some((&block_id, &credit)) = self.scheduled_blocks.iter().next() else {
+        if excess <= 0 {
+            return;
+        }
+        let mut by_age: Vec<(u64, i64, i64)> = self
+            .scheduled_blocks
+            .iter()
+            .map(|(&block_id, &(seq, credit))| (seq, block_id, credit))
+            .collect();
+        by_age.sort_unstable();
+        for (seq, block_id, credit) in by_age {
+            if excess <= 0 {
                 break;
-            };
+            }
             if credit <= excess {
                 self.scheduled_blocks.remove(&block_id);
-                excess -= credit.max(0);
+                self.scheduled_block_bytes =
+                    self.scheduled_block_bytes.saturating_sub(credit).max(0);
+                excess -= credit;
             } else {
-                if let Some(c) = self.scheduled_blocks.get_mut(&block_id) {
-                    *c = credit - excess;
-                }
+                self.scheduled_blocks
+                    .insert(block_id, (seq, credit - excess));
+                self.scheduled_block_bytes =
+                    self.scheduled_block_bytes.saturating_sub(excess).max(0);
                 break;
             }
         }
@@ -277,7 +308,18 @@ impl WorkerInfo {
             self.scheduled_bytes = 0;
             self.scheduled_since_ms = 0;
             self.scheduled_blocks.clear();
+            self.scheduled_block_bytes = 0;
         }
+    }
+
+    /// Carries the in-flight reservation state from the previous
+    /// registration of the same worker across a heartbeat re-insert.
+    pub fn carry_scheduled_from(&mut self, previous: &mut WorkerInfo) {
+        self.scheduled_bytes = previous.scheduled_bytes;
+        self.scheduled_since_ms = previous.scheduled_since_ms;
+        self.scheduled_blocks = std::mem::take(&mut previous.scheduled_blocks);
+        self.scheduled_block_bytes = previous.scheduled_block_bytes;
+        self.scheduled_seq = previous.scheduled_seq;
     }
 
     pub fn rpc_addr(&self) -> String {
@@ -324,6 +366,8 @@ impl Default for WorkerInfo {
             scheduled_bytes: 0,
             scheduled_since_ms: 0,
             scheduled_blocks: BTreeMap::new(),
+            scheduled_block_bytes: 0,
+            scheduled_seq: 0,
         }
     }
 }
@@ -487,6 +531,13 @@ mod tests {
         assert_eq!(worker.scheduled_bytes, 128);
     }
 
+    fn block_credit(worker: &WorkerInfo, block_id: i64) -> Option<i64> {
+        worker
+            .scheduled_blocks
+            .get(&block_id)
+            .map(|&(_, credit)| credit)
+    }
+
     #[test]
     fn bind_scheduled_block_caps_credit_at_anonymous_reservation() {
         let mut worker = WorkerInfo::default();
@@ -495,10 +546,12 @@ mod tests {
         // can only own what is still outstanding.
         worker.unschedule_bytes(100);
         worker.bind_scheduled_block(1, 128);
-        assert_eq!(worker.scheduled_blocks.get(&1), Some(&28));
+        assert_eq!(block_credit(&worker, 1), Some(28));
+        assert_eq!(worker.scheduled_block_bytes, 28);
         // Nothing anonymous is left for a second block.
         worker.bind_scheduled_block(2, 128);
-        assert_eq!(worker.scheduled_blocks.get(&2), None);
+        assert_eq!(block_credit(&worker, 2), None);
+        assert_eq!(worker.scheduled_block_bytes, 28);
     }
 
     #[test]
@@ -509,6 +562,7 @@ mod tests {
 
         worker.settle_scheduled_block(1, 32);
         assert_eq!(worker.scheduled_bytes, 32);
+        assert_eq!(worker.scheduled_block_bytes, 32);
         // A repeated flush or a larger commit releases nothing further.
         worker.settle_scheduled_block(1, 32);
         worker.settle_scheduled_block(1, 64);
@@ -516,23 +570,28 @@ mod tests {
         // A block without credit settles nothing.
         worker.settle_scheduled_block(2, 0);
         assert_eq!(worker.scheduled_bytes, 32);
+        assert_eq!(worker.scheduled_block_bytes, 32);
     }
 
     #[test]
-    fn heartbeat_reclaim_shrinks_oldest_block_credit_first() {
+    fn heartbeat_reclaim_trims_by_reservation_age_not_block_id() {
         let mut worker = WorkerInfo {
             available: 1 << 30,
             ..Default::default()
         };
+        // Block ids group by file creation order, so the numerically larger
+        // id can hold the older reservation. Bind id 10 first: its credit
+        // must be trimmed first even though 2 < 10.
         worker.schedule_bytes(256);
-        worker.bind_scheduled_block(1, 128);
+        worker.bind_scheduled_block(10, 128);
         worker.bind_scheduled_block(2, 128);
 
         worker.available -= 160;
         worker.reclaim_scheduled_from_heartbeat(worker.available + 160);
         assert_eq!(worker.scheduled_bytes, 96);
-        assert_eq!(worker.scheduled_blocks.get(&1), None);
-        assert_eq!(worker.scheduled_blocks.get(&2), Some(&96));
+        assert_eq!(block_credit(&worker, 10), None);
+        assert_eq!(block_credit(&worker, 2), Some(96));
+        assert_eq!(worker.scheduled_block_bytes, 96);
     }
 
     #[test]
@@ -544,5 +603,6 @@ mod tests {
         worker.expire_scheduled_bytes(20, 10);
         assert_eq!(worker.scheduled_bytes, 0);
         assert!(worker.scheduled_blocks.is_empty());
+        assert_eq!(worker.scheduled_block_bytes, 0);
     }
 }

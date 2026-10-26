@@ -19,6 +19,7 @@ use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
 use crate::master::meta::{CacheInvalidationResult, FsDir};
 
+use crate::master::fs::worker_manager::WorkerManager;
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
@@ -659,7 +660,7 @@ impl MasterFilesystem {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
-        let settle_blocks = commit_blocks.clone();
+        let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         let block =
             match fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len) {
                 Ok(block) => block,
@@ -745,7 +746,7 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
-        let settle_blocks = commit_blocks.clone();
+        let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         fs_dir.complete_file(
             path,
             &mut inode,
@@ -2396,6 +2397,115 @@ mod tests {
                 .unwrap()
                 .scheduled_bytes,
             0
+        );
+    }
+
+    #[test]
+    fn complete_file_settles_commit_reservation_through_entry_path() {
+        let fs = test_fs("complete-file-settles");
+        let capacity = 1 << 40;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/settle/small.log", true).unwrap();
+        let located = fs
+            .add_block(
+                "/settle/small.log",
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size
+        );
+
+        let mut commit = CommitBlock::from(&located);
+        commit.block_len = 4096;
+        fs.complete_file(
+            "/settle/small.log",
+            None,
+            4096,
+            vec![commit],
+            "client",
+            false,
+            None,
+        )
+        .unwrap();
+
+        // The unused remainder is released on commit; only the written bytes
+        // stay reserved until the heartbeat delta reclaims them.
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            4096
+        );
+    }
+
+    #[test]
+    fn add_block_settles_previous_commit_through_entry_path() {
+        let fs = test_fs("add-block-settles");
+        let capacity = 1 << 40;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/settle/grow.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .add_block(
+                "/settle/grow.log",
+                None,
+                client.clone(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+
+        let mut commit = CommitBlock::from(&first);
+        commit.block_len = 4096;
+        let second = fs
+            .add_block(
+                "/settle/grow.log",
+                None,
+                client,
+                vec![commit],
+                vec![],
+                4096,
+                Some(first.block.clone()),
+            )
+            .unwrap();
+        assert_ne!(second.block.id, first.block.id);
+
+        // The first block's reservation settles to its committed 4 KiB while
+        // the new block holds a fresh full reservation.
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size + 4096
         );
     }
 }
