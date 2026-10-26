@@ -379,6 +379,11 @@ mod tests {
             self.0.shutdowns.load(Ordering::SeqCst)
         }
 
+        async fn active_lease_id(&self, endpoint: &ServiceEndpoint) -> Option<i64> {
+            let key = format!("{}/{}", endpoint.kind, endpoint.id);
+            self.0.active.lock().await.get(&key).copied()
+        }
+
         fn consume_failure(&self) -> bool {
             self.0
                 .fail_next
@@ -591,6 +596,54 @@ mod tests {
             DiscoveryError::RegistrationStartupTimeout { .. }
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn stopped_supervisor_cannot_revoke_replacement_registration() {
+        let registry = TestRegistry::default();
+        let endpoint = test_endpoint();
+        let mut stopped = RegistrationSupervisor::start(
+            Arc::new(registry.clone()),
+            endpoint.clone(),
+            RegistrationOptions::default(),
+            test_retry_policy(),
+        )
+        .await
+        .unwrap();
+        registry.lose_latest().await;
+
+        let mut status = stopped.subscribe_status();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if registry.calls() >= 2
+                    && matches!(*status.borrow(), RegistrationSupervisorStatus::Registered)
+                {
+                    break;
+                }
+                status.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        stopped.shutdown().await.unwrap();
+        let mut replacement = RegistrationSupervisor::start(
+            Arc::new(registry.clone()),
+            endpoint.clone(),
+            RegistrationOptions::default(),
+            test_retry_policy(),
+        )
+        .await
+        .unwrap();
+        let replacement_lease = registry.active_lease_id(&endpoint).await.unwrap();
+
+        stopped.shutdown().await.unwrap();
+
+        assert_eq!(
+            registry.active_lease_id(&endpoint).await,
+            Some(replacement_lease)
+        );
+        replacement.shutdown().await.unwrap();
     }
 
     #[test]
