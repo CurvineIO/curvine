@@ -98,15 +98,14 @@ mod tests {
     #[test]
     fn parses_async_flag() {
         let cli = Cli::try_parse_from(["rm", "rm", "-r", "--async", "/data"]).unwrap();
+        // `RmCommand` has a single variant, so the pattern is irrefutable and an
+        // `else { panic!(..) }` clause would be unreachable (`irrefutable_let_patterns`).
         let RmCommand::Rm {
             recursive,
             skip_trash,
             async_delete,
             ..
-        } = cli.command
-        else {
-            panic!("expected the rm command");
-        };
+        } = cli.command;
         assert!(recursive);
         assert!(async_delete);
         assert!(!skip_trash, "--async must not imply --skip-trash");
@@ -115,9 +114,7 @@ mod tests {
     #[test]
     fn async_defaults_to_off() {
         let cli = Cli::try_parse_from(["rm", "rm", "/data"]).unwrap();
-        let RmCommand::Rm { async_delete, .. } = cli.command else {
-            panic!("expected the rm command");
-        };
+        let RmCommand::Rm { async_delete, .. } = cli.command;
         assert!(!async_delete);
     }
 }
