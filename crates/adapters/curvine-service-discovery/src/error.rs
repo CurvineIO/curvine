@@ -20,6 +20,8 @@ pub enum DiscoveryError {
     InvalidRegistrationOptions(String),
     #[error("invalid discovery config: {0}")]
     InvalidDiscoveryConfig(String),
+    #[error("discovery provider unavailable: {0}")]
+    ProviderUnavailable(String),
     #[error("service registration already exists: {0}")]
     RegistrationAlreadyExists(String),
     #[error("etcd unavailable: {0}")]

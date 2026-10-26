@@ -2,6 +2,7 @@ mod endpoint;
 mod error;
 #[cfg(feature = "etcd")]
 mod etcd_provider;
+mod factory;
 #[cfg(test)]
 mod fake;
 mod key;
@@ -15,6 +16,9 @@ pub use self::endpoint::{
 pub use self::error::{DiscoveryError, DiscoveryResult};
 #[cfg(feature = "etcd")]
 pub use self::etcd_provider::{EtcdDiscoveryConfig, EtcdServiceRegistry, EtcdServiceResolver};
+#[cfg(feature = "etcd")]
+pub use self::factory::connect_etcd;
+pub use self::factory::{ensure_provider_available, DiscoveryProvider};
 pub use self::key::{normalize_prefix, validate_cluster_id, ServiceKey};
 pub use self::registry::{
     RegistrationControl, RegistrationGuard, RegistrationOptions, RegistrationStatus,
