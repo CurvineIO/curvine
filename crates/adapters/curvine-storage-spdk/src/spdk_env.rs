@@ -1685,17 +1685,33 @@ impl SpdkEnv {
                 return err_box!("SPDK poller is not running; refusing runtime detach");
             }
             result => {
-                // TODO(spdk): on sustained timeout, defer+reconcile via a
-                // deferred_ctrlrs map + CtrlrAckRegistry instead of leaking it.
+                // TODO(spdk): double-timeout still needs deferred_ctrlrs + CtrlrAckRegistry.
+                // Compensation is safe: FIFO + `lifecycle` guarantee this runs last.
+                let compensation = self.register_ctrlr_with_poller_until_acked(CtrlHandle(ctrlr));
+                if compensation == UnregisterResult::Acked {
+                    return err_box!(
+                        "poller did not acknowledge SPDK target {} removal in time ({:?}); \
+                         controller was re-registered and remains polled, retry detach later",
+                        target_idx,
+                        result
+                    );
+                }
+                error!(
+                    "SPDK target {}: unregister ack timed out ({:?}) and compensating \
+                     re-register also failed ({:?}); controller polling state is uncertain",
+                    target_idx, result, compensation
+                );
                 return err_box!(
-                    "poller did not acknowledge SPDK target {} removal: {:?}",
+                    "poller did not acknowledge SPDK target {} removal or re-registration \
+                     ({:?}/{:?}); controller polling state is uncertain, retry detach",
                     target_idx,
-                    result
+                    result,
+                    compensation
                 );
             }
         }
         // TODO(spdk): known TOCTOU race here, to be eliminated via per-controller locks.
-        // Observability only, never aborts (see issue-spdk-detach-toctou-observability.md).
+        // Observability only, never aborts
         if self.open_handles.load(Ordering::Acquire) != 0 {
             error!(
                 "SPDK target {}: proceeding to nvme_detach with open handle(s) present \
@@ -1710,7 +1726,7 @@ impl SpdkEnv {
             if self.register_ctrlr_with_poller_until_acked(CtrlHandle(ctrlr))
                 != UnregisterResult::Acked
             {
-                // TODO(spdk): same deferred_ctrlrs + CtrlrAckRegistry gap as above.
+                // TODO(spdk): same deferred_ctrlrs + CtrlrAckRegistry gap as the unregister-timeout path
                 warn!(
                     "SPDK target {}: failed to resume admin polling after nvme_detach failure",
                     target_idx
@@ -2627,6 +2643,14 @@ mod test {
             detach_calls_hook.fetch_add(1, Ordering::AcqRel);
             0
         }));
+        // Compensation succeeds: the orphaned unregister (if it ever lands)
+        // is guaranteed to be re-registered right behind it.
+        let register_calls = Arc::new(AtomicUsize::new(0));
+        let register_calls_hook = Arc::clone(&register_calls);
+        env.test_hooks.register_ctrlr = Some(Arc::new(move || {
+            register_calls_hook.fetch_add(1, Ordering::AcqRel);
+            UnregisterResult::Acked
+        }));
 
         let err = env.detach_target(0).unwrap_err().to_string();
 
@@ -2634,9 +2658,26 @@ mod test {
             err.contains("did not acknowledge"),
             "unexpected error: {err}"
         );
-        assert!(err.contains("TimedOut"), "unexpected error: {err}");
+        assert!(err.contains("re-registered"), "unexpected error: {err}");
         assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
         assert_eq!(detach_calls.load(Ordering::Acquire), 0);
+        assert_eq!(register_calls.load(Ordering::Acquire), 1);
+    }
+
+    /// Regression: if the compensating re-register also fails, the error must
+    /// say the polling state is uncertain, not falsely claim it was restored.
+    #[test]
+    fn detach_target_surfaces_uncertain_state_when_compensation_also_fails() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.test_hooks.ctrlr_poller_ack_retry_deadline = Some(Duration::from_millis(50));
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::TimedOut));
+        env.test_hooks.register_ctrlr = Some(Arc::new(|| UnregisterResult::TimedOut));
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(err.contains("uncertain"), "unexpected error: {err}");
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
     }
 
     /// A single missed ack window must not be treated as final.
