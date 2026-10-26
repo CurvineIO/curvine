@@ -23,6 +23,8 @@ export const DEFAULT_PROFILE_SECONDS = 5
 /** What the sampled process reports it can serve. */
 export interface ProfileCapability {
   max_duration_secs?: number | null
+  memory_enabled?: boolean | null
+  memory_available?: boolean | null
 }
 
 /**
@@ -75,17 +77,29 @@ function toSeconds(value: string): number {
  * `theme` is passed because the returned SVG is a static document with baked
  * colours; it cannot read the console's CSS variables.
  */
+/** Which profile the dialog is showing. */
+export type ProfileKind = 'cpu' | 'memory'
+
+/**
+ * Builds the profiling URL for the requested kind.
+ *
+ * The two endpoints differ in more than their path: the CPU graph samples for
+ * a window the caller chooses, while the heap graph reads samples jemalloc has
+ * been recording since startup, so it takes no duration.
+ */
 export function profileUrl(
   host: string | null | undefined,
   webPort: number | null | undefined,
   seconds: number = DEFAULT_PROFILE_SECONDS,
-  theme: 'light' | 'dark' = 'light'
+  theme: 'light' | 'dark' = 'light',
+  kind: ProfileKind = 'cpu'
 ) {
   if (!host || !webPort) return null
-  return (
-    `http://${host}:${webPort}/api/v1/profiling/cpu` +
-    `?seconds=${seconds}&frequency=${PROFILE_FREQUENCY}&theme=${theme}`
-  )
+  const base = `http://${host}:${webPort}/api/v1/profiling`
+  if (kind === 'memory') {
+    return `${base}/memory?theme=${theme}`
+  }
+  return `${base}/cpu?seconds=${seconds}&frequency=${PROFILE_FREQUENCY}&theme=${theme}`
 }
 
 /**
@@ -153,6 +167,7 @@ export function ProfileDialog({ host, webPort, target, open, onOpenChange }: Pro
   const t = useT()
   const { resolved } = useTheme()
   const [seconds, setSeconds] = useState<number>(DEFAULT_PROFILE_SECONDS)
+  const [kind, setKind] = useState<ProfileKind>('cpu')
   const [capability, setCapability] = useState<ProfileCapability | null>(null)
   // The sampler blocks for the whole window, so the iframe stays blank until
   // the response arrives. Track load state so that wait is explained.
@@ -186,9 +201,13 @@ export function ProfileDialog({ host, webPort, target, open, onOpenChange }: Pro
     return Number.isFinite(cap) && cap > 0 ? Math.min(seconds, cap) : seconds
   }, [seconds, capability])
 
+  // The heap graph is only offered when the process reports it can serve one.
+  const memoryReady = Boolean(capability?.memory_enabled && capability?.memory_available)
+  const activeKind: ProfileKind = kind === 'memory' && memoryReady ? 'memory' : 'cpu'
+
   const url = useMemo(
-    () => profileUrl(host, webPort, effectiveSeconds, resolved),
-    [host, webPort, effectiveSeconds, resolved]
+    () => profileUrl(host, webPort, effectiveSeconds, resolved, activeKind),
+    [host, webPort, effectiveSeconds, resolved, activeKind]
   )
 
   // A new request (duration, theme, target) or a reopened dialog starts over;
@@ -205,15 +224,41 @@ export function ProfileDialog({ host, webPort, target, open, onOpenChange }: Pro
             {target ? t('workers.profile.titleWithTarget', { target }) : t('workers.profile.title')}
           </DialogTitle>
           <DialogDescription>
-            {url
-              ? t('workers.profile.description', { seconds: effectiveSeconds })
-              : t('workers.profile.unsupported')}
+            {!url
+              ? t('workers.profile.unsupported')
+              : activeKind === 'memory'
+                ? t('workers.profile.memoryDescription')
+                : t('workers.profile.description', { seconds: effectiveSeconds })}
           </DialogDescription>
         </DialogHeader>
 
         {url ? (
           <div className="space-y-2">
             <div className="flex items-center gap-2">
+              <Select
+                value={activeKind}
+                onValueChange={(value) => setKind(value === 'memory' ? 'memory' : 'cpu')}
+              >
+                <SelectTrigger
+                  size="sm"
+                  className="w-32"
+                  aria-label={t('workers.profile.kind')}
+                  data-testid="profile-kind"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="cpu">{t('workers.profile.kindCpu')}</SelectItem>
+                  <SelectItem value="memory" disabled={!memoryReady}>
+                    {t('workers.profile.kindMemory')}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+
+              {/* The heap graph has no window: jemalloc samples continuously,
+                  so a duration control would be meaningless there. */}
+              {activeKind === 'cpu' && (
+                <>
               <label
                 className="text-xs text-muted-foreground"
                 htmlFor="profile-duration"
@@ -240,6 +285,8 @@ export function ProfileDialog({ host, webPort, target, open, onOpenChange }: Pro
                   ))}
                 </SelectContent>
               </Select>
+                </>
+              )}
 
               <Button
                 variant="ghost"

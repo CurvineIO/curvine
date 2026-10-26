@@ -8,6 +8,7 @@ license.workspace = true
 default = []
 # CPU flame-graph sampling: compiles the SIGPROF sampler and mounts its route.
 profiling = ["curvine-profiling/profiling", "curvine-web/profiling"]
+memory-profiling = ["profiling", "curvine-profiling/memory-profiling", "curvine-web/memory-profiling"]
 spdk = [
     "dep:curvine-storage-spdk",
     "curvine-storage-spdk/spdk",

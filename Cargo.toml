@@ -226,6 +226,10 @@ chrono = { version = "0.4.31", default-features = false, features = ["clock"] }
 prometheus = { version = "0.13.4", features = ["process"] }
 # CPU flame-graph sampling. Feature-gated by `curvine-profiling/profiling`.
 pprof = { version = "0.15" }
+# Heap profile: converts jemalloc samples to flame graphs. 0.8 keeps the
+# tikv-jemalloc-ctl 0.6 line the workspace already pins; 0.9 pulls ctl 0.7 and
+# Cargo rejects two versions of the same `links = "jemalloc"` native library.
+jemalloc_pprof = { version = "0.8", default-features = false }
 sysinfo = "0.30.13"
 fs2 = "0.4.3"
 byteorder = "1.5.0"

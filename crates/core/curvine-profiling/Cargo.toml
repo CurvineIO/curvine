@@ -11,8 +11,21 @@ log = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 pprof = { workspace = true, features = ["flamegraph"], optional = true }
+# Heap profile: reads jemalloc's own allocation samples and renders them.
+# `flamegraph` implies `symbolize`, which resolves frames in-process so no
+# external pprof/addr2line tool is needed.
+jemalloc_pprof = { workspace = true, features = ["flamegraph"], optional = true }
+# jemalloc_pprof pins inferno 0.12 while pprof pins 0.11; both major lines end
+# up in the graph, so the heap graph's options type is named explicitly.
+inferno = { version = "0.12", optional = true }
+
+[dev-dependencies]
+tikv-jemallocator = { workspace = true, features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 
 [features]
 # Compiles the SIGPROF sampler. Without it this crate only exposes the
 # configuration gate, so default builds carry no profiling dependency.
 profiling = ["dep:pprof"]
+# Heap profiling additionally needs the allocator built with `--enable-prof`;
+# that is `curvine-alloc/memory-profiling`, enabled by the binary crate.
+memory-profiling = ["profiling", "dep:jemalloc_pprof", "dep:inferno"]

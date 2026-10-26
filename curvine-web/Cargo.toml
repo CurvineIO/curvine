@@ -45,3 +45,5 @@ tower = { workspace = true, features = ["util"] }
 [features]
 # Forwards to the sampler crate: without it the route is never mounted.
 profiling = ["curvine-profiling/profiling"]
+# Heap profile: needs the jemalloc sampling build plus the conversion crate.
+memory-profiling = ["curvine-profiling/memory-profiling"]

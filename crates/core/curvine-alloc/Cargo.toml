@@ -10,11 +10,19 @@ mimalloc = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
+# Same crate, enabled with the native `--enable-prof` build flag. Cargo unifies
+# features across the graph, so this only takes effect when a consumer turns on
+# `memory-profiling` below.
+tikv-jemalloc-sys = { workspace = true, optional = true, features = ["profiling"] }
 
 [features]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 system = []
+# Compiles jemalloc with heap profiling (--enable-prof) and exports the
+# `malloc_conf` symbol that activates it. Off by default: it grows the binary
+# and adds sampling cost to every allocation.
+memory-profiling = ["jemalloc", "dep:tikv-jemalloc-sys"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

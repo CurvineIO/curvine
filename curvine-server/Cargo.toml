@@ -32,6 +32,15 @@ fault-injection = [
 # `-f profiling` on build.sh enables it. The binaries then still need
 # `profiling.cpu_enabled = true` to expose the route.
 profiling = ["curvine-master/profiling", "curvine-worker/profiling"]
+# Heap profile. Also switches the allocator to the `--enable-prof` jemalloc
+# build; without `curvine-alloc/memory-profiling` jemalloc would reject the
+# `prof.*` mallctl and the route would report NotActivated.
+memory-profiling = [
+    "profiling",
+    "curvine-master/memory-profiling",
+    "curvine-worker/memory-profiling",
+    "curvine-alloc/memory-profiling",
+]
 
 [dependencies]
 curvine-core-error = { workspace = true }

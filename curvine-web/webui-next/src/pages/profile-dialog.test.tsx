@@ -49,6 +49,14 @@ describe('profileUrl', () => {
     expect(DEFAULT_PROFILE_SECONDS).toBe(PROFILE_DURATIONS[0])
   })
 
+  it('targets the heap endpoint without a duration', () => {
+    // The heap graph reads samples jemalloc already recorded, so there is no
+    // window to request; sending one would imply a wait that never happens.
+    expect(profileUrl('10.0.0.1', 9002, 60, 'dark', 'memory')).toBe(
+      'http://10.0.0.1:9002/api/v1/profiling/memory?theme=dark'
+    )
+  })
+
   it('returns null when the web port is unknown', () => {
     // A missing web port means the endpoint cannot be addressed at all, so
     // the caller must not build a host-only URL that silently 404s.

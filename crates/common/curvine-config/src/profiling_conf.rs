@@ -52,6 +52,12 @@ pub const DEFAULT_MAX_DURATION_SECS: u64 = 120;
 /// is listed because several distributions ship incorrect DWARF for it.
 pub const DEFAULT_BLOCKLIST: [&str; 4] = ["libc", "libgcc", "pthread", "vdso"];
 
+/// Default heap sampling interval as log2(bytes): 19 = 512 KiB.
+///
+/// jemalloc's own default. Smaller values give finer attribution at a higher
+/// sampling cost; every sampled allocation records a stack trace.
+pub const DEFAULT_MEMORY_LG_PROF_SAMPLE: u8 = 19;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProfilingConf {
@@ -72,6 +78,21 @@ pub struct ProfilingConf {
 
     /// Frame modules excluded from the sampled backtrace.
     pub blocklist: Vec<String>,
+
+    /// Master switch for the jemalloc heap profile (memory flame graph).
+    ///
+    /// Unlike the CPU sampler this cannot be turned on at runtime: jemalloc
+    /// reads `prof_active` and the sampling interval once at process start.
+    /// The switch therefore only decides whether the route is exposed — a
+    /// process started without profiling compiled in reports the feature as
+    /// unavailable rather than answering with an empty profile.
+    pub memory_enabled: bool,
+
+    /// Average bytes between heap samples, as a base-2 logarithm.
+    ///
+    /// 19 = 512 KiB, jemalloc's default. Larger values sample less often and
+    /// cost less; every sampled allocation records a stack.
+    pub memory_lg_prof_sample: u8,
 }
 
 impl Default for ProfilingConf {
@@ -81,6 +102,8 @@ impl Default for ProfilingConf {
             cpu_frequency: DEFAULT_CPU_FREQUENCY,
             max_duration_secs: DEFAULT_MAX_DURATION_SECS,
             blocklist: DEFAULT_BLOCKLIST.iter().map(|s| s.to_string()).collect(),
+            memory_enabled: false,
+            memory_lg_prof_sample: DEFAULT_MEMORY_LG_PROF_SAMPLE,
         }
     }
 }
@@ -107,6 +130,14 @@ impl ProfilingConf {
         // would silently match every module and empty the profile.
         if self.blocklist.iter().any(|entry| entry.trim().is_empty()) {
             return Err("profiling.blocklist must not contain blank entries".to_string());
+        }
+        // jemalloc accepts 0..=23; below 12 the sampling cost becomes
+        // prohibitive for a storage server, so keep the useful band only.
+        if !(12..=23).contains(&self.memory_lg_prof_sample) {
+            return Err(format!(
+                "profiling.memory_lg_prof_sample must be in 12..=23, got {}",
+                self.memory_lg_prof_sample
+            ));
         }
         Ok(())
     }

@@ -133,6 +133,38 @@ pub fn check_startup(conf: &ProfilingConf) -> Result<(), ProfilingError> {
 /// The returned `seconds`/`frequency` are the values actually used, so a
 /// clamped request is visible to the caller instead of silently differing
 /// from what it asked for.
+/// Picks inferno's frozen palette for a console theme.
+///
+/// Both flame graphs (CPU and heap) are static SVGs built by the sampled
+/// process, so neither can read the console's CSS variables. These settings
+/// are the closest available match; `uicolor` is the search box and the reset
+/// button.
+///
+/// `FlamegraphOptions` and `pprof::flamegraph::Options` are the same underlying
+/// `inferno` type, so one helper serves both.
+#[cfg(all(any(feature = "profiling", feature = "memory-profiling"), unix))]
+fn flamegraph_options(theme: ProfileTheme) -> pprof::flamegraph::Options<'static> {
+    use pprof::flamegraph::{color, Options};
+    let mut options = Options::default();
+    match theme {
+        // Light: keep inferno's default warm background, which matches the
+        // light console's near-white surfaces.
+        ProfileTheme::Light => {
+            options.bgcolors = Some(color::BackgroundColor::Yellow);
+            options.uicolor = color::Color::new(0, 0, 0);
+        }
+        // Dark: a flat near-black plate instead of a gradient, with light UI
+        // text so the search box stays legible.
+        ProfileTheme::Dark => {
+            options.bgcolors = Some(color::BackgroundColor::Flat(color::Color::new(
+                0x0f, 0x11, 0x15,
+            )));
+            options.uicolor = color::Color::new(0xe6, 0xe6, 0xe6);
+        }
+    }
+    options
+}
+
 pub fn sample(
     conf: &ProfilingConf,
     requested_secs: Option<u64>,
@@ -214,36 +246,6 @@ mod imp {
         }
     }
 
-    /// Picks inferno's frozen palette for a console theme.
-    ///
-    /// The flame graph is a static SVG built by the sampled process, so it
-    /// cannot read the console's CSS variables. These two settings are the
-    /// closest available match; `uicolor` is the search box and reset button.
-    fn flamegraph_options(theme: super::ProfileTheme) -> pprof::flamegraph::Options<'static> {
-        use pprof::flamegraph::{color, Options};
-        let mut options = Options::default();
-        match theme {
-            // Light: keep inferno's default warm background, which matches
-            // the light console's near-white surfaces.
-            super::ProfileTheme::Light => {
-                options.bgcolors = Some(color::BackgroundColor::Yellow);
-                options.uicolor = color::Color::new(0, 0, 0);
-            }
-            // Dark: a flat near-black plate instead of a gradient, with light
-            // UI text so the search box stays legible.
-            super::ProfileTheme::Dark => {
-                options.bgcolors = Some(color::BackgroundColor::Flat(color::Color::new(
-                    0x0f, 0x11, 0x15,
-                )));
-                options.uicolor = color::Color::new(0xe6, 0xe6, 0xe6);
-                // Darker frames on a dark plate; `Mem` keys off allocation-ish
-                // names and stays readable against the near-black background.
-                options.colors = color::Palette::Basic(color::BasicPalette::Mem);
-            }
-        }
-        options
-    }
-
     pub fn sample(
         conf: &ProfilingConf,
         seconds: u64,
@@ -267,7 +269,7 @@ mod imp {
             .map_err(|e| ProfilingError::Sampler(e.to_string()))?;
 
         let mut svg = Vec::new();
-        let mut options = flamegraph_options(theme);
+        let mut options = super::flamegraph_options(theme);
         report
             .flamegraph_with_options(&mut svg, &mut options)
             .map_err(|e| ProfilingError::Sampler(e.to_string()))?;
@@ -376,3 +378,176 @@ mod test {
         }
     }
 }
+
+/// Why a heap-profile request could not be served.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MemoryProfileError {
+    /// The build has no `memory-profiling` feature, so jemalloc was not
+    /// compiled with `--enable-prof`.
+    FeatureDisabled,
+    /// `profiling.memory_enabled` is false.
+    NotEnabled,
+    /// jemalloc was built with profiling but is not sampling this process —
+    /// normally because the process started without the `malloc_conf` symbol.
+    NotActivated,
+    /// Another dump is already running.
+    Busy,
+    /// Reading or converting the profile failed.
+    Sampler(String),
+}
+
+impl std::fmt::Display for MemoryProfileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FeatureDisabled => write!(
+                f,
+                "heap profiling requires a build with the `memory-profiling` feature"
+            ),
+            Self::NotEnabled => {
+                write!(
+                    f,
+                    "heap profiling is disabled (profiling.memory_enabled=false)"
+                )
+            }
+            Self::NotActivated => write!(
+                f,
+                "jemalloc is not sampling this process; start it from a binary built \
+                 with `memory-profiling` so `malloc_conf` activates profiling"
+            ),
+            Self::Busy => write!(f, "another heap profile dump is already running"),
+            Self::Sampler(reason) => write!(f, "heap profiling failed: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for MemoryProfileError {}
+
+/// A rendered heap flame graph.
+#[derive(Debug)]
+pub struct MemoryProfileOutput {
+    /// SVG flame graph of live allocations.
+    pub svg: Vec<u8>,
+}
+
+/// Whether this build can serve a heap profile at all.
+pub fn memory_available() -> bool {
+    cfg!(all(feature = "memory-profiling", target_os = "linux"))
+}
+
+/// Renders a flame graph of live allocations.
+///
+/// Sampling happens inside jemalloc as the program allocates; this call only
+/// walks the recorded samples, so there is no observation window to wait for.
+/// The returned graph is attributed by *allocation site*, which is what makes
+/// it useful for a large resident set: the width of a frame is bytes still
+/// held, not CPU time.
+///
+/// Blocking: it holds the process-wide profile lock and writes a temporary
+/// file. Async callers must run it on a blocking pool.
+pub fn sample_memory(
+    conf: &ProfilingConf,
+    theme: ProfileTheme,
+) -> Result<MemoryProfileOutput, MemoryProfileError> {
+    if !cfg!(feature = "memory-profiling") {
+        return Err(MemoryProfileError::FeatureDisabled);
+    }
+    if !conf.memory_enabled {
+        return Err(MemoryProfileError::NotEnabled);
+    }
+    imp_memory::sample_memory(theme)
+}
+
+#[cfg(not(all(feature = "memory-profiling", target_os = "linux")))]
+mod memory_imp {
+    use super::{MemoryProfileError, MemoryProfileOutput, ProfileTheme};
+
+    pub fn sample_memory(_theme: ProfileTheme) -> Result<MemoryProfileOutput, MemoryProfileError> {
+        Err(MemoryProfileError::FeatureDisabled)
+    }
+}
+
+#[cfg(all(feature = "memory-profiling", target_os = "linux"))]
+mod memory_imp {
+    use super::{MemoryProfileError, MemoryProfileOutput, ProfileTheme};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// One dump at a time: the library serialises on its own lock, but a queued
+    /// request would block a blocking-pool thread just to fail behind it.
+    static DUMP_BUSY: AtomicBool = AtomicBool::new(false);
+
+    struct DumpSlot;
+
+    impl DumpSlot {
+        fn try_acquire() -> Result<Self, MemoryProfileError> {
+            DUMP_BUSY
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map(|_| Self)
+                .map_err(|_| MemoryProfileError::Busy)
+        }
+    }
+
+    impl Drop for DumpSlot {
+        fn drop(&mut self) {
+            DUMP_BUSY.store(false, Ordering::Release);
+        }
+    }
+
+    /// Theme-matched plate for the heap graph (inferno 0.12 through
+    /// `jemalloc_pprof`). Same colours as the CPU graph's helper, but that
+    /// helper's `Options` comes from inferno 0.11 and is not interchangeable.
+    fn memory_flamegraph_options(
+        theme: ProfileTheme,
+    ) -> jemalloc_pprof::FlamegraphOptions<'static> {
+        use jemalloc_pprof::FlamegraphOptions;
+        let mut options = FlamegraphOptions::default();
+        match theme {
+            ProfileTheme::Light => {
+                options.bgcolors = Some(inferno::flamegraph::color::BackgroundColor::Yellow);
+                options.uicolor = inferno::flamegraph::color::Color::new(0, 0, 0);
+            }
+            ProfileTheme::Dark => {
+                options.bgcolors = Some(inferno::flamegraph::color::BackgroundColor::Flat(
+                    inferno::flamegraph::color::Color::new(0x0f, 0x11, 0x15),
+                ));
+                options.uicolor = inferno::flamegraph::color::Color::new(0xe6, 0xe6, 0xe6);
+            }
+        }
+        options
+    }
+
+    pub fn sample_memory(theme: ProfileTheme) -> Result<MemoryProfileOutput, MemoryProfileError> {
+        let _slot = DumpSlot::try_acquire()?;
+
+        let ctl = jemalloc_pprof::PROF_CTL.as_ref().ok_or_else(|| {
+            MemoryProfileError::Sampler("jemalloc profile control unavailable".into())
+        })?;
+        let mut guard = ctl.blocking_lock();
+        if !guard.activated() {
+            return Err(MemoryProfileError::NotActivated);
+        }
+
+        // jemalloc_pprof depends on inferno 0.12 while pprof uses 0.11, so the
+        // two `Options` types are distinct and cannot share a helper. The
+        // settings are duplicated deliberately: the plate and UI text follow
+        // the console theme, the frame palette keeps inferno's default because
+        // it encodes allocation sites rather than aesthetics.
+        let mut options = memory_flamegraph_options(theme);
+        let svg = guard
+            .dump_flamegraph_with_options(&mut options)
+            .map_err(|e| MemoryProfileError::Sampler(e.to_string()))?;
+
+        if svg.len() <= 512 {
+            return Err(MemoryProfileError::Sampler(
+                "heap profile contained no samples; the process has not allocated \
+                 enough since start to trigger the sampling interval"
+                    .into(),
+            ));
+        }
+        Ok(MemoryProfileOutput { svg })
+    }
+}
+
+#[cfg(all(feature = "memory-profiling", target_os = "linux"))]
+use memory_imp as imp_memory;
+#[cfg(not(all(feature = "memory-profiling", target_os = "linux")))]
+use memory_imp as imp_memory;

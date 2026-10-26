@@ -56,6 +56,12 @@ pub const CPU_PROFILE_PATH: &str = "/api/v1/profiling/cpu";
 /// server would silently clamp: a clamped request would still be described to
 /// the operator as the duration they picked.
 pub const CPU_PROFILE_STATUS_PATH: &str = "/api/v1/profiling/cpu/status";
+/// Path of the heap (memory) flame graph.
+///
+/// Rendered from jemalloc's own allocation samples, so its widths are bytes
+/// still held rather than CPU time. Unlike the CPU graph there is no
+/// observation window: the samples already exist.
+pub const MEMORY_PROFILE_PATH: &str = "/api/v1/profiling/memory";
 
 /// Query parameters for a sampling request.
 #[derive(Debug, Deserialize, Default)]
@@ -82,12 +88,20 @@ pub fn mount(router: Router, conf: &ProfilingConf) -> Router {
         in_flight: AtomicBool::new(false),
     });
     let status_state = state.clone();
+    let memory_state = state.clone();
     router
         .route(
             CPU_PROFILE_PATH,
             get(move |query: Query<SampleQuery>| {
                 let state = state.clone();
                 async move { cpu_flamegraph(state, query.0).await }
+            }),
+        )
+        .route(
+            MEMORY_PROFILE_PATH,
+            get(move |query: Query<SampleQuery>| {
+                let state = memory_state.clone();
+                async move { memory_flamegraph(state, query.0).await }
             }),
         )
         .route(
@@ -100,6 +114,8 @@ pub fn mount(router: Router, conf: &ProfilingConf) -> Router {
                         "available": curvine_profiling::available(),
                         "max_duration_secs": conf.max_duration_secs,
                         "cpu_frequency": conf.cpu_frequency,
+                        "memory_enabled": conf.memory_enabled,
+                        "memory_available": curvine_profiling::memory_available(),
                     }))
                 }
             }),
@@ -117,6 +133,55 @@ struct ProfileRouteState {
     /// full-length window after the previous one finished. Claiming here
     /// makes the second request fail immediately instead.
     in_flight: AtomicBool,
+}
+
+async fn memory_flamegraph(state: Arc<ProfileRouteState>, query: SampleQuery) -> Response {
+    let theme = curvine_profiling::ProfileTheme::parse(query.theme.as_deref());
+    let conf = state.conf.clone();
+    // No window to wait for: jemalloc has been sampling since startup, so this
+    // only walks what already exists.
+    let run =
+        tokio::task::spawn_blocking(move || curvine_profiling::sample_memory(&conf, theme)).await;
+
+    match run {
+        Ok(Ok(output)) => {
+            log::info!("served heap flame graph: bytes={}", output.svg.len());
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "image/svg+xml"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                output.svg,
+            )
+                .into_response()
+        }
+        Ok(Err(err)) => {
+            let status = match err {
+                curvine_profiling::MemoryProfileError::Busy => StatusCode::CONFLICT,
+                // Compiled in but this process is not sampling: the operator
+                // needs to know to rebuild/restart, not to retry.
+                curvine_profiling::MemoryProfileError::NotActivated => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                curvine_profiling::MemoryProfileError::NotEnabled
+                | curvine_profiling::MemoryProfileError::FeatureDisabled => StatusCode::NOT_FOUND,
+                curvine_profiling::MemoryProfileError::Sampler(_) => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
+            log::warn!("heap flame graph request failed: {err}");
+            (status, err.to_string()).into_response()
+        }
+        Err(join_err) => {
+            log::error!("heap flame graph task panicked: {join_err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "heap profiling task failed".to_string(),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn cpu_flamegraph(state: Arc<ProfileRouteState>, query: SampleQuery) -> Response {

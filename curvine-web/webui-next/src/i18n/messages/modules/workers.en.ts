@@ -83,6 +83,10 @@ export default {
       title: 'CPU Flame Graph',
       description:
         'Sampling for {seconds}s. The graph appears when the window ends — sampling is synchronous by design.',
+      kind: 'Profile type',
+      kindCpu: 'CPU',
+      kindMemory: 'Memory',
+      memoryDescription: 'Bytes still held, attributed to the allocating call site. jemalloc samples continuously from startup, so there is no window to wait for.',
       fullscreen: 'Fullscreen',
       exitFullscreen: 'Exit fullscreen',
       duration: 'Duration',
