@@ -22,8 +22,7 @@ use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext};
-use curvine_error::FsError;
-use curvine_error::FsResult;
+use curvine_error::{ErrorKind, FsError, FsResult};
 use curvine_fs_api::Path;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
@@ -35,8 +34,9 @@ use curvine_model::{
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
+use curvine_raft::raft::FollowerReadRefusal;
 use curvine_rpc::handler::MessageHandler;
-use curvine_rpc::message::Message;
+use curvine_rpc::message::{Message, FOLLOWER_READ_SEQ_ID};
 use curvine_runtime::runtime::{GroupExecutor, Runtime};
 use dashmap::DashMap;
 use prost::Message as _;
@@ -71,6 +71,109 @@ pub struct MasterHandler {
 }
 
 impl MasterHandler {
+    fn is_follower_read_opt_in(msg: &Message) -> bool {
+        msg.seq_id() == FOLLOWER_READ_SEQ_ID
+    }
+
+    fn is_follower_read_candidate(code: RpcCode) -> bool {
+        matches!(
+            code,
+            RpcCode::FileStatus
+                | RpcCode::ListStatus
+                | RpcCode::Exists
+                | RpcCode::GetBlockLocations
+                | RpcCode::ListOptions
+                | RpcCode::GetMountTable
+                | RpcCode::GetMountInfo
+                | RpcCode::GetFilesystemInfo
+                | RpcCode::GetFileBlockDetails
+                | RpcCode::ListTrash
+                | RpcCode::GetCvMetadataSnapshotPage
+                | RpcCode::OpenFile
+        )
+    }
+
+    fn follower_read_denial_reason(
+        enabled: bool,
+        role: curvine_raft::raft::RoleState,
+        marked_follower_read: bool,
+        code: RpcCode,
+        open_file_flags: Option<u32>,
+    ) -> Option<&'static str> {
+        if !enabled {
+            return Some("disabled");
+        }
+        if role != curvine_raft::raft::RoleState::Follower {
+            return Some("not_follower");
+        }
+        if !marked_follower_read {
+            return Some("missing_opt_in");
+        }
+        if code.allows_follower_read(open_file_flags) {
+            None
+        } else if code == RpcCode::OpenFile {
+            Some("open_file_not_read_only")
+        } else {
+            Some("not_allowlisted")
+        }
+    }
+
+    fn follower_read_refusal_label(reason: FollowerReadRefusal) -> &'static str {
+        match reason {
+            FollowerReadRefusal::NotFollower => "not_follower",
+            FollowerReadRefusal::ReplayNotReady => "replay_not_ready",
+            FollowerReadRefusal::NoLeader => "no_leader",
+            FollowerReadRefusal::NoCurrentTermLeaderContact => "no_current_term_contact",
+            FollowerReadRefusal::StaleLeaderContact => "stale_leader_contact",
+            FollowerReadRefusal::ApplyProgressUnknown => "apply_progress_unknown",
+            FollowerReadRefusal::ApplyStalled => "apply_stalled",
+            FollowerReadRefusal::CommitLag => "commit_lag",
+        }
+    }
+
+    fn record_follower_read_accepted(metrics: &MasterMetrics, code: RpcCode) {
+        let code_label = format!("{:?}", code);
+        metrics
+            .follower_read_accepted_total
+            .with_label_values(&[&code_label])
+            .inc();
+    }
+
+    fn record_follower_read_refused(metrics: &MasterMetrics, code: RpcCode, reason: &str) {
+        let code_label = format!("{:?}", code);
+        metrics
+            .follower_read_refused_total
+            .with_label_values(&[&code_label, reason])
+            .inc();
+    }
+
+    fn follower_read(&self, ctx: &mut RpcContext<'_>, code: RpcCode) -> FsResult<Message> {
+        match code {
+            RpcCode::OpenFile => self.retry_check_open_file(ctx),
+            RpcCode::FileStatus => self.file_status(ctx),
+            RpcCode::ListStatus => self.list_status(ctx),
+            RpcCode::Exists => self.exists(ctx),
+            RpcCode::GetBlockLocations => self.get_block_locations(ctx),
+            RpcCode::ListOptions => self.list_options(ctx),
+            RpcCode::GetMountTable => self.get_mount_table(ctx),
+            RpcCode::GetMountInfo => self.get_mount_info(ctx),
+            _ => Err(FsError::not_leader(
+                "RPC is not allowlisted for follower reads",
+            )),
+        }
+    }
+
+    fn passive_worker_rpc_allowed(
+        worker_state_enabled: bool,
+        follower_reads_enabled: bool,
+        role: curvine_raft::raft::RoleState,
+        code: RpcCode,
+    ) -> bool {
+        (worker_state_enabled || follower_reads_enabled)
+            && role == curvine_raft::raft::RoleState::Follower
+            && matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         conf: &ClusterConf,
@@ -204,7 +307,7 @@ impl MasterHandler {
         flags: OpenFlags,
     ) -> FsResult<FileBlocks> {
         if flags.read_only() {
-            return self.fs.get_block_locations(&path);
+            return self.get_block_locations_for_read(&path);
         }
 
         if self.check_is_retry(req_id)? {
@@ -213,6 +316,16 @@ impl MasterHandler {
 
         let res = self.fs.open_file(path, opts, flags);
         self.set_req_cache(req_id, res)
+    }
+
+    fn get_block_locations_for_read(&self, path: &str) -> FsResult<FileBlocks> {
+        if self.fs.master_monitor.is_active() {
+            return self.fs.get_block_locations(path);
+        }
+
+        self.fs
+            .follower_get_block_locations_if_ready(path)?
+            .ok_or_else(|| FsError::not_leader("Follower block locations are not ready"))
     }
 
     pub fn file_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -588,15 +701,11 @@ impl MasterHandler {
         let req: GetBlockLocationsRequest = ctx.parse_header()?;
         ctx.set_audit(Some(req.path.to_string()), None);
 
-        let blocks = Self::process_get_block_locations(self.fs.clone(), req.path)?;
+        let blocks = self.get_block_locations_for_read(&req.path)?;
         let rep_header = GetBlockLocationsResponse {
             blocks: ProtoUtils::file_blocks_to_pb(blocks),
         };
         ctx.response(rep_header)
-    }
-
-    fn process_get_block_locations(fs: MasterFilesystem, path: String) -> FsResult<FileBlocks> {
-        fs.get_block_locations(path)
     }
 
     pub fn get_file_block_details(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -735,6 +844,73 @@ impl MasterHandler {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
         };
         ctx.response(rep_header)
+    }
+
+    /// Record worker liveness and storage information on a follower. The
+    /// passive path deliberately returns no pending block deletion commands.
+    fn worker_heartbeat_passive(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: WorkerHeartbeatRequest = ctx.parse_header()?;
+        if self
+            .compatibility_policy
+            .should_evaluate(header.component_info.is_some())
+        {
+            Self::check_peer_compatibility(
+                "worker",
+                &format!("worker:{}", header.worker_id),
+                &self.compat_warned,
+                self.compatibility_policy.mode,
+                self.compatibility_policy
+                    .check_worker(header.component_info.as_ref()),
+                self.metrics,
+            )?;
+        }
+
+        Self::process_worker_heartbeat_passive(self.fs.clone(), header)?;
+        ctx.response(WorkerHeartbeatResponse { cmds: Vec::new() })
+    }
+
+    fn process_worker_heartbeat_passive(
+        fs: MasterFilesystem,
+        header: WorkerHeartbeatRequest,
+    ) -> FsResult<()> {
+        let status = HeartbeatStatus::from(header.status);
+        let address = ProtoUtils::worker_address_from_pb(&header.address);
+        let worker_id = address.worker_id;
+        let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
+        let worker_session_id = header.worker_session_id.unwrap_or_default();
+        if status == HeartbeatStatus::Start {
+            fs.worker_manager
+                .read()
+                .validate_passive_start(&header.cluster_id, &address)?;
+            // Revoke location readiness before publishing the new worker
+            // session, so a concurrent client read cannot use the prior
+            // session's full-report completion bit.
+            fs.observe_passive_worker_heartbeat(status, worker_id);
+        }
+        let mut wm = fs.worker_manager.write();
+        wm.heartbeat_passive(
+            &header.cluster_id,
+            status,
+            address,
+            weight,
+            worker_session_id,
+            curvine_model::TransferWorkerCapabilities {
+                task_submit: header.transfer_task_submit.unwrap_or(false),
+                report_target: header.transfer_report_target.unwrap_or(false),
+                query_task: header.transfer_query_task.unwrap_or(false),
+                attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
+                source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
+            },
+            header.software_version,
+            u64::try_from(header.fs_ctime).unwrap_or_default(),
+            ProtoUtils::storage_info_list_from_pb(header.storages),
+            header.component_info,
+        )?;
+        drop(wm);
+        if status != HeartbeatStatus::Start {
+            fs.observe_passive_worker_heartbeat(status, worker_id);
+        }
+        Ok(())
     }
 
     /// Evaluate a compatibility verdict against the configured mode.
@@ -877,6 +1053,15 @@ impl MasterHandler {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
         };
         ctx.response(rep_header)
+    }
+
+    fn block_report_passive(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: BlockReportListRequest = ctx.parse_header()?;
+        let worker_session_id = header.worker_session_id.clone();
+        let list = ProtoUtils::block_report_list_from_pb(header);
+        self.fs
+            .passive_block_report(list, worker_session_id.as_deref())?;
+        ctx.response(BlockReportListResponse { cmds: Vec::new() })
     }
 
     fn process_block_report(
@@ -1249,8 +1434,55 @@ impl MessageHandler for MasterHandler {
 
         // Unified processing of all RPC requests (standby NotLeader uses the same
         // observability + error_ext conversion path as async_handle).
-        let response = if !self.fs.master_monitor.is_active() {
-            Err(FsError::not_leader_master(ctx.code, self.client_ip()))
+        let mut follower_read_snapshot = None;
+        let mut response = if !self.fs.master_monitor.is_active() {
+            let readiness_snapshot = self.fs.master_monitor.follower_readiness_snapshot();
+            let role = readiness_snapshot.role;
+            if Self::passive_worker_rpc_allowed(
+                self.fs.conf.follower_worker_state_enabled,
+                self.fs.conf.follower_reads_enabled,
+                role,
+                code,
+            ) {
+                match code {
+                    RpcCode::WorkerHeartbeat => self.worker_heartbeat_passive(ctx),
+                    RpcCode::WorkerBlockReport => self.block_report_passive(ctx),
+                    _ => Err(FsError::not_leader_master(ctx.code, self.client_ip())),
+                }
+            } else {
+                let open_file_flags = if code == RpcCode::OpenFile {
+                    ctx.parse_header::<OpenFileRequest>()
+                        .ok()
+                        .map(|request| request.flags)
+                } else {
+                    None
+                };
+                let denial = Self::follower_read_denial_reason(
+                    self.fs.conf.follower_reads_enabled,
+                    role,
+                    Self::is_follower_read_opt_in(msg),
+                    code,
+                    open_file_flags,
+                );
+                if let Some(reason) = denial {
+                    if Self::is_follower_read_candidate(code) {
+                        Self::record_follower_read_refused(self.metrics, code, reason);
+                    }
+                    Err(FsError::not_leader_master(ctx.code, self.client_ip()))
+                } else if let Some(reason) = self.fs.follower_read_refusal(&readiness_snapshot) {
+                    if Self::is_follower_read_candidate(code) {
+                        Self::record_follower_read_refused(
+                            self.metrics,
+                            code,
+                            Self::follower_read_refusal_label(reason),
+                        );
+                    }
+                    Err(FsError::not_leader_master(ctx.code, self.client_ip()))
+                } else {
+                    follower_read_snapshot = Some(readiness_snapshot);
+                    self.follower_read(ctx, code)
+                }
+            }
         } else {
             match code {
                 // File system operation request
@@ -1307,6 +1539,31 @@ impl MessageHandler for MasterHandler {
             }
         };
 
+        if let Some(initial_snapshot) = follower_read_snapshot {
+            let final_snapshot = self.fs.master_monitor.follower_readiness_snapshot();
+            let refusal = if initial_snapshot.leadership_epoch != final_snapshot.leadership_epoch {
+                Some("leadership_changed")
+            } else {
+                self.fs
+                    .follower_read_refusal(&final_snapshot)
+                    .map(Self::follower_read_refusal_label)
+            };
+            if let Some(reason) = refusal {
+                Self::record_follower_read_refused(self.metrics, code, reason);
+                response = Err(FsError::not_leader(format!(
+                    "Follower read refused: {reason}"
+                )));
+            } else if response
+                .as_ref()
+                .err()
+                .is_some_and(|error| matches!(error.kind(), ErrorKind::NotLeaderMaster))
+            {
+                Self::record_follower_read_refused(self.metrics, code, "block_locations_not_ready");
+            } else if response.is_ok() {
+                Self::record_follower_read_accepted(self.metrics, code);
+            }
+        }
+
         self.record_rpc_observability(ctx, &response);
 
         match response {
@@ -1334,6 +1591,9 @@ impl MessageHandler for MasterHandler {
         let code = RpcCode::from(msg.code());
 
         let res = if !self.fs.master_monitor.is_active() {
+            if Self::is_follower_read_candidate(code) {
+                Self::record_follower_read_refused(self.metrics, code, "async_rpc_not_allowlisted");
+            }
             Err(FsError::not_leader_master(ctx.code, self.client_ip()))
         } else {
             match code {
@@ -1376,7 +1636,168 @@ mod tests {
     use super::*;
     use crate::master::journal::JournalSystem;
     use curvine_model::{TrashEntry, WorkerAddress};
+    use curvine_rpc::message::Builder;
     use curvine_runtime::common::Utils;
+
+    #[test]
+    fn passive_worker_rpc_gate_is_opt_in_and_allowlisted() {
+        let follower = curvine_raft::raft::RoleState::Follower;
+        assert!(!MasterHandler::passive_worker_rpc_allowed(
+            false,
+            false,
+            follower,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(MasterHandler::passive_worker_rpc_allowed(
+            true,
+            false,
+            follower,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(MasterHandler::passive_worker_rpc_allowed(
+            false,
+            true,
+            follower,
+            RpcCode::WorkerBlockReport
+        ));
+        assert!(!MasterHandler::passive_worker_rpc_allowed(
+            true,
+            true,
+            follower,
+            RpcCode::Mkdir
+        ));
+        assert!(!MasterHandler::passive_worker_rpc_allowed(
+            true,
+            true,
+            curvine_raft::raft::RoleState::Leader,
+            RpcCode::WorkerBlockReport
+        ));
+    }
+
+    #[test]
+    fn follower_read_gate_requires_request_marker_config_allowlist_and_read_only_open_file() {
+        let follower = curvine_raft::raft::RoleState::Follower;
+        let marked_request = Builder::new_rpc(RpcCode::FileStatus as i8)
+            .seq_id(FOLLOWER_READ_SEQ_ID)
+            .build();
+        let unmarked_request = Builder::new_rpc(RpcCode::FileStatus as i8).build();
+        let marked = MasterHandler::is_follower_read_opt_in(&marked_request);
+        let unmarked = MasterHandler::is_follower_read_opt_in(&unmarked_request);
+        assert!(marked);
+        assert!(!unmarked);
+
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                false,
+                follower,
+                marked,
+                RpcCode::FileStatus,
+                None
+            ),
+            Some("disabled")
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                curvine_raft::raft::RoleState::Leader,
+                marked,
+                RpcCode::FileStatus,
+                None
+            ),
+            Some("not_follower")
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                follower,
+                marked,
+                RpcCode::FileStatus,
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                follower,
+                unmarked,
+                RpcCode::FileStatus,
+                None
+            ),
+            Some("missing_opt_in")
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                follower,
+                marked,
+                RpcCode::OpenFile,
+                Some(OpenFlags::RDONLY.bits())
+            ),
+            None
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                follower,
+                unmarked,
+                RpcCode::OpenFile,
+                Some(OpenFlags::RDONLY.bits())
+            ),
+            Some("missing_opt_in")
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                follower,
+                marked,
+                RpcCode::OpenFile,
+                Some(OpenFlags::WRONLY.bits())
+            ),
+            Some("open_file_not_read_only")
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                follower,
+                marked,
+                RpcCode::ListTrash,
+                None
+            ),
+            Some("not_allowlisted")
+        );
+    }
+
+    #[test]
+    fn follower_read_metrics_have_bounded_rpc_and_reason_labels() {
+        let metrics = test_metrics();
+        let accepted_before = metrics
+            .follower_read_accepted_total
+            .with_label_values(&["FileStatus"])
+            .get();
+        let refused_before = metrics
+            .follower_read_refused_total
+            .with_label_values(&["FileStatus", "commit_lag"])
+            .get();
+
+        MasterHandler::record_follower_read_accepted(metrics, RpcCode::FileStatus);
+        MasterHandler::record_follower_read_refused(metrics, RpcCode::FileStatus, "commit_lag");
+
+        assert_eq!(
+            metrics
+                .follower_read_accepted_total
+                .with_label_values(&["FileStatus"])
+                .get(),
+            accepted_before + 1
+        );
+        assert_eq!(
+            metrics
+                .follower_read_refused_total
+                .with_label_values(&["FileStatus", "commit_lag"])
+                .get(),
+            refused_before + 1
+        );
+    }
 
     #[test]
     fn process_worker_heartbeat_stores_worker_report_fields() {
