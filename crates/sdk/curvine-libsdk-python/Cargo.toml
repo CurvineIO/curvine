@@ -11,6 +11,7 @@ name = "curvine_libsdk_python"
 [features]
 default = []
 extension-module = ["pyo3/extension-module"]
+discovery-etcd = ["curvine-sdk-core/discovery-etcd"]
 opendal-s3 = ["curvine-sdk-core/opendal-s3"]
 opendal-oss = ["curvine-sdk-core/opendal-oss"]
 opendal-gcs = ["curvine-sdk-core/opendal-gcs"]
