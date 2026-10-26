@@ -50,6 +50,15 @@ impl FileSystemClient {
         self.unified().delete(&path, recursive).await
     }
 
+    pub async fn delete_async(
+        &self,
+        path: impl AsRef<str>,
+        recursive: bool,
+    ) -> FsResult<DeleteResult> {
+        let path = Path::from_str(path)?;
+        self.unified().delete_async(&path, recursive).await
+    }
+
     pub async fn get_status(&self, path: impl AsRef<str>) -> FsResult<BytesMut> {
         let path = Path::from_str(path)?;
         self.unified().get_status_bytes(&path).await

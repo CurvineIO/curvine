@@ -83,6 +83,13 @@ pub struct FuseConf {
     #[client_cli]
     pub metrics_enabled: bool,
 
+    // Delete through the master's async lane: `unlink`/`rmdir` stage the entry
+    // under `/.Trash/.pending` and return before the master reclaims it. The
+    // namespace effect is still immediate; only the physical reclamation moves
+    // to the background. Off by default so POSIX deletion keeps its "space is
+    // reclaimed when the call returns" expectation unless an operator opts in.
+    pub async_delete: bool,
+
     #[client_cli]
     pub io_threads: usize,
 
@@ -665,6 +672,8 @@ impl Default for FuseConf {
             audit_logging_enabled: false,
             metrics_enabled: true,
 
+            async_delete: false,
+
             io_threads: 32,
             worker_threads: Utils::worker_threads(32),
 
@@ -731,6 +740,11 @@ mod tests {
     fn default_max_readahead_kb_is_none() {
         let conf = FuseConf::default();
         assert_eq!(conf.max_readahead_kb, None);
+    }
+
+    #[test]
+    fn async_delete_is_opt_in() {
+        assert!(!FuseConf::default().async_delete);
     }
 
     #[test]

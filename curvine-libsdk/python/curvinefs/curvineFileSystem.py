@@ -193,16 +193,20 @@ class CurvineFileSystem(AbstractFileSystem):
     def current(self) -> Any:
         raise NotImplementedError
 
-    def delete(self, path: str, recursive: bool = False, **kwargs: Any) -> None:
+    def delete(
+        self, path: str, recursive: bool = False, async_delete: bool = False, **kwargs: Any
+    ) -> None:
         """Delete a file or directory.
 
         Args:
             path: Path to delete.
             recursive: If True, delete directories recursively.
+            async_delete: If True, return once the name leaves the namespace and
+                let the master reclaim the blocks in the background.
             **kwargs: Additional keyword arguments.
         """
         path = self._format_path(path)
-        self.client.rm(path, recursive)
+        self.client.rm(path, recursive, async_delete)
 
     def disk_usage(self, path: str, total: bool = True, maxdepth: Optional[int] = None, **kwargs: Any) -> Any:
         raise NotImplementedError
