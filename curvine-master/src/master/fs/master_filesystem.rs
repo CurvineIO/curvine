@@ -452,45 +452,72 @@ impl MasterFilesystem {
         Ok(restored)
     }
 
-    pub fn empty_trash(&self) -> FsResult<DeleteResult> {
-        // Snapshot the names once so the purge releases the write lock between
-        // batches instead of blocking every metadata mutation for the whole
-        // purge. Entries added after the snapshot stay for the next purge.
+    /// Stages every visible recycle-bin entry for the background purger and
+    /// returns how many were accepted. Entries are renamed, not walked, so the
+    /// call does not depend on the size of the trashed subtrees.
+    pub fn stage_trash_for_purge(&self) -> FsResult<u64> {
         const BATCH_SIZE: usize = 1000;
+
+        // Snapshot the names once: entries added after the snapshot stay for the
+        // next empty, and each batch releases the write lock between renames.
         let names = self.fs_dir.read().trash_entry_names()?;
-
-        let mut total = DeleteResult::new();
-        let mut first_err = None;
+        let mut staged = 0;
         for batch in names.chunks(BATCH_SIZE) {
-            let (mut delete_res, res) = {
-                let mut fs_dir = self.fs_dir.write();
-                fs_dir.empty_trash_batch(batch)
-            };
+            let mut fs_dir = self.fs_dir.write();
+            staged += fs_dir.stage_trash_entries(batch)?;
+        }
+        Ok(staged)
+    }
 
-            // Entries deleted before a failure have already left the namespace,
-            // so their block locations must be released even when the purge
-            // fails partway through the batch.
-            self.worker_manager.write().remove_blocks(&DeleteResult {
-                inodes: 0,
-                bytes: 0,
-                blocks: std::mem::take(&mut delete_res.blocks),
-                trashed: false,
-                purge_pending: false,
-            });
+    /// Drains `/.Trash/.pending` through the bounded purger until it is empty.
+    /// Returns the real reclaimed counts; `blocks` are already handed to the
+    /// worker managers by the purge batches themselves.
+    pub fn drain_pending_trash(&self) -> FsResult<Option<DeleteResult>> {
+        const BATCH_SIZE: usize = 64;
+        let purger = crate::master::fs::TrashPurger::new(self.clone(), self.master_monitor.clone());
+        let mut total = DeleteResult::new();
+        let mut start_after = None;
 
-            total.inodes += delete_res.inodes;
-            total.bytes += delete_res.bytes;
-            if let Err(e) = res {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
+        loop {
+            let page = self.scan_pending_trash(BATCH_SIZE, start_after.as_deref())?;
+            for path in page.paths {
+                let Some(outcome) = purger.purge_entry(&path)? else {
+                    return Ok(None);
+                };
+                total.inodes += outcome.inodes;
+                total.bytes += outcome.bytes;
+            }
+            match page.next_after {
+                Some(next) => start_after = Some(next),
+                None => return Ok(Some(total)),
             }
         }
+    }
 
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(total),
+    /// Empties the recycle bin. Returns the number of accepted entries and, in
+    /// wait mode, the counts actually reclaimed by the bounded purger.
+    ///
+    /// Both modes stage the entries first, so there is exactly one purge
+    /// implementation and an interrupted sweep resumes from `/.Trash/.pending`
+    /// instead of from an in-memory queue.
+    pub fn empty_trash0(&self, wait: bool) -> FsResult<(u64, DeleteResult)> {
+        let accepted = self.stage_trash_for_purge()?;
+        if !wait {
+            return Ok((accepted, DeleteResult::new()));
         }
+
+        match self.drain_pending_trash()? {
+            Some(res) => Ok((accepted, res)),
+            // The master was demoted mid-sweep; the staged entries stay for the
+            // next active master instead of being reported as reclaimed.
+            None => Ok((accepted, DeleteResult::new())),
+        }
+    }
+
+    /// Empties the recycle bin synchronously, keeping the pre-async contract.
+    pub fn empty_trash(&self) -> FsResult<DeleteResult> {
+        let (_, res) = self.empty_trash0(true)?;
+        Ok(res)
     }
 
     pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
@@ -3103,6 +3130,8 @@ mod tests {
     #[test]
     fn empty_trash_purges_entries_but_keeps_the_trash_root() {
         let fs = test_fs_with_trash("trash-empty");
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
 
         let empty = fs.empty_trash().unwrap();
         assert_eq!(empty.inodes, 0);
@@ -3118,10 +3147,16 @@ mod tests {
 
         let res = fs.empty_trash().unwrap();
         assert_eq!(res.inodes, 2);
-        assert!(fs
+        // Only the internal async-staging directory stays behind; every visible
+        // trash entry is gone.
+        assert!(fs.list_trash().unwrap().is_empty());
+        let children: Vec<String> = fs
             .list_options("/.Trash", ListOptions::default())
             .unwrap()
-            .is_empty());
+            .into_iter()
+            .map(|child| child.name)
+            .collect();
+        assert_eq!(children, vec![trash::TRASH_PENDING_NAME.to_string()]);
         assert!(fs.get_block_locations("/dir/child.log").is_err());
 
         fs.create("/next.log", true).unwrap();
@@ -3133,6 +3168,8 @@ mod tests {
     #[test]
     fn empty_trash_does_not_purge_foreign_children() {
         let fs = test_fs_with_trash("trash-empty-foreign");
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
 
         fs.create("/keep.log", true).unwrap();
         fs.delete_with_mode("/keep.log", false, DeleteMode::Default)
@@ -3160,8 +3197,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_trash_releases_blocks_of_entries_purged_before_a_failure() {
+    fn empty_trash_purges_healthy_entries_when_one_entry_is_corrupt() {
         let fs = test_fs_with_trash("trash-empty-partial");
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
         let worker_id = 100;
         let mut worker = WorkerInfo::default();
         worker.address.worker_id = worker_id;
@@ -3205,23 +3244,35 @@ mod tests {
         fs.delete_with_mode("/broken.log", false, DeleteMode::Default)
             .unwrap();
 
-        // Drop the store record of one trash entry so purging it fails. The
-        // loop must still purge the other entry and report its blocks.
-        let broken_id = fs
-            .list_trash()
-            .unwrap()
-            .into_iter()
+        // Drop the store record of one trash entry so it can no longer be
+        // resolved. Staging skips it instead of failing the sweep, and the
+        // healthy entry must still be purged with its blocks released.
+        let entries = fs.list_trash().unwrap();
+        let broken_id = entries
+            .iter()
             .find(|entry| entry.origin == "/broken.log")
             .unwrap()
             .status
             .id;
+        let good_entry = entries
+            .iter()
+            .find(|entry| entry.origin == "/good.log")
+            .unwrap()
+            .path
+            .clone();
         let fs_dir = fs.fs_dir.read();
         let mut batch = fs_dir.store.new_batch();
         batch.delete_inode(broken_id).unwrap();
         batch.commit().unwrap();
         drop(fs_dir);
 
-        assert!(fs.empty_trash().is_err());
+        let res = fs.empty_trash().unwrap();
+        assert_eq!(res.inodes, 1, "only the healthy entry is reclaimed");
+        assert!(fs.get_block_locations("/good.log").is_err());
+        assert!(
+            !fs.exists(&good_entry).unwrap(),
+            "the healthy entry must leave the recycle bin"
+        );
 
         let cmds = fs
             .worker_manager

@@ -1021,34 +1021,49 @@ impl FsDir {
     // Purge one batch of names. Keeping the loop in the caller lets the
     // write lock be released between batches instead of blocking every
     // metadata mutation for the whole purge.
-    pub fn empty_trash_batch(&mut self, names: &[String]) -> (DeleteResult, FsResult<()>) {
-        let mut total = DeleteResult::new();
+    /// Moves the named recycle-bin entries into the async staging directory.
+    ///
+    /// Renaming a whole entry is O(1) and keeps its origin/delete-time xattrs,
+    /// so `EmptyTrash` can acknowledge immediately and let the purger reclaim the
+    /// subtrees in bounded batches. Entries that disappeared since the snapshot
+    /// (restored, purged, or staged by another node) are skipped, which keeps a
+    /// retried empty idempotent.
+    pub fn stage_trash_entries(&mut self, names: &[String]) -> FsResult<u64> {
+        if names.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_pending_root()?;
 
-        // Keep deleting the remaining entries after a failure: the caller
-        // needs the partial result to release the blocks of entries that were
-        // already removed, and those block lists cannot be recovered later.
-        let mut first_err = None;
+        let mtime = LocalTime::mills() as i64;
+        let mut staged = 0;
         for name in names {
-            let path = trash::trash_entry_path(name);
-            let res = match InodePath::resolve(self.root_ptr(), &path, &self.store) {
-                Ok(child_inp) => self.delete(&child_inp, true),
-                Err(e) => Err(e.into()),
-            };
-            match res {
-                Ok(res) => {
-                    total.inodes += res.inodes;
-                    total.bytes += res.bytes;
-                    total.blocks.extend(res.blocks);
-                }
+            let src_path = trash::trash_entry_path(name);
+            let dst_path = trash::pending_entry_path(name);
+
+            let src = match InodePath::resolve(self.root_ptr(), &src_path, &self.store) {
+                Ok(inp) => inp,
                 Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
+                    debug!("stage: skip unresolvable trash entry {}: {}", src_path, e);
+                    continue;
                 }
+            };
+            if src.get_last_inode().is_none() {
+                continue;
             }
+
+            let dst = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+            if dst.get_last_inode().is_some() {
+                debug!("stage: {} is already staged", dst_path);
+                continue;
+            }
+
+            // No TRASH flag: the entry already carries its origin and delete
+            // time, and re-stamping them would rewrite the user-visible origin.
+            self.rename_with_mtime(&src, &dst, RenameFlags::NO_REPLACE, mtime)?;
+            staged += 1;
         }
 
-        (total, first_err.map_or(Ok(()), Err))
+        Ok(staged)
     }
 
     pub fn free(&mut self, inp: &InodePath, recursive: bool) -> FsResult<FreeResult> {

@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{DeleteMode, MasterFilesystem};
 use crate::master::meta::inode::ttl::InodeTtlExecutor;
 use crate::master::meta::inode::InodeView;
 use crate::master::quota::eviction::evictor::Evictor;
@@ -276,7 +276,10 @@ fn execute_eviction_step(
     }
 
     for inode_id in file_inode_ids {
-        match ttl_executor.execute_by_id(inode_id) {
+        // Evict into the async purge lane: the entry is renamed immediately and
+        // reclaimed by the purger within a cycle, instead of waiting out
+        // `trash_retention` while the cluster stays over quota.
+        match ttl_executor.execute_by_id_with_mode(inode_id, DeleteMode::AsyncPurge) {
             Ok((true, _, reclaimed)) => {
                 step.consumed.push(inode_id);
                 if reclaimed > 0 {
@@ -332,7 +335,6 @@ struct EvictionStep {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::master::fs::DeleteMode;
     use crate::master::journal::JournalSystem;
     use crate::master::meta::inode::ttl::InodeTtlExecutor;
     use crate::master::quota::eviction::evictor::LRUEvictor;
@@ -507,5 +509,47 @@ mod tests {
             5,
             "skipped candidates remain for a later trigger"
         );
+    }
+
+    // Eviction must not park victims in the recycle bin for the whole retention
+    // window, or eviction could never relieve pressure. A victim is staged for
+    // the async purger instead, and the step still reports no reclaimed bytes
+    // because nothing has been reclaimed yet.
+    #[test]
+    fn eviction_stages_victims_for_the_async_purger() {
+        let fs = test_fs("evict-async-purge", true);
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        let victim = create_expired_file(&fs, "/evict/victim.log");
+        std::thread::sleep(Duration::from_millis(10));
+
+        let conf = eviction_conf(1, 0);
+        let evictor = LRUEvictor::new(conf);
+        evictor.on_access(victim);
+
+        let executor = InodeTtlExecutor::with_managers(fs.clone());
+        let step = execute_eviction_step(&fs, &evictor, &executor, &[victim]);
+
+        assert_eq!(step.reclaimed_bytes, 0, "a staged victim frees nothing yet");
+        assert_eq!(step.consumed, vec![victim]);
+        assert!(
+            fs.file_status("/evict/victim.log").is_err(),
+            "the victim must leave the namespace immediately"
+        );
+        assert!(
+            fs.list_trash().unwrap().is_empty(),
+            "an evicted victim must not wait in the recoverable bin"
+        );
+        let staged = fs
+            .list_options("/.Trash/.pending", ListOptions::default())
+            .unwrap();
+        assert_eq!(staged.len(), 1, "the victim must be staged for the purger");
+
+        // One purger cycle reclaims it, so the space comes back within a tick.
+        fs.drain_pending_trash().unwrap().unwrap();
+        assert!(fs
+            .list_options("/.Trash/.pending", ListOptions::default())
+            .unwrap()
+            .is_empty());
     }
 }

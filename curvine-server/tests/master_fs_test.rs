@@ -2262,7 +2262,8 @@ fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
 #[test]
 fn trash_rpc_list_restore_empty() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_with_conf("trash-rpc", |conf| conf.master.trash_enabled = true);
+    let handler =
+        new_handler_with_active_master("trash-rpc", |conf| conf.master.trash_enabled = true);
     let fs = handler.clone_fs();
 
     fs.create("/rpc/a.log", true)?;
@@ -2325,7 +2326,7 @@ fn trash_rpc_list_restore_empty() -> CommonResult<()> {
     handler.retry_check_delete(&mut del_ctx)?;
 
     let empty_msg = Builder::new_rpc(RpcCode::EmptyTrash)
-        .proto_header(EmptyTrashRequest {})
+        .proto_header(EmptyTrashRequest { wait: Some(true) })
         .build();
     let mut empty_ctx = RpcContext::new(&empty_msg);
     let empty_rep = handler
@@ -2333,6 +2334,44 @@ fn trash_rpc_list_restore_empty() -> CommonResult<()> {
         .parse_header::<EmptyTrashResponse>()?;
     assert_eq!(empty_rep.res.inodes, 1);
     assert!(fs.list_trash()?.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn trash_rpc_empty_async_acknowledges_and_purges_later() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_active_master("trash-empty-async", |conf| {
+        conf.master.trash_enabled = true
+    });
+    let fs = handler.clone_fs();
+
+    fs.create("/async-empty/a.log", true)?;
+    fs.create("/async-empty/b.log", true)?;
+    fs.delete_with_mode("/async-empty", true, DeleteMode::Default)?;
+
+    let empty_msg = Builder::new_rpc(RpcCode::EmptyTrash)
+        .proto_header(EmptyTrashRequest { wait: Some(false) })
+        .build();
+    let empty_rep = handler.handle(&empty_msg)?;
+    assert!(empty_rep.is_success(), "{}", empty_rep.to_error_msg());
+    let empty_rep: EmptyTrashResponse = empty_rep.parse_header()?;
+
+    // The call only renames the entry into the purger lane.
+    assert_eq!(empty_rep.accepted(), 1);
+    assert_eq!(empty_rep.res.inodes, 0);
+    assert!(fs.list_trash()?.is_empty());
+    assert!(
+        fs.get_block_locations("/async-empty/a.log").is_err(),
+        "the path is gone at once"
+    );
+
+    // The background purger reclaims the staged entry on its next cycle.
+    let drained = fs
+        .drain_pending_trash()?
+        .expect("the master must stay active");
+    assert_eq!(drained.inodes, 2);
+    assert_eq!(fs.get_file_counts().1, 0);
 
     Ok(())
 }
@@ -2456,7 +2495,7 @@ fn trash_rpc_dispatches_through_handle() -> CommonResult<()> {
     fs.create("/dispatch/b.log", true)?;
     fs.delete_with_mode("/dispatch/b.log", false, DeleteMode::Default)?;
     let empty_msg = Builder::new_rpc(RpcCode::EmptyTrash)
-        .proto_header(EmptyTrashRequest {})
+        .proto_header(EmptyTrashRequest { wait: Some(true) })
         .build();
     let empty_rep = handler.handle(&empty_msg)?;
     assert!(empty_rep.is_success(), "{}", empty_rep.to_error_msg());
