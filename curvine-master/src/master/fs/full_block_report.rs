@@ -208,19 +208,6 @@ impl FullReportTracker {
         });
     }
 
-    pub(super) fn completed_round(&self, worker_id: u32) -> Option<u64> {
-        let state = self.state.lock();
-        state
-            .rounds
-            .get(&worker_id)
-            .filter(|r| r.done)
-            .map(|r| r.report_id)
-    }
-
-    pub(super) fn open_sessions(&self) -> usize {
-        self.state.lock().sessions.len()
-    }
-
     /// Forget everything about the worker, e.g. when it registers again.
     pub(super) fn reset(&self, worker_id: u32) {
         let mut state = self.state.lock();

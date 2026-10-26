@@ -31,7 +31,6 @@ struct FollowerReadinessState {
     leadership_epoch: u64,
     commit_index: u64,
     applied_index: Option<u64>,
-    applied_term: Option<u64>,
     replay_ready: bool,
     leader_contact: Option<LeaderContact>,
     leader_contact_sequence: u64,
@@ -47,7 +46,6 @@ impl Default for FollowerReadinessState {
             leadership_epoch: 0,
             commit_index: 0,
             applied_index: None,
-            applied_term: None,
             replay_ready: false,
             leader_contact: None,
             leader_contact_sequence: 0,
@@ -74,7 +72,6 @@ pub struct FollowerReadinessSnapshot {
     pub leadership_epoch: u64,
     pub commit_index: u64,
     pub applied_index: Option<u64>,
-    pub applied_term: Option<u64>,
     pub replay_ready: bool,
     /// Monotonic counter incremented only for accepted current-term leader
     /// traffic. Consumers can distinguish a contact that arrived after an
@@ -198,14 +195,13 @@ impl FollowerReadinessMonitor {
     }
 
     /// Publishes the journal FSM's real metadata apply watermark.
-    pub fn observe_applied(&self, applied_term: u64, applied_index: u64) {
+    pub fn observe_applied(&self, applied_index: u64) {
         let now = Instant::now();
         let mut state = self.lock();
         let advanced = state
             .applied_index
             .is_some_and(|current| applied_index > current);
         state.applied_index = Some(applied_index);
-        state.applied_term = Some(applied_term);
         if advanced {
             if state.commit_index > applied_index {
                 state.lag_started_at = Some(now);
@@ -247,7 +243,6 @@ impl FollowerReadinessMonitor {
             leadership_epoch: state.leadership_epoch,
             commit_index: state.commit_index,
             applied_index: state.applied_index,
-            applied_term: state.applied_term,
             replay_ready: state.replay_ready,
             leader_contact_sequence: state.leader_contact_sequence,
             leader_contact_age,
@@ -273,7 +268,7 @@ mod tests {
 
     fn initialized_follower() -> FollowerReadinessMonitor {
         let monitor = FollowerReadinessMonitor::default();
-        monitor.observe_applied(3, 10);
+        monitor.observe_applied(10);
         monitor.set_replay_ready(true);
         monitor.observe_raft_state(RoleState::Follower, 4, 8, 10);
         monitor.observe_leader_contact(4, 8);
@@ -305,7 +300,7 @@ mod tests {
             Some(FollowerReadRefusal::ReplayNotReady)
         );
 
-        monitor.observe_applied(0, 0);
+        monitor.observe_applied(0);
         monitor.set_replay_ready(true);
         assert_eq!(
             monitor
@@ -337,7 +332,7 @@ mod tests {
         );
         assert!(lagging.apply_no_progress_age.is_some());
 
-        monitor.observe_applied(3, 11);
+        monitor.observe_applied(11);
         let progressing = monitor.snapshot();
         assert_eq!(progressing.applied_index, Some(11));
         assert!(progressing
