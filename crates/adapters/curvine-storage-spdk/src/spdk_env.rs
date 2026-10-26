@@ -1694,6 +1694,15 @@ impl SpdkEnv {
                 );
             }
         }
+        // TODO(spdk): known TOCTOU race here, to be eliminated via per-controller locks.
+        // Observability only, never aborts (see issue-spdk-detach-toctou-observability.md).
+        if self.open_handles.load(Ordering::Acquire) != 0 {
+            error!(
+                "SPDK target {}: proceeding to nvme_detach with open handle(s) present \
+                 (open-handle precondition check-then-act race)",
+                target_idx
+            );
+        }
         let rc = self.nvme_detach_ctrlr(ctrlr);
         if rc != 0 {
             // Detach never happened; resume keep-alive polling for this
@@ -2771,6 +2780,30 @@ mod test {
 
         // Clean up the injected stale entry so it doesn't leak into drop/teardown.
         env.qpair_pool.inner.lock().unwrap().remove(&0x1000);
+    }
+
+    /// Regression: the observability-only recheck must never change detach_target()'s outcome.
+    #[test]
+    fn detach_target_proceeds_unchanged_when_open_handle_races_past_precondition() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+
+        // Simulate a handle opening during the unregister retry window.
+        let open_handles_ptr = &env.open_handles as *const AtomicUsize as usize;
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(move || {
+            let open_handles = unsafe { &*(open_handles_ptr as *const AtomicUsize) };
+            open_handles.fetch_add(1, Ordering::AcqRel);
+            UnregisterResult::Acked
+        }));
+
+        env.detach_target(0).unwrap();
+
+        assert_eq!(env.controllers[0].state(), ControllerState::Detached);
+        assert_eq!(env.open_handles.load(Ordering::Acquire), 1);
+
+        // Clean up so later assertions elsewhere aren't affected.
+        env.open_handles.store(0, Ordering::Release);
     }
 
     #[test]
