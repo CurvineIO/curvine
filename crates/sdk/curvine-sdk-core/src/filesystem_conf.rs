@@ -116,14 +116,16 @@ pub struct FilesystemConf {
     pub large_file_size: String,
     pub max_read_parallel: i64,
     pub sequential_read_threshold: u64,
-    // Forward-seek absorption window (byte-size string, e.g. "4MB"); "0"
-    // disables it. See ClientConf::seek_absorb_window for the preconditions
-    // (enable_smart_prefetch and read_chunk_num > 1) and side effects.
-    pub seek_absorb_window: String,
 
     /// Client-side Transfer routing only. Service-side store and scheduler settings remain
     /// owned by the Transfer process configuration.
     pub transfer: TransferClientConf,
+
+    // Forward-seek absorption window (byte-size string, e.g. "4MB"); "0"
+    // disables it. See ClientConf::seek_absorb_window for the preconditions
+    // (enable_smart_prefetch and read_chunk_num > 1) and side effects.
+    // Appended last: new public fields go at the end of the struct.
+    pub seek_absorb_window: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
