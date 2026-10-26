@@ -1582,11 +1582,9 @@ where
             .recover_transient_failed_tasks(&job, &lease, now)
             .await?;
 
-        if self.store.has_failed_tasks(&job.job_id, job.run_id)? {
-            if !retryable_failed {
-                self.finish_failed_transfer(&job, &lease).await?;
-                return Ok(());
-            }
+        if self.store.has_failed_tasks(&job.job_id, job.run_id)? && !retryable_failed {
+            self.finish_failed_transfer(&job, &lease).await?;
+            return Ok(());
         }
 
         if !self
