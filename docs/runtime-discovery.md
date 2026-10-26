@@ -32,8 +32,7 @@ Raft voters or elect a leader. Master registrations use the stable Raft node ID
 and the master RPC address. Worker registrations include their process session
 identity and heartbeat RPC address. Worker registrations provide visibility;
 heartbeats, block reports, and the master placement state still determine data
-routing. A `Serving` registration denotes lifecycle readiness, not leadership or
-permission to serve follower reads.
+routing. A `Serving` registration denotes lifecycle readiness, not leadership.
 
 Clients load an initial master snapshot before sending metadata requests, then
 maintain local candidates through etcd watches. RPCs select from this local cache;

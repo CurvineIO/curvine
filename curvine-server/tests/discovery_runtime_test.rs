@@ -24,81 +24,14 @@ use curvine_service_discovery::{
     EtcdDiscoveryConfig, EtcdServiceResolver, ServiceEndpoint, ServiceKind, ServiceResolver,
     ServiceStatus,
 };
-use std::fs::{self, File};
+use std::fs;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::{Daemon, TestDirectory};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-struct TestDirectory(PathBuf);
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-struct Daemon {
-    child: Child,
-    log_path: PathBuf,
-}
-
-impl Daemon {
-    fn spawn(service: &str, config_path: &std::path::Path, directory: &TestDirectory) -> Self {
-        let log_path = directory.0.join(format!("{service}-process.log"));
-        let log = File::create(&log_path).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_curvine-server"))
-            .args(["--service", service, "--conf"])
-            .arg(config_path)
-            .env_remove("CURVINE_MASTER_HOSTNAME")
-            .env_remove("CURVINE_JOURNAL_HOSTNAME")
-            .env_remove("CURVINE_WORKER_HOSTNAME")
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap();
-        Self { child, log_path }
-    }
-
-    fn assert_running(&mut self) {
-        if let Some(status) = self.child.try_wait().unwrap() {
-            panic!(
-                "daemon exited with {status}: {}",
-                fs::read_to_string(&self.log_path).unwrap_or_default()
-            );
-        }
-    }
-
-    async fn terminate(&mut self) {
-        self.assert_running();
-        assert!(Command::new("kill")
-            .args(["-TERM", &self.child.id().to_string()])
-            .status()
-            .unwrap()
-            .success());
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                assert!(
-                    status.success(),
-                    "graceful shutdown failed: {status}: {}",
-                    fs::read_to_string(&self.log_path).unwrap_or_default()
-                );
-                return;
-            }
-            assert!(Instant::now() < deadline, "daemon shutdown timed out");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 fn test_config(etcd: String) -> (TestDirectory, ClusterConf, PathBuf) {
     // Hold all sockets together while selecting distinct ports for this cluster.
@@ -116,9 +49,11 @@ fn test_config(etcd: String) -> (TestDirectory, ClusterConf, PathBuf) {
     )));
     fs::create_dir_all(directory.0.join("master-log")).unwrap();
     fs::create_dir_all(directory.0.join("worker-log")).unwrap();
-    let mut conf = ClusterConf::default();
-    conf.format_master = true;
-    conf.cluster_id = format!("discovery-runtime-{}", ports[0]);
+    let mut conf = ClusterConf {
+        format_master: true,
+        cluster_id: format!("discovery-runtime-{}", ports[0]),
+        ..Default::default()
+    };
     conf.master.hostname = "127.0.0.1".to_string();
     conf.master.rpc_port = ports[0];
     conf.master.web_port = ports[1];
@@ -167,7 +102,12 @@ async fn wait_endpoints(
             .list(ServiceKind::try_new(kind).unwrap())
             .await
             .unwrap();
-        if snapshot.endpoints.len() == count {
+        if snapshot.endpoints.len() == count
+            && snapshot
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.status == ServiceStatus::Serving)
+        {
             return snapshot.endpoints;
         }
         assert!(
@@ -237,6 +177,8 @@ fn daemon_registration_live_resolution_and_graceful_revoke() {
             dead_seed.local_addr().unwrap().port(),
         )];
         let client = CurvineFileSystem::with_rt(client_conf, rt.clone()).unwrap();
+        // Raw metadata entry points must also await the first snapshot.
+        client.get_filesystem_info().await.unwrap();
         let path = Path::from_str("/runtime-discovery").unwrap();
         client.mkdir(&path, false).await.unwrap();
         assert!(client.exists(&path).await.unwrap());

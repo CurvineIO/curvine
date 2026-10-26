@@ -33,6 +33,12 @@ type ProviderFuture =
     Pin<Box<dyn Future<Output = DiscoveryResult<DiscoveryProvider>> + Send + 'static>>;
 type ProviderFactory = Arc<dyn Fn(Arc<Runtime>) -> ProviderFuture + Send + Sync + 'static>;
 
+struct WatchSettings {
+    kind: ServiceKind,
+    reconnect_min_ms: u64,
+    reconnect_max_ms: u64,
+}
+
 #[derive(Clone, Debug)]
 enum Readiness {
     Starting { last_error: Option<String> },
@@ -116,9 +122,12 @@ impl ClientDiscovery {
             runtime,
             provider_factory,
             connector,
-            ServiceKind::try_new("master").map_err(|error| fs_error(error.to_string()))?,
-            config.watch_reconnect_min_ms,
-            config.watch_reconnect_max_ms,
+            WatchSettings {
+                kind: ServiceKind::try_new("master")
+                    .map_err(|error| fs_error(error.to_string()))?,
+                reconnect_min_ms: config.watch_reconnect_min_ms,
+                reconnect_max_ms: config.watch_reconnect_max_ms,
+            },
             config.allow_stale_cache,
             initial_ready_timeout,
         )
@@ -128,9 +137,7 @@ impl ClientDiscovery {
         runtime: Arc<Runtime>,
         provider_factory: ProviderFactory,
         connector: Weak<ClusterConnector>,
-        kind: ServiceKind,
-        reconnect_min_ms: u64,
-        reconnect_max_ms: u64,
+        settings: WatchSettings,
         allow_stale_cache: bool,
         initial_ready_timeout: Duration,
     ) -> FsResult<Self> {
@@ -147,9 +154,7 @@ impl ClientDiscovery {
                     thread_runtime,
                     provider_factory,
                     connector,
-                    kind,
-                    reconnect_min_ms,
-                    reconnect_max_ms,
+                    settings,
                     thread_cache,
                     readiness_tx,
                     stop_rx,
@@ -287,13 +292,16 @@ fn supervise(
     runtime: Arc<Runtime>,
     provider_factory: ProviderFactory,
     connector: Weak<ClusterConnector>,
-    kind: ServiceKind,
-    reconnect_min_ms: u64,
-    reconnect_max_ms: u64,
+    settings: WatchSettings,
     cache: Arc<RwLock<CacheState>>,
     readiness: watch::Sender<Readiness>,
     mut stop: watch::Receiver<bool>,
 ) {
+    let WatchSettings {
+        kind,
+        reconnect_min_ms,
+        reconnect_max_ms,
+    } = settings;
     let mut reconnect_delay_ms = reconnect_min_ms.max(1);
     let mut initial_ready = false;
 
@@ -410,12 +418,12 @@ fn supervise(
         let message = loop {
             enum Event {
                 Stop,
-                Received(Option<DiscoveryResult<ServiceWatchEvent>>),
+                Received(Box<Option<DiscoveryResult<ServiceWatchEvent>>>),
             }
             let event = runtime.block_on(async {
                 tokio::select! {
                     _ = stopped(&mut stop) => Event::Stop,
-                    event = events.recv() => Event::Received(event),
+                    event = events.recv() => Event::Received(Box::new(event)),
                 }
             });
             match event {
@@ -433,48 +441,58 @@ fn supervise(
                     drop(provider);
                     return;
                 }
-                Event::Received(None) => {
-                    break "master discovery watch closed".to_string();
-                }
-                Event::Received(Some(Err(error))) => {
-                    break error.to_string();
-                }
-                Event::Received(Some(Ok(event))) => match apply_event(&snapshot, event) {
-                    Ok(next_snapshot) => match snapshot_to_nodes(&next_snapshot) {
-                        Ok(nodes) => {
-                            if let Err(error) = reconcile(&runtime, &connector, nodes.clone()) {
+                Event::Received(event) => match *event {
+                    None => {
+                        break "master discovery watch closed".to_string();
+                    }
+                    Some(Err(error)) => {
+                        break error.to_string();
+                    }
+                    Some(Ok(event)) => match apply_event(&snapshot, event) {
+                        Ok(next_snapshot) => match snapshot_to_nodes(&next_snapshot) {
+                            Ok(nodes) => {
+                                if let Err(error) = reconcile(&runtime, &connector, nodes.clone()) {
+                                    set_cache_error(&runtime, &cache, error.clone());
+                                    if !initial_ready {
+                                        readiness.send_replace(Readiness::Starting {
+                                            last_error: Some(error),
+                                        });
+                                    }
+                                    continue;
+                                }
+
+                                snapshot = next_snapshot;
+                                let event_error = if nodes.is_empty() {
+                                    Some("discovery snapshot has no serving masters".to_string())
+                                } else {
+                                    None
+                                };
+                                set_cache_snapshot(
+                                    &runtime,
+                                    &cache,
+                                    snapshot.clone(),
+                                    true,
+                                    event_error.clone(),
+                                );
+                                if event_error.is_none() && !initial_ready {
+                                    initial_ready = true;
+                                    reconnect_delay_ms = reconnect_min_ms.max(1);
+                                    readiness.send_replace(Readiness::Ready);
+                                } else if !initial_ready {
+                                    readiness.send_replace(Readiness::Starting {
+                                        last_error: event_error,
+                                    });
+                                }
+                            }
+                            Err(error) => {
                                 set_cache_error(&runtime, &cache, error.clone());
                                 if !initial_ready {
                                     readiness.send_replace(Readiness::Starting {
                                         last_error: Some(error),
                                     });
                                 }
-                                continue;
                             }
-
-                            snapshot = next_snapshot;
-                            let event_error = if nodes.is_empty() {
-                                Some("discovery snapshot has no serving masters".to_string())
-                            } else {
-                                None
-                            };
-                            set_cache_snapshot(
-                                &runtime,
-                                &cache,
-                                snapshot.clone(),
-                                true,
-                                event_error.clone(),
-                            );
-                            if event_error.is_none() && !initial_ready {
-                                initial_ready = true;
-                                reconnect_delay_ms = reconnect_min_ms.max(1);
-                                readiness.send_replace(Readiness::Ready);
-                            } else if !initial_ready {
-                                readiness.send_replace(Readiness::Starting {
-                                    last_error: event_error,
-                                });
-                            }
-                        }
+                        },
                         Err(error) => {
                             set_cache_error(&runtime, &cache, error.clone());
                             if !initial_ready {
@@ -484,14 +502,6 @@ fn supervise(
                             }
                         }
                     },
-                    Err(error) => {
-                        set_cache_error(&runtime, &cache, error.clone());
-                        if !initial_ready {
-                            readiness.send_replace(Readiness::Starting {
-                                last_error: Some(error),
-                            });
-                        }
-                    }
                 },
             }
         };
@@ -796,19 +806,21 @@ mod tests {
         }
     }
 
+    type TestDiscovery = (
+        Arc<Runtime>,
+        Arc<ClusterConnector>,
+        ClientDiscovery,
+        mpsc::Sender<DiscoveryResult<ServiceWatchEvent>>,
+        Arc<AtomicBool>,
+    );
+
     fn start_test_discovery(
         snapshot: ServiceSnapshot,
         initial_peers: Vec<NodeAddr>,
         allow_stale_reader: bool,
         allow_stale_client: bool,
         initial_ready_timeout: Duration,
-    ) -> (
-        Arc<Runtime>,
-        Arc<ClusterConnector>,
-        ClientDiscovery,
-        mpsc::Sender<DiscoveryResult<ServiceWatchEvent>>,
-        Arc<AtomicBool>,
-    ) {
+    ) -> TestDiscovery {
         let runtime = Arc::new(Runtime::new("client-discovery-test", 2, 2));
         let connector = Arc::new(ClusterConnector::with_rt(
             ClientConf::default(),
@@ -836,9 +848,11 @@ mod tests {
             runtime.clone(),
             factory,
             Arc::downgrade(&connector),
-            ServiceKind::try_new("master").unwrap(),
-            5,
-            20,
+            WatchSettings {
+                kind: ServiceKind::try_new("master").unwrap(),
+                reconnect_min_ms: 5,
+                reconnect_max_ms: 20,
+            },
             allow_stale_client,
             initial_ready_timeout,
         )

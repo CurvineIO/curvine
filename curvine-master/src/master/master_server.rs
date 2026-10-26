@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use once_cell::sync::OnceCell;
 
@@ -22,7 +23,7 @@ use curvine_fault::FaultHttpControl;
 use curvine_model::ProtoUtils;
 use curvine_net::net::{ConnState, InetAddr};
 use curvine_rpc::handler::{HandlerService, LimitConf};
-use curvine_rpc::server::{RpcServer, ServerStateListener};
+use curvine_rpc::server::{RpcServer, ServerState, ServerStateListener};
 use curvine_runtime::common::{LocalTime, Logger};
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime, Runtime};
 #[cfg(feature = "discovery-etcd")]
@@ -32,7 +33,7 @@ use curvine_service_discovery::{
     RegistrationSupervisor, ServiceEndpoint, ServiceKind, ServiceStatus,
 };
 use curvine_web::server::{WebHandlerService, WebServer};
-use log::{error, info};
+use log::{error, info, warn};
 
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
@@ -265,10 +266,19 @@ impl Master {
     }
 
     pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
+        let result = self.start_inner().await;
+        if result.is_err() {
+            shutdown_registration_on_start_failure(self.registration_slot.clone()).await;
+        }
+        result
+    }
+
+    async fn start_inner(&mut self) -> CommonResult<ServerStateListener> {
         let rpc_server_for_discovery = self
             .rpc_server
             .as_ref()
             .ok_or_else(|| CommonError::from("master rpc server is not initialized"))?;
+        let rpc_ctl = rpc_server_for_discovery.new_state_ctl();
         let discovery_provider =
             connect_discovery_provider(&self.conf, rpc_server_for_discovery.clone_rt()).await?;
         let discovery_endpoint = if discovery_provider.is_some() {
@@ -280,6 +290,43 @@ impl Master {
         } else {
             None
         };
+
+        if let (Some(provider), Some(endpoint)) = (discovery_provider, discovery_endpoint) {
+            let retry_policy = RegistrationRetryPolicy {
+                startup_timeout_ms: self
+                    .conf
+                    .discovery
+                    .connect_timeout_ms
+                    .saturating_add(self.conf.discovery.request_timeout_ms),
+                retry_min_ms: self.conf.discovery.watch_reconnect_min_ms,
+                retry_max_ms: self.conf.discovery.watch_reconnect_max_ms,
+            };
+            let supervisor = RegistrationSupervisor::start(
+                provider.registry.clone(),
+                endpoint,
+                RegistrationOptions::default(),
+                retry_policy,
+            )
+            .await
+            .map_err(|error| CommonError::from(error.to_string()))?;
+            let mut pending = Some(supervisor);
+            {
+                let mut slot = self
+                    .registration_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // The entry remains Starting until all local services are
+                // ready. Store the handle before further startup awaits so a
+                // concurrent server shutdown can revoke it.
+                if rpc_ctl.value() < ServerState::Shutdown as i8 {
+                    *slot = pending.take();
+                }
+            }
+            if let Some(mut supervisor) = pending {
+                shutdown_registration(&mut supervisor, "master").await;
+                return err_box!("master shut down during discovery registration");
+            }
+        }
 
         // step 1: Start journal_system, raft server and raft node will be started internally
         let journal_system = match self.journal_system.take() {
@@ -321,28 +368,17 @@ impl Master {
             error!("Failed to start inode ttl scheduler: {}", e);
         }
 
-        if let (Some(provider), Some(endpoint)) = (discovery_provider, discovery_endpoint) {
-            let retry_policy = RegistrationRetryPolicy {
-                startup_timeout_ms: self
-                    .conf
-                    .discovery
-                    .connect_timeout_ms
-                    .saturating_add(self.conf.discovery.request_timeout_ms),
-                retry_min_ms: self.conf.discovery.watch_reconnect_min_ms,
-                retry_max_ms: self.conf.discovery.watch_reconnect_max_ms,
-            };
-            let supervisor = RegistrationSupervisor::start(
-                provider.registry.clone(),
-                endpoint,
-                RegistrationOptions::default(),
-                retry_policy,
-            )
-            .await
-            .map_err(|error| CommonError::from(error.to_string()))?;
-            *self
+        {
+            let slot = self
                 .registration_slot
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(supervisor);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if rpc_ctl.value() >= ServerState::Shutdown as i8 {
+                return err_box!("master shut down during startup");
+            }
+            if let Some(supervisor) = slot.as_ref() {
+                supervisor.set_desired_status(ServiceStatus::Serving);
+            }
         }
 
         Ok(rpc_status)
@@ -416,6 +452,24 @@ async fn connect_discovery_provider(
     }
 }
 
+async fn shutdown_registration_on_start_failure(slot: Arc<Mutex<Option<RegistrationSupervisor>>>) {
+    let supervisor = slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(mut supervisor) = supervisor {
+        shutdown_registration(&mut supervisor, "master").await;
+    }
+}
+
+async fn shutdown_registration(supervisor: &mut RegistrationSupervisor, role: &str) {
+    match tokio::time::timeout(Duration::from_secs(2), supervisor.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!("failed to revoke {role} discovery registration: {error}"),
+        Err(_) => warn!("timed out revoking {role} discovery registration during startup"),
+    }
+}
+
 fn master_discovery_endpoint(
     conf: &ClusterConf,
     addr: &InetAddr,
@@ -446,7 +500,7 @@ fn master_endpoint_for_node(
             &curvine_sys::version::component_version(kind.as_str()),
         ),
         start_time_ms,
-        status: ServiceStatus::Serving,
+        status: ServiceStatus::Starting,
         metadata: None,
     };
     endpoint
@@ -470,6 +524,6 @@ mod discovery_tests {
         assert_eq!(endpoint.rpc_port, addr.port);
         assert_eq!(endpoint.web_port, Some(8996));
         assert_eq!(endpoint.start_time_ms, 123);
-        assert_eq!(endpoint.status, ServiceStatus::Serving);
+        assert_eq!(endpoint.status, ServiceStatus::Starting);
     }
 }

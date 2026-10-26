@@ -26,7 +26,7 @@ use curvine_model::ProtoUtils;
 use curvine_model::{CompatibilityPolicy, HeartbeatStatus, WorkerAddress};
 use curvine_net::net::ConnState;
 use curvine_rpc::handler::HandlerService;
-use curvine_rpc::server::{RpcServer, ServerStateListener};
+use curvine_rpc::server::{RpcServer, ServerState, ServerStateListener};
 use curvine_runtime::common::Utils;
 use curvine_runtime::common::{LocalTime, Logger};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
@@ -44,6 +44,7 @@ use log::{info, warn};
 use once_cell::sync::OnceCell;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 static CLUSTER_CONF: OnceCell<ClusterConf> = OnceCell::new();
 
@@ -311,50 +312,37 @@ impl Worker {
     }
 
     pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
-        let rpc_server = self
-            .rpc_server
-            .take()
-            .expect("worker rpc server must be initialized before startup");
-        let discovery_provider = connect_discovery_provider(
-            &self.discovery_conf,
-            &self.cluster_id,
-            rpc_server.clone_rt(),
-        )
-        .await?;
-        let discovery_endpoint = if discovery_provider.is_some() {
-            Some(worker_discovery_endpoint(
-                &self.addr,
-                &self.worker_session_id,
-                self.start_ms,
-            )?)
-        } else {
-            None
+        let result = self.start_inner().await;
+        if result.is_err() {
+            shutdown_registration_on_start_failure(self.registration_slot.clone()).await;
+        }
+        result
+    }
+
+    async fn start_inner(&mut self) -> CommonResult<ServerStateListener> {
+        let (rpc_ctl, discovery_provider, discovery_endpoint) = {
+            let rpc_server = self
+                .rpc_server
+                .as_ref()
+                .expect("worker rpc server must be initialized before startup");
+            let rpc_ctl = rpc_server.new_state_ctl();
+            let discovery_provider = connect_discovery_provider(
+                &self.discovery_conf,
+                &self.cluster_id,
+                rpc_server.clone_rt(),
+            )
+            .await?;
+            let discovery_endpoint = if discovery_provider.is_some() {
+                Some(worker_discovery_endpoint(
+                    &self.addr,
+                    &self.worker_session_id,
+                    self.start_ms,
+                )?)
+            } else {
+                None
+            };
+            (rpc_ctl, discovery_provider, discovery_endpoint)
         };
-
-        // step 3: Start rpc server
-        let mut rpc_status = rpc_server.start();
-        rpc_status.wait_running().await?;
-
-        // step 4: Start the web server
-        let web_server = self
-            .web_server
-            .take()
-            .expect("worker web server must be initialized before startup");
-        let web_name = web_server.server_name().to_string();
-        let bind_addr = web_server.resolve_bind_addr();
-        let mut web_status = web_server.start();
-        WebServer::<WorkerService>::wait_bind(&mut web_status, &web_name, &bind_addr).await?;
-
-        // step 5: Start block heartbeat check service
-        let block_actor = self.block_actor.clone();
-        thread::spawn(move || block_actor.start())
-            .join()
-            .map_err(|_| {
-                CommonError::from(StringError::from(
-                    "worker block actor startup thread panicked",
-                ))
-            })
-            .and_then(|result| result)?;
 
         if let (Some(provider), Some(endpoint)) = (discovery_provider, discovery_endpoint) {
             let retry_policy = RegistrationRetryPolicy {
@@ -373,10 +361,73 @@ impl Worker {
             )
             .await
             .map_err(|error| CommonError::from(error.to_string()))?;
-            *self
+            let mut pending = Some(supervisor);
+            {
+                let mut slot = self
+                    .registration_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Keep the entry Starting until the RPC, web, and block actor
+                // have reached readiness. Retain the live guard before any
+                // subsequent startup wait so shutdown can revoke it.
+                if rpc_ctl.value() < ServerState::Shutdown as i8 {
+                    *slot = pending.take();
+                }
+            }
+            if let Some(mut supervisor) = pending {
+                shutdown_registration(&mut supervisor, "worker").await;
+                return curvine_core_error::err_box!(
+                    "worker shut down during discovery registration"
+                );
+            }
+        }
+
+        // step 3: Start rpc server
+        let rpc_server = self
+            .rpc_server
+            .take()
+            .expect("worker rpc server must be initialized before startup");
+        let mut rpc_status = rpc_server.start();
+        rpc_status.wait_running().await?;
+
+        // step 4: Start the web server
+        let web_server = self
+            .web_server
+            .take()
+            .expect("worker web server must be initialized before startup");
+        let web_name = web_server.server_name().to_string();
+        let bind_addr = web_server.resolve_bind_addr();
+        let mut web_status = web_server.start();
+        WebServer::<WorkerService>::wait_bind(&mut web_status, &web_name, &bind_addr).await?;
+
+        // step 5: Start block heartbeat check service
+        let block_actor = self.block_actor.clone();
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        thread::spawn(move || {
+            let _ = startup_tx.send(block_actor.start());
+        });
+        // The actor's synchronous client needs this same I/O runtime. Joining
+        // its thread here blocks startup forever with a single I/O worker.
+        startup_rx
+            .await
+            .map_err(|_| {
+                CommonError::from(StringError::from(
+                    "worker block actor startup thread panicked",
+                ))
+            })
+            .and_then(|result| result)?;
+
+        {
+            let slot = self
                 .registration_slot
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(supervisor);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if rpc_ctl.value() >= ServerState::Shutdown as i8 {
+                return curvine_core_error::err_box!("worker shut down during startup");
+            }
+            if let Some(supervisor) = slot.as_ref() {
+                supervisor.set_desired_status(ServiceStatus::Serving);
+            }
         }
 
         Ok(rpc_status)
@@ -449,6 +500,24 @@ async fn connect_discovery_provider(
     }
 }
 
+async fn shutdown_registration_on_start_failure(slot: Arc<Mutex<Option<RegistrationSupervisor>>>) {
+    let supervisor = slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(mut supervisor) = supervisor {
+        shutdown_registration(&mut supervisor, "worker").await;
+    }
+}
+
+async fn shutdown_registration(supervisor: &mut RegistrationSupervisor, role: &str) {
+    match tokio::time::timeout(Duration::from_secs(2), supervisor.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!("failed to revoke {role} discovery registration: {error}"),
+        Err(_) => warn!("timed out revoking {role} discovery registration during startup"),
+    }
+}
+
 fn worker_discovery_endpoint(
     addr: &WorkerAddress,
     session_id: &str,
@@ -476,7 +545,7 @@ fn worker_discovery_endpoint(
             &curvine_sys::version::component_version(kind.as_str()),
         ),
         start_time_ms,
-        status: ServiceStatus::Serving,
+        status: ServiceStatus::Starting,
         metadata: None,
     };
     endpoint
@@ -511,7 +580,7 @@ mod discovery_tests {
         );
         assert_eq!(endpoint.web_port, Some(addr.web_port as u16));
         assert_eq!(endpoint.start_time_ms, 456);
-        assert_eq!(endpoint.status, ServiceStatus::Serving);
+        assert_eq!(endpoint.status, ServiceStatus::Starting);
     }
 
     #[test]
