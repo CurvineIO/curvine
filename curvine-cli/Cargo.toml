@@ -37,6 +37,11 @@ default = []
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 system = []
+discovery-etcd = [
+    "curvine-client-core/discovery-etcd",
+    "curvine-job-client/discovery-etcd",
+    "curvine-unified-fs/discovery-etcd",
+]
 opendal-s3 = ["curvine-unified-fs/opendal-s3"]
 opendal-oss = ["curvine-unified-fs/opendal-oss"]
 opendal-gcs = ["curvine-unified-fs/opendal-gcs"]

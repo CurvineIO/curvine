@@ -49,6 +49,7 @@ futures = { workspace = true }
 default = ["fuse3"]
 fuse2 = []
 fuse3 = []
+discovery-etcd = ["curvine-client/discovery-etcd"]
 # Product builds enable UFS adapters via build.sh (`curvine-client/<ufs>`).
 # Keep them optional here so the default fuse tree stays client-light.
 opendal-s3 = ["curvine-client/opendal-s3"]

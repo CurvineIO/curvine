@@ -11,6 +11,7 @@ name = "curvine_libsdk"
 [features]
 default = ["java-sdk"]
 rust-sdk = ["curvine-sdk-core/rust-sdk"]
+discovery-etcd = ["curvine-sdk-core/discovery-etcd"]
 java-sdk = ["dep:curvine-libsdk-java"]
 python-sdk = ["dep:curvine-libsdk-python", "curvine-libsdk-python/extension-module"]
 

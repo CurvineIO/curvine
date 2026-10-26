@@ -12,6 +12,13 @@ license.workspace = true
 # rejects `kv_backend = "fdb"` at startup when compiled without it.
 default = []
 fdb = ["curvine-mds/fdb"]
+discovery-etcd = [
+    "curvine-master/discovery-etcd",
+    "curvine-worker/discovery-etcd",
+    "curvine-client-core/discovery-etcd",
+    "curvine-job-client/discovery-etcd",
+    "curvine-service-discovery/etcd",
+]
 jni = ["curvine-data-transfer/opendal-hdfs"]
 spdk = [
     "curvine-worker/spdk",
@@ -75,3 +82,4 @@ parking_lot = { workspace = true }
 [dev-dependencies]
 curvine-fault = { workspace = true, features = ["http-client"] }
 raft = { workspace = true }
+curvine-service-discovery = { workspace = true }

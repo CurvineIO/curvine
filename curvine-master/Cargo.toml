@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 default = []
+discovery-etcd = ["curvine-service-discovery/etcd"]
 fault-injection = ["curvine-fault/http-server"]
 
 [dependencies]
@@ -16,6 +17,7 @@ curvine-raft = { workspace = true }
 curvine-proto = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-config = { workspace = true }
+curvine-service-discovery = { workspace = true }
 curvine-sys = { workspace = true }
 curvine-alloc = { workspace = true }
 curvine-model = { workspace = true }
