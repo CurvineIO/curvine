@@ -128,6 +128,13 @@ impl FsReaderParallel {
         self.parallel_id
     }
 
+    // Test-only visibility into the underlying reader position, so tests can
+    // assert which readers a seek actually repositioned.
+    #[cfg(test)]
+    pub(crate) fn pos(&self) -> i64 {
+        self.inner.pos()
+    }
+
     pub async fn read(&mut self) -> FsResult<FileChunk> {
         match self.cur_idx {
             None => {
