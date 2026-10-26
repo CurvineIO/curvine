@@ -29,6 +29,7 @@ import { useRefreshSignal } from '@/refresh/refresh-context'
 import { useAsync } from '@/lib/use-async'
 import { useSlidingSheet } from '@/lib/use-sliding-sheet'
 import { WorkerDetailSheet } from './worker-detail-sheet'
+import { ProfileDialog } from './profile-dialog'
 
 type WorkerRow = WorkerInfo & { rowStatus: string }
 
@@ -58,6 +59,10 @@ export function WorkersPage() {
   )
   const [submitting, setSubmitting] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
+  // Which worker's flame graph is open, if any. Kept as the worker object
+  // rather than an id so the dialog does not re-resolve it after the list
+  // refreshes behind the modal.
+  const [profileWorker, setProfileWorker] = useState<WorkerInfo | null>(null)
 
   const load = useCallback(() => api.fetchWorkersData(), [api])
   const { data, loading, error, reload, refresh } = useAsync(load, [load])
@@ -298,6 +303,10 @@ export function WorkersPage() {
                       label={t('workers.actions.detail')}
                       onClick={() => navigate(`/workers/${encodeURIComponent(selector)}`)}
                     />
+                    <WorkerActionButton
+                      label={t('workers.actions.profile')}
+                      onClick={() => setProfileWorker(worker)}
+                    />
                     {worker.rowStatus !== 'lost' && worker.rowStatus !== 'blacklist' && (
                       <WorkerActionButton
                         label={t('workers.actions.addBlacklist')}
@@ -358,6 +367,27 @@ export function WorkersPage() {
           onClose={() => navigate('/workers')}
         />
       )}
+
+      <ProfileDialog
+        host={
+          profileWorker
+            ? profileWorker.display_ip ||
+              profileWorker.address?.ip_addr ||
+              profileWorker.address?.hostname ||
+              profileWorker.ip_addr
+            : null
+        }
+        webPort={profileWorker?.address?.web_port}
+        target={
+          profileWorker
+            ? `${t('nav.workers')} ${workerHostname(profileWorker)}:${rpcPort(profileWorker)}`
+            : undefined
+        }
+        open={profileWorker !== null}
+        onOpenChange={(open) => {
+          if (!open) setProfileWorker(null)
+        }}
+      />
     </>
   )
 }

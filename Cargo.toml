@@ -29,6 +29,7 @@ members = [
     "crates/core/curvine-sys",
     "crates/core/curvine-alloc",
     "crates/core/curvine-io",
+    "crates/core/curvine-profiling",
     "crates/adapters/curvine-rocksdb",
     "crates/adapters/curvine-service-discovery",
     "crates/metadata/curvine-raft",
@@ -87,6 +88,7 @@ default-members = [
     "crates/core/curvine-sys",
     "crates/core/curvine-alloc",
     "crates/core/curvine-io",
+    "crates/core/curvine-profiling",
     "crates/adapters/curvine-service-discovery",
     "crates/metadata/curvine-raft",
     "crates/adapters/curvine-storage-local",
@@ -121,6 +123,7 @@ curvine-rpc = { path = "crates/core/rpc" }
 curvine-sys = { path = "crates/core/curvine-sys" }
 curvine-alloc = { path = "crates/core/curvine-alloc" }
 curvine-io = { path = "crates/core/curvine-io" }
+curvine-profiling = { path = "crates/core/curvine-profiling" }
 curvine-rocksdb = { path = "crates/adapters/curvine-rocksdb" }
 curvine-service-discovery = { path = "crates/adapters/curvine-service-discovery" }
 curvine-raft = { path = "crates/metadata/curvine-raft" }
@@ -221,6 +224,8 @@ crc32fast = "1.4.2"
 socket2 = "0.5.8"
 chrono = { version = "0.4.31", default-features = false, features = ["clock"] }
 prometheus = { version = "0.13.4", features = ["process"] }
+# CPU flame-graph sampling. Feature-gated by `curvine-profiling/profiling`.
+pprof = { version = "0.15" }
 sysinfo = "0.30.13"
 fs2 = "0.4.3"
 byteorder = "1.5.0"

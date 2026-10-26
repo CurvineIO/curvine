@@ -38,6 +38,7 @@ export default {
       allow: 'Allow',
       decommission: 'Decommission',
       recommission: 'Recommission',
+      profile: 'Profile',
       confirm: '{action} worker {worker}?',
     },
     actionVerb: {
@@ -76,6 +77,20 @@ export default {
         type: 'Type',
         empty: 'No storage directories reported.'
       }
+    },
+    profile: {
+      titleWithTarget: 'CPU Flame Graph · {target}',
+      title: 'CPU Flame Graph',
+      description:
+        'Sampling for {seconds}s. The graph appears when the window ends — sampling is synchronous by design.',
+      fullscreen: 'Fullscreen',
+      exitFullscreen: 'Exit fullscreen',
+      duration: 'Duration',
+      seconds: '{count}s',
+      sampling: 'Sampling, ~{seconds}s…',
+      openInNewTab: 'Open in a new tab',
+      unsupported: 'This process cannot serve a profile.',
+      noWebPort: 'This process did not report a web port, so its profiling endpoint is unreachable.'
     }
   }
 }

@@ -51,6 +51,9 @@ pub use self::observability_conf::*;
 mod web_conf;
 pub use self::web_conf::*;
 
+mod profiling_conf;
+pub use self::profiling_conf::ProfilingConf;
+
 mod cluster_conf;
 pub use self::cluster_conf::{ClusterConf, S3GatewayConf};
 

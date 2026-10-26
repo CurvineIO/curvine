@@ -42,6 +42,8 @@ struct MasterMetricsHandler {
     /// Snapshot plus live registry behind the `/config` routes.
     config_view: Arc<ConfigViewState>,
     runtime: MasterRuntimeMetadata,
+    /// Profiling gate; the flame-graph route is mounted only when this says so.
+    profiling: curvine_config::ProfilingConf,
 }
 
 #[derive(Clone)]
@@ -183,7 +185,10 @@ async fn update_runtime_config(
 }
 
 fn metrics_router(handler: MasterMetricsHandler) -> Router {
-    Router::new()
+    // Mounted before the Extension layer: `mount` only adds a route and
+    // needs the profiling gate, not the handler state.
+    let router = curvine_web::router::profiling::mount(Router::new(), &handler.profiling);
+    router
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -209,6 +214,8 @@ pub struct MasterMetricsServer {
     /// Snapshot plus live registry behind the `/config` routes.
     config_view: Arc<ConfigViewState>,
     runtime: MasterRuntimeMetadata,
+    /// Profiling gate forwarded from `ClusterConf`.
+    profiling: curvine_config::ProfilingConf,
 }
 
 impl MasterMetricsServer {
@@ -219,6 +226,7 @@ impl MasterMetricsServer {
         config_view: Arc<ConfigViewState>,
         start_time: String,
         start_time_ms: u64,
+        profiling: curvine_config::ProfilingConf,
     ) -> Self {
         let address = InetAddr::new(&conf.hostname, conf.port);
         Self {
@@ -231,6 +239,7 @@ impl MasterMetricsServer {
                 start_time,
                 start_time_ms,
             },
+            profiling,
         }
     }
 
@@ -258,6 +267,7 @@ impl MasterMetricsServer {
                         self.fs,
                         self.config_view,
                         self.runtime,
+                        self.profiling,
                         &self.conf,
                         &self.address,
                     )
@@ -295,6 +305,7 @@ impl MasterMetricsServer {
         fs: MasterFilesystem,
         config_view: Arc<ConfigViewState>,
         runtime: MasterRuntimeMetadata,
+        profiling: curvine_config::ProfilingConf,
         conf: &ServerConf,
         address: &InetAddr,
     ) -> CommonResult<()> {
@@ -306,6 +317,7 @@ impl MasterMetricsServer {
             fs,
             config_view,
             runtime,
+            profiling,
         });
         axum::serve(listener, app).await?;
         Ok(())
@@ -318,6 +330,7 @@ impl MasterMetricsServer {
             self.fs,
             self.config_view,
             self.runtime,
+            self.profiling,
             &self.conf,
             &self.address,
         )

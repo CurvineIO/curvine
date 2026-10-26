@@ -6,6 +6,8 @@ license.workspace = true
 
 [features]
 default = []
+# CPU flame-graph sampling: compiles the SIGPROF sampler and mounts its route.
+profiling = ["curvine-profiling/profiling", "curvine-web/profiling"]
 fault-injection = ["curvine-fault/http-server"]
 
 [dependencies]
@@ -16,6 +18,7 @@ curvine-raft = { workspace = true }
 curvine-proto = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-config = { workspace = true }
+curvine-profiling = { workspace = true }
 curvine-sys = { workspace = true }
 curvine-alloc = { workspace = true }
 curvine-model = { workspace = true }

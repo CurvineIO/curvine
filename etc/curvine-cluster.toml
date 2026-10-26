@@ -37,6 +37,19 @@ format_worker = false
 enabled = false
 auth_token_env = "CURVINE_FAULT_TOKEN"
 
+# Process-level CPU flame graph (GET /api/v1/profiling/cpu).
+#
+# Two gates, both off by default:
+#   1. build with `--features profiling` so the SIGPROF sampler is compiled
+#   2. set cpu_enabled = true below
+# Enabling cpu_enabled on a build without the feature is rejected at startup.
+# Sampling costs CPU and must never be switched on implicitly.
+[profiling]
+cpu_enabled = false
+cpu_frequency = 1000        # Hz, 1..=1000
+max_duration_secs = 120     # longest accepted window; larger requests are clamped
+blocklist = ["libc", "libgcc", "pthread", "vdso"]  # libunwind is not signal-safe
+
 # Service discovery is disabled by default. When enabled, the first provider is
 # etcd over internal cluster networking; auth/TLS settings are intentionally not
 # part of the first phase.

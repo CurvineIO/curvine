@@ -72,6 +72,9 @@ impl ConfValidate for ClusterConf {
         self.fuse.validate()?;
         self.job.validate()?;
         self.transfer.validate()?;
+        if let Err(reason) = self.profiling.validate() {
+            return err_box!(reason);
+        }
         Ok(())
     }
 }

@@ -169,6 +169,10 @@ impl Master {
         Logger::init(log);
         let fault_http = FaultHttpControl::from_env(&conf.fault_injection)
             .map_err(|error| CommonError::from(error.to_string()))?;
+        // Reject `profiling.cpu_enabled=true` on a build without the sampler
+        // instead of silently leaving the route unmounted.
+        curvine_profiling::check_startup(&conf.profiling)
+            .map_err(|error| CommonError::from(error.to_string()))?;
         let metrics = MASTER_METRICS.get_or_try_init(MasterMetrics::new)?;
         info!("allocator: {}", curvine_alloc::allocator_type_name());
         info!("git version: {}", curvine_sys::version::GIT_VERSION);
@@ -251,6 +255,7 @@ impl Master {
             config_view,
             start_time,
             start_time_ms,
+            conf.profiling.clone(),
         );
 
         Ok(Self {

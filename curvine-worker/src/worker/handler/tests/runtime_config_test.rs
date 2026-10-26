@@ -20,6 +20,7 @@ fn test_handler() -> WorkerRouterHandler {
     let runtime_config = Arc::new(build_worker_runtime_registry(task_manager.clone(), &conf));
     WorkerRouterHandler {
         fault_http: FaultHttpControl::default(),
+        profiling_conf: conf.profiling.clone(),
         server_state: Arc::default(),
         task_manager: task_manager.clone(),
         config_view: WorkerRouterHandler::build_config_view(

@@ -85,6 +85,10 @@ impl WorkerService {
     ) -> CommonResult<Self> {
         let fault_http = FaultHttpControl::from_env(&conf.fault_injection)
             .map_err(|error| CommonError::from(error.to_string()))?;
+        // Reject `profiling.cpu_enabled=true` on a build without the sampler
+        // instead of silently leaving the route unmounted.
+        curvine_profiling::check_startup(&conf.profiling)
+            .map_err(|error| CommonError::from(error.to_string()))?;
         let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
 
         let task_manager = Arc::new(TaskManager::with_rt(
@@ -167,6 +171,7 @@ impl WebHandlerService for WorkerService {
         );
         WorkerRouterHandler {
             fault_http: self.fault_http.clone(),
+            profiling_conf: self.conf.profiling.clone(),
             server_state: self.server_state.clone(),
             task_manager: self.task_manager.clone(),
             runtime_config: self.runtime_config.clone(),

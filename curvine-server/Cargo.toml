@@ -28,6 +28,10 @@ fault-injection = [
     "curvine-worker/fault-injection",
     "curvine-data-transfer/fault-injection",
 ]
+# CPU flame-graph sampling for the packaged server binaries. Off by default;
+# `-f profiling` on build.sh enables it. The binaries then still need
+# `profiling.cpu_enabled = true` to expose the route.
+profiling = ["curvine-master/profiling", "curvine-worker/profiling"]
 
 [dependencies]
 curvine-core-error = { workspace = true }

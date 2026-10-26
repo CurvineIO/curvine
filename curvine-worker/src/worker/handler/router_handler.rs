@@ -34,6 +34,8 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct WorkerRouterHandler {
     pub(crate) fault_http: FaultHttpControl,
+    /// Profiling gate; routes are mounted only when this says so.
+    pub(crate) profiling_conf: curvine_config::ProfilingConf,
     pub(crate) server_state: Arc<OnceCell<StateCtl>>,
     #[allow(dead_code)] // used by integration tests and registry wiring
     pub(crate) task_manager: Arc<TaskManager>,
@@ -147,6 +149,10 @@ impl RouterHandler for WorkerRouterHandler {
             .route("/api/v1/worker/config", get(runtime_config))
             .route("/api/update_config", post(update_runtime_config))
             .layer(Extension(instance));
+
+        // Absent unless `profiling.cpu_enabled` is set and the `profiling`
+        // feature is compiled; `mount` is a no-op otherwise.
+        let router = curvine_web::router::profiling::mount(router, &self.profiling_conf);
 
         self.fault_http.mount(router)
     }

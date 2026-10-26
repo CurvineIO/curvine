@@ -16,7 +16,7 @@ use crate::validation::ConfValidate;
 use crate::{pipeline, validation, ConfigSource, ConfigSourceMap};
 use crate::{
     CliConf, ClientConf, DBConf, DiscoveryConf, FuseConf, JobConf, JournalConf, MasterConf,
-    MdsConf, TransferConf, WebConf, WorkerConf,
+    MdsConf, ProfilingConf, TransferConf, WebConf, WorkerConf,
 };
 use curvine_core_error::{err_box, try_err, CommonResult};
 use curvine_fault::FaultHttpConfig;
@@ -74,6 +74,13 @@ pub struct ClusterConf {
     /// setting only controls HTTP route exposure; enabling it without the
     /// corresponding Cargo feature fails server startup.
     pub fault_injection: FaultHttpConfig,
+
+    /// Process-level profiling (flame graph).
+    ///
+    /// Same two-gate control as `fault_injection`: the `profiling` Cargo
+    /// feature compiles the sampler, and `cpu_enabled` decides whether the
+    /// routes are exposed. Defaults to fully off.
+    pub profiling: ProfilingConf,
 
     pub log: LogConf,
 
@@ -645,6 +652,7 @@ impl Default for ClusterConf {
             journal: Default::default(),
             worker: Default::default(),
             fault_injection: Default::default(),
+            profiling: Default::default(),
             log: Default::default(),
             client: Default::default(),
             fuse: FuseConf::default(),

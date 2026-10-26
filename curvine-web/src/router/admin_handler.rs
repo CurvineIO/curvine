@@ -2126,6 +2126,11 @@ async fn overview(
             display_addr_text_for_cluster(&active_master, conf, &active_master)
         },
         "local_hostname": resolve_display_hostname(conf, &active_master),
+        // Host + port of the active master's `web_port`, where its `/metrics`
+        // and profiling endpoint listen. Reported explicitly because it is
+        // not derivable from `master_addr`, which carries the RPC port.
+        "master_metrics_host": resolve_display_hostname(conf, &active_master),
+        "master_web_port": conf.master.web_port,
         "journal_nodes": master_info.journal_nodes.clone(),
         "version": runtime.version_json(),
         "version_commit": runtime.version_commit_json(),

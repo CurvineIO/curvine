@@ -7,6 +7,7 @@ import { ErrorAlert } from '@/components/data-state'
 import { Meter } from '@/components/meter'
 import { MetricCard, type MetricTone } from '@/components/metric-card'
 import { PageHeader } from '@/components/page-header'
+import { ProfileDialog } from '@/pages/profile-dialog'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -98,6 +99,9 @@ export function OverviewPage() {
 
   const [failoverTarget, setFailoverTarget] = useState<MasterHaNode | null>(null)
   const [switching, setSwitching] = useState<string | null>(null)
+  // Which master's flame graph is open; kept as the node so the row that
+  // opened it stays identifiable after the HA list refreshes.
+  const [profileNode, setProfileNode] = useState<MasterHaNode | null>(null)
   const [failoverError, setFailoverError] = useState<string | null>(null)
   const [haRefreshing, setHaRefreshing] = useState(false)
   const switchingRef = useRef(false)
@@ -413,20 +417,32 @@ export function OverviewPage() {
                 {node.current ? t('overview.ha.activeTarget') : '-'}
               </TableCell>
               <TableCell>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-6 px-1 text-primary"
-                  disabled={Boolean(switching) || !node.switchable}
-                  title={switchTitle(node)}
-                  onClick={() => {
-                    setFailoverError(null)
-                    setFailoverTarget(node)
-                  }}
-                  data-testid={`overview-failover-${node.addr}`}
-                >
-                  {switching === node.addr ? t('common.switching') : t('common.switch')}
-                </Button>
+                <div className="flex items-center gap-1">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-1 text-primary"
+                    disabled={!overview.master_web_port || !node.reachable}
+                    onClick={() => setProfileNode(node)}
+                    data-testid={`overview-profile-${node.addr}`}
+                  >
+                    {t('workers.actions.profile')}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-1 text-primary"
+                    disabled={Boolean(switching) || !node.switchable}
+                    title={switchTitle(node)}
+                    onClick={() => {
+                      setFailoverError(null)
+                      setFailoverTarget(node)
+                    }}
+                    data-testid={`overview-failover-${node.addr}`}
+                  >
+                    {switching === node.addr ? t('common.switching') : t('common.switch')}
+                  </Button>
+                </div>
               </TableCell>
             </TableRow>
           ))}
@@ -474,6 +490,20 @@ export function OverviewPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <ProfileDialog
+        host={profileNode ? hostnameFromAddr(profileNode.addr) : null}
+        webPort={overview.master_web_port}
+        target={
+          profileNode
+            ? `${t('overview.ha.master')} ${profileNode.display_addr || profileNode.addr}`
+            : undefined
+        }
+        open={profileNode !== null}
+        onOpenChange={(open) => {
+          if (!open) setProfileNode(null)
+        }}
+      />
     </>
   )
 }

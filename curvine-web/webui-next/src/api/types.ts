@@ -27,6 +27,10 @@ export interface OverviewData {
   start_time?: string | null
   start_time_ms?: number | null
   local_hostname?: string | null
+  /** Host of the active master's web port (serves `/metrics` and profiling). */
+  master_metrics_host?: string | null
+  /** Active master's `web_port`; not derivable from `master_addr` (RPC port). */
+  master_web_port?: number | null
   capacity?: number | null
   fs_used?: number | null
   available?: number | null

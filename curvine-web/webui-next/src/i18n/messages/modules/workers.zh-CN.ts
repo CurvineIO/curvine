@@ -38,6 +38,7 @@ export default {
       allow: '允许',
       decommission: '下线',
       recommission: '重新上线',
+      profile: '火焰图',
       confirm: '{action} Worker {worker}？',
     },
     actionVerb: {
@@ -76,6 +77,19 @@ export default {
         type: '类型',
         empty: '未上报存储目录。'
       }
+    },
+    profile: {
+      titleWithTarget: 'CPU 火焰图 · {target}',
+      title: 'CPU 火焰图',
+      description: '正在采样 {seconds} 秒。采样是同步的，窗口结束后才会出图。',
+      fullscreen: '全屏',
+      exitFullscreen: '退出全屏',
+      duration: '采样时长',
+      seconds: '{count} 秒',
+      sampling: '采样中，约 {seconds} 秒…',
+      openInNewTab: '在新标签页打开',
+      unsupported: '该进程无法提供火焰图。',
+      noWebPort: '未上报 web 端口，无法访问其 profiling 端点。'
     }
   }
 }
