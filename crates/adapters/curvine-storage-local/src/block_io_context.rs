@@ -116,6 +116,11 @@ impl BlockWriteContext {
         self.device.flush()
     }
 
+    /// Whether the underlying device has an uncertain write/flush outcome.
+    pub fn has_uncertain_writes(&self) -> bool {
+        self.device.has_uncertain_writes()
+    }
+
     /// Callers must gate on `supports_resize()`; see `WriteHandler::resize`.
     pub fn resize(&mut self, truncate: bool, block_off: i64, len: i64, mode: i32) -> IOResult<()> {
         if block_off < 0 || len < 0 {
