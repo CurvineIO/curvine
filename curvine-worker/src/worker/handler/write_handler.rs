@@ -317,8 +317,15 @@ impl WriteHandler {
         let file = self.file.take();
         if let Some(mut file) = file {
             if let Err(flush_err) = file.flush() {
+                // Uncertain (timed-out) flush: quarantine, don't release.
+                let uncertain = file.has_uncertain_writes();
                 drop(file);
-                if let Err(abort_err) = self.store.abort_block(&context.block) {
+                let abort_result = if uncertain {
+                    self.store.abort_block_uncertain(&context.block)
+                } else {
+                    self.store.abort_block(&context.block)
+                };
+                if let Err(abort_err) = abort_result {
                     log::warn!(
                         "failed to abort block {} after flush error: {}",
                         context.block.id,
@@ -564,6 +571,75 @@ mod tests {
         }
     }
 
+    /// Reports uncertain writes, to exercise `abort_block_uncertain` routing.
+    struct FailingFlushUncertainBlockIO;
+
+    impl BlockIO for FailingFlushUncertainBlockIO {
+        fn read_region(
+            &mut self,
+            _enable_send_file: bool,
+            _len: i32,
+        ) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read not supported",
+            )))
+        }
+
+        fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write_all not supported",
+            )))
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read_all not supported",
+            )))
+        }
+
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "flush timed out",
+            )))
+        }
+
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            0
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn path(&self) -> &str {
+            "failing-flush-uncertain"
+        }
+
+        fn resize(
+            &mut self,
+            _truncate: bool,
+            _off: i64,
+            _len: i64,
+            _mode: i32,
+        ) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "resize not supported",
+            )))
+        }
+
+        fn has_uncertain_writes(&self) -> bool {
+            true
+        }
+    }
+
     // Regression test for GH#1673: a data-bearing Running frame with flush=true
     // must write the payload before calling file.flush().
     #[test]
@@ -682,6 +758,70 @@ mod tests {
         assert!(
             err.to_string().contains("flush failed"),
             "unexpected error: {err}"
+        );
+
+        Ok(())
+    }
+
+    // `complete()` must route an uncertain flush failure through abort_block_uncertain.
+    #[test]
+    fn complete_routes_uncertain_flush_failure_through_abort_uncertain() -> FsResult<()> {
+        let block_size = 1024_i64;
+        let block = ExtendedBlock::new(42, 0, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("complete-uncertain-flush")?;
+        let meta = store.open_block(&block).map_err(FsError::from)?;
+        assert!(store.get_block(meta.id).is_ok());
+
+        let file = BlockWriteContext::new(FailingFlushUncertainBlockIO, 0, block_size, 0)?;
+        let context = WriteContext {
+            block: block.clone(),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+        };
+
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(context),
+            file: Some(file),
+            lease: None,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        let err = handler.complete(&msg, true).unwrap_err();
+        assert!(
+            err.to_string().contains("flush timed out"),
+            "unexpected error: {err}"
+        );
+
+        // Block must be cleaned up, not left dangling.
+        assert!(
+            store.get_block(meta.id).is_err(),
+            "block must be cleaned up after uncertain flush failure"
         );
 
         Ok(())

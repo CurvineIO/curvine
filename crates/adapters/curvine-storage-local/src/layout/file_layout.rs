@@ -71,7 +71,9 @@ impl FileLayout {
             BlockState::Writing
             | BlockState::Recovering
             | BlockState::Allocating
-            | BlockState::Finalizing => Self::staging_dir(dir),
+            | BlockState::Finalizing
+            // Quarantined is SPDK-only; unreachable here but kept exhaustive.
+            | BlockState::Quarantined => Self::staging_dir(dir),
         };
 
         if path.exists() {

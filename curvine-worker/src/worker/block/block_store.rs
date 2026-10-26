@@ -343,6 +343,15 @@ impl BlockStore {
         self.with_dataset_write("abort", |state| state.abort_block(block))
     }
 
+    /// Abort with an uncertain (timed-out) write/flush outcome; see `Dataset::abort_block_uncertain`.
+    pub fn abort_block_uncertain(&self, block: &ExtendedBlock) -> CommonResult<()> {
+        let _block_lock = self.block_lock(block.id, "abort_uncertain");
+        self.check_replication_owner(block.id)?;
+        self.with_dataset_write("abort_uncertain", |state| {
+            state.abort_block_uncertain(block)
+        })
+    }
+
     pub(crate) fn abort_replication_write(&self, block_id: i64) -> CommonResult<()> {
         let _lock = self.block_lock(block_id, "abort_replication");
         self.check_replication_owner(block_id)?;

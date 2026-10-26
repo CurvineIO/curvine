@@ -125,7 +125,9 @@ impl BlockLayout for BdevLayout {
             }
 
             alloc_entries.push((record.block_id, record.offset, record.size));
-            let state = if record.finalized {
+            let state = if record.quarantined {
+                BlockState::Quarantined
+            } else if record.finalized {
                 BlockState::Finalized
             } else {
                 BlockState::Recovering

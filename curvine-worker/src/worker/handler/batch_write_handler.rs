@@ -225,9 +225,25 @@ impl BatchWriteHandler {
             commit_blocks.push(block);
         }
 
-        for file in files.iter_mut() {
+        for (file, context) in files.iter_mut().zip(contexts.iter()) {
             if let Some(file) = file.as_mut() {
-                file.flush()?;
+                if let Err(flush_err) = file.flush() {
+                    // Uncertain (timed-out) flush: quarantine, don't release.
+                    let uncertain = file.has_uncertain_writes();
+                    let abort_result = if uncertain {
+                        self.store.abort_block_uncertain(&context.block)
+                    } else {
+                        self.store.abort_block(&context.block)
+                    };
+                    if let Err(abort_err) = abort_result {
+                        log::warn!(
+                            "failed to abort batch block {} after flush error: {}",
+                            context.block.id,
+                            abort_err
+                        );
+                    }
+                    return Err(flush_err.into());
+                }
             }
         }
         for file in files.iter_mut() {

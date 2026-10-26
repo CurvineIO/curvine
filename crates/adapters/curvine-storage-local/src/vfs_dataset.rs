@@ -758,6 +758,23 @@ impl Dataset for VfsDataset {
         Ok(())
     }
 
+    /// Quarantine SPDK extents instead of releasing them; falls back to normal abort otherwise.
+    fn abort_block_uncertain(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
+        let Some(meta) = self.meta.get(block.id).cloned() else {
+            return Ok(());
+        };
+
+        if meta.storage_type() != StorageType::SpdkDisk {
+            return self.abort_block(block);
+        }
+
+        // Keep the extent reserved; only flip state, don't deallocate/release.
+        let mut quarantined = meta;
+        quarantined.state = BlockState::Quarantined;
+        self.meta.put(quarantined);
+        Ok(())
+    }
+
     fn remove_block(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
         if self.meta.get(block.id).is_none() {
             return Ok(());
@@ -1535,6 +1552,89 @@ mod test {
         assert_eq!(st2.offset_alloc.free_list_bytes(), 4096);
 
         assert_eq!(st2.offset_alloc.allocate(4, 4096).unwrap(), 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn abort_block_uncertain_quarantines_spdk_block() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let available = ds.available();
+        ds.open_block(&block)?;
+
+        ds.abort_block_uncertain(&block)?;
+
+        // Quarantined, not removed; capacity stays reserved.
+        let meta = ds.get_block(1).unwrap();
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        assert_eq!(ds.available(), available - 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn quarantined_extent_not_reused_by_allocator() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        ds.abort_block_uncertain(&b1)?;
+
+        // Quarantine must not free the offset (unlike normal abort).
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(alloc.free_list_size(), 0);
+        assert_eq!(alloc.free_list_bytes(), 0);
+
+        // New block must get a fresh offset, not the quarantined one.
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let m2 = ds.open_block(&b2)?;
+        assert_eq!(m2.bdev_offset, 4096, "must not reuse quarantined offset 0");
+        Ok(())
+    }
+
+    #[test]
+    fn quarantined_block_survives_metadata_reload() -> CommonResult<()> {
+        let path = "../testing/spdk_quarantine_reload";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let available = dir.available();
+        let mut ds = VfsDataset::new("t", DirList::new(vec![dir])?, Some(store.clone()))?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.abort_block_uncertain(&block)?;
+        drop(ds);
+
+        // Reopen: must restore as Quarantined, extent still occupied.
+        let dir2 = spdk_dir(1, spdk_state());
+        let ds2 = VfsDataset::new("t", DirList::new(vec![dir2])?, Some(store.clone()))?;
+        let meta = ds2.get_block(1).unwrap();
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        assert_eq!(ds2.available(), available - 4096);
+        let alloc = ds2.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "quarantined extent must stay occupied after reload"
+        );
+
+        drop(ds2);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn abort_block_uncertain_falls_back_for_file_storage() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "abort-uncertain-file-fallback");
+        let block = ExtendedBlock::with_mem(1, "100B")?;
+        let available = ds.available();
+        ds.open_block(&block)?;
+        assert_eq!(ds.available(), available - 100);
+
+        // Non-SPDK: uncertain abort behaves like normal abort.
+        ds.abort_block_uncertain(&block)?;
+        assert!(ds.get_block(block.id).is_none());
+        assert_eq!(ds.available(), available);
         Ok(())
     }
 }

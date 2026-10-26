@@ -29,6 +29,8 @@ pub enum BlockState {
     Recovering = 2,
     Allocating = 3,
     Finalizing = 4,
+    /// Uncertain (timeout-class) write/flush outcome; extent stays reserved.
+    Quarantined = 5,
 }
 
 impl BlockState {
@@ -168,6 +170,10 @@ impl BlockMeta {
 
     pub fn is_transitioning(&self) -> bool {
         matches!(self.state, BlockState::Allocating | BlockState::Finalizing)
+    }
+
+    pub fn is_quarantined(&self) -> bool {
+        self.state == BlockState::Quarantined
     }
 
     pub fn dir_id(&self) -> u32 {

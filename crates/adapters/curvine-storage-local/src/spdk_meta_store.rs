@@ -1,14 +1,14 @@
 //! RocksDB-backed SPDK block metadata.
 use crate::meta_store::BlockMetaStore;
 use crate::BlockMeta;
-/// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) = 29B.
+/// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) | quarantined(1B) = 30B.
 /// O(1) per block
 use byteorder::{BigEndian, ByteOrder};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_rocksdb::{DBConf, DBEngine};
 use log::{info, warn};
 const CF_SPDK_BLOCKS: &str = "spdk_blocks";
-const VALUE_SIZE: usize = 29;
+const VALUE_SIZE: usize = 30;
 pub struct SpdkMetaStore {
     db: DBEngine,
 }
@@ -20,6 +20,8 @@ pub struct SpdkBlockRecord {
     pub size: i64,
     pub len: i64,
     pub finalized: bool,
+    /// Extent must stay reserved on restart when true.
+    pub quarantined: bool,
 }
 impl SpdkMetaStore {
     pub fn open(dir: &str, format: bool) -> CommonResult<Self> {
@@ -37,8 +39,21 @@ impl SpdkMetaStore {
         len: i64,
         finalized: bool,
     ) -> CommonResult<()> {
+        self.put_with_state(block_id, dir_id, offset, size, len, finalized, false)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_with_state(
+        &self,
+        block_id: i64,
+        dir_id: u32,
+        offset: i64,
+        size: i64,
+        len: i64,
+        finalized: bool,
+        quarantined: bool,
+    ) -> CommonResult<()> {
         let key = Self::encode_key(block_id);
-        let value = Self::encode_value(dir_id, offset, size, len, finalized);
+        let value = Self::encode_value(dir_id, offset, size, len, finalized, quarantined);
         self.db.put_cf(CF_SPDK_BLOCKS, key, value)
     }
     pub fn delete(&self, block_id: i64) -> CommonResult<()> {
@@ -96,6 +111,7 @@ impl SpdkMetaStore {
         size: i64,
         len: i64,
         finalized: bool,
+        quarantined: bool,
     ) -> [u8; VALUE_SIZE] {
         let mut buf = [0u8; VALUE_SIZE];
         BigEndian::write_u32(&mut buf[0..4], dir_id);
@@ -103,6 +119,7 @@ impl SpdkMetaStore {
         BigEndian::write_i64(&mut buf[12..20], size);
         BigEndian::write_i64(&mut buf[20..28], len);
         buf[28] = if finalized { 1 } else { 0 };
+        buf[29] = if quarantined { 1 } else { 0 };
         buf
     }
     #[inline]
@@ -122,19 +139,21 @@ impl SpdkMetaStore {
             size: BigEndian::read_i64(&bytes[12..20]),
             len: BigEndian::read_i64(&bytes[20..28]),
             finalized: bytes[28] != 0,
+            quarantined: bytes[29] != 0,
         })
     }
 }
 
 impl BlockMetaStore for SpdkMetaStore {
     fn put_block_meta(&self, meta: &BlockMeta) -> CommonResult<()> {
-        self.put(
+        self.put_with_state(
             meta.id(),
             meta.dir_id(),
             meta.bdev_offset,
             meta.actual_len,
             meta.len(),
             meta.is_final(),
+            meta.is_quarantined(),
         )
     }
 
@@ -158,8 +177,19 @@ mod test {
         let r = store.get(1).unwrap().unwrap();
         assert_eq!(r.offset, 0);
         assert!(r.finalized);
+        assert!(!r.quarantined);
         store.delete(1).unwrap();
         assert!(store.get(1).unwrap().is_none());
+    }
+    #[test]
+    fn put_with_state_persists_quarantined() {
+        let store = SpdkMetaStore::open(&test_dir("quarantined"), true).unwrap();
+        store
+            .put_with_state(1, 1, 0, 4096, 4096, false, true)
+            .unwrap();
+        let r = store.get(1).unwrap().unwrap();
+        assert!(!r.finalized);
+        assert!(r.quarantined);
     }
     #[test]
     fn scan_all() {
