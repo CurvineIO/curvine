@@ -65,8 +65,8 @@ fn purge_paths_removes_only_the_listed_batch() {
             .unwrap()
     };
     assert_eq!(res.inodes, 2);
-    assert!(!fs.exists(&format!("{entry}/a/file-a")).unwrap());
-    assert!(fs.exists(&format!("{entry}/b/file-c")).unwrap());
+    assert!(!fs.exists(format!("{entry}/a/file-a")).unwrap());
+    assert!(fs.exists(format!("{entry}/b/file-c")).unwrap());
 
     // Second batch: the now-empty directory and its sibling leaf.
     let second = vec![format!("{entry}/a"), format!("{entry}/b/file-c")];
@@ -78,14 +78,14 @@ fn purge_paths_removes_only_the_listed_batch() {
             .unwrap()
     };
     assert_eq!(res.inodes, 1);
-    assert!(fs.exists(&format!("{entry}/b")).unwrap());
+    assert!(fs.exists(format!("{entry}/b")).unwrap());
 
     // The entry directory itself is the producer's last batch.
     let res = {
         let fs_dir = fs.fs_dir();
         let mut fs_dir = fs_dir.write();
         fs_dir
-            .purge_paths(&[entry.clone()], LocalTime::mills() as i64)
+            .purge_paths(std::slice::from_ref(&entry), LocalTime::mills() as i64)
             .unwrap()
     };
     assert_eq!(res.inodes, 0);
@@ -129,9 +129,9 @@ fn purge_paths_is_idempotent_across_retries() {
     assert_eq!(second.inodes, 0);
     assert_eq!(second.bytes, 0);
     assert!(second.blocks.is_empty());
-    assert!(fs.exists(&format!("{entry}/b/file-c")).unwrap());
+    assert!(fs.exists(format!("{entry}/b/file-c")).unwrap());
 
     fs.restore_from_rocksdb().unwrap();
-    assert!(!fs.exists(&format!("{entry}/a/file-a")).unwrap());
-    assert!(fs.exists(&format!("{entry}/b/file-c")).unwrap());
+    assert!(!fs.exists(format!("{entry}/a/file-a")).unwrap());
+    assert!(fs.exists(format!("{entry}/b/file-c")).unwrap());
 }
