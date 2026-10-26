@@ -280,6 +280,7 @@ impl BlockActor {
             store,
             report_blocks,
             pending_deletes,
+            pending_quarantine_proofs: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
 
         scheduler.start(task)?;

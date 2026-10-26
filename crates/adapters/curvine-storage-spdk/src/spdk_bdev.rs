@@ -218,6 +218,15 @@ pub struct SpdkBdev {
     retired_dma: Arc<RetiredDmaRegistry>,
     /// Set on write/flush `ETIMEDOUT` (unconfirmed completion); sticky like `qpair_dead`.
     uncertain_writes: AtomicBool,
+    /// Block identity for terminal-event reporting; 0 means "unknown/not set"
+    /// (e.g. read-only handles), in which case no event is ever emitted.
+    block_id: i64,
+    /// Block's full physical extent, independent of this handle's offset/len.
+    block_bdev_offset: i64,
+    block_extent_size: i64,
+    /// Sender for late-arriving terminal completions; cloned from the global
+    /// `SpdkEnv` at open time so timeout-watcher threads don't need a lookup.
+    terminal_tx: crossbeam::channel::Sender<crate::spdk_env::SpdkCommandTerminalEvent>,
 }
 
 // SAFETY: owns qpair and DMA buffers exclusively
@@ -328,8 +337,52 @@ impl SpdkBdev {
                 inflight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 retired_dma,
                 uncertain_writes: AtomicBool::new(false),
+                block_id: 0,
+                block_bdev_offset: 0,
+                block_extent_size: 0,
+                terminal_tx: env.terminal_event_sender(),
             })
         }
+    }
+
+    /// Associate this handle with the block it belongs to, so a late
+    /// terminal completion (after a write/flush timeout) can be reported
+    /// with enough identity to match a `QuarantineReleaseProof`. Only
+    /// writers created for a quarantine-eligible block need to call this;
+    /// handles without identity (`block_id == 0`) never emit terminal events.
+    pub fn set_block_identity(&mut self, block_id: i64, bdev_offset: i64, extent_size: i64) {
+        self.block_id = block_id;
+        self.block_bdev_offset = bdev_offset;
+        self.block_extent_size = extent_size;
+    }
+
+    /// Spawn a thread that blocks on the completion until it is truly
+    /// resolved (by the real SPDK callback or a later force-complete), then
+    /// reports a `SpdkCommandTerminalEvent`. Only called after a write/flush
+    /// `ETIMEDOUT`, and only if this handle has known block identity.
+    ///
+    /// This thread can in principle live forever if SPDK never produces a
+    /// terminal completion for the qpair (e.g. hung controller with no
+    /// reset) — see the design doc's documented limitation. It is not
+    /// cancelled early because there is no safe way to abandon an in-flight
+    /// DMA buffer without a real terminal signal.
+    fn spawn_terminal_watcher(&self, completion: Arc<crate::spdk_poller::IoCompletion>) {
+        if self.block_id == 0 {
+            return;
+        }
+        let block_id = self.block_id;
+        let bdev_offset = self.block_bdev_offset;
+        let size = self.block_extent_size;
+        let tx = self.terminal_tx.clone();
+        std::thread::spawn(move || {
+            let status = completion.wait(0);
+            let _ = tx.send(crate::spdk_env::SpdkCommandTerminalEvent {
+                block_id,
+                bdev_offset,
+                size,
+                success: status == 0,
+            });
+        });
     }
 
     /// Device block size in bytes.
@@ -591,6 +644,7 @@ impl SpdkBdev {
                 if rc == -libc::ETIMEDOUT {
                     // Write may still complete later; not a confirmed failure.
                     self.uncertain_writes.store(true, Ordering::Release);
+                    self.spawn_terminal_watcher(completion.clone());
                 }
                 return err_box!(
                     "NVMe write failed on '{}' at offset={}, len={}: {}",
@@ -632,6 +686,7 @@ impl SpdkBdev {
             if rc == -libc::ETIMEDOUT {
                 // Flush may still complete later; not a confirmed failure.
                 self.uncertain_writes.store(true, Ordering::Release);
+                self.spawn_terminal_watcher(completion.clone());
             }
             return err_box!(
                 "NVMe flush failed on '{}': {}",
@@ -1023,6 +1078,10 @@ mod test {
             inflight,
             retired_dma,
             uncertain_writes: AtomicBool::new(false),
+            block_id: 0,
+            block_bdev_offset: 0,
+            block_extent_size: 0,
+            terminal_tx: crossbeam::channel::unbounded().0,
         })
     }
 
@@ -1227,6 +1286,10 @@ mod test {
             inflight: Arc::new(AtomicUsize::new(0)),
             retired_dma: RetiredDmaRegistry::new(),
             uncertain_writes: AtomicBool::new(false),
+            block_id: 0,
+            block_bdev_offset: 0,
+            block_extent_size: 0,
+            terminal_tx: crossbeam::channel::unbounded().0,
         };
         (bdev, rx)
     }
@@ -1353,6 +1416,67 @@ mod test {
 
         let rx = responder.join().expect("responder thread must not panic");
         assert!(rx.try_recv().is_err(), "only one submit expected");
+
+        std::mem::forget(bdev);
+    }
+
+    /// A timed-out write with known block identity spawns a watcher thread
+    /// that reports a `SpdkCommandTerminalEvent` once the real completion
+    /// (simulated here via `IoCompletion::complete`) finally arrives.
+    #[test]
+    fn spdk_write_timeout_terminal_watcher_reports_late_completion() {
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+        bdev.set_block_identity(42, 1000, 4096);
+        let (term_tx, term_rx) = crossbeam::channel::unbounded();
+        bdev.terminal_tx = term_tx;
+
+        let err = bdev
+            .spdk_write(0, &[0u8; 512])
+            .expect_err("write should time out");
+        assert!(err.to_string().contains("NVMe write failed"), "{}", err);
+
+        // Simulate the real SPDK callback finally firing, after the waiter
+        // already gave up with ETIMEDOUT.
+        let req = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("write should have submitted exactly once");
+        assert!(req.completion.complete(0), "first completion call must win");
+
+        let event = term_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("terminal event must be reported once the real completion arrives");
+        assert_eq!(event.block_id, 42);
+        assert_eq!(event.bdev_offset, 1000);
+        assert_eq!(event.size, 4096);
+        assert!(event.success);
+
+        std::mem::forget(bdev);
+    }
+
+    /// A handle with no block identity (block_id == 0, e.g. a reader) must
+    /// never spawn a watcher or emit a terminal event.
+    #[test]
+    fn spdk_write_timeout_without_identity_emits_no_terminal_event() {
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+        let (term_tx, term_rx) = crossbeam::channel::unbounded();
+        bdev.terminal_tx = term_tx;
+
+        let err = bdev
+            .spdk_write(0, &[0u8; 512])
+            .expect_err("write should time out");
+        assert!(err.to_string().contains("NVMe write failed"), "{}", err);
+
+        let req = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("write should have submitted exactly once");
+        assert!(req.completion.complete(0));
+
+        assert!(
+            term_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "no identity set must mean no terminal event"
+        );
 
         std::mem::forget(bdev);
     }

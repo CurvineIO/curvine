@@ -863,6 +863,18 @@ struct SpdkEnvTestHooks {
     dma_reclaim_calls: AtomicUsize,
 }
 
+/// Proof that a specific SPDK write/flush command has reached a real
+/// terminal completion, emitted after a timed-out wait eventually unblocks.
+/// `success` only reflects the NVMe completion status; it does not prove the
+/// bytes are correct, only that the command is no longer outstanding.
+#[derive(Debug, Clone, Copy)]
+pub struct SpdkCommandTerminalEvent {
+    pub block_id: i64,
+    pub bdev_offset: i64,
+    pub size: i64,
+    pub success: bool,
+}
+
 /// SPDK env lifecycle (singleton). Send + Sync
 pub struct SpdkEnv {
     conf: SpdkConf,
@@ -879,6 +891,8 @@ pub struct SpdkEnv {
     lifecycle: Mutex<()>,
     /// Rejects a second concurrent `shutdown()` call (lifecycle alone no longer blocks it).
     shutdown_in_progress: AtomicBool,
+    terminal_tx: crossbeam::channel::Sender<SpdkCommandTerminalEvent>,
+    terminal_rx: crossbeam::channel::Receiver<SpdkCommandTerminalEvent>,
     #[cfg(test)]
     test_hooks: SpdkEnvTestHooks,
 }
@@ -907,6 +921,7 @@ impl SpdkEnv {
         let qpair_pool = QpairPool::with_qpair_acquire_timeout(Duration::from_millis(
             conf.qpair_acquire_timeout_ms,
         ));
+        let (terminal_tx, terminal_rx) = crossbeam::channel::unbounded();
 
         Ok(Self {
             conf,
@@ -922,6 +937,8 @@ impl SpdkEnv {
             retired_dma: RetiredDmaRegistry::new(),
             lifecycle: Mutex::new(()),
             shutdown_in_progress: AtomicBool::new(false),
+            terminal_tx,
+            terminal_rx,
             #[cfg(test)]
             test_hooks: SpdkEnvTestHooks::default(),
         })
@@ -1399,6 +1416,18 @@ impl SpdkEnv {
             .as_ref()
             .expect("SpdkPoller not started — was init() called?")
             .sender()
+    }
+
+    /// Sender for `SpdkCommandTerminalEvent`s; cloned into each `SpdkBdev`
+    /// that has known block identity, used only from timeout-watcher threads.
+    pub fn terminal_event_sender(&self) -> crossbeam::channel::Sender<SpdkCommandTerminalEvent> {
+        self.terminal_tx.clone()
+    }
+
+    /// Drain all terminal events accumulated since the last drain. Called
+    /// periodically by the worker to retry releasing quarantined blocks.
+    pub fn drain_terminal_events(&self) -> Vec<SpdkCommandTerminalEvent> {
+        self.terminal_rx.try_iter().collect()
     }
 
     /// Get eventfd for waking poller on new I/O

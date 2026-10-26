@@ -23,7 +23,7 @@ use curvine_runtime::runtime::{GroupExecutor, LoopTask};
 use curvine_runtime::sync::StateCtl;
 use dashmap::{DashMap, DashSet};
 use log::{error, warn};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub struct HeartbeatTask {
     pub(crate) executor: Arc<GroupExecutor>,
@@ -32,6 +32,12 @@ pub struct HeartbeatTask {
     pub(crate) store: BlockStore,
     pub(crate) report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
     pub(crate) pending_deletes: Arc<DashSet<i64>>,
+    /// Quarantine release proofs that didn't yet match (quarantine not
+    /// visible to this dataset generation, or a transient store error),
+    /// retried every tick. See `Dataset::release_quarantined_block_with_proof`.
+    #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
+    pub(crate) pending_quarantine_proofs:
+        Arc<Mutex<Vec<crate::worker::storage::QuarantineReleaseProof>>>,
 }
 
 impl HeartbeatTask {
@@ -124,12 +130,72 @@ impl HeartbeatTask {
             }
         }
     }
+
+    /// Drain SPDK terminal-completion events and retry any proof that
+    /// didn't match last tick (the quarantine may not have been visible yet
+    /// when the event arrived — see `pending_quarantine_proofs`).
+    #[cfg(feature = "spdk")]
+    fn process_quarantine_terminal_events(&self) {
+        use crate::worker::storage::QuarantineReleaseProof;
+
+        let new_proofs: Vec<QuarantineReleaseProof> = curvine_storage_spdk::SpdkEnv::global()
+            .map(|env| {
+                env.drain_terminal_events()
+                    .into_iter()
+                    .map(|event| QuarantineReleaseProof {
+                        block_id: event.block_id,
+                        bdev_offset: event.bdev_offset,
+                        size: event.size,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut pending = match self.pending_quarantine_proofs.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pending.extend(new_proofs);
+        if pending.is_empty() {
+            return;
+        }
+
+        pending.retain(|proof| {
+            match self.store.release_quarantined_block_with_proof(proof) {
+                Ok(true) => {
+                    log::info!(
+                        "released quarantined SPDK extent: block_id={} offset={} size={}",
+                        proof.block_id,
+                        proof.bdev_offset,
+                        proof.size
+                    );
+                    false
+                }
+                // No exact match yet (or ever): keep retrying. A stale proof
+                // whose block was since removed stays here harmlessly; see
+                // the design doc's documented recovery-workflow limitation.
+                Ok(false) => true,
+                Err(e) => {
+                    warn!(
+                        "release_quarantined_block_with_proof failed for block {}: {}",
+                        proof.block_id, e
+                    );
+                    true
+                }
+            }
+        });
+    }
+
+    #[cfg(not(feature = "spdk"))]
+    fn process_quarantine_terminal_events(&self) {}
 }
 
 impl LoopTask for HeartbeatTask {
     type Error = FsError;
 
     fn run(&self) -> FsResult<()> {
+        self.process_quarantine_terminal_events();
+
         // Perform heartbeat sending.
         let info = match self.store.get_and_check_storages() {
             Ok(info) => info,

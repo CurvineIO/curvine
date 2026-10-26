@@ -182,7 +182,8 @@ impl BlockLayout for BdevLayout {
             if max_len == 0 {
                 return err_box!("Cannot open SPDK writer: no space remaining");
             }
-            let bdev = SpdkBdev::open_write(bdev_name, abs_offset, max_len)?;
+            let mut bdev = SpdkBdev::open_write(bdev_name, abs_offset, max_len)?;
+            bdev.set_block_identity(meta.id, meta.bdev_offset, meta.actual_len);
             BlockWriteContext::new(bdev, base_offset, meta.len, off)
         }
         #[cfg(not(feature = "spdk"))]

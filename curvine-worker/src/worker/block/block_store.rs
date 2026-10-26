@@ -14,7 +14,7 @@
 
 use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{
-    BlockDataset, BlockLayout, BlockReadContext, BlockWriteContext, Dataset,
+    BlockDataset, BlockLayout, BlockReadContext, BlockWriteContext, Dataset, QuarantineReleaseProof,
 };
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
@@ -349,6 +349,18 @@ impl BlockStore {
         self.check_replication_owner(block.id)?;
         self.with_dataset_write("abort_uncertain", |state| {
             state.abort_block_uncertain(block)
+        })
+    }
+
+    /// Release a quarantined block only if `proof` matches current metadata
+    /// exactly. See `Dataset::release_quarantined_block_with_proof`.
+    pub fn release_quarantined_block_with_proof(
+        &self,
+        proof: &QuarantineReleaseProof,
+    ) -> CommonResult<bool> {
+        let _block_lock = self.block_lock(proof.block_id, "release_quarantine");
+        self.with_dataset_write("release_quarantine", |state| {
+            state.release_quarantined_block_with_proof(proof)
         })
     }
 

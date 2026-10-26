@@ -29,6 +29,16 @@ pub struct DirFreeRatio {
     pub free_ratio: f64,
 }
 
+/// Proof required to release a `Quarantined` SPDK extent. Must match the
+/// current metadata exactly (block id, state, storage type, offset, size)
+/// or the release is rejected and the extent stays quarantined.
+#[derive(Debug, Clone, Copy)]
+pub struct QuarantineReleaseProof {
+    pub block_id: i64,
+    pub bdev_offset: i64,
+    pub size: i64,
+}
+
 // block data collection.
 pub trait Dataset {
     // Total capacity
@@ -67,6 +77,17 @@ pub trait Dataset {
     /// Abort with an uncertain write/flush outcome; default falls back to `abort_block`.
     fn abort_block_uncertain(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
         self.abort_block(block)
+    }
+
+    /// Release a quarantined block only if `proof` exactly matches current
+    /// metadata. Returns `true` if released, `false` if not found/mismatched
+    /// (the block, if any, stays quarantined). Default: nothing to release.
+    fn release_quarantined_block_with_proof(
+        &mut self,
+        proof: &QuarantineReleaseProof,
+    ) -> CommonResult<bool> {
+        let _ = proof;
+        Ok(false)
     }
 
     // Delete a block.

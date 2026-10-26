@@ -15,7 +15,7 @@
 use crate::layout::FileFinalizePlan;
 use crate::{
     BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirFreeRatio, DirList, FileLayout,
-    SpdkMetaStore, StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
+    QuarantineReleaseProof, SpdkMetaStore, StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
 };
 use crate::{BlockMeta, BlockState};
 use curvine_config::{ClusterConf, WorkerDataDir};
@@ -775,6 +775,26 @@ impl Dataset for VfsDataset {
         Ok(())
     }
 
+    /// Release only on an exact block_id/state/storage_type/offset/size match.
+    fn release_quarantined_block_with_proof(
+        &mut self,
+        proof: &QuarantineReleaseProof,
+    ) -> CommonResult<bool> {
+        let Some(meta) = self.meta.get(proof.block_id) else {
+            return Ok(false);
+        };
+        let matches = meta.is_quarantined()
+            && meta.storage_type() == StorageType::SpdkDisk
+            && meta.bdev_offset == proof.bdev_offset
+            && meta.physical_bytes() == proof.size;
+        if !matches {
+            return Ok(false);
+        }
+
+        self.remove_block_by_id(proof.block_id)?;
+        Ok(true)
+    }
+
     fn remove_block(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
         if self.meta.get(block.id).is_none() {
             return Ok(());
@@ -788,8 +808,8 @@ impl Dataset for VfsDataset {
 mod test {
     use super::{normalize_free_ratio, MAX_FREE_RATIO};
     use crate::{
-        BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion,
-        VfsDataset, VfsDir,
+        BlockLayout, Dataset, DirList, DirState, FileLayout, QuarantineReleaseProof, SpdkMetaStore,
+        StorageVersion, VfsDataset, VfsDir,
     };
     use crate::{BlockMeta, BlockState};
     use curvine_config::{ClusterConf, WorkerConf};
@@ -1635,6 +1655,79 @@ mod test {
         ds.abort_block_uncertain(&block)?;
         assert!(ds.get_block(block.id).is_none());
         assert_eq!(ds.available(), available);
+        Ok(())
+    }
+
+    #[test]
+    fn release_quarantined_block_with_matching_proof_frees_extent() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let available = ds.available();
+        ds.open_block(&block)?;
+        ds.abort_block_uncertain(&block)?;
+
+        let proof = QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        };
+        let released = ds.release_quarantined_block_with_proof(&proof)?;
+
+        assert!(released);
+        assert!(ds.get_block(1).is_none());
+        assert_eq!(ds.available(), available);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(alloc.free_list_size(), 1, "extent must be freed for reuse");
+        Ok(())
+    }
+
+    #[test]
+    fn release_quarantined_block_with_mismatched_offset_rejected() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.abort_block_uncertain(&block)?;
+
+        let wrong_offset_proof = QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 4096, // real offset is 0
+            size: 4096,
+        };
+        assert!(!ds.release_quarantined_block_with_proof(&wrong_offset_proof)?);
+        assert_eq!(ds.get_block(1).unwrap().state(), &BlockState::Quarantined);
+
+        let wrong_size_proof = QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 8192, // real size is 4096
+        };
+        assert!(!ds.release_quarantined_block_with_proof(&wrong_size_proof)?);
+        assert_eq!(ds.get_block(1).unwrap().state(), &BlockState::Quarantined);
+        Ok(())
+    }
+
+    #[test]
+    fn release_quarantined_block_wrong_state_rejected() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        // Not quarantined: still Writing.
+
+        let proof = QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        };
+        assert!(!ds.release_quarantined_block_with_proof(&proof)?);
+        assert!(ds.get_block(1).is_some(), "non-quarantined block untouched");
+
+        // A stale/forged proof for a block id that doesn't even exist.
+        let missing_proof = QuarantineReleaseProof {
+            block_id: 999,
+            bdev_offset: 0,
+            size: 4096,
+        };
+        assert!(!ds.release_quarantined_block_with_proof(&missing_proof)?);
         Ok(())
     }
 }
