@@ -14,7 +14,7 @@
 
 #![cfg(target_os = "linux")]
 
-#[path = "common/daemon.rs"]
+#[path = "common/follower_daemon.rs"]
 mod daemon;
 
 use curvine_client_core::file::CurvineFileSystem;
