@@ -14,7 +14,7 @@
 
 use curvine_config::{ClusterConf, MasterConf};
 use curvine_core_error::CommonResult;
-use curvine_error::FsError;
+use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::RpcCode;
 use curvine_fs_api::{CurvineURI, Path};
 use curvine_model::MountOptions;
@@ -4209,5 +4209,124 @@ fn rename_rejects_master_internal_flags() -> CommonResult<()> {
     )?;
     assert!(fs.exists("/internal-flag-moved.log")?);
 
+    Ok(())
+}
+
+#[test]
+fn rejects_overlong_name_component() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "overlong-name");
+
+    // A component longer than NAME_MAX must be rejected at every master entry
+    // point with the standard ENAMETOOLONG kind, not a generic one.
+    let too_long = "n".repeat(MasterFilesystem::NAME_MAX + 1);
+    let max_len = "n".repeat(MasterFilesystem::NAME_MAX);
+
+    let err = fs
+        .create(format!("/{}", too_long), false)
+        .expect_err("create must reject an overlong name");
+    assert!(matches!(err.kind(), ErrorKind::FileNameTooLong));
+
+    let err = fs
+        .mkdir(format!("/{}", too_long), true)
+        .expect_err("mkdir must reject an overlong name");
+    assert!(matches!(err.kind(), ErrorKind::FileNameTooLong));
+
+    fs.mkdir("/src", true)?;
+    let err = fs
+        .rename(
+            "/src".to_string(),
+            format!("/{}", too_long),
+            RenameFlags::empty(),
+        )
+        .expect_err("rename must reject an overlong destination name");
+    assert!(matches!(err.kind(), ErrorKind::FileNameTooLong));
+
+    // Exactly NAME_MAX bytes is still accepted.
+    fs.create(format!("/{}", max_len), false)?;
+    Ok(())
+}
+
+#[test]
+fn overlapping_path_limits_still_report_file_name_too_long() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "overlong-name-overlap");
+
+    // A path that breaks the total-length limit AND carries an overlong
+    // component must still surface FileNameTooLong, not the generic kind.
+    let too_long = "n".repeat(MasterFilesystem::NAME_MAX + 1);
+    let path = format!("/{}", vec![too_long.as_str(); 32].join("/"));
+    assert!(
+        path.len() > ClusterConf::default().master.max_path_len,
+        "the fixture must exceed the component and the total-length limit"
+    );
+
+    let err = fs
+        .create(&path, false)
+        .expect_err("create must reject an overlong component");
+    assert!(matches!(err.kind(), ErrorKind::FileNameTooLong));
+
+    let err = fs
+        .mkdir(&path, true)
+        .expect_err("mkdir must reject an overlong component");
+    assert!(matches!(err.kind(), ErrorKind::FileNameTooLong));
+
+    Ok(())
+}
+
+#[test]
+fn restore_trash_dst_rejects_overlong_name() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-overlong-dst", |conf| {
+        conf.master.trash_enabled = true
+    });
+    let fs = handler.clone_fs();
+
+    fs.create("/long/a.log", true)?;
+    fs.delete_with_opts("/long/a.log", false, false)?;
+    let entry = fs.list_trash()?.remove(0);
+
+    let too_long = "n".repeat(MasterFilesystem::NAME_MAX + 1);
+    let dst = format!("/long/{}", too_long);
+
+    let err = fs
+        .restore_dst(&entry.path, Some(dst.as_str()))
+        .expect_err("restore_dst must reject an overlong destination component");
+    assert!(matches!(err.kind(), ErrorKind::FileNameTooLong));
+
+    let err = fs
+        .restore_trash(&entry.path, Some(dst.as_str()), false)
+        .expect_err("restore_trash must reject an overlong destination component");
+    assert!(matches!(err.kind(), ErrorKind::FileNameTooLong));
+
+    Ok(())
+}
+
+#[test]
+fn link_and_symlink_reject_overlong_name() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "overlong-name-link");
+
+    let too_long = "n".repeat(MasterFilesystem::NAME_MAX + 1);
+    let max_a = "a".repeat(MasterFilesystem::NAME_MAX);
+    let max_b = "b".repeat(MasterFilesystem::NAME_MAX);
+    let too_long_path = format!("/{}", too_long);
+    fs.create("/a.log", true)?;
+
+    let err = fs
+        .link("/a.log", too_long_path.as_str())
+        .expect_err("link must reject an overlong destination name");
+    assert!(matches!(err.kind(), ErrorKind::FileNameTooLong));
+
+    let err = fs
+        .symlink("/a.log", too_long_path.as_str(), false, 0o777)
+        .expect_err("symlink must reject an overlong link name");
+    assert!(matches!(err.kind(), ErrorKind::FileNameTooLong));
+
+    assert!(!fs.exists(too_long_path.as_str())?);
+
+    // Exactly NAME_MAX bytes is still accepted for both entry points.
+    fs.link("/a.log", format!("/{}", max_a).as_str())?;
+    fs.symlink("/a.log", format!("/{}", max_b).as_str(), false, 0o777)?;
     Ok(())
 }

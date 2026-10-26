@@ -129,6 +129,7 @@ pub(crate) fn errno_of(value: &FsError) -> i32 {
         FsError::InProgress(_) => Some(libc::EBUSY),
         FsError::UnsupportedUfsRead(_) => Some(libc::EOPNOTSUPP),
         FsError::ReadOnly(_) => Some(libc::EROFS),
+        FsError::FileNameTooLong(_) => Some(libc::ENAMETOOLONG),
         _ => None,
     };
 
@@ -257,6 +258,13 @@ mod tests {
         let err: FuseError = FsError::read_only("/mnt/ro").into();
         assert_eq!(err.errno, libc::EROFS);
         assert_eq!(errno_label(err.errno), "EROFS");
+    }
+
+    #[test]
+    fn file_name_too_long_maps_to_enametoolong() {
+        let err: FuseError = FsError::file_name_too_long(300, 255).into();
+        assert_eq!(err.errno, libc::ENAMETOOLONG);
+        assert_eq!(errno_label(err.errno), "ENAMETOOLONG");
     }
 
     #[test]

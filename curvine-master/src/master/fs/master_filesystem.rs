@@ -205,6 +205,7 @@ impl MasterFilesystem {
     }
 
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
+        Self::check_name_length(path.as_ref())?;
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         Self::check_not_reserved_path(inp.path())?;
@@ -353,6 +354,9 @@ impl MasterFilesystem {
     }
 
     pub fn restore_dst<T: AsRef<str>>(&self, path: T, dst: Option<&str>) -> FsResult<String> {
+        if let Some(dst) = dst.filter(|dst| !dst.is_empty()) {
+            Self::check_name_length(dst)?;
+        }
         let fs_dir = self.fs_dir.read();
         fs_dir.restore_dst(path.as_ref(), dst)
     }
@@ -375,6 +379,10 @@ impl MasterFilesystem {
         dst: Option<&str>,
         overwrite: bool,
     ) -> FsResult<RestoredTrashEntry> {
+        if let Some(dst) = dst.filter(|dst| !dst.is_empty()) {
+            Self::check_name_length(dst)?;
+        }
+
         let mut fs_dir = self.fs_dir.write();
         let restored = fs_dir.restore_trash(path.as_ref(), dst, overwrite)?;
         drop(fs_dir);
@@ -451,6 +459,8 @@ impl MasterFilesystem {
     pub fn rename<T: AsRef<str>>(&self, src: T, dst: T, flags: RenameFlags) -> FsResult<bool> {
         let src = src.as_ref();
         let dst = dst.as_ref();
+        Self::check_name_length(src)?;
+        Self::check_name_length(dst)?;
 
         let mut fs_dir = self.fs_dir.write();
         let src_inp = Self::resolve_path(&fs_dir, src)?;
@@ -714,7 +724,9 @@ impl MasterFilesystem {
         InodePath::resolve_for_glob_pattern(fs_dir.root_ptr(), path, &fs_dir.store)
     }
 
-    pub fn check_path_length(&self, path: &str) -> CommonResult<()> {
+    pub fn check_path_length(&self, path: &str) -> FsResult<()> {
+        Self::check_name_length(path)?;
+
         if path.len() > self.conf.max_path_len {
             return err_box!(
                 "create: Path too long, limit {} characters",
@@ -730,6 +742,24 @@ impl MasterFilesystem {
             );
         }
 
+        Ok(())
+    }
+
+    // POSIX limit on a single path component, in bytes. Kept as its own constant
+    // so the entry-level check is independent of any container implementation.
+    pub const NAME_MAX: usize = 255;
+
+    // A component longer than NAME_MAX cannot be stored, so surface the standard
+    // ENAMETOOLONG error at the entry instead of a generic one from deeper down.
+    // Shared by every creation entry point (create / mkdir / rename) so they all
+    // reject an overlong name with the same kind.
+    fn check_name_length(path: &str) -> FsResult<()> {
+        if let Some(name) = path
+            .split(PATH_SEPARATOR)
+            .find(|component| component.len() > Self::NAME_MAX)
+        {
+            return err_ext!(FsError::file_name_too_long(name.len(), Self::NAME_MAX));
+        }
         Ok(())
     }
 
@@ -1757,6 +1787,8 @@ impl MasterFilesystem {
         owner: Option<String>,
         group: Option<String>,
     ) -> FsResult<()> {
+        Self::check_name_length(link.as_ref())?;
+
         let mut fs_dir = self.fs_dir.write();
         let target = target.as_ref().to_string();
         let link = Self::resolve_path(&fs_dir, link.as_ref())?;
@@ -1765,6 +1797,8 @@ impl MasterFilesystem {
     }
 
     pub fn link<T: AsRef<str>>(&self, src_path: T, dst_path: T) -> FsResult<()> {
+        Self::check_name_length(dst_path.as_ref())?;
+
         let mut fs_dir = self.fs_dir.write();
         let src_path = Self::resolve_path(&fs_dir, src_path.as_ref())?;
         let dst_path = Self::resolve_path(&fs_dir, dst_path.as_ref())?;

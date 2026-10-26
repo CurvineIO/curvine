@@ -1910,6 +1910,9 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn link(&self, op: Link<'_>) -> FuseResult<fuse_entry_out> {
         let name = try_option!(op.name.to_str());
+        if name.len() > FUSE_MAX_NAME_LENGTH {
+            return err_fuse!(libc::ENAMETOOLONG);
+        }
         let oldnodeid = op.arg.oldnodeid;
         let parent_ino = op.header.nodeid;
 

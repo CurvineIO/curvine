@@ -73,6 +73,7 @@ pub enum ErrorKind {
     TransferStoreUnavailable = 34,
     TransferAlreadyRunning = 35,
     TransferTargetConflict = 36,
+    FileNameTooLong = 40,
 
     #[num_enum(default)]
     Common = 10000,
@@ -226,6 +227,10 @@ pub enum FsError {
     #[error("{0}")]
     TransferTargetConflict(ErrorImpl<StringError>),
 
+    // A path component (file name) exceeds NAME_MAX (POSIX ENAMETOOLONG).
+    #[error("{0}")]
+    FileNameTooLong(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -310,6 +315,15 @@ impl FsError {
 
     pub fn transfer_target_conflict(msg: impl Into<String>) -> Self {
         Self::TransferTargetConflict(ErrorImpl::with_source(msg.into().into()))
+    }
+
+    /// A single path component exceeds NAME_MAX (maps to POSIX ENAMETOOLONG).
+    pub fn file_name_too_long(len: usize, max: usize) -> Self {
+        let msg = format!(
+            "File name too long: {} bytes exceeds the {} byte limit",
+            len, max
+        );
+        Self::FileNameTooLong(ErrorImpl::with_source(msg.into()))
     }
 
     pub fn file_exists(path: impl AsRef<str>) -> Self {
@@ -456,6 +470,7 @@ impl FsError {
             FsError::TransferStoreUnavailable(_) => ErrorKind::TransferStoreUnavailable,
             FsError::TransferAlreadyRunning(_) => ErrorKind::TransferAlreadyRunning,
             FsError::TransferTargetConflict(_) => ErrorKind::TransferTargetConflict,
+            FsError::FileNameTooLong(_) => ErrorKind::FileNameTooLong,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -604,6 +619,7 @@ impl ErrorExt for FsError {
             FsError::TransferStoreUnavailable(e) => FsError::TransferStoreUnavailable(e.ctx(ctx)),
             FsError::TransferAlreadyRunning(e) => FsError::TransferAlreadyRunning(e.ctx(ctx)),
             FsError::TransferTargetConflict(e) => FsError::TransferTargetConflict(e.ctx(ctx)),
+            FsError::FileNameTooLong(e) => FsError::FileNameTooLong(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -646,6 +662,7 @@ impl ErrorExt for FsError {
             FsError::TransferStoreUnavailable(e) => e.encode(ErrorKind::TransferStoreUnavailable),
             FsError::TransferAlreadyRunning(e) => e.encode(ErrorKind::TransferAlreadyRunning),
             FsError::TransferTargetConflict(e) => e.encode(ErrorKind::TransferTargetConflict),
+            FsError::FileNameTooLong(e) => e.encode(ErrorKind::FileNameTooLong),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -693,6 +710,7 @@ impl ErrorExt for FsError {
             }
             ErrorKind::TransferAlreadyRunning => FsError::TransferAlreadyRunning(de.into_string()),
             ErrorKind::TransferTargetConflict => FsError::TransferTargetConflict(de.into_string()),
+            ErrorKind::FileNameTooLong => FsError::FileNameTooLong(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }
@@ -832,5 +850,17 @@ mod tests {
         let decoded = FsError::decode(bytes);
         assert!(matches!(decoded, FsError::TransferTargetConflict(_)));
         assert!(decoded.to_string().contains("/a"));
+    }
+
+    #[test]
+    pub fn file_name_too_long_test() {
+        assert_eq!(ErrorKind::FileNameTooLong as i32, 40);
+        let error = FsError::file_name_too_long(300, 255);
+        assert!(matches!(error.kind(), ErrorKind::FileNameTooLong));
+        assert!(error.to_string().contains("300"));
+        let bytes = error.encode();
+        let decoded = FsError::decode(bytes);
+        assert!(matches!(decoded, FsError::FileNameTooLong(_)));
+        assert!(matches!(decoded.kind(), ErrorKind::FileNameTooLong));
     }
 }
