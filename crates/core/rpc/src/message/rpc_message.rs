@@ -35,6 +35,13 @@ pub const INIT_SEQ_ID: i32 = -1;
 
 pub const END_SEQ_ID: i32 = -2;
 
+/// Marks a one-shot metadata RPC as an explicitly follower-eligible read.
+///
+/// This value uses the existing seq_id field, which is echoed by the response
+/// and checked for request/response correlation. It is distinct from the
+/// streaming INIT and END sentinels.
+pub const FOLLOWER_READ_SEQ_ID: i32 = -3;
+
 pub const EMPTY_REQ_ID: i64 = -1;
 
 pub const MAX_DATE_SIZE: i32 = 16 * 1024 * 1024;
