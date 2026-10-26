@@ -55,13 +55,30 @@ jobs:
           ETCD_DATA_DIR: /tmp/curvine-etcd
         options: >-
           --entrypoint /usr/local/bin/etcd
-          --health-cmd "/usr/local/bin/etcdctl --endpoints=http://127.0.0.1:2379 endpoint health"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 12
     
     steps:
       - uses: actions/checkout@v4
+
+      - name: Wait for etcd service
+        run: |
+          python3 - <<'PY'
+          import time
+          import urllib.error
+          import urllib.request
+
+          url = "http://etcd:2379/health"
+          for attempt in range(30):
+              try:
+                  with urllib.request.urlopen(url, timeout=2) as response:
+                      if response.status == 200:
+                          print(f"etcd is healthy: {response.read().decode()}")
+                          break
+              except (OSError, urllib.error.URLError):
+                  pass
+              time.sleep(2)
+          else:
+              raise SystemExit(f"etcd did not become healthy: {url}")
+          PY
       
       - name: Setup Rust toolchain
         run: |
