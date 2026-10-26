@@ -3021,6 +3021,7 @@ dependencies = [
 name = "curvine-worker"
 version = "0.2.2"
 dependencies = [
+ "async-trait",
  "axum 0.7.9",
  "bytes",
  "curvine-alloc",

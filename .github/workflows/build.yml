@@ -126,6 +126,10 @@ jobs:
           echo "After etcd service discovery tests, disk usage:"
           df -h
 
+      - name: Follower reads with static master addresses
+        run: |
+          cargo test -p curvine-server --test follower_runtime_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
+
       - name: Replication lifecycle regression tests
         run: |
           # Exercise the real Master/Worker submit, dropped-report, reaper and

@@ -71,6 +71,17 @@ pub struct MasterHandler {
 }
 
 impl MasterHandler {
+    fn passive_worker_rpc_allowed(
+        worker_state_enabled: bool,
+        follower_reads_enabled: bool,
+        role: curvine_raft::raft::RoleState,
+        code: RpcCode,
+    ) -> bool {
+        (worker_state_enabled || follower_reads_enabled)
+            && role == curvine_raft::raft::RoleState::Follower
+            && matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         conf: &ClusterConf,
@@ -737,6 +748,73 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
+    /// Record worker liveness and storage information on a follower. The
+    /// passive path deliberately returns no pending block deletion commands.
+    fn worker_heartbeat_passive(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: WorkerHeartbeatRequest = ctx.parse_header()?;
+        if self
+            .compatibility_policy
+            .should_evaluate(header.component_info.is_some())
+        {
+            Self::check_peer_compatibility(
+                "worker",
+                &format!("worker:{}", header.worker_id),
+                &self.compat_warned,
+                self.compatibility_policy.mode,
+                self.compatibility_policy
+                    .check_worker(header.component_info.as_ref()),
+                self.metrics,
+            )?;
+        }
+
+        Self::process_worker_heartbeat_passive(self.fs.clone(), header)?;
+        ctx.response(WorkerHeartbeatResponse { cmds: Vec::new() })
+    }
+
+    fn process_worker_heartbeat_passive(
+        fs: MasterFilesystem,
+        header: WorkerHeartbeatRequest,
+    ) -> FsResult<()> {
+        let status = HeartbeatStatus::from(header.status);
+        let address = ProtoUtils::worker_address_from_pb(&header.address);
+        let worker_id = address.worker_id;
+        let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
+        let worker_session_id = header.worker_session_id.unwrap_or_default();
+        if status == HeartbeatStatus::Start {
+            fs.worker_manager
+                .read()
+                .validate_passive_start(&header.cluster_id, &address)?;
+            // Revoke location readiness before publishing the new worker
+            // session, so a concurrent client read cannot use the prior
+            // session's full-report completion bit.
+            fs.observe_passive_worker_heartbeat(status, worker_id);
+        }
+        let mut wm = fs.worker_manager.write();
+        wm.heartbeat_passive(
+            &header.cluster_id,
+            status,
+            address,
+            weight,
+            worker_session_id,
+            curvine_model::TransferWorkerCapabilities {
+                task_submit: header.transfer_task_submit.unwrap_or(false),
+                report_target: header.transfer_report_target.unwrap_or(false),
+                query_task: header.transfer_query_task.unwrap_or(false),
+                attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
+                source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
+            },
+            header.software_version,
+            u64::try_from(header.fs_ctime).unwrap_or_default(),
+            ProtoUtils::storage_info_list_from_pb(header.storages),
+            header.component_info,
+        )?;
+        drop(wm);
+        if status != HeartbeatStatus::Start {
+            fs.observe_passive_worker_heartbeat(status, worker_id);
+        }
+        Ok(())
+    }
+
     /// Evaluate a compatibility verdict against the configured mode.
     ///
     /// - `diagnose` (default): log a warning for non-compatible peers and
@@ -877,6 +955,15 @@ impl MasterHandler {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
         };
         ctx.response(rep_header)
+    }
+
+    fn block_report_passive(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: BlockReportListRequest = ctx.parse_header()?;
+        let worker_session_id = header.worker_session_id.clone();
+        let list = ProtoUtils::block_report_list_from_pb(header);
+        self.fs
+            .passive_block_report(list, worker_session_id.as_deref())?;
+        ctx.response(BlockReportListResponse { cmds: Vec::new() })
     }
 
     fn process_block_report(
@@ -1250,7 +1337,21 @@ impl MessageHandler for MasterHandler {
         // Unified processing of all RPC requests (standby NotLeader uses the same
         // observability + error_ext conversion path as async_handle).
         let response = if !self.fs.master_monitor.is_active() {
-            Err(FsError::not_leader_master(ctx.code, self.client_ip()))
+            let role = self.fs.master_monitor.follower_readiness_snapshot().role;
+            if Self::passive_worker_rpc_allowed(
+                self.fs.conf.follower_worker_state_enabled,
+                self.fs.conf.follower_reads_enabled,
+                role,
+                code,
+            ) {
+                match code {
+                    RpcCode::WorkerHeartbeat => self.worker_heartbeat_passive(ctx),
+                    RpcCode::WorkerBlockReport => self.block_report_passive(ctx),
+                    _ => Err(FsError::not_leader_master(ctx.code, self.client_ip())),
+                }
+            } else {
+                Err(FsError::not_leader_master(ctx.code, self.client_ip()))
+            }
         } else {
             match code {
                 // File system operation request
@@ -1377,6 +1478,41 @@ mod tests {
     use crate::master::journal::JournalSystem;
     use curvine_model::{TrashEntry, WorkerAddress};
     use curvine_runtime::common::Utils;
+
+    #[test]
+    fn passive_worker_rpc_gate_is_opt_in_and_allowlisted() {
+        let follower = curvine_raft::raft::RoleState::Follower;
+        assert!(!MasterHandler::passive_worker_rpc_allowed(
+            false,
+            false,
+            follower,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(MasterHandler::passive_worker_rpc_allowed(
+            true,
+            false,
+            follower,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(MasterHandler::passive_worker_rpc_allowed(
+            false,
+            true,
+            follower,
+            RpcCode::WorkerBlockReport
+        ));
+        assert!(!MasterHandler::passive_worker_rpc_allowed(
+            true,
+            true,
+            follower,
+            RpcCode::Mkdir
+        ));
+        assert!(!MasterHandler::passive_worker_rpc_allowed(
+            true,
+            true,
+            curvine_raft::raft::RoleState::Leader,
+            RpcCode::WorkerBlockReport
+        ));
+    }
 
     #[test]
     fn process_worker_heartbeat_stores_worker_report_fields() {

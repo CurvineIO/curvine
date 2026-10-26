@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use crate::block::{BlockClient, BlockClientPool};
-use crate::file::{FsClient, MasterHandshake, WorkerPrecheck};
+use crate::file::{FsClient, MasterHandshake, SessionPathTracker, WorkerPrecheck};
 use crate::ClientMetrics;
 use curvine_config::ClusterConf;
+use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_io::CacheManager;
 use curvine_io::IOResult;
@@ -41,6 +42,10 @@ use std::time::Duration;
 
 static CLIENT_METRICS: OnceCell<ClientMetrics> = OnceCell::new();
 
+// Bound sticky-path state per client session. SessionPathTracker caps retained
+// keys at 4 KiB each and conservatively pins all reads to the leader on overflow.
+const SESSION_PATH_TRACKER_CAPACITY: usize = 1_024;
+
 // The core feature of the file system is thread-safe, which can be shared between multiple threads through Arc.
 // 1. The cluster configuration file is saved.
 // 2. Create client.
@@ -52,6 +57,7 @@ pub struct FsContext {
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
     pub(crate) block_pool: Arc<BlockClientPool>,
+    session_path_tracker: SessionPathTracker,
     // Client-master handshake result: the master's advertised version /
     // protocol / capabilities (or a legacy marker when the master does not
     // advertise a compatibility contract). Populated by the first
@@ -91,6 +97,12 @@ impl FsContext {
 
     pub fn with_rt(conf: impl Into<ClusterConf>, rt: Arc<Runtime>) -> FsResult<Self> {
         let conf = conf.into();
+        if conf.client.follower_reads_enabled && conf.client.follower_write_sticky_ms == 0 {
+            return err_box!(
+                "client.follower_write_sticky_ms must be greater than zero when follower reads are enabled"
+            );
+        }
+
         let hostname = conf.client.hostname.to_owned();
         let ip = NetUtils::local_ip(&hostname);
         let client_addr = ClientAddress {
@@ -125,6 +137,10 @@ impl FsContext {
             conf.client.block_conn_idle_size,
             conf.client.block_conn_idle_time_ms,
         ));
+        let session_path_tracker = SessionPathTracker::new(
+            SESSION_PATH_TRACKER_CAPACITY,
+            Duration::from_millis(conf.client.follower_write_sticky_ms),
+        );
 
         let context = Self {
             conf,
@@ -133,6 +149,7 @@ impl FsContext {
             os_cache,
             failed_workers: exclude_workers,
             block_pool,
+            session_path_tracker,
             master_handshake: FastRwLock::new(MasterHandshake::default()),
             live_workers: FastRwLock::new(HashMap::new()),
             worker_precheck: FastRwLock::new(WorkerPrecheck::default()),
@@ -160,6 +177,10 @@ impl FsContext {
     /// successful handshake so no component is rejected by default.
     pub fn master_handshake(&self) -> MasterHandshake {
         self.master_handshake.read().clone()
+    }
+
+    pub(crate) fn session_path_tracker(&self) -> &SessionPathTracker {
+        &self.session_path_tracker
     }
 
     /// Atomically claim the one-time right to attach this client's

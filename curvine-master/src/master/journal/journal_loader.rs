@@ -27,7 +27,7 @@ use curvine_model::RenameFlags;
 use curvine_raft::conf::JournalConfExt;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData};
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg, LogStorage, RocksLogStorage};
-use curvine_raft::raft::{RaftClient, RaftResult, RaftUtils};
+use curvine_raft::raft::{FollowerReadinessMonitor, RaftClient, RaftResult, RaftUtils};
 use curvine_runtime::common::{FileUtils, TimeSpent};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
@@ -58,6 +58,7 @@ pub struct JournalLoader {
     retry_interval: Duration,
     metrics: &'static MasterMetrics,
     has_apply_worker: bool,
+    follower_readiness: FollowerReadinessMonitor,
 }
 
 impl JournalLoader {
@@ -79,6 +80,7 @@ impl JournalLoader {
             job_manager,
             log_store,
             journal_writer,
+            FollowerReadinessMonitor::default(),
             true,
         )
     }
@@ -92,6 +94,7 @@ impl JournalLoader {
         job_manager: Arc<JobManager>,
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
+        follower_readiness: FollowerReadinessMonitor,
     ) -> CommonResult<Self> {
         Self::build(
             rt,
@@ -101,6 +104,7 @@ impl JournalLoader {
             job_manager,
             log_store,
             journal_writer,
+            follower_readiness,
             false,
         )
     }
@@ -114,6 +118,7 @@ impl JournalLoader {
         job_manager: Arc<JobManager>,
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
+        follower_readiness: FollowerReadinessMonitor,
         testing: bool,
     ) -> CommonResult<Self> {
         let ufs_loader = UfsLoader::new(job_manager, fs_dir.clone(), conf);
@@ -135,6 +140,7 @@ impl JournalLoader {
             retry_interval: Duration::from_secs(conf.retry_interval_secs),
             metrics: Master::get_metrics()?,
             has_apply_worker: !testing,
+            follower_readiness,
         };
 
         loader.refresh_metrics()?;
@@ -183,6 +189,8 @@ impl JournalLoader {
         }
 
         let mut state = self.fsm_state()?;
+        let applied_term = applied.term;
+        let applied_index = applied.index;
         if is_leader {
             state.ufs_applied = applied.clone();
             state.applied = applied;
@@ -192,7 +200,19 @@ impl JournalLoader {
 
         self.refresh_fsm_metrics(&state);
         drop(state);
+        self.follower_readiness
+            .observe_applied(applied_term, applied_index);
         self.hard_state_changed(&self.log_store.hard_state());
+        Ok(())
+    }
+
+    fn refresh_replay_readiness(&self) -> CommonResult<()> {
+        let applied = self.fsm_state_snapshot()?.applied;
+        let committed_index = self.log_store.hard_state().commit;
+        self.follower_readiness
+            .observe_applied(applied.term, applied.index);
+        self.follower_readiness
+            .set_replay_ready(applied.index >= committed_index);
         Ok(())
     }
 
@@ -361,6 +381,7 @@ impl JournalLoader {
             }
 
             ApplyMsg::Scan(applied_index) => {
+                self.follower_readiness.set_replay_ready(false);
                 let mut last_applied = applied_index.index;
                 if is_leader && skip_ufs_error {
                     last_applied = last_applied.max(self.fsm_state_snapshot()?.ufs_applied.index);
@@ -369,6 +390,11 @@ impl JournalLoader {
                 let commit_index = self.log_store.hard_state().commit;
                 loop {
                     if last_applied >= commit_index {
+                        let applied = self.fsm_state_snapshot()?.applied;
+                        self.follower_readiness
+                            .observe_applied(applied.term, applied.index);
+                        self.follower_readiness
+                            .set_replay_ready(applied.index >= commit_index);
                         return Ok(());
                     }
 
@@ -376,6 +402,7 @@ impl JournalLoader {
                     let list = self.log_store.scan_entries(last_applied + 1, high)?;
 
                     if list.is_empty() {
+                        self.follower_readiness.set_replay_ready(false);
                         return Ok(());
                     };
 
@@ -629,6 +656,7 @@ impl JournalLoader {
 
         *self.fsm_state()? = snapshot.fsm_state;
         self.refresh_metrics()?;
+        self.refresh_replay_readiness()?;
 
         info!(
             "apply_snapshot: fs_dir_restore={} ms, mount_restore={} ms, total={} ms",

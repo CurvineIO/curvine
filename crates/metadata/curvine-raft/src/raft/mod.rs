@@ -44,6 +44,9 @@ pub use self::raft_error::RaftError;
 mod role_monitor;
 pub use self::role_monitor::*;
 
+mod follower_readiness;
+pub use self::follower_readiness::*;
+
 pub mod snapshot;
 
 mod raft_utils;

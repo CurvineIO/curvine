@@ -37,6 +37,8 @@ curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-metrics = { workspace = true }
 curvine-client-core = { workspace = true }
 curvine-data-transfer = { workspace = true, features = ["opendal-s3"] }
+async-trait = { workspace = true }
+prost = { workspace = true }
 curvine-web = { workspace = true }
 curvine-fault = { workspace = true }
 curvine-storage-local = { workspace = true }
@@ -51,4 +53,3 @@ bytes = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-prost = { workspace = true }

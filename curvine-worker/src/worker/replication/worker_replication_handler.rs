@@ -96,7 +96,11 @@ impl MessageHandler for WorkerReplicationHandler {
             RpcCode::ReconcileReplication => {
                 let req: ReconcileReplicationRequest = ctx.parse_header()?;
                 let block_id = req.block_id;
+                let released = req.release;
                 let response = self.manager.target.reconcile(req)?;
+                if released && response.storage_type.is_some() {
+                    self.manager.queue_finalized_replica_report(block_id);
+                }
                 crate::fault_point! {
                     sync,
                     name: "worker.replication.reconciled",
