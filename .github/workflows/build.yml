@@ -46,6 +46,19 @@ jobs:
     container:
       image: ghcr.io/curvineio/curvine-tests:rocky9
       options: --privileged --device /dev/fuse
+    services:
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.17
+        env:
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+          ETCD_DATA_DIR: /tmp/curvine-etcd
+        options: >-
+          --entrypoint /usr/local/bin/etcd
+          --health-cmd "/usr/local/bin/etcdctl --endpoints=http://127.0.0.1:2379 endpoint health"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
     
     steps:
       - uses: actions/checkout@v4
@@ -119,9 +132,17 @@ jobs:
           df -h
 
       - name: Run etcd service discovery tests
+        env:
+          CURVINE_ETCD_ADDR: http://etcd:2379
         run: |
           echo "Running feature-gated etcd service discovery unit tests"
           cargo test -p curvine-service-discovery --features etcd --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "Running real etcd provider integration tests"
+          cargo test -p curvine-service-discovery --features etcd --test etcd_provider_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --ignored --test-threads=1
+
+          echo "Running daemon discovery runtime integration"
+          cargo test -p curvine-server --features discovery-etcd --test discovery_runtime_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --ignored --test-threads=1
 
           echo "After etcd service discovery tests, disk usage:"
           df -h
