@@ -111,6 +111,7 @@ impl MasterClient {
         blocks: &[BlockMeta],
     ) -> CommonResult<BlockReportListResponse> {
         let mut req = BlockReportListRequest {
+            worker_session_id: Some(self.worker_session_id.clone()),
             cluster_id: self.cluster_id.clone(),
             worker_id: self.worker_id,
             full_report: true,
@@ -147,6 +148,7 @@ impl MasterClient {
         blocks: &[BlockReportInfo],
     ) -> CommonResult<BlockReportListResponse> {
         let mut req = BlockReportListRequest {
+            worker_session_id: Some(self.worker_session_id.clone()),
             cluster_id: self.cluster_id.clone(),
             worker_id: self.worker_id,
             full_report: false,

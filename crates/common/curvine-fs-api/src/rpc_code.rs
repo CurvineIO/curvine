@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_model::OpenFlags;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use std::fmt;
 
@@ -104,5 +105,105 @@ pub enum RpcCode {
 impl fmt::Display for RpcCode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", self)
+    }
+}
+
+impl RpcCode {
+    /// Returns whether this RPC is an explicitly permitted follower metadata read.
+    ///
+    /// This is deliberately a closed allowlist. New RPC codes, including trash
+    /// operations, remain leader-only until they are reviewed and added here.
+    pub fn is_follower_read(&self) -> bool {
+        matches!(
+            self,
+            Self::FileStatus
+                | Self::ListStatus
+                | Self::Exists
+                | Self::GetBlockLocations
+                | Self::ListOptions
+                | Self::GetMountTable
+                | Self::GetMountInfo
+        )
+    }
+
+    /// Checks the follower-read allowlist, including OpenFile's encoded flags.
+    ///
+    /// `OpenFile` is allowed only for a valid, exactly read-only flag set. A
+    /// missing or malformed flag word is denied, as are create, truncate,
+    /// append, and exclusive-create flags. Non-OpenFile RPCs do not use the
+    /// optional flag word.
+    pub fn allows_follower_read(&self, open_file_flags: Option<u32>) -> bool {
+        if *self == Self::OpenFile {
+            let Some(flags) = open_file_flags.and_then(OpenFlags::from_bits) else {
+                return false;
+            };
+            return flags.read_only()
+                && !flags.intersects(
+                    OpenFlags::CREAT | OpenFlags::EXCL | OpenFlags::TRUNC | OpenFlags::APPEND,
+                );
+        }
+
+        self.is_follower_read()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RpcCode;
+    use curvine_model::OpenFlags;
+
+    #[test]
+    fn follower_read_allowlist_is_explicit_and_excludes_trash_and_unknown_codes() {
+        for code in [
+            RpcCode::FileStatus,
+            RpcCode::ListStatus,
+            RpcCode::Exists,
+            RpcCode::GetBlockLocations,
+            RpcCode::ListOptions,
+            RpcCode::GetMountTable,
+            RpcCode::GetMountInfo,
+        ] {
+            assert!(code.allows_follower_read(None), "{code:?}");
+        }
+
+        for code in [
+            RpcCode::Undefined,
+            RpcCode::OpenFile,
+            RpcCode::GetFilesystemInfo,
+            RpcCode::GetFileBlockDetails,
+            RpcCode::ListTrash,
+            RpcCode::RestoreTrash,
+            RpcCode::EmptyTrash,
+            RpcCode::Mkdir,
+            RpcCode::Delete,
+            RpcCode::Rename,
+        ] {
+            assert!(!code.allows_follower_read(None), "{code:?}");
+        }
+
+        assert!(!RpcCode::from(127).allows_follower_read(None));
+    }
+
+    #[test]
+    fn follower_open_file_requires_valid_read_only_flags() {
+        assert!(RpcCode::OpenFile.allows_follower_read(Some(0)));
+        assert!(RpcCode::OpenFile.allows_follower_read(Some(OpenFlags::RDONLY.bits())));
+
+        for flags in [
+            OpenFlags::WRONLY.bits(),
+            OpenFlags::RDWR.bits(),
+            OpenFlags::CREAT.bits(),
+            OpenFlags::EXCL.bits(),
+            OpenFlags::TRUNC.bits(),
+            OpenFlags::APPEND.bits(),
+            OpenFlags::RDONLY.bits() | (1 << 31),
+        ] {
+            assert!(
+                !RpcCode::OpenFile.allows_follower_read(Some(flags)),
+                "flags {flags:#x} must be denied"
+            );
+        }
+
+        assert!(!RpcCode::OpenFile.allows_follower_read(None));
     }
 }
