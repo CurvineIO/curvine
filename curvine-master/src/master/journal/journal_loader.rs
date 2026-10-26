@@ -189,7 +189,6 @@ impl JournalLoader {
         }
 
         let mut state = self.fsm_state()?;
-        let applied_term = applied.term;
         let applied_index = applied.index;
         if is_leader {
             state.ufs_applied = applied.clone();
@@ -200,8 +199,7 @@ impl JournalLoader {
 
         self.refresh_fsm_metrics(&state);
         drop(state);
-        self.follower_readiness
-            .observe_applied(applied_term, applied_index);
+        self.follower_readiness.observe_applied(applied_index);
         self.hard_state_changed(&self.log_store.hard_state());
         Ok(())
     }
@@ -209,8 +207,7 @@ impl JournalLoader {
     fn refresh_replay_readiness(&self) -> CommonResult<()> {
         let applied = self.fsm_state_snapshot()?.applied;
         let committed_index = self.log_store.hard_state().commit;
-        self.follower_readiness
-            .observe_applied(applied.term, applied.index);
+        self.follower_readiness.observe_applied(applied.index);
         self.follower_readiness
             .set_replay_ready(applied.index >= committed_index);
         Ok(())
@@ -391,8 +388,7 @@ impl JournalLoader {
                 loop {
                     if last_applied >= commit_index {
                         let applied = self.fsm_state_snapshot()?.applied;
-                        self.follower_readiness
-                            .observe_applied(applied.term, applied.index);
+                        self.follower_readiness.observe_applied(applied.index);
                         self.follower_readiness
                             .set_replay_ready(applied.index >= commit_index);
                         return Ok(());

@@ -36,8 +36,7 @@ mod fs_context;
 pub use self::fs_context::FsContext;
 
 mod session_path_tracker;
-pub(crate) use self::session_path_tracker::SessionMutationGuard;
-pub use self::session_path_tracker::SessionPathTracker;
+pub(crate) use self::session_path_tracker::{SessionMutationGuard, SessionPathTracker};
 
 mod fs_reader_base;
 pub use self::fs_reader_base::FsReaderBase;

@@ -27,7 +27,7 @@ const MAX_TRACKED_PATH_BYTES: usize = 4 * 1024;
 /// Clones share the same session state. The owner should create one tracker
 /// for each client context and share it with that context's clients.
 #[derive(Clone)]
-pub struct SessionPathTracker {
+pub(crate) struct SessionPathTracker {
     state: Arc<Mutex<TrackerState>>,
     capacity: usize,
     ttl: Duration,
@@ -181,7 +181,7 @@ impl SessionPathTracker {
     /// sticky until the untracked mutation's TTL ends. A zero capacity therefore
     /// remains correct, at the cost of sending every read to the leader for the
     /// configured TTL after a mutation.
-    pub fn new(capacity: usize, ttl: Duration) -> Self {
+    pub(crate) fn new(capacity: usize, ttl: Duration) -> Self {
         Self {
             state: Arc::new(Mutex::new(TrackerState::default())),
             capacity,
@@ -190,17 +190,20 @@ impl SessionPathTracker {
     }
 
     /// Mark one path before sending a metadata mutation.
-    pub fn mark_mutation(&self, path: &Path) {
+    #[cfg(test)]
+    pub(crate) fn mark_mutation(&self, path: &Path) {
         self.mark_mutations([path]);
     }
 
     /// Mark several paths under one lock, for batch mutations.
-    pub fn mark_mutations<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) {
+    #[cfg(test)]
+    pub(crate) fn mark_mutations<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) {
         self.mark_mutations_at(paths, Instant::now());
     }
 
     /// Mark both rename subtrees together so reads cannot observe a partial mark.
-    pub fn mark_rename(&self, source: &Path, destination: &Path) {
+    #[cfg(test)]
+    pub(crate) fn mark_rename(&self, source: &Path, destination: &Path) {
         self.mark_mutations([source, destination]);
     }
 
@@ -270,10 +273,11 @@ impl SessionPathTracker {
 
     /// Whether this path or a directory listing that contains it must use the
     /// leader. Matching uses Path's normalized component-prefix semantics.
-    pub fn is_sticky(&self, path: &Path) -> bool {
+    pub(crate) fn is_sticky(&self, path: &Path) -> bool {
         self.is_sticky_at(path, Instant::now())
     }
 
+    #[cfg(test)]
     fn mark_mutations_at<'a>(&self, paths: impl IntoIterator<Item = &'a Path>, now: Instant) {
         let expiry = Expiry::after(now, self.ttl);
         let mut state = self.state.lock().unwrap();

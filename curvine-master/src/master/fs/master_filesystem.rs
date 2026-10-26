@@ -1529,18 +1529,6 @@ impl MasterFilesystem {
         self.invalidate_full_block_reconcile(worker_id);
     }
 
-    /// Report id of the last fully processed full report of the worker.
-    #[doc(hidden)]
-    pub fn full_report_completed_round(&self, worker_id: u32) -> Option<u64> {
-        self.full_report_tracker.completed_round(worker_id)
-    }
-
-    /// Number of workers with a partially accumulated full report.
-    #[doc(hidden)]
-    pub fn full_report_open_sessions(&self) -> usize {
-        self.full_report_tracker.open_sessions()
-    }
-
     fn invalidate_full_block_report_session(&self, worker_id: u32) {
         self.full_report_tracker
             .invalidate_session(worker_id, LocalTime::mills());
@@ -2448,7 +2436,7 @@ mod tests {
     fn use_current_follower_view(fs: &mut MasterFilesystem) -> FollowerReadinessMonitor {
         let readiness = FollowerReadinessMonitor::default();
         readiness.observe_raft_state(RoleState::Follower, 1, 2, 0);
-        readiness.observe_applied(1, 0);
+        readiness.observe_applied(0);
         readiness.set_replay_ready(true);
         readiness.observe_leader_contact(1, 2);
         fs.master_monitor = MasterMonitor::with_follower_readiness(
