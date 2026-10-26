@@ -22,16 +22,18 @@ use curvine_model::ProtoUtils;
 use curvine_model::{
     AccessMode, BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress,
     CommitBlock, ContentSummary, CreateFileOpts, CreateFileOptsBuilder, DeleteResult,
-    FileAllocOpts, LocatedBlock, MkdirOpts, MkdirOptsBuilder, MountInfo, Provider, StorageType,
-    TtlAction, TtlType, WorkerAddress, WorkerInfo, WorkerStatus, WriteType,
+    FileAllocOpts, HeartbeatStatus, ListOptions, LocatedBlock, MkdirOpts, MkdirOptsBuilder,
+    MountInfo, Provider, StorageType, TtlAction, TtlType, WorkerAddress, WorkerCommand,
+    WorkerInfo, WorkerStatus, WriteType,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
-    CreateFileRequest, DeleteRequest, GetContentSummaryRequest, GetContentSummaryResponse,
-    GetFilesystemInfoRequest, GetFilesystemInfoResponse, HeartbeatStatusProto, MkdirOptsProto,
-    MkdirRequest, RenameRequest, WorkerAddressProto, WorkerHeartbeatRequest,
-    WorkerHeartbeatResponse,
+    CreateFileRequest, DeleteRequest, EmptyTrashRequest, EmptyTrashResponse,
+    GetContentSummaryRequest, GetContentSummaryResponse, GetFilesystemInfoRequest,
+    GetFilesystemInfoResponse, HeartbeatStatusProto, ListTrashRequest, ListTrashResponse,
+    MkdirOptsProto, MkdirRequest, MountRequest, RenameRequest, RestoreTrashRequest,
+    RestoreTrashResponse, WorkerAddressProto, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -43,16 +45,20 @@ use curvine_rpc::message::{Builder, MAX_DATE_SIZE};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
+use curvine_runtime::sync::StateCtl;
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
+use curvine_server::master::meta::trash;
 use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::space::{DirSpaceManager, ScanOutcome};
-use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
+use curvine_server::master::{
+    JobHandler, JobManager, Master, MasterHandler, MasterMonitor, RpcContext,
+};
 use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -217,9 +223,36 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
     new_handler_for_test_with_dir_space(test_name, false).0
 }
 
+fn new_handler_with_conf(
+    test_name: &str,
+    configure: impl FnOnce(&mut ClusterConf),
+) -> MasterHandler {
+    new_handler_for_test_with_options(test_name, false, false, configure).0
+}
+
+fn new_handler_with_active_master(
+    test_name: &str,
+    configure: impl FnOnce(&mut ClusterConf),
+) -> MasterHandler {
+    new_handler_for_test_with_options(test_name, false, true, configure).0
+}
+
 fn new_handler_for_test_with_dir_space(
     test_name: &str,
     dir_space_enabled: bool,
+) -> (
+    MasterHandler,
+    MasterFilesystem,
+    Option<Arc<DirSpaceManager>>,
+) {
+    new_handler_for_test_with_options(test_name, dir_space_enabled, dir_space_enabled, |_| {})
+}
+
+fn new_handler_for_test_with_options(
+    test_name: &str,
+    dir_space_enabled: bool,
+    active_leader: bool,
+    configure: impl FnOnce(&mut ClusterConf),
 ) -> (
     MasterHandler,
     MasterFilesystem,
@@ -230,6 +263,7 @@ fn new_handler_for_test_with_dir_space(
     let test_id = Utils::rand_str(8);
     let mut conf = ClusterConf::format();
     conf.journal.enable = false;
+    configure(&mut conf);
 
     conf.master.meta_dir =
         Utils::test_sub_dir(format!("master-fs-test/meta-{test_name}-{test_id}"));
@@ -244,8 +278,11 @@ fn new_handler_for_test_with_dir_space(
     }
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
-    let fs = MasterFilesystem::with_js(&conf, &journal_system);
-    if dir_space_enabled {
+    let mut fs = MasterFilesystem::with_js(&conf, &journal_system);
+    if active_leader {
+        fs.master_monitor =
+            MasterMonitor::new(StateCtl::new(RoleState::Leader.into()), StateCtl::new(0));
+    } else if dir_space_enabled {
         fs.master_monitor
             .set_journal_role_for_test(RoleState::Leader);
     }
@@ -2372,6 +2409,461 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     Ok(())
 }
 
+#[test]
+fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-skip", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    fs.create("/skip.log", true)?;
+    let res = handler.delete0(
+        Utils::req_id(),
+        DeleteRequest {
+            path: "/skip.log".to_string(),
+            recursive: false,
+            skip_trash: Some(true),
+        },
+    )?;
+    assert!(!res.trashed);
+    assert!(fs.get_block_locations("/skip.log").is_err());
+    assert!(fs.list_options("/.Trash", ListOptions::default()).is_err());
+
+    fs.create("/soft.log", true)?;
+    let res = handler.delete0(
+        Utils::req_id(),
+        DeleteRequest {
+            path: "/soft.log".to_string(),
+            recursive: false,
+            skip_trash: Some(false),
+        },
+    )?;
+    assert!(res.trashed);
+    assert!(fs.get_block_locations("/soft.log").is_err());
+    assert_eq!(fs.list_options("/.Trash", ListOptions::default())?.len(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn trash_rpc_list_restore_empty() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-rpc", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    fs.create("/rpc/a.log", true)?;
+    let del_msg = Builder::new_rpc(RpcCode::Delete)
+        .proto_header(DeleteRequest {
+            path: "/rpc/a.log".to_string(),
+            recursive: false,
+            skip_trash: Some(false),
+        })
+        .build();
+    let mut del_ctx = RpcContext::new(&del_msg);
+    handler.retry_check_delete(&mut del_ctx)?;
+
+    let list_msg = Builder::new_rpc(RpcCode::ListTrash)
+        .proto_header(ListTrashRequest::default())
+        .build();
+    let mut list_ctx = RpcContext::new(&list_msg);
+    let list_rep = handler
+        .list_trash(&mut list_ctx)?
+        .parse_header::<ListTrashResponse>()?;
+    assert_eq!(list_rep.entries.len(), 1);
+    let entry = &list_rep.entries[0];
+    assert_eq!(entry.origin, "/rpc/a.log");
+    assert!(entry.delete_ms > 0);
+    assert_eq!(entry.status.path, entry.path);
+
+    let restore_msg = Builder::new_rpc(RpcCode::RestoreTrash)
+        .proto_header(RestoreTrashRequest {
+            path: entry.path.clone(),
+            dst: None,
+            overwrite: Some(false),
+        })
+        .build();
+    let mut restore_ctx = RpcContext::new(&restore_msg);
+    let restore_rep = handler
+        .retry_check_restore_trash(&mut restore_ctx)?
+        .parse_header::<RestoreTrashResponse>()?;
+    assert_eq!(restore_rep.dst.as_deref(), Some("/rpc/a.log"));
+    assert_eq!(
+        restore_rep
+            .status
+            .as_ref()
+            .map(|status| status.path.as_str()),
+        Some("/rpc/a.log")
+    );
+    assert!(fs.get_block_locations("/rpc/a.log").is_ok());
+    assert!(fs.list_trash()?.is_empty());
+
+    fs.create("/rpc/b.log", true)?;
+    let del_msg = Builder::new_rpc(RpcCode::Delete)
+        .proto_header(DeleteRequest {
+            path: "/rpc/b.log".to_string(),
+            recursive: false,
+            skip_trash: Some(false),
+        })
+        .build();
+    let mut del_ctx = RpcContext::new(&del_msg);
+    handler.retry_check_delete(&mut del_ctx)?;
+
+    let empty_msg = Builder::new_rpc(RpcCode::EmptyTrash)
+        .proto_header(EmptyTrashRequest {})
+        .build();
+    let mut empty_ctx = RpcContext::new(&empty_msg);
+    let empty_rep = handler
+        .retry_check_empty_trash(&mut empty_ctx)?
+        .parse_header::<EmptyTrashResponse>()?;
+    assert_eq!(empty_rep.res.inodes, 1);
+    assert!(fs.list_trash()?.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn trash_rpc_list_paginates() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-page", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    for i in 0..250 {
+        let path = format!("/page/f{}.log", i);
+        fs.create(&path, true)?;
+        fs.delete_with_opts(&path, false, false)?;
+    }
+    let expected: Vec<String> = fs.list_trash()?.into_iter().map(|e| e.path).collect();
+    assert_eq!(expected.len(), 250);
+
+    let mut seen = Vec::new();
+    let mut page_token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages <= 3);
+
+        let msg = Builder::new_rpc(RpcCode::ListTrash)
+            .proto_header(ListTrashRequest {
+                page_token: page_token.clone(),
+                page_size: Some(100),
+            })
+            .build();
+        let mut ctx = RpcContext::new(&msg);
+        let rep = handler
+            .list_trash(&mut ctx)?
+            .parse_header::<ListTrashResponse>()?;
+        assert!(!rep.entries.is_empty());
+        assert!(rep.entries.len() <= 100);
+        seen.extend(rep.entries.into_iter().map(|e| e.path));
+
+        match rep.next_page_token.filter(|token| !token.is_empty()) {
+            Some(token) => page_token = Some(token),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(seen, expected);
+
+    // Page sizes below the minimum are clamped so a listing cannot degenerate
+    // into one RPC per entry.
+    let msg = Builder::new_rpc(RpcCode::ListTrash)
+        .proto_header(ListTrashRequest {
+            page_token: None,
+            page_size: Some(1),
+        })
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    let rep = handler
+        .list_trash(&mut ctx)?
+        .parse_header::<ListTrashResponse>()?;
+    assert_eq!(rep.entries.len(), 100);
+    assert!(rep.next_page_token.is_some());
+
+    let msg = Builder::new_rpc(RpcCode::ListTrash)
+        .proto_header(ListTrashRequest {
+            page_token: Some("invalid-token".to_string()),
+            page_size: Some(100),
+        })
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    assert!(handler.list_trash(&mut ctx).is_err());
+
+    Ok(())
+}
+
+#[test]
+fn trash_rpc_dispatches_through_handle() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler =
+        new_handler_with_active_master("trash-dispatch", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    fs.create("/dispatch/a.log", true)?;
+    let delete_msg = Builder::new_rpc(RpcCode::Delete)
+        .proto_header(DeleteRequest {
+            path: "/dispatch/a.log".to_string(),
+            recursive: false,
+            skip_trash: Some(false),
+        })
+        .build();
+    let delete_rep = handler.handle(&delete_msg)?;
+    assert!(delete_rep.is_success(), "{}", delete_rep.to_error_msg());
+
+    // Drive ListTrash through the real dispatch path so the RpcCode branch,
+    // header parsing and response encoding are covered, not just the handler
+    // method.
+    let list_msg = Builder::new_rpc(RpcCode::ListTrash)
+        .proto_header(ListTrashRequest::default())
+        .build();
+    let list_rep = handler.handle(&list_msg)?;
+    assert!(list_rep.is_success(), "{}", list_rep.to_error_msg());
+    let list_rep: ListTrashResponse = list_rep.parse_header()?;
+    assert_eq!(list_rep.entries.len(), 1);
+    let entry = &list_rep.entries[0];
+    assert_eq!(entry.origin, "/dispatch/a.log");
+
+    let restore_msg = Builder::new_rpc(RpcCode::RestoreTrash)
+        .proto_header(RestoreTrashRequest {
+            path: entry.path.clone(),
+            dst: None,
+            overwrite: Some(false),
+        })
+        .build();
+    let restore_rep = handler.handle(&restore_msg)?;
+    assert!(restore_rep.is_success(), "{}", restore_rep.to_error_msg());
+    let restore_rep: RestoreTrashResponse = restore_rep.parse_header()?;
+    assert_eq!(restore_rep.dst.as_deref(), Some("/dispatch/a.log"));
+    assert!(fs.get_block_locations("/dispatch/a.log").is_ok());
+    assert!(fs.list_trash()?.is_empty());
+
+    fs.create("/dispatch/b.log", true)?;
+    fs.delete_with_opts("/dispatch/b.log", false, false)?;
+    let empty_msg = Builder::new_rpc(RpcCode::EmptyTrash)
+        .proto_header(EmptyTrashRequest {})
+        .build();
+    let empty_rep = handler.handle(&empty_msg)?;
+    assert!(empty_rep.is_success(), "{}", empty_rep.to_error_msg());
+    let empty_rep: EmptyTrashResponse = empty_rep.parse_header()?;
+    assert_eq!(empty_rep.res.inodes, 1);
+    assert!(fs.list_trash()?.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn restore_trash_overwrite_releases_replaced_blocks() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-restore-overwrite", |conf| {
+        conf.master.trash_enabled = true
+    });
+    let fs = handler.clone_fs();
+
+    fs.create("/overwrite/a.log", true)?;
+    fs.delete_with_opts("/overwrite/a.log", false, false)?;
+    let entry = fs.list_trash()?.remove(0);
+
+    // The destination that gets replaced owns a committed block on the test
+    // worker, so an overwrite restore has blocks to reclaim.
+    fs.create("/overwrite/a.log", true)?;
+    let replaced = fs.add_block(
+        "/overwrite/a.log",
+        None,
+        ClientAddress::default(),
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    let replaced_block = replaced.block.id;
+    let worker_address = replaced.locs[0].clone();
+    fs.fs_dir.write().add_block_location(
+        replaced_block,
+        BlockLocation::with_id(worker_address.worker_id),
+    )?;
+    fs.complete_file(
+        "/overwrite/a.log",
+        None,
+        1,
+        vec![CommitBlock {
+            block_id: replaced_block,
+            block_len: 1,
+            locations: vec![BlockLocation::with_id(worker_address.worker_id)],
+        }],
+        "",
+        false,
+        None,
+    )?;
+
+    let restored = fs.restore_trash(&entry.path, Some("/overwrite/a.log"), true)?;
+    assert_eq!(restored.dst, "/overwrite/a.log");
+    assert!(
+        restored.replaced.is_some(),
+        "overwrite restore must report the replaced entry"
+    );
+
+    // The replaced entry left the namespace, so remove_blocks is the only
+    // place that reclaims its blocks; assert the worker delete was queued.
+    let heartbeat = Builder::new_rpc(RpcCode::WorkerHeartbeat)
+        .proto_header(WorkerHeartbeatRequest {
+            cluster_id: ClusterConf::format().cluster_id,
+            worker_id: worker_address.worker_id,
+            fs_ctime: 0,
+            address: ProtoUtils::worker_address_to_pb(&worker_address),
+            failed_dirs: 0,
+            status: HeartbeatStatus::Running.into(),
+            software_version: String::new(),
+            ..Default::default()
+        })
+        .build();
+    let mut heartbeat_ctx = RpcContext::new(&heartbeat);
+    let heartbeat_rep: WorkerHeartbeatResponse = handler
+        .worker_heartbeat(&mut heartbeat_ctx)?
+        .parse_header()?;
+    let pending: HashSet<i64> = ProtoUtils::worker_cmd_from_pb(heartbeat_rep.cmds)
+        .into_iter()
+        .flat_map(|cmd| match cmd {
+            WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+        })
+        .collect();
+    assert!(
+        pending.contains(&replaced_block),
+        "block {replaced_block} was not queued for removal: {pending:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn restore_trash_checks_the_effective_destination_mount() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-restore-mount", |conf| {
+        conf.master.trash_enabled = true
+    });
+    let fs = handler.clone_fs();
+
+    for (cv_path, write_type) in [
+        ("/cache-mode", WriteType::CacheMode),
+        ("/fs-mode", WriteType::FsMode),
+    ] {
+        mount_for_test(&handler, cv_path, write_type)?;
+    }
+
+    fs.create("/data/a.log", true)?;
+    fs.delete_with_opts("/data/a.log", false, false)?;
+    let entry = fs.list_trash()?.remove(0);
+
+    let err = handler
+        .restore_trash0(
+            1,
+            RestoreTrashRequest {
+                path: entry.path.clone(),
+                dst: Some("/cache-mode/a.log".to_string()),
+                overwrite: Some(false),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, FsError::Unsupported(_)), "got {err:?}");
+
+    let err = handler
+        .restore_trash0(
+            2,
+            RestoreTrashRequest {
+                path: entry.path.clone(),
+                dst: Some("/fs-mode".to_string()),
+                overwrite: Some(false),
+            },
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("mount point root"), "got {err}");
+
+    // fs-mode reads fall back to CV blocks, so restoring below such a mount is
+    // safe even when the client names the destination.
+    let restored = handler
+        .restore_trash0(
+            3,
+            RestoreTrashRequest {
+                path: entry.path.clone(),
+                dst: Some("/fs-mode/a.log".to_string()),
+                overwrite: Some(false),
+            },
+        )
+        .unwrap();
+    assert_eq!(restored.dst.as_deref(), Some("/fs-mode/a.log"));
+    assert_eq!(
+        restored.status.as_ref().map(|status| status.path.as_str()),
+        Some("/fs-mode/a.log")
+    );
+    assert!(fs.list_trash()?.is_empty());
+
+    // A default restore resolves the recorded origin on the master, so a direct
+    // RPC cannot bypass the cache-mode check by omitting dst.
+    fs.create("/cache-mode/b.log", true)?;
+    fs.delete_with_opts("/cache-mode/b.log", false, false)?;
+    let cache_entry = fs
+        .list_trash()?
+        .into_iter()
+        .find(|entry| entry.origin == "/cache-mode/b.log")
+        .unwrap();
+    let err = handler
+        .restore_trash0(
+            4,
+            RestoreTrashRequest {
+                path: cache_entry.path,
+                dst: None,
+                overwrite: Some(false),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, FsError::Unsupported(_)), "got {err:?}");
+    assert_eq!(fs.list_trash()?.len(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn restore_trash_replays_as_a_single_atomic_rename() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, loader, _js2, fs2) = setup_pair_with_conf("trash-restore-replay", |conf| {
+        conf.master.trash_enabled = true;
+    });
+
+    fs.create("/data/a.log", true)?;
+    fs.delete_with_opts("/data/a.log", false, false)?;
+
+    let setup_entries = js.fs().fs_dir.read().take_entries();
+    apply_entries(&loader, &setup_entries, 1)?;
+
+    let entry = fs.list_trash()?.remove(0);
+    fs.restore_trash(&entry.path, None, false)?;
+
+    // The trash markers must be cleared by the rename mutation itself; a
+    // separate SetAttr would leave a window where the entry has no origin.
+    let restore_entries = js.fs().fs_dir.read().take_entries();
+    assert_eq!(
+        restore_entries
+            .iter()
+            .filter(|entry| matches!(entry, JournalEntry::SetAttr(_)))
+            .count(),
+        0
+    );
+    assert_eq!(
+        restore_entries
+            .iter()
+            .filter(|entry| matches!(entry, JournalEntry::Rename(_)))
+            .count(),
+        1
+    );
+
+    apply_entries(&loader, &restore_entries, setup_entries.len() as u64 + 1)?;
+
+    assert!(fs.get_block_locations("/data/a.log").is_ok());
+    assert!(fs2.get_block_locations("/data/a.log").is_ok());
+    assert!(fs.list_trash()?.is_empty());
+    assert!(fs2.list_trash()?.is_empty());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
+
+    Ok(())
+}
+
 fn delete_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
     let msg = Builder::new_rpc(RpcCode::Mkdir)
         .proto_header(MkdirRequest {
@@ -2465,6 +2957,38 @@ fn setup_pair(
         testing: true,
         ..Default::default()
     };
+    let worker = WorkerInfo::default();
+
+    conf.change_test_meta_dir(format!("idem-{}-leader", name));
+    let js1 = JournalSystem::from_conf(&conf).unwrap();
+    let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    fs1.add_test_worker(worker.clone());
+
+    conf.change_test_meta_dir(format!("idem-{}-follower", name));
+    let js2 = JournalSystem::from_conf(&conf).unwrap();
+    let fs2 = MasterFilesystem::with_js(&conf, &js2);
+    fs2.add_test_worker(worker);
+    let loader = js2.journal_loader();
+
+    (fs1, js1, loader, js2, fs2)
+}
+
+fn setup_pair_with_conf(
+    name: &str,
+    configure: impl FnOnce(&mut ClusterConf),
+) -> (
+    MasterFilesystem,
+    JournalSystem,
+    JournalLoader,
+    JournalSystem,
+    MasterFilesystem,
+) {
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    configure(&mut conf);
     let worker = WorkerInfo::default();
 
     conf.change_test_meta_dir(format!("idem-{}-leader", name));
@@ -3912,3 +4436,136 @@ fn standby_records_running_heartbeat_and_rejects_metadata_writes() -> CommonResu
     );
     Ok(())
 }
+
+fn mount_for_test(
+    handler: &MasterHandler,
+    cv_path: &str,
+    write_type: WriteType,
+) -> CommonResult<()> {
+    let msg = Builder::new_rpc(RpcCode::Mount)
+        .proto_header(MountRequest {
+            cv_path: cv_path.to_string(),
+            ufs_path: format!("oss://bucket{cv_path}"),
+            mount_options: ProtoUtils::mount_options_to_pb(
+                MountOptions::builder().write_type(write_type).build(),
+            ),
+        })
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    handler.mount(&mut ctx)?;
+    Ok(())
+}
+
+#[test]
+fn mounted_deletes_bypass_recycle_bin() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-mounted", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    for (cv_path, write_type) in [
+        ("/cache-mode", WriteType::CacheMode),
+        ("/fs-mode", WriteType::FsMode),
+    ] {
+        mount_for_test(&handler, cv_path, write_type)?;
+        let file = format!("{cv_path}/data.log");
+        fs.create(&file, true)?;
+
+        let res = handler.delete0(
+            Utils::req_id(),
+            DeleteRequest {
+                path: file.clone(),
+                recursive: false,
+                ..Default::default()
+            },
+        )?;
+
+        assert_eq!(res.inodes, 1, "{file} should be deleted");
+        assert!(!fs.exists(&file)?, "{file} should be gone");
+        assert!(
+            !fs.exists("/.Trash")?,
+            "{cv_path} delete must bypass the recycle bin"
+        );
+    }
+
+    // Unmounted deletes still land in the recycle bin.
+    fs.create("/plain.log", true)?;
+    handler.delete0(
+        Utils::req_id(),
+        DeleteRequest {
+            path: "/plain.log".to_string(),
+            recursive: false,
+            ..Default::default()
+        },
+    )?;
+    assert!(!fs.exists("/plain.log")?);
+    assert_eq!(
+        fs.list_status("/.Trash")?.len(),
+        1,
+        "unmounted deletes must land in the recycle bin"
+    );
+
+    Ok(())
+}
+
+// A soft delete must cost one journaled mutation, not SetAttr + Rename, and the
+// markers must exist on the follower after replay (they are written by the
+// rename itself, using the journaled timestamp).
+#[test]
+fn trash_move_journals_a_single_rename_and_replays_markers() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (leader, journal_system, loader, _follower_js, follower) =
+        setup_pair_with_conf("trash-single-rename", |conf| {
+            conf.master.trash_enabled = true
+        });
+
+    leader.create("/data/a.log", true)?;
+    leader.complete_file("/data/a.log", None, 0, vec![], "", false, None)?;
+    leader.delete_with_opts("/data/a.log", false, false)?;
+
+    let entries = journal_system.fs().fs_dir.read().take_entries();
+    let renames = entries
+        .iter()
+        .filter(|entry| matches!(entry, JournalEntry::Rename(_)))
+        .count();
+    let set_attrs = entries
+        .iter()
+        .filter(|entry| matches!(entry, JournalEntry::SetAttr(_)))
+        .count();
+    assert_eq!(renames, 1, "a soft delete must journal exactly one rename");
+    assert_eq!(
+        set_attrs, 0,
+        "trash markers must be recorded by the rename, not a separate SetAttr"
+    );
+
+    apply_entries(&loader, &entries, 1)?;
+    // `sum_hash` is deliberately not asserted here: resolving a path during
+    // replay can persist a lazily loaded FileEntry record, so the inode store
+    // hash may differ from the leader even when the namespace agrees. The
+    // replayed entry is compared field by field below instead.
+
+    let mut follower_entries = follower.list_options("/.Trash", ListOptions::default())?;
+    assert_eq!(follower_entries.len(), 1, "replay must recreate the entry");
+    let entry = follower_entries.remove(0);
+    assert_eq!(
+        entry
+            .x_attr
+            .get(trash::TRASH_XATTR_ORIGIN)
+            .map(Vec::as_slice),
+        Some(b"/data/a.log".as_slice()),
+        "replay must restore the recorded origin"
+    );
+    let delete_ms = i64::from_le_bytes(
+        entry
+            .x_attr
+            .get(trash::TRASH_XATTR_DELETE_MS)
+            .expect("delete_ms marker must be replayed")
+            .as_slice()
+            .try_into()
+            .unwrap(),
+    );
+    assert!(
+        entry.name.starts_with(&format!("{}-", delete_ms)),
+        "the entry name and the journaled delete_ms must come from the same timestamp"
+    );
+
+    Ok(())
