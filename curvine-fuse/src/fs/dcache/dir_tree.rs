@@ -708,7 +708,22 @@ impl DirTree {
         self.inodes.iter()
     }
 
-    /// Expired inodes that may be evicted; cheap enough to run under a read lock.
+    /// Finds expired inodes that may be evicted, returning their inode numbers. Runs under the
+    /// read lock, so it must not mutate.
+    ///
+    /// The result is **advisory**: a snapshot taken under one lock hold, not an eviction decision.
+    /// `evict` must re-run `can_evict` and the open-handle check under the write lock, because a
+    /// candidate can be re-referenced by a LOOKUP, opened, marked for delete, or get a child again
+    /// before its batch runs.
+    ///
+    /// Every read taken here is therefore only a pre-filter -- including `n_lookup` inside
+    /// `can_evict`, which is why that counter may be read without stronger ordering guarantees; the
+    /// load that actually decides an eviction is the one `evict` takes under the write lock.
+    ///
+    /// The snapshot is a full `Vec<u64>` of expired inos: 8 bytes each, so ~8 MB for a million
+    /// candidates, allocated before the first batch is evicted. That is deliberate -- evicting
+    /// while scanning would either hold the write lock for the whole sweep (what this split
+    /// replaced) or force a rescan from the start for every batch.
     pub fn evict_candidates(&self, has_handle: impl Fn(u64) -> bool) -> Vec<u64> {
         let ttl = self.cache_ttl;
         self.inodes
@@ -727,6 +742,10 @@ impl DirTree {
             let Some(inode) = self.inodes.get(ino) else {
                 continue;
             };
+            // Mandatory, not redundant. This write-lock hold is where the eviction decision is
+            // taken; the candidate came from a scan under a *different* lock hold and may have been
+            // re-looked-up, opened, marked deleted, or given a child since. Removing this check
+            // would evict a live inode.
             if !inode.can_evict(ttl) || has_handle(*ino) {
                 continue;
             }
