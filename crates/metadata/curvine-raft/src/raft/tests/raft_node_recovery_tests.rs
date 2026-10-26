@@ -112,16 +112,20 @@ fn only_current_leader_replication_messages_can_refresh_contact() {
 #[test]
 fn snapshot_readiness_is_invalidated_only_for_real_or_malformed_snapshot_state() {
     let placeholder = SnapshotData::default();
-    let mut snapshot = Snapshot::default();
-    snapshot.data = placeholder.encode_to_vec();
+    let snapshot = Snapshot {
+        data: placeholder.encode_to_vec(),
+        ..Default::default()
+    };
     assert!(!snapshot_carries_metadata(&snapshot));
 
-    let mut materialized = Snapshot::default();
-    materialized.data = SnapshotData {
-        snapshot_id: 1,
+    let materialized = Snapshot {
+        data: SnapshotData {
+            snapshot_id: 1,
+            ..Default::default()
+        }
+        .encode_to_vec(),
         ..Default::default()
-    }
-    .encode_to_vec();
+    };
     assert!(snapshot_carries_metadata(&materialized));
 
     let malformed = Snapshot {
