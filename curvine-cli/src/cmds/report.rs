@@ -29,7 +29,12 @@ pub struct ReportCommand {
 #[derive(Subcommand, Debug)]
 pub enum ReportSubCommand {
     Json,
-    All,
+    All {
+        // Released in v0.5.x; hidden and pinned to true so existing
+        // `cv report all --show-workers` invocations keep working.
+        #[clap(long, hide = true, default_value_t = true)]
+        show_workers: bool,
+    },
     Capacity {
         #[clap(value_name = "WORKER_ADDRESS")]
         worker_address: Option<String>,
@@ -51,7 +56,7 @@ impl ReportCommand {
     fn render(&self, report: &CurvineReport) -> String {
         match &self.action {
             Some(ReportSubCommand::Json) => report.to_json(),
-            Some(ReportSubCommand::All) => report.simple(true),
+            Some(ReportSubCommand::All { show_workers }) => report.simple(*show_workers),
             Some(ReportSubCommand::Capacity { worker_address }) => match worker_address {
                 Some(addr) => report.capacity_worker(addr),
                 None => report.capacity_cluster(),
@@ -656,7 +661,11 @@ mod tests {
     }
 
     #[test]
-    fn all_subcommand_rejects_show_workers_flag() {
-        assert!(ReportCommand::try_parse_from(["report", "all", "--show-workers"]).is_err());
+    fn all_subcommand_accepts_show_workers_flag() {
+        let cmd = ReportCommand::try_parse_from(["report", "all", "--show-workers"]).unwrap();
+        let output = cmd.render(&report_with_workers());
+
+        assert!(output.contains("live_worker_list"));
+        assert!(output.contains("lost_worker_list"));
     }
 }
