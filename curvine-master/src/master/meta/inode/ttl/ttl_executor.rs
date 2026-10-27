@@ -82,7 +82,11 @@ impl InodeTtlExecutor {
     // bookkeeping; `reclaimed_bytes` lets quota eviction count only space that
     // was actually released.
     pub fn execute_by_id(&self, inode_id: i64) -> FsResult<(bool, InodeView, i64)> {
-        self.execute_by_id_with_mode(inode_id, DeleteMode::Default)
+        // Expiry removes the entry permanently. Routing it through the recycle
+        // bin would keep the blocks for another retention window while this
+        // executor reports the length as reclaimed, so the quota never sees the
+        // space come back. Quota eviction keeps its own explicit `AsyncPurge`.
+        self.execute_by_id_with_mode(inode_id, DeleteMode::SkipTrash)
     }
 
     /// Executes the TTL action for `inode_id` with an explicit delete mode.
