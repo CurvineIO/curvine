@@ -93,18 +93,60 @@ function createStubClient(overrides: Partial<ApiClient> = {}): ApiClient {
       lost_workers: []
     })),
     fetchConfigData: vi.fn(async () => ({
+      role: 'master',
+      node: 'master-01:9010',
       values: {
-        master: { hostname: 'master-01' },
+        // No entry in `sources`: this leaf is what has to render as Default.
+        cluster_id: 'cv-cluster',
+        master: {
+          hostname: 'master-01',
+          web_port: 9010,
+          dir_space: { enabled: false, tracked_paths: [] }
+        },
         worker: { hostname: 'worker-01' },
         web: { port: 9000 },
         log: { level: 'info' }
       },
       sources: {
         'master.hostname': 'file',
+        'master.web_port': 'derived',
+        'master.dir_space.tracked_paths': 'runtime',
         'worker.hostname': 'env',
-        'web.port': 'cli'
-      }
+        'web.port': 'cli',
+        'log.level': 'runtime'
+      },
+      // Two shapes on purpose. `log.level` backs a path of the same name, while
+      // `master.dir_space_enabled` backs `master.dir_space.enabled`: the row has
+      // to be found by configuration path, not by registry key, or the second
+      // tunable never becomes editable.
+      runtime: [
+        {
+          key: 'log.level',
+          path: 'log.level',
+          file_value: 'info',
+          override_value: 'debug',
+          effective_value: 'debug'
+        },
+        {
+          key: 'master.dir_space_enabled',
+          path: 'master.dir_space.enabled',
+          file_value: false,
+          override_value: undefined,
+          effective_value: false
+        },
+        {
+          key: 'master.dir_space_tracked_paths',
+          path: 'master.dir_space.tracked_paths',
+          file_value: [],
+          override_value: ['/probe'],
+          effective_value: ['/probe']
+        }
+      ],
+      writable: ['log.level', 'master.dir_space_enabled', 'master.dir_space_tracked_paths'],
+      unresolved: [],
+      persistent: false
     })),
+    updateConfig: vi.fn(async ({ key, value }) => ({ key, value, reset: value === null })),
     fetchBrowseData: vi.fn(async () => ({ path: '/', items: [] })),
     fetchBlocksData: vi.fn(async () => ({})),
     downloadFile: vi.fn(async () => new Blob(['hello curvine'])),
@@ -185,6 +227,22 @@ function createStubClient(overrides: Partial<ApiClient> = {}): ApiClient {
     ...overrides
   }
   return stub as unknown as ApiClient
+}
+
+/**
+ * The values-table row for one configuration path.
+ *
+ * Looked up by path text rather than by registry key: a tunable row renders the
+ * path, and for most knobs the key and the path differ
+ * (`master.dir_space_enabled` backs `master.dir_space.enabled`).
+ */
+function configRow(path: string): HTMLElement {
+  const table = screen.getByTestId('config-values-table')
+  const row = within(table)
+    .getAllByTestId('config-row')
+    .find((candidate) => within(candidate).queryByText(path) !== null)
+  if (!row) throw new Error(`no config row rendered for ${path}`)
+  return row
 }
 
 function renderApp(path: string, client: ApiClient) {
@@ -321,10 +379,121 @@ describe('Console shell', () => {
 
     expect(await screen.findByText('master.hostname')).toBeInTheDocument()
     expect(screen.getByText('master-01')).toBeInTheDocument()
-    expect(screen.getByText('Config File')).toBeInTheDocument()
-    expect(screen.getByText('Environment')).toBeInTheDocument()
-    expect(screen.getByText('CLI')).toBeInTheDocument()
-    expect(screen.getByText('Default')).toBeInTheDocument()
+
+    // Every source the backend can emit has to land on a real badge. `derived`
+    // and `runtime` are the ones a missing whitelist entry would silently
+    // demote to Default.
+    const table = await screen.findByTestId('config-values-table')
+    const badges = within(table)
+      .getAllByTestId('config-source-cell')
+      .map((cell) => cell.textContent)
+    expect(badges).toContain('Config File')
+    expect(badges).toContain('Environment')
+    expect(badges).toContain('CLI')
+    expect(badges).toContain('Derived')
+    expect(badges).toContain('Runtime')
+    expect(badges).toContain('Default')
+  })
+
+  it('shows the process role and node the view came from', async () => {
+    renderApp('/config', createStubClient())
+
+    expect(await screen.findByTestId('config-node')).toHaveTextContent('master-01:9010')
+    // Scoped to the role badge: `master` also appears as a config group name and
+    // as a prefix of `master.hostname`.
+    expect(screen.getByTestId('config-role')).toHaveTextContent('master')
+  })
+
+  it('edits a hot-tunable row in place and saves it', async () => {
+    const client = createStubClient()
+    renderApp('/config', client)
+
+    await screen.findByText('master.hostname')
+    const row = configRow('log.level')
+    // The row is edited inside the values table; there is no second table to
+    // keep in sync, so the pencil has to live on the row itself.
+    await userEvent.click(within(row).getByTestId('config-edit'))
+
+    const input = within(row).getByTestId('config-edit-input')
+    expect(input).toHaveValue('debug')
+    await userEvent.clear(input)
+    await userEvent.type(input, 'trace')
+    await userEvent.click(within(row).getByTestId('config-save'))
+
+    // The registry key travels, not the configuration path: `log.level` happens
+    // to be both, so the assertion uses the key the page was told is writable.
+    await waitFor(() =>
+      expect(client.updateConfig).toHaveBeenCalledWith({ key: 'log.level', value: 'trace' })
+    )
+    expect(await screen.findByTestId('toast-success')).toHaveTextContent('log.level updated')
+  })
+
+  it('reverts an overridden row by clearing the override', async () => {
+    const client = createStubClient()
+    renderApp('/config', client)
+
+    await screen.findByText('master.hostname')
+    const row = configRow('master.dir_space.tracked_paths')
+    // The file value only earns a line when an override actually replaced it.
+    expect(within(row).getByTestId('config-file-value')).toHaveTextContent('File: []')
+    await userEvent.click(within(row).getByTestId('config-revert'))
+
+    // `null` is load-bearing: an empty string would be handed to the array
+    // parser and rejected, while `null` clears the override.
+    await waitFor(() =>
+      expect(client.updateConfig).toHaveBeenCalledWith({
+        key: 'master.dir_space_tracked_paths',
+        value: null
+      })
+    )
+  })
+
+  it('seeds the editor with the json spelling of a list value', async () => {
+    renderApp('/config', createStubClient())
+
+    await screen.findByText('master.hostname')
+    const row = configRow('master.dir_space.tracked_paths')
+    await userEvent.click(within(row).getByTestId('config-edit'))
+
+    // The registry parser for a list-typed knob runs `serde_json::from_str`, so
+    // the table's humanised rendering would not round-trip.
+    expect(within(row).getByTestId('config-edit-input')).toHaveValue('["/probe"]')
+  })
+
+  it('marks non-tunable rows read-only instead of offering an editor', async () => {
+    renderApp('/config', createStubClient())
+
+    await screen.findByText('master.hostname')
+    const row = configRow('master.hostname')
+    expect(within(row).getByText('Read-only')).toBeInTheDocument()
+    expect(within(row).queryByTestId('config-edit')).not.toBeInTheDocument()
+  })
+
+  it('narrows the table to hot-tunable rows from the checkbox', async () => {
+    renderApp('/config', createStubClient())
+
+    await screen.findByText('master.hostname')
+    await userEvent.click(screen.getByTestId('config-tunable-only'))
+
+    // The filter lives on the values table rather than in a second card, so the
+    // table is the only place a tunable row can appear.
+    const table = within(screen.getByTestId('config-values-table'))
+    expect(table.getByText('log.level')).toBeInTheDocument()
+    // A registry key whose configuration path differs from the key still has to
+    // be reachable; matching on the key alone would hide it.
+    expect(table.getByText('master.dir_space.enabled')).toBeInTheDocument()
+    expect(table.queryByText('master.hostname')).not.toBeInTheDocument()
+    expect(table.queryByText('cluster_id')).not.toBeInTheDocument()
+  })
+
+  it('explains the derived and runtime provenance labels', async () => {
+    renderApp('/config', createStubClient())
+
+    const legend = await screen.findByTestId('config-source-legend')
+    expect(legend).toHaveTextContent('Derived')
+    expect(legend).toHaveTextContent('computed this value after reading the file')
+    expect(legend).toHaveTextContent('Runtime')
+    expect(legend).toHaveTextContent('disappears on restart')
   })
 
   it('filters config entries by source', async () => {
@@ -333,10 +502,26 @@ describe('Console shell', () => {
     await userEvent.click(await screen.findByTestId('config-source'))
     await userEvent.click(await screen.findByRole('option', { name: 'Environment (1)' }))
 
-    expect(screen.getByText('worker.hostname')).toBeInTheDocument()
-    expect(screen.queryByText('master.hostname')).not.toBeInTheDocument()
-    expect(screen.queryByText('web.port')).not.toBeInTheDocument()
-    expect(screen.queryByText('log.level')).not.toBeInTheDocument()
+    // Scoped to the values table so the assertion cannot accidentally match the
+    // provenance legend below it.
+    const table = within(screen.getByTestId('config-values-table'))
+    expect(table.getByText('worker.hostname')).toBeInTheDocument()
+    expect(table.queryByText('master.hostname')).not.toBeInTheDocument()
+    expect(table.queryByText('web.port')).not.toBeInTheDocument()
+    expect(table.queryByText('log.level')).not.toBeInTheDocument()
+  })
+
+  it('filters config entries by the runtime source', async () => {
+    renderApp('/config', createStubClient())
+
+    await userEvent.click(await screen.findByTestId('config-source'))
+    await userEvent.click(await screen.findByRole('option', { name: 'Runtime (2)' }))
+
+    const table = within(screen.getByTestId('config-values-table'))
+    expect(table.getByText('log.level')).toBeInTheDocument()
+    expect(table.getByText('master.dir_space.tracked_paths')).toBeInTheDocument()
+    expect(table.queryByText('worker.hostname')).not.toBeInTheDocument()
+    expect(table.queryByText('master.hostname')).not.toBeInTheDocument()
   })
 
   it('renders the browse toolbar', async () => {

@@ -19,10 +19,11 @@ use axum::extract::{Extension, Query};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use curvine_config::RuntimeConfigRegistry;
+use curvine_config::{ClusterConf, ConfigSourceMap, RuntimeConfigRegistry, ViewProfile};
 use curvine_metrics::Metrics;
+use curvine_web::router::ConfigViewState;
 use curvine_web::router::RouterHandler;
-use curvine_web::router::{get_runtime_config, post_update_config, RuntimeConfigHttpResult};
+use curvine_web::router::{get_config_view, post_update_config, RuntimeConfigHttpResult};
 use log::warn;
 use serde_json::Value;
 
@@ -35,6 +36,8 @@ pub struct TransferRouterHandler {
     service: TransferService<TransferStoreBackend>,
     cluster_cache: ClusterMetadataCache,
     runtime_config: Arc<RuntimeConfigRegistry>,
+    /// Snapshot plus live registry behind `GET /api/v1/transfer/config`.
+    config_view: Arc<ConfigViewState>,
 }
 
 impl TransferRouterHandler {
@@ -44,13 +47,26 @@ impl TransferRouterHandler {
         service: TransferService<TransferStoreBackend>,
         cluster_cache: ClusterMetadataCache,
         runtime_config: Arc<RuntimeConfigRegistry>,
+        conf: &ClusterConf,
+        config_sources: ConfigSourceMap,
     ) -> Self {
+        let config_view = Arc::new(ConfigViewState::new(
+            "transfer",
+            format!("{}:{}", conf.transfer.hostname, conf.transfer.web_port),
+            Arc::new(conf.clone()),
+            // The transfer process loads only the client/transfer subset, so its
+            // view is validated against that profile rather than the full tree.
+            ViewProfile::Transfer,
+            config_sources,
+            runtime_config.clone(),
+        ));
         Self {
             ready,
             store_backend,
             service,
             cluster_cache,
             runtime_config,
+            config_view,
         }
     }
 }
@@ -107,7 +123,7 @@ async fn readyz(
 async fn runtime_config(
     Extension(handler): Extension<Arc<TransferRouterHandler>>,
 ) -> RuntimeConfigHttpResult<Json<Value>> {
-    get_runtime_config(handler.runtime_config.clone(), Value::Null).await
+    get_config_view(Extension(handler.config_view.clone())).await
 }
 
 async fn update_runtime_config(

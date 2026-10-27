@@ -1027,8 +1027,10 @@ mod tests {
     use curvine_config::{ClusterConf, JournalConf, MasterConf};
     use curvine_model::RenameFlags;
     use curvine_raft::raft::RoleState;
+    use curvine_rpc::handler::LimitConf;
     use curvine_runtime::common::Utils;
     use curvine_runtime::runtime::LoopTask;
+    use serde_json::Value;
     use std::sync::Arc;
 
     /// Real in-memory master filesystem backed by a temp RocksDB, with the
@@ -1455,7 +1457,11 @@ mod tests {
         set_role(&monitor_for(&fs), true);
         seed_tree(&fs);
         let manager = manager_for(&fs, &conf);
-        let registry = crate::master::build_master_runtime_registry(manager.clone());
+        let registry = crate::master::build_master_runtime_registry(
+            manager.clone(),
+            LimitConf::new(conf.conn_limit, conf.global_limit),
+            &conf,
+        );
 
         assert_eq!(manager.explicit_paths(), vec!["/a".to_string()]);
         let (outcome, _, complete) = manager.try_scan_tracked_points(0);
@@ -1511,6 +1517,68 @@ mod tests {
             .is_err());
         assert_eq!(manager.explicit_paths(), vec!["/a".to_string()]);
         assert!(manager.config_epoch() >= 1);
+    }
+
+    /// The two RPC limit keys must be registered against the live `LimitConf` the
+    /// RPC server applies: an edit has to move the value traffic is throttled by,
+    /// not just the number the config endpoint prints.
+    #[test]
+    fn runtime_limit_keys_edit_the_live_limit_conf() {
+        let (fs, conf) = test_fs_with_options("runtime-limits", false, |master| {
+            master.conn_limit = 8;
+            master.global_limit = 16;
+        });
+        let manager = manager_for(&fs, &conf);
+        let limit = LimitConf::new(conf.conn_limit, conf.global_limit);
+        let registry =
+            crate::master::build_master_runtime_registry(manager.clone(), limit.clone(), &conf);
+
+        assert_eq!(limit.conn_limit(), 8);
+        assert_eq!(limit.global_limit_size(), 16);
+        assert_eq!(
+            registry.get("master.conn_limit").unwrap().file_value,
+            Value::from(8usize)
+        );
+        assert_eq!(
+            registry.get("master.global_limit").unwrap().file_value,
+            Value::from(16usize)
+        );
+
+        let update = registry
+            .set("master.conn_limit", "32", Some("test"))
+            .unwrap();
+        assert_eq!(update.previous_value, Value::from(8usize));
+        assert_eq!(limit.conn_limit(), 32);
+        assert_eq!(
+            registry.get("master.conn_limit").unwrap().effective_value,
+            Value::from(32usize)
+        );
+
+        registry
+            .set("master.global_limit", "64", Some("test"))
+            .unwrap();
+        assert_eq!(limit.global_limit_size(), 64);
+        assert_eq!(limit.global_limit().available_permits(), 64);
+
+        // Zero is rejected: `MasterConf::validate` refuses it at startup too, so a
+        // runtime edit must not reach a state the process would not boot with.
+        assert!(registry
+            .set("master.conn_limit", "0", Some("test"))
+            .is_err());
+        assert!(registry
+            .set("master.global_limit", "0", Some("test"))
+            .is_err());
+        assert!(registry
+            .set("master.conn_limit", "abc", Some("test"))
+            .is_err());
+        assert_eq!(limit.conn_limit(), 32);
+        assert_eq!(limit.global_limit_size(), 64);
+
+        registry.reset("master.conn_limit", Some("test")).unwrap();
+        registry.reset("master.global_limit", Some("test")).unwrap();
+        assert_eq!(limit.conn_limit(), 8);
+        assert_eq!(limit.global_limit_size(), 16);
+        assert_eq!(limit.global_limit().available_permits(), 16);
     }
 
     #[test]

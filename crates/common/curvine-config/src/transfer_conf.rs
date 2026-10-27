@@ -80,25 +80,30 @@ pub struct TransferConf {
 
     #[serde(skip)]
     pub lease_timeout: Duration,
-    #[serde(alias = "lease_timeout")]
+    #[serde(rename = "lease_timeout", alias = "lease_timeout_str")]
     pub lease_timeout_str: String,
 
     #[serde(skip)]
     pub cluster_snapshot_max_staleness: Duration,
     #[serde(
-        skip,
-        default = "TransferConf::default_cluster_snapshot_max_staleness_str"
+        default = "TransferConf::default_cluster_snapshot_max_staleness_str",
+        rename = "cluster_snapshot_max_staleness",
+        alias = "cluster_snapshot_max_staleness_str"
     )]
     pub cluster_snapshot_max_staleness_str: String,
 
     #[serde(skip)]
     pub terminal_retention: Duration,
-    #[serde(alias = "terminal_retention")]
+    #[serde(rename = "terminal_retention", alias = "terminal_retention_str")]
     pub terminal_retention_str: String,
 
     #[serde(skip)]
     pub task_retention: Duration,
-    #[serde(default = "TransferConf::default_task_retention_str")]
+    #[serde(
+        default = "TransferConf::default_task_retention_str",
+        rename = "task_retention",
+        alias = "task_retention_str"
+    )]
     pub task_retention_str: String,
 
     /// How long a worker keeps a finished transfer task context that could not
@@ -107,7 +112,11 @@ pub struct TransferConf {
     /// full task plan per undelivered report for the life of the process.
     #[serde(skip)]
     pub worker_terminal_retention: Duration,
-    #[serde(default = "TransferConf::default_worker_terminal_retention_str")]
+    #[serde(
+        default = "TransferConf::default_worker_terminal_retention_str",
+        rename = "worker_terminal_retention",
+        alias = "worker_terminal_retention_str"
+    )]
     pub worker_terminal_retention_str: String,
 }
 

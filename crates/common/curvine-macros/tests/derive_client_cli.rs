@@ -25,7 +25,7 @@ struct SampleClientConf {
     #[client_cli(long = "client.io-threads")]
     io_threads: usize,
 
-    #[serde(alias = "block_size")]
+    #[serde(rename = "block_size", alias = "block_size_str")]
     block_size_str: String,
 
     #[serde(alias = "hugepage", default)]

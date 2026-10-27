@@ -6,7 +6,7 @@ use crate::worker::runtime_config::{
 };
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, ConfigSourceMap};
 use curvine_fault::FaultHttpControl;
 use curvine_runtime::runtime::Runtime;
 use tower::ServiceExt;
@@ -17,11 +17,17 @@ fn test_handler() -> WorkerRouterHandler {
         TaskManager::with_rt(Arc::new(Runtime::single()), &conf, "runtime-config-test")
             .expect("task manager"),
     );
+    let runtime_config = Arc::new(build_worker_runtime_registry(task_manager.clone(), &conf));
     WorkerRouterHandler {
         fault_http: FaultHttpControl::default(),
         server_state: Arc::default(),
         task_manager: task_manager.clone(),
-        runtime_config: Arc::new(build_worker_runtime_registry(task_manager, &conf)),
+        config_view: WorkerRouterHandler::build_config_view(
+            &conf,
+            ConfigSourceMap::new(),
+            runtime_config.clone(),
+        ),
+        runtime_config,
         registration: MasterRegistration::new(),
     }
 }
@@ -34,6 +40,16 @@ async fn response_json(response: axum::response::Response) -> Value {
         .await
         .expect("response body");
     serde_json::from_slice(&bytes).expect("json body")
+}
+
+/// Finds the runtime entry for `key` in a full config view body.
+fn runtime_entry<'a>(body: &'a Value, key: &str) -> &'a Value {
+    body["runtime"]
+        .as_array()
+        .expect("runtime array")
+        .iter()
+        .find(|entry| entry["key"] == key)
+        .unwrap_or_else(|| panic!("runtime entry missing for {key}"))
 }
 
 #[test]
@@ -77,14 +93,47 @@ fn runtime_config_endpoint_reads_the_current_values() {
         assert_eq!(response.status(), StatusCode::OK);
         response_json(response).await
     });
+
+    // The body is the full view, tagged with the process that answered.
+    assert_eq!(current["role"], "worker");
+    assert_eq!(current["persistent"], false);
+    assert!(current["node"].is_string());
+    assert!(current["values"].is_object());
+    assert!(current["sources"].is_object());
+
+    // Every worker knob is writable, and the one with a config path reports its
+    // effective value through the runtime entry.
+    let writable: Vec<&str> = current["writable"]
+        .as_array()
+        .expect("writable array")
+        .iter()
+        .map(|value| value.as_str().expect("writable string"))
+        .collect();
+    for key in [
+        TRANSFER_INFLIGHT_BUDGET_CONFIG,
+        WORKER_MAX_CONCURRENT_TASKS_CONFIG,
+        TASK_TIMEOUT_CONFIG,
+        TASK_REPORT_INTERVAL_CONFIG,
+    ] {
+        assert!(writable.contains(&key), "writable missing {key}");
+    }
+
     assert_eq!(
-        current[TRANSFER_INFLIGHT_BUDGET_CONFIG],
-        task_manager.transfer_inflight_budget_bytes()
+        runtime_entry(&current, WORKER_MAX_CONCURRENT_TASKS_CONFIG)["effective_value"],
+        json!(task_manager.worker_max_concurrent_tasks())
     );
-    assert_eq!(
-        current[WORKER_MAX_CONCURRENT_TASKS_CONFIG],
-        task_manager.worker_max_concurrent_tasks()
-    );
+    // Runtime-only knobs have no config path, so they are listed as writable but
+    // deliberately absent from both `values` and the runtime table.
+    assert!(current["values"]
+        .get(TRANSFER_INFLIGHT_BUDGET_CONFIG)
+        .is_none());
+
+    // Nothing in this registry is stale: an empty `unresolved` proves every
+    // declared path still resolves in the config tree.
+    assert_eq!(current["unresolved"], json!([]));
+
+    // The worker-specific scheduler note survives on the widened body.
+    assert_eq!(current["scheduler_propagation"], "next worker heartbeat");
 }
 
 #[test]

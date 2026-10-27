@@ -25,6 +25,7 @@ export default {
     loading: 'Loading…',
     apply: 'Apply',
     applying: 'Applying…',
+    save: 'Save',
     saving: 'Saving…',
     cancel: 'Cancel',
     close: 'Close',

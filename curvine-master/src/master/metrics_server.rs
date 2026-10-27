@@ -20,13 +20,13 @@ use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use curvine_config::RuntimeConfigRegistry;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_net::net::{InetAddr, NetUtils};
 use curvine_rpc::server::ServerConf;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
-use curvine_web::router::{get_runtime_config, post_update_config, RuntimeConfigHttpResult};
+use curvine_web::router::ConfigViewState;
+use curvine_web::router::{get_config_view, post_update_config, RuntimeConfigHttpResult};
 use log::{error, info};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -39,7 +39,8 @@ use crate::master::{Master, MasterState};
 #[derive(Clone)]
 struct MasterMetricsHandler {
     fs: MasterFilesystem,
-    runtime_config: Arc<RuntimeConfigRegistry>,
+    /// Snapshot plus live registry behind the `/config` routes.
+    config_view: Arc<ConfigViewState>,
     runtime: MasterRuntimeMetadata,
 }
 
@@ -171,14 +172,14 @@ fn rollout_status(view: ProbeView) -> (StatusCode, &'static str) {
 async fn runtime_config(
     Extension(handler): Extension<Arc<MasterMetricsHandler>>,
 ) -> RuntimeConfigHttpResult<Json<Value>> {
-    get_runtime_config(handler.runtime_config.clone(), Value::Null).await
+    get_config_view(Extension(handler.config_view.clone())).await
 }
 
 async fn update_runtime_config(
     Extension(handler): Extension<Arc<MasterMetricsHandler>>,
     query: Query<Vec<(String, String)>>,
 ) -> RuntimeConfigHttpResult<Json<Value>> {
-    post_update_config(handler.runtime_config.clone(), query, Value::Null).await
+    post_update_config(handler.config_view.registry.clone(), query, Value::Null).await
 }
 
 fn metrics_router(handler: MasterMetricsHandler) -> Router {
@@ -189,6 +190,9 @@ fn metrics_router(handler: MasterMetricsHandler) -> Router {
         .route("/recoveryz", get(recoveryz))
         .route("/rolloutz", get(rolloutz))
         .route("/api/v1/master/runtime", get(master_runtime))
+        .route("/api/v1/master/config", get(runtime_config))
+        // Frozen for one release: dashboards and curl recipes still scrape this
+        // path, so it stays an alias of the full view above.
         .route("/api/v1/master/runtime/config", get(runtime_config))
         .route("/api/update_config", post(update_runtime_config))
         .layer(Extension(Arc::new(handler)))
@@ -202,7 +206,8 @@ pub struct MasterMetricsServer {
     fs: MasterFilesystem,
     conf: ServerConf,
     address: InetAddr,
-    runtime_config: Arc<RuntimeConfigRegistry>,
+    /// Snapshot plus live registry behind the `/config` routes.
+    config_view: Arc<ConfigViewState>,
     runtime: MasterRuntimeMetadata,
 }
 
@@ -211,7 +216,7 @@ impl MasterMetricsServer {
         rt: Arc<Runtime>,
         conf: ServerConf,
         fs: MasterFilesystem,
-        runtime_config: Arc<RuntimeConfigRegistry>,
+        config_view: Arc<ConfigViewState>,
         start_time: String,
         start_time_ms: u64,
     ) -> Self {
@@ -221,7 +226,7 @@ impl MasterMetricsServer {
             fs,
             conf,
             address,
-            runtime_config,
+            config_view,
             runtime: MasterRuntimeMetadata {
                 start_time,
                 start_time_ms,
@@ -251,8 +256,8 @@ impl MasterMetricsServer {
                     if let Err(err) = Self::serve(
                         listener,
                         self.fs,
-                        self.runtime_config.clone(),
-                        self.runtime.clone(),
+                        self.config_view,
+                        self.runtime,
                         &self.conf,
                         &self.address,
                     )
@@ -288,7 +293,7 @@ impl MasterMetricsServer {
     async fn serve(
         listener: TcpListener,
         fs: MasterFilesystem,
-        runtime_config: Arc<RuntimeConfigRegistry>,
+        config_view: Arc<ConfigViewState>,
         runtime: MasterRuntimeMetadata,
         conf: &ServerConf,
         address: &InetAddr,
@@ -299,7 +304,7 @@ impl MasterMetricsServer {
         );
         let app = metrics_router(MasterMetricsHandler {
             fs,
-            runtime_config,
+            config_view,
             runtime,
         });
         axum::serve(listener, app).await?;
@@ -311,7 +316,7 @@ impl MasterMetricsServer {
         Self::serve(
             listener,
             self.fs,
-            self.runtime_config,
+            self.config_view,
             self.runtime,
             &self.conf,
             &self.address,
@@ -348,8 +353,11 @@ pub async fn wait_for_metrics_bind(
 mod tests {
     use super::*;
     use crate::master::MasterMonitor;
+    use curvine_config::{ClusterConf, ConfigSourceMap, RuntimeConfigRegistry, ViewProfile};
     use curvine_raft::raft::RoleState;
     use curvine_runtime::sync::StateCtl;
+    use curvine_web::router::config_view_for_state;
+    use std::sync::Arc;
 
     fn view_for(role: RoleState, safe_mode: bool, ufs_caught_up: bool) -> ProbeView {
         let monitor = MasterMonitor::new(StateCtl::new(role.into()), StateCtl::new(0));
@@ -453,5 +461,38 @@ mod tests {
         assert_eq!(payload["version_commit"], json!(master_version.git_commit));
         assert_eq!(payload["start_time"], json!(runtime.start_time.as_str()));
         assert_eq!(payload["start_time_ms"], json!(runtime.start_time_ms));
+    }
+
+    /// The master's `/api/v1/master/config` route must publish the full view, not
+    /// the flat map that `GET /api/v1/master/runtime/config` used to return: the
+    /// console needs `values` for the tree and `writable` for the edit affordance.
+    #[test]
+    fn config_view_reports_role_node_and_full_tree() {
+        let conf = ClusterConf::default();
+        let state = ConfigViewState::new(
+            "master",
+            format!("{}:{}", conf.master.hostname, conf.master.web_port),
+            Arc::new(conf),
+            ViewProfile::Full,
+            ConfigSourceMap::new(),
+            Arc::new(RuntimeConfigRegistry::builder().build()),
+        );
+
+        let body = config_view_for_state(&state).expect("config view must build");
+
+        assert_eq!(body["role"], json!("master"));
+        assert!(body["node"].is_string(), "node must name the scrape target");
+        assert!(
+            body["values"]["master"]["hostname"].is_string(),
+            "values must carry the effective tree, not a flat key map"
+        );
+        assert!(body["sources"].is_object());
+        assert!(body["runtime"].is_array());
+        assert!(body["writable"].is_array());
+        assert_eq!(
+            body["persistent"],
+            json!(false),
+            "runtime overrides die with the process"
+        );
     }
 }

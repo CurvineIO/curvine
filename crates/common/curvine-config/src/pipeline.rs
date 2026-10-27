@@ -60,6 +60,15 @@ pub enum ConfigSource {
     File,
     Env,
     Cli,
+    /// Value applied by an operator through the runtime registry. It is held in
+    /// memory only and never written back to the file, so the console must not
+    /// report it as a file/env/cli layer value.
+    Runtime,
+    /// Value the loader computed *after* deserialization rather than reading
+    /// from a layer: the legacy `master.web_port` split, a hostname resolved
+    /// from `net_interface`, or the derived `client.master_addrs`. Reporting
+    /// these as `File` would claim a file value the process is not using.
+    Derived,
 }
 
 /// Dotted configuration paths mapped to the layer that supplied the effective
@@ -274,7 +283,9 @@ fn apply_env_layer_with_sources(
         }
         for path in touched {
             set_dotted(doc, path, toml::Value::String(ip.clone()))?;
-            sources.insert(path.to_string(), ConfigSource::File);
+            // The value is computed from the local NIC, not read from the file:
+            // the file may well say something else.
+            sources.insert(path.to_string(), ConfigSource::Derived);
         }
         return Ok(sources);
     }

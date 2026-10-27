@@ -1,3 +1,8 @@
+#[cfg(any(
+    feature = "transfer-store-sqlite",
+    feature = "transfer-store-mysql",
+    feature = "transfer-store-postgres"
+))]
 use std::error::Error;
 
 mod store;
@@ -37,6 +42,11 @@ pub(crate) use self::cluster_cache::MountSnapshotError;
 mod job_snapshot;
 pub(crate) use self::job_snapshot::job_mount_snapshot_with_version_async;
 pub use self::job_snapshot::{job_mount_snapshot, job_mount_snapshot_async};
+
+mod runtime_config;
+pub use self::runtime_config::{
+    build_transfer_runtime_registry, TransferRuntimeConfig, WORKER_MAX_CONCURRENT_TASKS_CONFIG,
+};
 
 mod dispatch;
 mod plan;
@@ -98,6 +108,11 @@ pub(crate) fn running_transfer_check_interval_ms(lease_ms: i64) -> i64 {
 /// on the error kind; the backend cause (driver error, SQL state, OS error) is
 /// appended here so that the failure reason survives into the client error and
 /// the startup log instead of only reaching the server log.
+#[cfg(any(
+    feature = "transfer-store-sqlite",
+    feature = "transfer-store-mysql",
+    feature = "transfer-store-postgres"
+))]
 pub(crate) fn store_error_detail(err: &(dyn Error + 'static)) -> String {
     let mut detail = err.to_string();
     let mut source = err.source();

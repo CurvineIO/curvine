@@ -277,6 +277,17 @@ async fn workers1(
     Ok(Json(wm.worker_list()))
 }
 
+/// Legacy HTTP surface for the master process.
+///
+/// **Not bound by any binary.** `grep MasterRouterHandler` outside this file
+/// returns nothing, so the process never serves these routes; the live surface
+/// is `MasterMetricsHandler` in `curvine-master/src/master/metrics_server.rs`.
+/// The code still compiles into the artifact, so it is annotated rather than
+/// left as an attractive nuisance.
+///
+/// `GET /api/config` here returns the whole `ClusterConf`. It has been superseded
+/// by `GET /api/v1/master/config` on the live metrics surface; do not build new
+/// clients against this route.
 impl RouterHandler for MasterRouterHandler {
     fn router(&self) -> Router {
         let instance = Arc::new(self.clone());

@@ -4,6 +4,7 @@ use crate::transfer::memory_store::MemoryTransferStore;
 use crate::transfer::plan::TransferPlanner;
 use crate::transfer::store::TransferStore;
 use crate::transfer::ClusterMetadataCache;
+use crate::transfer::TransferRuntimeConfig;
 use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::{ClusterConf, TransferConf};
 use curvine_model::{
@@ -13,6 +14,13 @@ use curvine_model::{
 use std::sync::Arc;
 
 fn scheduler(store: Arc<MemoryTransferStore>) -> TransferScheduler<MemoryTransferStore> {
+    scheduler_with_state(store, Arc::new(TransferRuntimeConfig::with_limit(1)))
+}
+
+fn scheduler_with_state(
+    store: Arc<MemoryTransferStore>,
+    runtime_config: Arc<TransferRuntimeConfig>,
+) -> TransferScheduler<MemoryTransferStore> {
     let conf = ClusterConf::default();
     let rt = Arc::new(conf.transfer_server_conf().create_runtime());
     let fs = CurvineFileSystem::with_rt(ClusterConf::default(), rt.clone()).unwrap();
@@ -35,7 +43,7 @@ fn scheduler(store: Arc<MemoryTransferStore>) -> TransferScheduler<MemoryTransfe
         "test-owner".to_string(),
         vec![],
         TransferConf::default(),
-        1,
+        runtime_config,
     )
 }
 
@@ -233,4 +241,45 @@ async fn due_failure_beyond_backoff_batch_is_requeued() {
         .find(|task| task.task_id == "due")
         .unwrap();
     assert_eq!(due.state, TransferTaskState::Pending);
+}
+
+/// The concurrency ceiling must be read at dispatch time, not snapshotted at
+/// construction: a runtime-config push has to change the very next decision of
+/// an already-running scheduler. Both the state setter and the registry (the
+/// only production write path) are exercised so the test fails if either the
+/// field goes back to a `usize` snapshot or the read point caches a local.
+#[test]
+fn dispatch_reads_the_live_worker_task_limit() {
+    use crate::transfer::{build_transfer_runtime_registry, WORKER_MAX_CONCURRENT_TASKS_CONFIG};
+    use curvine_model::WorkerInfo;
+
+    let conf = ClusterConf::default();
+    let state = Arc::new(TransferRuntimeConfig::with_limit(1));
+    let scheduler = scheduler_with_state(Arc::new(MemoryTransferStore::new()), state.clone());
+    let workers = [WorkerInfo::new(Default::default(), 1)];
+
+    // Ceiling 1: the first decision admits the idle worker and debits the
+    // ledger; the second one must be blocked by the same 1-slot ceiling.
+    assert!(scheduler.choose_worker(&workers, 10).is_some());
+    assert!(scheduler.choose_worker(&workers, 10).is_none());
+
+    // Raising the live value alone (no new scheduler) admits the next decision.
+    assert_eq!(state.update_worker_task_limit(2).unwrap(), 1);
+    assert!(
+        scheduler.choose_worker(&workers, 10).is_some(),
+        "scheduler must observe the raised live limit without being rebuilt"
+    );
+
+    // The registry is the production write path and must move the same atomic.
+    let registry = build_transfer_runtime_registry(state.clone(), &conf);
+    registry
+        .set(WORKER_MAX_CONCURRENT_TASKS_CONFIG, "1", None)
+        .unwrap();
+    assert_eq!(state.worker_task_limit(), 1);
+    // Two tasks are already in flight, so a ceiling of 1 blocks dispatch again.
+    assert!(scheduler.choose_worker(&workers, 10).is_none());
+    registry
+        .set(WORKER_MAX_CONCURRENT_TASKS_CONFIG, "9", None)
+        .unwrap();
+    assert!(scheduler.choose_worker(&workers, 10).is_some());
 }

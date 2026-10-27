@@ -12,6 +12,8 @@ import type {
   BlockLocationData,
   BrowseData,
   ConfigData,
+  ConfigUpdate,
+  ConfigUpdateResult,
   DashboardQueryParams,
   DiagnosticsPayload,
   InstantMetric,
@@ -55,6 +57,14 @@ export interface ApiClient {
   fetchMasterHa(): Promise<MasterHaData>
   requestMasterFailover(targetMaster: string): Promise<unknown>
   fetchConfigData(): Promise<ConfigData>
+  /**
+   * Push or clear one hot-tunable override.
+   *
+   * `value: null` clears the override and restores the file-backed value;
+   * `undefined` would be dropped by JSON serialisation, so clearing needs the
+   * explicit `null` this signature forces.
+   */
+  updateConfig(data: ConfigUpdate): Promise<ConfigUpdateResult>
 
   fetchBrowseData(query: Record<string, unknown>): Promise<BrowseData>
   fetchBlocksData(query: Record<string, unknown>): Promise<BlockLocationData>
@@ -158,6 +168,7 @@ export function createApiClient(options: HttpClientOptions = {}): ApiClient {
         timeout: 180000
       }),
     fetchConfigData: () => get<ConfigData>('/v1/config'),
+    updateConfig: (data) => post<ConfigUpdateResult>('/v1/config', data),
 
     fetchBrowseData: (query) => get<BrowseData>('/v1/fs/list', { params: query }),
     fetchBlocksData: (query) => get<BlockLocationData>('/v1/fs/blocks', { params: query }),

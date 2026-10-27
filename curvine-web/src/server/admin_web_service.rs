@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use curvine_config::{ClusterConf, ConfigSourceMap};
+use curvine_config::ClusterConf;
 use curvine_runtime::runtime::Runtime;
 
 use crate::router::AdminRouterHandler;
@@ -23,25 +23,12 @@ use crate::server::WebHandlerService;
 #[derive(Clone)]
 pub struct AdminWebService {
     conf: ClusterConf,
-    config_sources: ConfigSourceMap,
     rt: Arc<Runtime>,
 }
 
 impl AdminWebService {
     pub fn new(conf: ClusterConf, rt: Arc<Runtime>) -> Self {
-        Self::with_sources(conf, ConfigSourceMap::new(), rt)
-    }
-
-    pub fn with_sources(
-        conf: ClusterConf,
-        config_sources: ConfigSourceMap,
-        rt: Arc<Runtime>,
-    ) -> Self {
-        Self {
-            conf,
-            config_sources,
-            rt,
-        }
+        Self { conf, rt }
     }
 }
 
@@ -49,11 +36,7 @@ impl WebHandlerService for AdminWebService {
     type Item = AdminRouterHandler;
 
     fn get_handler(&self) -> Self::Item {
-        AdminRouterHandler::with_rt_and_sources(
-            self.conf.clone(),
-            self.config_sources.clone(),
-            self.rt.clone(),
-        )
-        .expect("failed to initialize standalone web router")
+        AdminRouterHandler::with_rt(self.conf.clone(), self.rt.clone())
+            .expect("failed to initialize standalone web router")
     }
 }

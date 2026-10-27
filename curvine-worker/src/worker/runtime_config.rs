@@ -51,8 +51,12 @@ pub fn build_worker_runtime_registry(
     let tm = task_manager;
 
     RuntimeConfigRegistry::builder()
-        .register(
+        .register_at(
             TRANSFER_INFLIGHT_BUDGET_CONFIG,
+            // No configuration-file entry: the file value comes from the
+            // `TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES` constant, so this
+            // knob stays runtime-writable without claiming a config path.
+            None,
             {
                 let file = file.clone();
                 move || Value::from(file.transfer_inflight_budget_bytes)
@@ -84,8 +88,10 @@ pub fn build_worker_runtime_registry(
                 }
             },
         )
-        .register(
+        .register_at(
             WORKER_MAX_CONCURRENT_TASKS_CONFIG,
+            // Backed by `JobConf::worker_max_concurrent_tasks`, i.e. `[job].*`.
+            Some("job.worker_max_concurrent_tasks"),
             {
                 let file = file.clone();
                 move || Value::from(file.worker_max_concurrent_tasks)
@@ -117,8 +123,9 @@ pub fn build_worker_runtime_registry(
                 }
             },
         )
-        .register(
+        .register_at(
             TASK_TIMEOUT_CONFIG,
+            Some("job.task_timeout"),
             {
                 let file = file.clone();
                 move || Value::from(format!("{}ms", file.task_timeout_ms))
@@ -150,8 +157,9 @@ pub fn build_worker_runtime_registry(
                 }
             },
         )
-        .register(
+        .register_at(
             TASK_REPORT_INTERVAL_CONFIG,
+            Some("job.task_report_interval"),
             {
                 let file = file.clone();
                 move || Value::from(format!("{}ms", file.task_report_interval_ms))

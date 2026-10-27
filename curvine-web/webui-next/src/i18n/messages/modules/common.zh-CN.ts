@@ -25,6 +25,7 @@ export default {
     loading: '加载中…',
     apply: '应用',
     applying: '应用中…',
+    save: '保存',
     saving: '保存中…',
     cancel: '取消',
     close: '关闭',

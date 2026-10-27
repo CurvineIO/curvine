@@ -14,9 +14,10 @@
 
 use std::sync::Arc;
 
-use curvine_config::{RuntimeConfigEntryView, RuntimeConfigRegistry};
+use curvine_config::{MasterConf, RuntimeConfigEntryView, RuntimeConfigRegistry};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_proto::RuntimeConfigEntryProto;
+use curvine_rpc::handler::LimitConf;
 use serde_json::Value;
 
 use crate::master::space::DirSpaceManager;
@@ -24,14 +25,36 @@ use crate::master::space::DirSpaceManager;
 pub const DIR_SPACE_ENABLED_KEY: &str = curvine_config::DIR_SPACE_ENABLED_RUNTIME_KEY;
 pub const DIR_SPACE_TRACKED_PATHS_KEY: &str = curvine_config::DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY;
 
+/// Per-connection in-flight request cap. The key is the configuration path so the
+/// config view can attribute the value without a translation table.
+pub const CONN_LIMIT_KEY: &str = "master.conn_limit";
+/// Process-wide concurrent request cap. Same dotted path as the key.
+pub const GLOBAL_LIMIT_KEY: &str = "master.global_limit";
+
 /// Master-side runtime registry.
 ///
-/// Dir-space exposes the on/off switch and the explicit statistics-path list.
-/// Overrides are volatile: restart restores the file-backed values.
-pub fn build_master_runtime_registry(manager: Arc<DirSpaceManager>) -> RuntimeConfigRegistry {
+/// Exposes the dir-space switch, the explicit statistics-path list, and the two
+/// RPC concurrency limits. Overrides are volatile: restart restores the
+/// file-backed values.
+///
+/// The limits are registered against the live [`LimitConf`] the RPC server
+/// applies, not against the `ClusterConf` snapshot, so an edit changes the value
+/// traffic is throttled by. A config-backed closure would only move the number
+/// the config endpoint prints.
+pub fn build_master_runtime_registry(
+    manager: Arc<DirSpaceManager>,
+    limit: LimitConf,
+    master_conf: &MasterConf,
+) -> RuntimeConfigRegistry {
+    let file_conn_limit = master_conf.conn_limit;
+    let file_global_limit = master_conf.global_limit;
+    let reset_conn = limit.clone();
+    let reset_global = limit.clone();
+
     RuntimeConfigRegistry::builder()
-        .register(
+        .register_at(
             DIR_SPACE_ENABLED_KEY,
+            Some("master.dir_space.enabled"),
             {
                 let manager = manager.clone();
                 move || Value::from(manager.file_enabled())
@@ -53,8 +76,9 @@ pub fn build_master_runtime_registry(manager: Arc<DirSpaceManager>) -> RuntimeCo
                 move || Ok(Value::from(manager.reset_enabled()))
             },
         )
-        .register(
+        .register_at(
             DIR_SPACE_TRACKED_PATHS_KEY,
+            Some("master.dir_space.tracked_paths"),
             {
                 let manager = manager.clone();
                 move || Value::from(manager.file_tracked_paths())
@@ -76,6 +100,48 @@ pub fn build_master_runtime_registry(manager: Arc<DirSpaceManager>) -> RuntimeCo
                 move || Ok(Value::from(manager.reset_tracked_paths()))
             },
         )
+        .register_at(
+            CONN_LIMIT_KEY,
+            Some(CONN_LIMIT_KEY),
+            move || Value::from(file_conn_limit),
+            {
+                let limit = limit.clone();
+                move || Value::from(limit.conn_limit())
+            },
+            {
+                let limit = limit.clone();
+                move |raw| {
+                    let value = parse_positive_usize(raw, CONN_LIMIT_KEY)?;
+                    let previous = limit.set_conn_limit(value);
+                    Ok((Value::from(previous), Value::from(value)))
+                }
+            },
+            move || {
+                reset_conn.set_conn_limit(file_conn_limit);
+                Ok(Value::from(file_conn_limit))
+            },
+        )
+        .register_at(
+            GLOBAL_LIMIT_KEY,
+            Some(GLOBAL_LIMIT_KEY),
+            move || Value::from(file_global_limit),
+            {
+                let limit = limit.clone();
+                move || Value::from(limit.global_limit_size())
+            },
+            {
+                let limit = limit.clone();
+                move |raw| {
+                    let value = parse_positive_usize(raw, GLOBAL_LIMIT_KEY)?;
+                    let previous = limit.set_global_limit(value);
+                    Ok((Value::from(previous), Value::from(value)))
+                }
+            },
+            move || {
+                reset_global.set_global_limit(file_global_limit);
+                Ok(Value::from(file_global_limit))
+            },
+        )
         .build()
 }
 
@@ -85,6 +151,19 @@ fn parse_enabled(raw: &str) -> CommonResult<bool> {
         "false" => Ok(false),
         _ => err_box!("{} expects true or false", DIR_SPACE_ENABLED_KEY),
     }
+}
+
+/// Reject zero and non-numeric input. `MasterConf::validate` applies the same
+/// rule at startup, so a runtime edit must not be able to introduce a value the
+/// process would refuse to boot with.
+fn parse_positive_usize(raw: &str, key: &str) -> CommonResult<usize> {
+    let value: usize = raw.trim().parse().map_err(|_| {
+        curvine_core_error::CommonError::from(format!("{} expects an integer", key))
+    })?;
+    if value == 0 {
+        return err_box!("{} must be greater than zero", key);
+    }
+    Ok(value)
 }
 
 fn parse_tracked_paths(raw: &str) -> CommonResult<Vec<String>> {

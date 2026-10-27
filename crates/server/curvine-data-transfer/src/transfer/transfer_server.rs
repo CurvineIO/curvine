@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::common::UfsFactory;
 use curvine_client_core::file::CurvineFileSystem;
-use curvine_config::{ClusterConf, RuntimeConfigRegistry, TransferStoreType};
+use curvine_config::{ClusterConf, ConfigSourceMap, RuntimeConfigRegistry, TransferStoreType};
 use curvine_core_error::CommonResult;
 use curvine_error::FsError;
 use curvine_net::net::ConnState;
@@ -30,9 +30,10 @@ use log::info;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::transfer::{
-    ClusterMetadataCache, MemoryTransferStore, MysqlTransferStore, PostgresTransferStore,
-    SqliteTransferStore, TransferHandler, TransferMetrics, TransferPlanner, TransferRouterHandler,
-    TransferScheduler, TransferService, TransferStoreBackend,
+    build_transfer_runtime_registry, ClusterMetadataCache, MemoryTransferStore, MysqlTransferStore,
+    PostgresTransferStore, SqliteTransferStore, TransferHandler, TransferMetrics, TransferPlanner,
+    TransferRouterHandler, TransferRuntimeConfig, TransferScheduler, TransferService,
+    TransferStoreBackend,
 };
 
 #[derive(Clone)]
@@ -42,6 +43,9 @@ pub struct TransferRpcService {
     store_backend: &'static str,
     cluster_cache: ClusterMetadataCache,
     runtime_config: Arc<RuntimeConfigRegistry>,
+    /// Layer attribution from the loader, for the config endpoint.
+    config_sources: ConfigSourceMap,
+    conf: Arc<ClusterConf>,
 }
 
 impl TransferRpcService {
@@ -51,6 +55,8 @@ impl TransferRpcService {
         store_backend: &'static str,
         cluster_cache: ClusterMetadataCache,
         runtime_config: Arc<RuntimeConfigRegistry>,
+        conf: Arc<ClusterConf>,
+        config_sources: ConfigSourceMap,
     ) -> Self {
         Self {
             service,
@@ -58,6 +64,8 @@ impl TransferRpcService {
             store_backend,
             cluster_cache,
             runtime_config,
+            config_sources,
+            conf,
         }
     }
 }
@@ -80,6 +88,8 @@ impl WebHandlerService for TransferRpcService {
             self.service.clone(),
             self.cluster_cache.clone(),
             self.runtime_config.clone(),
+            &self.conf,
+            self.config_sources.clone(),
         )
     }
 }
@@ -94,7 +104,17 @@ pub struct TransferServer {
 }
 
 impl TransferServer {
+    /// Starts a transfer server without configuration-layer attribution.
     pub fn with_conf(conf: ClusterConf) -> CommonResult<Self> {
+        Self::with_conf_and_sources(conf, ConfigSourceMap::new())
+    }
+
+    /// Same as [`TransferServer::with_conf`] but keeps the loader's layer map so
+    /// `GET /api/v1/transfer/config` can report where each value came from.
+    pub fn with_conf_and_sources(
+        conf: ClusterConf,
+        config_sources: ConfigSourceMap,
+    ) -> CommonResult<Self> {
         if !conf.transfer.enabled {
             return Err(FsError::common("curvine-transfer requires transfer.enabled=true").into());
         }
@@ -164,6 +184,11 @@ impl TransferServer {
             conf.transfer.max_tasks_per_transfer,
             conf.transfer.ufs_max_concurrency_per_endpoint,
         );
+        // One state object, two consumers: the scheduler reads it on every
+        // dispatch decision and the registry below is its only write path.
+        // Building it here (not inside the scheduler) is what keeps a pushed
+        // value and the process's behaviour from diverging.
+        let runtime_state = Arc::new(TransferRuntimeConfig::from_conf(&conf));
         let scheduler = TransferScheduler::new(
             store.clone(),
             planner,
@@ -173,11 +198,11 @@ impl TransferServer {
             owner,
             report_endpoints,
             conf.transfer.clone(),
-            conf.job.worker_max_concurrent_tasks,
+            runtime_state.clone(),
         );
 
         let ready = Arc::new(AtomicBool::new(false));
-        let runtime_config = Arc::new(RuntimeConfigRegistry::builder().build());
+        let runtime_config = Arc::new(build_transfer_runtime_registry(runtime_state, &conf));
         let service = TransferRpcService::new(
             TransferService::with_cache_and_report_queue(
                 store,
@@ -190,6 +215,8 @@ impl TransferServer {
             store_backend,
             cache.clone(),
             runtime_config,
+            Arc::new(conf.clone()),
+            config_sources,
         );
         let rpc_server =
             RpcServer::with_rt(rt.clone(), conf.transfer_server_conf(), service.clone());

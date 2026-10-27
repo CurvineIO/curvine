@@ -16,8 +16,8 @@ use crate::common::UfsFactory;
 use crate::transfer::{
     is_store_unavailable_error, job_mount_snapshot_async, job_mount_snapshot_with_version_async,
     record_master_rpc, transfer_failure_message, MountSnapshotError, TransferMountSnapshotUpdate,
-    TransferPlannedTasks, TransferPlanner, TransferRequeueUpdate, TransferStore,
-    TransferTaskStateUpdate,
+    TransferPlannedTasks, TransferPlanner, TransferRequeueUpdate, TransferRuntimeConfig,
+    TransferStore, TransferTaskStateUpdate,
 };
 use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::TransferConf;
@@ -429,7 +429,10 @@ pub struct TransferScheduler<S> {
     owner: String,
     report_endpoints: Vec<String>,
     conf: TransferConf,
-    worker_task_limit: usize,
+    /// Live knobs shared with the runtime-config registry. Held by `Arc`, never
+    /// snapshotted into this struct: a pushed value must be visible to the very
+    /// next dispatch decision.
+    runtime_config: Arc<TransferRuntimeConfig>,
     worker_cursor: Arc<AtomicUsize>,
     acquire_tick: Arc<AtomicU64>,
     last_cleanup_ms: Arc<AtomicU64>,
@@ -449,7 +452,7 @@ impl<S> Clone for TransferScheduler<S> {
             owner: self.owner.clone(),
             report_endpoints: self.report_endpoints.clone(),
             conf: self.conf.clone(),
-            worker_task_limit: self.worker_task_limit,
+            runtime_config: self.runtime_config.clone(),
             worker_cursor: self.worker_cursor.clone(),
             acquire_tick: self.acquire_tick.clone(),
             last_cleanup_ms: self.last_cleanup_ms.clone(),
@@ -474,7 +477,7 @@ where
         owner: String,
         report_endpoints: Vec<String>,
         conf: TransferConf,
-        worker_task_limit: usize,
+        runtime_config: Arc<TransferRuntimeConfig>,
     ) -> Self {
         let inflight_ttl =
             Duration::from_millis(TransferConf::DEFAULT_SCHEDULER_INFLIGHT_CACHE_TTL_MS);
@@ -487,7 +490,7 @@ where
             owner,
             report_endpoints,
             conf,
-            worker_task_limit: worker_task_limit.max(1),
+            runtime_config,
             worker_cursor: Arc::new(AtomicUsize::new(0)),
             acquire_tick: Arc::new(AtomicU64::new(0)),
             last_cleanup_ms: Arc::new(AtomicU64::new(0)),
@@ -2209,7 +2212,9 @@ where
         let admitted = choose_worker_admitted(
             workers,
             estimated_bytes,
-            self.worker_task_limit,
+            // Loaded per decision, not per scheduler: a runtime-config push must
+            // change the very next dispatch, and a cached local would freeze it.
+            self.runtime_config.worker_task_limit(),
             TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES,
             |worker_id| self.inflight.get(worker_id),
         );

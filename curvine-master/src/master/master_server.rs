@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 
-use curvine_config::{ClusterConf, RuntimeConfigRegistry};
+use curvine_config::{ClusterConf, ConfigSourceMap, RuntimeConfigRegistry, ViewProfile};
 use curvine_core_error::{err_box, CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
 use curvine_net::net::ConnState;
@@ -24,6 +24,7 @@ use curvine_rpc::handler::{HandlerService, LimitConf};
 use curvine_rpc::server::{RpcServer, ServerStateListener};
 use curvine_runtime::common::{LocalTime, Logger};
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime, Runtime};
+use curvine_web::router::ConfigViewState;
 use log::{error, info};
 
 use crate::master::build_master_runtime_registry;
@@ -70,6 +71,7 @@ impl MasterService {
         metrics: &'static MasterMetrics,
         fault_http: FaultHttpControl,
         runtime_config: Arc<RuntimeConfigRegistry>,
+        limit: LimitConf,
         dir_space_manager: Option<Arc<DirSpaceManager>>,
     ) -> Self {
         let actor_rt = Arc::new(AsyncRuntime::new(
@@ -78,7 +80,6 @@ impl MasterService {
             conf.master.actor_threads,
         ));
         let control_rpc_executor = Arc::new(GroupExecutor::new("master-control-rpc", 2, 1024));
-        let limit = LimitConf::new(conf.master.conn_limit, conf.master.global_limit);
         Self {
             conf,
             fs,
@@ -159,7 +160,7 @@ pub struct Master {
 }
 
 impl Master {
-    fn new(conf: ClusterConf) -> CommonResult<Self> {
+    fn new(conf: ClusterConf, config_sources: ConfigSourceMap) -> CommonResult<Self> {
         let mut log = conf.master.log.clone();
         if conf.master.audit_logging_enabled {
             log.targets = vec!["audit".to_string()]
@@ -205,9 +206,27 @@ impl Master {
         // step 3: Create rpc server.
         let retry_cache = FsRetryCache::with_conf(&conf.master)?;
         let metrics_fs = fs.clone();
-        let runtime_config = Arc::new(build_master_runtime_registry(dir_space_manager.clone()));
+        // Built before the registry so both the RPC server and the config
+        // endpoint share one cell; the limits are runtime-editable, so a second
+        // copy would drift from the one throttling traffic.
+        let limit = LimitConf::new(conf.master.conn_limit, conf.master.global_limit);
+        let runtime_config = Arc::new(build_master_runtime_registry(
+            dir_space_manager.clone(),
+            limit.clone(),
+            &conf.master,
+        ));
         let start_time_ms = LocalTime::mills();
         let start_time = LocalTime::now_datetime();
+        // One snapshot backs both the rpc-side registry and the metrics surface,
+        // so the config endpoint reports exactly the values this process uses.
+        let config_view = Arc::new(ConfigViewState::new(
+            "master",
+            format!("{}:{}", conf.master.hostname, conf.master.web_port),
+            Arc::new(conf.clone()),
+            ViewProfile::Full,
+            config_sources,
+            runtime_config.clone(),
+        ));
         let service = MasterService::new(
             conf.clone(),
             fs,
@@ -219,6 +238,7 @@ impl Master {
             metrics,
             fault_http,
             runtime_config.clone(),
+            limit,
             Some(dir_space_manager),
         );
 
@@ -228,7 +248,7 @@ impl Master {
             rt,
             conf.master_metrics_conf(),
             metrics_fs,
-            runtime_config,
+            config_view,
             start_time,
             start_time_ms,
         );
@@ -246,7 +266,16 @@ impl Master {
     }
 
     pub fn with_conf(conf: ClusterConf) -> CommonResult<Self> {
-        Self::new(conf)
+        Self::new(conf, ConfigSourceMap::new())
+    }
+
+    /// Same as [`Master::with_conf`] but threads the loader's layer map into the
+    /// `/config` endpoints so they can report `file` / `env` / `cli` sources.
+    pub fn with_conf_and_sources(
+        conf: ClusterConf,
+        config_sources: ConfigSourceMap,
+    ) -> CommonResult<Self> {
+        Self::new(conf, config_sources)
     }
 
     pub async fn start(&mut self) -> CommonResult<ServerStateListener> {

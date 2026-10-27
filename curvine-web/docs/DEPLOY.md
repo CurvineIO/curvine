@@ -22,6 +22,58 @@
 > **注意**：旧配置曾将 Master 的 `web_port` 设为 9000。当前 main 分支已将 Master metrics 拆到 **9010**。  
 > 若启用 `[web.observability]` 并配置 `client.master_web_addrs`，应指向各 Master 的 **metrics 端口（9010）**，而非独立控制台端口 9000。
 
+### 进程级配置视图接口
+
+每个进程在自身的 web/metrics 端口上暴露一份**进程级生效配置视图**：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/v1/master/config` | Master 进程的生效配置视图 |
+| `GET` | `/api/v1/worker/config` | Worker 进程的生效配置视图 |
+| `GET` | `/api/v1/transfer/config` | Transfer 进程的生效配置视图 |
+| `GET` | `/api/v1/master/runtime/config` | 上一版路径，保留为 `/api/v1/master/config` 的别名 |
+| `POST` | `/api/update_config?<key>=<value>` | 修改单个可热改项，恰好一个参数 |
+| `POST` | `/api/v1/config`（9000 端口） | 控制台写入口，JSON 体 `{"key":"…","value":"…"}`；省略 `value` 即还原为文件值 |
+
+响应包含 `role`、`node`、`values`（完整配置树）、`sources`（逐项来源）、
+`runtime`（可热改项的当前值）、`writable`（可改 key 列表）、`unresolved`（注册了
+但配置树中无法解析的 key）与 `persistent`（当前恒为 `false`：热改值不落盘，
+重启丢失）。
+
+`sources` 的每项取值：`default` / `file` / `env` / `cli` / `derived` / `runtime`。
+其中 `derived` 表示加载器在反序列化**之后**计算出来的值（如遗留配置中
+`master.web_port` 由 9000 自动迁移到 9010、`net_interface` 解析出的主机名、
+派生的 `client.master_addrs`），`runtime` 表示当前被进程内热改覆盖。
+
+#### 可热改的 key
+
+| key | 配置路径 | 生效范围 |
+|-----|----------|----------|
+| `master.conn_limit` | `master.conn_limit` | 每连接在途请求上限，**对已建立的连接立即生效** |
+| `master.global_limit` | `master.global_limit` | Master 全局在途请求并发上限，原地调整容量 |
+| `master.dir_space_enabled` | `master.dir_space.enabled` | dir-space 扫描开关 |
+| `master.dir_space_tracked_paths` | `master.dir_space.tracked_paths` | 跟踪点列表，值为 JSON 数组字符串 |
+| `worker_max_concurrent_tasks` | `job.worker_max_concurrent_tasks` | Worker 任务池 / Transfer 派单上限 |
+| `task_timeout` | `job.task_timeout` | Worker 任务超时 |
+| `task_report_interval` | `job.task_report_interval` | Worker 任务上报间隔 |
+| `transfer_inflight_budget_bytes` | —（无配置文件入口） | Worker 在途字节预算；可改但不出现在视图中 |
+
+表中 key 与配置路径不同名是历史原因：`master.dir_space_*` 与 worker 的四个扁平
+key 是已对外承诺的运维接口（`cv admin config` 脚本在用），因此保留原名，由
+registry 条目单独声明它背后的配置路径。`sources` / `values` 一律用配置路径，
+`runtime[].key` 与 `writable` 一律用 registry key。
+
+`master.conn_limit` / `master.global_limit` 缩容到低于当前在途数量时不会打断
+已受理的请求：空闲许可立即回收，被在途请求占用的许可在释放时逐步收敛到目标值。
+两个值都必须大于 0。
+
+> **⚠️ 安全边界**：**9010 端口没有鉴权**（`/metrics` 与上述配置接口共用同一
+> 路由表，仅挂载 handler，无中间件）。这些接口按内网信任模型设计，只应用于
+> 集群内部抓取与排障，**不得对集群外暴露**。控制台上的配置写操作应通过
+> **9000 端口的 `curvine-web`** 进行，该端口有会话鉴权（`/api/*` 路径全部
+> 要求登录）。S3 网关的 `access_key` / `secret_key` 已在序列化层
+> （`#[serde(skip_serializing)]`）屏蔽，不会出现在任何视图响应中。
+
 ---
 
 ## 2. 环境要求

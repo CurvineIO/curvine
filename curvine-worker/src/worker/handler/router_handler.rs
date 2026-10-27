@@ -19,13 +19,13 @@ use axum::extract::{Extension, Query};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use curvine_config::RuntimeConfigRegistry;
+use curvine_config::{ClusterConf, ConfigSourceMap, RuntimeConfigRegistry, ViewProfile};
 use curvine_error::FsResult;
 use curvine_fault::FaultHttpControl;
 use curvine_rpc::server::ServerState;
 use curvine_runtime::sync::StateCtl;
 use curvine_web::router::{
-    get_runtime_config, post_update_config, RouterHandler, RuntimeConfigHttpResult,
+    get_config_view, post_update_config, ConfigViewState, RouterHandler, RuntimeConfigHttpResult,
 };
 use once_cell::sync::OnceCell;
 use serde_json::{json, Value};
@@ -38,7 +38,34 @@ pub struct WorkerRouterHandler {
     #[allow(dead_code)] // used by integration tests and registry wiring
     pub(crate) task_manager: Arc<TaskManager>,
     pub(crate) runtime_config: Arc<RuntimeConfigRegistry>,
+    /// Snapshot plus live registry behind `GET /api/v1/worker/config`.
+    pub(crate) config_view: Arc<ConfigViewState>,
     pub(crate) registration: MasterRegistration,
+}
+
+impl WorkerRouterHandler {
+    /// Builds the shared full-view state for the worker's config endpoint.
+    ///
+    /// `sources` is the layer map captured when the conf was loaded; passing an
+    /// empty map here only loses the file/env/cli attribution, never the values.
+    pub(crate) fn build_config_view(
+        conf: &ClusterConf,
+        sources: ConfigSourceMap,
+        runtime_config: Arc<RuntimeConfigRegistry>,
+    ) -> Arc<ConfigViewState> {
+        let mut state = ConfigViewState::new(
+            "worker",
+            format!("{}:{}", conf.worker.hostname, conf.worker.web_port),
+            Arc::new(conf.clone()),
+            ViewProfile::Full,
+            sources,
+            runtime_config,
+        );
+        // The worker advertises where an override lands; this is process
+        // metadata, not a runtime key, so it rides along as an extra field.
+        state.extra = worker_config_extra();
+        Arc::new(state)
+    }
 }
 
 fn worker_config_extra() -> Value {
@@ -87,7 +114,9 @@ fn is_serving(server_state: &OnceCell<StateCtl>) -> bool {
 async fn runtime_config(
     Extension(instance): Extension<Arc<WorkerRouterHandler>>,
 ) -> RuntimeConfigHttpResult<Json<Value>> {
-    get_runtime_config(instance.runtime_config.clone(), worker_config_extra()).await
+    // Delegates to the shared handler; the extractor is fed from the handler's
+    // own state because this router carries one `Extension` per process.
+    get_config_view(Extension(instance.config_view.clone())).await
 }
 
 async fn update_runtime_config(

@@ -47,13 +47,13 @@ pub struct ClientConf {
     pub replicas: i32,
     #[serde(skip)]
     pub block_size: i64,
-    #[serde(alias = "block_size")]
+    #[serde(rename = "block_size", alias = "block_size_str")]
     #[client_cli]
     pub block_size_str: String,
 
     #[serde(skip)]
     pub write_chunk_size: usize,
-    #[serde(alias = "write_chunk_size")]
+    #[serde(rename = "write_chunk_size", alias = "write_chunk_size_str")]
     #[client_cli]
     pub write_chunk_size_str: String,
     #[client_cli]
@@ -61,7 +61,7 @@ pub struct ClientConf {
 
     #[serde(skip)]
     pub read_chunk_size: usize,
-    #[serde(alias = "read_chunk_size")]
+    #[serde(rename = "read_chunk_size", alias = "read_chunk_size_str")]
     #[client_cli]
     pub read_chunk_size_str: String,
     #[client_cli]
@@ -77,7 +77,7 @@ pub struct ClientConf {
     // Default is 0, the value is read_chunk_size * read_chunk_num
     #[serde(skip)]
     pub read_slice_size: i64,
-    #[serde(alias = "read_slice_size")]
+    #[serde(rename = "read_slice_size", alias = "read_slice_size_str")]
     #[client_cli]
     pub read_slice_size_str: String,
 
@@ -92,19 +92,19 @@ pub struct ClientConf {
 
     #[serde(skip)]
     pub storage_type: StorageType,
-    #[serde(alias = "storage_type")]
+    #[serde(rename = "storage_type", alias = "storage_type_str")]
     #[client_cli]
     pub storage_type_str: String,
 
     #[serde(skip)]
     pub ttl_ms: i64,
-    #[serde(alias = "ttl_ms")]
+    #[serde(rename = "ttl_ms", alias = "ttl_ms_str")]
     #[client_cli]
     pub ttl_ms_str: String,
 
     #[serde(skip)]
     pub ttl_action: TtlAction,
-    #[serde(alias = "ttl_action")]
+    #[serde(rename = "ttl_action", alias = "ttl_action_str")]
     #[client_cli]
     pub ttl_action_str: String,
 
@@ -117,7 +117,7 @@ pub struct ClientConf {
     /// mtime-based TTL (their activity is reflected by child changes).
     #[serde(skip)]
     pub ttl_type: TtlType,
-    #[serde(alias = "ttl_type")]
+    #[serde(rename = "ttl_type", alias = "ttl_type_str")]
     #[client_cli]
     pub ttl_type_str: String,
 
@@ -178,12 +178,12 @@ pub struct ClientConf {
     // Default is 0, the value is read_chunk_size * read_chunk_num
     #[serde(skip)]
     pub read_ahead_len: i64,
-    #[serde(alias = "read_ahead_len")]
+    #[serde(rename = "read_ahead_len", alias = "read_ahead_len_str")]
     #[client_cli]
     pub read_ahead_len_str: String,
     #[serde(skip)]
     pub drop_cache_len: i64,
-    #[serde(alias = "drop_cache_len")]
+    #[serde(rename = "drop_cache_len", alias = "drop_cache_len_str")]
     #[client_cli]
     pub drop_cache_len_str: String,
 
@@ -259,7 +259,7 @@ pub struct ClientConf {
 
     #[serde(skip)]
     pub small_file_size: i64,
-    #[serde(alias = "small_file_size")]
+    #[serde(rename = "small_file_size", alias = "small_file_size_str")]
     #[client_cli]
     pub small_file_size_str: String,
 
@@ -270,7 +270,7 @@ pub struct ClientConf {
 
     #[serde(skip)]
     pub large_file_size: i64,
-    #[serde(alias = "large_file_size")]
+    #[serde(rename = "large_file_size", alias = "large_file_size_str")]
     #[client_cli]
     pub large_file_size_str: String,
 
@@ -293,7 +293,7 @@ pub struct ClientConf {
     // instead of repositioning every lane on every seek.
     #[serde(skip)]
     pub seek_absorb_window: i64,
-    #[serde(alias = "seek_absorb_window")]
+    #[serde(rename = "seek_absorb_window", alias = "seek_absorb_window_str")]
     #[client_cli]
     pub seek_absorb_window_str: String,
 }

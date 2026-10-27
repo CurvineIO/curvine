@@ -79,6 +79,10 @@ pub use pipeline::{ConfigLoader, ConfigSource, ConfigSourceMap, DiscoveredPath};
 /// Unified validation framework (per-section validate + unknown-key audit).
 pub mod validation;
 
+/// Process-scoped effective configuration view (overlay + provenance).
+pub mod config_view;
+pub use config_view::{effective_config_view, ConfigView, RuntimeEntryView, ViewProfile};
+
 /// Hot-reload extension points (no watcher/RPC wired yet — see module docs).
 pub mod reload;
 

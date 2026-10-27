@@ -19,7 +19,9 @@ pub mod runtime_config;
 
 pub use self::admin_handler::AdminRouterHandler;
 pub use self::router_handler::{RouterHandler, TestHandler};
+#[allow(deprecated)]
 pub use self::runtime_config::{
-    get_runtime_config, post_update_config, runtime_config_view, RuntimeConfigHttpError,
+    config_view_for_state, config_view_response, get_config_view, get_runtime_config,
+    post_update_config, runtime_config_view, ConfigViewState, RuntimeConfigHttpError,
     RuntimeConfigHttpResult,
 };

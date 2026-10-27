@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::handler::{Frame, LimitConf, MessageHandler, ReadFrame, WriteFrame};
+use crate::handler::{
+    Frame, GlobalLimit, LimitConf, LimitPermit, MessageHandler, ReadFrame, WriteFrame,
+};
 use crate::message::{Builder, Message};
 use crate::ServerConf;
 use curvine_io::{IOError, IOResult};
@@ -23,9 +25,10 @@ use futures::StreamExt;
 use log::debug;
 use once_cell::sync::Lazy;
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::TryAcquireError;
 use tokio::time::sleep;
 
 static BLOCKED_REQUESTS: Lazy<Gauge> = Lazy::new(|| {
@@ -88,7 +91,7 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
     async fn process_request(
         rt: &Runtime,
         handler: &Arc<M>,
-        global_limit: &Arc<Semaphore>,
+        global_limit: &Arc<GlobalLimit>,
         request: Message,
     ) -> IOResult<Message> {
         let permit = Self::acquire_limit(global_limit).await?;
@@ -123,16 +126,18 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
         Ok(response)
     }
 
-    async fn acquire_limit(global_limit: &Arc<Semaphore>) -> IOResult<OwnedSemaphorePermit> {
-        match global_limit.clone().try_acquire_owned() {
-            Ok(permit) => Ok(permit),
+    async fn acquire_limit(global_limit: &Arc<GlobalLimit>) -> IOResult<LimitPermit> {
+        let semaphore = global_limit.semaphore();
+        match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => Ok(global_limit.track_permit(permit)),
             Err(TryAcquireError::NoPermits) => {
                 let _blocked = BlockedRequestGuard::new();
-                global_limit
+                let permit = semaphore
                     .clone()
                     .acquire_owned()
                     .await
-                    .map_err(|e| IOError::create(e.to_string()))
+                    .map_err(|e| IOError::create(e.to_string()))?;
+                Ok(global_limit.track_permit(permit))
             }
             Err(TryAcquireError::Closed) => err_box!("global limit is closed"),
         }
@@ -150,7 +155,7 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
         reader: &mut ReadFrame,
         writer: &mut WriteFrame,
         inflight: &mut FuturesUnordered<R>,
-        conn_limit: usize,
+        conn_limit: &AtomicUsize,
         close_idle: bool,
         idle_timeout: Duration,
     ) -> IOResult<Message>
@@ -161,6 +166,9 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
         tokio::pin!(receive);
 
         loop {
+            // Read per iteration rather than once per connection: an edit has to
+            // reach connections that are already established.
+            let conn_limit = conn_limit.load(Ordering::Acquire);
             tokio::select! {
                 response = inflight.next(), if !inflight.is_empty() => {
                     if let Some(response) = response {
@@ -188,6 +196,10 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
         } = self;
 
         let (mut reader, mut writer) = frame.split();
+        // Declared before `inflight`: the futures below borrow it, so it has to
+        // outlive the set of requests that are still running.
+        let global_limit = limit.global_limit().clone();
+        let conn_limit = limit.conn_limit_cell();
         let mut inflight = FuturesUnordered::new();
 
         loop {
@@ -195,7 +207,7 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
                 &mut reader,
                 &mut writer,
                 &mut inflight,
-                limit.conn_limit,
+                &conn_limit,
                 close_idle,
                 idle_timeout,
             )
@@ -205,12 +217,7 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
                 return Ok(());
             }
 
-            inflight.push(Self::process_request(
-                &rt,
-                &handler,
-                &limit.global_limit,
-                request,
-            ));
+            inflight.push(Self::process_request(&rt, &handler, &global_limit, request));
         }
     }
 }
@@ -218,13 +225,13 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
 #[cfg(test)]
 mod tests {
     use super::{BlockedRequestGuard, BufferHandler, BLOCKED_REQUESTS};
-    use crate::handler::{MessageHandler, RpcFrame, TestMessageHandler};
+    use crate::handler::{GlobalLimit, MessageHandler, RpcFrame, TestMessageHandler};
     use crate::message::Message;
     use curvine_core_error::CommonErrorExt;
     use curvine_runtime::runtime::{RpcRuntime, Runtime};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
-    use tokio::sync::{oneshot, Semaphore};
+    use tokio::sync::oneshot;
 
     struct BlockingHandler {
         started: Mutex<Option<oneshot::Sender<()>>>,
@@ -278,7 +285,7 @@ mod tests {
     #[test]
     fn closed_global_limit_returns_error() {
         let runtime = Runtime::current_thread("closed-global-limit-test");
-        let limit = Arc::new(Semaphore::new(1));
+        let limit = GlobalLimit::new(1);
         limit.close();
 
         let result =
@@ -289,7 +296,7 @@ mod tests {
     #[test]
     fn sync_task_keeps_permit_after_outer_future_is_cancelled() {
         let runtime = Arc::new(Runtime::current_thread("sync-permit-cancellation-test"));
-        let limit = Arc::new(Semaphore::new(1));
+        let limit = GlobalLimit::new(1);
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let handler = Arc::new(BlockingHandler {
@@ -326,6 +333,50 @@ mod tests {
         });
     }
 
+    /// A shrink that could not be applied while permits were in flight has to be
+    /// finished by the requests that release them, otherwise a lowered limit
+    /// would stay over-provisioned until the service restarts.
+    #[test]
+    fn released_permit_finishes_a_deferred_shrink() {
+        let runtime = Runtime::current_thread("deferred-shrink-test");
+        let limit = GlobalLimit::new(4);
+
+        runtime.block_on(async {
+            let first = BufferHandler::<RpcFrame, TestMessageHandler>::acquire_limit(&limit)
+                .await
+                .unwrap();
+            let second = BufferHandler::<RpcFrame, TestMessageHandler>::acquire_limit(&limit)
+                .await
+                .unwrap();
+            let third = BufferHandler::<RpcFrame, TestMessageHandler>::acquire_limit(&limit)
+                .await
+                .unwrap();
+            assert_eq!(limit.in_flight(), 3);
+            assert_eq!(limit.available_permits(), 1);
+
+            // Only one permit is idle, so the cap lands on three and the rest of
+            // the shrink is owed by whoever releases next.
+            limit.resize(1);
+            assert_eq!(limit.capacity(), 3);
+            assert_eq!(limit.available_permits(), 0);
+            assert!(limit.is_settling());
+
+            drop(third);
+            assert_eq!(limit.capacity(), 2);
+            assert_eq!(limit.available_permits(), 0);
+            assert!(limit.is_settling());
+
+            drop(second);
+            assert_eq!(limit.capacity(), 1);
+            assert_eq!(limit.available_permits(), 0);
+            assert!(!limit.is_settling());
+
+            drop(first);
+            assert_eq!(limit.capacity(), 1);
+            assert_eq!(limit.available_permits(), 1);
+        });
+    }
+
     #[test]
     fn sync_request_uses_handler_runtime() {
         let runtime = Runtime::current_thread("buffer-handler-default-runtime");
@@ -334,7 +385,7 @@ mod tests {
             rt: Runtime::new("buffer-handler-selected-runtime", 1, 1),
             executed_on: executed_on_tx,
         });
-        let limit = Arc::new(Semaphore::new(1));
+        let limit = GlobalLimit::new(1);
 
         runtime.block_on(async {
             BufferHandler::<RpcFrame, RuntimeRoutingHandler>::process_request(

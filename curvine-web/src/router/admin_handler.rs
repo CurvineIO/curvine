@@ -35,10 +35,10 @@ use crate::observability::{self, ObservabilityService};
 use crate::router::RouterHandler;
 use crate::util::addr::{
     configured_master_addrs, display_addr_text_for_cluster, display_inet_addr_with_hint,
-    display_master_endpoint, hosts_match_for_cluster_mapping, master_runtime_scrape_url,
-    resolve_display_hostname, resolve_display_ip,
+    display_master_endpoint, hosts_match_for_cluster_mapping, master_config_view_scrape_url,
+    master_runtime_scrape_url, resolve_display_hostname, resolve_display_ip,
 };
-use curvine_config::{ClusterConf, ConfigSourceMap};
+use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_error::{ErrorKind, FsError};
@@ -497,10 +497,44 @@ fn master_runtime_http_client() -> Option<reqwest::Client> {
         .ok()
 }
 
+/// Fetches the master's published config view from `url`.
+///
+/// Split from URL construction so the success and failure paths can be driven
+/// against a local listener instead of a real cluster.
+async fn fetch_config_view_from(client: &reqwest::Client, url: &str) -> Result<Value, String> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("request to {url} failed: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("{url} answered HTTP {status}"));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("{url} did not return JSON: {error}"))
+}
+
+/// Reads the effective configuration view from the active master.
+///
+/// The console deliberately has no local fallback: it used to render its own
+/// startup snapshot, which made the page silently disagree with the process it
+/// claimed to describe. Callers turn the error into an explicit `502`.
+async fn fetch_master_config_view(
+    conf: &ClusterConf,
+    active_master: &str,
+) -> Result<Value, String> {
+    let client = master_runtime_http_client()
+        .ok_or_else(|| "failed to build the master HTTP client".to_string())?;
+    let url = master_config_view_scrape_url(conf, active_master);
+    fetch_config_view_from(&client, &url).await
+}
+
 #[derive(Clone)]
 pub struct AdminRouterHandler {
     conf: ClusterConf,
-    config_sources: ConfigSourceMap,
     unified_fs: UnifiedFileSystem,
     rt: Arc<Runtime>,
     start_time: String,
@@ -1663,21 +1697,12 @@ impl AdminRouterHandler {
     }
 
     pub fn with_rt(conf: ClusterConf, rt: Arc<Runtime>) -> FsResult<Self> {
-        Self::with_rt_and_sources(conf, ConfigSourceMap::new(), rt)
-    }
-
-    pub fn with_rt_and_sources(
-        conf: ClusterConf,
-        config_sources: ConfigSourceMap,
-        rt: Arc<Runtime>,
-    ) -> FsResult<Self> {
         let unified_fs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
         let observability = Arc::new(ObservabilityService::new(conf.clone(), unified_fs.clone()));
         observability.start(rt.clone());
 
         Ok(Self {
             conf,
-            config_sources,
             unified_fs,
             rt,
             start_time: LocalTime::now_datetime(),
@@ -2164,13 +2189,126 @@ async fn master_failover_v1(
     ))
 }
 
-async fn config_v1(
+/// `GET /api/v1/config` — the effective configuration of the active master.
+///
+/// The console used to answer from this process's own startup snapshot, which
+/// meant the page described `curvine-web`'s view of the file rather than what the
+/// master was actually running with — the two disagree as soon as a runtime
+/// override is pushed or a node loads a different file. Fetching from the active
+/// master removes that ambiguity.
+///
+/// There is deliberately no local fallback: a page that silently shows stale
+/// values is worse than an error, because an operator cannot tell the difference.
+async fn config_v1(Extension(instance): Extension<Arc<AdminRouterHandler>>) -> FsResult<Response> {
+    // `current_master_info` fails when the master cannot be reached at all. That
+    // is the same operator-facing condition as "the view fetch failed", so it has
+    // to travel through the same envelope: letting the `?` bubble up would emit
+    // `500 {"message": ...}`, which the console cannot unwrap and which reports
+    // the wrong cause (an unreachable master is 502, not an internal error).
+    let master_info = match current_master_info(&instance).await {
+        Ok(info) => info,
+        Err(error) => {
+            log::warn!("config view cannot locate an active master: {error}");
+            return Ok(api_error_response(
+                StatusCode::BAD_GATEWAY,
+                "MASTER_CONFIG_UNAVAILABLE",
+                format!("no active master is reachable: {error}"),
+            ));
+        }
+    };
+    let active_master = master_info.active_master.trim().to_string();
+    match fetch_master_config_view(&instance.conf, &active_master).await {
+        Ok(view) => Ok(api_success(view).into_response()),
+        Err(error) => {
+            log::warn!("config view fetch from master {active_master} failed: {error}");
+            Ok(api_error_response(
+                StatusCode::BAD_GATEWAY,
+                "MASTER_CONFIG_UNAVAILABLE",
+                format!(
+                    "failed to read the configuration view from the active master {}: {error}",
+                    if active_master.is_empty() {
+                        "<none>"
+                    } else {
+                        active_master.as_str()
+                    }
+                ),
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigUpdateRequest {
+    /// Registry key, e.g. `master.dir_space_enabled` — not a configuration path.
+    key: String,
+    /// Raw value for the key's parser. `null` clears the override and restores
+    /// the file-backed value.
+    value: Option<String>,
+}
+
+/// `POST /api/v1/config` — push or clear one hot-tunable override.
+///
+/// Deliberately routed through the master RPC (`UpdateRuntimeConfig` /
+/// `ResetRuntimeConfig`), the same path `cv admin config` takes, rather than
+/// posting to the process scrape port. Those ports carry no authentication, so
+/// a write has to stay behind the console's session even though the read side is
+/// a plain HTTP proxy.
+async fn config_update_v1(
     Extension(instance): Extension<Arc<AdminRouterHandler>>,
-) -> FsResult<Json<Value>> {
-    Ok(api_success(json!({
-        "values": instance.conf,
-        "sources": instance.config_sources,
-    })))
+    Json(payload): Json<ConfigUpdateRequest>,
+) -> FsResult<Response> {
+    let key = payload.key.trim().to_string();
+    if key.is_empty() {
+        return Ok(api_error_response(
+            StatusCode::BAD_REQUEST,
+            "CONFIG_KEY_REQUIRED",
+            "key must name one writable runtime configuration",
+        ));
+    }
+    let client = instance.unified_client(false);
+    let outcome = match payload.value {
+        Some(value) => client
+            .update_runtime_config(&key, &value)
+            .await
+            .map(|done| {
+                json!({
+                    "key": done.key,
+                    "previous_value": parse_json_text(&done.previous_value_json),
+                    "value": parse_json_text(&done.value_json),
+                    "reset": false,
+                    "persistent": done.persistent,
+                })
+            }),
+        None => client.reset_runtime_config(&key).await.map(|done| {
+            json!({
+                "key": done.key,
+                "effective_value": parse_json_text(&done.effective_value_json),
+                "reset": true,
+                "persistent": false,
+            })
+        }),
+    };
+    match outcome {
+        Ok(body) => Ok(api_success(body).into_response()),
+        Err(error) => {
+            // An unknown key or a value the parser rejects is the operator's
+            // mistake, not a server fault. 422 keeps the console from treating
+            // it as a transient failure and lets it show the parser's own text
+            // ("expects true or false", "unsupported runtime configuration").
+            log::warn!("runtime config update for {key:?} rejected: {error}");
+            Ok(api_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "CONFIG_UPDATE_REJECTED",
+                error.to_string(),
+            ))
+        }
+    }
+}
+
+/// The RPC layer carries values as JSON text; re-parse so the body nests real
+/// values instead of double-encoded strings.
+fn parse_json_text(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
 fn add_cache_state_count(
@@ -4446,7 +4584,7 @@ impl RouterHandler for AdminRouterHandler {
             .route("/api/v1/overview", get(overview_v1))
             .route("/api/v1/master/ha", get(master_ha_v1))
             .route("/api/v1/master/failover", post(master_failover_v1))
-            .route("/api/v1/config", get(config_v1))
+            .route("/api/v1/config", get(config_v1).post(config_update_v1))
             .route("/api/v1/fs/list", get(browse_v1))
             .route("/api/v1/fs/blocks", get(block_locations_v1))
             .route(
@@ -5076,5 +5214,203 @@ mod browse_overlay_tests {
         let mut item = ufs_row();
         overlay_cv_metadata_on_ufs_entry(&mut item, None);
         assert_eq!(item.storage_policy.state, StorageState::Ufs);
+    }
+}
+
+#[cfg(test)]
+mod config_view_proxy_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use tokio::io::AsyncWriteExt;
+
+    /// A master stand-in that answers `GET /api/v1/master/config` with `body`.
+    ///
+    /// Bound on `0.0.0.0` on purpose: the scrape-hostname resolver replaces a
+    /// loopback master address with the local non-loopback IP (same rule the
+    /// `/metrics` scraper uses), so a listener confined to `127.0.0.1` would be
+    /// unreachable through the URL the handler actually builds.
+    async fn spawn_master(body: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let _ = stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        port
+    }
+
+    fn conf_pointing_at(port: u16) -> ClusterConf {
+        let mut conf = ClusterConf::default();
+        conf.master.hostname = "127.0.0.1".to_string();
+        conf.master.web_port = port;
+        // Pin the scrape target so the test does not depend on name resolution.
+        conf.client.master_web_addrs = vec![InetAddr::new("127.0.0.1", port)];
+        conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 8995)];
+        conf
+    }
+
+    #[tokio::test]
+    async fn proxies_the_view_published_by_the_active_master() {
+        let port = spawn_master(r#"{"role":"master","node":"m:9010","values":{"a":1}}"#).await;
+        let conf = conf_pointing_at(port);
+        let view = fetch_master_config_view(&conf, "127.0.0.1:8995")
+            .await
+            .expect("master answered with a view");
+        assert_eq!(view["role"], json!("master"));
+        assert_eq!(view["node"], json!("m:9010"));
+        assert_eq!(view["values"]["a"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn refuses_to_answer_when_the_master_is_unreachable() {
+        // Bind and immediately drop so the port is closed: the connection is
+        // refused rather than hanging until the client timeout.
+        let port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let conf = conf_pointing_at(port);
+        let error = fetch_master_config_view(&conf, "127.0.0.1:8995")
+            .await
+            .expect_err("an unreachable master must not yield a view");
+        assert!(
+            error.contains("/api/v1/master/config"),
+            "error should name the endpoint it tried: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_a_master_that_answers_with_the_wrong_shape() {
+        let port = spawn_master("not json at all").await;
+        let conf = conf_pointing_at(port);
+        let error = fetch_master_config_view(&conf, "127.0.0.1:8995")
+            .await
+            .expect_err("a non-JSON body must not be rendered");
+        assert!(
+            error.contains("did not return JSON"),
+            "error should explain the body was unusable: {error}"
+        );
+    }
+
+    /// Regression: `config_v1` used to propagate the master-info probe with `?`,
+    /// so a master that could not be reached at all escaped as
+    /// `500 {"message": ...}` — a shape the console cannot unwrap, reporting the
+    /// wrong cause on top of it. An unreachable master is a 502 in this endpoint's
+    /// contract, exactly like a failed view fetch.
+    #[tokio::test]
+    async fn config_endpoint_reports_an_unreachable_master_as_502() {
+        let port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let conf = conf_pointing_at(port);
+        let handler = Arc::new(
+            AdminRouterHandler::with_rt(conf, Arc::new(Runtime::single()))
+                .expect("handler builds from an unreachable-master config"),
+        );
+        let response = config_v1(Extension(handler))
+            .await
+            .expect("the endpoint reports failures in-band, not as an Err");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["success"], json!(false));
+        assert_eq!(body["error"]["code"], json!("MASTER_CONFIG_UNAVAILABLE"));
+        assert!(body["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn config_endpoint_carries_the_502_envelope_on_failure() {
+        let port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let conf = conf_pointing_at(port);
+        let response = api_error_response(
+            StatusCode::BAD_GATEWAY,
+            "MASTER_CONFIG_UNAVAILABLE",
+            format!("failed to read from {port}"),
+        );
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["success"], json!(false));
+        assert_eq!(body["error"]["code"], json!("MASTER_CONFIG_UNAVAILABLE"));
+        assert!(body["data"].is_null());
+        // And the same address really is unreachable, so the test is not lying
+        // about the failure path it exercises.
+        assert!(fetch_master_config_view(&conf, "127.0.0.1:8995")
+            .await
+            .is_err());
+    }
+
+    /// The proxy must target the *new* view endpoint, not the frozen HA probe
+    /// route: `/api/v1/master/runtime` answers with liveness metadata only and
+    /// its shape is relied upon by `fetch_master_runtime_info`, so pointing the
+    /// console at it would render an empty page instead of failing loudly.
+    #[test]
+    fn proxy_targets_the_view_endpoint_not_the_ha_probe_route() {
+        let conf = conf_pointing_at(9010);
+        let url = master_config_view_scrape_url(&conf, "127.0.0.1:8995");
+        assert!(
+            url.ends_with("/api/v1/master/config"),
+            "unexpected scrape target: {url}"
+        );
+        assert!(
+            !url.ends_with("/api/v1/master/runtime"),
+            "the HA probe route is not a config view: {url}"
+        );
+    }
+
+    /// A blank key would otherwise travel down the RPC as an unknown key and be
+    /// reported as a rejected update; catching it first keeps the console's error
+    /// text about the request rather than about the cluster.
+    #[tokio::test]
+    async fn config_update_rejects_a_blank_key_before_any_rpc() {
+        let conf = conf_pointing_at(9010);
+        let handler = Arc::new(
+            AdminRouterHandler::with_rt(conf, Arc::new(Runtime::single()))
+                .expect("handler builds without a reachable master"),
+        );
+        let response = config_update_v1(
+            Extension(handler),
+            Json(ConfigUpdateRequest {
+                key: "   ".to_string(),
+                value: Some("true".to_string()),
+            }),
+        )
+        .await
+        .expect("validation failures travel in-band");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], json!("CONFIG_KEY_REQUIRED"));
+    }
+
+    /// The RPC layer hands values back as JSON text. Passing that through
+    /// verbatim would nest a double-encoded string in the response, so the
+    /// console would render `"true"` (quoted) instead of `true`.
+    #[test]
+    fn rpc_json_text_becomes_a_real_value() {
+        assert_eq!(parse_json_text("true"), json!(true));
+        assert_eq!(parse_json_text("32"), json!(32));
+        assert_eq!(parse_json_text("[\"/a\"]"), json!(["/a"]));
+        // Not JSON: keep the text so the operator still sees what was stored
+        // instead of a parse error replacing the value.
+        assert_eq!(parse_json_text("1800000ms"), json!("1800000ms"));
     }
 }

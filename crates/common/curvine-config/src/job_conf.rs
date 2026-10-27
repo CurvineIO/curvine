@@ -25,19 +25,19 @@ pub struct JobConf {
     // job expiration time (seconds)
     #[serde(skip)]
     pub job_life_ttl: Duration,
-    #[serde(alias = "job_life_ttl")]
+    #[serde(rename = "job_life_ttl", alias = "job_life_ttl_str")]
     pub job_life_ttl_str: String,
 
     // Task expiration time (seconds)
     #[serde(skip)]
     pub job_cleanup_ttl: Duration,
-    #[serde(alias = "job_cleanup_ttl")]
+    #[serde(rename = "job_cleanup_ttl", alias = "job_cleanup_ttl_str")]
     pub job_cleanup_ttl_str: String,
 
     // How long terminal load jobs stay queryable in the legacy master JobStore.
     #[serde(skip)]
     pub terminal_retention: Duration,
-    #[serde(alias = "terminal_retention")]
+    #[serde(rename = "terminal_retention", alias = "terminal_retention_str")]
     pub terminal_retention_str: String,
 
     // Maximum number of files allowed to be loaded by a job
@@ -61,19 +61,22 @@ pub struct JobConf {
     // Time to reuse a deterministic source-not-found load failure before retrying UFS.
     #[serde(skip)]
     pub master_failed_load_job_retry_interval: Duration,
-    #[serde(alias = "master_failed_load_job_retry_interval")]
+    #[serde(
+        rename = "master_failed_load_job_retry_interval",
+        alias = "master_failed_load_job_retry_interval_str"
+    )]
     pub master_failed_load_job_retry_interval_str: String,
 
     // Maximum execution time allowed for a task.
     #[serde(skip)]
     pub task_timeout: Duration,
-    #[serde(alias = "task_timeout")]
+    #[serde(rename = "task_timeout", alias = "task_timeout_str")]
     pub task_timeout_str: String,
 
     // Task progress reporting interval
     #[serde(skip)]
     pub task_report_interval: Duration,
-    #[serde(alias = "task_report_interval")]
+    #[serde(rename = "task_report_interval", alias = "task_report_interval_str")]
     pub task_report_interval_str: String,
 
     // Maximum concurrency allowed by worker

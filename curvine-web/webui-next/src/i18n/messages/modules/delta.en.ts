@@ -21,6 +21,7 @@ export default {
     tasks: 'tasks',
     active: 'active',
     good: 'good',
+    hot: 'hot',
     warn: 'warn',
     bad: 'bad',
     neutral: 'neutral'

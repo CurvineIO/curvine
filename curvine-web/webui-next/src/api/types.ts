@@ -124,11 +124,61 @@ export interface WorkerDetailData {
 
 export type ConfigValue = string | number | boolean | null | ConfigValue[] | { [key: string]: ConfigValue }
 
-export type ConfigSource = 'default' | 'file' | 'env' | 'cli'
+/**
+ * Where a configuration leaf's current value came from.
+ *
+ * `derived` is not a file value: the loader computes it after deserialization
+ * (the legacy `master.web_port` split, a hostname resolved from `net_interface`,
+ * the synthesized `client.master_addrs`). `runtime` means a process-local
+ * override is active — it is not persisted and disappears on restart.
+ */
+export type ConfigSource = 'default' | 'file' | 'env' | 'cli' | 'derived' | 'runtime'
+
+/** One hot-tunable knob as the owning process currently sees it. */
+export interface ConfigRuntimeEntry {
+  /** Registry key, e.g. `master.dir_space_enabled`. Not a configuration path. */
+  key: string
+  /** Configuration path the key backs, e.g. `master.dir_space.enabled`. */
+  path: string
+  file_value: ConfigValue
+  override_value?: ConfigValue
+  effective_value: ConfigValue
+}
 
 export interface ConfigData {
+  role?: string
+  node?: string
   values: ConfigValue
   sources?: Record<string, ConfigSource>
+  runtime?: ConfigRuntimeEntry[]
+  /** Registry keys that may be changed through `POST /api/update_config`. */
+  writable?: string[]
+  /**
+   * Registered keys whose configuration path could not be resolved in the
+   * published tree. Non-empty means the backend and the configuration schema
+   * have drifted; those keys are excluded from every other field.
+   */
+  unresolved?: string[]
+  /** Whether hot-tunable changes survive a restart. Currently always false. */
+  persistent?: boolean
+}
+
+/** Body of `POST /api/v1/config`. */
+export interface ConfigUpdate {
+  /** Registry key, e.g. `master.dir_space_enabled`. */
+  key: string
+  /** `null` clears the active override and restores the file-backed value. */
+  value: string | null
+}
+
+/** What `POST /api/v1/config` reports after a push or a reset. */
+export interface ConfigUpdateResult {
+  key: string
+  previous_value?: ConfigValue
+  value?: ConfigValue
+  effective_value?: ConfigValue
+  reset?: boolean
+  persistent?: boolean
 }
 
 export interface BrowseEntry {

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::validation::ConfValidate;
-use crate::{pipeline, validation};
+use crate::{pipeline, validation, ConfigSource, ConfigSourceMap};
 use crate::{
     CliConf, ClientConf, DBConf, DiscoveryConf, FuseConf, JobConf, JournalConf, MasterConf,
     MdsConf, TransferConf, WebConf, WorkerConf,
@@ -106,33 +106,73 @@ impl ClusterConf {
     /// validate → discovery.init → resolve_master_addrs`.
     /// See [`crate::pipeline`] for layer semantics.
     pub fn from<T: AsRef<str>>(path: T) -> CommonResult<Self> {
+        Ok(Self::from_with_sources(path)?.0)
+    }
+
+    /// [`Self::from`] plus the layer that supplied each effective leaf.
+    ///
+    /// The map covers file, environment and CLI layers as produced by the
+    /// pipeline, and marks values this loader computes *after* deserialization
+    /// as [`ConfigSource::Derived`] — `master.web_port` after the legacy port
+    /// split, and the synthesized `client.master_addrs`. Reporting those as
+    /// `File` would claim a file value the process is not using.
+    pub fn from_with_sources<T: AsRef<str>>(path: T) -> CommonResult<(Self, ConfigSourceMap)> {
         let text = pipeline::read_file_text(path.as_ref())?;
         validation::warn_unknown_keys(&text);
-        let doc = pipeline::build_document(&text, &[])?;
-        let mut conf: Self = doc.try_into()?;
-        conf.normalize_whitespace();
-        conf.apply_hostname_overrides()?;
-        conf.normalize_split_web_ports();
-        conf.validate()?;
-        conf.discovery.init(&conf.cluster_id)?;
-        conf.resolve_master_addrs();
-        Ok(conf)
+        let (doc, sources) = pipeline::build_document_with_sources(&text, &[])?;
+        Self::finalize_full(doc, sources)
     }
 
     /// Load only the configuration needed by the standalone Transfer service.
     /// Same pipeline as [`Self::from`] with a transfer-scoped env layer
     /// (only client/transfer hostnames resolve) and a reduced validation set.
     pub fn from_transfer<T: AsRef<str>>(path: T) -> CommonResult<Self> {
+        Ok(Self::from_transfer_with_sources(path)?.0)
+    }
+
+    /// [`Self::from_transfer`] plus the effective source map.
+    pub fn from_transfer_with_sources<T: AsRef<str>>(
+        path: T,
+    ) -> CommonResult<(Self, ConfigSourceMap)> {
         let text = pipeline::read_file_text(path.as_ref())?;
         validation::warn_unknown_keys(&text);
-        let doc = pipeline::build_transfer_document(&text, &[])?;
+        let (doc, sources) = pipeline::build_transfer_document_with_sources(&text, &[])?;
+        Self::finalize_transfer(doc, sources)
+    }
+
+    /// Post-deserialization tail of [`Self::from`], carrying the source map.
+    fn finalize_full(
+        doc: toml::Value,
+        mut sources: ConfigSourceMap,
+    ) -> CommonResult<(Self, ConfigSourceMap)> {
+        let mut conf: Self = doc.try_into()?;
+        conf.normalize_whitespace();
+        conf.apply_hostname_overrides()?;
+        if conf.normalize_split_web_ports() {
+            sources.insert("master.web_port".to_string(), ConfigSource::Derived);
+        }
+        conf.validate()?;
+        conf.discovery.init(&conf.cluster_id)?;
+        if conf.resolve_master_addrs() {
+            sources.insert("client.master_addrs".to_string(), ConfigSource::Derived);
+        }
+        Ok((conf, sources))
+    }
+
+    /// Post-deserialization tail of [`Self::from_transfer`], carrying the map.
+    fn finalize_transfer(
+        doc: toml::Value,
+        mut sources: ConfigSourceMap,
+    ) -> CommonResult<(Self, ConfigSourceMap)> {
         let mut conf: Self = doc.try_into()?;
         conf.normalize_whitespace();
         conf.client.validate()?;
         conf.transfer.validate()?;
         conf.discovery.init(&conf.cluster_id)?;
-        conf.resolve_master_addrs();
-        Ok(conf)
+        if conf.resolve_master_addrs() {
+            sources.insert("client.master_addrs".to_string(), ConfigSource::Derived);
+        }
+        Ok((conf, sources))
     }
 
     fn normalize_whitespace(&mut self) {
@@ -168,7 +208,9 @@ impl ClusterConf {
             .collect();
     }
 
-    fn resolve_master_addrs(&mut self) {
+    /// Returns `true` when the value was rewritten, so the caller can record the
+    /// value as derived rather than file-supplied.
+    fn resolve_master_addrs(&mut self) -> bool {
         if self.client.master_addrs.is_empty() {
             if self.journal.journal_addrs.is_empty() {
                 self.client
@@ -181,17 +223,23 @@ impl ClusterConf {
                         .push(InetAddr::new(&peer.hostname, self.master.rpc_port));
                 }
             }
+            return true;
         }
+        false
     }
 
     /// Upgrade compatibility for the split between standalone `curvine-web`
     /// (`web.port`) and master Prometheus `/metrics` (`master.web_port`).
-    fn normalize_split_web_ports(&mut self) {
+    ///
+    /// Returns `true` when the value was migrated, so the caller can record
+    /// `master.web_port` as derived instead of echoing the file value it is not
+    /// going to use.
+    fn normalize_split_web_ports(&mut self) -> bool {
         if self.master.web_port != self.web.port {
-            return;
+            return false;
         }
         if self.master.web_port != Self::DEFAULT_WEB_PORT {
-            return;
+            return false;
         }
         log::warn!(
             "master.web_port and web.port both use legacy unified port {} on the same host; \
@@ -201,6 +249,7 @@ impl ClusterConf {
             Self::DEFAULT_MASTER_WEB_PORT
         );
         self.master.web_port = Self::DEFAULT_MASTER_WEB_PORT;
+        true
     }
 
     fn apply_hostname_overrides(&mut self) -> CommonResult<()> {
@@ -548,7 +597,14 @@ pub struct S3GatewayConf {
     pub put_temp_dir: String,
     pub put_memory_buffer_threshold: usize,
     pub put_max_memory_buffer: usize,
+    /// Credential material. Never serialized: the config view exposes the whole
+    /// `ClusterConf` tree to unauthenticated observability ports, so a plaintext
+    /// round-trip here would publish the secret. Deserialization is unchanged, so
+    /// the value can still be supplied through the configuration file.
+    #[serde(skip_serializing)]
     pub access_key: Option<String>,
+    /// Secret material. See [`S3GatewayConf::access_key`].
+    #[serde(skip_serializing)]
     pub secret_key: Option<String>,
     pub enable_distributed_auth: bool,
     pub credentials_path: Option<String>,
@@ -1066,5 +1122,55 @@ mod tests {
         assert_eq!(conf.client.hostname, "127.0.0.1");
         assert_eq!(conf.transfer.hostname, "127.0.0.1");
         assert_eq!(conf.client.master_addrs[0].hostname, "cv-master");
+    }
+
+    /// The config view publishes the whole `ClusterConf` tree over ports that
+    /// carry no authentication (master / worker / transfer observability
+    /// listeners), so credential material must never reach a serialized form.
+    /// Deserialization still has to work: operators configure these keys in the
+    /// cluster TOML even though no component reads them today.
+    #[test]
+    fn s3_gateway_credentials_are_not_serialized() {
+        let mut conf = ClusterConf::default();
+        conf.s3_gateway.access_key = Some("AKIA_PROBE_ACCESS".to_string());
+        conf.s3_gateway.secret_key = Some("PROBE_SECRET_VALUE".to_string());
+
+        let toml = conf.to_pretty_toml().expect("serialize to toml");
+        assert!(
+            !toml.contains("AKIA_PROBE_ACCESS"),
+            "access_key must not appear in the serialized toml"
+        );
+        assert!(
+            !toml.contains("PROBE_SECRET_VALUE"),
+            "secret_key must not appear in the serialized toml"
+        );
+
+        let json = serde_json::to_value(&conf).expect("serialize to json");
+        let json = json.to_string();
+        assert!(
+            !json.contains("AKIA_PROBE_ACCESS"),
+            "access_key must not appear in the serialized json"
+        );
+        assert!(
+            !json.contains("PROBE_SECRET_VALUE"),
+            "secret_key must not appear in the serialized json"
+        );
+
+        let parsed: ClusterConf = toml::from_str(
+            r#"
+            [s3_gateway]
+            access_key = "AKIA_ROUNDTRIP"
+            secret_key = "ROUNDTRIP_SECRET"
+            "#,
+        )
+        .expect("credentials must still deserialize");
+        assert_eq!(
+            parsed.s3_gateway.access_key.as_deref(),
+            Some("AKIA_ROUNDTRIP")
+        );
+        assert_eq!(
+            parsed.s3_gateway.secret_key.as_deref(),
+            Some("ROUNDTRIP_SECRET")
+        );
     }
 }

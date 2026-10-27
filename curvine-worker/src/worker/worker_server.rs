@@ -19,7 +19,7 @@ use crate::worker::replication::worker_replication_manager::WorkerReplicationMan
 use crate::worker::runtime_config::build_worker_runtime_registry;
 use crate::worker::task::TaskManager;
 use crate::worker::WorkerMetrics;
-use curvine_config::{ClusterConf, RuntimeConfigRegistry};
+use curvine_config::{ClusterConf, ConfigSourceMap, RuntimeConfigRegistry};
 use curvine_core_error::StringError;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
@@ -60,6 +60,10 @@ pub struct WorkerService {
     /// handlers share the policy without deep-copying it per connection.
     compatibility_policy: Arc<CompatibilityPolicy>,
     runtime_config: Arc<RuntimeConfigRegistry>,
+    /// Layer attribution captured when the conf was loaded, so the config
+    /// endpoint can say *where* each value came from. Empty when the caller
+    /// built the conf without source tracking.
+    config_sources: ConfigSourceMap,
     registration: MasterRegistration,
 }
 
@@ -68,6 +72,16 @@ impl WorkerService {
         conf: &ClusterConf,
         rt: Arc<Runtime>,
         worker_session_id: String,
+    ) -> CommonResult<Self> {
+        Self::with_conf_and_sources(conf, rt, worker_session_id, ConfigSourceMap::new())
+    }
+
+    /// Same as [`WorkerService::with_conf`] but keeps the loader's layer map.
+    pub fn with_conf_and_sources(
+        conf: &ClusterConf,
+        rt: Arc<Runtime>,
+        worker_session_id: String,
+        config_sources: ConfigSourceMap,
     ) -> CommonResult<Self> {
         let fault_http = FaultHttpControl::from_env(&conf.fault_injection)
             .map_err(|error| CommonError::from(error.to_string()))?;
@@ -98,6 +112,7 @@ impl WorkerService {
             server_state: Arc::new(OnceCell::new()),
             compatibility_policy: Arc::new(conf.worker.compatibility.to_policy()),
             runtime_config,
+            config_sources,
             registration: MasterRegistration::new(),
         };
         Ok(ws)
@@ -145,11 +160,17 @@ impl WebHandlerService for WorkerService {
     type Item = WorkerRouterHandler;
 
     fn get_handler(&self) -> Self::Item {
+        let config_view = WorkerRouterHandler::build_config_view(
+            &self.conf,
+            self.config_sources.clone(),
+            self.runtime_config.clone(),
+        );
         WorkerRouterHandler {
             fault_http: self.fault_http.clone(),
             server_state: self.server_state.clone(),
             task_manager: self.task_manager.clone(),
             runtime_config: self.runtime_config.clone(),
+            config_view,
             registration: self.registration.clone(),
         }
     }
@@ -166,8 +187,18 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// Starts a worker without configuration-layer attribution.
+    pub fn with_conf(conf: ClusterConf) -> CommonResult<Self> {
+        Self::with_conf_and_sources(conf, ConfigSourceMap::new())
+    }
+
+    /// Same as [`Worker::with_conf`] but threads the loader's layer map into the
+    /// web config endpoint so it can report `file` / `env` / `cli` sources.
     #[cfg_attr(not(feature = "spdk"), allow(unused_mut))]
-    pub fn with_conf(mut conf: ClusterConf) -> CommonResult<Self> {
+    pub fn with_conf_and_sources(
+        mut conf: ClusterConf,
+        config_sources: ConfigSourceMap,
+    ) -> CommonResult<Self> {
         Logger::init(conf.worker.log.clone());
 
         // Init SPDK before WorkerService - enables BlockMeta to open SPDK bdevs
@@ -235,8 +266,12 @@ impl Worker {
 
         let rt = Arc::new(conf.worker_server_conf().create_runtime());
         let worker_session_id = Utils::uuid();
-        let service: WorkerService =
-            WorkerService::with_conf(&conf, rt.clone(), worker_session_id.clone())?;
+        let service: WorkerService = WorkerService::with_conf_and_sources(
+            &conf,
+            rt.clone(),
+            worker_session_id.clone(),
+            config_sources,
+        )?;
         let worker_id = service.store.worker_id()?;
 
         CLUSTER_CONF.get_or_init(|| conf.clone());

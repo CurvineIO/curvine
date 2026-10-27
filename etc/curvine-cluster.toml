@@ -109,6 +109,8 @@ max_tracked_points = 128
 # `/` selects the global scan; other absolute paths are tracked points.
 # Both this list and enabled can be changed with `cv admin config`
 # (`master.dir_space_enabled`, `master.dir_space_tracked_paths`).
+# Those runtime keys keep their historical spelling; the configuration paths
+# they back are `master.dir_space.enabled` and `master.dir_space.tracked_paths`.
 auto_track_mounts = false
 tracked_paths = []
 # How long a snapshot restore waits for an in-flight scan lease to drop.

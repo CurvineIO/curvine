@@ -330,3 +330,37 @@ fn rejects_invalid_octal_umask() {
 fn default_master_conn_pool_size_is_one() {
     assert_eq!(ClientConf::default().master_conn_pool_size, 1);
 }
+
+/// The `_str` twins serialize under their base name (`rename`) while still
+/// accepting the historical `_str` spelling (`alias`). The CLI long name is
+/// derived from whichever of the two the `#[serde]` attribute carries, so this
+/// pins the user-facing flag: `--client.block-size` must keep working and the
+/// internal `--client.block-size-str` spelling must stay hidden.
+///
+/// The guarantee is that `rename` and `alias` sit in the *same* `#[serde(...)]`
+/// attribute. Splitting them into two attributes silently renames the flag to
+/// `--client.block-size-str` with no other test noticing.
+#[test]
+fn duration_twin_keeps_its_documented_cli_long_name() {
+    let parsed =
+        CliHarness::try_parse_from(["curvine-fuse", "--client.block-size", "64MB"]).unwrap();
+    assert_eq!(parsed.overrides.block_size_str.as_deref(), Some("64MB"));
+
+    let err = CliHarness::try_parse_from(["curvine-fuse", "--client.block-size-str", "64MB"])
+        .unwrap_err();
+    // clap echoes the rejected argument back, so only the usage line says which
+    // spellings are actually accepted.
+    let message = err.to_string();
+    let usage = message
+        .lines()
+        .find(|line| line.trim_start().starts_with("Usage:"))
+        .unwrap_or_else(|| panic!("expected a usage line, got: {message}"));
+    assert!(
+        usage.contains("--client.block-size <"),
+        "usage should advertise the documented long name, got: {usage}"
+    );
+    assert!(
+        !usage.contains("--client.block-size-str"),
+        "the internal _str spelling must stay hidden, got: {usage}"
+    );
+}

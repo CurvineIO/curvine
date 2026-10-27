@@ -120,6 +120,13 @@ jobs:
           echo "After build, disk usage:"
           df -h
 
+      # The config crate carries the whole serialization surface behind the
+      # configuration console, but only the nightly coverage job ran its tests,
+      # so a twenty-field serialization change could land green. Gate it here.
+      - name: Config crate tests
+        run: |
+          cargo test -p curvine-config --jobs ${{ env.CARGO_BUILD_JOBS }}
+
       - name: Run etcd service discovery tests
         run: |
           echo "Running feature-gated etcd service discovery unit tests"

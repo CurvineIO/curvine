@@ -49,6 +49,13 @@ type RuntimeResetFn = Arc<dyn Fn() -> CommonResult<Value> + Send + Sync>;
 
 struct EntryInner {
     key: &'static str,
+    /// Dotted path of the on-disk configuration field this key is backed by.
+    ///
+    /// `None` means "identical to `key`" — either because the runtime key is already
+    /// the real config path, or because the parameter has no configuration-file entry
+    /// at all (runtime-only knob). Use [`RuntimeConfigRegistry::config_path`] to read
+    /// the resolved value.
+    config_path: Option<&'static str>,
     file_value: RuntimeValueFn,
     effective: RuntimeValueFn,
     apply: RuntimeApplyFn,
@@ -75,9 +82,31 @@ impl RuntimeConfigRegistryBuilder {
 
     /// Registers one hot-updatable key. `apply` must be all-or-nothing: on error the
     /// runtime state and override map are unchanged.
+    ///
+    /// The configuration path defaults to the runtime key itself; use
+    /// [`Self::register_at`] when the key name and the on-disk config path differ.
     pub fn register(
+        self,
+        key: &'static str,
+        file_value: impl Fn() -> Value + Send + Sync + 'static,
+        effective: impl Fn() -> Value + Send + Sync + 'static,
+        apply: impl Fn(&str) -> CommonResult<(Value, Value)> + Send + Sync + 'static,
+        reset: impl Fn() -> CommonResult<Value> + Send + Sync + 'static,
+    ) -> Self {
+        self.register_at(key, None, file_value, effective, apply, reset)
+    }
+
+    /// Registers one hot-updatable key and declares the dotted configuration path
+    /// that backs it.
+    ///
+    /// `config_path` exists so a runtime key can keep a stable, documented name even
+    /// when the value lives elsewhere in the TOML tree (for example
+    /// `master.dir_space_enabled` backing `master.dir_space.enabled`). Passing `None`
+    /// keeps the legacy behaviour: the key is treated as the config path itself.
+    pub fn register_at(
         mut self,
         key: &'static str,
+        config_path: Option<&'static str>,
         file_value: impl Fn() -> Value + Send + Sync + 'static,
         effective: impl Fn() -> Value + Send + Sync + 'static,
         apply: impl Fn(&str) -> CommonResult<(Value, Value)> + Send + Sync + 'static,
@@ -85,6 +114,7 @@ impl RuntimeConfigRegistryBuilder {
     ) -> Self {
         self.entries.push(EntryInner {
             key,
+            config_path,
             file_value: Arc::new(file_value),
             effective: Arc::new(effective),
             apply: Arc::new(apply),
@@ -127,6 +157,36 @@ impl RuntimeConfigRegistry {
         let mut keys: Vec<_> = self.inner.entries.keys().copied().collect();
         keys.sort_unstable();
         keys
+    }
+
+    /// Dotted configuration path backing `key`.
+    ///
+    /// Returns `Some(entry.config_path.unwrap_or(entry.key))` for a registered key — so
+    /// keys registered through [`RuntimeConfigRegistryBuilder::register`] resolve to
+    /// themselves — and `None` for a key that was never registered.
+    ///
+    /// Note this is a *resolved* view: an entry that declares no config path (see
+    /// [`Self::declared_config_path`]) still falls back to its own key. Use
+    /// [`Self::declared_config_path`] when the caller must tell "no configuration-file
+    /// field at all" apart from "config path happens to equal the key".
+    pub fn config_path(&self, key: &str) -> Option<&'static str> {
+        self.inner
+            .entries
+            .get(key)
+            .map(|entry| entry.config_path.unwrap_or(entry.key))
+    }
+
+    /// Raw config-path declaration, without the `key` fallback.
+    ///
+    /// `None` = the key was never registered; `Some(None)` = registered without an
+    /// explicit path (the key *is* the config path); `Some(Some(path))` = backed by an
+    /// explicit config path.
+    ///
+    /// This is what lets a caller distinguish a runtime-only knob (registered with
+    /// `None` through [`RuntimeConfigRegistryBuilder::register_at`]) from one whose
+    /// config path merely coincides with its key.
+    pub fn declared_config_path(&self, key: &str) -> Option<Option<&'static str>> {
+        self.inner.entries.get(key).map(|entry| entry.config_path)
     }
 
     pub fn set(
@@ -322,5 +382,77 @@ mod tests {
         assert_eq!(listed[0].key, "a_key");
         assert_eq!(listed[1].key, "b_key");
         assert_eq!(registry.list_as_json()["a_key"], Value::from(false));
+    }
+
+    #[test]
+    fn config_path_defaults_to_key() {
+        let registry = RuntimeConfigRegistry::builder()
+            .register(
+                "demo.limit",
+                || Value::from(1),
+                || Value::from(1),
+                |_| Ok((Value::from(1), Value::from(1))),
+                || Ok(Value::from(1)),
+            )
+            .build();
+        assert_eq!(registry.config_path("demo.limit"), Some("demo.limit"));
+        // `register` is sugar for `register_at(.., None, ..)`: nothing explicit declared.
+        assert_eq!(registry.declared_config_path("demo.limit"), Some(None));
+    }
+
+    #[test]
+    fn register_at_declares_custom_path() {
+        let registry = RuntimeConfigRegistry::builder()
+            .register_at(
+                "demo_limit",
+                Some("a.b.c"),
+                || Value::from(1),
+                || Value::from(1),
+                |_| Ok((Value::from(1), Value::from(1))),
+                || Ok(Value::from(1)),
+            )
+            .build();
+        // The key keeps its own identity…
+        assert_eq!(registry.keys(), vec!["demo_limit"]);
+        // …while the config path points at the real field.
+        assert_eq!(registry.config_path("demo_limit"), Some("a.b.c"));
+        assert_eq!(
+            registry.declared_config_path("demo_limit"),
+            Some(Some("a.b.c"))
+        );
+    }
+
+    #[test]
+    fn register_at_none_declares_no_config_path() {
+        // A runtime-only knob: `config_path` falls back to the key, but the declaration
+        // itself stays empty so a view builder can tell "no file field" apart from
+        // "config path happens to equal the key".
+        let registry = RuntimeConfigRegistry::builder()
+            .register_at(
+                "runtime_only",
+                None,
+                || Value::from(1),
+                || Value::from(1),
+                |_| Ok((Value::from(1), Value::from(1))),
+                || Ok(Value::from(1)),
+            )
+            .build();
+        assert_eq!(registry.config_path("runtime_only"), Some("runtime_only"));
+        assert_eq!(registry.declared_config_path("runtime_only"), Some(None));
+    }
+
+    #[test]
+    fn config_path_of_unregistered_key_is_none() {
+        let registry = RuntimeConfigRegistry::builder()
+            .register(
+                "demo.limit",
+                || Value::from(1),
+                || Value::from(1),
+                |_| Ok((Value::from(1), Value::from(1))),
+                || Ok(Value::from(1)),
+            )
+            .build();
+        assert_eq!(registry.config_path("not.registered"), None);
+        assert_eq!(registry.declared_config_path("not.registered"), None);
     }
 }

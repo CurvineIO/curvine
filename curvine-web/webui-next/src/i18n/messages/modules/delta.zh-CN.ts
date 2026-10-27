@@ -21,6 +21,7 @@ export default {
     tasks: '子任务',
     active: '活跃',
     good: '良好',
+    hot: '可热改',
     warn: '警告',
     bad: '异常',
     neutral: '中性'

@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use curvine_alloc as _;
-use curvine_config::{ClusterConf, ConfigLoader};
+use curvine_config::{ClusterConf, ConfigLoader, ConfigSourceMap};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_data_transfer::transfer::TransferServer;
 use curvine_master::master::Master;
@@ -42,19 +42,19 @@ fn main() -> CommonResult<()> {
     );
 
     let service = args.get_service()?;
-    let mut conf = args.get_conf(&service)?;
+    let (mut conf, config_sources) = args.get_conf_with_sources(&service)?;
 
     Utils::set_panic_exit_hook();
 
     match service {
         ServiceType::Master => {
             conf.check_master_hostname()?;
-            let master = Master::with_conf(conf)?;
+            let master = Master::with_conf_and_sources(conf, config_sources)?;
             master.block_on_start()?;
         }
 
         ServiceType::Worker => {
-            let worker = Worker::with_conf(conf)?;
+            let worker = Worker::with_conf_and_sources(conf, config_sources)?;
             worker.block_on_start()?;
         }
 
@@ -64,7 +64,7 @@ fn main() -> CommonResult<()> {
         }
 
         ServiceType::Transfer => {
-            let transfer = TransferServer::with_conf(conf)?;
+            let transfer = TransferServer::with_conf_and_sources(conf, config_sources)?;
             transfer.block_on_start()?;
         }
     }
@@ -110,6 +110,16 @@ impl ServerArgs {
     }
 
     pub fn get_conf(&self, service: &ServiceType) -> CommonResult<ClusterConf> {
+        Ok(self.get_conf_with_sources(service)?.0)
+    }
+
+    /// Same as [`ServerArgs::get_conf`] but also returns the layer map, so the
+    /// process can tell the config endpoint which file/env/cli layer supplied
+    /// each value.
+    pub fn get_conf_with_sources(
+        &self,
+        service: &ServiceType,
+    ) -> CommonResult<(ClusterConf, ConfigSourceMap)> {
         // Unified discovery: `--conf` > CURVINE_CONF_FILE > well-known
         // locations (launch scripts export the env var; bare local runs fall
         // back to ./conf/curvine-cluster.toml).
@@ -126,11 +136,12 @@ impl ServerArgs {
         )?;
         println!("Loading config from {} ({})", found.as_str(), found.source);
 
-        let load = match service {
-            ServiceType::Transfer => ClusterConf::from_transfer,
-            ServiceType::Master | ServiceType::Worker | ServiceType::Mds => ClusterConf::from,
-        };
-        load(found.as_str())
+        match service {
+            ServiceType::Transfer => ClusterConf::from_transfer_with_sources(found.as_str()),
+            ServiceType::Master | ServiceType::Worker | ServiceType::Mds => {
+                ClusterConf::from_with_sources(found.as_str())
+            }
+        }
     }
 }
 

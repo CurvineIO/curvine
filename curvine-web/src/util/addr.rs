@@ -379,6 +379,19 @@ pub fn master_runtime_scrape_url(conf: &ClusterConf, master_addr: &str) -> Strin
     )
 }
 
+/// HTTP URL for the master's published effective configuration view.
+///
+/// This is the full view (`values` + `sources` + `runtime` + `writable`), not the
+/// flat key/value map behind `GET /api/v1/master/runtime/config`, so the console
+/// reads exactly what the master process is running with.
+pub fn master_config_view_scrape_url(conf: &ClusterConf, master_addr: &str) -> String {
+    format!(
+        "http://{}:{}/api/v1/master/config",
+        resolve_master_scrape_hostname(conf, master_addr),
+        master_scrape_web_port(conf, master_addr)
+    )
+}
+
 fn docker_container_ip(hostname: &str) -> Option<String> {
     let name = hostname.trim();
     if name.is_empty() {
