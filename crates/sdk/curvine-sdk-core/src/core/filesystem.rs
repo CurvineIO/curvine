@@ -64,6 +64,14 @@ impl LibFilesystem {
             .block_on(async { self.inner().delete(&path, recursive).await })
     }
 
+    /// Deletes without waiting for the master to reclaim the entry; the returned
+    /// counts are zero because the purge has not run yet.
+    pub fn delete_async(&self, path: impl AsRef<str>, recursive: bool) -> FsResult<DeleteResult> {
+        let path = Path::from_str(path)?;
+        self.rt()
+            .block_on(async { self.inner().delete_async(&path, recursive).await })
+    }
+
     pub fn get_status(&self, path: impl AsRef<str>) -> FsResult<BytesMut> {
         let path = Path::from_str(path)?;
         self.rt()

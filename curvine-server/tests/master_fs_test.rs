@@ -2325,8 +2325,10 @@ fn trash_rpc_list_restore_empty() -> CommonResult<()> {
     let mut del_ctx = RpcContext::new(&del_msg);
     handler.retry_check_delete(&mut del_ctx)?;
 
+    // A client that predates the `wait` field omits it and must keep the
+    // blocking contract with real reclaimed counts.
     let empty_msg = Builder::new_rpc(RpcCode::EmptyTrash)
-        .proto_header(EmptyTrashRequest { wait: Some(true) })
+        .proto_header(EmptyTrashRequest { wait: None })
         .build();
     let mut empty_ctx = RpcContext::new(&empty_msg);
     let empty_rep = handler

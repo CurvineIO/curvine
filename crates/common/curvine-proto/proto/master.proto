@@ -164,8 +164,9 @@ message RestoreTrashResponse {
 message EmptyTrashRequest {
     // Block until the entries are reclaimed and return the real counts. When
     // false, the entries are staged for the background purger and the response
-    // only reports how many were accepted.
-    optional bool wait = 1 [default = false];
+    // only reports how many were accepted. Defaults to true so a client that
+    // predates this field keeps the blocking contract during rolling upgrades.
+    optional bool wait = 1 [default = true];
 }
 
 message EmptyTrashResponse {
