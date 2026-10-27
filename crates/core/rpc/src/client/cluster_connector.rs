@@ -265,6 +265,27 @@ impl ClusterConnector {
         self.timeout_rpc_to_peer::<E>(&peer, msg).await
     }
 
+    /// Send one RPC with a deadline that covers both pooled-client acquisition
+    /// (including connection establishment) and the request/response exchange.
+    /// This is used by opportunistic follower reads so a blackholed peer cannot
+    /// consume the leader's remaining request budget.
+    pub async fn timeout_rpc_with_timeout<E>(
+        &self,
+        id: u64,
+        msg: impl RefMessage,
+        timeout: Duration,
+    ) -> Result<Message, (bool, E)>
+    where
+        E: ErrorExt + From<IOError> + From<CommonError>,
+    {
+        let peer = match self.get_addr(id) {
+            Err(e) => return Err((true, e.into())),
+            Ok(v) => v,
+        };
+        self.timeout_rpc_to_peer_with_timeout::<E>(&peer, msg, timeout)
+            .await
+    }
+
     async fn timeout_rpc_to_peer<E>(
         &self,
         peer: &NodeAddr,
@@ -307,8 +328,78 @@ impl ClusterConnector {
 
             Err(e) => {
                 client.set_closed();
-                self.factory.remove(&peer.addr);
+                self.factory.remove_client(&peer.addr, &client);
                 Err((true, e.into()))
+            }
+        }
+    }
+
+    async fn timeout_rpc_to_peer_with_timeout<E>(
+        &self,
+        peer: &NodeAddr,
+        msg: impl RefMessage,
+        timeout: Duration,
+    ) -> Result<Message, (bool, E)>
+    where
+        E: ErrorExt + From<IOError> + From<CommonError>,
+    {
+        // Reject stale peer snapshots before spending any of the caller's
+        // deadline opening a connection to an endpoint that is already gone.
+        let is_current = self
+            .membership
+            .read()
+            .unwrap()
+            .peers
+            .get(&peer.id)
+            .is_some_and(|current| current.as_ref() == peer);
+        if !is_current {
+            return Err((
+                true,
+                IOError::create(format!(
+                    "Node {} is no longer in the connector membership",
+                    peer.id
+                ))
+                .into(),
+            ));
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let client = match tokio::time::timeout_at(deadline, self.factory.get(&peer.addr)).await {
+            Ok(Ok(client)) => client,
+            Ok(Err(error)) => return Err((true, error.into())),
+            Err(_) => {
+                return Err((
+                    true,
+                    IOError::create(format!(
+                        "timed out connecting to follower node {} after {:?}",
+                        peer.id, timeout
+                    ))
+                    .into(),
+                ));
+            }
+        };
+
+        match tokio::time::timeout_at(deadline, client.rpc(msg)).await {
+            Ok(Ok(response)) => match response.check_error_ext::<E>() {
+                Err(error) => Err((error.should_retry(), error)),
+                Ok(_) => Ok(response),
+            },
+            Ok(Err(error)) => {
+                client.set_closed();
+                self.factory.remove_client(&peer.addr, &client);
+                Err((true, error.into()))
+            }
+            Err(_) => {
+                client.set_closed();
+                self.factory.remove_client(&peer.addr, &client);
+                Err((
+                    true,
+                    IOError::create(format!(
+                        "timed out requesting follower node {} after {:?}",
+                        peer.id, timeout
+                    ))
+                    .into(),
+                ))
             }
         }
     }
