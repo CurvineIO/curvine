@@ -80,6 +80,12 @@ pub struct MasterFilesystem {
     full_report_tracker: FullReportTracker,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
+    /// Serialises drains of `/.Trash/.pending`. The blocking empty-trash call
+    /// owns the staging directory across staging and draining, and the
+    /// background purger skips a cycle while that lock is held, so the two can
+    /// never reclaim the same entry and the blocking caller always reports the
+    /// totals it actually reclaimed.
+    pending_drain: Arc<Mutex<()>>,
 }
 
 pub struct BlockReportResult {
@@ -175,6 +181,7 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_THREADS,
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
+            pending_drain: Default::default(),
         }
     }
 
@@ -191,6 +198,7 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_THREADS,
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
+            pending_drain: Default::default(),
         }
     }
 
@@ -471,45 +479,107 @@ impl MasterFilesystem {
         Ok(restored)
     }
 
-    pub fn empty_trash(&self) -> FsResult<DeleteResult> {
-        // Snapshot the names once so the purge releases the write lock between
-        // batches instead of blocking every metadata mutation for the whole
-        // purge. Entries added after the snapshot stay for the next purge.
+    /// Stages every visible recycle-bin entry for the background purger and
+    /// returns how many were accepted. Entries are renamed, not walked, so the
+    /// call does not depend on the size of the trashed subtrees.
+    ///
+    /// Leadership is re-checked under each batch's write lock: a demotion while
+    /// the loop is between batches must stop the staging instead of letting a
+    /// former leader persist further renames and journal records.
+    pub fn stage_trash_for_purge(&self) -> FsResult<u64> {
         const BATCH_SIZE: usize = 1000;
+
+        // Snapshot the names once: entries added after the snapshot stay for the
+        // next empty, and each batch releases the write lock between renames.
         let names = self.fs_dir.read().trash_entry_names()?;
-
-        let mut total = DeleteResult::new();
-        let mut first_err = None;
+        let mut staged = 0;
         for batch in names.chunks(BATCH_SIZE) {
-            let (mut delete_res, res) = {
-                let mut fs_dir = self.fs_dir.write();
-                fs_dir.empty_trash_batch(batch)
-            };
+            let mut fs_dir = self.fs_dir.write();
+            if !self.master_monitor.is_active() {
+                return err_ext!(FsError::not_leader(
+                    "empty-trash staging lost leadership mid-sweep"
+                ));
+            }
+            staged += fs_dir.stage_trash_entries(batch)?;
+        }
+        Ok(staged)
+    }
 
-            // Entries deleted before a failure have already left the namespace,
-            // so their block locations must be released even when the purge
-            // fails partway through the batch.
-            self.worker_manager.write().remove_blocks(&DeleteResult {
-                inodes: 0,
-                bytes: 0,
-                blocks: std::mem::take(&mut delete_res.blocks),
-                trashed: false,
-                purge_pending: false,
-            });
+    /// Takes ownership of `/.Trash/.pending` for a blocking drain.
+    pub(crate) fn lock_pending_drain(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.pending_drain.lock()
+    }
 
-            total.inodes += delete_res.inodes;
-            total.bytes += delete_res.bytes;
-            if let Err(e) = res {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
+    /// Non-blocking variant used by the background purger, which must never
+    /// queue behind a blocking empty-trash sweep.
+    pub(crate) fn try_lock_pending_drain(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        self.pending_drain.try_lock()
+    }
+
+    /// Drains `/.Trash/.pending` through the bounded purger until it is empty.
+    /// Returns the real reclaimed counts; `blocks` are already handed to the
+    /// worker managers by the purge batches themselves.
+    pub fn drain_pending_trash(&self) -> FsResult<Option<DeleteResult>> {
+        let _guard = self.lock_pending_drain();
+        self.drain_pending_trash_owned()
+    }
+
+    /// Drain body that assumes the caller already owns the pending directory.
+    fn drain_pending_trash_owned(&self) -> FsResult<Option<DeleteResult>> {
+        const BATCH_SIZE: usize = 64;
+        let purger = crate::master::fs::TrashPurger::new(self.clone(), self.master_monitor.clone());
+        let mut total = DeleteResult::new();
+        let mut start_after = None;
+
+        loop {
+            let page = self.scan_pending_trash(BATCH_SIZE, start_after.as_deref())?;
+            for path in page.paths {
+                let Some(outcome) = purger.purge_entry(&path)? else {
+                    return Ok(None);
+                };
+                total.inodes += outcome.inodes;
+                total.bytes += outcome.bytes;
+            }
+            match page.next_after {
+                Some(next) => start_after = Some(next),
+                None => return Ok(Some(total)),
             }
         }
+    }
 
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(total),
+    /// Empties the recycle bin. Returns the number of accepted entries and, in
+    /// wait mode, the counts actually reclaimed by the bounded purger.
+    ///
+    /// Both modes stage the entries first, so there is exactly one purge
+    /// implementation and an interrupted sweep resumes from `/.Trash/.pending`
+    /// instead of from an in-memory queue.
+    pub fn empty_trash0(&self, wait: bool) -> FsResult<(u64, DeleteResult)> {
+        if !wait {
+            let accepted = self.stage_trash_for_purge()?;
+            return Ok((accepted, DeleteResult::new()));
         }
+
+        // Hold the drain lock across staging and draining: the background
+        // purger must not reclaim an entry between the rename that stages it and
+        // the drain that has to report its totals.
+        let _guard = self.lock_pending_drain();
+        let accepted = self.stage_trash_for_purge()?;
+        match self.drain_pending_trash_owned()? {
+            Some(res) => Ok((accepted, res)),
+            // The master was demoted mid-sweep. The staged entries stay in the
+            // durable pending directory for the next active master, but this
+            // call cannot report the blocking totals the caller waits for, so it
+            // must fail retryably instead of caching a success with zero counts.
+            None => err_ext!(FsError::not_leader(
+                "empty-trash lost leadership before the staged entries were reclaimed"
+            )),
+        }
+    }
+
+    /// Empties the recycle bin synchronously, keeping the pre-async contract.
+    pub fn empty_trash(&self) -> FsResult<DeleteResult> {
+        let (_, res) = self.empty_trash0(true)?;
+        Ok(res)
     }
 
     pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
@@ -2920,6 +2990,44 @@ mod tests {
             .is_empty());
     }
 
+    // Expiry is a permanent removal. Sending it through the recycle bin kept
+    // the blocks for another retention window while the executor reported the
+    // length as reclaimed, so the freed space never showed up.
+    #[test]
+    fn ttl_expiry_bypasses_the_recycle_bin() {
+        use crate::master::meta::inode::ttl::InodeTtlExecutor;
+
+        let fs = test_fs_with_trash("ttl-permanent");
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .ttl_ms(1)
+            .ttl_action(TtlAction::Delete)
+            .build();
+        fs.create_with_opts(
+            "/ttl/expired.log",
+            opts,
+            OpenFlags::new_create().set_overwrite(true),
+        )
+        .unwrap();
+        fs.complete_file("/ttl/expired.log", None, 10, vec![], "", false, None)
+            .unwrap();
+        let inode_id = fs.file_status("/ttl/expired.log").unwrap().id;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let executor = InodeTtlExecutor::with_managers(fs.clone());
+        let (handled, _, reclaimed) = executor.execute_by_id(inode_id).unwrap();
+
+        assert!(handled);
+        assert_eq!(reclaimed, 10, "the expired length is reported as reclaimed");
+        assert!(fs.file_status("/ttl/expired.log").is_err());
+        assert!(
+            fs.list_trash().unwrap().is_empty(),
+            "an expired file must not become restorable"
+        );
+    }
+
     #[test]
     fn ttl_does_not_expunge_trashed_entries() {
         use crate::master::meta::inode::ttl::InodeTtlExecutor;
@@ -3163,6 +3271,8 @@ mod tests {
     #[test]
     fn empty_trash_purges_entries_but_keeps_the_trash_root() {
         let fs = test_fs_with_trash("trash-empty");
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
 
         let empty = fs.empty_trash().unwrap();
         assert_eq!(empty.inodes, 0);
@@ -3178,10 +3288,20 @@ mod tests {
 
         let res = fs.empty_trash().unwrap();
         assert_eq!(res.inodes, 2);
-        assert!(fs
+        // Every visible trash entry is gone, and the internal async-staging
+        // directory stays behind without being listed to clients.
+        assert!(fs.list_trash().unwrap().is_empty());
+        let children: Vec<String> = fs
             .list_options("/.Trash", ListOptions::default())
             .unwrap()
-            .is_empty());
+            .into_iter()
+            .map(|child| child.name)
+            .collect();
+        assert!(
+            children.is_empty(),
+            "the staging dir must be hidden: {:?}",
+            children
+        );
         assert!(fs.get_block_locations("/dir/child.log").is_err());
 
         fs.create("/next.log", true).unwrap();
@@ -3193,6 +3313,8 @@ mod tests {
     #[test]
     fn empty_trash_does_not_purge_foreign_children() {
         let fs = test_fs_with_trash("trash-empty-foreign");
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
 
         fs.create("/keep.log", true).unwrap();
         fs.delete_with_mode("/keep.log", false, DeleteMode::Default)
@@ -3220,8 +3342,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_trash_releases_blocks_of_entries_purged_before_a_failure() {
+    fn empty_trash_purges_healthy_entries_when_one_entry_is_corrupt() {
         let fs = test_fs_with_trash("trash-empty-partial");
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
         let worker_id = 100;
         let mut worker = WorkerInfo::default();
         worker.address.worker_id = worker_id;
@@ -3265,23 +3389,35 @@ mod tests {
         fs.delete_with_mode("/broken.log", false, DeleteMode::Default)
             .unwrap();
 
-        // Drop the store record of one trash entry so purging it fails. The
-        // loop must still purge the other entry and report its blocks.
-        let broken_id = fs
-            .list_trash()
-            .unwrap()
-            .into_iter()
+        // Drop the store record of one trash entry so it can no longer be
+        // resolved. Staging skips it instead of failing the sweep, and the
+        // healthy entry must still be purged with its blocks released.
+        let entries = fs.list_trash().unwrap();
+        let broken_id = entries
+            .iter()
             .find(|entry| entry.origin == "/broken.log")
             .unwrap()
             .status
             .id;
+        let good_entry = entries
+            .iter()
+            .find(|entry| entry.origin == "/good.log")
+            .unwrap()
+            .path
+            .clone();
         let fs_dir = fs.fs_dir.read();
         let mut batch = fs_dir.store.new_batch();
         batch.delete_inode(broken_id).unwrap();
         batch.commit().unwrap();
         drop(fs_dir);
 
-        assert!(fs.empty_trash().is_err());
+        let res = fs.empty_trash().unwrap();
+        assert_eq!(res.inodes, 1, "only the healthy entry is reclaimed");
+        assert!(fs.get_block_locations("/good.log").is_err());
+        assert!(
+            !fs.exists(&good_entry).unwrap(),
+            "the healthy entry must leave the recycle bin"
+        );
 
         let cmds = fs
             .worker_manager
@@ -3600,5 +3736,79 @@ mod tests {
 
         // The staged entry is still drained by the purger.
         assert_eq!(fs.scan_pending_trash(16, None).unwrap().paths.len(), 1);
+    }
+
+    // A blocking empty-trash owns `/.Trash/.pending` from the staging rename to
+    // the drain that has to report its totals. The background purger must not
+    // reclaim a staged entry in that window, otherwise the blocking caller
+    // reports zeros for entries it accepted.
+    #[test]
+    fn background_purger_yields_to_a_blocking_empty_trash() {
+        let fs = test_fs_with_trash("trash-drain-owner");
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+
+        fs.create("/owned.log", true).unwrap();
+        fs.delete_with_mode("/owned.log", false, DeleteMode::Default)
+            .unwrap();
+
+        // Stand in for a blocking empty-trash: it holds the pending directory
+        // while it stages and drains.
+        let guard = fs.lock_pending_drain();
+        assert_eq!(fs.stage_trash_for_purge().unwrap(), 1);
+
+        let purger =
+            crate::master::fs::PendingTrashPurger::new(fs.clone(), fs.master_monitor.clone());
+        assert_eq!(
+            purger.drain_pending().unwrap(),
+            Some((0, 0, 0)),
+            "the background cycle must skip instead of stealing the entry"
+        );
+        assert_eq!(
+            fs.scan_pending_trash(16, None).unwrap().paths.len(),
+            1,
+            "the staged entry is still there for the owner"
+        );
+
+        // Once the owner releases the directory the next cycle reclaims it.
+        drop(guard);
+        assert_eq!(purger.drain_pending().unwrap(), Some((1, 1, 0)));
+        assert!(fs.scan_pending_trash(16, None).unwrap().paths.is_empty());
+    }
+
+    // A blocking empty cannot promise reclaimed totals once it is demoted, so it
+    // must fail retryably instead of answering success with zero counts while
+    // the accepted entries are still staged.
+    #[test]
+    fn blocking_empty_trash_fails_retryably_when_demoted() {
+        let fs = test_fs_with_trash("trash-empty-demoted");
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+
+        fs.create("/lost.log", true).unwrap();
+        fs.delete_with_mode("/lost.log", false, DeleteMode::Default)
+            .unwrap();
+
+        // Accept the entries while still active, then lose leadership before the
+        // drain can run.
+        assert_eq!(fs.empty_trash0(false).unwrap().0, 1);
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Follower);
+
+        let err = fs.empty_trash0(true).unwrap_err();
+        assert!(
+            matches!(err, FsError::NotLeaderMaster(_)),
+            "a demoted master must not report a successful empty: {:?}",
+            err
+        );
+        assert_eq!(
+            fs.scan_pending_trash(16, None).unwrap().paths.len(),
+            1,
+            "the accepted entry stays staged for the next active master"
+        );
+
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        assert_eq!(fs.drain_pending_trash().unwrap().unwrap().inodes, 1);
     }
 }

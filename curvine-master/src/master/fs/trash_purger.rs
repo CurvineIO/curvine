@@ -315,7 +315,19 @@ impl PendingTrashPurger {
 
     /// Purges every currently staged entry, page by page. Returns the number of
     /// entries reclaimed, or `None` when the master was demoted mid-cycle.
+    ///
+    /// The drain is skipped when a blocking empty-trash call owns the pending
+    /// directory: both walk the same entries, and only the blocking caller has
+    /// to report per-entry totals, so it must be the one that reclaims them.
+    /// A skipped cycle costs nothing — the entries stay staged for the next one.
     pub fn drain_pending(&self) -> FsResult<Option<(u64, u64, u64)>> {
+        let Some(_guard) = self.fs.try_lock_pending_drain() else {
+            debug!(
+                "pending trash purger skipped: a blocking empty-trash drain owns the staging dir"
+            );
+            return Ok(Some((0, 0, 0)));
+        };
+
         let mut entries = 0u64;
         let mut inodes = 0u64;
         let mut bytes = 0u64;
