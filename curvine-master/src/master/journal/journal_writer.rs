@@ -28,7 +28,7 @@ use curvine_raft::conf::JournalConfExt;
 use curvine_raft::raft::RaftClient;
 use curvine_runtime::common::{FileUtils, LocalTime, TimeSpent};
 use curvine_runtime::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
-use curvine_runtime::sync::AtomicCounter;
+use curvine_runtime::sync::{AtomicBool, AtomicCounter};
 use log::{debug, info, warn};
 use std::sync::Mutex;
 
@@ -40,7 +40,7 @@ pub struct JournalWriter {
     metrics: &'static MasterMetrics,
     receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
 
-    snapshot_lock: Mutex<()>,
+    snapshot_in_flight: AtomicBool,
 
     leader_create_snapshot: bool,
     snapshot_entries: u64,
@@ -70,7 +70,7 @@ impl JournalWriter {
             sender,
             metrics,
             receiver,
-            snapshot_lock: Mutex::new(()),
+            snapshot_in_flight: AtomicBool::new(false),
             leader_create_snapshot: conf.leader_creates_snapshot(),
             snapshot_entries: conf.snapshot_entries,
             snapshot_min_interval_ms: conf.snapshot_min_interval.as_millis(),
@@ -172,7 +172,7 @@ impl JournalWriter {
 
     fn next_checkpoint_id(&self, fs_dir: &FsDir) -> u64 {
         let mut id = LocalTime::mills();
-        while FileUtils::exists(&fs_dir.get_checkpoint_path(id)) {
+        while FileUtils::exists(fs_dir.get_checkpoint_path(id)) {
             id += 1;
         }
         id
@@ -183,13 +183,13 @@ impl JournalWriter {
             return err_box!("leader snapshot requires journal.enable = true");
         }
 
-        let _guard = match self.snapshot_lock.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(_) => return err_box!("a leader snapshot is already in progress"),
-        };
+        if !self.snapshot_in_flight.compare_and_set(false, true) {
+            return err_box!("a leader snapshot is already in progress");
+        }
 
-        self.emit_snapshot(fs_dir, "operator", self.entries_since_snapshot.get())
+        let info = self.emit_snapshot(fs_dir, "operator", self.entries_since_snapshot.get());
+        self.snapshot_in_flight.set(false);
+        info
     }
 
     pub fn log_mkdir(&self, fs_dir: &FsDir, path: impl AsRef<str>, dir: &InodeDir) -> FsResult<()> {
@@ -741,10 +741,7 @@ mod tests {
         let writer = Arc::new(build_writer(&conf)?);
         let fs_dir = build_fs_dir(&conf, writer.clone())?;
 
-        let _guard = writer
-            .snapshot_lock
-            .try_lock()
-            .expect("snapshot lock should be free");
+        writer.snapshot_in_flight.set(true);
 
         let err = writer
             .create_snapshot(&fs_dir)
