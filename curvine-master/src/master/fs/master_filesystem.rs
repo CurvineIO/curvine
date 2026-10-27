@@ -1376,7 +1376,8 @@ impl MasterFilesystem {
 
     /// Record the registration state needed by follower block-location reads.
     /// This state is local and is reset whenever the worker starts a new session.
-    pub fn observe_passive_worker_heartbeat(&self, status: HeartbeatStatus, worker_id: u32) {
+    #[cfg(test)]
+    fn observe_passive_worker_heartbeat(&self, status: HeartbeatStatus, worker_id: u32) {
         let _serial = self.follower_block_report_lock.lock();
         if self.master_monitor.is_active()
             || self.master_monitor.follower_readiness_snapshot().role
@@ -2692,17 +2693,13 @@ mod tests {
             .unwrap();
         assert!(fs.follower_block_report_state.worker_ready(7));
 
-        let bad_address = WorkerAddress {
-            hostname: "conflicting-address".to_string(),
-            ..address.clone()
-        };
-        assert!(apply_test_passive_heartbeat(
-            &fs,
+        let rejected = fs.process_passive_worker_heartbeat(
             HeartbeatStatus::Start,
-            bad_address,
-            "rejected-session",
-        )
-        .is_err());
+            7,
+            |wm| wm.validate_passive_start("wrong-cluster", &address),
+            |_| panic!("invalid Start must not update the worker"),
+        );
+        assert!(rejected.is_err());
         assert!(fs.follower_block_report_state.worker_ready(7));
         assert_eq!(
             fs.worker_manager

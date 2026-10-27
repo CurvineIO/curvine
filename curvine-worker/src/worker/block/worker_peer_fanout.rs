@@ -1158,13 +1158,9 @@ fn retryable(error: &FsError) -> bool {
     // A follower's ResyncRequired response is terminal for this queued update:
     // fail the peer immediately so the heartbeat task can build a bounded full
     // snapshot instead of retrying the stale report until retry_timeout_ms.
-    let message = error.to_string();
-    if message.starts_with("ResyncRequired:") {
-        return false;
-    }
-
     matches!(error.kind(), ErrorKind::IO | ErrorKind::Timeout)
-        || (matches!(error.kind(), ErrorKind::InProgress) && message.starts_with("NotRegistered:"))
+        || (matches!(error.kind(), ErrorKind::InProgress)
+            && error.to_string().starts_with("NotRegistered:"))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
