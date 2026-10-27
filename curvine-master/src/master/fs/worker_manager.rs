@@ -196,18 +196,6 @@ impl WorkerManager {
         res
     }
 
-    // Rebuilds the heartbeat baseline when this node becomes the active master.
-    // Worker heartbeats are answered with NotLeader while the node is a follower,
-    // so last_update keeps the demotion time; expiring on those timestamps would
-    // treat live workers as blacklisted or lost. Returns the refreshed count.
-    pub fn refresh_last_heartbeat(&mut self, now: u64) -> usize {
-        let refreshed = self.worker_map.workers.len();
-        for worker in self.worker_map.workers.values_mut() {
-            worker.last_update = now;
-        }
-        refreshed
-    }
-
     pub fn available_bytes(&self) -> i64 {
         self.worker_map
             .workers()
@@ -225,10 +213,11 @@ impl WorkerManager {
         &mut self,
         id: u32,
         now: u64,
+        baseline: u64,
         lost_ms: u64,
     ) -> Option<WorkerInfo> {
         match self.worker_map.workers.get(&id) {
-            Some(worker) if now > worker.last_update + lost_ms => {
+            Some(worker) if now > worker.last_update.max(baseline) + lost_ms => {
                 self.worker_map.remove_expired(id)
             }
             _ => None,
@@ -648,6 +637,7 @@ mod tests {
         let mut conf = ClusterConf::default();
         conf.master.worker_policy = "robin".to_string();
         conf.master.heartbeat_interval = "1ms".to_string();
+        conf.master.worker_check_interval = "1ms".to_string();
         conf.master.worker_lost_interval = "10ms".to_string();
         conf.master.init().unwrap();
         let mut manager = WorkerManager::new(&conf).unwrap();

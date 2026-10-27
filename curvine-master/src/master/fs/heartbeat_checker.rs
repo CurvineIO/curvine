@@ -34,6 +34,10 @@ pub struct HeartbeatChecker {
     quota_manager: Arc<QuotaManager>,
     last_active: AtomicBool,
     last_tick_ms: AtomicCounter,
+    // Heartbeats are answered with NotLeader while this node is a follower, so worker
+    // timestamps freeze at the demotion time; judgments compare max(last_update, this)
+    // against the thresholds instead of rewriting the recorded heartbeats.
+    heartbeat_baseline_ms: AtomicCounter,
 }
 
 impl HeartbeatChecker {
@@ -56,6 +60,7 @@ impl HeartbeatChecker {
             quota_manager,
             last_active: AtomicBool::new(false),
             last_tick_ms: AtomicCounter::new(0),
+            heartbeat_baseline_ms: AtomicCounter::new(0),
         }
     }
 }
@@ -75,6 +80,7 @@ impl LoopTask for HeartbeatChecker {
 
         let mut blacklisted_workers = Vec::new();
         let mut expired_workers = Vec::new();
+        let baseline = self.heartbeat_baseline_ms.get();
         {
             let mut wm = self.fs.worker_manager.write();
             if !self.monitor.is_active() {
@@ -86,14 +92,16 @@ impl LoopTask for HeartbeatChecker {
             let missed_role_change =
                 previous_tick != 0 && now.saturating_sub(previous_tick) > self.worker_lost_ms;
             if promoted || missed_role_change {
-                let refreshed = wm.refresh_last_heartbeat(now);
-                if refreshed > 0 {
+                self.heartbeat_baseline_ms.set(now);
+                let workers = wm.get_last_heartbeat();
+                if !workers.is_empty() {
                     warn!(
-                        "Promotion detected (promoted: {}, tick gap {} ms): refreshed last \
-                         heartbeat of {} workers, expiration check resumes on the next tick",
+                        "Promotion detected (promoted: {}, tick gap {} ms): re-based the \
+                         heartbeat baseline of {} workers, expiration check resumes on the \
+                         next tick",
                         promoted,
                         now.saturating_sub(previous_tick),
-                        refreshed
+                        workers.len()
                     );
                 }
                 return Ok(());
@@ -102,14 +110,15 @@ impl LoopTask for HeartbeatChecker {
             let workers = wm.get_last_heartbeat();
 
             for (id, last_update) in workers {
-                if now > last_update + self.worker_blacklist_ms {
+                let heartbeat = last_update.max(baseline);
+                if now > heartbeat + self.worker_blacklist_ms {
                     // Worker blacklist timeout
                     if let Some(worker) = wm.add_blacklist_worker(id) {
                         blacklisted_workers.push((id, worker.address, worker.last_update));
                     }
                 }
 
-                if now > last_update + self.worker_lost_ms {
+                if now > heartbeat + self.worker_lost_ms {
                     // Heartbeat timeout
                     expired_workers.push(id);
                 }
@@ -127,7 +136,7 @@ impl LoopTask for HeartbeatChecker {
             let removed = {
                 let mut wm = self.fs.worker_manager.write();
                 if self.monitor.is_active() {
-                    wm.remove_expired_worker_if_stale(id, now, self.worker_lost_ms)
+                    wm.remove_expired_worker_if_stale(id, now, baseline, self.worker_lost_ms)
                 } else {
                     None
                 }
@@ -324,14 +333,21 @@ mod tests {
     }
 
     // The re-basing branches must not disable loss detection: a regular active tick
-    // still expires a worker whose heartbeat is older than the lost timeout.
+    // still expires a worker whose heartbeat aged past the lost timeout after the
+    // re-based baseline.
     #[test]
     fn active_tick_expires_worker_past_lost_timeout() {
         let (fs, checker) = fixture("active-expiry");
         fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
         checker.run().unwrap();
 
-        set_heartbeat_age(&fs, fs.conf.worker_lost_interval_ms() * 2);
+        let lost_ms = fs.conf.worker_lost_interval_ms();
+        set_heartbeat_age(&fs, lost_ms * 2);
+        // The baseline only lifts timestamps that froze before the promotion, so it has
+        // to age as well for this worker to stay past the lost timeout.
+        checker
+            .heartbeat_baseline_ms
+            .set(LocalTime::mills().saturating_sub(lost_ms * 3));
         checker.run().unwrap();
 
         assert!(
@@ -366,6 +382,42 @@ mod tests {
             worker_present(&fs),
             "the rebased worker must survive the next judgment"
         );
+        forget_checker(checker);
+    }
+
+    // The re-base must keep the recorded heartbeat: the worker listing and the expiry
+    // log still report the real last heartbeat of a worker that died while this node
+    // was a follower.
+    #[test]
+    fn promotion_rebase_keeps_recorded_heartbeat() {
+        let (fs, checker) = fixture("rebase-keeps-heartbeat");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        checker.run().unwrap();
+
+        fs.master_monitor.journal_ctl.set_state(RoleState::Follower);
+        checker.run().unwrap();
+        set_heartbeat_age(&fs, fs.conf.worker_lost_interval_ms() * 2);
+        let frozen = fs
+            .worker_manager
+            .read()
+            .get_worker(WORKER_ID)
+            .unwrap()
+            .last_update;
+
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        checker.run().unwrap();
+
+        let after = fs
+            .worker_manager
+            .read()
+            .get_worker(WORKER_ID)
+            .unwrap()
+            .last_update;
+        assert_eq!(
+            after, frozen,
+            "the re-base must not rewrite the recorded heartbeat"
+        );
+        assert!(worker_live(&fs));
         forget_checker(checker);
     }
 
