@@ -64,9 +64,15 @@ resync; followers whose worker report state is incomplete must refuse
 location-dependent reads. The shared resync inventory also consumes this byte
 budget. If a full inventory cannot fit, the peer stays unready and reads fall
 back to the leader; increase the budget for large worker inventories. Budget
-failures are retried with a delay rather than rebuilding in a tight loop. Retry defaults are 30 seconds total, starting at
-100 ms and capped at 5 seconds between attempts. The maximum retry timeout is
-5 minutes and the maximum retry delay is 60 seconds.
+failures and failed peer sends are retried with a delay rather than rebuilding
+in a tight loop. Inventory collection runs outside the heartbeat task; if a
+block report or worker session changes during collection, that snapshot is
+discarded and retried. For example, when `BlockMeta` occupies 48 bytes, the
+default 64 MiB budget holds at most roughly 1.4 million block entries before
+queue overhead; actual capacity depends on the build and other queued data.
+RPC retry defaults are 30 seconds total, starting at 100 ms and capped at 5
+seconds between attempts. The maximum retry timeout is 5 minutes and the
+maximum retry delay is 60 seconds.
 
 ## Rollout order
 
@@ -80,12 +86,14 @@ failures are retried with a delay rather than rebuilding in a tight loop. Retry 
    workers that do not mirror reports cannot make follower block locations
    complete.
 4. Enable follower reads on clients and monitor follower refusals and fallback
-   traffic. A refusal or peer/network error causes one leader fallback.
+   traffic. A retryable refusal or peer/network error causes one leader fallback;
+   terminal errors are returned directly.
 
-The client tries at most one follower for an eligible read. It bounds that
-attempt to half of the remaining `client.rpc_timeout_ms` deadline, then uses
-the remaining time for the leader route. It does not cycle through every
-follower on a slow or unavailable peer.
+The client tries at most one follower for an eligible read. It bounds connection
+and request time to the smaller of one second and half of the remaining
+`client.rpc_timeout_ms` deadline, then uses the remaining time for the leader
+route. Unavailable peers enter a five-second cooldown shared by client clones.
+The client does not cycle through every follower on a slow or unavailable peer.
 
 ## Read consistency
 
