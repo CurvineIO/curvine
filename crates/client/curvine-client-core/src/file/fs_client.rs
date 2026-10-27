@@ -297,23 +297,43 @@ impl FsClient {
         self.delete_with_opts(path, recursive, false).await
     }
 
+    /// Deletes without waiting for the master to reclaim the subtree: the entry
+    /// is staged under `/.Trash/.pending` and purged in the background, so the
+    /// returned counts are zero and the space is released later.
+    pub async fn delete_async(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
+        self.delete_mode(path, recursive, false, true).await
+    }
+
     pub async fn delete_with_opts(
         &self,
         path: &Path,
         recursive: bool,
         skip_trash: bool,
     ) -> FsResult<DeleteResult> {
+        self.delete_mode(path, recursive, skip_trash, false).await
+    }
+
+    async fn delete_mode(
+        &self,
+        path: &Path,
+        recursive: bool,
+        skip_trash: bool,
+        async_delete: bool,
+    ) -> FsResult<DeleteResult> {
         let _mutation_guard = self.mutation_guard([path]);
         let header = DeleteRequest {
             path: path.encode(),
             recursive,
             skip_trash: Some(skip_trash),
+            async_delete: Some(async_delete),
         };
 
         let rep: DeleteResponse = self.rpc(RpcCode::Delete, header).await?;
         let trashed = rep.trashed();
+        let purge_pending = rep.purge_pending();
         let mut res = ProtoUtils::delete_res_from_pb(rep.res.unwrap_or_default());
         res.trashed = trashed;
+        res.purge_pending = purge_pending;
         Ok(res)
     }
 
@@ -372,13 +392,23 @@ impl FsClient {
         Ok(ProtoUtils::restore_trash_res_from_pb(rep))
     }
 
+    /// Empties the recycle bin and waits for the reclamation, reporting the real
+    /// counts. Callers that can proceed while the purger works should use
+    /// [`Self::empty_trash_async`] instead.
     pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
-        // EmptyTrash has no path list. It can affect any namespace path that
-        // was moved to trash, so pin reads globally for the sticky window.
+        Ok(self.empty_trash_mode(true).await?.1)
+    }
+
+    /// Stages recycle-bin entries for background removal.
+    pub async fn empty_trash_async(&self) -> FsResult<(u64, DeleteResult)> {
+        self.empty_trash_mode(false).await
+    }
+
+    async fn empty_trash_mode(&self, wait: bool) -> FsResult<(u64, DeleteResult)> {
         let _mutation_guard = self.all_metadata_paths_mutation_guard();
-        let req = EmptyTrashRequest {};
+        let req = EmptyTrashRequest { wait: Some(wait) };
         let rep: EmptyTrashResponse = self.rpc(RpcCode::EmptyTrash, req).await?;
-        Ok(ProtoUtils::delete_res_from_pb(rep.res))
+        Ok((rep.accepted(), ProtoUtils::delete_res_from_pb(rep.res)))
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
