@@ -39,6 +39,21 @@ fn get_fs() -> UnifiedFileSystem {
     testing.get_unified_fs_with_rt(rt.clone()).unwrap()
 }
 
+fn get_fs_with_trash() -> UnifiedFileSystem {
+    let testing = Testing::builder()
+        .workers(1)
+        .mutate_conf(|conf| conf.master.trash_enabled = true)
+        .build()
+        .unwrap();
+    if env::var("UFS_TEST_PATH").is_err() {
+        env::set_var("UFS_TEST_PATH", testing.ufs_path.clone());
+    }
+
+    testing.start_cluster().unwrap();
+    let rt = Arc::new(AsyncRuntime::single());
+    testing.get_unified_fs_with_rt(rt.clone()).unwrap()
+}
+
 #[test]
 fn test_cache_mode() {
     let fs = get_fs();
@@ -246,6 +261,54 @@ fn test_fs_mode() {
 }
 
 #[test]
+fn test_fs_mode_delete_with_trash_enabled_purges_ufs() {
+    let fs = get_fs_with_trash();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+
+        let path = format!(
+            "/write_cache_{:?}/test_fs_mode_delete_trash.log",
+            WriteType::FsMode
+        )
+        .into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(Utils::rand_str(1024)).await.unwrap();
+        writer.complete().await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(mnt.ufs().unwrap().exists(&ufs_path).await.unwrap());
+
+        // Mounted deletes remove the UFS object first, so they must bypass the
+        // recycle bin; a trashed entry here could never be restored.
+        fs.delete(&path, false).await.unwrap();
+
+        let mut ufs_gone = awaitility::at_most(Duration::from_secs(60));
+        ufs_gone.poll_interval(Duration::from_millis(100));
+        ufs_gone
+            .until_async(|| async { !mnt.ufs().unwrap().exists(&ufs_path).await.unwrap_or(true) })
+            .await;
+        ufs_gone
+            .result()
+            .expect("mounted delete must purge the backing UFS object");
+
+        assert!(!fs.cv().exists(&path).await.unwrap());
+        assert!(
+            !fs.cv()
+                .exists(&Path::from_str("/.Trash").unwrap())
+                .await
+                .unwrap(),
+            "mounted deletes must not leave entries in the recycle bin"
+        );
+    });
+}
+
+#[test]
 fn test_cache_mode_free() {
     let fs = get_fs();
     let rt = fs.clone_runtime();
@@ -295,6 +358,57 @@ fn test_cache_mode_free() {
         let mut reader = fs.open(&path).await.unwrap();
         assert!(!matches!(reader, UnifiedReader::Cv(_)));
         assert_eq!(reader.read_as_string().await.unwrap(), data);
+    });
+}
+
+#[test]
+fn test_cache_mode_free_with_trash_enabled() {
+    let fs = get_fs_with_trash();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::CacheMode).await;
+
+        let data = Utils::rand_str(1024);
+        let path = format!(
+            "/write_cache_{:?}/test_cache_mode_free_trash.log",
+            WriteType::CacheMode
+        )
+        .into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&data).await.unwrap();
+        writer.complete().await.unwrap();
+        let _ = fs.open(&path).await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(mnt.ufs().unwrap().exists(&ufs_path).await.unwrap());
+
+        let free_res = fs.free(&path, false).await.unwrap();
+        assert!(
+            free_res.inodes > 0,
+            "cache mode free must delete metadata even with trash enabled"
+        );
+        assert!(
+            free_res.bytes > 0,
+            "cache mode free must release blocks instead of trashing them"
+        );
+
+        assert!(!fs.cv().exists(&path).await.unwrap());
+        assert!(
+            !fs.cv()
+                .exists(&Path::from_str("/.Trash").unwrap())
+                .await
+                .unwrap(),
+            "cache mode free must not move entries into the recycle bin"
+        );
+        assert!(
+            mnt.ufs().unwrap().exists(&ufs_path).await.unwrap(),
+            "cache mode free must not delete the UFS file"
+        );
     });
 }
 

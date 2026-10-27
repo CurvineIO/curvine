@@ -23,3 +23,6 @@ pub use self::dir_handle::DirHandle;
 
 mod backend_handle;
 pub use self::backend_handle::BackendHandle;
+
+mod dir_tree_lock;
+pub use self::dir_tree_lock::{DirTreeLock, DirTreeReadGuard, DirTreeWriteGuard};
