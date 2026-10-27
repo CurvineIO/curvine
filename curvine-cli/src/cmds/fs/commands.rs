@@ -162,6 +162,11 @@ pub enum FsSubCommand {
             help = "Delete permanently, bypassing the recycle bin (if enabled)"
         )]
         skip_trash: bool,
+        #[clap(
+            long = "async",
+            help = "Return immediately and let the master reclaim the entry in the background (Curvine paths only)"
+        )]
+        async_delete: bool,
     },
 
     /// Recycle bin operations
@@ -339,11 +344,13 @@ impl FsCommand {
                 path,
                 recursive,
                 skip_trash,
+                async_delete,
             } => {
                 let rm_cmd = RmCommand::Rm {
                     path: path.clone(),
                     recursive: *recursive,
                     skip_trash: *skip_trash,
+                    async_delete: *async_delete,
                 };
                 rm_cmd.execute(client).await
             }

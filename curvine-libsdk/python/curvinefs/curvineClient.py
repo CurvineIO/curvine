@@ -170,19 +170,22 @@ class CurvineClient:
         if not is_success:
             raise IOError("mkdir failed")
 
-    def rm(self, path: str, recursive: bool = False) -> None:
+    def rm(self, path: str, recursive: bool = False, async_delete: bool = False) -> None:
         """Delete a file or directory.
 
         Args:
             path: Path to delete.
             recursive: If True, delete directories recursively.
+            async_delete: If True, return once the name leaves the namespace and
+                let the master reclaim the blocks in the background. Mounted
+                paths stay synchronous.
 
         Raises:
             IOError: If deletion fails.
         """
         try:
             curvine_libsdk.python_io_curvine_curvine_native_delete(
-                self.file_system_ptr, path, recursive
+                self.file_system_ptr, path, recursive, async_delete
             )
         except Exception as e:
             raise IOError(f"Native delete file failed: {e}")

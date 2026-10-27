@@ -20,6 +20,12 @@ pub enum RmCommand {
             help = "Delete permanently, bypassing the recycle bin (if enabled)"
         )]
         skip_trash: bool,
+        #[clap(
+            long = "async",
+            help = "Return immediately and let the master reclaim the entry in \
+                    the background (Curvine paths only)"
+        )]
+        async_delete: bool,
     },
 }
 
@@ -30,6 +36,7 @@ impl RmCommand {
                 path,
                 recursive,
                 skip_trash,
+                async_delete,
             } => {
                 let path = CurvineURI::new(path)?;
 
@@ -42,13 +49,19 @@ impl RmCommand {
                             return Ok(());
                         }
 
-                        // Delete the file or directory
-                        match client
-                            .delete_with_opts(&path, *recursive, *skip_trash)
-                            .await
-                        {
+                        let deleted = if *async_delete && !*skip_trash {
+                            client.delete_async(&path, *recursive).await
+                        } else {
+                            client
+                                .delete_with_opts(&path, *recursive, *skip_trash)
+                                .await
+                        };
+
+                        match deleted {
                             Ok(res) => {
-                                if res.trashed {
+                                if res.purge_pending {
+                                    println!("Staged for background purge: {}", path.full_path());
+                                } else if res.trashed {
                                     println!("Moved to /.Trash: {}", path.full_path());
                                 } else {
                                     println!("Deleted permanently: {}", path.full_path());
@@ -68,5 +81,40 @@ impl RmCommand {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RmCommand;
+    use clap::Parser;
+
+    #[derive(Parser, Debug)]
+    struct Cli {
+        #[clap(subcommand)]
+        command: RmCommand,
+    }
+
+    #[test]
+    fn parses_async_flag() {
+        let cli = Cli::try_parse_from(["rm", "rm", "-r", "--async", "/data"]).unwrap();
+        // `RmCommand` has a single variant, so the pattern is irrefutable and an
+        // `else { panic!(..) }` clause would be unreachable (`irrefutable_let_patterns`).
+        let RmCommand::Rm {
+            recursive,
+            skip_trash,
+            async_delete,
+            ..
+        } = cli.command;
+        assert!(recursive);
+        assert!(async_delete);
+        assert!(!skip_trash, "--async must not imply --skip-trash");
+    }
+
+    #[test]
+    fn async_defaults_to_off() {
+        let cli = Cli::try_parse_from(["rm", "rm", "/data"]).unwrap();
+        let RmCommand::Rm { async_delete, .. } = cli.command;
+        assert!(!async_delete);
     }
 }
