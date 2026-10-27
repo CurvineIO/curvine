@@ -56,7 +56,8 @@ struct ReaddirEntry {
     status: Arc<FileStatus>,
     attr: fuse_attr,
     is_child: bool,
-    dirty: Option<FileStatus>,
+    // Boxed: only in-flight dirty inodes set it, so keep the common entry small.
+    dirty: Option<Box<FileStatus>>,
 }
 
 pub struct CurvineFileSystem {
@@ -481,7 +482,10 @@ impl CurvineFileSystem {
         // bumps n_lookup, and an entry the kernel never receives never gets a
         // FORGET, which would pin its inode forever.
         let mut budget = res.remaining();
-        let mut pending = Vec::with_capacity(batch.len());
+        // Size the staging buffer by what can fit, not by the batch (`list_limit`):
+        // the smallest dirent header bounds the number of entries the reply can hold.
+        let max_fit = budget / std::mem::size_of::<fuse_dirent>();
+        let mut pending = Vec::with_capacity(batch.len().min(max_fit));
         while let Some(status) = batch.pop_front() {
             let len = FuseDirentList::dirent_len(plus, &status.name);
             if len > budget {
@@ -515,7 +519,7 @@ impl CurvineFileSystem {
                 entry.attr.ino = inode.ino;
                 // A dirty inode keeps its local status; report that instead.
                 if inode.is_dirty() {
-                    entry.dirty = Some(inode.status.clone());
+                    entry.dirty = Some(Box::new(inode.status.clone()));
                 }
             }
         }
