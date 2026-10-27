@@ -199,7 +199,6 @@ impl TrashPurger {
         limit: usize,
         max_bytes: usize,
     ) -> FsResult<Vec<String>> {
->>>>>>> c801d774 (docs(master): document async delete, add purge metrics and a bench op (#1837))
         let limit = limit.max(1);
         let mut batch = Vec::with_capacity(limit.min(CHILD_PAGE));
         let mut bytes = 0usize;
