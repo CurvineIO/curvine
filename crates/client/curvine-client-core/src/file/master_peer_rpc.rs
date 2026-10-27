@@ -16,7 +16,7 @@ use super::FsClient;
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::RpcCode;
 use curvine_net::net::NodeAddr;
-use curvine_rpc::message::MessageBuilder;
+use curvine_rpc::message::{MessageBuilder, WORKER_MIRROR_SEQ_ID};
 use prost::Message;
 
 impl FsClient {
@@ -34,7 +34,8 @@ impl FsClient {
     ///
     /// This intentionally does not run a handshake against the selected peer.
     /// Worker mirror callers first complete their normal leader-routed request
-    /// and must discard commands in mirror responses.
+    /// and must discard commands in mirror responses. Heartbeat and block
+    /// report peer calls carry the explicit worker-mirror marker.
     pub async fn rpc_to_master_peer<T, R>(
         &self,
         peer_id: u64,
@@ -45,7 +46,11 @@ impl FsClient {
         T: Message + Default,
         R: Message + Default,
     {
-        let message = MessageBuilder::new_rpc(code).proto_header(request).build();
+        let mut builder = MessageBuilder::new_rpc(code);
+        if matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport) {
+            builder = builder.seq_id(WORKER_MIRROR_SEQ_ID);
+        }
+        let message = builder.proto_header(request).build();
         let response = self
             .context()
             .connector
@@ -64,7 +69,7 @@ mod tests {
     use curvine_net::net::{ConnState, InetAddr, NetUtils};
     use curvine_proto::WorkerHeartbeatRequest;
     use curvine_rpc::handler::{HandlerService, MessageHandler};
-    use curvine_rpc::message::{Message as RpcMessage, MessageBuilder};
+    use curvine_rpc::message::{Message as RpcMessage, MessageBuilder, WORKER_MIRROR_SEQ_ID};
     use curvine_rpc::server::{RpcServer, ServerConf};
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use std::sync::Arc;
@@ -85,6 +90,7 @@ mod tests {
         fn handle(&self, request: &RpcMessage) -> CommonResultExt<RpcMessage> {
             // Any automatic GetFilesystemInfo handshake would fail this test.
             assert_eq!(request.code(), i8::from(RpcCode::WorkerHeartbeat));
+            assert_eq!(request.seq_id(), WORKER_MIRROR_SEQ_ID);
             let header: WorkerHeartbeatRequest = request.parse_header()?;
             Ok(MessageBuilder::success_with_header(request, header).build())
         }

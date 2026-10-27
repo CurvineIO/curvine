@@ -36,7 +36,7 @@ use curvine_net::net::ConnState;
 use curvine_proto::*;
 use curvine_raft::raft::FollowerReadRefusal;
 use curvine_rpc::handler::MessageHandler;
-use curvine_rpc::message::{Message, FOLLOWER_READ_SEQ_ID};
+use curvine_rpc::message::{Message, FOLLOWER_READ_SEQ_ID, WORKER_MIRROR_SEQ_ID};
 use curvine_runtime::runtime::{GroupExecutor, Runtime};
 use dashmap::DashMap;
 use prost::Message as _;
@@ -73,6 +73,10 @@ pub struct MasterHandler {
 impl MasterHandler {
     fn is_follower_read_opt_in(msg: &Message) -> bool {
         msg.seq_id() == FOLLOWER_READ_SEQ_ID
+    }
+
+    fn is_worker_mirror_opt_in(msg: &Message) -> bool {
+        msg.seq_id() == WORKER_MIRROR_SEQ_ID
     }
 
     fn is_follower_read_candidate(code: RpcCode) -> bool {
@@ -167,10 +171,12 @@ impl MasterHandler {
         worker_state_enabled: bool,
         follower_reads_enabled: bool,
         role: curvine_raft::raft::RoleState,
+        marked_worker_mirror: bool,
         code: RpcCode,
     ) -> bool {
         (worker_state_enabled || follower_reads_enabled)
             && role == curvine_raft::raft::RoleState::Follower
+            && marked_worker_mirror
             && matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport)
     }
 
@@ -1442,6 +1448,7 @@ impl MessageHandler for MasterHandler {
                 self.fs.conf.follower_worker_state_enabled,
                 self.fs.conf.follower_reads_enabled,
                 role,
+                Self::is_worker_mirror_opt_in(msg),
                 code,
             ) {
                 match code {
@@ -1636,40 +1643,59 @@ mod tests {
     use super::*;
     use crate::master::journal::JournalSystem;
     use curvine_model::{TrashEntry, WorkerAddress};
-    use curvine_rpc::message::Builder;
+    use curvine_rpc::message::{Builder, WORKER_MIRROR_SEQ_ID};
     use curvine_runtime::common::Utils;
 
     #[test]
-    fn passive_worker_rpc_gate_is_opt_in_and_allowlisted() {
+    fn passive_worker_rpc_gate_requires_explicit_marker_and_allowlists_codes() {
         let follower = curvine_raft::raft::RoleState::Follower;
+        let marked_request = Builder::new_rpc(RpcCode::WorkerHeartbeat as i8)
+            .seq_id(WORKER_MIRROR_SEQ_ID)
+            .build();
+        let unmarked_request = Builder::new_rpc(RpcCode::WorkerHeartbeat as i8).build();
+        assert!(MasterHandler::is_worker_mirror_opt_in(&marked_request));
+        assert!(!MasterHandler::is_worker_mirror_opt_in(&unmarked_request));
+
         assert!(!MasterHandler::passive_worker_rpc_allowed(
             false,
             false,
             follower,
+            true,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(!MasterHandler::passive_worker_rpc_allowed(
+            true,
+            false,
+            follower,
+            false,
             RpcCode::WorkerHeartbeat
         ));
         assert!(MasterHandler::passive_worker_rpc_allowed(
             true,
             false,
             follower,
+            true,
             RpcCode::WorkerHeartbeat
         ));
         assert!(MasterHandler::passive_worker_rpc_allowed(
             false,
             true,
             follower,
+            true,
             RpcCode::WorkerBlockReport
         ));
         assert!(!MasterHandler::passive_worker_rpc_allowed(
             true,
             true,
             follower,
+            true,
             RpcCode::Mkdir
         ));
         assert!(!MasterHandler::passive_worker_rpc_allowed(
             true,
             true,
             curvine_raft::raft::RoleState::Leader,
+            true,
             RpcCode::WorkerBlockReport
         ));
     }

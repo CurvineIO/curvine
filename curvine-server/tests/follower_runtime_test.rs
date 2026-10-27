@@ -20,11 +20,12 @@ mod daemon;
 use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::ClusterConf;
 use curvine_fs_api::{Path, RpcCode};
-use curvine_model::ProtoUtils;
+use curvine_model::{HeartbeatStatus, ProtoUtils};
 use curvine_net::net::InetAddr;
 use curvine_proto::{
     GetBlockLocationsRequest, GetBlockLocationsResponse, GetFileStatusRequest,
-    GetFileStatusResponse, GetFilesystemInfoRequest, MkdirRequest,
+    GetFileStatusResponse, GetFilesystemInfoRequest, GetFilesystemInfoResponse, MkdirRequest,
+    WorkerHeartbeatRequest,
 };
 use curvine_raft::raft::RaftPeer;
 use curvine_rpc::client::RpcClient;
@@ -166,6 +167,37 @@ async fn follower_reads_served(confs: &[ClusterConf]) -> u64 {
     total
 }
 
+async fn active_master_index(confs: &[ClusterConf], exclude: Option<usize>) -> Option<usize> {
+    for (index, conf) in confs.iter().enumerate() {
+        if Some(index) == exclude {
+            continue;
+        }
+        let response = direct(
+            conf,
+            index,
+            RpcCode::GetFilesystemInfo,
+            GetFilesystemInfoRequest::default(),
+            false,
+        )
+        .await;
+        if response.is_success() {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn response_has_live_worker(response: &Message, worker_id: u32) -> bool {
+    response.is_success()
+        && response
+            .parse_header::<GetFilesystemInfoResponse>()
+            .is_ok_and(|info| {
+                info.live_workers
+                    .iter()
+                    .any(|worker| worker.address.worker_id == worker_id)
+            })
+}
+
 fn signal(pid: u32, name: &str) {
     assert!(Command::new("kill")
         .args([name, &pid.to_string()])
@@ -180,7 +212,7 @@ fn static_three_master_follower_reads_reports_and_contact_loss() {
 }
 
 #[test]
-fn workers_without_mirroring_fall_back_for_locations() {
+fn workers_without_mirroring_fall_back_and_reregister_after_leader_change() {
     run_cluster(false);
 }
 
@@ -436,6 +468,142 @@ fn run_cluster(mirror_reports: bool) {
                 signal(daemon.id(), "-CONT");
             }
         }
+
+        if !mirror_reports {
+            // Freeze the worker while the cached leader is stopped. Once the
+            // other two masters elect a replacement, resume the old leader as
+            // a follower before resuming the worker. Its next ordinary,
+            // unmarked heartbeat must be refused so the worker's connector
+            // discovers the new leader instead of treating the mirror reply
+            // as its authoritative heartbeat response.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let (worker_info, old_leader_index) = loop {
+                worker.assert_running();
+                if let Ok(info) = fs.get_filesystem_info().await {
+                    if let (Some(worker_info), Some(leader_id)) = (
+                        info.live_workers.first().cloned(),
+                        fs.fs_client().master_peer_leader_id(),
+                    ) {
+                        let leader_index = fs
+                            .fs_client()
+                            .master_peer_snapshot()
+                            .iter()
+                            .position(|peer| peer.id == leader_id)
+                            .unwrap();
+                        break (worker_info, leader_index);
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "worker was not live after recovery"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            let worker_id = worker_info.address.worker_id;
+            signal(worker.id(), "-STOP");
+            signal(daemons[old_leader_index].id(), "-STOP");
+
+            let deadline = Instant::now() + Duration::from_secs(40);
+            let new_leader_index = loop {
+                for daemon in &daemons {
+                    daemon.assert_running();
+                }
+                if let Some(index) = active_master_index(&confs, Some(old_leader_index)).await {
+                    break index;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "no replacement master was elected"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            assert_ne!(new_leader_index, old_leader_index);
+            let before_worker_resume = direct(
+                &confs[0],
+                new_leader_index,
+                RpcCode::GetFilesystemInfo,
+                GetFilesystemInfoRequest::default(),
+                false,
+            )
+            .await;
+            assert!(before_worker_resume.is_success());
+            assert!(
+                !response_has_live_worker(&before_worker_resume, worker_id),
+                "replacement leader unexpectedly inherited non-mirrored worker state"
+            );
+
+            signal(daemons[old_leader_index].id(), "-CONT");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let old_master = direct(
+                    &confs[0],
+                    old_leader_index,
+                    RpcCode::GetFilesystemInfo,
+                    GetFilesystemInfoRequest::default(),
+                    false,
+                )
+                .await;
+                if !old_master.is_success() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "old leader did not step down");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            let unmarked_heartbeat = WorkerHeartbeatRequest {
+                cluster_id: confs[0].cluster_id.clone(),
+                worker_id,
+                fs_ctime: worker_info.startup_time_ms as i64,
+                address: ProtoUtils::worker_address_to_pb(&worker_info.address),
+                failed_dirs: 0,
+                status: HeartbeatStatus::Running.into(),
+                software_version: worker_info.software_version.clone(),
+                weight: Some(worker_info.weight),
+                worker_session_id: Some(worker_info.worker_session_id.clone()),
+                component_info: worker_info.component_info.clone(),
+                ..Default::default()
+            };
+            let refused = direct(
+                &confs[0],
+                old_leader_index,
+                RpcCode::WorkerHeartbeat,
+                unmarked_heartbeat,
+                false,
+            )
+            .await;
+            assert!(
+                !refused.is_success(),
+                "demoted leader accepted an unmarked heartbeat"
+            );
+            assert!(
+                refused.to_error_msg().contains("Not a leader master"),
+                "follower should return NotLeaderMaster, got: {}",
+                refused.to_error_msg()
+            );
+
+            signal(worker.id(), "-CONT");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                worker.assert_running();
+                let new_master = direct(
+                    &confs[0],
+                    new_leader_index,
+                    RpcCode::GetFilesystemInfo,
+                    GetFilesystemInfoRequest::default(),
+                    false,
+                )
+                .await;
+                if response_has_live_worker(&new_master, worker_id) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "worker did not re-register with the elected leader"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
         worker.terminate().await;
         for daemon in &mut daemons {
             daemon.terminate().await;
