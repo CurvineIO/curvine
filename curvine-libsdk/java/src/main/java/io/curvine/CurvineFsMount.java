@@ -160,6 +160,17 @@ public class CurvineFsMount {
         });
     }
 
+    /**
+     * Delete a path through the master's async lane: the namespace effect is immediate and the
+     * blocks are reclaimed by the master's background purger.
+     */
+    public void deleteAsync(String path, boolean recursive) throws IOException {
+        filesystem.withOpen(nativeHandle -> {
+            checkError(CurvineNative.deleteAsync(nativeHandle, path, recursive));
+            return null;
+        });
+    }
+
     /** Release Curvine metadata and blocks for a path and return the released totals. */
     public FreeResult free(String path, boolean recursive) throws IOException {
         return filesystem.withOpen(nativeHandle -> {

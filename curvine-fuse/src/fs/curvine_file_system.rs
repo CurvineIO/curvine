@@ -33,7 +33,7 @@ use curvine_config::{ClusterConf, FuseConf};
 use curvine_core_error::try_option;
 use curvine_error::FsError;
 use curvine_error::MAX_FILE_SIZE;
-use curvine_fs_api::{FileSystem, Path, RpcCode};
+use curvine_fs_api::{Path, RpcCode};
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{
     is_special_file_type, FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags,
@@ -1928,9 +1928,8 @@ impl fs::FileSystem for CurvineFileSystem {
                     "release ino={}: no more open handles, executing delayed deletion of {}",
                     ino, path
                 );
-                let delete_result = self
-                    .state
-                    .complete_deferred_delete(ino, self.fs.delete(&path, false).await);
+                let deleted = self.state.delete_path(&path, false).await;
+                let delete_result = self.state.complete_deferred_delete(ino, deleted);
                 if let Err(e) = &delete_result {
                     warn!(
                         "failed to delete {} after last handle closed; retaining pending delete: {}",
@@ -2060,7 +2059,7 @@ impl fs::FileSystem for CurvineFileSystem {
         self.ensure_writable_path(&path, RpcCode::Delete).await?;
 
         let _guard = self.state.lock_path(&path).await;
-        self.fs.delete(&path, false).await?;
+        self.state.delete_path(&path, false).await?;
         self.state.unlink(op.header.nodeid, name, false)?;
         self.state
             .invalid_cache(op.header.nodeid, None, INVAL_REASON_RMDIR);
