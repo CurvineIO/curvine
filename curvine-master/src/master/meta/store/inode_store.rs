@@ -25,7 +25,7 @@ use curvine_core_error::{err_box, try_err, try_option, CommonResult};
 use curvine_model::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
 use curvine_rocksdb::{DBConf, DbReadSnapshot as DBReadSnapshot, RocksIterator, RocksUtils};
 use curvine_runtime::common::{FileUtils, Utils};
-use log::{info, warn};
+use log::info;
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::sync::Arc;
 
@@ -614,7 +614,7 @@ impl InodeStore {
     fn decrement_inode_nlink(
         &self,
         inode_id: i64,
-        links: u32,
+        _links: u32,
         ctime: i64,
         batch: &mut InodeWriteBatch<'_>,
     ) -> CommonResult<DeleteResult> {

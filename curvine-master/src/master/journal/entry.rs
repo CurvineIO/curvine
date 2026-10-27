@@ -563,6 +563,14 @@ impl JournalEntry {
                 error: e.error,
                 payload: e.payload,
             }),
+
+            JournalEntry::TrashPurge(e) => PbEntry::TrashPurge(TrashPurgeEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                entry: e.entry,
+                mtime: e.mtime,
+                paths: e.paths,
+            }),
         };
 
         Ok(JournalEntryProto { entry: Some(entry) })
@@ -729,6 +737,14 @@ impl JournalEntry {
                 index: e.index,
                 error: e.error,
                 payload: e.payload,
+            }),
+
+            PbEntry::TrashPurge(e) => JournalEntry::TrashPurge(TrashPurgeEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                entry: e.entry,
+                mtime: e.mtime,
+                paths: e.paths,
             }),
         })
     }

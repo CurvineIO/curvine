@@ -527,7 +527,7 @@ impl FsDir {
             // Re-read the live child: a hydrated `FileEntry` copy was already
             // freed with its InodePath, and only a tree-resident file inode
             // holds the shared nlink.
-            if let Some(child) = parent.get_child_ptr(&claim.name) {
+            if let Some(child) = parent.get_child(&claim.name) {
                 // Files keep their shared inode when other names still link to it.
                 if matches!(child.as_ref(), File(f) if f.nlink() > 1) {
                     child.as_mut().dec_nlink(mtime);

@@ -1606,6 +1606,7 @@ impl MasterFilesystem {
         action()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn expire_worker(
         &self,
         worker_id: u32,

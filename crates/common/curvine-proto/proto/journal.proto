@@ -42,6 +42,7 @@ message JournalEntryProto {
         SnapshotEntryProto snapshot = 17;
         CacheInvalidationEntryProto cache_invalidation = 18;
         UfsDeferredEntryProto ufs_deferred = 19;
+        TrashPurgeEntryProto trash_purge = 20;
     }
 }
 
@@ -194,4 +195,12 @@ message SnapshotEntryProto {
     required int64 rpc_id = 2;
     required uint64 node_id = 3;
     required string dir = 4;
+}
+
+message TrashPurgeEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required string entry = 3;
+    required int64 mtime = 4;
+    repeated string paths = 5;
 }

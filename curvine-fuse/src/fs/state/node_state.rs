@@ -47,7 +47,7 @@ use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::Arc;
 
 enum StatProbe {
     Hit(FileStatus),

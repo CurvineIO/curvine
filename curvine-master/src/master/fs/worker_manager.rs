@@ -894,10 +894,13 @@ mod tests {
                 1,
                 String::new(),
                 TransferWorkerCapabilities::default(),
+                0,
+                0,
                 String::new(),
                 0,
                 vec![storage(1 << 30, 1 << 30)],
                 None,
+                false,
             )
             .unwrap();
     }

@@ -271,7 +271,7 @@ impl TrashPurger {
                     name: child.name().to_string(),
                     path: format!("{}{}{}", prefix, PATH_SEPARATOR, child.name()),
                     is_dir: child.is_dir(),
-                    has_children: matches!(child, InodeView::Dir(d) if d.children_len() > 0),
+                    has_children: matches!(&*child, InodeView::Dir(d) if d.children_len() > 0),
                 })
                 .collect(),
         ))

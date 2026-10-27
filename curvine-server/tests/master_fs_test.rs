@@ -2947,6 +2947,7 @@ fn delete_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
         path: "/delete_file_retry".to_string(),
         recursive: true,
         skip_trash: None,
+        async_delete: None,
         client_context: None,
     };
 
