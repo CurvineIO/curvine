@@ -53,8 +53,15 @@ fn create_tree(fs: &MasterFilesystem, path: &str, dirs: usize, per_dir: usize) {
 }
 
 fn pending_entries(fs: &MasterFilesystem) -> Vec<String> {
-    fs.list_options(trash::TRASH_PENDING_ROOT, Default::default())
-        .map(|children| children.into_iter().map(|c| c.name).collect())
+    // `.pending` is hidden from client-facing listings; inspect it through the
+    // purger's own scan instead.
+    fs.scan_pending_trash(usize::MAX, None)
+        .map(|page| {
+            page.paths
+                .into_iter()
+                .map(|path| path.rsplit('/').next().unwrap_or_default().to_string())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -164,8 +171,8 @@ fn pending_purger_reclaims_staged_entries() {
             .into_iter()
             .map(|child| child.name)
             .collect::<Vec<_>>(),
-        vec![trash::TRASH_PENDING_NAME.to_string()],
-        "only the staging directory itself stays behind"
+        Vec::<String>::new(),
+        "the staging directory is drained and never listed to clients"
     );
     assert_eq!(fs.get_file_counts().1, 0, "every file inode is reclaimed");
 
