@@ -74,9 +74,9 @@ pub struct PurgeOutcome {
 ///
 /// The walk is a depth-first post-order traversal: children are removed before
 /// their parent, so every emitted path is a file or an empty directory and
-/// removing it cannot touch inodes that a later batch still needs. Batches are
-/// journaled before they are applied; a batch is idempotent, so a leader that
-/// fails halfway converges when the batch is replayed and retried.
+/// removing it cannot touch inodes that a later batch still needs. Each batch
+/// is applied atomically and then journaled under the same lock; a batch is
+/// idempotent, so a leader that fails halfway converges on the next retry.
 pub struct TrashPurger {
     fs: MasterFilesystem,
     monitor: MasterMonitor,

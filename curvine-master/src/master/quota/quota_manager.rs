@@ -238,7 +238,10 @@ fn run_eviction_plan(
 
         examined += inode_ids.len();
         let step = execute_eviction_step(fs, evictor, ttl_executor, &inode_ids);
-        plan.target_free_bytes = plan.target_free_bytes.saturating_sub(step.reclaimed_bytes);
+        plan.target_free_bytes = plan
+            .target_free_bytes
+            .saturating_sub(step.reclaimed_bytes)
+            .saturating_sub(step.scheduled_bytes);
         total_reclaimed += step.reclaimed_bytes;
         skipped.extend(step.skipped);
     }
@@ -280,16 +283,17 @@ fn execute_eviction_step(
         // reclaimed by the purger within a cycle, instead of waiting out
         // `trash_retention` while the cluster stays over quota.
         match ttl_executor.execute_by_id_with_mode(inode_id, DeleteMode::AsyncPurge) {
-            Ok((true, _, reclaimed)) => {
+            Ok(outcome) if outcome.handled => {
                 step.consumed.push(inode_id);
-                if reclaimed > 0 {
+                if outcome.reclaimed_bytes > 0 {
                     reclaimed_files += 1;
-                    step.reclaimed_bytes += reclaimed;
+                    step.reclaimed_bytes += outcome.reclaimed_bytes;
                 }
+                step.scheduled_bytes += outcome.scheduled_bytes;
             }
             // Not expirable yet, or a hard-linked name that keeps its blocks:
             // leave it in the evictor for a later trigger.
-            Ok((false, _, _)) => step.skipped.push(inode_id),
+            Ok(_) => step.skipped.push(inode_id),
             Err(FsError::FileNotFound(_)) => step.consumed.push(inode_id),
             Err(e) => {
                 log::warn!(
@@ -330,6 +334,10 @@ struct EvictionStep {
     skipped: Vec<i64>,
     /// Bytes actually released by this step.
     reclaimed_bytes: i64,
+    /// Bytes staged for the async purger. They are not reported as freed, but
+    /// count toward the eviction target so a trigger stops once enough space
+    /// is on its way back instead of staging every remaining candidate.
+    scheduled_bytes: i64,
 }
 
 #[cfg(test)]
@@ -387,6 +395,10 @@ mod tests {
     }
 
     fn create_expired_file(fs: &MasterFilesystem, path: &str) -> i64 {
+        create_expired_file_with_len(fs, path, 0)
+    }
+
+    fn create_expired_file_with_len(fs: &MasterFilesystem, path: &str, len: i64) -> i64 {
         let opts = CreateFileOptsBuilder::new()
             .create_parent(true)
             .ttl_ms(1)
@@ -395,7 +407,7 @@ mod tests {
         let status = fs
             .create_with_opts(path, opts, OpenFlags::new_create().set_overwrite(true))
             .unwrap();
-        fs.complete_file(path, None, 0, vec![], "", false, None)
+        fs.complete_file(path, None, len, vec![], "", false, None)
             .unwrap();
         status.id
     }
@@ -551,5 +563,53 @@ mod tests {
             .list_options("/.Trash/.pending", ListOptions::default())
             .unwrap()
             .is_empty());
+    }
+
+    // Plain TTL expiration keeps its permanent-delete contract: an expired file
+    // is reclaimed immediately instead of waiting out the trash retention.
+    #[test]
+    fn ttl_expiration_deletes_permanently_with_trash_enabled() {
+        let fs = test_fs("ttl-permanent", true);
+        let victim = create_expired_file_with_len(&fs, "/ttl/victim.log", 100);
+        std::thread::sleep(Duration::from_millis(10));
+
+        let executor = InodeTtlExecutor::with_managers(fs.clone());
+        let (handled, _, reclaimed) = executor.execute_by_id(victim).unwrap();
+
+        assert!(handled);
+        assert_eq!(reclaimed, 100);
+        assert!(fs.file_status("/ttl/victim.log").is_err());
+        assert!(fs.list_trash().unwrap().is_empty());
+    }
+
+    // Staged victims free nothing until the purger runs, but their size must
+    // still count toward the target, or one trigger keeps staging candidates
+    // until the scan budget runs out, even with the recycle bin disabled.
+    #[test]
+    fn eviction_stops_once_scheduled_bytes_cover_the_target() {
+        let fs = test_fs("evict-scheduled", false);
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        let mut victims = Vec::new();
+        for i in 0..4 {
+            let path = format!("/evict/victim-{}.log", i);
+            victims.push(create_expired_file_with_len(&fs, &path, 100));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+
+        let conf = eviction_conf(1, 0);
+        let evictor = LRUEvictor::new(conf.clone());
+        for id in &victims {
+            evictor.on_access(*id);
+        }
+
+        let executor = InodeTtlExecutor::with_managers(fs.clone());
+        let mut plan = plan_with_target(150);
+        let (examined, reclaimed) = run_eviction_plan(&fs, &evictor, &executor, &conf, &mut plan);
+
+        assert_eq!(examined, 2, "two 100-byte victims cover a 150-byte target");
+        assert_eq!(reclaimed, 0, "staged victims are not reported as freed");
+        assert!(plan.target_free_bytes <= 0);
+        assert_eq!(evictor.cache_size(), 2, "the rest stay for a later trigger");
     }
 }

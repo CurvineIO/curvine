@@ -34,6 +34,18 @@ use log::debug;
 // - Support for different storage policies
 // - UFS (Unified File System) integration for data migration
 
+/// Result of one TTL action.
+#[derive(Debug)]
+pub struct TtlOutcome {
+    /// Drives TTL bucket bookkeeping.
+    pub handled: bool,
+    pub inode: InodeView,
+    /// Bytes actually released by this action.
+    pub reclaimed_bytes: i64,
+    /// Bytes staged for the async purger, released after the call returns.
+    pub scheduled_bytes: i64,
+}
+
 #[derive(Clone)]
 pub struct InodeTtlExecutor {
     filesystem: MasterFilesystem,
@@ -81,8 +93,11 @@ impl InodeTtlExecutor {
     // Returns (handled, inode, reclaimed_bytes). `handled` drives TTL bucket
     // bookkeeping; `reclaimed_bytes` lets quota eviction count only space that
     // was actually released.
+    //
+    // TTL expiration deletes permanently, independent of the recycle bin.
     pub fn execute_by_id(&self, inode_id: i64) -> FsResult<(bool, InodeView, i64)> {
-        self.execute_by_id_with_mode(inode_id, DeleteMode::Default)
+        let res = self.execute_by_id_with_mode(inode_id, DeleteMode::SkipTrash)?;
+        Ok((res.handled, res.inode, res.reclaimed_bytes))
     }
 
     /// Executes the TTL action for `inode_id` with an explicit delete mode.
@@ -90,11 +105,27 @@ impl InodeTtlExecutor {
     /// Quota eviction passes [`DeleteMode::AsyncPurge`] so a victim is reclaimed
     /// by the trash purger instead of occupying the recycle bin for the whole
     /// retention window, which would make eviction unable to relieve pressure.
+    /// A staged victim reports its size as `scheduled_bytes`, not as reclaimed.
     pub fn execute_by_id_with_mode(
         &self,
         inode_id: i64,
         delete_mode: DeleteMode,
-    ) -> FsResult<(bool, InodeView, i64)> {
+    ) -> FsResult<TtlOutcome> {
+        let (handled, inode, reclaimed_bytes, scheduled_bytes) =
+            self.execute_inner(inode_id, delete_mode)?;
+        Ok(TtlOutcome {
+            handled,
+            inode,
+            reclaimed_bytes,
+            scheduled_bytes,
+        })
+    }
+
+    fn execute_inner(
+        &self,
+        inode_id: i64,
+        delete_mode: DeleteMode,
+    ) -> FsResult<(bool, InodeView, i64, i64)> {
         let inode = if let Some(inode) = self.get_inode_from_store(inode_id)? {
             inode
         } else {
@@ -109,11 +140,11 @@ impl InodeTtlExecutor {
         // progress. Blocks stay allocated until a purge reclaims them.
         if Self::is_trash_entry(&inode) {
             debug!("skip ttl action for trash entry inode_id={}", inode_id);
-            return Ok((true, inode, 0));
+            return Ok((true, inode, 0, 0));
         }
 
         if !inode.is_expired()? {
-            return Ok((false, inode, 0));
+            return Ok((false, inode, 0, 0));
         }
 
         let action = inode.storage_policy()?.ttl_action;
@@ -128,7 +159,7 @@ impl InodeTtlExecutor {
             // Entries placed under /.Trash without the internal marker (for
             // example restored/foreign entries) are still not TTL candidates.
             debug!("skip ttl action for trash path {} ({})", path, inode_id);
-            return Ok((true, inode, 0));
+            return Ok((true, inode, 0, 0));
         }
 
         match action {
@@ -138,22 +169,26 @@ impl InodeTtlExecutor {
                 // Free is not gated here: it drops cached blocks and leaves children.
                 if inode.is_dir() && !self.is_empty_dir(&path)? {
                     debug!("skip ttl delete for non-empty directory {}", inode_id);
-                    return Ok((false, inode, 0));
+                    return Ok((false, inode, 0, 0));
                 }
                 // Unlinking one name of a hard-linked file keeps the shared
-                // blocks, so only the last link reclaims the file size. A staged
-                // async purge has not reclaimed anything yet either.
-                let reclaimed = match &inode {
-                    InodeView::File(f)
-                        if f.nlink() <= 1 && !matches!(delete_mode, DeleteMode::AsyncPurge) =>
-                    {
-                        f.len.max(0)
-                    }
+                // blocks, so only the last link frees the file size.
+                let size = match &inode {
+                    InodeView::File(f) if f.nlink() <= 1 => f.len.max(0),
                     _ => 0,
                 };
-                self.filesystem.delete_with_mode(&path, true, delete_mode)?;
+                let res = self.filesystem.delete_with_mode(&path, true, delete_mode)?;
                 debug!("ttl delete {} {:?}", path, inode);
-                Ok((true, inode, reclaimed))
+                // Report how the delete was actually served: a staged entry is
+                // freed later by the purger, a trashed one only after retention.
+                let (reclaimed, scheduled) = if res.purge_pending {
+                    (0, size)
+                } else if res.trashed {
+                    (0, 0)
+                } else {
+                    (size, 0)
+                };
+                Ok((true, inode, reclaimed, scheduled))
             }
             TtlAction::Free => {
                 let reclaimed = match &inode {
@@ -162,10 +197,10 @@ impl InodeTtlExecutor {
                 };
                 self.filesystem.free(&path, true)?;
                 debug!("ttl free {} {:?}", path, inode);
-                Ok((true, inode, reclaimed))
+                Ok((true, inode, reclaimed, 0))
             }
 
-            _ => Ok((true, inode, 0)),
+            _ => Ok((true, inode, 0, 0)),
         }
     }
 }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::{MasterFilesystem, TrashPurger};
+use crate::master::fs::{MasterFilesystem, TrashPurger, TrashStage};
 use crate::master::MasterMonitor;
 use curvine_error::{FsError, FsResult};
 use curvine_runtime::common::LocalTime;
@@ -79,10 +79,26 @@ impl TrashExpunger {
                 self.fs
                     .scan_expired_trash(cutoff_ms, self.scan_batch, start_after.as_deref())?;
             for path in page.paths {
+                // Stage the entry before its first destructive batch. A pending
+                // entry is not restorable, so a restore either wins with the
+                // intact tree or finds the entry gone; it can never observe a
+                // partially purged subtree. A staged entry that this sweep does
+                // not finish is resumed by the pending purger.
+                let pending = match self.fs.stage_trash_entry_if_active(&path) {
+                    Ok(TrashStage::Staged(pending)) => pending,
+                    // Restored or emptied after the scan.
+                    Ok(TrashStage::Gone) => continue,
+                    Ok(TrashStage::NotActive) => return Ok(result),
+                    Err(e) => {
+                        warn!("failed to stage expired trash entry {}: {}", path, e);
+                        continue;
+                    }
+                };
+
                 // Each entry is reclaimed in bounded batches instead of one
                 // whole-subtree delete, so a single huge entry cannot hold the
                 // namespace lock for the length of the sweep.
-                match self.purger.purge_entry(&path) {
+                match self.purger.purge_entry(&pending) {
                     Ok(Some(purged)) => {
                         result.entries += 1;
                         result.inodes += purged.inodes;
@@ -258,6 +274,44 @@ mod tests {
         let result = handle.join().unwrap().unwrap();
         assert_eq!(result, TrashExpungeResult::default());
         assert_eq!(fs.list_trash().unwrap().len(), 2);
+    }
+
+    // An expired entry is staged before its first destructive batch, so once
+    // the sweep has started on it the entry is no longer restorable and a
+    // restore can never observe a partially purged subtree.
+    #[test]
+    fn expired_entry_is_staged_before_it_is_purged() {
+        let fs = test_fs("stage-first", "1ms");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        fs.mkdir("/data/dir", true).unwrap();
+        for i in 0..4 {
+            fs.create(format!("/data/dir/{}.log", i), true).unwrap();
+        }
+        fs.delete_with_mode("/data/dir", true, DeleteMode::Default)
+            .unwrap();
+        let entry = fs.list_trash().unwrap().remove(0).path;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let pending = match fs.stage_trash_entry_if_active(&entry).unwrap() {
+            TrashStage::Staged(pending) => pending,
+            other => panic!("expected the entry to be staged, got {:?}", other),
+        };
+        assert!(fs.list_trash().unwrap().is_empty());
+        assert!(
+            fs.restore_trash(&pending, None, false).is_err(),
+            "a staged entry must not be restorable"
+        );
+        assert!(fs.restore_trash(&entry, None, false).is_err());
+        assert_eq!(
+            fs.stage_trash_entry_if_active(&entry).unwrap(),
+            TrashStage::Gone
+        );
+
+        // The sweep resumes a staged entry through the pending purger.
+        let purger = TrashPurger::new(fs.clone(), fs.master_monitor.clone());
+        let outcome = purger.purge_entry(&pending).unwrap().unwrap();
+        assert_eq!(outcome.inodes, 4, "the four trashed files");
+        assert!(!fs.exists(&pending).unwrap());
     }
 
     #[test]
