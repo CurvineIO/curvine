@@ -42,6 +42,11 @@ pub const END_SEQ_ID: i32 = -2;
 /// streaming INIT and END sentinels.
 pub const FOLLOWER_READ_SEQ_ID: i32 = -3;
 
+/// Marks a worker heartbeat or block report sent directly as follower mirror
+/// state. Ordinary leader-routed worker RPCs keep the normal INIT sequence ID
+/// so a demoted leader can reject them and trigger leader rediscovery.
+pub const WORKER_MIRROR_SEQ_ID: i32 = -4;
+
 pub const EMPTY_REQ_ID: i64 = -1;
 
 pub const MAX_DATE_SIZE: i32 = 16 * 1024 * 1024;
