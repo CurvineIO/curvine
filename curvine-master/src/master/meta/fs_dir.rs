@@ -509,7 +509,16 @@ impl FsDir {
             if claim.is_dir {
                 parent.dec_nlink(mtime);
             }
-            let _ = parent.delete_child(claim.child_id, &claim.name)?;
+            // The store batch already committed, so the child is gone from the
+            // durable tree. Aborting here would drop `total`, and the block
+            // locations it carries could then never be released; report the
+            // in-memory divergence instead of losing the reclamation.
+            if let Err(e) = parent.delete_child(claim.child_id, &claim.name) {
+                warn!(
+                    "purge: {} is deleted from the store but could not be dropped from the in-memory tree: {}",
+                    claim.name, e
+                );
+            }
         }
 
         Ok(total)
