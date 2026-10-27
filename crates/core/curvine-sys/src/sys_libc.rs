@@ -21,6 +21,7 @@ use std::fs;
 use std::fs::Metadata;
 use std::io::{ErrorKind, IoSlice};
 use std::path::Path;
+use std::sync::Mutex;
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
@@ -569,23 +570,37 @@ pub fn get_device_id(path: &Path) -> u64 {
     }
 }
 
+/// Serializes the non-reentrant NSS lookups: `getpwnam` / `getpwuid` / `getgrnam` /
+/// `getgrgid` return pointers into libc-owned static storage that the next lookup in *any*
+/// thread overwrites. Metadata paths (GETATTR, LOOKUP, READDIR, ...) resolve owners and groups
+/// concurrently from multiple worker threads, so a caller that copied `pw_uid` / `gr_gid` after
+/// releasing the lock could read a value another lookup just wrote. The whole call plus the copy
+/// of its result runs under this lock, and the lookup stays outside every caller-side lock (in
+/// particular the FUSE dcache lock), so it does not re-serialize metadata handling.
+#[cfg(target_os = "linux")]
+static NSS_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(target_os = "linux")]
+fn nss_call<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
+    // A panicking holder must not break name resolution for the whole process.
+    let _guard = NSS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
 /// Get UID by username using getpwnam system call
 pub fn get_uid_by_name(username: &str) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
-        let c_username = match CString::new(username) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
+        let c_username = CString::new(username).ok()?;
 
-        unsafe {
+        nss_call(|| unsafe {
             let passwd = libc::getpwnam(c_username.as_ptr());
             if passwd.is_null() {
                 None
             } else {
                 Some((*passwd).pw_uid)
             }
-        }
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -598,15 +613,15 @@ pub fn get_uid_by_name(username: &str) -> Option<u32> {
 pub fn get_username_by_uid(uid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        unsafe {
+        nss_call(|| unsafe {
             let passwd = libc::getpwuid(uid);
             if passwd.is_null() {
                 None
             } else {
                 let c_str = CStr::from_ptr((*passwd).pw_name);
-                c_str.to_string_lossy().into_owned().into()
+                Some(c_str.to_string_lossy().into_owned())
             }
-        }
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -619,19 +634,16 @@ pub fn get_username_by_uid(uid: u32) -> Option<String> {
 pub fn get_gid_by_name(groupname: &str) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
-        let c_groupname = match CString::new(groupname) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
+        let c_groupname = CString::new(groupname).ok()?;
 
-        unsafe {
+        nss_call(|| unsafe {
             let group = libc::getgrnam(c_groupname.as_ptr());
             if group.is_null() {
                 None
             } else {
                 Some((*group).gr_gid)
             }
-        }
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -644,15 +656,15 @@ pub fn get_gid_by_name(groupname: &str) -> Option<u32> {
 pub fn get_groupname_by_gid(gid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        unsafe {
+        nss_call(|| unsafe {
             let group = libc::getgrgid(gid);
             if group.is_null() {
                 None
             } else {
                 let c_str = CStr::from_ptr((*group).gr_name);
-                c_str.to_string_lossy().into_owned().into()
+                Some(c_str.to_string_lossy().into_owned())
             }
-        }
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
