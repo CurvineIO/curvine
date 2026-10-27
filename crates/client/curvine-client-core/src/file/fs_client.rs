@@ -1958,9 +1958,10 @@ mod tests {
             assert_eq!(follower_state.counts.mount_table.load(Ordering::SeqCst), 0);
             assert_eq!(follower_state.counts.list_status.load(Ordering::SeqCst), 0);
 
-            context
-                .session_path_tracker()
-                .mark_mutation(&path("/glob/child"));
+            client
+                .mkdir(&path("/glob/child"), MkdirOpts::with_create(false))
+                .await
+                .unwrap();
             let leader_lists_before_glob = leader_state.counts.list_status.load(Ordering::SeqCst);
             let follower_lists_before_glob =
                 follower_state.counts.list_status.load(Ordering::SeqCst);
