@@ -199,10 +199,15 @@ impl WorkerManager {
                     return Ok(vec![]);
                 }
                 if same_session {
-                    // The follower handler separately invalidates its
-                    // full-report readiness state. This active-path no-op is
-                    // safe when a mirrored Start reaches the newly elected
-                    // leader.
+                    // A Start can arrive while a worker is in a promotion
+                    // grace period after being marked Lost by a follower.
+                    // Refresh the timeout origin so a slow initial full report
+                    // cannot be cleaned up before its first Running heartbeat.
+                    // Keep its status unchanged until that Running heartbeat
+                    // confirms the worker is ready again.
+                    if let Some(worker) = self.worker_map.workers.get_mut(&addr.worker_id) {
+                        worker.last_update = LocalTime::mills();
+                    }
                     return Ok(vec![]);
                 }
                 for stale in self.worker_map.remove_same_endpoint(&addr) {
@@ -353,6 +358,21 @@ impl WorkerManager {
         }
         worker.status = WorkerStatus::Lost;
         Some(worker.clone())
+    }
+
+    /// Start a bounded recovery window for workers that expired only in the
+    /// follower's passive heartbeat view. Keep them non-live until an
+    /// authoritative heartbeat arrives, but do not let the stale passive time
+    /// immediately trigger active lost-worker cleanup after promotion.
+    pub fn refresh_passive_lost_workers_for_promotion(&mut self, now_ms: u64) -> Vec<u32> {
+        let mut refreshed = Vec::new();
+        for (worker_id, worker) in &mut self.worker_map.workers {
+            if worker.status == WorkerStatus::Lost {
+                worker.last_update = now_ms;
+                refreshed.push(*worker_id);
+            }
+        }
+        refreshed
     }
 
     pub fn add_blacklist_worker(&mut self, id: u32) -> Option<WorkerInfo> {
@@ -803,6 +823,32 @@ mod tests {
         assert!(manager.get_worker(1).is_some());
         assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 64);
 
+        {
+            let worker = manager.worker_map.workers.get_mut(&1).unwrap();
+            worker.status = WorkerStatus::Lost;
+            worker.last_update = 1;
+        }
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                "session-1".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        let worker = manager.get_worker(1).unwrap();
+        assert_eq!(worker.status, WorkerStatus::Lost);
+        assert!(
+            worker.last_update > 1,
+            "same-session Start refreshes liveness"
+        );
+
         manager
             .heartbeat_passive(
                 &cluster_id,
@@ -1009,6 +1055,43 @@ mod tests {
             .unwrap();
         assert_eq!(manager.get_worker(1).unwrap().address, new_addr);
         assert!(manager.get_worker(1).unwrap().is_live());
+    }
+
+    #[test]
+    fn promotion_refreshes_passive_lost_timeout_without_marking_worker_live() {
+        let mut manager = robin_manager();
+        let cluster_id = manager.cluster_id.clone();
+        let addr = WorkerAddress {
+            worker_id: 9,
+            ..Default::default()
+        };
+        manager
+            .heartbeat_passive(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr,
+                1,
+                "passive-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        manager.mark_passive_worker_expired(9).unwrap();
+        manager.worker_map.workers.get_mut(&9).unwrap().last_update = 1;
+
+        assert_eq!(
+            manager.refresh_passive_lost_workers_for_promotion(10_000),
+            vec![9]
+        );
+        let worker = manager.get_worker(9).unwrap();
+        assert_eq!(worker.status, WorkerStatus::Lost);
+        assert_eq!(worker.last_update, 10_000);
+        assert!(manager
+            .refresh_passive_lost_workers_for_promotion(20_000)
+            .is_empty());
     }
 
     #[test]

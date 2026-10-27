@@ -21,6 +21,7 @@ use curvine_error::FsResult;
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::{GroupExecutor, LoopTask};
 use log::{error, info, warn};
+use parking_lot::Mutex;
 use std::sync::Arc;
 
 pub struct HeartbeatChecker {
@@ -31,6 +32,7 @@ pub struct HeartbeatChecker {
     worker_lost_ms: u64,
     replication_manager: Arc<MasterReplicationManager>,
     quota_manager: Arc<QuotaManager>,
+    last_active_epoch: Mutex<Option<u64>>,
 }
 
 impl HeartbeatChecker {
@@ -51,6 +53,7 @@ impl HeartbeatChecker {
             worker_lost_ms,
             replication_manager,
             quota_manager,
+            last_active_epoch: Mutex::new(None),
         }
     }
 }
@@ -99,6 +102,39 @@ impl LoopTask for HeartbeatChecker {
                 }
             }
             return Ok(());
+        }
+
+        let readiness = self.monitor.follower_readiness_snapshot();
+        let promotion_epoch = {
+            let mut last_epoch = self.last_active_epoch.lock();
+            if *last_epoch == Some(readiness.leadership_epoch) {
+                false
+            } else {
+                *last_epoch = Some(readiness.leadership_epoch);
+                true
+            }
+        };
+        if promotion_epoch
+            && (self.fs.conf.follower_worker_state_enabled || self.fs.conf.follower_reads_enabled)
+        {
+            let now = LocalTime::mills();
+            let refreshed = {
+                let mut wm = self.fs.worker_manager.write();
+                if !self.monitor.is_active()
+                    || self.monitor.follower_readiness_snapshot().leadership_epoch
+                        != readiness.leadership_epoch
+                {
+                    return Ok(());
+                }
+                wm.refresh_passive_lost_workers_for_promotion(now)
+            };
+            if !refreshed.is_empty() {
+                info!(
+                    "Master promotion granted {} passively expired workers a {} ms recovery window",
+                    refreshed.len(),
+                    self.worker_lost_ms
+                );
+            }
         }
 
         let mut blacklisted_workers = Vec::new();
@@ -177,5 +213,123 @@ impl LoopTask for HeartbeatChecker {
 
     fn terminate(&self) -> bool {
         self.monitor.is_stop()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::journal::JournalSystem;
+    use crate::master::quota::eviction::evictor::LRUEvictor;
+    use crate::master::quota::eviction::types::EvictionConf;
+    use crate::master::quota::QuotaManager;
+    use crate::master::replication::master_replication_manager::MasterReplicationManager;
+    use crate::master::{Master, MasterMonitor};
+    use curvine_config::ClusterConf;
+    use curvine_model::{TransferWorkerCapabilities, WorkerAddress, WorkerStatus};
+    use curvine_raft::raft::{FollowerReadinessMonitor, RoleState};
+    use curvine_runtime::common::Utils;
+    use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor};
+    use curvine_runtime::sync::StateCtl;
+    use std::sync::Arc;
+
+    #[test]
+    fn promotion_grants_passive_lost_worker_one_lost_interval_before_cleanup() {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.follower_worker_state_enabled = true;
+        let test_id = Utils::rand_str(8);
+        conf.master.meta_dir = Utils::test_sub_dir(format!("heartbeat-promotion/meta-{test_id}"));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("heartbeat-promotion/journal-{test_id}"));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+
+        let readiness = FollowerReadinessMonitor::default();
+        readiness.observe_raft_state(RoleState::Follower, 1, 2, 0);
+        readiness.observe_applied(0);
+        readiness.set_replay_ready(true);
+        let monitor = MasterMonitor::with_follower_readiness(
+            StateCtl::new(RoleState::Follower.into()),
+            StateCtl::new(0),
+            readiness.clone(),
+        );
+        fs.master_monitor = monitor.clone();
+
+        let worker_id = 17;
+        let addr = WorkerAddress {
+            worker_id,
+            ..Default::default()
+        };
+        {
+            let mut wm = fs.worker_manager.write();
+            let cluster_id = wm.cluster_id.clone();
+            wm.heartbeat_passive(
+                &cluster_id,
+                curvine_model::HeartbeatStatus::Start,
+                addr,
+                1,
+                "promoted-worker-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+            wm.worker_map
+                .workers
+                .get_mut(&worker_id)
+                .unwrap()
+                .last_update = 1;
+            wm.mark_passive_worker_expired(worker_id).unwrap();
+        }
+
+        let runtime = Arc::new(AsyncRuntime::single());
+        let replication_manager =
+            MasterReplicationManager::new(&fs, &conf, &runtime, &fs.worker_manager).unwrap();
+        let quota_manager = QuotaManager::new(
+            EvictionConf::from_conf(&conf),
+            fs.clone(),
+            Arc::new(LRUEvictor::new(EvictionConf::from_conf(&conf))),
+            runtime,
+            true,
+        );
+        let executor = Arc::new(GroupExecutor::new("heartbeat-promotion-test", 1, 16));
+        let checker = HeartbeatChecker::new(
+            fs.clone(),
+            monitor.clone(),
+            executor,
+            replication_manager,
+            quota_manager,
+        );
+
+        checker.run().unwrap();
+        readiness.observe_raft_state(RoleState::Leader, 2, 1, 0);
+        monitor.journal_ctl.set_state(RoleState::Leader);
+        checker.run().unwrap();
+
+        let promoted = fs.worker_manager.read();
+        let worker = promoted.get_worker(worker_id).unwrap();
+        assert_eq!(worker.status, WorkerStatus::Lost);
+        assert!(worker.last_update > 1);
+        drop(promoted);
+
+        // The grace is bounded: after a full lost interval with no authoritative
+        // heartbeat, the active checker performs its normal cleanup transition.
+        {
+            let mut wm = fs.worker_manager.write();
+            let lost_interval_ms = wm.conf.master.worker_lost_interval_ms();
+            wm.worker_map
+                .workers
+                .get_mut(&worker_id)
+                .unwrap()
+                .last_update = LocalTime::mills().saturating_sub(lost_interval_ms + 1);
+        }
+        checker.run().unwrap();
+        let wm = fs.worker_manager.read();
+        assert!(wm.get_worker(worker_id).is_none());
+        assert!(wm.worker_map.lost_workers().contains_key(&worker_id));
     }
 }
