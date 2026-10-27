@@ -132,6 +132,15 @@ pub struct MasterConf {
     #[serde(skip)]
     pub trash_check_interval_unit: DurationUnit,
 
+    // Maximum number of inodes a single trash purge batch removes before the
+    // namespace lock is released. Every path in a batch removes exactly one
+    // inode, so this also bounds the batch's journal record.
+    pub trash_purge_batch_inodes: usize,
+
+    // Milliseconds the purger yields between batches so foreground metadata
+    // operations can take the namespace lock.
+    pub trash_purge_yield_ms: u64,
+
     // Eviction configuration
     pub enable_quota_eviction: bool,
     pub quota_eviction_mode: String,
@@ -394,6 +403,9 @@ impl Default for MasterConf {
 
             trash_check_interval: "1h".to_string(),
             trash_check_interval_unit: Default::default(),
+
+            trash_purge_batch_inodes: 4096,
+            trash_purge_yield_ms: 5,
 
             // Eviction configuration defaults
             enable_quota_eviction: false,

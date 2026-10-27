@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{MasterFilesystem, TrashPurger};
 use crate::master::MasterMonitor;
 use curvine_error::{FsError, FsResult};
 use curvine_runtime::common::LocalTime;
@@ -30,6 +30,7 @@ pub struct TrashExpunger {
     monitor: MasterMonitor,
     retention_ms: i64,
     scan_batch: usize,
+    purger: TrashPurger,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -42,11 +43,13 @@ pub struct TrashExpungeResult {
 impl TrashExpunger {
     pub fn new(fs: MasterFilesystem, monitor: MasterMonitor) -> Self {
         let retention_ms = fs.conf.trash_retention_ms().min(i64::MAX as u64) as i64;
+        let purger = TrashPurger::new(fs.clone(), monitor.clone());
         Self {
             fs,
             monitor,
             retention_ms,
             scan_batch: TRASH_SCAN_BATCH,
+            purger,
         }
     }
 
@@ -76,11 +79,14 @@ impl TrashExpunger {
                 self.fs
                     .scan_expired_trash(cutoff_ms, self.scan_batch, start_after.as_deref())?;
             for path in page.paths {
-                match self.fs.delete_with_opts_if_active(&path, true, true) {
-                    Ok(Some(deleted)) => {
+                // Each entry is reclaimed in bounded batches instead of one
+                // whole-subtree delete, so a single huge entry cannot hold the
+                // namespace lock for the length of the sweep.
+                match self.purger.purge_entry(&path) {
+                    Ok(Some(purged)) => {
                         result.entries += 1;
-                        result.inodes += deleted.inodes;
-                        result.bytes += deleted.bytes;
+                        result.inodes += purged.inodes;
+                        result.bytes += purged.bytes;
                     }
                     // Leadership moved elsewhere mid-sweep; a former leader
                     // must not mutate metadata or enqueue journal records.

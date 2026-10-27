@@ -374,6 +374,40 @@ impl FsDir {
         Ok(del_res)
     }
 
+    /// Removes the given paths without journaling one record per path.
+    ///
+    /// The trash purger supplies leaf-first batches, so each call stays bounded
+    /// even when the trashed entry holds millions of inodes. Paths that no
+    /// longer resolve are skipped, which makes a replayed or partially applied
+    /// batch idempotent: the remaining paths of a failed batch are simply
+    /// retried by the next cycle.
+    pub fn purge_paths(&mut self, paths: &[String], mtime: i64) -> FsResult<DeleteResult> {
+        let mut total = DeleteResult::new();
+
+        for path in paths {
+            let inp = match InodePath::resolve(self.root_ptr(), path, &self.store) {
+                Ok(inp) => inp,
+                Err(e) => {
+                    debug!("purge: skip unresolvable path {}: {}", path, e);
+                    continue;
+                }
+            };
+
+            // The entry may have been restored, emptied or purged already.
+            if inp.is_empty() || inp.get_last_inode().is_none() {
+                debug!("purge: skip vanished path {}", path);
+                continue;
+            }
+
+            let res = self.unprotected_delete(&inp, mtime)?;
+            total.inodes += res.inodes;
+            total.bytes += res.bytes;
+            total.blocks.extend(res.blocks);
+        }
+
+        Ok(total)
+    }
+
     // Move an entry into /.Trash instead of removing it. Blocks stay on the
     // workers so the entry can be restored until retention expires.
     pub fn trash(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
