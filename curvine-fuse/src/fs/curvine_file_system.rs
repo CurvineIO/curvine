@@ -625,9 +625,12 @@ impl CurvineFileSystem {
             return Ok(());
         }
 
-        let mut dir_ino = {
+        let meta_ttl = self.conf.meta_cache_ttl.as_millis() as u64;
+        // Snapshot the whole ancestor chain under one read guard so traversal cost
+        // does not grow lock acquisitions with path depth.
+        let (ancestors, missing) = {
             let dir = self.state.dir_read();
-            match dir.get_inode(ino, None) {
+            let mut dir_ino = match dir.get_inode(ino, None) {
                 None => {
                     return err_fuse!(
                         libc::EACCES,
@@ -637,11 +640,30 @@ impl CurvineFileSystem {
                 }
                 Some(inode) if inode.is_root() => return Ok(()),
                 Some(inode) => inode.parent,
+            };
+
+            let mut ancestors = Vec::new();
+            let mut missing = None;
+            while dir_ino != 0 {
+                match dir.get_inode(dir_ino, None) {
+                    Some(inode) => {
+                        ancestors.push((dir_ino, Self::traversal_cached_status(inode, meta_ttl)));
+                        if inode.is_root() {
+                            break;
+                        }
+                        dir_ino = inode.parent;
+                    }
+                    None => {
+                        ancestors.push((dir_ino, None));
+                        missing = Some(dir_ino);
+                        break;
+                    }
+                }
             }
+            (ancestors, missing)
         };
 
-        let meta_ttl = self.conf.meta_cache_ttl.as_millis() as u64;
-        while dir_ino != 0 {
+        for (dir_ino, cached_status) in ancestors {
             let check_header = fuse_in_header {
                 uid: header.uid,
                 gid: header.gid,
@@ -649,32 +671,18 @@ impl CurvineFileSystem {
                 nodeid: dir_ino,
                 ..Default::default()
             };
-            let (is_root, cached_status) = {
-                let dir = self.state.dir_read();
-                match dir.get_inode(dir_ino, None) {
-                    Some(inode) => {
-                        let is_root = inode.is_root();
-                        let status = Self::traversal_cached_status(inode, meta_ttl);
-                        (is_root, status)
-                    }
-                    None => (false, None),
-                }
-            };
-
             if let Some(status) = cached_status {
                 self.check_access_permissions(&status, &check_header, libc::X_OK as u32)?;
             } else {
                 self.check_permissions(&check_header, libc::X_OK as u32)
                     .await?;
             }
-
-            if is_root {
-                break;
-            }
-            dir_ino = self.state.get_parent_ino(dir_ino)?;
         }
 
-        Ok(())
+        match missing {
+            Some(dir_ino) => err_fuse!(libc::ENOENT, "inode {} not exists", dir_ino),
+            None => Ok(()),
+        }
     }
 
     /// Check if the current user has the requested access permissions
@@ -2502,6 +2510,72 @@ mod tests {
 
         assert_eq!(actual, (expected, expected));
         assert!(actual.1 <= actual.0);
+    }
+
+    #[test]
+    fn traverse_permissions_check_every_cached_ancestor() {
+        use super::CurvineFileSystem;
+        use crate::FUSE_ROOT_ID;
+        use curvine_config::ClusterConf;
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+        use std::sync::Arc;
+
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.check_permission = true;
+        conf.fuse.enable_meta_cache = true;
+        conf.fuse.metrics_enabled = false;
+        let fs = CurvineFileSystem::new(conf, rt.clone()).unwrap();
+
+        let dir_status = |id: i64, name: &str, mode: u32| {
+            let mut status = FileStatus::with_name(id, name.to_string(), true);
+            status.mode = mode;
+            status.owner = "0".to_string();
+            status.group = "0".to_string();
+            status
+        };
+        let _ = fs
+            .state
+            .update_status(FUSE_ROOT_ID, None, &dir_status(1, "", 0o755));
+        let (b_ino, f_ino) = {
+            let mut dir = fs.state.dir_write();
+            let a = dir
+                .lookup(FUSE_ROOT_ID, "a", dir_status(2, "a", 0o755), true)
+                .unwrap()
+                .ino;
+            let b = dir
+                .lookup(a, "b", dir_status(3, "b", 0o755), true)
+                .unwrap()
+                .ino;
+            let f = dir
+                .lookup(
+                    b,
+                    "f",
+                    FileStatus::with_name(4, "f".to_string(), false),
+                    true,
+                )
+                .unwrap()
+                .ino;
+            (b, f)
+        };
+
+        let header = hdr(1000, 1000, 1);
+        rt.block_on(fs.check_traverse_permissions(f_ino, &header))
+            .unwrap();
+
+        // Non-Linux builds bypass permission bits entirely.
+        #[cfg(target_os = "linux")]
+        {
+            let _ = fs
+                .state
+                .update_status(b_ino, None, &dir_status(3, "b", 0o700));
+            let err = rt
+                .block_on(fs.check_traverse_permissions(f_ino, &header))
+                .unwrap_err();
+            assert_eq!(err.errno(), libc::EACCES);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = b_ino;
     }
 
     #[test]
