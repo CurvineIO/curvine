@@ -529,6 +529,17 @@ class TestCurvineFileSystem(unittest.TestCase):
         mock_client_instance.rm.assert_called_once_with("/test/dir", True, True)
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_rm_async(self, mock_curvine_client: MagicMock) -> None:
+        """Test rm forwards async_delete like delete does."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        fs.rm("/test/dir", recursive=True, async_delete=True)
+
+        mock_client_instance.rm.assert_called_once_with("/test/dir", True, True)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
     def test_get_file_status(self, mock_curvine_client: MagicMock) -> None:
         """Test get_file_status."""
         mock_client_instance = MagicMock()

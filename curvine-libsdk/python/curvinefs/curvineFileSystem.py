@@ -476,16 +476,20 @@ class CurvineFileSystem(AbstractFileSystem):
         path2 = self._format_path(path2)
         return self.client.rename(path1, path2)
 
-    def rm(self, path: str, recursive: bool = False, **kwargs: Any) -> None:
+    def rm(
+        self, path: str, recursive: bool = False, async_delete: bool = False, **kwargs: Any
+    ) -> None:
         """Remove a file or directory.
 
         Args:
             path: Path to remove.
             recursive: If True, remove directories recursively.
+            async_delete: If True, return once the name leaves the namespace and
+                let the master reclaim the blocks in the background.
             **kwargs: Additional keyword arguments.
         """
         path = self._format_path(path)
-        self.client.rm(path, recursive)
+        self.client.rm(path, recursive, async_delete)
 
     def rm_file(self, path: str) -> None:
         """Remove a file.
