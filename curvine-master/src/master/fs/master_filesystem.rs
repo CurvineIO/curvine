@@ -2037,8 +2037,8 @@ impl MasterFilesystem {
     }
 
     /// Retry unknown-inode reports after journal replay catches up. Missing or
-    /// non-file inodes are discarded only with a fresh current-leader contact
-    /// and an applied index that covers local commit.
+    /// non-file inodes are discarded only with fresh leader-commit proof and an
+    /// applied index that covers both the local and leader commit watermarks.
     pub fn retry_passive_block_reports(&self) -> FsResult<()> {
         if !self.follower_worker_state_enabled() {
             return Ok(());
@@ -2057,16 +2057,20 @@ impl MasterFilesystem {
         let mut resolved = Vec::new();
         let snapshot = self.master_monitor.follower_readiness_snapshot();
         let contact_timeout = Duration::from_millis(self.follower_read_contact_timeout_ms);
-        let replay_is_current = snapshot.role == curvine_raft::raft::RoleState::Follower
-            && snapshot.replay_ready
-            && snapshot
-                .applied_index
-                .is_some_and(|applied| applied >= snapshot.commit_index)
-            && snapshot
-                .leader_contact_age
-                .is_some_and(|age| age <= contact_timeout);
+        let replay_is_current = |snapshot: &FollowerReadinessSnapshot| {
+            snapshot.role == RoleState::Follower
+                && snapshot.replay_ready
+                && snapshot.leader_commit_index.is_some_and(|leader_commit| {
+                    snapshot
+                        .applied_index
+                        .is_some_and(|applied| applied >= snapshot.commit_index.max(leader_commit))
+                })
+                && snapshot
+                    .leader_contact_age
+                    .is_some_and(|age| age <= contact_timeout)
+        };
         for report in deferred {
-            if !replay_is_current
+            if !replay_is_current(&snapshot)
                 || snapshot.leader_contact_sequence <= report.leader_contact_sequence
             {
                 continue;
@@ -2093,9 +2097,10 @@ impl MasterFilesystem {
             }
         }
 
+        let final_snapshot = self.master_monitor.follower_readiness_snapshot();
         if self.master_monitor.is_active()
-            || self.master_monitor.follower_readiness_snapshot().role
-                != curvine_raft::raft::RoleState::Follower
+            || !replay_is_current(&final_snapshot)
+            || final_snapshot.leadership_epoch != snapshot.leadership_epoch
         {
             return Ok(());
         }
@@ -2524,7 +2529,7 @@ mod tests {
         readiness.observe_raft_state(RoleState::Follower, 1, 2, 0);
         readiness.observe_applied(0);
         readiness.set_replay_ready(true);
-        readiness.observe_leader_contact(1, 2);
+        readiness.observe_leader_contact(1, 2, Some(0));
         fs.master_monitor = MasterMonitor::with_follower_readiness(
             StateCtl::new(RoleState::Follower.into()),
             StateCtl::new(0),
@@ -2823,7 +2828,7 @@ mod tests {
             .is_some());
 
         readiness.observe_raft_state(RoleState::Follower, 2, 3, 0);
-        readiness.observe_leader_contact(2, 3);
+        readiness.observe_leader_contact(2, 3, Some(0));
         let resync_signal = apply_test_passive_heartbeat(
             &fs,
             HeartbeatStatus::Running,
@@ -2953,7 +2958,19 @@ mod tests {
 
         // Only accepted current-term leader traffic after the report can
         // authorize treating the still-missing inode as a stale worker block.
-        readiness.observe_leader_contact(1, 2);
+        readiness.observe_leader_contact(1, 2, None);
+        fs.retry_passive_block_reports().unwrap();
+        assert_eq!(fs.follower_block_report_state.deferred_len(), 1);
+
+        // A known remote watermark that the local FSM has not applied cannot
+        // authorize removal of a report whose inode is still missing locally.
+        readiness.observe_leader_contact(1, 2, Some(10));
+        fs.retry_passive_block_reports().unwrap();
+        assert_eq!(fs.follower_block_report_state.deferred_len(), 1);
+
+        readiness.observe_raft_state(RoleState::Follower, 1, 2, 10);
+        readiness.observe_applied(10);
+        readiness.observe_leader_contact(1, 2, Some(10));
         fs.retry_passive_block_reports().unwrap();
         assert_eq!(fs.follower_block_report_state.deferred_len(), 0);
         assert!(fs.follower_block_report_state.worker_ready(7));

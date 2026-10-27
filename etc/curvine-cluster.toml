@@ -57,8 +57,8 @@ meta_dir = "testing/meta"
 # worker_policy = "weighted"
 
 # Optional follower metadata reads. See docs/follower-reads.md for rollout and
-# consistency limits. Commit lag is 0..10000 entries; the apply-stall timeout
-# is 1ms..10m and only applies while committed entries await replay.
+# consistency limits. Commit lag is 0..10000 entries; the stall timeout is
+# 1ms..10m and separately covers local apply stalls and replication stalls.
 # follower_reads_enabled = false
 # follower_worker_state_enabled = false
 # follower_read_max_commit_lag = 0

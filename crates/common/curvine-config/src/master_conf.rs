@@ -170,11 +170,11 @@ pub struct MasterConf {
     /// their local, non-journaled worker and block-location view.
     /// This does not enable client metadata reads on followers.
     pub follower_worker_state_enabled: bool,
-    /// Maximum number of committed Raft entries the follower may trail by.
-    /// Zero requires the metadata FSM to reach the observed local commit index.
+    /// Maximum number of entries the applied metadata FSM may trail the greater
+    /// of the local Raft commit and the latest proven leader commit.
     pub follower_read_max_commit_lag: u64,
-    /// Refuse follower reads when committed entries remain unapplied without
-    /// progress for this long. This timer runs only while commit exceeds apply.
+    /// Refuse follower reads when local apply or replication makes no progress
+    /// for this long. The two stall reasons are tracked and reported separately.
     pub follower_read_apply_stall_timeout: String,
     #[serde(skip)]
     pub follower_read_apply_stall_timeout_unit: DurationUnit,

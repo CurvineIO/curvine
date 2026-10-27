@@ -68,12 +68,12 @@ impl ConfValidate for ClusterConf {
             self.mds.validate()?;
         }
         self.journal.validate()?;
-        if self.master.follower_reads_enabled {
+        if self.master.follower_reads_enabled || self.master.follower_worker_state_enabled {
             let contact_timeout = self.journal.follower_read_contact_timeout_ms()?;
             let election_timeout = self.journal.minimum_election_timeout_ms()?;
             if contact_timeout >= election_timeout {
                 return err_box!(
-                    "journal follower-read contact timeout ({}ms) must be below minimum election timeout ({}ms)",
+                    "journal follower readiness contact timeout ({}ms) must be below minimum election timeout ({}ms)",
                     contact_timeout,
                     election_timeout
                 );
@@ -399,12 +399,18 @@ mod tests {
     }
 
     #[test]
-    fn enabled_follower_reads_reject_contact_deadline_at_or_above_election_timeout() {
+    fn enabled_follower_features_reject_contact_deadline_at_or_above_election_timeout() {
         let mut conf = ClusterConf::default();
         conf.master.follower_reads_enabled = true;
         conf.journal.raft_heartbeat_tick = 5;
         let error = conf.validate().unwrap_err().to_string();
-        assert!(error.contains("follower-read contact timeout"));
+        assert!(error.contains("follower readiness contact timeout"));
+
+        let mut passive_state = ClusterConf::default();
+        passive_state.master.follower_worker_state_enabled = true;
+        passive_state.journal.raft_heartbeat_tick = 5;
+        let error = passive_state.validate().unwrap_err().to_string();
+        assert!(error.contains("follower readiness contact timeout"));
     }
 
     #[test]
@@ -427,5 +433,26 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("contact timeout overflows"));
+    }
+
+    #[test]
+    fn zero_minimum_election_ticks_use_the_raft_election_tick_fallback() {
+        let mut conf = ClusterConf::default();
+        conf.master.follower_reads_enabled = true;
+        conf.journal.raft_min_election_ticks = 0;
+        conf.journal.raft_election_tick = 7;
+
+        assert_eq!(conf.journal.minimum_election_timeout_ms().unwrap(), 7_000);
+        conf.validate().unwrap();
+
+        let mut too_short_fallback = ClusterConf::default();
+        too_short_fallback.master.follower_reads_enabled = true;
+        too_short_fallback.journal.raft_min_election_ticks = 0;
+        too_short_fallback.journal.raft_election_tick = 6;
+        assert!(too_short_fallback
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("follower readiness contact timeout"));
     }
 }

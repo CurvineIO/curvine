@@ -18,9 +18,10 @@ use std::time::{Duration, Instant};
 
 /// Shared observation of Raft leadership contact and metadata replay progress.
 ///
-/// Raft publishes role, term, leader, and commit observations. The journal FSM
-/// separately publishes its actual applied index after replay completes. The
-/// two watermarks are intentionally not inferred from each other.
+/// Raft publishes role, term, leader, local commit, and verified leader-commit
+/// observations. The journal FSM separately publishes its actual applied
+/// index after replay completes. These watermarks are not inferred from each
+/// other.
 #[derive(Clone, Default)]
 pub struct FollowerReadinessMonitor(Arc<Mutex<FollowerReadinessState>>);
 
@@ -30,11 +31,14 @@ struct FollowerReadinessState {
     leader_id: u64,
     leadership_epoch: u64,
     commit_index: u64,
+    leader_commit_index: Option<u64>,
+    leader_commit_contact_proven: bool,
     applied_index: Option<u64>,
     replay_ready: bool,
     leader_contact: Option<LeaderContact>,
     leader_contact_sequence: u64,
     lag_started_at: Option<Instant>,
+    replication_lag_started_at: Option<Instant>,
 }
 
 impl Default for FollowerReadinessState {
@@ -45,11 +49,14 @@ impl Default for FollowerReadinessState {
             leader_id: 0,
             leadership_epoch: 0,
             commit_index: 0,
+            leader_commit_index: None,
+            leader_commit_contact_proven: false,
             applied_index: None,
             replay_ready: false,
             leader_contact: None,
             leader_contact_sequence: 0,
             lag_started_at: None,
+            replication_lag_started_at: None,
         }
     }
 }
@@ -71,6 +78,10 @@ pub struct FollowerReadinessSnapshot {
     /// leader changes. Request handlers compare it across build/serve windows.
     pub leadership_epoch: u64,
     pub commit_index: u64,
+    /// Highest leader commit observed in this leadership epoch. This is
+    /// exposed only when the most recent accepted leader contact carried the
+    /// optional commit proof; otherwise follower reads must fail closed.
+    pub leader_commit_index: Option<u64>,
     pub applied_index: Option<u64>,
     pub replay_ready: bool,
     /// Monotonic counter incremented only for accepted current-term leader
@@ -80,9 +91,13 @@ pub struct FollowerReadinessSnapshot {
     /// Present only when the last observed contact belongs to the current
     /// follower term and leader.
     pub leader_contact_age: Option<Duration>,
-    /// Present only while committed work remains unapplied. This timer resets
-    /// whenever the applied index advances, and is absent for a healthy idle node.
+    /// Present only while local committed work remains unapplied. This timer
+    /// resets whenever the applied index advances and stays absent for network
+    /// replication lag.
     pub apply_no_progress_age: Option<Duration>,
+    /// Present only while the advertised leader commit is ahead of the local
+    /// Raft commit. This timer resets when local replication advances.
+    pub replication_no_progress_age: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,8 +107,10 @@ pub enum FollowerReadRefusal {
     NoLeader,
     NoCurrentTermLeaderContact,
     StaleLeaderContact,
+    LeaderCommitUnknown,
     ApplyProgressUnknown,
     ApplyStalled,
+    ReplicationStalled,
     CommitLag,
 }
 
@@ -121,11 +138,13 @@ impl FollowerReadinessSnapshot {
         if contact_age > max_contact_age {
             return Some(FollowerReadRefusal::StaleLeaderContact);
         }
+        let Some(leader_commit_index) = self.leader_commit_index else {
+            return Some(FollowerReadRefusal::LeaderCommitUnknown);
+        };
 
-        let lag = self
-            .commit_index
-            .saturating_sub(self.applied_index.unwrap_or_default());
-        if lag > 0 {
+        let applied_index = self.applied_index.unwrap_or_default();
+        let local_apply_lag = self.commit_index.saturating_sub(applied_index);
+        if local_apply_lag > 0 {
             match self.apply_no_progress_age {
                 Some(age) if age >= apply_stall_timeout => {
                     return Some(FollowerReadRefusal::ApplyStalled);
@@ -134,8 +153,18 @@ impl FollowerReadinessSnapshot {
                 _ => {}
             }
         }
+        let lag = self
+            .commit_index
+            .max(leader_commit_index)
+            .saturating_sub(applied_index);
         if lag > max_commit_lag {
             return Some(FollowerReadRefusal::CommitLag);
+        }
+        if self
+            .replication_no_progress_age
+            .is_some_and(|age| age >= apply_stall_timeout)
+        {
+            return Some(FollowerReadRefusal::ReplicationStalled);
         }
 
         None
@@ -158,8 +187,39 @@ impl FollowerReadinessMonitor {
     ) {
         let now = Instant::now();
         let mut state = self.lock();
+        Self::observe_raft_state_locked(&mut state, role, term, leader_id, commit_index, now);
+    }
+
+    /// Atomically publishes a verified leader contact alongside the local Raft
+    /// state that accepted it. Readers can never observe a newer contact while
+    /// retaining the previous request's leader-commit proof.
+    pub fn observe_raft_state_with_leader_contact(
+        &self,
+        role: RoleState,
+        term: u64,
+        leader_id: u64,
+        commit_index: u64,
+        leader_commit_index: Option<u64>,
+    ) {
+        let now = Instant::now();
+        let mut state = self.lock();
+        Self::observe_raft_state_locked(&mut state, role, term, leader_id, commit_index, now);
+        Self::observe_leader_contact_locked(&mut state, term, leader_id, leader_commit_index, now);
+    }
+
+    fn observe_raft_state_locked(
+        state: &mut FollowerReadinessState,
+        role: RoleState,
+        term: u64,
+        leader_id: u64,
+        commit_index: u64,
+        now: Instant,
+    ) {
         if state.role != role || state.term != term || state.leader_id != leader_id {
             state.leadership_epoch = state.leadership_epoch.saturating_add(1);
+            state.leader_commit_index = None;
+            state.leader_commit_contact_proven = false;
+            state.replication_lag_started_at = None;
             if role != RoleState::Follower
                 || state
                     .leader_contact
@@ -169,17 +229,40 @@ impl FollowerReadinessMonitor {
             }
         }
 
+        let local_commit_advanced = commit_index > state.commit_index;
         state.role = role;
         state.term = term;
         state.leader_id = leader_id;
         state.commit_index = commit_index;
         Self::update_lag_timer(&mut state, now);
+        Self::update_replication_lag_timer(&mut state, now, local_commit_advanced);
     }
 
     /// Records contact only when the Raft caller has verified that the
     /// accepted message came from the currently recognized leader and term.
-    pub fn observe_leader_contact(&self, term: u64, leader_id: u64) {
+    pub fn observe_leader_contact(
+        &self,
+        term: u64,
+        leader_id: u64,
+        leader_commit_index: Option<u64>,
+    ) {
         let mut state = self.lock();
+        Self::observe_leader_contact_locked(
+            &mut state,
+            term,
+            leader_id,
+            leader_commit_index,
+            Instant::now(),
+        );
+    }
+
+    fn observe_leader_contact_locked(
+        state: &mut FollowerReadinessState,
+        term: u64,
+        leader_id: u64,
+        leader_commit_index: Option<u64>,
+        now: Instant,
+    ) {
         if state.role == RoleState::Follower
             && state.term == term
             && state.leader_id == leader_id
@@ -189,8 +272,25 @@ impl FollowerReadinessMonitor {
             state.leader_contact = Some(LeaderContact {
                 term,
                 leader_id,
-                at: Instant::now(),
+                at: now,
             });
+            match leader_commit_index {
+                Some(commit) => {
+                    state.leader_commit_index = Some(
+                        state
+                            .leader_commit_index
+                            .map_or(commit, |observed| observed.max(commit)),
+                    );
+                    state.leader_commit_contact_proven = true;
+                    Self::update_replication_lag_timer(&mut state, now, false);
+                }
+                None => {
+                    // Preserve the epoch's high watermark for a later
+                    // out-of-order proof, but never let this contact refresh
+                    // read eligibility using an older proof.
+                    state.leader_commit_contact_proven = false;
+                }
+            }
         }
     }
 
@@ -235,6 +335,15 @@ impl FollowerReadinessMonitor {
                     .is_some_and(|applied| state.commit_index > applied)
             })
             .map(|started_at| now.saturating_duration_since(started_at));
+        let replication_no_progress_age = state
+            .replication_lag_started_at
+            .filter(|_| {
+                state.leader_commit_contact_proven
+                    && state
+                        .leader_commit_index
+                        .is_some_and(|leader_commit| leader_commit > state.commit_index)
+            })
+            .map(|started_at| now.saturating_duration_since(started_at));
 
         FollowerReadinessSnapshot {
             role: state.role,
@@ -242,11 +351,16 @@ impl FollowerReadinessMonitor {
             leader_id: state.leader_id,
             leadership_epoch: state.leadership_epoch,
             commit_index: state.commit_index,
+            leader_commit_index: state
+                .leader_commit_contact_proven
+                .then_some(state.leader_commit_index)
+                .flatten(),
             applied_index: state.applied_index,
             replay_ready: state.replay_ready,
             leader_contact_sequence: state.leader_contact_sequence,
             leader_contact_age,
             apply_no_progress_age,
+            replication_no_progress_age,
         }
     }
 
@@ -256,6 +370,21 @@ impl FollowerReadinessMonitor {
                 state.lag_started_at.get_or_insert(now);
             }
             _ => state.lag_started_at = None,
+        }
+    }
+
+    fn update_replication_lag_timer(
+        state: &mut FollowerReadinessState,
+        now: Instant,
+        local_commit_advanced: bool,
+    ) {
+        match state.leader_commit_index {
+            Some(leader_commit) if leader_commit > state.commit_index => {
+                if state.replication_lag_started_at.is_none() || local_commit_advanced {
+                    state.replication_lag_started_at = Some(now);
+                }
+            }
+            _ => state.replication_lag_started_at = None,
         }
     }
 }
@@ -271,7 +400,7 @@ mod tests {
         monitor.observe_applied(10);
         monitor.set_replay_ready(true);
         monitor.observe_raft_state(RoleState::Follower, 4, 8, 10);
-        monitor.observe_leader_contact(4, 8);
+        monitor.observe_leader_contact(4, 8, Some(10));
         monitor
     }
 
@@ -291,7 +420,7 @@ mod tests {
     fn startup_and_snapshot_application_require_explicit_replay_completion() {
         let monitor = FollowerReadinessMonitor::default();
         monitor.observe_raft_state(RoleState::Follower, 4, 8, 0);
-        monitor.observe_leader_contact(4, 8);
+        monitor.observe_leader_contact(4, 8, Some(0));
 
         let before_replay = monitor.snapshot();
         assert_eq!(before_replay.applied_index, None);
@@ -331,6 +460,7 @@ mod tests {
             Some(FollowerReadRefusal::CommitLag)
         );
         assert!(lagging.apply_no_progress_age.is_some());
+        assert_eq!(lagging.replication_no_progress_age, None);
 
         monitor.observe_applied(11);
         let progressing = monitor.snapshot();
@@ -379,6 +509,71 @@ mod tests {
     }
 
     #[test]
+    fn leader_commit_watermark_is_monotonic_and_missing_proof_refuses() {
+        let monitor = initialized_follower();
+        monitor.observe_leader_contact(4, 8, Some(20));
+        monitor.observe_leader_contact(4, 8, Some(15));
+
+        let reordered = monitor.snapshot();
+        assert_eq!(reordered.leader_commit_index, Some(20));
+        assert!(reordered.leader_contact_age.is_some());
+        assert_eq!(
+            reordered.refusal_reason(Duration::from_secs(5), 0, Duration::from_secs(60)),
+            Some(FollowerReadRefusal::CommitLag)
+        );
+
+        monitor.observe_leader_contact(4, 8, None);
+        let missing_proof = monitor.snapshot();
+        assert_eq!(missing_proof.leader_commit_index, None);
+        assert!(missing_proof.leader_contact_age.is_some());
+        assert_eq!(
+            missing_proof.refusal_reason(Duration::from_secs(5), 0, Duration::from_secs(60)),
+            Some(FollowerReadRefusal::LeaderCommitUnknown)
+        );
+
+        // A later proof from an older reordered request restores proof only at
+        // the highest watermark already observed in this leadership epoch.
+        monitor.observe_leader_contact(4, 8, Some(12));
+        assert_eq!(monitor.snapshot().leader_commit_index, Some(20));
+    }
+
+    #[test]
+    fn network_replication_lag_uses_its_own_no_progress_clock() {
+        let monitor = initialized_follower();
+        monitor.observe_leader_contact(4, 8, Some(12));
+
+        let mut stalled = monitor.snapshot();
+        assert_eq!(stalled.commit_index, 10);
+        assert_eq!(stalled.applied_index, Some(10));
+        assert_eq!(stalled.apply_no_progress_age, None);
+        assert!(stalled.replication_no_progress_age.is_some());
+        assert_eq!(
+            stalled.refusal_reason(Duration::from_secs(5), 2, Duration::from_secs(60)),
+            None
+        );
+        stalled.replication_no_progress_age = Some(Duration::from_secs(2));
+        assert_eq!(
+            stalled.refusal_reason(Duration::from_secs(5), 2, Duration::from_secs(1)),
+            Some(FollowerReadRefusal::ReplicationStalled)
+        );
+
+        // Local commit progress resets the replication timer. Remote lag within
+        // the configured index allowance remains eligible while progress is
+        // recent, and is not misclassified as an apply stall.
+        monitor.observe_raft_state(RoleState::Follower, 4, 8, 11);
+        monitor.observe_applied(11);
+        let progressing = monitor.snapshot();
+        assert_eq!(progressing.apply_no_progress_age, None);
+        assert!(progressing
+            .replication_no_progress_age
+            .is_some_and(|age| age < Duration::from_secs(1)));
+        assert_eq!(
+            progressing.refusal_reason(Duration::from_secs(5), 1, Duration::from_secs(60)),
+            None
+        );
+    }
+
+    #[test]
     fn term_or_leader_change_discards_old_contact() {
         let monitor = initialized_follower();
         monitor.observe_raft_state(RoleState::Follower, 5, 8, 10);
@@ -390,12 +585,12 @@ mod tests {
             Some(FollowerReadRefusal::NoCurrentTermLeaderContact)
         );
 
-        monitor.observe_leader_contact(5, 8);
+        monitor.observe_leader_contact(5, 8, Some(10));
         let current_term_contact_sequence = monitor.snapshot().leader_contact_sequence;
         assert_eq!(current_term_contact_sequence, 2);
         monitor.observe_raft_state(RoleState::Follower, 5, 9, 10);
         assert_eq!(monitor.snapshot().leader_contact_age, None);
-        monitor.observe_leader_contact(5, 8);
+        monitor.observe_leader_contact(5, 8, Some(10));
         assert_eq!(
             monitor.snapshot().leader_contact_sequence,
             current_term_contact_sequence
@@ -410,6 +605,7 @@ mod tests {
         monitor.observe_raft_state(RoleState::Exit, 4, 8, 10);
         let exit_epoch = monitor.snapshot().leadership_epoch;
         assert!(exit_epoch > follower_epoch);
+        assert_eq!(monitor.snapshot().leader_commit_index, None);
 
         monitor.observe_raft_state(RoleState::Follower, 4, 8, 10);
         let follower_again_epoch = monitor.snapshot().leadership_epoch;
@@ -428,7 +624,7 @@ mod tests {
         );
 
         monitor.observe_raft_state(RoleState::Follower, 4, 0, 10);
-        monitor.observe_leader_contact(4, 8);
+        monitor.observe_leader_contact(4, 8, Some(10));
         assert_eq!(monitor.snapshot().leader_contact_age, None);
     }
 }

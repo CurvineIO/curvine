@@ -25,11 +25,28 @@ follower_write_sticky_ms = 5000
 ```
 
 All switches default to `false`. `follower_read_max_commit_lag = 0` requires a
-follower to have applied its locally observed committed entries. The allowed
-range is 0–10,000 entries. The apply-stall timeout defaults to 30 seconds and
-must be between 1 ms and 10 minutes; it only runs while committed entries are
-waiting to be applied, so an idle follower does not become ineligible merely
-because it has no new work.
+follower to have applied the maximum of its local Raft commit and the leader
+commit reported in its latest accepted current-term request. The allowed range
+is 0–10,000 entries. A current-term leader request without the optional leader
+commit proof makes follower reads unavailable until a later request carries
+that proof, so older leaders during a mixed-version rollout fail closed.
+
+The stall timeout defaults to 30 seconds and must be between 1 ms and 10
+minutes. It applies separately to committed entries waiting for local FSM apply
+and to leader-committed entries that remain absent from the local Raft commit
+without local commit progress. These are reported as apply and replication
+stalls respectively; network lag is not classified as an apply stall. A
+nonzero commit-lag allowance can tolerate recent replication lag, but it does
+not permit the follower to remain eligible indefinitely without local
+replication progress. Caught-up and idle followers remain eligible.
+
+Leader commit and contact age are based on the latest accepted Raft request at
+the follower. Requests are sent asynchronously and may arrive out of order;
+the commit watermark is monotonic within a leadership epoch, but contact age is
+receiver-arrival based and is not a sender sequence or timestamp. The gate
+bounds reads against the latest leader commit proof observed by that follower;
+it does not provide linearizable reads or prove the leader's exact commit at
+the instant the response is sent.
 
 The client sticky window must be positive when client follower reads are
 enabled; its default is 5 seconds. Each client context remembers at most 1,024

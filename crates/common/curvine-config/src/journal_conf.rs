@@ -215,9 +215,9 @@ pub struct JournalConf {
 impl JournalConf {
     pub const DEFAULT_NODE_ID: u64 = 0;
 
-    /// Derives a conservative follower-read contact deadline as two Raft
-    /// heartbeat periods. Configuration validation also requires it to remain
-    /// strictly below the minimum election timeout.
+    /// Derives a conservative follower-read/passive-state contact deadline as
+    /// two Raft heartbeat periods. Configuration validation also requires it
+    /// to remain strictly below the minimum election timeout.
     pub fn follower_read_contact_timeout_ms(&self) -> CommonResult<u64> {
         let Ok(heartbeat_ticks) = u64::try_from(self.raft_heartbeat_tick) else {
             return err_box!("journal.raft_heartbeat_tick exceeds u64");
@@ -233,19 +233,25 @@ impl JournalConf {
             .and_then(|heartbeat_ms| heartbeat_ms.checked_mul(2))
         {
             Some(timeout_ms) => Ok(timeout_ms),
-            None => err_box!("journal follower-read contact timeout overflows u64"),
+            None => err_box!("journal follower readiness contact timeout overflows u64"),
         }
     }
 
-    /// Returns the shortest configured election timeout, checking arithmetic
-    /// rather than allowing extreme values to wrap into an unsafe deadline.
+    /// Returns the shortest effective election timeout, including raft-rs's
+    /// `min_election_tick == 0` fallback to `election_tick`. Arithmetic is
+    /// checked rather than allowing extreme values to wrap into a deadline.
     pub fn minimum_election_timeout_ms(&self) -> CommonResult<u64> {
-        let Ok(min_election_ticks) = u64::try_from(self.raft_min_election_ticks) else {
-            return err_box!("journal.raft_min_election_ticks exceeds u64");
+        let configured_minimum = if self.raft_min_election_ticks == 0 {
+            self.raft_election_tick
+        } else {
+            self.raft_min_election_ticks
+        };
+        let Ok(min_election_ticks) = u64::try_from(configured_minimum) else {
+            return err_box!("journal effective minimum election ticks exceeds u64");
         };
         if self.raft_tick_interval_ms == 0 || min_election_ticks == 0 {
             return err_box!(
-                "journal Raft tick interval and minimum election ticks must be greater than zero"
+                "journal Raft tick interval and effective minimum election ticks must be greater than zero"
             );
         }
         match self.raft_tick_interval_ms.checked_mul(min_election_ticks) {
