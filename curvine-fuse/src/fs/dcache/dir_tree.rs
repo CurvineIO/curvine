@@ -209,6 +209,12 @@ impl DirTree {
         bump_kref: bool,
     ) -> FuseResult<&mut Inode> {
         Self::validate_backend_id(status.id)?;
+        // Resolve the parent directory before any mutation. `lookup` bumps `n_lookup` for the
+        // child, and callers that batch lookups (READDIRPLUS) bail out on the first error: a
+        // failure after that bump would leave a kernel ref for a dirent the kernel never
+        // receives, i.e. one it never sends a FORGET for. Checking here also leaves the rest of
+        // this function infallible, so a failed lookup does not mutate the tree at all.
+        self.get_dir_mut_check(parent)?;
 
         let ino = match self.get_inode_mut(parent, Some(name)) {
             Some(inode) => {
@@ -906,6 +912,34 @@ mod test {
         assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup(), 1);
         t.lookup(FUSE_ROOT_ID, "p", file_st("p", 0), true).unwrap();
         assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup(), 2);
+    }
+
+    /// A `lookup` that fails must not materialize the child with a kernel lookup ref: READDIRPLUS
+    /// batches lookups and bails out on the first error, and the kernel never sends a FORGET for
+    /// dirents it did not receive, so such a ref would pin the inode forever. The parent directory
+    /// is resolved before the child is created, so an unusable parent fails before the bump.
+    #[test]
+    fn failed_lookup_takes_no_kernel_lookup_ref() {
+        let mut t = DirTree::default();
+        let before = t.inode_lens();
+
+        // Missing parent.
+        assert!(t.lookup(4242, "x", file_st("x", 900), true).is_err());
+        assert!(t.get_inode(900, None::<&str>).is_none());
+
+        // Parent that is not a directory.
+        let f = t
+            .lookup(FUSE_ROOT_ID, "f", file_st("f", 0), true)
+            .unwrap()
+            .ino;
+        assert!(t.lookup(f, "y", file_st("y", 901), true).is_err());
+        assert!(t.get_inode(901, None::<&str>).is_none());
+
+        assert_eq!(
+            t.inode_lens(),
+            before + 1,
+            "only the explicit file lookup may create an inode"
+        );
     }
 
     /// A file the kernel no longer references, seen only by

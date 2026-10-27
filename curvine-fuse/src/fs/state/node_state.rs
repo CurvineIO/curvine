@@ -866,6 +866,12 @@ impl NodeState {
         Ok(handle)
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_dir_handle(&self, handle: Arc<DirHandle>) {
+        let mut lock = self.dir_handles.write();
+        Self::insert_dir_handle_locked(&mut lock, handle.ino, handle.fh, handle);
+    }
+
     pub fn all_handles(&self) -> Vec<Arc<FileHandle>> {
         let lock = self.handles.read();
         lock.values()
