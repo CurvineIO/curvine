@@ -244,7 +244,7 @@ mod tests {
         conf.master.meta_dir = Utils::test_sub_dir(format!("heartbeat-promotion/meta-{test_id}"));
         conf.journal.journal_dir =
             Utils::test_sub_dir(format!("heartbeat-promotion/journal-{test_id}"));
-        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        let mut fs = JournalSystem::fs_only_for_test(&conf).unwrap();
 
         let readiness = FollowerReadinessMonitor::default();
         readiness.observe_raft_state(RoleState::Follower, 1, 2, 0);

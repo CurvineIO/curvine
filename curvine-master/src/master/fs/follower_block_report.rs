@@ -31,7 +31,7 @@ pub(super) struct DeferredBlockReport {
 
 #[derive(Default)]
 struct State {
-    term: Option<u64>,
+    epoch: Option<(u64, u64)>,
     workers: HashSet<u32>,
     /// Whether each currently known worker has sent a complete full report in
     /// its current registration session.
@@ -100,15 +100,14 @@ impl FollowerBlockReadiness<'_> {
 pub(super) struct FollowerBlockReportState(Arc<RwLock<State>>);
 
 impl FollowerBlockReportState {
-    pub(super) fn has_term(&self, term: u64) -> bool {
-        self.0.read().term == Some(term)
+    pub(super) fn has_epoch(&self, term: u64, leadership_epoch: u64) -> bool {
+        self.0.read().epoch == Some((term, leadership_epoch))
     }
 
-    /// A new Raft term is a new passive worker-view epoch. Discard report state
-    /// from the previous leader before accepting or serving this term's view.
-    pub(super) fn reset_for_term(&self, term: u64) -> Vec<u32> {
+    /// Discard passive report state when either the term or leadership epoch changes.
+    pub(super) fn reset_for_epoch(&self, term: u64, leadership_epoch: u64) -> Vec<u32> {
         let mut state = self.0.write();
-        if state.term == Some(term) {
+        if state.epoch == Some((term, leadership_epoch)) {
             return Vec::new();
         }
         let workers: Vec<_> = state.workers.drain().collect();
@@ -119,7 +118,7 @@ impl FollowerBlockReportState {
         state.needs_full_report.extend(workers.iter().copied());
         state.reconcile_generations.clear();
         state.reconcile_pending.clear();
-        state.term = Some(term);
+        state.epoch = Some((term, leadership_epoch));
         workers
     }
 
@@ -401,7 +400,7 @@ mod tests {
     #[test]
     fn deferred_block_index_tracks_each_worker_and_all_removal_paths() {
         let state = FollowerBlockReportState::default();
-        state.reset_for_term(1);
+        state.reset_for_epoch(1, 1);
         assert!(state.defer(deferred(7, 42)));
         assert!(state.defer(deferred(7, 42))); // replacement does not add a count
         assert!(state.defer(deferred(8, 42)));
@@ -424,7 +423,7 @@ mod tests {
         assert!(!state.has_deferred_block(44));
 
         assert!(state.defer(deferred(9, 45)));
-        state.reset_for_term(2);
+        state.reset_for_epoch(2, 2);
         assert!(!state.has_deferred_block(45));
     }
 
@@ -459,13 +458,27 @@ mod tests {
     }
 
     #[test]
+    fn same_term_leadership_change_invalidates_worker_readiness() {
+        let state = FollowerBlockReportState::default();
+        state.reset_for_epoch(7, 1);
+        state.observe_worker(7, false);
+        state.mark_full_report_complete(7);
+        assert!(state.worker_ready(7));
+        assert_eq!(state.reset_for_epoch(7, 2), vec![7]);
+        assert!(!state.worker_ready(7));
+        assert!(state.requires_full_report(7));
+        assert!(!state.has_epoch(7, 1));
+        assert!(state.has_epoch(7, 2));
+    }
+
+    #[test]
     fn a_new_term_drops_reports_from_the_previous_leader_epoch() {
         let state = FollowerBlockReportState::default();
-        assert!(state.reset_for_term(1).is_empty());
+        assert!(state.reset_for_epoch(1, 1).is_empty());
         state.observe_worker(7, false);
         assert!(state.defer(deferred(7, 42)));
 
-        assert_eq!(state.reset_for_term(2), vec![7]);
+        assert_eq!(state.reset_for_epoch(2, 2), vec![7]);
         assert_eq!(state.deferred_len(), 0);
         assert!(state.requires_full_report(7));
     }

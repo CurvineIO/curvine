@@ -1378,14 +1378,14 @@ impl MasterFilesystem {
     }
 
     /// Caller holds the write side of `follower_block_report_lock`.
-    fn reset_passive_view_for_current_term(&self) {
+    fn reset_passive_view_for_current_epoch(&self) {
         let snapshot = self.master_monitor.follower_readiness_snapshot();
         if snapshot.role != curvine_raft::raft::RoleState::Follower {
             return;
         }
         for worker_id in self
             .follower_block_report_state
-            .reset_for_term(snapshot.term)
+            .reset_for_epoch(snapshot.term, snapshot.leadership_epoch)
         {
             self.follower_full_report_tracker.reset(worker_id);
         }
@@ -1402,7 +1402,7 @@ impl MasterFilesystem {
         {
             return;
         }
-        self.reset_passive_view_for_current_term();
+        self.reset_passive_view_for_current_epoch();
         let worker_manager = self.worker_manager.read();
         self.observe_passive_worker_heartbeat_locked(status, worker_id, &worker_manager);
     }
@@ -1467,7 +1467,7 @@ impl MasterFilesystem {
         if self.master_monitor.is_active() || initial_snapshot.role != RoleState::Follower {
             return err_box!("Passive worker heartbeats are not accepted by the active master");
         }
-        self.reset_passive_view_for_current_term();
+        self.reset_passive_view_for_current_epoch();
 
         let mut worker_manager = self.worker_manager.write();
         let current_snapshot = self.master_monitor.follower_readiness_snapshot();
@@ -1527,7 +1527,7 @@ impl MasterFilesystem {
         {
             return;
         }
-        self.reset_passive_view_for_current_term();
+        self.reset_passive_view_for_current_epoch();
         self.follower_full_report_tracker.reset(worker_id);
         self.follower_block_report_state.forget_worker(worker_id);
     }
@@ -1604,7 +1604,7 @@ impl MasterFilesystem {
         }
         if !self
             .follower_block_report_state
-            .has_term(initial_snapshot.term)
+            .has_epoch(initial_snapshot.term, initial_snapshot.leadership_epoch)
         {
             drop(_serial);
             let Some(_reset_guard) = self.follower_block_report_lock.try_write() else {
@@ -1618,7 +1618,7 @@ impl MasterFilesystem {
             {
                 return Ok(None);
             }
-            self.reset_passive_view_for_current_term();
+            self.reset_passive_view_for_current_epoch();
             drop(_reset_guard);
             let Some(read_guard) = self.follower_block_report_lock.try_read() else {
                 return Ok(None);
@@ -1631,9 +1631,10 @@ impl MasterFilesystem {
                 || self
                     .follower_read_refusal(&reset_complete_snapshot)
                     .is_some()
-                || !self
-                    .follower_block_report_state
-                    .has_term(reset_complete_snapshot.term)
+                || !self.follower_block_report_state.has_epoch(
+                    reset_complete_snapshot.term,
+                    reset_complete_snapshot.leadership_epoch,
+                )
             {
                 return Ok(None);
             }
@@ -1914,7 +1915,7 @@ impl MasterFilesystem {
         if self.master_monitor.is_active() || report_snapshot.role != RoleState::Follower {
             return err_box!("Passive worker reports are not accepted by the active master");
         }
-        self.reset_passive_view_for_current_term();
+        self.reset_passive_view_for_current_epoch();
         let worker_session_id = {
             let wm = self.worker_manager.read();
             if list.cluster_id != wm.cluster_id {
@@ -2082,14 +2083,16 @@ impl MasterFilesystem {
             }
         }
 
-        let applied = (|| -> FsResult<()> {
+        let applied = self.apply_block_report_batch_fenced(batch, || {
             let current_snapshot = self.master_monitor.follower_readiness_snapshot();
             if self.master_monitor.is_active()
                 || current_snapshot.role != RoleState::Follower
                 || current_snapshot.term != report_snapshot.term
                 || current_snapshot.leadership_epoch != report_snapshot.leadership_epoch
             {
-                return err_box!("Passive worker reports are not accepted by the active master");
+                return Err(FsError::in_progress_msg(
+                    "Passive worker report crossed its follower leadership epoch",
+                ));
             }
             if !self
                 .worker_manager
@@ -2105,10 +2108,16 @@ impl MasterFilesystem {
                     worker_id
                 )));
             }
+            Ok(true)
+        });
 
-            self.apply_block_report_batch(batch)
-        })();
-
+        let applied = match applied {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(FsError::in_progress_msg(
+                "Passive worker report crossed its follower leadership epoch",
+            )),
+            Err(error) => Err(error),
+        };
         if let Err(error) = applied {
             if let Some(inventory) = full_report_inventory.take() {
                 self.follower_full_report_tracker
@@ -2156,10 +2165,8 @@ impl MasterFilesystem {
         {
             return Ok(());
         }
-        self.reset_passive_view_for_current_term();
+        self.reset_passive_view_for_current_epoch();
         let deferred = self.follower_block_report_state.deferred_snapshot();
-        let mut batch = Vec::new();
-        let mut resolved = Vec::new();
         let snapshot = self.master_monitor.follower_readiness_snapshot();
         let contact_timeout = Duration::from_millis(self.follower_read_contact_timeout_ms);
         let replay_is_current = |snapshot: &FollowerReadinessSnapshot| {
@@ -2174,6 +2181,7 @@ impl MasterFilesystem {
                     .leader_contact_age
                     .is_some_and(|age| age <= contact_timeout)
         };
+        let mut candidates = Vec::new();
         for report in deferred {
             if self
                 .follower_block_report_state
@@ -2186,41 +2194,90 @@ impl MasterFilesystem {
             {
                 continue;
             }
-            match self.block_inode_state(report.block_id)? {
-                BlockInodeState::File => {
-                    batch.push((
-                        true,
-                        report.block_id,
-                        BlockLocation::new(report.worker_id, report.storage_type),
-                    ));
-                    resolved.push((report.worker_id, report.block_id));
+            candidates.push(report);
+        }
+
+        if !self.apply_deferred_block_reports_fenced(&candidates, &snapshot, contact_timeout)? {
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    fn apply_deferred_block_reports_fenced(
+        &self,
+        reports: &[DeferredBlockReport],
+        initial_snapshot: &FollowerReadinessSnapshot,
+        contact_timeout: Duration,
+    ) -> FsResult<bool> {
+        let replay_is_current = |snapshot: &FollowerReadinessSnapshot| {
+            snapshot.role == RoleState::Follower
+                && snapshot.replay_ready
+                && snapshot.leader_commit_index.is_some_and(|leader_commit| {
+                    snapshot
+                        .applied_index
+                        .is_some_and(|applied| applied >= snapshot.commit_index.max(leader_commit))
+                })
+                && snapshot
+                    .leader_contact_age
+                    .is_some_and(|age| age <= contact_timeout)
+        };
+        let mut resolved = Vec::with_capacity(reports.len());
+        for chunk in reports.chunks(Self::BLOCK_REPORT_WRITE_CHUNK) {
+            let mut fs_dir = self.fs_dir.write();
+            let current_snapshot = self.master_monitor.follower_readiness_snapshot();
+            if self.master_monitor.is_active()
+                || !replay_is_current(&current_snapshot)
+                || current_snapshot.leadership_epoch != initial_snapshot.leadership_epoch
+            {
+                return Ok(false);
+            }
+
+            let mut batch = Vec::with_capacity(chunk.len());
+            let mut resolved_chunk = Vec::with_capacity(chunk.len());
+            for report in chunk {
+                if current_snapshot.leader_contact_sequence <= report.leader_contact_sequence {
+                    continue;
                 }
-                BlockInodeState::Missing | BlockInodeState::NotFile => {
-                    if report.remove_if_missing {
+                match fs_dir.block_inode_state(report.block_id)? {
+                    BlockInodeState::File => {
                         batch.push((
-                            false,
+                            true,
                             report.block_id,
-                            BlockLocation::with_id(report.worker_id),
+                            BlockLocation::new(report.worker_id, report.storage_type),
                         ));
+                        resolved_chunk.push((report.worker_id, report.block_id));
                     }
-                    resolved.push((report.worker_id, report.block_id));
+                    BlockInodeState::Missing | BlockInodeState::NotFile => {
+                        if report.remove_if_missing {
+                            batch.push((
+                                false,
+                                report.block_id,
+                                BlockLocation::with_id(report.worker_id),
+                            ));
+                        }
+                        resolved_chunk.push((report.worker_id, report.block_id));
+                    }
                 }
             }
+
+            if !batch.is_empty() {
+                fs_dir.block_report(batch)?;
+            }
+            resolved.extend(resolved_chunk);
         }
 
         let final_snapshot = self.master_monitor.follower_readiness_snapshot();
         if self.master_monitor.is_active()
             || !replay_is_current(&final_snapshot)
-            || final_snapshot.leadership_epoch != snapshot.leadership_epoch
+            || final_snapshot.leadership_epoch != initial_snapshot.leadership_epoch
         {
-            return Ok(());
+            return Ok(false);
         }
-        self.apply_block_report_batch(batch)?;
         for (worker_id, block_id) in resolved {
             self.follower_block_report_state
                 .mark_deferred_resolved(worker_id, block_id);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Submit the follower's stale-location scan without retaining the global
@@ -2352,9 +2409,21 @@ impl MasterFilesystem {
             .into_iter()
             .map(|block_id| (false, block_id, BlockLocation::with_id(job.worker_id)))
             .collect();
-        if let Err(error) = self.apply_block_report_batch(batch) {
-            self.fail_follower_full_block_reconcile(&job, &error.to_string());
-            return;
+        match self.apply_block_report_batch_fenced(batch, || {
+            Ok(self.follower_reconcile_context_current(&job))
+        }) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.fail_follower_full_block_reconcile(
+                    &job,
+                    "fencing context changed during apply",
+                );
+                return;
+            }
+            Err(error) => {
+                self.fail_follower_full_block_reconcile(&job, &error.to_string());
+                return;
+            }
         }
 
         // The worker or Raft role may have changed while chunked removals were
@@ -2549,8 +2618,24 @@ impl MasterFilesystem {
     /// independent add/remove for one block location, so chunk boundaries do
     /// not break cross-entry invariants.
     fn apply_block_report_batch(&self, batch: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
+        self.apply_block_report_batch_fenced(batch, || Ok(true))
+            .map(|_| ())
+    }
+
+    /// Apply block-location chunks only after acquiring the namespace writer
+    /// and validating the caller's fence under that same lock. A role change
+    /// after the check cannot let an active writer overtake this chunk: active
+    /// block-report and replication updates use the same fs_dir writer.
+    fn apply_block_report_batch_fenced<F>(
+        &self,
+        batch: Vec<(bool, i64, BlockLocation)>,
+        mut validate: F,
+    ) -> FsResult<bool>
+    where
+        F: FnMut() -> FsResult<bool>,
+    {
         if batch.is_empty() {
-            return Ok(());
+            return validate();
         }
 
         let mut iter = batch.into_iter();
@@ -2560,9 +2645,12 @@ impl MasterFilesystem {
                 break;
             }
             let mut fs_dir = self.fs_dir.write();
+            if !validate()? {
+                return Ok(false);
+            }
             fs_dir.block_report(chunk)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn is_full_block_reconcile_current(&self, worker_id: u32, generation: u64) -> bool {
@@ -3212,9 +3300,10 @@ mod tests {
                 .unwrap_err();
         assert!(retry.to_string().starts_with("ResyncRequired:"));
 
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
         fs.passive_block_report(
             BlockReportList {
-                cluster_id: fs.worker_manager.read().cluster_id.clone(),
+                cluster_id,
                 worker_id: 7,
                 full_report: true,
                 total_len: 0,
@@ -3226,6 +3315,136 @@ mod tests {
         .unwrap();
         wait_for_follower_reconcile(&fs, 7);
         assert!(fs.follower_block_report_state.worker_ready(7));
+    }
+
+    #[test]
+    fn follower_stale_chunk_rechecks_role_after_acquiring_namespace_writer() {
+        let mut fs = test_fs("follower-reconcile-promotion-fence");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        let readiness = use_current_follower_view(&mut fs);
+
+        let address = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address, "session-7").unwrap();
+        fs.follower_block_report_state.require_full_report(7);
+        let snapshot = fs.master_monitor.follower_readiness_snapshot();
+        let generation = fs.follower_block_report_state.begin_reconcile(7);
+        let job = FollowerFullBlockReconcileJob {
+            worker_id: 7,
+            generation,
+            term: snapshot.term,
+            leadership_epoch: snapshot.leadership_epoch,
+            worker_session_id: "session-7".to_string(),
+            report_id: 10,
+            inventory: FullReportInventory::without_slot(HashSet::new()),
+        };
+        let block_id = 1_i64;
+
+        // Hold FsDir so the stale chunk can only validate after this test has
+        // promoted the node and installed the authoritative location.
+        let namespace_guard = fs.fs_dir.write();
+        let chunk_fs = fs.clone();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let chunk = std::thread::spawn(move || {
+            assert!(chunk_fs.follower_reconcile_context_current(&job));
+            attempted_tx.send(()).unwrap();
+            let result = chunk_fs.apply_block_report_batch_fenced(
+                vec![(false, block_id, BlockLocation::with_id(7))],
+                || Ok(chunk_fs.follower_reconcile_context_current(&job)),
+            );
+            result_tx.send(result).unwrap();
+        });
+        attempted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stale chunk should start while namespace writer is held");
+
+        readiness.observe_raft_state(RoleState::Leader, 2, 1, 0);
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        namespace_guard
+            .add_block_location(block_id, BlockLocation::with_id(7))
+            .unwrap();
+        drop(namespace_guard);
+
+        assert!(!result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stale chunk should recheck the promoted role")
+            .unwrap());
+        chunk.join().unwrap();
+        assert_eq!(
+            fs.fs_dir
+                .read()
+                .get_block_locations(block_id)
+                .unwrap()
+                .iter()
+                .map(|location| location.worker_id)
+                .collect::<Vec<_>>(),
+            vec![7],
+            "a follower stale chunk must not delete a location installed after promotion"
+        );
+    }
+
+    #[test]
+    fn deferred_replay_rechecks_commit_fence_under_namespace_writer() {
+        let mut fs = test_fs("deferred-replay-promotion-fence");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        let readiness = use_current_follower_view(&mut fs);
+        let report = DeferredBlockReport {
+            worker_id: 7,
+            block_id: 1,
+            storage_type: StorageType::Disk,
+            remove_if_missing: true,
+            leader_contact_sequence: 0,
+        };
+        let initial_snapshot = fs.master_monitor.follower_readiness_snapshot();
+
+        let namespace_guard = fs.fs_dir.write();
+        namespace_guard
+            .add_block_location(report.block_id, BlockLocation::with_id(report.worker_id))
+            .unwrap();
+        let replay_fs = fs.clone();
+        let replay_snapshot = initial_snapshot.clone();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let replay = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let result = replay_fs.apply_deferred_block_reports_fenced(
+                &[report],
+                &replay_snapshot,
+                Duration::from_secs(5),
+            );
+            result_tx.send(result).unwrap();
+        });
+        attempted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deferred replay should start while namespace writer is held");
+
+        readiness.observe_raft_state(RoleState::Leader, 2, 1, 0);
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        drop(namespace_guard);
+
+        assert!(!result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deferred replay should recheck role under the writer")
+            .unwrap());
+        replay.join().unwrap();
+        assert_eq!(
+            fs.fs_dir
+                .read()
+                .get_block_locations(1)
+                .unwrap()
+                .iter()
+                .map(|location| location.worker_id)
+                .collect::<Vec<_>>(),
+            vec![7],
+            "deferred replay must not remove locations after leadership changes"
+        );
     }
 
     #[test]
