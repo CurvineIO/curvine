@@ -21,15 +21,17 @@ use curvine_error::FsResult;
 use curvine_fs_api::{Path, RpcCode};
 use curvine_model::ProtoUtils;
 use curvine_model::*;
+use curvine_net::net::InetAddr;
 use curvine_proto::*;
 use curvine_rpc::client::ClusterConnector;
 use curvine_rpc::message::{BoxMessage, Message, MessageBuilder, FOLLOWER_READ_SEQ_ID};
 use curvine_runtime::runtime::RpcRuntime;
 use log::warn;
 use prost::Message as PMessage;
-use std::collections::LinkedList;
+use std::collections::{HashMap, LinkedList};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::time::Instant;
 
 #[derive(Clone)]
@@ -37,6 +39,7 @@ pub struct FsClient {
     context: Arc<FsContext>,
     connector: Arc<ClusterConnector>,
     follower_peer_cursor: Arc<AtomicUsize>,
+    follower_peer_cooldowns: Arc<Mutex<HashMap<InetAddr, Instant>>>,
 }
 
 struct CompleteFileOptions {
@@ -50,6 +53,8 @@ struct CompleteFileOptions {
 const MAX_ENCODED_MUTATION_PATHS: usize = 1_024;
 const MAX_ENCODED_MUTATION_PATH_BYTES: usize = 4 * 1_024;
 const FOLLOWER_RPC_DEADLINE_FRACTION: u32 = 2;
+const FOLLOWER_RPC_MAX_BUDGET: Duration = Duration::from_secs(1);
+const FOLLOWER_PEER_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// RAII guard for a claimed one-time handshake report. Resets the claim when
 /// dropped without being committed, so a cancelled or failed in-flight
@@ -82,6 +87,7 @@ impl FsClient {
             context,
             connector,
             follower_peer_cursor: Arc::new(AtomicUsize::new(0)),
+            follower_peer_cooldowns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1109,7 +1115,9 @@ impl FsClient {
     /// Route requests through a follower only when the session opted in and
     /// the closed RPC classifier plus decoded path say the request is safe.
     /// Writes and non-allowlisted RPCs retain the connector's existing
-    /// leader-routing and retry behavior.
+    /// leader-routing and retry behavior. A follower response and its later
+    /// leader fallback are separate reads, so this opt-in path is bounded but
+    /// does not promise linearizable reads.
     async fn route_master_message(&self, code: RpcCode, msg: Message) -> FsResult<Message> {
         if !self.context.conf.client.follower_reads_enabled || code == RpcCode::GetFilesystemInfo {
             return self.connector.rpc::<FsError>(msg).await;
@@ -1145,35 +1153,43 @@ impl FsClient {
                 .filter(|peer| peer.id != leader_id)
                 .collect();
             if !followers.is_empty() {
-                let index =
+                let start =
                     self.follower_peer_cursor.fetch_add(1, Ordering::Relaxed) % followers.len();
-                let peer = &followers[index];
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                let follower_budget = remaining / FOLLOWER_RPC_DEADLINE_FRACTION;
-                if !follower_budget.is_zero() {
-                    if let Some(follower_msg) = follower_read_message(&msg) {
-                        match tokio::time::timeout(
-                            follower_budget,
-                            self.connector.timeout_rpc::<FsError>(peer.id, follower_msg),
-                        )
-                        .await
-                        {
-                            Ok(Ok(response)) => return Ok(response),
-                            Ok(Err((_, error))) => {
-                                warn!(
-                                    "follower read rpc({}) to node {} failed; falling back to leader: {}",
-                                    msg.req_id(),
+                let peer = (0..followers.len())
+                    .map(|offset| &followers[(start + offset) % followers.len()])
+                    .find(|peer| !self.follower_peer_is_cooling_down(&peer.addr));
+                if let Some(peer) = peer {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let follower_budget =
+                        (remaining / FOLLOWER_RPC_DEADLINE_FRACTION).min(FOLLOWER_RPC_MAX_BUDGET);
+                    if !follower_budget.is_zero() {
+                        if let Some(follower_msg) = follower_read_message(&msg) {
+                            match self
+                                .connector
+                                .timeout_rpc_with_timeout::<FsError>(
                                     peer.id,
-                                    error
-                                );
-                            }
-                            Err(error) => {
-                                warn!(
-                                    "follower read rpc({}) to node {} timed out; falling back to leader: {}",
-                                    msg.req_id(),
-                                    peer.id,
-                                    error
-                                );
+                                    follower_msg,
+                                    follower_budget,
+                                )
+                                .await
+                            {
+                                Ok(response) => return Ok(response),
+                                Err((false, error)) => return Err(error),
+                                Err((true, error)) => {
+                                    // A leader refusal is a quick membership hint and
+                                    // should be reconsidered on the next read. Cool down
+                                    // connection/transport failures, especially peers that
+                                    // accepted a connection and then stopped responding.
+                                    if !matches!(&error, FsError::NotLeaderMaster(_)) {
+                                        self.cooldown_follower_peer(&peer.addr);
+                                    }
+                                    warn!(
+                                        "follower read rpc({}) to node {} failed; falling back to leader: {}",
+                                        msg.req_id(),
+                                        peer.id,
+                                        error
+                                    );
+                                }
                             }
                         }
                     }
@@ -1182,6 +1198,20 @@ impl FsClient {
         }
 
         self.send_to_leader_until(leader_id, msg, deadline).await
+    }
+
+    fn follower_peer_is_cooling_down(&self, addr: &InetAddr) -> bool {
+        let now = Instant::now();
+        let mut cooldowns = self.follower_peer_cooldowns.lock().unwrap();
+        cooldowns.retain(|_, until| *until > now);
+        cooldowns.get(addr).is_some_and(|until| *until > now)
+    }
+
+    fn cooldown_follower_peer(&self, addr: &InetAddr) {
+        self.follower_peer_cooldowns
+            .lock()
+            .unwrap()
+            .insert(addr.clone(), Instant::now() + FOLLOWER_PEER_COOLDOWN);
     }
 
     async fn ensure_leader_until(&self, deadline: Instant) -> FsResult<u64> {
@@ -1411,11 +1441,14 @@ mod tests {
     const FAKE_LEADER: usize = 0;
     const FAKE_FOLLOWER_SUCCESS: usize = 1;
     const FAKE_FOLLOWER_REFUSE: usize = 2;
+    const FAKE_FOLLOWER_NOT_FOUND: usize = 3;
+    const FAKE_FOLLOWER_BLACKHOLE: usize = 4;
 
     #[derive(Default)]
     struct RpcCounts {
         filesystem_info: AtomicUsize,
         exists: AtomicUsize,
+        file_status: AtomicUsize,
         open_file: AtomicUsize,
         delete: AtomicUsize,
         mount_table: AtomicUsize,
@@ -1436,6 +1469,7 @@ mod tests {
             let counter = match code {
                 RpcCode::GetFilesystemInfo => &self.filesystem_info,
                 RpcCode::Exists => &self.exists,
+                RpcCode::FileStatus => &self.file_status,
                 RpcCode::OpenFile => &self.open_file,
                 RpcCode::Delete => &self.delete,
                 RpcCode::GetMountTable => &self.mount_table,
@@ -1494,6 +1528,14 @@ mod tests {
             {
                 return Ok(msg.error_ext(&FsError::not_leader("unmarked read is leader-only")));
             }
+            if code == RpcCode::FileStatus && mode == FAKE_FOLLOWER_NOT_FOUND {
+                return Ok(msg.error_ext(&FsError::file_not_found("/missing/on/follower")));
+            }
+            if code == RpcCode::Exists && mode == FAKE_FOLLOWER_BLACKHOLE {
+                // Hold the server worker without replying so the client must
+                // enforce its follower deadline and close the pooled socket.
+                std::thread::sleep(Duration::from_millis(1_300));
+            }
             if code == RpcCode::Exists {
                 let response = ExistsResponse {
                     exists: mode == FAKE_FOLLOWER_SUCCESS,
@@ -1533,6 +1575,15 @@ mod tests {
         sticky_ms: u64,
         leader_addr: &InetAddr,
     ) -> (Arc<FsContext>, Arc<curvine_runtime::runtime::Runtime>) {
+        follower_route_context_with_rpc_timeout(enabled, sticky_ms, leader_addr, 800)
+    }
+
+    fn follower_route_context_with_rpc_timeout(
+        enabled: bool,
+        sticky_ms: u64,
+        leader_addr: &InetAddr,
+        rpc_timeout_ms: u64,
+    ) -> (Arc<FsContext>, Arc<curvine_runtime::runtime::Runtime>) {
         let mut conf = ClusterConf::default();
         conf.client.follower_reads_enabled = enabled;
         conf.client.follower_write_sticky_ms = sticky_ms;
@@ -1544,7 +1595,7 @@ mod tests {
         conf.client.rpc_retry_max_duration_ms = 800;
         conf.client.rpc_retry_min_sleep_ms = 2;
         conf.client.rpc_retry_max_sleep_ms = 20;
-        conf.client.rpc_timeout_ms = 800;
+        conf.client.rpc_timeout_ms = rpc_timeout_ms;
         conf.client.init().unwrap();
 
         let runtime = Arc::new(conf.client.client_rpc_conf().create_runtime());
@@ -1752,6 +1803,94 @@ mod tests {
         assert!(error
             .to_string()
             .contains("follower_write_sticky_ms must be greater than zero"));
+    }
+
+    #[test]
+    fn terminal_follower_file_not_found_does_not_retry_the_leader() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let keep_context_runtimes = Arc::new(Mutex::new(Vec::<
+            Arc<curvine_runtime::runtime::Runtime>,
+        >::new()));
+        let keep_context_runtimes_for_test = keep_context_runtimes.clone();
+
+        runtime.block_on(async move {
+            let leader_state = FakeRpcState::new(FAKE_LEADER);
+            let follower_state = FakeRpcState::new(FAKE_FOLLOWER_NOT_FOUND);
+            let leader_addr = start_fake_rpc_server(leader_state.clone()).await;
+            let follower_addr = start_fake_rpc_server(follower_state.clone()).await;
+            let (context, context_runtime) = follower_route_context(true, 250, &leader_addr);
+            keep_context_runtimes_for_test
+                .lock()
+                .unwrap()
+                .push(context_runtime);
+            context
+                .connector
+                .reconcile_nodes(vec![peer(1, &leader_addr), peer(2, &follower_addr)])
+                .unwrap();
+            context.connector.change_leader(1);
+
+            let error = FsClient::new(context)
+                .file_status(&path("/missing/on/follower"))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, FsError::FileNotFound(_)));
+            assert_eq!(follower_state.counts.file_status.load(Ordering::SeqCst), 1);
+            assert_eq!(leader_state.counts.file_status.load(Ordering::SeqCst), 0);
+        });
+
+        drop(keep_context_runtimes);
+        drop(runtime);
+    }
+
+    #[test]
+    fn blackholed_follower_is_bounded_and_cooled_down_across_client_clones() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let keep_context_runtimes = Arc::new(Mutex::new(Vec::<
+            Arc<curvine_runtime::runtime::Runtime>,
+        >::new()));
+        let keep_context_runtimes_for_test = keep_context_runtimes.clone();
+
+        runtime.block_on(async move {
+            let leader_state = FakeRpcState::new(FAKE_LEADER);
+            let follower_state = FakeRpcState::new(FAKE_FOLLOWER_BLACKHOLE);
+            let leader_addr = start_fake_rpc_server(leader_state.clone()).await;
+            let follower_addr = start_fake_rpc_server(follower_state.clone()).await;
+            let (context, context_runtime) =
+                follower_route_context_with_rpc_timeout(true, 250, &leader_addr, 5_000);
+            keep_context_runtimes_for_test
+                .lock()
+                .unwrap()
+                .push(context_runtime);
+            context
+                .connector
+                .reconcile_nodes(vec![peer(1, &leader_addr), peer(2, &follower_addr)])
+                .unwrap();
+            context.connector.change_leader(1);
+
+            let client = FsClient::new(context);
+            let started = std::time::Instant::now();
+            assert!(!client.exists(&path("/blackhole/first")).await.unwrap());
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "follower timeout should be capped near one second, with leader time left"
+            );
+            assert_eq!(follower_state.counts.exists.load(Ordering::SeqCst), 1);
+            assert_eq!(leader_state.counts.exists.load(Ordering::SeqCst), 1);
+
+            // FsClient clones share the per-peer cooldown and go straight to
+            // the leader while the blackholed follower recovers.
+            let clone = client.clone();
+            assert!(!clone.exists(&path("/blackhole/second")).await.unwrap());
+            assert_eq!(follower_state.counts.exists.load(Ordering::SeqCst), 1);
+            assert_eq!(leader_state.counts.exists.load(Ordering::SeqCst), 2);
+
+            // Let the fake server finish its deliberately delayed handler so
+            // the test also exercises the late-response-after-client-close path.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        });
+
+        drop(keep_context_runtimes);
+        drop(runtime);
     }
 
     #[test]
