@@ -1155,9 +1155,16 @@ async fn send_with_retry(
 }
 
 fn retryable(error: &FsError) -> bool {
+    // A follower's ResyncRequired response is terminal for this queued update:
+    // fail the peer immediately so the heartbeat task can build a bounded full
+    // snapshot instead of retrying the stale report until retry_timeout_ms.
+    let message = error.to_string();
+    if message.starts_with("ResyncRequired:") {
+        return false;
+    }
+
     matches!(error.kind(), ErrorKind::IO | ErrorKind::Timeout)
-        || (matches!(error.kind(), ErrorKind::InProgress)
-            && error.to_string().starts_with("NotRegistered:"))
+        || (matches!(error.kind(), ErrorKind::InProgress) && message.starts_with("NotRegistered:"))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1182,6 +1189,7 @@ mod tests {
         slow_blocked: AtomicBool,
         slow_entered: Notify,
         slow_release: Notify,
+        resync_required_on_running: AtomicBool,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1211,6 +1219,13 @@ mod tests {
                 },
             };
             lock(&self.calls).push((peer_id, call));
+            if call == PeerCall::Heartbeat(HeartbeatStatus::Running)
+                && self.resync_required_on_running.load(Ordering::Acquire)
+            {
+                return Err(FsError::in_progress_msg(
+                    "ResyncRequired: worker must send a full report",
+                ));
+            }
             if self.slow_peer.load(Ordering::Acquire) == peer_id
                 && !self.slow_blocked.swap(true, Ordering::AcqRel)
             {
@@ -1324,6 +1339,50 @@ mod tests {
             })
             .await
             .unwrap();
+            fanout.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn resync_required_signal_marks_peer_stale_without_retrying() {
+        let runtime = Arc::new(Runtime::new("peer-fanout-resync-signal", 2, 2));
+        runtime.block_on(async {
+            let transport = transport();
+            let fanout =
+                WorkerPeerFanout::new(runtime.clone(), transport.clone(), config()).unwrap();
+
+            fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if lock(&transport.calls)
+                        .iter()
+                        .any(|(_, call)| *call == PeerCall::Heartbeat(HeartbeatStatus::Start))
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            transport
+                .resync_required_on_running
+                .store(true, Ordering::Release);
+            fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Running));
+            timeout(Duration::from_secs(1), async {
+                while !fanout.needs_full_resync() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            let running_calls = lock(&transport.calls)
+                .iter()
+                .filter(|(_, call)| *call == PeerCall::Heartbeat(HeartbeatStatus::Running))
+                .count();
+            assert_eq!(running_calls, 1, "resync signal must not use retry timeout");
             fanout.shutdown().await;
         });
     }

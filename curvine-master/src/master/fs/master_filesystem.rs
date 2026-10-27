@@ -1385,9 +1385,17 @@ impl MasterFilesystem {
             return;
         }
         self.reset_passive_view_for_current_term();
-        let mut retained_workers: HashSet<u32> = self
-            .worker_manager
-            .read()
+        let worker_manager = self.worker_manager.read();
+        self.observe_passive_worker_heartbeat_locked(status, worker_id, &worker_manager);
+    }
+
+    fn observe_passive_worker_heartbeat_locked(
+        &self,
+        status: HeartbeatStatus,
+        worker_id: u32,
+        worker_manager: &WorkerManager,
+    ) {
+        let mut retained_workers: HashSet<u32> = worker_manager
             .get_last_heartbeat()
             .into_iter()
             .map(|(id, _)| id)
@@ -1418,6 +1426,76 @@ impl MasterFilesystem {
                 self.follower_block_report_state.forget_worker(worker_id);
             }
         }
+    }
+
+    /// Apply a passive worker heartbeat while holding the follower report lock
+    /// across registration validation, readiness invalidation, and the worker
+    /// map update. Reports and location reads take the same lock before the
+    /// worker map, so an old session cannot restore readiness between a Start
+    /// reset and installation of the new session.
+    pub(crate) fn process_passive_worker_heartbeat<V, U>(
+        &self,
+        status: HeartbeatStatus,
+        worker_id: u32,
+        validate: V,
+        update: U,
+    ) -> FsResult<()>
+    where
+        V: FnOnce(&WorkerManager) -> FsResult<()>,
+        U: FnOnce(&mut WorkerManager) -> FsResult<()>,
+    {
+        let _serial = self.follower_block_report_lock.lock();
+        let initial_snapshot = self.master_monitor.follower_readiness_snapshot();
+        if self.master_monitor.is_active() || initial_snapshot.role != RoleState::Follower {
+            return err_box!("Passive worker heartbeats are not accepted by the active master");
+        }
+        self.reset_passive_view_for_current_term();
+
+        let mut worker_manager = self.worker_manager.write();
+        let current_snapshot = self.master_monitor.follower_readiness_snapshot();
+        if self.master_monitor.is_active()
+            || current_snapshot.role != RoleState::Follower
+            || current_snapshot.leadership_epoch != initial_snapshot.leadership_epoch
+        {
+            return err_box!("Passive worker heartbeat crossed a leadership epoch");
+        }
+        validate(&worker_manager)?;
+        if status == HeartbeatStatus::Start {
+            // Revoke readiness after validation but before publishing the new
+            // worker session. The report lock keeps reports from observing the
+            // old map between these operations.
+            self.observe_passive_worker_heartbeat_locked(status, worker_id, &worker_manager);
+            update(&mut worker_manager)?;
+        } else {
+            update(&mut worker_manager)?;
+        }
+        let current_snapshot = self.master_monitor.follower_readiness_snapshot();
+        if self.master_monitor.is_active()
+            || current_snapshot.role != RoleState::Follower
+            || current_snapshot.leadership_epoch != initial_snapshot.leadership_epoch
+        {
+            return err_box!("Passive worker heartbeat crossed a leadership epoch");
+        }
+        if status != HeartbeatStatus::Start {
+            self.observe_passive_worker_heartbeat_locked(status, worker_id, &worker_manager);
+        }
+        drop(worker_manager);
+
+        if status == HeartbeatStatus::Running
+            && self
+                .follower_block_report_state
+                .requires_full_report(worker_id)
+            && !self
+                .follower_full_report_tracker
+                .has_open_session(worker_id, LocalTime::mills())
+        {
+            return Err(FsError::in_progress_msg(format!(
+                "ResyncRequired: worker {} must send a full report to refresh follower state",
+                worker_id
+            )));
+        }
+
+        Ok(())
     }
 
     /// Forget a worker's passive state after local heartbeat expiry. No block
@@ -1788,6 +1866,16 @@ impl MasterFilesystem {
         let report_id = list.report_id;
         let total_len = list.total_len;
         let full_report = list.full_report;
+        if !full_report
+            && self
+                .follower_block_report_state
+                .requires_full_report(worker_id)
+        {
+            return Err(FsError::in_progress_msg(format!(
+                "ResyncRequired: worker {} must complete a full report before incremental reports",
+                worker_id
+            )));
+        }
         let now = LocalTime::mills();
         self.follower_block_report_state
             .observe_worker(worker_id, false);
@@ -2446,6 +2534,45 @@ mod tests {
         readiness
     }
 
+    fn apply_test_passive_heartbeat(
+        fs: &MasterFilesystem,
+        status: HeartbeatStatus,
+        address: WorkerAddress,
+        worker_session_id: &str,
+    ) -> FsResult<()> {
+        let worker_id = address.worker_id;
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        let validate_cluster_id = cluster_id.clone();
+        let validate_address = address.clone();
+        let update_address = address.clone();
+        let update_session = worker_session_id.to_string();
+        fs.process_passive_worker_heartbeat(
+            status,
+            worker_id,
+            move |wm| {
+                if status == HeartbeatStatus::Start {
+                    wm.validate_passive_start(&validate_cluster_id, &validate_address)
+                } else {
+                    Ok(())
+                }
+            },
+            move |wm| {
+                wm.heartbeat_passive(
+                    &cluster_id,
+                    status,
+                    update_address,
+                    1,
+                    update_session,
+                    TransferWorkerCapabilities::default(),
+                    String::new(),
+                    0,
+                    vec![],
+                    None,
+                )
+            },
+        )
+    }
+
     #[test]
     fn passive_block_report_from_unregistered_worker_is_retryable() {
         let mut fs = test_fs("passive-block-report-unregistered");
@@ -2530,6 +2657,249 @@ mod tests {
         assert!(fs
             .follower_block_report_state
             .has_deferred_block((50_000_i64 << 24) | 1));
+    }
+
+    #[test]
+    fn passive_start_serializes_readiness_reset_with_session_replacement() {
+        let mut fs = test_fs("passive-start-session-serialization");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+
+        let address = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address.clone(), "old-session")
+            .unwrap();
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        let block_id = (50_000_i64 << 24) | 1;
+        let report = |report_id| BlockReportList {
+            cluster_id: cluster_id.clone(),
+            worker_id: 7,
+            full_report: true,
+            total_len: 1,
+            report_id,
+            blocks: vec![BlockReportInfo::new(
+                block_id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                128,
+            )],
+        };
+        fs.passive_block_report(report(10), Some("old-session"))
+            .unwrap();
+        assert!(fs.follower_block_report_state.worker_ready(7));
+
+        let bad_address = WorkerAddress {
+            hostname: "conflicting-address".to_string(),
+            ..address.clone()
+        };
+        assert!(apply_test_passive_heartbeat(
+            &fs,
+            HeartbeatStatus::Start,
+            bad_address,
+            "rejected-session",
+        )
+        .is_err());
+        assert!(fs.follower_block_report_state.worker_ready(7));
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(7)
+                .unwrap()
+                .worker_session_id,
+            "old-session"
+        );
+
+        let start_fs = fs.clone();
+        let callback_fs = fs.clone();
+        let start_cluster_id = cluster_id.clone();
+        let start_update_cluster_id = cluster_id.clone();
+        let start_address = address.clone();
+        let (start_paused_tx, start_paused_rx) = std::sync::mpsc::channel();
+        let (resume_start_tx, resume_start_rx) = std::sync::mpsc::channel();
+        let start_thread = std::thread::spawn(move || {
+            start_fs.process_passive_worker_heartbeat(
+                HeartbeatStatus::Start,
+                7,
+                move |wm| wm.validate_passive_start(&start_cluster_id, &start_address),
+                move |wm| {
+                    assert!(callback_fs.follower_block_report_lock.try_lock().is_none());
+                    assert!(!callback_fs.follower_block_report_state.worker_ready(7));
+                    start_paused_tx.send(()).unwrap();
+                    resume_start_rx.recv().unwrap();
+                    wm.heartbeat_passive(
+                        &start_update_cluster_id,
+                        HeartbeatStatus::Start,
+                        address,
+                        1,
+                        "new-session".to_string(),
+                        TransferWorkerCapabilities::default(),
+                        String::new(),
+                        0,
+                        vec![],
+                        None,
+                    )
+                },
+            )
+        });
+        start_paused_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let report_fs = fs.clone();
+        let old_report = report(11);
+        let (report_attempted_tx, report_attempted_rx) = std::sync::mpsc::channel();
+        let (report_result_tx, report_result_rx) = std::sync::mpsc::channel();
+        let report_thread = std::thread::spawn(move || {
+            assert!(report_fs.follower_block_report_lock.try_lock().is_none());
+            report_attempted_tx.send(()).unwrap();
+            report_result_tx
+                .send(report_fs.passive_block_report(old_report, Some("old-session")))
+                .unwrap();
+        });
+        report_attempted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        resume_start_tx.send(()).unwrap();
+        start_thread.join().unwrap().unwrap();
+        let stale_report_error = report_result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        report_thread.join().unwrap();
+
+        assert!(matches!(stale_report_error.kind(), ErrorKind::InProgress));
+        assert!(stale_report_error.to_string().starts_with("NotRegistered:"));
+        assert!(!fs.follower_block_report_state.worker_ready(7));
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(7)
+                .unwrap()
+                .worker_session_id,
+            "new-session"
+        );
+    }
+
+    #[test]
+    fn follower_resyncs_surviving_worker_after_term_change() {
+        let mut fs = test_fs("follower-term-worker-resync");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        let readiness = use_current_follower_view(&mut fs);
+
+        let file_path = "/term-resync.log";
+        let block_id = replication_file(&fs, file_path);
+        let mut address = WorkerInfo::default().address;
+        address.worker_id = 100;
+        apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address.clone(), "session-100")
+            .unwrap();
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        let full_report = |report_id, total_len, blocks| BlockReportList {
+            cluster_id: cluster_id.clone(),
+            worker_id: 100,
+            full_report: true,
+            total_len,
+            report_id,
+            blocks,
+        };
+        fs.passive_block_report(
+            full_report(
+                10,
+                1,
+                vec![BlockReportInfo::new(
+                    block_id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    128,
+                )],
+            ),
+            Some("session-100"),
+        )
+        .unwrap();
+        assert!(fs
+            .follower_get_block_locations_if_ready(file_path)
+            .unwrap()
+            .is_some());
+
+        readiness.observe_raft_state(RoleState::Follower, 2, 3, 0);
+        readiness.observe_leader_contact(2, 3);
+        let resync_signal = apply_test_passive_heartbeat(
+            &fs,
+            HeartbeatStatus::Running,
+            address.clone(),
+            "session-100",
+        )
+        .unwrap_err();
+        assert!(matches!(resync_signal.kind(), ErrorKind::InProgress));
+        assert!(resync_signal.to_string().starts_with("ResyncRequired:"));
+        assert!(fs
+            .follower_get_block_locations_if_ready(file_path)
+            .unwrap()
+            .is_none());
+
+        let incremental_error = fs
+            .passive_block_report(
+                BlockReportList {
+                    cluster_id: cluster_id.clone(),
+                    worker_id: 100,
+                    full_report: false,
+                    total_len: 0,
+                    report_id: 0,
+                    blocks: Vec::new(),
+                },
+                Some("session-100"),
+            )
+            .unwrap_err();
+        assert!(incremental_error.to_string().starts_with("ResyncRequired:"));
+
+        let later_block_id = (50_000_i64 << 24) | 99;
+        fs.passive_block_report(
+            full_report(
+                11,
+                2,
+                vec![BlockReportInfo::new(
+                    block_id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    128,
+                )],
+            ),
+            Some("session-100"),
+        )
+        .unwrap();
+        assert!(apply_test_passive_heartbeat(
+            &fs,
+            HeartbeatStatus::Running,
+            address.clone(),
+            "session-100",
+        )
+        .is_ok());
+        fs.passive_block_report(
+            full_report(
+                11,
+                2,
+                vec![BlockReportInfo::new(
+                    later_block_id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    128,
+                )],
+            ),
+            Some("session-100"),
+        )
+        .unwrap();
+        assert!(fs
+            .follower_get_block_locations_if_ready(file_path)
+            .unwrap()
+            .is_some());
+        apply_test_passive_heartbeat(&fs, HeartbeatStatus::Running, address, "session-100")
+            .unwrap();
     }
 
     #[test]

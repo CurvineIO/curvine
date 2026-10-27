@@ -893,39 +893,46 @@ impl MasterHandler {
         let worker_id = address.worker_id;
         let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
         let worker_session_id = header.worker_session_id.unwrap_or_default();
-        if status == HeartbeatStatus::Start {
-            fs.worker_manager
-                .read()
-                .validate_passive_start(&header.cluster_id, &address)?;
-            // Revoke location readiness before publishing the new worker
-            // session, so a concurrent client read cannot use the prior
-            // session's full-report completion bit.
-            fs.observe_passive_worker_heartbeat(status, worker_id);
-        }
-        let mut wm = fs.worker_manager.write();
-        wm.heartbeat_passive(
-            &header.cluster_id,
+        let cluster_id = header.cluster_id;
+        let validate_cluster_id = cluster_id.clone();
+        let validate_address = address.clone();
+        let transfer_capabilities = curvine_model::TransferWorkerCapabilities {
+            task_submit: header.transfer_task_submit.unwrap_or(false),
+            report_target: header.transfer_report_target.unwrap_or(false),
+            query_task: header.transfer_query_task.unwrap_or(false),
+            attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
+            source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
+        };
+        let software_version = header.software_version;
+        let startup_time_ms = u64::try_from(header.fs_ctime).unwrap_or_default();
+        let storages = ProtoUtils::storage_info_list_from_pb(header.storages);
+        let component_info = header.component_info;
+
+        fs.process_passive_worker_heartbeat(
             status,
-            address,
-            weight,
-            worker_session_id,
-            curvine_model::TransferWorkerCapabilities {
-                task_submit: header.transfer_task_submit.unwrap_or(false),
-                report_target: header.transfer_report_target.unwrap_or(false),
-                query_task: header.transfer_query_task.unwrap_or(false),
-                attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
-                source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
+            worker_id,
+            |wm| {
+                if status == HeartbeatStatus::Start {
+                    wm.validate_passive_start(&validate_cluster_id, &validate_address)
+                } else {
+                    Ok(())
+                }
             },
-            header.software_version,
-            u64::try_from(header.fs_ctime).unwrap_or_default(),
-            ProtoUtils::storage_info_list_from_pb(header.storages),
-            header.component_info,
-        )?;
-        drop(wm);
-        if status != HeartbeatStatus::Start {
-            fs.observe_passive_worker_heartbeat(status, worker_id);
-        }
-        Ok(())
+            |wm| {
+                wm.heartbeat_passive(
+                    &cluster_id,
+                    status,
+                    address,
+                    weight,
+                    worker_session_id,
+                    transfer_capabilities,
+                    software_version,
+                    startup_time_ms,
+                    storages,
+                    component_info,
+                )
+            },
+        )
     }
 
     /// Evaluate a compatibility verdict against the configured mode.
