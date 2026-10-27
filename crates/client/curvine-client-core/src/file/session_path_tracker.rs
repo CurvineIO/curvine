@@ -217,7 +217,11 @@ fn path_index_has_related_path<V>(index: &BTreeMap<PathKey, V>, path: &str) -> (
     descendant_prefix.push_str(path);
     descendant_prefix.push('/');
     probes += 1;
-    if let Some((candidate, _)) = index.range::<str, _>(descendant_prefix.as_str()..).next() {
+    let range = (
+        std::ops::Bound::Included(descendant_prefix.as_str()),
+        std::ops::Bound::Unbounded,
+    );
+    if let Some((candidate, _)) = index.range::<str, _>(range).next() {
         if candidate.0.starts_with(&descendant_prefix) {
             return (true, probes);
         }

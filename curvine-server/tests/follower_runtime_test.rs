@@ -303,6 +303,13 @@ fn run_cluster(mirror_reports: bool) {
             .into_iter()
             .next()
             .unwrap();
+        let active_leader_id = fs.fs_client().master_peer_leader_id().unwrap();
+        let active_leader_index = fs
+            .fs_client()
+            .master_peer_snapshot()
+            .iter()
+            .position(|peer| peer.id == active_leader_id)
+            .unwrap();
         let worker_id = registered_worker.address.worker_id;
         let marked_end = WorkerHeartbeatRequest {
             cluster_id: confs[0].cluster_id.clone(),
@@ -319,7 +326,7 @@ fn run_cluster(mirror_reports: bool) {
         };
         let marked_response = direct_with_seq(
             &confs[0],
-            leader_index,
+            active_leader_index,
             RpcCode::WorkerHeartbeat,
             marked_end,
             WORKER_MIRROR_SEQ_ID,
@@ -331,7 +338,7 @@ fn run_cluster(mirror_reports: bool) {
         );
         let after_marked_mirror = direct(
             &confs[0],
-            leader_index,
+            active_leader_index,
             RpcCode::GetFilesystemInfo,
             GetFilesystemInfoRequest::default(),
             false,
@@ -572,7 +579,7 @@ fn run_cluster(mirror_reports: bool) {
 
             let deadline = Instant::now() + Duration::from_secs(40);
             let new_leader_index = loop {
-                for daemon in &daemons {
+                for daemon in &mut daemons {
                     daemon.assert_running();
                 }
                 if let Some(index) = active_master_index(&confs, Some(old_leader_index)).await {
