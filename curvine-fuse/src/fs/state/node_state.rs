@@ -16,6 +16,7 @@ use crate::fs::dcache::DirTree;
 use crate::fs::pcache::{CacheManager, WriteBackWork};
 use crate::fs::state::file_handle::FileHandle;
 use crate::fs::state::DirHandle;
+use crate::fs::state::{DirTreeLock, DirTreeReadGuard, DirTreeWriteGuard};
 use crate::fs::{FuseReader, FuseWriter};
 use crate::fuse_metrics::{
     StateStageTimer, CACHE_BLOCKS, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT,
@@ -49,7 +50,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub struct NodeState {
-    dir_tree: RwLock<DirTree>,
+    dir_tree: DirTreeLock,
     writers: AsyncSharedMap<u64, FuseWriter>,
     handles: RwLockHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
     dir_handles: RwLockHashMap<u64, FastHashMap<u64, Arc<DirHandle>>>,
@@ -80,7 +81,7 @@ impl NodeState {
         });
 
         let state = Self {
-            dir_tree: RwLock::new(DirTree::new(conf.clone())),
+            dir_tree: DirTreeLock::new(DirTree::new(conf.clone()), conf.metrics_enabled),
             writers: AsyncSharedMap::default(),
             handles: RwLockHashMap::default(),
             dir_handles: RwLockHashMap::default(),
@@ -102,12 +103,12 @@ impl NodeState {
         Ok(state)
     }
 
-    pub fn dir_write(&self) -> RwLockWriteGuard<'_, DirTree> {
-        self.dir_tree.write().unwrap()
+    pub fn dir_write(&self) -> DirTreeWriteGuard<'_> {
+        self.dir_tree.write()
     }
 
-    pub fn dir_read(&self) -> RwLockReadGuard<'_, DirTree> {
-        self.dir_tree.read().unwrap()
+    pub fn dir_read(&self) -> DirTreeReadGuard<'_> {
+        self.dir_tree.read()
     }
 
     pub fn client_conf(&self) -> &ClientConf {
