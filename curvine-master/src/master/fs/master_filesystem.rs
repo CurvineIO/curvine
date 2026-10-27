@@ -1748,9 +1748,7 @@ impl MasterFilesystem {
                     if readiness.has_deferred_block(block.id) {
                         return None;
                     }
-                    let Some(locations) = file_locations.get(&block.id) else {
-                        return None;
-                    };
+                    let locations = file_locations.get(&block.id)?;
                     let usable = locations
                         .iter()
                         .filter(|location| {
@@ -2332,9 +2330,7 @@ impl MasterFilesystem {
                 report_id,
                 inventory,
             };
-            if let Err(error) = self.submit_follower_full_block_reconcile(job, total_len) {
-                return Err(error);
-            }
+            self.submit_follower_full_block_reconcile(job, total_len)?;
         }
 
         for block_id in clear_deferred {
@@ -3483,10 +3479,7 @@ mod tests {
 
         fs.finish_follower_full_block_reconcile(
             job,
-            Err(FsError::io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "injected scan failure",
-            ))),
+            Err(FsError::io(std::io::Error::other("injected scan failure"))),
         );
         assert!(!fs.follower_block_report_state.reconcile_pending(7));
         assert!(!fs.follower_block_report_state.worker_ready(7));
