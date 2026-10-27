@@ -79,10 +79,26 @@ impl TrashExpunger {
                 self.fs
                     .scan_expired_trash(cutoff_ms, self.scan_batch, start_after.as_deref())?;
             for path in page.paths {
+                // Claim the entry first: moving it into `.pending` makes it
+                // unrestorable before the first destructive batch, so a
+                // concurrent RestoreTrash cannot bring back a partially purged
+                // tree. A claimed entry that fails mid-purge is finished by the
+                // pending purger.
+                let claimed = match self.fs.claim_trash_entry_for_purge(&path) {
+                    Ok(Some(Some(claimed))) => claimed,
+                    // Restored or emptied after the scan.
+                    Ok(Some(None)) => continue,
+                    Ok(None) => return Ok(result),
+                    Err(e) => {
+                        warn!("failed to claim trash entry {} for purge: {}", path, e);
+                        continue;
+                    }
+                };
+
                 // Each entry is reclaimed in bounded batches instead of one
                 // whole-subtree delete, so a single huge entry cannot hold the
                 // namespace lock for the length of the sweep.
-                match self.purger.purge_entry(&path) {
+                match self.purger.purge_entry(&claimed) {
                     Ok(Some(purged)) => {
                         result.entries += 1;
                         result.inodes += purged.inodes;
@@ -135,6 +151,7 @@ mod tests {
     use super::*;
     use crate::master::fs::DeleteMode;
     use crate::master::journal::JournalSystem;
+    use crate::master::meta::trash;
     use crate::master::Master;
     use curvine_config::ClusterConf;
     use curvine_raft::raft::RoleState;
@@ -258,6 +275,72 @@ mod tests {
         let result = handle.join().unwrap().unwrap();
         assert_eq!(result, TrashExpungeResult::default());
         assert_eq!(fs.list_trash().unwrap().len(), 2);
+    }
+
+    // Regression for a restore racing a bounded retention purge: once the
+    // expunger has claimed an entry, the original trash path no longer resolves,
+    // so RestoreTrash fails instead of returning a partially purged tree.
+    #[test]
+    fn claimed_entry_is_no_longer_restorable() {
+        let fs = test_fs("claim-restore", "1ms");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        fs.create("/data/dir/a.log", true).unwrap();
+        fs.create("/data/dir/b.log", true).unwrap();
+        fs.delete_with_mode("/data/dir", true, DeleteMode::Default)
+            .unwrap();
+        let entry = fs.list_trash().unwrap().remove(0);
+
+        let claimed = fs
+            .claim_trash_entry_for_purge(&entry.path)
+            .unwrap()
+            .expect("leader")
+            .expect("entry exists");
+        assert!(trash::is_pending_entry_path(&claimed), "got {}", claimed);
+        assert!(fs.list_trash().unwrap().is_empty());
+
+        // Simulates RestoreTrash landing between two purge batches.
+        let err = fs.restore_trash(&entry.path, None, false).unwrap_err();
+        assert!(matches!(err, FsError::FileNotFound(_)), "got {:?}", err);
+        assert!(fs.restore_trash(&claimed, None, false).is_err());
+        assert!(!fs.exists("/data/dir").unwrap());
+
+        // A second claim of the same (now gone) entry is a no-op.
+        assert_eq!(
+            fs.claim_trash_entry_for_purge(&entry.path).unwrap(),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn expunge_leaves_nothing_in_trash_or_pending() {
+        let fs = test_fs("claim-drain", "1ms");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        fs.create("/data/dir/a.log", true).unwrap();
+        fs.delete_with_mode("/data/dir", true, DeleteMode::Default)
+            .unwrap();
+
+        let result = expunger_for(&fs)
+            .expunge_expired(LocalTime::mills() as i64 + 10)
+            .unwrap();
+
+        assert_eq!(result.entries, 1);
+        assert_eq!(result.inodes, 1);
+        assert!(fs.list_trash().unwrap().is_empty());
+        assert!(fs.scan_pending_trash(16, None).unwrap().paths.is_empty());
+    }
+
+    // A follower must not journal the claim rename either.
+    #[test]
+    fn follower_does_not_claim() {
+        let fs = test_fs("claim-follower", "1ms");
+        let delete_ms = trash_one(&fs, "/data/a.log");
+        let entry = fs.list_trash().unwrap().remove(0);
+        assert_eq!(fs.claim_trash_entry_for_purge(&entry.path).unwrap(), None);
+        assert_eq!(fs.list_trash().unwrap()[0].delete_ms, delete_ms);
+    }
+
+    fn expunger_for(fs: &MasterFilesystem) -> TrashExpunger {
+        TrashExpunger::new(fs.clone(), fs.master_monitor.clone())
     }
 
     #[test]

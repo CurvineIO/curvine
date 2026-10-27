@@ -27,6 +27,13 @@ use std::time::Duration;
 // listing in memory while the lock is held.
 const CHILD_PAGE: usize = 256;
 
+// Upper bound on the summed path bytes of one purge batch. A batch is a single
+// journal record and Raft proposal, so it must stay well below the 16 MiB RPC
+// frame (`MAX_DATE_SIZE`) even when every path is near `max_path_len` (8000 by
+// default): 4096 such paths would be ~32 MiB. 4 MiB leaves room for encoding
+// overhead and for other entries the sender aggregates into the same proposal.
+pub const PURGE_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 /// One directory still being enumerated. `after` is the last child already
 /// accounted for, so a batch that ends mid-directory resumes from the next
 /// name instead of rescanning the directory from the start.
@@ -66,7 +73,8 @@ pub struct PurgeOutcome {
 
 /// Reclaims trashed entries in bounded batches.
 ///
-/// Each batch removes at most `trash_purge_batch_inodes` inodes, is journaled
+/// Each batch removes at most `trash_purge_batch_inodes` inodes and carries at
+/// most [`PURGE_BATCH_MAX_BYTES`] of path bytes, is journaled
 /// as one [`crate::master::journal::TrashPurgeEntry`], and then releases the
 /// namespace write lock for `trash_purge_yield_ms`. A trashed directory with
 /// millions of inodes therefore never blocks metadata operations for longer
@@ -74,13 +82,14 @@ pub struct PurgeOutcome {
 ///
 /// The walk is a depth-first post-order traversal: children are removed before
 /// their parent, so every emitted path is a file or an empty directory and
-/// removing it cannot touch inodes that a later batch still needs. Batches are
-/// journaled before they are applied; a batch is idempotent, so a leader that
-/// fails halfway converges when the batch is replayed and retried.
+/// removing it cannot touch inodes that a later batch still needs. Each batch
+/// is applied atomically and then journaled; replay is idempotent because
+/// paths that no longer resolve are skipped.
 pub struct TrashPurger {
     fs: MasterFilesystem,
     monitor: MasterMonitor,
     batch_inodes: usize,
+    batch_bytes: usize,
     yield_ms: u64,
 }
 
@@ -92,8 +101,16 @@ impl TrashPurger {
             fs,
             monitor,
             batch_inodes,
+            batch_bytes: PURGE_BATCH_MAX_BYTES,
             yield_ms,
         }
+    }
+
+    /// Overrides the per-batch path byte bound. Test hook: a small bound lets a
+    /// test exercise byte-limited batching without megabytes of path data.
+    pub fn with_batch_bytes(mut self, batch_bytes: usize) -> Self {
+        self.batch_bytes = batch_bytes.max(1);
+        self
     }
 
     /// Purges `entry` completely. Returns `None` when this node lost leadership
@@ -115,7 +132,7 @@ impl TrashPurger {
             let batch = {
                 let fs_dir = self.fs.fs_dir();
                 let fs_dir = fs_dir.read();
-                Self::next_batch(&fs_dir, &mut frames, self.batch_inodes)?
+                Self::next_batch(&fs_dir, &mut frames, self.batch_inodes, self.batch_bytes)?
             };
             if batch.is_empty() {
                 return Ok(Some(outcome));
@@ -141,12 +158,21 @@ impl TrashPurger {
         }
     }
 
-    /// Collects the next bounded batch of leaf paths, deepest first.
-    fn next_batch(fs_dir: &FsDir, frames: &mut Vec<Frame>, limit: usize) -> FsResult<Vec<String>> {
+    /// Collects the next bounded batch of leaf paths, deepest first. The batch
+    /// stops at `limit` paths or once its path bytes reach `max_bytes`; a batch
+    /// always holds at least one path, so a single path larger than the bound
+    /// still makes progress.
+    fn next_batch(
+        fs_dir: &FsDir,
+        frames: &mut Vec<Frame>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> FsResult<Vec<String>> {
         let limit = limit.max(1);
         let mut batch = Vec::with_capacity(limit.min(CHILD_PAGE));
+        let mut bytes = 0usize;
 
-        while batch.len() < limit {
+        while batch.len() < limit && bytes < max_bytes {
             let Some(frame) = frames.last() else {
                 break;
             };
@@ -165,6 +191,7 @@ impl TrashPurger {
                 // restored entry never journals a no-op batch.
                 ChildPage::Leaf => {
                     let leaf = frames.pop().expect("frame was checked above");
+                    bytes += leaf.path.len();
                     batch.push(leaf.path);
                     continue;
                 }
@@ -178,6 +205,7 @@ impl TrashPurger {
                 // Every child is accounted for, so this directory is either
                 // already empty or becomes empty when this batch is applied.
                 let done = frames.pop().expect("frame was checked above");
+                bytes += done.path.len();
                 batch.push(done.path);
                 continue;
             }
@@ -186,7 +214,7 @@ impl TrashPurger {
             for child in children {
                 // Leave the cursor on the first child this batch cannot hold so
                 // the next batch starts exactly here.
-                if batch.len() >= limit {
+                if batch.len() >= limit || bytes >= max_bytes {
                     break;
                 }
 
@@ -200,6 +228,7 @@ impl TrashPurger {
                     break;
                 }
 
+                bytes += child.path.len();
                 batch.push(child.path);
             }
 

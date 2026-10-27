@@ -335,6 +335,7 @@ struct EvictionStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::master::fs::DeleteMode;
     use crate::master::journal::JournalSystem;
     use crate::master::meta::inode::ttl::InodeTtlExecutor;
     use crate::master::quota::eviction::evictor::LRUEvictor;

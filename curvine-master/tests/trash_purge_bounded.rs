@@ -198,3 +198,47 @@ fn purges_a_trashed_single_file_entry() {
     // (dirs, files): the surviving /data parent and the trash root, no files.
     assert_eq!(fs.get_file_counts(), (2, 0));
 }
+
+// Regression: a purge batch is one journal record and one Raft proposal, so it
+// is bounded by path bytes as well as inode count. With 4096 paths near
+// `max_path_len` (8000) an inode-only bound produced ~32 MiB batches, over the
+// 16 MiB RPC frame. A small byte bound must split a batch the inode bound
+// alone would allow.
+#[test]
+fn bounds_batches_by_path_bytes_as_well_as_inodes() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let fs = trash_fs("byte-bound", 4096, 0);
+    let long = "n".repeat(200);
+    for file in 0..40 {
+        fs.create(format!("/victim/{long}-{file}"), true).unwrap();
+    }
+    fs.delete_with_mode("/victim", true, DeleteMode::Default)
+        .unwrap();
+    let entry = fs.list_trash().unwrap().remove(0).path;
+
+    // Each path is ~240 bytes; 1 KiB per batch holds at most 5 of them.
+    let outcome = purger(&fs)
+        .with_batch_bytes(1024)
+        .purge_entry(&entry)
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        outcome.batches >= 40 / 5,
+        "expected the byte bound to split the purge, got {} batches",
+        outcome.batches
+    );
+    assert_eq!(outcome.inodes, 40);
+    assert!(!fs.exists(&entry).unwrap());
+
+    // The default bound keeps the same tree in a single inode-bounded batch.
+    let fs = trash_fs("byte-bound-default", 4096, 0);
+    for file in 0..40 {
+        fs.create(format!("/victim/{long}-{file}"), true).unwrap();
+    }
+    fs.delete_with_mode("/victim", true, DeleteMode::Default)
+        .unwrap();
+    let entry = fs.list_trash().unwrap().remove(0).path;
+    let outcome = purger(&fs).purge_entry(&entry).unwrap().unwrap();
+    assert_eq!(outcome.batches, 1);
+}

@@ -223,6 +223,10 @@ impl MasterConf {
             return err_box!("Worker_lost_interval must be greater than heartbeat_interval");
         }
 
+        if self.worker_check_interval_unit >= self.worker_lost_interval_unit {
+            return err_box!("Worker_lost_interval must be greater than worker_check_interval");
+        }
+
         if self.conn_limit == 0 {
             return err_box!("master.conn_limit must be greater than zero");
         }
@@ -484,6 +488,21 @@ mod tests {
         assert!(error
             .to_string()
             .contains("block_replication_job_timeout must be greater than zero"));
+    }
+
+    #[test]
+    fn worker_check_interval_must_be_shorter_than_lost_interval() {
+        let mut conf = MasterConf {
+            worker_check_interval: "15m".to_string(),
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("a check cadence slower than the lost interval must be rejected");
+        assert!(error
+            .to_string()
+            .contains("Worker_lost_interval must be greater than worker_check_interval"));
     }
 
     #[test]

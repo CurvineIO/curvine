@@ -262,8 +262,10 @@ impl MasterFilesystem {
     }
 
     // Permanently delete a path, bypassing the recycle bin.
+    // Internal callers (TTL eviction, quota) count the inode's bytes as
+    // reclaimed, so this must never route through the recycle bin.
     pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<DeleteResult> {
-        self.delete_with_mode(path, recursive, DeleteMode::Default)
+        self.delete_with_mode(path, recursive, DeleteMode::SkipTrash)
     }
 
     pub fn delete_with_mode<T: AsRef<str>>(
@@ -352,13 +354,15 @@ impl MasterFilesystem {
         });
     }
 
-    /// Journals and applies one bounded trash purge batch.
+    /// Applies and journals one bounded trash purge batch.
     ///
-    /// The batch is journaled before it is applied: a batch is self-contained
-    /// and idempotent, so a leader that fails after journaling still converges
-    /// on replay, while journaling after a partial apply could leave the
-    /// standbys without the batch the leader already applied. Returns `None`
-    /// when this node is no longer the active master.
+    /// The batch is applied before it is journaled, like every other `FsDir`
+    /// mutation: `JournalWriter::send` may emit a leader snapshot right after
+    /// enqueueing the record, and that checkpoint must already reflect the
+    /// purge, otherwise recovery from it would skip the batch and resurrect
+    /// inodes whose blocks were already released. `purge_paths` commits the
+    /// whole batch atomically, so a failed apply journals nothing. Returns
+    /// `None` when this node is no longer the active master.
     pub(crate) fn purge_trash_batch(
         &self,
         entry: &str,
@@ -371,10 +375,11 @@ impl MasterFilesystem {
             }
 
             let mtime = LocalTime::mills() as i64;
+            let delete_res = fs_dir.purge_paths(paths, mtime)?;
+
             let writer = fs_dir.journal_writer.clone();
             writer.log_trash_purge(&fs_dir, entry, mtime, paths.to_vec())?;
-
-            fs_dir.purge_paths(paths, mtime)?
+            delete_res
         };
 
         self.release_deleted_blocks(&mut delete_res);
@@ -419,6 +424,20 @@ impl MasterFilesystem {
     ) -> FsResult<TrashScanPage> {
         let fs_dir = self.fs_dir.read();
         fs_dir.scan_expired_trash(cutoff_ms, limit, start_after)
+    }
+
+    /// Leader-fenced [`FsDir::claim_trash_entry_for_purge`]. Returns
+    /// `Ok(None)` when this node is no longer active and `Ok(Some(None))` when
+    /// the entry already vanished.
+    pub fn claim_trash_entry_for_purge(
+        &self,
+        trash_path: &str,
+    ) -> FsResult<Option<Option<String>>> {
+        let mut fs_dir = self.fs_dir.write();
+        if !self.master_monitor.is_active() {
+            return Ok(None);
+        }
+        fs_dir.claim_trash_entry_for_purge(trash_path).map(Some)
     }
 
     /// One bounded page of `/.Trash/.pending` entries, i.e. entries staged by
@@ -738,13 +757,23 @@ impl MasterFilesystem {
     ) -> FsResult<FileStatus> {
         let path = path.as_ref();
         let fs_dir = self.fs_dir.read();
+        if inode_id.is_none_or(|id| id <= 0) {
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            return match inp.get_last_inode() {
+                Some(inode) => Ok(inode.to_file_status(path)?),
+                None => err_ext!(FsError::file_not_found(path)),
+            };
+        }
         let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         Ok(inode.to_file_status(path)?)
     }
 
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
         let fs_dir = self.fs_dir.read();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let inp = Self::resolve_path_raw(&fs_dir, path.as_ref())?;
+        if trash::is_pending_path(inp.path()) {
+            return Ok(false);
+        }
         Ok(inp.get_last_inode().is_some())
     }
 
@@ -755,13 +784,17 @@ impl MasterFilesystem {
             let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;
             let mut all_statuses = Vec::new();
             for path in &paths {
+                if trash::is_pending_path(path.path()) {
+                    continue;
+                }
                 let statuses = fs_dir.list_status(path)?;
-                all_statuses.extend(statuses);
+                all_statuses.extend(Self::hide_pending(path.path(), statuses));
             }
             Ok(all_statuses)
         } else {
             let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
-            fs_dir.list_status(&inp)
+            let statuses = fs_dir.list_status(&inp)?;
+            Ok(Self::hide_pending(inp.path(), statuses))
         }
     }
 
@@ -777,12 +810,38 @@ impl MasterFilesystem {
             err_box!("list_options does not support glob pattern, path {}", path)
         } else {
             let inp = Self::resolve_path(&fs_dir, path)?;
-            fs_dir.list_options(&inp, &opts)
+            let statuses = fs_dir.list_options(&inp, &opts)?;
+            Ok(Self::hide_pending(inp.path(), statuses))
         }
     }
 
-    fn resolve_path(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
+    /// Resolves a client-supplied path. `/.Trash/.pending` is master-owned
+    /// staging for async deletes and reclamation, so it resolves as missing:
+    /// clients can neither stat, list, open, rename nor synchronously delete it.
+    /// Internal reclamation goes through `FsDir` directly and is not affected.
+    fn resolve_path(fs_dir: &FsDir, path: &str) -> FsResult<InodePath> {
+        let inp = Self::resolve_path_raw(fs_dir, path)?;
+        Self::check_not_pending_path(inp.path())?;
+        Ok(inp)
+    }
+
+    fn resolve_path_raw(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
         InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
+    }
+
+    fn check_not_pending_path(path: &str) -> FsResult<()> {
+        if trash::is_pending_path(path) {
+            return err_ext!(FsError::file_not_found(path));
+        }
+        Ok(())
+    }
+
+    /// Drops the `.pending` staging directory from a listing of `/.Trash`.
+    fn hide_pending(dir_path: &str, mut statuses: Vec<FileStatus>) -> Vec<FileStatus> {
+        if dir_path == trash::TRASH_ROOT {
+            statuses.retain(|status| status.name != trash::TRASH_PENDING_NAME);
+        }
+        statuses
     }
 
     fn check_not_reserved_path(path: &str) -> FsResult<()> {
@@ -896,7 +955,8 @@ impl MasterFilesystem {
             },
 
             _ => {
-                let inp = Self::resolve_path(fs_dir, path)?;
+                // Raw resolution: journal replay addresses `.pending` paths.
+                let inp = Self::resolve_path_raw(fs_dir, path)?;
                 match inp.task_last() {
                     Some(ptr) => Ok(ptr),
                     None => err_ext!(FsError::file_not_found(path)),
@@ -3439,5 +3499,157 @@ mod tests {
             )
             .unwrap();
         assert_eq!(blocks.status.len, 128);
+    }
+
+    // Journal enabled in testing mode: entries stay on the writer's channel and
+    // every journaled mutation emits a leader checkpoint.
+    fn test_fs_snapshot_every_entry(name: &str) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = true;
+        conf.journal.leader_create_snapshot = Some(true);
+        conf.journal.snapshot_entries = 1;
+        conf.journal.snapshot_min_interval = curvine_runtime::common::DurationUnit::new(0);
+        conf.master.trash_enabled = true;
+        conf.master.meta_dir = Utils::test_sub_dir(format!(
+            "master-fs-purge-snapshot/meta-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-purge-snapshot/journal-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor
+            .journal_ctl
+            .set_state(curvine_raft::raft::RoleState::Leader);
+        fs
+    }
+
+    // Regression: the leader checkpoint emitted while journaling a purge batch
+    // must already exclude the purged inodes. Journaling before applying left
+    // the victims in a checkpoint whose watermark covered the purge, so a
+    // recovery from it resurrected metadata for released blocks.
+    #[test]
+    fn purge_checkpoint_excludes_the_purged_inodes() {
+        use crate::master::fs::TrashPurger;
+        use crate::master::journal::JournalEntry;
+        use crate::master::meta::store::RocksInodeStore;
+
+        let fs = test_fs_snapshot_every_entry("apply-before-log");
+        let victim = fs.create("/data/victim.log", true).unwrap();
+        fs.delete_with_mode("/data/victim.log", false, DeleteMode::Default)
+            .unwrap();
+        let entry = fs.list_trash().unwrap().remove(0);
+        let writer = fs.fs_dir.read().journal_writer.clone();
+        writer.take_entries();
+
+        TrashPurger::new(fs.clone(), fs.master_monitor.clone())
+            .purge_entry(&entry.path)
+            .unwrap()
+            .expect("leader");
+
+        let entries = writer.take_entries();
+        let purge_at = entries
+            .iter()
+            .position(|e| matches!(e, JournalEntry::TrashPurge(_)))
+            .expect("purge must be journaled");
+        let checkpoint = entries[purge_at..]
+            .iter()
+            .find_map(|e| match e {
+                JournalEntry::Snapshot(s) => Some(s.dir.clone()),
+                _ => None,
+            })
+            .expect("snapshot_entries = 1 emits a checkpoint after the purge record");
+
+        // Open the checkpoint itself as a store (a separate scratch dir keeps its
+        // own checkpoints away from the live DB).
+        let mut db_conf = fs.conf.rocksdb.clone().set_dir(Utils::test_sub_dir(format!(
+            "master-fs-purge-snapshot/open-{}",
+            Utils::rand_str(6)
+        )));
+        db_conf.data_dir = checkpoint.clone();
+        let store = RocksInodeStore::new(db_conf, false).unwrap();
+        assert!(
+            store.get_inode(victim.id).unwrap().is_none(),
+            "checkpoint {} still holds purged inode {}",
+            checkpoint,
+            victim.id
+        );
+    }
+
+    // `delete()` serves TTL eviction and quota, which count the inode's bytes as
+    // reclaimed; it must bypass the recycle bin even when trash is enabled.
+    #[test]
+    fn delete_bypasses_the_recycle_bin_when_trash_is_enabled() {
+        let fs = test_fs_with_trash("delete-skips-trash");
+        fs.create("/data/ttl.log", true).unwrap();
+
+        let res = fs.delete("/data/ttl.log", false).unwrap();
+
+        assert!(!res.trashed, "delete() must not soft-delete");
+        assert!(fs.list_trash().unwrap().is_empty());
+        assert!(!fs.exists(trash::TRASH_ROOT).unwrap());
+    }
+
+    // `/.Trash/.pending` is master-owned staging: no client RPC may stat, list,
+    // open, rename, restore or synchronously delete it.
+    #[test]
+    fn pending_staging_dir_is_not_addressable_by_clients() {
+        let fs = test_fs_with_trash("pending-hidden");
+        fs.create("/kept/k.log", true).unwrap();
+        fs.delete_with_mode("/kept", true, DeleteMode::Default)
+            .unwrap();
+        fs.create("/victim/a.log", true).unwrap();
+        fs.delete_with_mode("/victim", true, DeleteMode::AsyncPurge)
+            .unwrap();
+        let staged = fs.scan_pending_trash(16, None).unwrap().paths.remove(0);
+        let staged_child = format!("{}/a.log", staged);
+
+        for path in [
+            trash::TRASH_PENDING_ROOT,
+            staged.as_str(),
+            staged_child.as_str(),
+        ] {
+            assert!(!fs.exists(path).unwrap(), "{} must not exist", path);
+            assert_file_not_found_roundtrip(&fs.file_status(path).unwrap_err());
+            assert_file_not_found_roundtrip(&fs.list_status(path).unwrap_err());
+            assert_file_not_found_roundtrip(
+                &fs.list_options(path, ListOptions::default()).unwrap_err(),
+            );
+            assert_file_not_found_roundtrip(&fs.get_block_locations(path).unwrap_err());
+            assert_file_not_found_roundtrip(&fs.delete(path, true).unwrap_err());
+            assert_file_not_found_roundtrip(
+                &fs.delete_with_mode(path, true, DeleteMode::AsyncPurge)
+                    .unwrap_err(),
+            );
+            assert!(fs.rename(path, "/moved", RenameFlags::empty()).is_err());
+            assert!(fs.restore_trash(path, None, false).is_err());
+        }
+
+        // Listing the bin shows the restorable entry but never `.pending`.
+        let names = |statuses: Vec<FileStatus>| -> Vec<String> {
+            statuses.into_iter().map(|s| s.name).collect()
+        };
+        let listed = names(fs.list_status(trash::TRASH_ROOT).unwrap());
+        assert_eq!(listed.len(), 1, "got {:?}", listed);
+        assert!(!listed.iter().any(|n| n == trash::TRASH_PENDING_NAME));
+        let listed = names(
+            fs.list_options(trash::TRASH_ROOT, ListOptions::default())
+                .unwrap(),
+        );
+        assert_eq!(listed.len(), 1, "got {:?}", listed);
+        let globbed = names(fs.list_status("/.Trash/*").unwrap());
+        assert!(
+            globbed.iter().all(|n| n != "a.log"),
+            "glob must not descend into .pending: {:?}",
+            globbed
+        );
+
+        // The staged entry is still drained by the purger.
+        assert_eq!(fs.scan_pending_trash(16, None).unwrap().paths.len(), 1);
     }
 }
