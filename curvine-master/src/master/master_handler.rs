@@ -138,8 +138,10 @@ impl MasterHandler {
             FollowerReadRefusal::NoLeader => "no_leader",
             FollowerReadRefusal::NoCurrentTermLeaderContact => "no_current_term_contact",
             FollowerReadRefusal::StaleLeaderContact => "stale_leader_contact",
+            FollowerReadRefusal::LeaderCommitUnknown => "leader_commit_unknown",
             FollowerReadRefusal::ApplyProgressUnknown => "apply_progress_unknown",
             FollowerReadRefusal::ApplyStalled => "apply_stalled",
+            FollowerReadRefusal::ReplicationStalled => "replication_stalled",
             FollowerReadRefusal::CommitLag => "commit_lag",
         }
     }

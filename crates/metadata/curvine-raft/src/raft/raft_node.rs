@@ -551,6 +551,7 @@ where
         let message_type = message.get_msg_type();
         let message_term = message.term;
         let message_from = message.from;
+        let leader_commit = raft.leader_commit;
         if message.to != self.id() || message.from == self.id() || message.from == DEFAULT_LEADER_ID
         {
             return Self::send_request_error(
@@ -577,15 +578,23 @@ where
         if let Err(e) = self.recovery.step(&mut self.raw, raft, self.session) {
             return Self::send_request_error(env, e);
         }
-        self.refresh_follower_readiness();
-        if is_leader_contact_message(message_type)
+        let accepted_leader_contact = !self.recovery.active
+            && is_leader_contact_message(message_type)
             && self.raw.raft.state == StateRole::Follower
             && self.raw.raft.term == message_term
-            && self.raw.raft.leader_id == message_from
-        {
+            && self.raw.raft.leader_id == message_from;
+        if accepted_leader_contact {
             self.role_monitor
                 .follower_readiness()
-                .observe_leader_contact(message_term, message_from);
+                .observe_raft_state_with_leader_contact(
+                    RoleState::Follower,
+                    self.raw.raft.term,
+                    self.raw.raft.leader_id,
+                    self.raw.raft.raft_log.committed,
+                    leader_commit,
+                );
+        } else {
+            self.refresh_follower_readiness();
         }
         if self.recovery.active && self.storage.recovery_state()? != Some(self.id()) {
             self.storage.set_recovery_state(Some(self.id()))?;
