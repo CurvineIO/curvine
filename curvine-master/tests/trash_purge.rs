@@ -147,7 +147,8 @@ fn purge_paths_releases_a_hard_linked_inode_once() {
     let fs = trash_fs("hard-link");
     fs.create("/victim/file", true).unwrap();
     fs.link("/victim/file", "/victim/link").unwrap();
-    fs.delete_with_opts("/victim", true, false).unwrap();
+    fs.delete_with_mode("/victim", true, DeleteMode::Default)
+        .unwrap();
     let entry = fs.list_trash().unwrap().remove(0).path;
     let before = fs.get_file_counts();
 
