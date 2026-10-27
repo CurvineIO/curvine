@@ -80,12 +80,14 @@ fn purge_paths_removes_only_the_listed_batch() {
     assert_eq!(res.inodes, 1);
     assert!(fs.exists(format!("{entry}/b")).unwrap());
 
-    // The entry directory itself is the producer's last batch.
+    // The producer lists a directory only once the batch empties it, so `b`
+    // precedes the entry itself.
+    let last = vec![format!("{entry}/b"), entry.clone()];
     let res = {
         let fs_dir = fs.fs_dir();
         let mut fs_dir = fs_dir.write();
         fs_dir
-            .purge_paths(std::slice::from_ref(&entry), LocalTime::mills() as i64)
+            .purge_paths(&last, LocalTime::mills() as i64)
             .unwrap()
     };
     assert_eq!(res.inodes, 0);
@@ -95,6 +97,81 @@ fn purge_paths_removes_only_the_listed_batch() {
     // the three files are gone, so only the trash root remains.
     assert_eq!(before, (4, 3));
     assert_eq!(fs.get_file_counts(), (1, 0));
+}
+
+#[test]
+fn purge_paths_never_removes_unlisted_descendants() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let fs = trash_fs("non-empty");
+    let entry = trash_dir(&fs, "/victim");
+
+    // Listing a directory that still holds children must not delete them.
+    let res = {
+        let fs_dir = fs.fs_dir();
+        let mut fs_dir = fs_dir.write();
+        fs_dir
+            .purge_paths(std::slice::from_ref(&entry), LocalTime::mills() as i64)
+            .unwrap()
+    };
+    assert_eq!(res.inodes, 0);
+    assert!(fs.exists(&entry).unwrap());
+    for path in ["a/file-a", "a/file-b", "b/file-c"] {
+        assert!(fs.exists(format!("{entry}/{path}")).unwrap());
+    }
+
+    // One batch may carry the leaves and every directory they empty.
+    let batch = vec![
+        format!("{entry}/a/file-a"),
+        format!("{entry}/a/file-b"),
+        format!("{entry}/a"),
+        format!("{entry}/b/file-c"),
+        format!("{entry}/b"),
+        entry.clone(),
+    ];
+    let res = {
+        let fs_dir = fs.fs_dir();
+        let mut fs_dir = fs_dir.write();
+        fs_dir
+            .purge_paths(&batch, LocalTime::mills() as i64)
+            .unwrap()
+    };
+    assert_eq!(res.inodes, 3);
+    assert!(!fs.exists(&entry).unwrap());
+    assert!(fs.exists("/.Trash").unwrap());
+}
+
+#[test]
+fn purge_paths_releases_a_hard_linked_inode_once() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let fs = trash_fs("hard-link");
+    fs.create("/victim/file", true).unwrap();
+    fs.link("/victim/file", "/victim/link").unwrap();
+    fs.delete_with_opts("/victim", true, false).unwrap();
+    let entry = fs.list_trash().unwrap().remove(0).path;
+    let before = fs.get_file_counts();
+
+    let batch = vec![
+        format!("{entry}/file"),
+        format!("{entry}/link"),
+        entry.clone(),
+    ];
+    let res = {
+        let fs_dir = fs.fs_dir();
+        let mut fs_dir = fs_dir.write();
+        fs_dir
+            .purge_paths(&batch, LocalTime::mills() as i64)
+            .unwrap()
+    };
+
+    // Both names belong to one inode: only the last link releases it.
+    assert_eq!(res.inodes, 1);
+    assert!(!fs.exists(&entry).unwrap());
+    let after = fs.get_file_counts();
+    assert_eq!(after.1, before.1 - 2, "both names must leave fs_stats");
+    assert_eq!(after.0, before.0 - 1, "the entry must leave fs_stats");
+
+    fs.restore_from_rocksdb().unwrap();
+    assert!(!fs.exists(&entry).unwrap());
 }
 
 #[test]
