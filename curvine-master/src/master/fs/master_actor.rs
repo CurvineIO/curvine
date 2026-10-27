@@ -14,7 +14,7 @@
 
 use crate::master::fs::heartbeat_checker::HeartbeatChecker;
 use crate::master::fs::master_filesystem::MasterFilesystem;
-use crate::master::fs::{FsDirWatchdog, TrashExpunger};
+use crate::master::fs::{FsDirWatchdog, PendingTrashPurger, TrashExpunger};
 use crate::master::meta::inode::ttl::TtlHeartbeatChecker;
 use crate::master::meta::inode::ttl::TtlHeartbeatConfig;
 use crate::master::meta::inode::ttl::{InodeTtlExecutor, InodeTtlManager};
@@ -68,6 +68,7 @@ impl MasterActor {
         )?;
         Self::start_fs_dir_watchdog(self.fs.clone())?;
         self.start_trash_expunger()?;
+        self.start_pending_trash_purger()?;
         Ok(())
     }
 
@@ -89,6 +90,18 @@ impl MasterActor {
             "trash expunger started, interval {} ms, retention {} ms",
             interval_ms, retention_ms
         );
+        Ok(())
+    }
+
+    /// Drains `/.Trash/.pending`, i.e. the entries staged by `async_delete`.
+    /// Started regardless of `trash_enabled`, because async deletes must be
+    /// reclaimed even when the recycle bin is off.
+    fn start_pending_trash_purger(&mut self) -> CommonResult<()> {
+        let interval_ms = self.fs.conf.trash_purge_interval_ms();
+        let scheduler = ScheduledExecutor::new("trash-pending-purger", interval_ms);
+        let purger = PendingTrashPurger::new(self.fs.clone(), self.master_monitor.clone());
+        scheduler.start(purger)?;
+        info!("trash pending purger started, interval {} ms", interval_ms);
         Ok(())
     }
 

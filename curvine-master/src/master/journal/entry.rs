@@ -96,6 +96,21 @@ pub struct DeleteEntry {
     pub(crate) mtime: i64,
 }
 
+// One bounded batch of a trash purge. `Delete` replays as a whole-subtree
+// removal, so a purge that releases the namespace lock between batches needs
+// its own entry: it names the trash entry it belongs to (for logging and
+// completion) and the exact paths removed by this batch. Paths are removed
+// leaf-first by the producer, which keeps every batch's work bounded and lets
+// replay skip paths that are already gone.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct TrashPurgeEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) entry: String,
+    pub(crate) mtime: i64,
+    pub(crate) paths: Vec<String>,
+}
+
 // mount
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct MountEntry {
@@ -206,6 +221,7 @@ pub enum JournalEntry {
     Snapshot(SnapshotEntry),
     // Keep new variants appended so existing journal discriminants remain stable.
     CacheInvalidation(CacheInvalidationEntry),
+    TrashPurge(TrashPurgeEntry),
 }
 
 impl JournalEntry {
@@ -229,6 +245,7 @@ impl JournalEntry {
             JournalEntry::CacheInvalidation(e) => e.op_id,
             JournalEntry::UfsApplied(e) => e.op_id,
             JournalEntry::Snapshot(e) => e.op_id,
+            JournalEntry::TrashPurge(e) => e.op_id,
         }
     }
 
@@ -252,6 +269,7 @@ impl JournalEntry {
             JournalEntry::CacheInvalidation(e) => e.rpc_id,
             JournalEntry::UfsApplied(e) => e.rpc_id,
             JournalEntry::Snapshot(e) => e.rpc_id,
+            JournalEntry::TrashPurge(e) => e.rpc_id,
         }
     }
 

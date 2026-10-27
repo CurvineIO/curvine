@@ -262,6 +262,22 @@ pub struct ClientConf {
     // Sequential read check threshold
     #[client_cli]
     pub sequential_read_threshold: u64,
+
+    // Forward-seek absorption window size (bytes). When a forward seek lands within
+    // this distance of the prefetch buffer, the read is served from the buffer
+    // instead of discarding it. Default is 0 (disabled).
+    // Preconditions: absorption requires enable_smart_prefetch = true AND
+    // read_chunk_num > 1 (buffered lanes); with either missing the window is
+    // silently ignored and no seek is ever absorbed.
+    // Side effect: any non-zero window also changes Random-mode seeks to
+    // reposition only the base reader (lanes are drained once on the
+    // sequential->random flip and left idle until the pattern flips back),
+    // instead of repositioning every lane on every seek.
+    #[serde(skip)]
+    pub seek_absorb_window: i64,
+    #[serde(alias = "seek_absorb_window")]
+    #[client_cli]
+    pub seek_absorb_window_str: String,
 }
 
 impl ClientConf {
@@ -316,6 +332,9 @@ impl ClientConf {
         if self.read_chunk_num <= 1 || self.read_ahead_len < Self::LONG_READ_THRESHOLD_LEN {
             self.enable_read_ahead = false
         }
+
+        self.seek_absorb_window =
+            ByteUnit::from_str(&self.seek_absorb_window_str)?.as_byte() as i64;
 
         self.small_file_size = ByteUnit::from_str(&self.small_file_size_str)?.as_byte() as i64;
 
@@ -461,9 +480,32 @@ impl Default for ClientConf {
             large_file_size_str: "10GB".to_string(),
             max_read_parallel: Self::DEFAULT_MAX_READ_PARALLEL,
             sequential_read_threshold: 7,
+            seek_absorb_window: 0,
+            seek_absorb_window_str: "0".to_string(),
         };
 
         conf.init().unwrap();
         conf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_seek_absorb_window_default_off() {
+        let conf = ClientConf::default();
+        assert_eq!(conf.seek_absorb_window, 0);
+    }
+
+    #[test]
+    fn test_seek_absorb_window_parse() {
+        let mut conf = ClientConf {
+            seek_absorb_window_str: "4MB".to_string(),
+            ..Default::default()
+        };
+        conf.init().unwrap();
+        assert_eq!(conf.seek_absorb_window, 4 * 1024 * 1024);
     }
 }

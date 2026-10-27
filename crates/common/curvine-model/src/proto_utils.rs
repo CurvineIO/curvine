@@ -904,11 +904,16 @@ impl ProtoUtils {
     }
 
     pub fn trash_entry_to_pb(src: TrashEntry) -> TrashEntryProto {
+        let mut status = Self::file_status_to_pb(src.status);
+        // Trash listings never expose user xattrs, and one entry carrying a
+        // large metadata blob would otherwise consume the whole ListTrash
+        // response budget (or even exceed the RPC frame limit).
+        status.x_attr.clear();
         TrashEntryProto {
             path: src.path,
             origin: src.origin,
             delete_ms: src.delete_ms,
-            status: Self::file_status_to_pb(src.status),
+            status,
         }
     }
 
@@ -993,6 +998,7 @@ mod tests {
                 id: 7,
                 path: "/.Trash/123-7".to_string(),
                 name: "123-7".to_string(),
+                x_attr: HashMap::from([("user.meta".to_string(), vec![b'x'; 32])]),
                 ..Default::default()
             },
         };
@@ -1001,6 +1007,10 @@ mod tests {
         assert_eq!(pb.path, "/.Trash/123-7");
         assert_eq!(pb.origin, "/data/a.log");
         assert_eq!(pb.delete_ms, 123);
+        assert!(
+            pb.status.x_attr.is_empty(),
+            "trash listings must not carry user xattrs"
+        );
 
         let round_trip = ProtoUtils::trash_entry_from_pb(pb);
         assert_eq!(round_trip.path, "/.Trash/123-7");

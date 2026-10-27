@@ -120,6 +120,12 @@ pub struct FilesystemConf {
     /// Client-side Transfer routing only. Service-side store and scheduler settings remain
     /// owned by the Transfer process configuration.
     pub transfer: TransferClientConf,
+
+    // Forward-seek absorption window (byte-size string, e.g. "4MB"); "0"
+    // disables it. See ClientConf::seek_absorb_window for the preconditions
+    // (enable_smart_prefetch and read_chunk_num > 1) and side effects.
+    // Appended last: new public fields go at the end of the struct.
+    pub seek_absorb_window: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +189,7 @@ impl FilesystemConf {
             block_conn_idle_time_ms: 30_000,
             small_file_size: "1MB".to_string(),
             large_file_size: "64MB".to_string(),
+            seek_absorb_window: "0".to_string(),
             log_level: log.level,
             log_dir: log.log_dir,
             log_file_name: log.file_name,
@@ -280,6 +287,14 @@ impl FilesystemConf {
             max_read_parallel: self.max_read_parallel,
             sequential_read_threshold: self.sequential_read_threshold,
 
+            // The derived FilesystemConf::default() leaves the string empty,
+            // which ClientConf::init() rejects; treat empty as "disabled".
+            seek_absorb_window_str: if self.seek_absorb_window.trim().is_empty() {
+                "0".to_string()
+            } else {
+                self.seek_absorb_window
+            },
+
             ..Default::default()
         };
 
@@ -322,6 +337,22 @@ mod tests {
 
         let cluster = conf.into_cluster_conf().unwrap();
         assert_eq!(cluster.client.master_conn_pool_size, 1);
+    }
+
+    #[test]
+    fn maps_seek_absorb_window_into_client_conf() {
+        // An explicit value flows through to ClientConf and parses.
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.seek_absorb_window = "4MB".to_string();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.seek_absorb_window, 4 * 1024 * 1024);
+
+        // Unset (the derived default is an empty string) means disabled, not
+        // an init error.
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.seek_absorb_window = String::new();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.seek_absorb_window, 0);
     }
 
     #[test]
