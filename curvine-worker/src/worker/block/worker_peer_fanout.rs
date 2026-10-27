@@ -604,10 +604,15 @@ impl WorkerPeerFanout {
             self.defer_resync();
             return Ok(());
         }
+        let mut queued = true;
         for (_, mailbox, _) in stale_peers {
-            mailbox.enqueue_resync(start.clone(), snapshot.clone());
+            queued &= mailbox.enqueue_resync(start.clone(), snapshot.clone());
         }
-        *lock(&self.resync_retry_after) = None;
+        if queued {
+            *lock(&self.resync_retry_after) = None;
+        } else {
+            self.defer_resync();
+        }
         Ok(())
     }
 
@@ -926,10 +931,10 @@ impl PeerMailbox {
         self.notify.notify_one();
     }
 
-    fn enqueue_resync(&self, start: WorkerHeartbeatRequest, snapshot: FullReportSnapshot) {
+    fn enqueue_resync(&self, start: WorkerHeartbeatRequest, snapshot: FullReportSnapshot) -> bool {
         let mut state = lock(&self.state);
         if !state.needs_resync || state.resync_in_progress {
-            return;
+            return true;
         }
         self.mark_resync_locked(&mut state);
         let generation = state.resync_generation;
@@ -942,7 +947,7 @@ impl PeerMailbox {
                 "follower full resync Start does not fit the configured global queued-byte limit"
             );
             self.notify.notify_one();
-            return;
+            return false;
         };
         state.next_sequence = state.next_sequence.saturating_add(1);
         let start_sequence = state.next_sequence;
@@ -958,7 +963,7 @@ impl PeerMailbox {
             drop(state);
             warn!("follower full resync snapshot does not fit the configured global queued-byte limit");
             self.notify.notify_one();
-            return;
+            return false;
         };
         if state.queued_ops >= self.max_ops {
             drop(permit);
@@ -966,7 +971,7 @@ impl PeerMailbox {
             drop(state);
             warn!("follower full resync exceeds the configured per-peer queue operation limit");
             self.notify.notify_one();
-            return;
+            return false;
         }
         state.next_sequence = state.next_sequence.saturating_add(1);
         let sequence = state.next_sequence;
@@ -979,6 +984,7 @@ impl PeerMailbox {
         });
         drop(state);
         self.notify.notify_one();
+        true
     }
 
     fn mark_resync_locked(&self, state: &mut PeerMailboxState) {
@@ -1732,6 +1738,43 @@ mod tests {
 
             assert_eq!(builds.load(Ordering::SeqCst), 1);
             assert!(fanout.has_stale_peer_state());
+            fanout.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn resync_queue_capacity_failure_defers_next_inventory_build() {
+        let runtime = Arc::new(Runtime::new("peer-fanout-resync-queue-budget", 2, 2));
+        runtime.block_on(async {
+            let transport = transport();
+            let fanout =
+                WorkerPeerFanout::new(runtime.clone(), transport.clone(), config()).unwrap();
+            fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
+            wait_for_calls(&transport, 1).await;
+            let mailbox = lock(&fanout.peers).get(&2).unwrap().mailbox.clone();
+            mailbox.mark_resync_locked(&mut lock(&mailbox.state));
+            let mut competing_permit = None;
+            fanout
+                .resync_with_snapshot(|_| {
+                    let inventory = snapshot();
+                    let start_bytes =
+                        PeerMirrorRequest::Heartbeat(Box::new(heartbeat(HeartbeatStatus::Start)))
+                            .encoded_len();
+                    let consume = fanout.global_bytes.remaining()
+                        - inventory.retained_inventory_bytes()
+                        - start_bytes
+                        + 1;
+                    competing_permit = fanout.global_bytes.try_acquire(consume);
+                    assert!(competing_permit.is_some());
+                    Ok(Some(inventory))
+                })
+                .unwrap();
+            assert!(mailbox.needs_resync());
+            assert!(lock(&fanout.resync_retry_after).is_some());
+            drop(competing_permit);
+            fanout
+                .resync_with_snapshot(|_| panic!("queue capacity failure must be rate limited"))
+                .unwrap();
             fanout.shutdown().await;
         });
     }

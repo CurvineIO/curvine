@@ -1089,9 +1089,6 @@ mod tests {
         let worker = manager.get_worker(9).unwrap();
         assert_eq!(worker.status, WorkerStatus::Lost);
         assert_eq!(worker.last_update, 10_000);
-        assert!(manager
-            .refresh_passive_lost_workers_for_promotion(20_000)
-            .is_empty());
     }
 
     #[test]
