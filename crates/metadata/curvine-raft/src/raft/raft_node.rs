@@ -133,6 +133,7 @@ where
             storage.set_recovery_state(Some(id))?;
         }
         let last_applied = Self::install_snapshot(&storage, group.voters()).await?;
+        let last_snapshot_op_id = storage.get_fsm_state().op_id();
         let config = conf.new_raft_conf(id, last_applied);
         config.validate()?;
 
@@ -163,7 +164,7 @@ where
             snapshot_min_interval_ms: conf.snapshot_min_interval.as_millis(),
             snapshot_entries,
             last_snapshot_ms: LocalTime::mills(),
-            last_snapshot_op_id: 0,
+            last_snapshot_op_id,
         };
 
         Ok(node)
@@ -198,6 +199,7 @@ where
             storage.set_recovery_state(Some(id))?;
         }
 
+        let last_snapshot_op_id = storage.get_fsm_state().op_id();
         // raft basic configuration.
         let config = conf.new_raft_conf(id, 0);
         config.validate()?;
@@ -228,7 +230,7 @@ where
             snapshot_min_interval_ms: conf.snapshot_min_interval.as_millis(),
             snapshot_entries,
             last_snapshot_ms: LocalTime::mills(),
-            last_snapshot_op_id: 0,
+            last_snapshot_op_id,
         };
 
         Ok(node)
@@ -437,6 +439,7 @@ where
         promise: &mut HashMap<i64, Callback>,
     ) -> RaftResult<()> {
         result?;
+        self.anchor_snapshot_markers();
         let pending = self
             .pending_ready
             .take()
@@ -751,6 +754,7 @@ where
             let to_follower = self.role_monitor.is_leader() && !self.is_leader();
             if to_follower {
                 Self::install_snapshot(&self.storage, self.group.voters()).await?;
+                self.anchor_snapshot_markers();
             }
 
             if !self.recovery.active {
@@ -926,9 +930,18 @@ where
         });
     }
 
+    fn anchor_snapshot_markers(&mut self) {
+        self.last_snapshot_op_id = self.storage.get_fsm_state().op_id();
+        self.last_snapshot_ms = LocalTime::mills();
+    }
+
     // Whether you need to create a new snapshot.
     fn apply_create_snapshot(&mut self) -> RaftResult<()> {
         if self.is_leader() || !self.storage.can_generate_snapshot() {
+            return Ok(());
+        }
+
+        if self.snapshot_entries == 0 {
             return Ok(());
         }
 

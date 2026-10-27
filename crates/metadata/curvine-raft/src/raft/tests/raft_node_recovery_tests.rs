@@ -350,6 +350,113 @@ fn wait_for_snapshot_job(node: &RaftNode<MemLogStorage, HashAppStorage<String, S
     }
 }
 
+fn seed_applied_state(node: &RaftNode<MemLogStorage, HashAppStorage<String, String>>, op_id: u64) {
+    node.rt
+        .block_on(node.storage.app_store.apply_snapshot(SnapshotData {
+            snapshot_id: 1,
+            node_id: node.id(),
+            create_time: LocalTime::mills(),
+            bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
+            files_data: None,
+            fsm_state: FsmState {
+                applied: AppliedIndex {
+                    term: 1,
+                    index: 1,
+                    op_id,
+                    rpc_id: 0,
+                },
+                ..Default::default()
+            },
+        }))
+        .unwrap();
+}
+
+#[test]
+fn restarted_node_does_not_create_a_snapshot_from_restored_state() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone(), 1);
+
+    // A restarted or newly joined node restores op_id 100 from its snapshot or
+    // from journal replay, but this process has never created a snapshot.
+    seed_applied_state(&node, 100);
+    node.storage
+        .append(&[Entry {
+            index: 1,
+            term: 1,
+            ..Default::default()
+        }])
+        .unwrap();
+    node.storage
+        .set_hard_state(&HardState {
+            term: 1,
+            commit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+    node.snapshot_interval_ms = 6 * 60 * 60 * 1000;
+    node.snapshot_min_interval_ms = 0;
+    node.snapshot_entries = 10;
+    node.anchor_snapshot_markers();
+    let anchored_ms = node.last_snapshot_ms;
+
+    // Counting from op_id 0 would make the restored state look like a full
+    // batch of unsnapshotted entries and create a snapshot on every start.
+    node.apply_create_snapshot().unwrap();
+    assert_eq!(node.last_snapshot_op_id, 100);
+    assert_eq!(node.last_snapshot_ms, anchored_ms);
+    assert!(
+        node.storage.can_generate_snapshot(),
+        "startup must not schedule a snapshot job"
+    );
+
+    // Entries applied after the anchor still trigger a snapshot.
+    seed_applied_state(&node, 120);
+    node.apply_create_snapshot().unwrap();
+    assert_eq!(node.last_snapshot_op_id, 120);
+    wait_for_snapshot_job(&node);
+}
+
+#[test]
+fn zero_snapshot_entries_disables_follower_snapshots() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone(), 1);
+
+    seed_applied_state(&node, 100);
+    node.storage
+        .append(&[Entry {
+            index: 1,
+            term: 1,
+            ..Default::default()
+        }])
+        .unwrap();
+    node.storage
+        .set_hard_state(&HardState {
+            term: 1,
+            commit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+    node.snapshot_interval_ms = 0;
+    node.snapshot_min_interval_ms = 0;
+    node.snapshot_entries = 0;
+    node.anchor_snapshot_markers();
+    let anchored_op_id = node.last_snapshot_op_id;
+
+    seed_applied_state(&node, 200);
+    node.apply_create_snapshot().unwrap();
+
+    assert_eq!(
+        node.last_snapshot_op_id, anchored_op_id,
+        "snapshot_entries = 0 must not create a snapshot for every entry"
+    );
+    assert!(
+        node.storage.can_generate_snapshot(),
+        "no snapshot job may be scheduled when snapshot creation is disabled"
+    );
+}
+
 #[test]
 fn follower_snapshot_is_throttled_by_min_interval() {
     let rt = JournalConf::with_test().create_runtime();
@@ -396,8 +503,9 @@ fn follower_snapshot_is_throttled_by_min_interval() {
     node.snapshot_interval_ms = 0;
     node.snapshot_min_interval_ms = 10 * 60 * 1000;
     node.snapshot_entries = 1;
-    // Match the production constructors, which anchor `last_snapshot_ms` to
-    // process start; the throttle must not treat that anchor as a snapshot.
+    // Freeze the markers as if no snapshot had been recorded for the restored
+    // state: the restored op_id then counts as pending work and only the min
+    // interval can hold the next snapshot back.
     node.last_snapshot_ms = LocalTime::mills();
     node.last_snapshot_op_id = 0;
 
