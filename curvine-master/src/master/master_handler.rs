@@ -79,6 +79,15 @@ impl MasterHandler {
         msg.seq_id() == WORKER_MIRROR_SEQ_ID
     }
 
+    fn is_worker_mirror_rpc(msg: &Message, code: RpcCode) -> bool {
+        Self::is_worker_mirror_opt_in(msg)
+            && matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport)
+    }
+
+    fn active_worker_mirror_rpc_rejected(active: bool, msg: &Message, code: RpcCode) -> bool {
+        active && Self::is_worker_mirror_rpc(msg, code)
+    }
+
     fn is_follower_read_candidate(code: RpcCode) -> bool {
         matches!(
             code,
@@ -1441,14 +1450,19 @@ impl MessageHandler for MasterHandler {
         // Unified processing of all RPC requests (standby NotLeader uses the same
         // observability + error_ext conversion path as async_handle).
         let mut follower_read_snapshot = None;
-        let mut response = if !self.fs.master_monitor.is_active() {
+        let active = self.fs.master_monitor.is_active();
+        let mut response = if Self::active_worker_mirror_rpc_rejected(active, msg, code) {
+            Err(FsError::not_leader(
+                "Worker mirror RPCs are not authoritative on an active master",
+            ))
+        } else if !active {
             let readiness_snapshot = self.fs.master_monitor.follower_readiness_snapshot();
             let role = readiness_snapshot.role;
             if Self::passive_worker_rpc_allowed(
                 self.fs.conf.follower_worker_state_enabled,
                 self.fs.conf.follower_reads_enabled,
                 role,
-                Self::is_worker_mirror_opt_in(msg),
+                Self::is_worker_mirror_rpc(msg, code),
                 code,
             ) {
                 match code {
@@ -1697,6 +1711,46 @@ mod tests {
             curvine_raft::raft::RoleState::Leader,
             true,
             RpcCode::WorkerBlockReport
+        ));
+    }
+
+    #[test]
+    fn active_master_rejects_marked_worker_mirror_requests() {
+        let marked_heartbeat = Builder::new_rpc(RpcCode::WorkerHeartbeat as i8)
+            .seq_id(WORKER_MIRROR_SEQ_ID)
+            .build();
+        let marked_report = Builder::new_rpc(RpcCode::WorkerBlockReport as i8)
+            .seq_id(WORKER_MIRROR_SEQ_ID)
+            .build();
+        let unmarked_heartbeat = Builder::new_rpc(RpcCode::WorkerHeartbeat as i8).build();
+        let marked_mutation = Builder::new_rpc(RpcCode::Mkdir as i8)
+            .seq_id(WORKER_MIRROR_SEQ_ID)
+            .build();
+
+        assert!(MasterHandler::active_worker_mirror_rpc_rejected(
+            true,
+            &marked_heartbeat,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(MasterHandler::active_worker_mirror_rpc_rejected(
+            true,
+            &marked_report,
+            RpcCode::WorkerBlockReport
+        ));
+        assert!(!MasterHandler::active_worker_mirror_rpc_rejected(
+            true,
+            &unmarked_heartbeat,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(!MasterHandler::active_worker_mirror_rpc_rejected(
+            false,
+            &marked_heartbeat,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(!MasterHandler::active_worker_mirror_rpc_rejected(
+            true,
+            &marked_mutation,
+            RpcCode::Mkdir
         ));
     }
 

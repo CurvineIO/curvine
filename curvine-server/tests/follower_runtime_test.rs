@@ -29,7 +29,9 @@ use curvine_proto::{
 };
 use curvine_raft::raft::RaftPeer;
 use curvine_rpc::client::RpcClient;
-use curvine_rpc::message::{Message, MessageBuilder, FOLLOWER_READ_SEQ_ID, INIT_SEQ_ID};
+use curvine_rpc::message::{
+    Message, MessageBuilder, FOLLOWER_READ_SEQ_ID, INIT_SEQ_ID, WORKER_MIRROR_SEQ_ID,
+};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use daemon::{Daemon, TestDirectory};
 use prost::Message as ProtoMessage;
@@ -119,15 +121,32 @@ async fn direct<T: ProtoMessage + std::fmt::Debug>(
     header: T,
     follower: bool,
 ) -> Message {
+    direct_with_seq(
+        conf,
+        index,
+        code,
+        header,
+        if follower {
+            FOLLOWER_READ_SEQ_ID
+        } else {
+            INIT_SEQ_ID
+        },
+    )
+    .await
+}
+
+async fn direct_with_seq<T: ProtoMessage + std::fmt::Debug>(
+    conf: &ClusterConf,
+    index: usize,
+    code: RpcCode,
+    header: T,
+    seq_id: i32,
+) -> Message {
     let rpc = RpcClient::with_raw(&conf.client.master_addrs[index], &conf.client_rpc_conf())
         .await
         .unwrap();
     let request = MessageBuilder::new_rpc(code)
-        .seq_id(if follower {
-            FOLLOWER_READ_SEQ_ID
-        } else {
-            INIT_SEQ_ID
-        })
+        .seq_id(seq_id)
         .proto_header(header)
         .build();
     rpc.timeout_rpc(Duration::from_secs(3), request)
@@ -275,6 +294,54 @@ fn run_cluster(mirror_reports: bool) {
             assert!(Instant::now() < deadline, "worker did not register");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+
+        let registered_worker = fs
+            .get_filesystem_info()
+            .await
+            .unwrap()
+            .live_workers
+            .into_iter()
+            .next()
+            .unwrap();
+        let worker_id = registered_worker.address.worker_id;
+        let marked_end = WorkerHeartbeatRequest {
+            cluster_id: confs[0].cluster_id.clone(),
+            worker_id,
+            fs_ctime: registered_worker.startup_time_ms as i64,
+            address: ProtoUtils::worker_address_to_pb(&registered_worker.address),
+            failed_dirs: 0,
+            status: HeartbeatStatus::End.into(),
+            software_version: registered_worker.software_version.clone(),
+            weight: Some(registered_worker.weight),
+            worker_session_id: Some(registered_worker.worker_session_id.clone()),
+            component_info: registered_worker.component_info.clone(),
+            ..Default::default()
+        };
+        let marked_response = direct_with_seq(
+            &confs[0],
+            leader_index,
+            RpcCode::WorkerHeartbeat,
+            marked_end,
+            WORKER_MIRROR_SEQ_ID,
+        )
+        .await;
+        assert!(
+            !marked_response.is_success(),
+            "active master accepted a marked mirror heartbeat as authoritative"
+        );
+        let after_marked_mirror = direct(
+            &confs[0],
+            leader_index,
+            RpcCode::GetFilesystemInfo,
+            GetFilesystemInfoRequest::default(),
+            false,
+        )
+        .await;
+        assert!(
+            response_has_live_worker(&after_marked_mirror, worker_id),
+            "rejected mirror heartbeat changed the active worker registration"
+        );
+
         let path = Path::from_str("/follower-file").unwrap();
         fs.write_string(&path, "passive follower locations")
             .await
