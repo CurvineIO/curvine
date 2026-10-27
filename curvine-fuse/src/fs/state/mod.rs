@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod node_state;
-pub use self::node_state::NodeState;
+pub use self::node_state::{EvictStats, NodeState};
 
 mod file_handle;
 pub use self::file_handle::*;
@@ -23,3 +23,6 @@ pub use self::dir_handle::DirHandle;
 
 mod backend_handle;
 pub use self::backend_handle::BackendHandle;
+
+mod dir_tree_lock;
+pub use self::dir_tree_lock::{DirTreeLock, DirTreeReadGuard, DirTreeWriteGuard};

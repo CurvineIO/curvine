@@ -17,7 +17,7 @@ use crate::master::journal::{JournalEntry, JournalWriter};
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
-use crate::master::meta::store::{InodeStore, RocksInodeStore};
+use crate::master::meta::store::{InodeStore, PurgeItem, PurgeTarget, RocksInodeStore};
 use crate::master::meta::{trash, BlockMeta, InodeId};
 use crate::master::quota::eviction::evictor::Evictor;
 use curvine_config::ClusterConf;
@@ -67,6 +67,19 @@ impl CacheInvalidationResult {
         self.invalidated_block_ids
             .extend(other.invalidated_block_ids);
     }
+}
+
+// One path claimed by a purge batch. Kept until the store batch commits so the
+// in-memory tree can be updated with the same state that was persisted.
+// The claimed child is not kept as a pointer: `InodePath::resolve` hydrates a
+// terminal `FileEntry` into an owned inode that is freed when the path drops.
+struct PurgeClaim {
+    parent: InodePtr,
+    child_id: i64,
+    name: String,
+    expired: bool,
+    is_dir: bool,
+    dir_meta: Option<InodeView>,
 }
 
 // One page of a trash listing. `next` is the sort key of the last scanned
@@ -376,33 +389,127 @@ impl FsDir {
 
     /// Removes the given paths without journaling one record per path.
     ///
-    /// The trash purger supplies leaf-first batches, so each call stays bounded
-    /// even when the trashed entry holds millions of inodes. Paths that no
-    /// longer resolve are skipped, which makes a replayed or partially applied
-    /// batch idempotent: the remaining paths of a failed batch are simply
-    /// retried by the next cycle.
+    /// The trash purger supplies bounded, leaf-first batches, so every listed
+    /// path is a file or a directory the earlier paths of the same batch empty.
+    /// The whole batch is staged in one store write batch: either all listed
+    /// paths are removed or none is, so a failure never leaves paths durable
+    /// without the block locations they returned.
+    ///
+    /// Paths that no longer resolve are skipped, which keeps a replayed batch
+    /// idempotent. A directory that still holds children after the paths
+    /// already claimed in this batch is skipped as well, so a purge never
+    /// removes inodes the batch did not list.
     pub fn purge_paths(&mut self, paths: &[String], mtime: i64) -> FsResult<DeleteResult> {
-        let mut total = DeleteResult::new();
+        let mut claims: Vec<PurgeClaim> = Vec::new();
+        // (parent id, name) pairs already claimed, so a duplicated path is not
+        // counted twice.
+        let mut claimed: HashSet<(i64, String)> = HashSet::new();
+        // Children claimed per directory: a later directory entry in the same
+        // batch is empty once these paths are gone.
+        let mut pending: HashMap<i64, HashSet<String>> = HashMap::new();
+        // Parent metadata staged once per directory, with this batch's mtime
+        // and nlink updates applied.
+        let mut parents: HashMap<i64, InodeView> = HashMap::new();
 
         for path in paths {
-            let inp = match InodePath::resolve(self.root_ptr(), path, &self.store) {
-                Ok(inp) => inp,
-                Err(e) => {
-                    debug!("purge: skip unresolvable path {}: {}", path, e);
-                    continue;
-                }
-            };
+            // A missing path resolves to a truncated InodePath and is skipped
+            // below; an error here is a store failure, not a missing path, and
+            // must fail replay instead of advancing past an undeleted inode.
+            let inp = InodePath::resolve(self.root_ptr(), path, &self.store)?;
 
-            // The entry may have been restored, emptied or purged already.
-            if inp.is_empty() || inp.get_last_inode().is_none() {
+            let Some(child) = inp.get_last_inode() else {
                 debug!("purge: skip vanished path {}", path);
+                continue;
+            };
+            let Some(parent) = inp.get_inode(-2) else {
+                return err_box!("purge: path {} has no parent directory", path);
+            };
+            let name = inp.name().to_string();
+            if claimed.contains(&(parent.id(), name.clone())) {
                 continue;
             }
 
-            let res = self.unprotected_delete(&inp, mtime)?;
-            total.inodes += res.inodes;
-            total.bytes += res.bytes;
-            total.blocks.extend(res.blocks);
+            let is_dir = child.as_ref().is_dir();
+            if let Dir(dir) = child.as_ref() {
+                let removed = pending.get(&child.id()).map_or(0, HashSet::len);
+                if dir.children_len() > removed {
+                    warn!(
+                        "purge: skip non-empty directory {} ({} unlisted children)",
+                        path,
+                        dir.children_len() - removed
+                    );
+                    continue;
+                }
+            }
+
+            let parent_meta = parents
+                .entry(parent.id())
+                .or_insert_with(|| parent.as_ref().clone_metadata());
+            let expired = matches!(parent_meta.expiration_ms(), Ok(Some(exp)) if mtime > exp);
+            if !expired {
+                parent_meta.update_mtime(mtime);
+            }
+            if is_dir {
+                parent_meta.dec_nlink(mtime);
+            }
+
+            let dir_meta = if is_dir {
+                Some(child.as_ref().clone_metadata())
+            } else {
+                None
+            };
+
+            claimed.insert((parent.id(), name.clone()));
+            pending.entry(parent.id()).or_default().insert(name.clone());
+            claims.push(PurgeClaim {
+                parent,
+                child_id: child.id(),
+                name,
+                expired,
+                is_dir,
+                dir_meta,
+            });
+        }
+
+        if claims.is_empty() {
+            return Ok(DeleteResult::new());
+        }
+
+        let items = claims
+            .iter()
+            .map(|claim| PurgeItem {
+                parent: parents[&claim.parent.id()].clone_metadata(),
+                target: match claim.dir_meta {
+                    Some(ref dir) => PurgeTarget::Dir(dir.clone()),
+                    None => PurgeTarget::File(claim.child_id),
+                },
+                name: claim.name.clone(),
+            })
+            .collect();
+
+        // The store batch is the only durable change; the in-memory tree and
+        // file counts are published only after it commits.
+        let total = self.store.apply_purge(items, mtime)?;
+
+        for claim in claims {
+            let parent = claim.parent.as_mut();
+            // Re-read the live child: a hydrated `FileEntry` copy was already
+            // freed with its InodePath, and only a tree-resident file inode
+            // holds the shared nlink.
+            if let Some(child) = parent.get_child_ptr(&claim.name) {
+                // Files keep their shared inode when other names still link to it.
+                if matches!(child.as_ref(), File(f) if f.nlink() > 1) {
+                    child.as_mut().dec_nlink(mtime);
+                }
+            }
+
+            if !claim.expired {
+                parent.update_mtime(mtime);
+            }
+            if claim.is_dir {
+                parent.dec_nlink(mtime);
+            }
+            let _ = parent.delete_child(claim.child_id, &claim.name)?;
         }
 
         Ok(total)
