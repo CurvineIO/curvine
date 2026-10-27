@@ -16,6 +16,7 @@ use curvine_model::BlockReportList;
 use log::warn;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// How long a partial session or a completed round is remembered.
@@ -27,7 +28,7 @@ struct Session {
     total_len: u64,
     update_time_ms: u64,
     reported_blocks: HashSet<i64>,
-    invalidated: bool,
+    inventory_slot: Option<ReportInventorySlot>,
 }
 
 /// The last round whose completing batch was accepted for a worker.
@@ -39,17 +40,74 @@ struct Round {
     done: bool,
 }
 
+/// Reserves one bounded full-report inventory from its first batch through
+/// reconciliation. The slot moves from Session into the completed inventory,
+/// which remains owned by the asynchronous job until it finishes.
+struct ReportInventorySlot(Arc<AtomicUsize>);
+
+impl ReportInventorySlot {
+    fn try_acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self(counter.clone())),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for ReportInventorySlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A completed inventory keeps its bounded slot while it is owned by an async
+/// reconcile job, including after a worker restart invalidates tracker state.
+pub(super) struct FullReportInventory {
+    blocks: HashSet<i64>,
+    inventory_slot: Option<ReportInventorySlot>,
+}
+
+impl FullReportInventory {
+    pub(super) fn blocks(&self) -> &HashSet<i64> {
+        &self.blocks
+    }
+
+    pub(super) fn into_blocks(self) -> HashSet<i64> {
+        self.blocks
+    }
+
+    pub(super) fn without_slot(blocks: HashSet<i64>) -> Self {
+        Self {
+            blocks,
+            inventory_slot: None,
+        }
+    }
+}
+
 /// Outcome of folding one full report batch into the master's state.
 pub(super) enum FullReportProgress {
     /// Incremental report, or a full report that is still missing batches.
     Partial,
     /// The batch completed the report; holds every reported block id. The caller
     /// must call `finish` or `abort` once it has processed the report.
-    Complete(HashSet<i64>),
+    Complete(FullReportInventory),
     /// The batch belongs to a round that was already processed successfully.
     Duplicate,
     /// The batch belongs to a round whose completing batch is still being processed.
     InFlight,
+    /// The tracker has reached its configured limit of retained report inventories.
+    CapacityExceeded,
 }
 
 #[derive(Default)]
@@ -65,12 +123,32 @@ struct State {
 /// the response to the completing batch is lost the worker resends it, so a round
 /// that was processed is remembered and its resent batches are ignored.
 /// Workers that send no `report_id` (0) keep the accumulate-only behavior.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct FullReportTracker {
     state: Arc<Mutex<State>>,
+    max_inflight_inventories: Option<usize>,
+    inflight_inventories: Arc<AtomicUsize>,
+}
+
+impl Default for FullReportTracker {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(State::default())),
+            max_inflight_inventories: None,
+            inflight_inventories: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 impl FullReportTracker {
+    pub(super) fn with_inventory_limit(limit: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(State::default())),
+            max_inflight_inventories: Some(limit),
+            inflight_inventories: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
     pub(super) fn collect(&self, list: &BlockReportList, now: u64) -> FullReportProgress {
         if !list.full_report {
             return FullReportProgress::Partial;
@@ -78,9 +156,9 @@ impl FullReportTracker {
 
         let mut guard = self.state.lock();
         let state = &mut *guard;
-        state
-            .rounds
-            .retain(|_, round| now.saturating_sub(round.time_ms) <= FULL_BLOCK_REPORT_TTL_MS);
+        state.rounds.retain(|_, round| {
+            !round.done || now.saturating_sub(round.time_ms) <= FULL_BLOCK_REPORT_TTL_MS
+        });
         state.sessions.retain(|_, session| {
             now.saturating_sub(session.update_time_ms) <= FULL_BLOCK_REPORT_TTL_MS
         });
@@ -111,19 +189,33 @@ impl FullReportTracker {
         {
             sessions.remove(&list.worker_id);
         }
-        // A prior incremental report may have invalidated the session. Drop it so
-        // this full report can start a fresh accumulation instead of being ignored.
-        if sessions.get(&list.worker_id).is_some_and(|s| s.invalidated) {
-            sessions.remove(&list.worker_id);
+        if !sessions.contains_key(&list.worker_id) {
+            let inventory_slot = match self.max_inflight_inventories {
+                Some(limit) => {
+                    match ReportInventorySlot::try_acquire(&self.inflight_inventories, limit) {
+                        Some(slot) => Some(slot),
+                        None => return FullReportProgress::CapacityExceeded,
+                    }
+                }
+                None => None,
+            };
+
+            sessions.insert(
+                list.worker_id,
+                Session {
+                    report_id: list.report_id,
+                    total_len: list.total_len,
+                    update_time_ms: now,
+                    // Avoid trusting the worker's total_len as an allocation
+                    // hint. The bounded slot limits concurrent inventories;
+                    // gradual growth follows the actual received block ids.
+                    reported_blocks: HashSet::with_capacity((list.total_len as usize).min(4096)),
+                    inventory_slot,
+                },
+            );
         }
 
-        let session = sessions.entry(list.worker_id).or_insert_with(|| Session {
-            report_id: list.report_id,
-            total_len: list.total_len,
-            update_time_ms: now,
-            reported_blocks: HashSet::with_capacity(list.total_len as usize),
-            invalidated: false,
-        });
+        let session = sessions.get_mut(&list.worker_id).expect("session inserted");
 
         if session.total_len != list.total_len {
             warn!(
@@ -135,8 +227,9 @@ impl FullReportTracker {
             );
             session.total_len = list.total_len;
             session.reported_blocks.clear();
-            session.reported_blocks.reserve(list.total_len as usize);
-            session.invalidated = false;
+            session
+                .reported_blocks
+                .reserve((list.total_len as usize).min(4096));
         }
         session.update_time_ms = now;
 
@@ -150,17 +243,18 @@ impl FullReportTracker {
 
         match sessions.remove(&list.worker_id) {
             Some(session) => {
-                if list.report_id != 0 {
-                    rounds.insert(
-                        list.worker_id,
-                        Round {
-                            report_id: list.report_id,
-                            time_ms: now,
-                            done: false,
-                        },
-                    );
-                }
-                FullReportProgress::Complete(session.reported_blocks)
+                rounds.insert(
+                    list.worker_id,
+                    Round {
+                        report_id: list.report_id,
+                        time_ms: now,
+                        done: false,
+                    },
+                );
+                FullReportProgress::Complete(FullReportInventory {
+                    blocks: session.reported_blocks,
+                    inventory_slot: session.inventory_slot,
+                })
             }
             None => FullReportProgress::Partial,
         }
@@ -168,9 +262,6 @@ impl FullReportTracker {
 
     /// The completing batch was processed successfully.
     pub(super) fn finish(&self, worker_id: u32, report_id: u64, now: u64) {
-        if report_id == 0 {
-            return;
-        }
         if let Some(round) = self.state.lock().rounds.get_mut(&worker_id) {
             if round.report_id == report_id {
                 round.done = true;
@@ -186,25 +277,32 @@ impl FullReportTracker {
         worker_id: u32,
         report_id: u64,
         total_len: u64,
-        blocks: HashSet<i64>,
+        inventory: FullReportInventory,
         now: u64,
     ) {
         let mut state = self.state.lock();
-        if report_id != 0
-            && state
-                .rounds
-                .get(&worker_id)
-                .is_some_and(|r| r.report_id == report_id && !r.done)
+        let matching_round = if state
+            .rounds
+            .get(&worker_id)
+            .is_some_and(|r| r.report_id == report_id && !r.done)
         {
-            state.rounds.remove(&worker_id);
-        }
+            state.rounds.remove(&worker_id).is_some()
+        } else {
+            false
+        };
+        let inventory_slot = if matching_round {
+            inventory.inventory_slot
+        } else {
+            None
+        };
+        let reported_blocks = inventory.blocks;
         // Do not clobber a session the worker already opened for a newer round.
         state.sessions.entry(worker_id).or_insert(Session {
             report_id,
             total_len,
             update_time_ms: now,
-            reported_blocks: blocks,
-            invalidated: false,
+            reported_blocks,
+            inventory_slot,
         });
     }
 
@@ -213,7 +311,7 @@ impl FullReportTracker {
         state
             .rounds
             .get(&worker_id)
-            .filter(|r| r.done)
+            .filter(|r| r.done && r.report_id != 0)
             .map(|r| r.report_id)
     }
 
@@ -247,12 +345,13 @@ impl FullReportTracker {
     /// blocks accumulated so far can no longer be trusted.
     pub(super) fn invalidate_session(&self, worker_id: u32, now: u64) {
         let mut state = self.state.lock();
-        // Only invalidate an in-flight session. Inserting a stub invalidated
-        // entry would make the next full report return Partial forever.
-        if let Some(session) = state.sessions.get_mut(&worker_id) {
-            session.update_time_ms = now;
-            session.reported_blocks.clear();
-            session.invalidated = true;
+        // Drop an in-flight inventory immediately. The next full report must
+        // start clean, and a bounded tracker must not reserve capacity for a
+        // snapshot that can no longer complete.
+        if state.sessions.get(&worker_id).is_some_and(|session| {
+            now.saturating_sub(session.update_time_ms) <= FULL_BLOCK_REPORT_TTL_MS
+        }) {
+            state.sessions.remove(&worker_id);
         }
     }
 }
@@ -281,8 +380,12 @@ mod tests {
     }
 
     fn complete(progress: FullReportProgress) -> HashSet<i64> {
+        complete_inventory(progress).into_blocks()
+    }
+
+    fn complete_inventory(progress: FullReportProgress) -> FullReportInventory {
         match progress {
-            FullReportProgress::Complete(blocks) => blocks,
+            FullReportProgress::Complete(inventory) => inventory,
             _ => panic!("expected the report to complete"),
         }
     }
@@ -329,7 +432,7 @@ mod tests {
         let blocks = complete(tracker.collect(&batch(1, 7, 3, &[3]), T0));
 
         // Reconcile submission or the metadata write failed.
-        tracker.abort(1, 7, 3, blocks, T0);
+        tracker.abort(1, 7, 3, FullReportInventory::without_slot(blocks), T0);
 
         // The resend must complete the round again with every block, not just
         // the resent batch, and must not be acknowledged as a duplicate.
@@ -349,7 +452,7 @@ mod tests {
         let blocks = complete(tracker.collect(&batch(1, 7, 1, &[1]), T0));
         // The worker already started round 8 while round 7 was being processed.
         tracker.collect(&batch(1, 8, 2, &[10]), T0);
-        tracker.abort(1, 7, 1, blocks, T0);
+        tracker.abort(1, 7, 1, FullReportInventory::without_slot(blocks), T0);
 
         let blocks = complete(tracker.collect(&batch(1, 8, 2, &[11]), T0));
         assert_eq!(blocks, HashSet::from([10, 11]));
@@ -399,6 +502,66 @@ mod tests {
         complete(tracker.collect(&batch(1, 7, 1, &[1]), T0));
         tracker.finish(1, 7, T0);
         complete(tracker.collect(&batch(2, 7, 1, &[1]), T0));
+    }
+
+    #[test]
+    fn bounded_inventory_slots_cover_partial_and_reconciling_reports() {
+        let tracker = FullReportTracker::with_inventory_limit(1);
+        assert!(matches!(
+            tracker.collect(&batch(1, 7, 2, &[1]), T0),
+            FullReportProgress::Partial
+        ));
+        assert!(matches!(
+            tracker.collect(&batch(2, 8, 1, &[2]), T0),
+            FullReportProgress::CapacityExceeded
+        ));
+
+        let inventory = complete_inventory(tracker.collect(&batch(1, 7, 2, &[3]), T0));
+        assert!(matches!(
+            tracker.collect(&batch(2, 8, 1, &[2]), T0),
+            FullReportProgress::CapacityExceeded
+        ));
+        tracker.finish(1, 7, T0);
+        drop(inventory);
+        assert!(matches!(
+            tracker.collect(&batch(2, 8, 1, &[2]), T0),
+            FullReportProgress::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn bounded_inventory_abort_keeps_the_slot_for_a_retry() {
+        let tracker = FullReportTracker::with_inventory_limit(1);
+        let inventory = complete_inventory(tracker.collect(&batch(1, 7, 1, &[1]), T0));
+        tracker.abort(1, 7, 1, inventory, T0);
+
+        assert!(matches!(
+            tracker.collect(&batch(2, 8, 1, &[2]), T0),
+            FullReportProgress::CapacityExceeded
+        ));
+        let inventory = complete_inventory(tracker.collect(&batch(1, 7, 1, &[1]), T0));
+        assert_eq!(inventory.blocks(), &HashSet::from([1]));
+        tracker.finish(1, 7, T0);
+        drop(inventory);
+        assert!(matches!(
+            tracker.collect(&batch(2, 8, 1, &[2]), T0),
+            FullReportProgress::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn bounded_inventory_slot_covers_reports_without_an_id() {
+        let tracker = FullReportTracker::with_inventory_limit(1);
+        let inventory = complete_inventory(tracker.collect(&batch(1, 0, 1, &[1]), T0));
+        assert!(matches!(
+            tracker.collect(&batch(2, 8, 1, &[2]), T0),
+            FullReportProgress::CapacityExceeded
+        ));
+        drop(inventory);
+        assert!(matches!(
+            tracker.collect(&batch(2, 8, 1, &[2]), T0),
+            FullReportProgress::Complete(_)
+        ));
     }
 
     #[test]

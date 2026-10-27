@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_model::StorageType;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -42,6 +42,11 @@ struct State {
     /// The worker must complete another full report before its locations can be
     /// used, for example after a bounded-queue overflow.
     needs_full_report: HashSet<u32>,
+    /// Current asynchronous full-report reconciliation generation per worker.
+    reconcile_generations: HashMap<u32, u64>,
+    /// Workers whose report inventory is being reconciled outside the report lock.
+    reconcile_pending: HashSet<u32>,
+    next_reconcile_generation: u64,
 }
 
 impl State {
@@ -92,13 +97,17 @@ impl FollowerBlockReadiness<'_> {
 /// Local follower location-view state. These rows are soft state and are never
 /// journaled or allowed to trigger worker commands or replication work.
 #[derive(Clone, Default)]
-pub(super) struct FollowerBlockReportState(Arc<Mutex<State>>);
+pub(super) struct FollowerBlockReportState(Arc<RwLock<State>>);
 
 impl FollowerBlockReportState {
+    pub(super) fn has_term(&self, term: u64) -> bool {
+        self.0.read().term == Some(term)
+    }
+
     /// A new Raft term is a new passive worker-view epoch. Discard report state
     /// from the previous leader before accepting or serving this term's view.
     pub(super) fn reset_for_term(&self, term: u64) -> Vec<u32> {
-        let mut state = self.0.lock();
+        let mut state = self.0.write();
         if state.term == Some(term) {
             return Vec::new();
         }
@@ -108,14 +117,18 @@ impl FollowerBlockReportState {
         state.deferred_by_block.clear();
         state.needs_full_report.clear();
         state.needs_full_report.extend(workers.iter().copied());
+        state.reconcile_generations.clear();
+        state.reconcile_pending.clear();
         state.term = Some(term);
         workers
     }
 
     pub(super) fn observe_worker(&self, worker_id: u32, restarted: bool) {
-        let mut state = self.0.lock();
+        let mut state = self.0.write();
         state.workers.insert(worker_id);
         if restarted {
+            Self::bump_reconcile_generation(&mut state, worker_id);
+            state.reconcile_pending.remove(&worker_id);
             state.retain_deferred(|id, _| id != worker_id);
             state.needs_full_report.remove(&worker_id);
             state.full_report_complete.remove(&worker_id);
@@ -123,7 +136,10 @@ impl FollowerBlockReportState {
     }
 
     pub(super) fn forget_worker(&self, worker_id: u32) {
-        let mut state = self.0.lock();
+        let mut state = self.0.write();
+        Self::bump_reconcile_generation(&mut state, worker_id);
+        state.reconcile_generations.remove(&worker_id);
+        state.reconcile_pending.remove(&worker_id);
         state.workers.remove(&worker_id);
         state.full_report_complete.remove(&worker_id);
         state.needs_full_report.remove(&worker_id);
@@ -131,8 +147,12 @@ impl FollowerBlockReportState {
     }
 
     pub(super) fn retain_workers(&self, worker_ids: &HashSet<u32>) -> Vec<u32> {
-        let mut state = self.0.lock();
+        let mut state = self.0.write();
         let removed: Vec<u32> = state.workers.difference(worker_ids).copied().collect();
+        for worker_id in &removed {
+            state.reconcile_generations.remove(worker_id);
+            state.reconcile_pending.remove(worker_id);
+        }
         state
             .workers
             .retain(|worker_id| worker_ids.contains(worker_id));
@@ -149,7 +169,7 @@ impl FollowerBlockReportState {
     /// Enqueue or replace one unresolved add. Replacing the same worker/block
     /// pair keeps the queue bounded and preserves the latest worker report.
     pub(super) fn defer(&self, report: DeferredBlockReport) -> bool {
-        let mut state = self.0.lock();
+        let mut state = self.0.write();
         let key = (report.worker_id, report.block_id);
         if !state.deferred.contains_key(&key)
             && state.deferred.len() >= MAX_DEFERRED_FOLLOWER_REPORTS
@@ -173,18 +193,18 @@ impl FollowerBlockReportState {
     }
 
     pub(super) fn remove_deferred(&self, worker_id: u32, block_id: i64) {
-        self.0.lock().remove_deferred(worker_id, block_id);
+        self.0.write().remove_deferred(worker_id, block_id);
     }
 
     /// Remove stale entries for a worker after its full report completes.
     pub(super) fn retain_reported_blocks(&self, worker_id: u32, reported: &HashSet<i64>) {
         self.0
-            .lock()
+            .write()
             .retain_deferred(|id, block_id| id != worker_id || reported.contains(&block_id));
     }
 
     pub(super) fn deferred_snapshot(&self) -> Vec<DeferredBlockReport> {
-        self.0.lock().deferred.values().copied().collect()
+        self.0.read().deferred.values().copied().collect()
     }
 
     pub(super) fn mark_deferred_resolved(&self, worker_id: u32, block_id: i64) {
@@ -192,7 +212,7 @@ impl FollowerBlockReportState {
     }
 
     pub(super) fn mark_full_report_complete(&self, worker_id: u32) {
-        let mut state = self.0.lock();
+        let mut state = self.0.write();
         state.workers.insert(worker_id);
         state.needs_full_report.remove(&worker_id);
         state.full_report_complete.insert(worker_id);
@@ -202,14 +222,75 @@ impl FollowerBlockReportState {
     /// report has been completely applied. This also fails closed if a report
     /// batch errors after applying only part of its location updates.
     pub(super) fn require_full_report(&self, worker_id: u32) {
-        let mut state = self.0.lock();
+        let mut state = self.0.write();
         state.workers.insert(worker_id);
         state.full_report_complete.remove(&worker_id);
         state.needs_full_report.insert(worker_id);
     }
 
+    fn bump_reconcile_generation(state: &mut State, worker_id: u32) -> u64 {
+        state.next_reconcile_generation = state.next_reconcile_generation.saturating_add(1);
+        let generation = state.next_reconcile_generation;
+        state.reconcile_generations.insert(worker_id, generation);
+        generation
+    }
+
+    pub(super) fn begin_reconcile(&self, worker_id: u32) -> u64 {
+        let mut state = self.0.write();
+        state.workers.insert(worker_id);
+        let generation = Self::bump_reconcile_generation(&mut state, worker_id);
+        state.reconcile_pending.insert(worker_id);
+        generation
+    }
+
+    pub(super) fn reconcile_pending(&self, worker_id: u32) -> bool {
+        self.0.read().reconcile_pending.contains(&worker_id)
+    }
+
+    pub(super) fn reconcile_is_current(&self, worker_id: u32, generation: u64) -> bool {
+        let state = self.0.read();
+        state.reconcile_pending.contains(&worker_id)
+            && state.reconcile_generations.get(&worker_id) == Some(&generation)
+    }
+
+    /// Complete a fenced reconciliation and expose the worker to follower
+    /// reads only after every stale location has been removed successfully.
+    pub(super) fn finish_reconcile(
+        &self,
+        worker_id: u32,
+        generation: u64,
+        reported: &HashSet<i64>,
+    ) -> bool {
+        let mut state = self.0.write();
+        if !state.reconcile_pending.contains(&worker_id)
+            || state.reconcile_generations.get(&worker_id) != Some(&generation)
+        {
+            return false;
+        }
+        state.retain_deferred(|id, block_id| id != worker_id || reported.contains(&block_id));
+        state.reconcile_pending.remove(&worker_id);
+        state.needs_full_report.remove(&worker_id);
+        state.full_report_complete.insert(worker_id);
+        true
+    }
+
+    /// Leave a failed reconciliation unreadable. The caller resets the report
+    /// tracker so the next Running heartbeat requests a fresh full report.
+    pub(super) fn fail_reconcile(&self, worker_id: u32, generation: u64) -> bool {
+        let mut state = self.0.write();
+        if !state.reconcile_pending.contains(&worker_id)
+            || state.reconcile_generations.get(&worker_id) != Some(&generation)
+        {
+            return false;
+        }
+        state.reconcile_pending.remove(&worker_id);
+        state.full_report_complete.remove(&worker_id);
+        state.needs_full_report.insert(worker_id);
+        true
+    }
+
     pub(super) fn requires_full_report(&self, worker_id: u32) -> bool {
-        let state = self.0.lock();
+        let state = self.0.read();
         !state.full_report_complete.contains(&worker_id)
             || state.needs_full_report.contains(&worker_id)
     }
@@ -218,7 +299,7 @@ impl FollowerBlockReportState {
         &self,
         check: impl FnOnce(&FollowerBlockReadiness<'_>) -> T,
     ) -> T {
-        let state = self.0.lock();
+        let state = self.0.read();
         check(&FollowerBlockReadiness(&state))
     }
 
@@ -234,7 +315,7 @@ impl FollowerBlockReportState {
 
     #[cfg(test)]
     pub(super) fn is_ready(&self) -> bool {
-        let state = self.0.lock();
+        let state = self.0.read();
         state.deferred.is_empty()
             && state.needs_full_report.is_empty()
             && state
@@ -245,7 +326,7 @@ impl FollowerBlockReportState {
 
     #[cfg(test)]
     pub(super) fn deferred_len(&self) -> usize {
-        self.0.lock().deferred.len()
+        self.0.read().deferred.len()
     }
 }
 
