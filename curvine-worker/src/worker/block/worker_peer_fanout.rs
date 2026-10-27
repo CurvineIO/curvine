@@ -230,7 +230,8 @@ pub(crate) struct WorkerPeerFanout {
     global_bytes: Arc<GlobalByteBudget>,
     rpc_semaphore: Arc<Semaphore>,
     omitted_peers: Mutex<HashSet<u64>>,
-    publication_gate: Mutex<()>,
+    publication_gate: Mutex<u64>,
+    resync_building: Arc<AtomicBool>,
     resync_retry_after: Mutex<Option<Instant>>,
     initial_full_report_active: AtomicBool,
     shutdown: AtomicBool,
@@ -261,6 +262,8 @@ struct PeerMailboxState {
     needs_resync: bool,
     resync_in_progress: bool,
     resync_generation: u64,
+    retry_after: Option<Instant>,
+    failures: u32,
 }
 
 struct QueuedRequest {
@@ -374,7 +377,8 @@ impl WorkerPeerFanout {
             global_bytes: GlobalByteBudget::new(config.queued_bytes_max),
             rpc_semaphore: Arc::new(Semaphore::new(config.max_concurrency)),
             omitted_peers: Mutex::new(HashSet::new()),
-            publication_gate: Mutex::new(()),
+            publication_gate: Mutex::new(0),
+            resync_building: Arc::new(AtomicBool::new(false)),
             resync_retry_after: Mutex::new(None),
             initial_full_report_active: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
@@ -388,8 +392,11 @@ impl WorkerPeerFanout {
         if self.shutdown.load(Ordering::Acquire) {
             return;
         }
-        let _publication = (HeartbeatStatus::from(request.status) == HeartbeatStatus::Start)
+        let mut publication = (HeartbeatStatus::from(request.status) == HeartbeatStatus::Start)
             .then(|| lock(&self.publication_gate));
+        if let Some(generation) = publication.as_mut() {
+            **generation = generation.wrapping_add(1);
+        }
         match HeartbeatStatus::from(request.status) {
             HeartbeatStatus::Start => self.remember_latest_start(request.clone()),
             HeartbeatStatus::Running => self.has_running.store(true, Ordering::Release),
@@ -436,7 +443,8 @@ impl WorkerPeerFanout {
         if self.shutdown.load(Ordering::Acquire) {
             return;
         }
-        let _publication = lock(&self.publication_gate);
+        let mut publication = lock(&self.publication_gate);
+        *publication = publication.wrapping_add(1);
         let Some(leader_id) = self.transport.master_peer_leader_id() else {
             return;
         };
@@ -480,6 +488,33 @@ impl WorkerPeerFanout {
     /// Oversized inventories leave peers stale; follower reads then fall back
     /// to the leader. Capacity failures are retried at the configured maximum
     /// retry interval to avoid repeatedly rebuilding the inventory.
+    pub(crate) fn schedule_resync<F>(
+        self: &Arc<Self>,
+        executor: &curvine_runtime::runtime::GroupExecutor,
+        build_reports: F,
+    ) -> CommonResult<()>
+    where
+        F: FnOnce(usize) -> CommonResult<Option<FullReportSnapshot>> + Send + 'static,
+    {
+        if self.resync_building.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        struct BuildGuard(Arc<AtomicBool>);
+        impl Drop for BuildGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let guard = BuildGuard(self.resync_building.clone());
+        let fanout = self.clone();
+        executor.try_spawn(move || {
+            let _guard = guard;
+            if let Err(error) = fanout.resync_with_snapshot(build_reports) {
+                warn!("build follower worker full report failed: {}", error);
+            }
+        })
+    }
+
     pub(crate) fn resync_with_snapshot<F>(&self, build_reports: F) -> CommonResult<()>
     where
         F: FnOnce(usize) -> CommonResult<Option<FullReportSnapshot>>,
@@ -487,7 +522,8 @@ impl WorkerPeerFanout {
         if self.shutdown.load(Ordering::Acquire) {
             return Ok(());
         }
-        let _publication = lock(&self.publication_gate);
+        let publication = lock(&self.publication_gate);
+        let generation = *publication;
         if !self.needs_full_resync() {
             return Ok(());
         }
@@ -505,7 +541,7 @@ impl WorkerPeerFanout {
         let stale_peers: Vec<_> = self
             .reconcile_peers(leader_id)
             .into_iter()
-            .filter(|(_, mailbox, _)| mailbox.needs_resync())
+            .filter(|(_, mailbox, _)| mailbox.ready_to_resync())
             .collect();
         if stale_peers.is_empty() {
             return Ok(());
@@ -528,6 +564,9 @@ impl WorkerPeerFanout {
             return Ok(());
         };
 
+        // Inventory collection can be expensive. Reports continue while it runs;
+        // discard the snapshot if any report or worker session changed meanwhile.
+        drop(publication);
         let snapshot = match build_reports(max_inventory_bytes) {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => {
@@ -540,6 +579,11 @@ impl WorkerPeerFanout {
                 return Err(error);
             }
         };
+        let publication = lock(&self.publication_gate);
+        if *publication != generation || self.shutdown.load(Ordering::Acquire) {
+            self.defer_resync();
+            return Ok(());
+        }
         let inventory_bytes = snapshot.retained_inventory_bytes();
         if inventory_bytes > max_inventory_bytes {
             warn!(
@@ -747,6 +791,8 @@ impl PeerMailbox {
                 needs_resync: false,
                 resync_in_progress: false,
                 resync_generation: 0,
+                retry_after: None,
+                failures: 0,
             }),
             notify: Notify::new(),
             max_ops,
@@ -955,9 +1001,25 @@ impl PeerMailbox {
         lock(&self.state).needs_resync
     }
 
-    fn mark_send_failed(&self) {
+    fn ready_to_resync(&self) -> bool {
+        let state = lock(&self.state);
+        state.needs_resync
+            && !state.resync_in_progress
+            && state
+                .retry_after
+                .is_none_or(|deadline| Instant::now() >= deadline)
+    }
+
+    fn mark_send_failed(&self, config: WorkerPeerFanoutConfig) {
         let mut state = lock(&self.state);
         self.mark_resync_locked(&mut state);
+        state.failures = state.failures.saturating_add(1);
+        let multiplier = 1u32 << state.failures.saturating_sub(1).min(16);
+        let delay = config
+            .retry_max()
+            .saturating_mul(multiplier)
+            .min(config.retry_timeout());
+        state.retry_after = Some(Instant::now() + delay);
     }
 
     async fn recv(&self, stop_rx: &mut watch::Receiver<bool>) -> Option<QueuedRequest> {
@@ -1038,12 +1100,14 @@ async fn run_peer_queue(
                 "follower worker heartbeat to master peer {} failed: {}",
                 peer_id, error
             );
-            mailbox.mark_send_failed();
+            mailbox.mark_send_failed(config);
         } else if let Some(generation) = request.resync_generation {
             let mut state = lock(&mailbox.state);
             if state.resync_generation == generation {
                 state.needs_resync = false;
                 state.resync_in_progress = false;
+                state.failures = 0;
+                state.retry_after = None;
             }
         }
         if is_end {
@@ -1651,11 +1715,8 @@ mod tests {
             let fanout = WorkerPeerFanout::new(runtime.clone(), transport.clone(), limits).unwrap();
             fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
             wait_for_calls(&transport, 1).await;
-            lock(&fanout.peers)
-                .get(&2)
-                .unwrap()
-                .mailbox
-                .mark_send_failed();
+            let mailbox = lock(&fanout.peers).get(&2).unwrap().mailbox.clone();
+            mailbox.mark_resync_locked(&mut lock(&mailbox.state));
 
             let builds = Arc::new(AtomicUsize::new(0));
             let build_count = builds.clone();
@@ -1673,6 +1734,44 @@ mod tests {
             assert!(fanout.has_stale_peer_state());
             fanout.shutdown().await;
         });
+    }
+
+    #[test]
+    fn snapshot_is_discarded_when_a_report_arrives_during_collection() {
+        let runtime = Arc::new(Runtime::new("peer-fanout-snapshot-race", 2, 2));
+        runtime.block_on(async {
+            let transport = transport();
+            let fanout =
+                WorkerPeerFanout::new(runtime.clone(), transport.clone(), config()).unwrap();
+            fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
+            wait_for_calls(&transport, 1).await;
+            let mailbox = lock(&fanout.peers).get(&2).unwrap().mailbox.clone();
+            mailbox.mark_resync_locked(&mut lock(&mailbox.state));
+            fanout
+                .resync_with_snapshot(|_| {
+                    fanout.publish_block_report(block_report(42));
+                    Ok(Some(snapshot()))
+                })
+                .unwrap();
+            assert!(mailbox.needs_resync());
+            fanout.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn failed_mirror_resync_uses_bounded_backoff() {
+        let limits = config();
+        let mailbox = PeerMailbox::new(
+            limits.queue_max_ops,
+            GlobalByteBudget::new(limits.queued_bytes_max),
+        );
+        mailbox.mark_send_failed(limits);
+        assert!(mailbox.needs_resync());
+        assert!(!mailbox.ready_to_resync());
+        let mut state = lock(&mailbox.state);
+        state.retry_after = Some(Instant::now() - Duration::from_millis(1));
+        drop(state);
+        assert!(mailbox.ready_to_resync());
     }
 
     async fn wait_for_calls(transport: &FakePeerTransport, count: usize) {

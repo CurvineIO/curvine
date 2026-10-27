@@ -163,15 +163,20 @@ impl LoopTask for HeartbeatTask {
             let client = self.client.clone();
             let store = self.store.clone();
             let block_report_limit = self.block_report_limit;
-            if let Err(e) = self.client.resync_follower_reports(|max_inventory_bytes| {
-                let block_count = store.block_count()?;
-                if FullReportSnapshot::minimum_inventory_bytes(block_count) > max_inventory_bytes {
-                    return Ok(None);
-                }
-                let blocks = store.all_blocks()?;
-                let snapshot = client.full_report_snapshot(blocks, block_report_limit);
-                Ok(Some(snapshot))
-            }) {
+            if let Err(e) =
+                self.client
+                    .resync_follower_reports(&self.executor, move |max_inventory_bytes| {
+                        let block_count = store.block_count()?;
+                        if FullReportSnapshot::minimum_inventory_bytes(block_count)
+                            > max_inventory_bytes
+                        {
+                            return Ok(None);
+                        }
+                        let blocks = store.all_blocks()?;
+                        let snapshot = client.full_report_snapshot(blocks, block_report_limit);
+                        Ok(Some(snapshot))
+                    })
+            {
                 warn!("build follower worker full report failed: {}", e);
             }
         }
