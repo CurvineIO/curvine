@@ -33,10 +33,11 @@ because it has no new work.
 
 The client sticky window must be positive when client follower reads are
 enabled; its default is 5 seconds. Each client context remembers at most 1,024
-mutation paths, each up to 4 KiB. Oversized paths or a full path table pin all
-reads to the leader for the sticky window. Large encoded mutation batches also
-fall back to pinning the full namespace when they exceed 1,024 paths or contain
-a path over 4 KiB.
+mutation paths, each up to 4 KiB. The client indexes those paths by component,
+so a read checks the path's ancestors and matching descendants without scanning
+the full table. Oversized paths or a full path table pin all reads to the leader
+for the sticky window. Large encoded mutation batches also fall back to pinning
+the full namespace when they exceed 1,024 paths or contain a path over 4 KiB.
 
 Worker report mirroring is bounded. Defaults are 256 queued operations per
 follower, 64 MiB across worker queues, 32 peer queues, and 16 concurrent peer
@@ -82,10 +83,13 @@ Recent mutations pin related reads in that client context to the leader while
 the sticky window is live. In-flight writes stay pinned until their RPC ends,
 then the configured window starts, including when the RPC fails or is
 cancelled. Matching includes the mutated path, descendants, and ancestor
-listings. This is a finite, per-client hint: it does not make reads linearizable
-or provide cross-client read-after-write guarantees. After the window expires,
-eligible reads may use a follower. A nonzero commit-lag setting also
-intentionally permits followers to serve a view behind the current leader.
+listings. Glob patterns in `ListStatus` and `ListOptions` are conservatively
+routed to the leader because their result paths cannot be matched by a single
+component prefix. This is a finite, per-client hint: it does not make reads
+linearizable or provide cross-client read-after-write guarantees. After the
+window expires, eligible reads may use a follower. A nonzero commit-lag setting
+also intentionally permits followers to serve a view behind the current
+leader.
 
 Use follower reads for workloads that can tolerate those limits. Keep the
 feature disabled when every read must observe the latest committed write.

@@ -1330,6 +1330,14 @@ fn follower_read_path(code: RpcCode, msg: &Message) -> Option<Path> {
         _ => return None,
     };
     let path = Path::from_str(path).ok()?;
+    if matches!(code, RpcCode::ListStatus | RpcCode::ListOptions)
+        && path.path().contains(['*', '?', '[', '{', '\\'])
+    {
+        // ListStatus resolves glob patterns to multiple paths. A component
+        // prefix check cannot prove which mutations that result set includes,
+        // so keep glob listings on the leader for read-after-write safety.
+        return None;
+    }
     if path.path().is_empty() {
         Path::from_str("/").ok()
     } else {
@@ -1949,6 +1957,31 @@ mod tests {
             );
             assert_eq!(follower_state.counts.mount_table.load(Ordering::SeqCst), 0);
             assert_eq!(follower_state.counts.list_status.load(Ordering::SeqCst), 0);
+
+            context
+                .session_path_tracker()
+                .mark_mutation(&path("/glob/child"));
+            let leader_lists_before_glob = leader_state.counts.list_status.load(Ordering::SeqCst);
+            let follower_lists_before_glob =
+                follower_state.counts.list_status.load(Ordering::SeqCst);
+            client
+                .rpc::<ListStatusRequest, ListStatusResponse>(
+                    RpcCode::ListStatus,
+                    ListStatusRequest {
+                        path: "/glob/*".to_string(),
+                        need_location: false,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                leader_state.counts.list_status.load(Ordering::SeqCst),
+                leader_lists_before_glob + 1
+            );
+            assert_eq!(
+                follower_state.counts.list_status.load(Ordering::SeqCst),
+                follower_lists_before_glob
+            );
 
             tokio::time::sleep(Duration::from_millis(260)).await;
             assert!(client.exists(&path("/sticky/tree/child")).await.unwrap());
