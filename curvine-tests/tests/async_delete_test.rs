@@ -44,6 +44,17 @@ fn seed(fs: &UnifiedFileSystem, root: &str, dirs: usize, per_dir: usize) {
     });
 }
 
+/// True once `/.Trash/.pending` has no children. The staging directory stays
+/// after it drains, so a failed lookup is an error, not proof of a purge.
+fn pending_drained(fs: &UnifiedFileSystem) -> CommonResult<bool> {
+    let pending = Path::from_str("/.Trash/.pending")?;
+    let status = fs
+        .clone_runtime()
+        .block_on(async { fs.get_status(&pending).await })?;
+    // A directory's status length is its child count.
+    Ok(status.len == 0)
+}
+
 /// The client must be able to retire a large tree without waiting for the master
 /// to walk it, with and without the recycle bin.
 #[test]
@@ -103,11 +114,7 @@ fn async_delete_space_is_reclaimed_by_the_purger() -> CommonResult<()> {
         assert!(status.is_err(), "the path must stay deleted");
 
         // The purger removes the entry, so the staging directory drains.
-        let pending = fs
-            .clone_runtime()
-            .block_on(async { fs.get_status(&Path::from_str("/.Trash/.pending")?).await });
-        let drained = pending.map(|status| status.len == 0).unwrap_or(true);
-        if drained {
+        if pending_drained(&fs)? {
             break;
         }
         assert!(
@@ -157,10 +164,7 @@ fn bench_sync_vs_async_delete() -> CommonResult<()> {
     let started = Instant::now();
     let mut purge_lag = None;
     while started.elapsed() < Duration::from_secs(120) {
-        let pending = fs
-            .clone_runtime()
-            .block_on(async { fs.get_status(&Path::from_str("/.Trash/.pending")?).await });
-        if pending.map(|status| status.len == 0).unwrap_or(true) {
+        if pending_drained(&fs)? {
             purge_lag = Some(started.elapsed());
             break;
         }
