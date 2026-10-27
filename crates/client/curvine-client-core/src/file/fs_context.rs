@@ -91,6 +91,11 @@ impl FsContext {
 
     pub fn with_rt(conf: impl Into<ClusterConf>, rt: Arc<Runtime>) -> FsResult<Self> {
         let conf = conf.into();
+        // The client SDK can export its own `/metrics` endpoint; tag it with the
+        // cluster_id like the server components do. Reporting to the master
+        // (`ClientMetrics::encode`) is unaffected: it reads the registry
+        // directly, so no extra label enters the master's metric definitions.
+        curvine_metrics::Metrics::set_cluster_id(&conf.cluster_id);
         let hostname = conf.client.hostname.to_owned();
         let ip = NetUtils::local_ip(&hostname);
         let client_addr = ClientAddress {

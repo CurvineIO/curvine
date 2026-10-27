@@ -23,6 +23,28 @@ use super::plan::{
     load_job_info, load_replica_mismatch, needs_source_status_refresh, unchanged_load_target,
 };
 
+/// Return the value of `name{labels...}` ignoring label order and any extra
+/// process-wide labels (the exporter appends `cluster_id` to every sample).
+fn sample_value(output: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+    output.lines().find_map(|line| {
+        let (series, value) = line.rsplit_once(' ')?;
+        let (series_name, rest) = series.split_once('{')?;
+        if series_name != name {
+            return None;
+        }
+        let rest = rest.trim_end_matches('}');
+        let matched = labels.iter().all(|(key, value)| {
+            let want = format!("{key}=\"{value}\"");
+            rest.split(',').any(|pair| pair == want)
+        });
+        if matched {
+            value.trim().parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
 fn source_status(mtime: i64, len: i64) -> FileStatus {
     FileStatus {
         mtime,
@@ -60,19 +82,30 @@ fn transfer_master_rpc_metrics_record_stage_operation_and_result() {
         std::time::Instant::now(),
     );
     let output = curvine_metrics::Metrics::text_output().unwrap();
-    assert!(
-        output.contains(
-            "transfer_master_rpc_total{operation=\"test_operation\",result=\"success\",stage=\"test_stage\"} 1"
-        ),
+    let labels = [
+        ("operation", "test_operation"),
+        ("result", "success"),
+        ("stage", "test_stage"),
+    ];
+    assert_eq!(
+        sample_value(&output, "transfer_master_rpc_total", &labels),
+        Some(1.0),
         "{output}"
     );
-    assert!(
-        output.contains(
-            "transfer_master_rpc_duration_us_count{operation=\"test_operation\",result=\"success\",stage=\"test_stage\"} 1"
-        ),
+    assert_eq!(
+        sample_value(&output, "transfer_master_rpc_duration_us_count", &labels),
+        Some(1.0),
         "{output}"
     );
     assert!(!output.contains("operation=\"test_fallback\""), "{output}");
+}
+
+#[test]
+fn sample_value_matches_labels_regardless_of_order_and_extra_labels() {
+    let output = "a{result=\"ok\",cluster_id=\"curvine\"} 3\nb{result=\"ok\",x=\"y\"} 7\n";
+    assert_eq!(sample_value(output, "a", &[("result", "ok")]), Some(3.0));
+    assert_eq!(sample_value(output, "a", &[("result", "no")]), None);
+    assert_eq!(sample_value(output, "missing", &[]), None);
 }
 
 #[test]

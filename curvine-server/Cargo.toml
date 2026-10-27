@@ -37,6 +37,7 @@ curvine-io = { workspace = true }
 curvine-proto = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-config = { workspace = true }
+curvine-metrics = { workspace = true }
 curvine-sys = { workspace = true }
 curvine-alloc = { workspace = true }
 curvine-model = { workspace = true }

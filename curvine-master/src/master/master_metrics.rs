@@ -700,6 +700,32 @@ mod tests {
         worker
     }
 
+    /// Value of the exported sample for `name` carrying every label in
+    /// `labels`, if present.
+    ///
+    /// Label-order and extra-label independent, so assertions do not break when
+    /// the process adds labels at gather time (e.g. `cluster_id`).
+    fn sample_value(output: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        output.lines().find_map(|line| {
+            let (series, value) = line.rsplit_once(' ')?;
+            let (series_name, series_labels) = match series.split_once('{') {
+                Some((n, rest)) => (n, rest.trim_end_matches('}')),
+                None => (series, ""),
+            };
+            if series_name != name {
+                return None;
+            }
+            let matched = labels.iter().all(|(k, v)| {
+                let expected = format!("{k}=\"{v}\"");
+                series_labels.split(',').any(|pair| pair == expected)
+            });
+            if !matched {
+                return None;
+            }
+            value.parse::<f64>().ok()
+        })
+    }
+
     #[test]
     fn scheduled_bytes_drops_lost_worker_labels() {
         let metric_name = "test_scheduled_bytes_drops_lost_worker_labels";
@@ -708,15 +734,17 @@ mod tests {
 
         MasterMetrics::refresh_scheduled_bytes(&metric, &[live_worker("10.0.0.1", 8995, 128)]);
         let output = Metrics::text_output().unwrap();
-        assert!(
-            output.contains(&format!("{metric_name}{{worker_addr=\"{lost}\"}} 128")),
+        assert_eq!(
+            sample_value(&output, metric_name, &[("worker_addr", lost)]),
+            Some(128.0),
             "{output}"
         );
 
         MasterMetrics::refresh_scheduled_bytes(&metric, &[]);
         let output = Metrics::text_output().unwrap();
-        assert!(
-            !output.contains(&format!("{metric_name}{{worker_addr=\"{lost}\"}}")),
+        assert_eq!(
+            sample_value(&output, metric_name, &[("worker_addr", lost)]),
+            None,
             "{output}"
         );
     }
@@ -732,16 +760,14 @@ mod tests {
 
         MasterMetrics::refresh_scheduled_bytes(&metric, &workers);
         let output = Metrics::text_output().unwrap();
-        assert!(
-            output.contains(&format!(
-                "{metric_name}{{worker_addr=\"10.0.0.1:8995\"}} 128"
-            )),
+        assert_eq!(
+            sample_value(&output, metric_name, &[("worker_addr", "10.0.0.1:8995")]),
+            Some(128.0),
             "{output}"
         );
-        assert!(
-            output.contains(&format!(
-                "{metric_name}{{worker_addr=\"10.0.0.1:8996\"}} 256"
-            )),
+        assert_eq!(
+            sample_value(&output, metric_name, &[("worker_addr", "10.0.0.1:8996")]),
+            Some(256.0),
             "{output}"
         );
     }

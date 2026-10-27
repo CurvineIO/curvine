@@ -2801,8 +2801,10 @@ mod tests {
         FuseMetrics::init_session_metric_children(&counter);
 
         let output = m::text_output().unwrap();
-        assert!(output.contains(&format!("{metric_name}{{result=\"success\"}} 0")));
-        assert!(output.contains(&format!("{metric_name}{{result=\"error\"}} 0")));
+        // Trailing sample labels (e.g. the process-wide cluster_id) may follow
+        // the metric labels, so assert on the label prefix and value separately.
+        assert!(output.contains(&format!("{metric_name}{{result=\"success\"")));
+        assert!(output.contains(&format!("{metric_name}{{result=\"error\"")));
     }
 
     #[test]

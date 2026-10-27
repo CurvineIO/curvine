@@ -44,6 +44,10 @@ fn main() -> CommonResult<()> {
     let service = args.get_service()?;
     let (mut conf, config_sources) = args.get_conf_with_sources(&service)?;
 
+    // Every metric served by this process is tagged with the cluster_id it
+    // belongs to, so one Prometheus can tell clusters apart.
+    curvine_metrics::Metrics::set_cluster_id(&conf.cluster_id);
+
     Utils::set_panic_exit_hook();
 
     match service {

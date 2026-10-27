@@ -28,6 +28,28 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::dispatch::stale_retry_exhausted_message;
+
+/// Return the value of `name{labels...}` ignoring label order and any extra
+/// process-wide labels (the exporter appends `cluster_id` to every sample).
+fn sample_value(output: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+    output.lines().find_map(|line| {
+        let (series, value) = line.rsplit_once(' ')?;
+        let (series_name, rest) = series.split_once('{')?;
+        if series_name != name {
+            return None;
+        }
+        let rest = rest.trim_end_matches('}');
+        let matched = labels.iter().all(|(key, value)| {
+            let want = format!("{key}=\"{value}\"");
+            rest.split(',').any(|pair| pair == want)
+        });
+        if matched {
+            value.trim().parse().ok()
+        } else {
+            None
+        }
+    })
+}
 #[cfg(feature = "transfer-store-sqlite")]
 use super::SqliteTransferStore;
 use super::{
@@ -580,12 +602,32 @@ fn backend_delegates_batched_reports_in_one_store_operation() {
     assert_batched_report_write_contract(store, job);
 
     let metrics = Metrics::text_output().unwrap();
-    assert!(metrics.contains(
-        "transfer_store_operation_total{backend=\"memory\",operation=\"update_task_reports\",result=\"success\"} 1"
-    ));
-    assert!(!metrics.contains(
-        "transfer_store_operation_total{backend=\"memory\",operation=\"update_task_report\",result=\"success\"}"
-    ));
+    assert_eq!(
+        sample_value(
+            &metrics,
+            "transfer_store_operation_total",
+            &[
+                ("backend", "memory"),
+                ("operation", "update_task_reports"),
+                ("result", "success"),
+            ],
+        ),
+        Some(1.0),
+        "{metrics}"
+    );
+    assert_eq!(
+        sample_value(
+            &metrics,
+            "transfer_store_operation_total",
+            &[
+                ("backend", "memory"),
+                ("operation", "update_task_report"),
+                ("result", "success"),
+            ],
+        ),
+        None,
+        "{metrics}"
+    );
 }
 
 #[test]

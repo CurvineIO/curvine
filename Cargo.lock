@@ -2933,6 +2933,7 @@ dependencies = [
  "curvine-job-client",
  "curvine-master",
  "curvine-mds",
+ "curvine-metrics",
  "curvine-model",
  "curvine-net",
  "curvine-proto",

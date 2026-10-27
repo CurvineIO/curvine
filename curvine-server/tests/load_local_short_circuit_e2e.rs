@@ -44,14 +44,28 @@ const MB: i64 = 1024 * 1024;
 /// production mismatch; `127.0.0.1` needs no DNS to resolve or bind.
 const NODE_HOSTNAME: &str = "127.0.0.1";
 
+/// Value of the `write_blocks` sample for `label`, or 0 when absent.
+///
+/// Matches the metric name plus that one label: samples can carry extra
+/// process-wide labels (e.g. `cluster_id`), and label order is not part of
+/// the line format.
 fn write_blocks(metrics: &str, label: &str) -> i64 {
-    let needle = format!("write_blocks{{type=\"{}\"}}", label);
+    let want = format!("type=\"{}\"", label);
     metrics
         .lines()
-        .filter_map(|line| line.trim().strip_prefix(&needle))
-        .filter_map(|value| value.trim().parse::<f64>().ok())
-        .map(|value| value as i64)
-        .next()
+        .find_map(|line| {
+            let (series, value) = line.trim().rsplit_once(' ')?;
+            let (name, labels) = series.split_once('{')?;
+            if name != "write_blocks" {
+                return None;
+            }
+            let labels = labels.trim_end_matches('}');
+            if labels.split(',').any(|pair| pair == want) {
+                value.trim().parse::<f64>().ok().map(|v| v as i64)
+            } else {
+                None
+            }
+        })
         .unwrap_or(0)
 }
 

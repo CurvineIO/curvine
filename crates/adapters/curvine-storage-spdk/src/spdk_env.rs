@@ -2452,7 +2452,9 @@ mod test {
         p.publish_metrics();
 
         let output = curvine_metrics::Metrics::text_output().unwrap();
-        assert!(output.contains("spdk_qpair_acquire_total{result=\"timeout\"}"));
+        // Match the label prefix only: samples can carry extra process-wide
+        // labels (e.g. cluster_id) after their own labels.
+        assert!(output.contains("spdk_qpair_acquire_total{result=\"timeout\""));
         assert!(output.contains("spdk_qpair_acquire_wait_us_bucket"));
         assert!(output.contains("spdk_qpair_contention_total"));
         assert!(output.contains("spdk_qpair_active 1"));

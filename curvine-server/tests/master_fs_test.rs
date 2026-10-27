@@ -513,9 +513,24 @@ fn rpc_queue_count(fs: &MasterFilesystem, executor: &str) -> u64 {
         .expect("test master metrics should initialize")
         .text_output(fs.clone())
         .expect("metrics text output should render");
-    let prefix = format!("rpc_queue_duration_count{{executor=\"{executor}\"}}");
+    // Match on the metric name plus the executor label instead of the exact
+    // label string: samples may carry extra process-wide labels (cluster_id),
+    // and label order is not guaranteed.
+    let want = format!("executor=\"{executor}\"");
     text.lines()
-        .find_map(|line| line.strip_prefix(&prefix)?.trim().parse().ok())
+        .find_map(|line| {
+            let (series, value) = line.rsplit_once(' ')?;
+            let (name, labels) = series.split_once('{')?;
+            if name != "rpc_queue_duration_count" {
+                return None;
+            }
+            let labels = labels.trim_end_matches('}');
+            if labels.split(',').any(|pair| pair == want) {
+                value.trim().parse().ok()
+            } else {
+                None
+            }
+        })
         .unwrap_or(0)
 }
 

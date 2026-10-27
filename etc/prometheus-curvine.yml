@@ -1,6 +1,10 @@
 # Production scrape example for curvine-web Prometheus/auto mode.
 # Keep the component labels: the observability query provider uses them to
 # distinguish master, worker, Transfer and FUSE series and validates the master contract.
+#
+# Every component also exports a `cluster_id` label on all of its series. The
+# value is the process's own cluster_id (`curvine` when unset), so scrapes of
+# several clusters stay distinguishable without any label here.
 global:
   scrape_interval: 30s
   scrape_timeout: 10s

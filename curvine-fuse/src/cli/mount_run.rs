@@ -33,6 +33,8 @@ pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
     }
 
     let cluster_conf = args.get_conf()?;
+    // Tag every metric this fuse process exports with its cluster_id.
+    curvine_metrics::Metrics::set_cluster_id(&cluster_conf.cluster_id);
     Logger::init(cluster_conf.fuse.log.clone());
     info!("allocator: {}", curvine_alloc::allocator_type_name());
     info!("git version: {}", curvine_sys::version::GIT_VERSION);
