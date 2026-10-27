@@ -37,9 +37,56 @@ struct State {
     /// its current registration session.
     full_report_complete: HashSet<u32>,
     deferred: HashMap<(u32, i64), DeferredBlockReport>,
+    /// Number of deferred workers per block, for constant-time read gating.
+    deferred_by_block: HashMap<i64, usize>,
     /// The worker must complete another full report before its locations can be
     /// used, for example after a bounded-queue overflow.
     needs_full_report: HashSet<u32>,
+}
+
+impl State {
+    fn remove_block_index(index: &mut HashMap<i64, usize>, block_id: i64) {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = index.entry(block_id) {
+            if *entry.get() == 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
+        }
+    }
+
+    fn retain_deferred(&mut self, mut keep: impl FnMut(u32, i64) -> bool) {
+        let index = &mut self.deferred_by_block;
+        self.deferred.retain(|&(worker_id, block_id), _| {
+            if keep(worker_id, block_id) {
+                true
+            } else {
+                Self::remove_block_index(index, block_id);
+                false
+            }
+        });
+    }
+
+    fn remove_deferred(&mut self, worker_id: u32, block_id: i64) {
+        if self.deferred.remove(&(worker_id, block_id)).is_some() {
+            Self::remove_block_index(&mut self.deferred_by_block, block_id);
+        }
+    }
+}
+
+/// A borrowed readiness view keeps all checks under one state lock per read.
+pub(super) struct FollowerBlockReadiness<'a>(&'a State);
+
+impl FollowerBlockReadiness<'_> {
+    pub(super) fn worker_ready(&self, worker_id: u32) -> bool {
+        self.0.workers.contains(&worker_id)
+            && self.0.full_report_complete.contains(&worker_id)
+            && !self.0.needs_full_report.contains(&worker_id)
+    }
+
+    pub(super) fn has_deferred_block(&self, block_id: i64) -> bool {
+        self.0.deferred_by_block.contains_key(&block_id)
+    }
 }
 
 /// Local follower location-view state. These rows are soft state and are never
@@ -55,10 +102,12 @@ impl FollowerBlockReportState {
         if state.term == Some(term) {
             return Vec::new();
         }
-        let workers = state.workers.drain().collect();
+        let workers: Vec<_> = state.workers.drain().collect();
         state.full_report_complete.clear();
         state.deferred.clear();
+        state.deferred_by_block.clear();
         state.needs_full_report.clear();
+        state.needs_full_report.extend(workers.iter().copied());
         state.term = Some(term);
         workers
     }
@@ -67,7 +116,7 @@ impl FollowerBlockReportState {
         let mut state = self.0.lock();
         state.workers.insert(worker_id);
         if restarted {
-            state.deferred.retain(|(id, _), _| *id != worker_id);
+            state.retain_deferred(|id, _| id != worker_id);
             state.needs_full_report.remove(&worker_id);
             state.full_report_complete.remove(&worker_id);
         }
@@ -78,7 +127,7 @@ impl FollowerBlockReportState {
         state.workers.remove(&worker_id);
         state.full_report_complete.remove(&worker_id);
         state.needs_full_report.remove(&worker_id);
-        state.deferred.retain(|(id, _), _| *id != worker_id);
+        state.retain_deferred(|id, _| id != worker_id);
     }
 
     pub(super) fn retain_workers(&self, worker_ids: &HashSet<u32>) -> Vec<u32> {
@@ -93,9 +142,7 @@ impl FollowerBlockReportState {
         state
             .needs_full_report
             .retain(|worker_id| worker_ids.contains(worker_id));
-        state
-            .deferred
-            .retain(|(worker_id, _), _| worker_ids.contains(worker_id));
+        state.retain_deferred(|worker_id, _| worker_ids.contains(&worker_id));
         removed
     }
 
@@ -120,12 +167,20 @@ impl FollowerBlockReportState {
             existing.leader_contact_sequence = report.leader_contact_sequence;
         } else {
             state.deferred.insert(key, report);
+            *state.deferred_by_block.entry(report.block_id).or_default() += 1;
         }
         true
     }
 
     pub(super) fn remove_deferred(&self, worker_id: u32, block_id: i64) {
-        self.0.lock().deferred.remove(&(worker_id, block_id));
+        self.0.lock().remove_deferred(worker_id, block_id);
+    }
+
+    /// Remove stale entries for a worker after its full report completes.
+    pub(super) fn retain_reported_blocks(&self, worker_id: u32, reported: &HashSet<i64>) {
+        self.0
+            .lock()
+            .retain_deferred(|id, block_id| id != worker_id || reported.contains(&block_id));
     }
 
     pub(super) fn deferred_snapshot(&self) -> Vec<DeferredBlockReport> {
@@ -133,7 +188,7 @@ impl FollowerBlockReportState {
     }
 
     pub(super) fn mark_deferred_resolved(&self, worker_id: u32, block_id: i64) {
-        self.0.lock().deferred.remove(&(worker_id, block_id));
+        self.remove_deferred(worker_id, block_id);
     }
 
     pub(super) fn mark_full_report_complete(&self, worker_id: u32) {
@@ -153,19 +208,28 @@ impl FollowerBlockReportState {
         state.needs_full_report.insert(worker_id);
     }
 
-    pub(super) fn worker_ready(&self, worker_id: u32) -> bool {
+    pub(super) fn requires_full_report(&self, worker_id: u32) -> bool {
         let state = self.0.lock();
-        state.workers.contains(&worker_id)
-            && state.full_report_complete.contains(&worker_id)
-            && !state.needs_full_report.contains(&worker_id)
+        !state.full_report_complete.contains(&worker_id)
+            || state.needs_full_report.contains(&worker_id)
     }
 
+    pub(super) fn with_readiness<T>(
+        &self,
+        check: impl FnOnce(&FollowerBlockReadiness<'_>) -> T,
+    ) -> T {
+        let state = self.0.lock();
+        check(&FollowerBlockReadiness(&state))
+    }
+
+    #[cfg(test)]
+    pub(super) fn worker_ready(&self, worker_id: u32) -> bool {
+        self.with_readiness(|state| state.worker_ready(worker_id))
+    }
+
+    #[cfg(test)]
     pub(super) fn has_deferred_block(&self, block_id: i64) -> bool {
-        self.0
-            .lock()
-            .deferred
-            .keys()
-            .any(|(_, pending_block)| *pending_block == block_id)
+        self.with_readiness(|state| state.has_deferred_block(block_id))
     }
 
     #[cfg(test)]
@@ -254,6 +318,36 @@ mod tests {
     }
 
     #[test]
+    fn deferred_block_index_tracks_each_worker_and_all_removal_paths() {
+        let state = FollowerBlockReportState::default();
+        state.reset_for_term(1);
+        assert!(state.defer(deferred(7, 42)));
+        assert!(state.defer(deferred(7, 42))); // replacement does not add a count
+        assert!(state.defer(deferred(8, 42)));
+        assert!(state.defer(deferred(7, 43)));
+
+        state.remove_deferred(7, 42);
+        assert!(state.has_deferred_block(42)); // worker 8 still defers it
+        state.retain_reported_blocks(8, &HashSet::new());
+        assert!(!state.has_deferred_block(42));
+        assert!(state.has_deferred_block(43));
+
+        assert!(state.defer(deferred(8, 44)));
+        assert!(state.defer(deferred(9, 46)));
+        state.observe_worker(7, true);
+        assert!(!state.has_deferred_block(43));
+        state.retain_workers(&HashSet::from([8]));
+        assert!(state.has_deferred_block(44));
+        assert!(!state.has_deferred_block(46));
+        state.forget_worker(8);
+        assert!(!state.has_deferred_block(44));
+
+        assert!(state.defer(deferred(9, 45)));
+        state.reset_for_term(2);
+        assert!(!state.has_deferred_block(45));
+    }
+
+    #[test]
     fn worker_removal_drops_only_its_passive_state() {
         let state = FollowerBlockReportState::default();
         state.observe_worker(7, false);
@@ -292,6 +386,6 @@ mod tests {
 
         assert_eq!(state.reset_for_term(2), vec![7]);
         assert_eq!(state.deferred_len(), 0);
-        assert!(state.is_ready());
+        assert!(state.requires_full_report(7));
     }
 }

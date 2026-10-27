@@ -1447,25 +1447,24 @@ impl MasterFilesystem {
             return file.len == 0 || file.storage_policy.ufs_only();
         }
 
-        file.blocks.iter().all(|block| {
-            if self
-                .follower_block_report_state
-                .has_deferred_block(block.id)
-            {
-                return false;
-            }
-            let Some(locations) = file_locations.get(&block.id) else {
-                return false;
-            };
-            !locations.is_empty()
-                && locations.iter().all(|location| {
-                    self.follower_block_report_state
-                        .worker_ready(location.worker_id)
-                        && worker_manager
-                            .get_worker(location.worker_id)
-                            .is_some_and(WorkerInfo::is_live)
+        self.follower_block_report_state
+            .with_readiness(|readiness| {
+                file.blocks.iter().all(|block| {
+                    if readiness.has_deferred_block(block.id) {
+                        return false;
+                    }
+                    let Some(locations) = file_locations.get(&block.id) else {
+                        return false;
+                    };
+                    !locations.is_empty()
+                        && locations.iter().all(|location| {
+                            readiness.worker_ready(location.worker_id)
+                                && worker_manager
+                                    .get_worker(location.worker_id)
+                                    .is_some_and(WorkerInfo::is_live)
+                        })
                 })
-        })
+            })
     }
 
     /// Return a block-location snapshot only when both the Raft/journal state
@@ -1527,6 +1526,18 @@ impl MasterFilesystem {
     pub fn reset_full_block_report(&self, worker_id: u32) {
         self.full_report_tracker.reset(worker_id);
         self.invalidate_full_block_reconcile(worker_id);
+    }
+
+    /// Report id of the last fully processed full report of the worker.
+    #[doc(hidden)]
+    pub fn full_report_completed_round(&self, worker_id: u32) -> Option<u64> {
+        self.full_report_tracker.completed_round(worker_id)
+    }
+
+    /// Number of workers with a partially accumulated full report.
+    #[doc(hidden)]
+    pub fn full_report_open_sessions(&self) -> usize {
+        self.full_report_tracker.open_sessions()
     }
 
     fn invalidate_full_block_report_session(&self, worker_id: u32) {
@@ -1908,20 +1919,8 @@ impl MasterFilesystem {
             match &applied {
                 Ok(()) => {
                     if let Some(reported_blocks) = &full_reported_blocks {
-                        let deferred = self
-                            .follower_block_report_state
-                            .deferred_snapshot()
-                            .into_iter()
-                            .filter(|report| {
-                                report.worker_id == worker_id
-                                    && !reported_blocks.contains(&report.block_id)
-                            })
-                            .map(|report| report.block_id)
-                            .collect::<Vec<_>>();
-                        for block_id in deferred {
-                            self.follower_block_report_state
-                                .remove_deferred(worker_id, block_id);
-                        }
+                        self.follower_block_report_state
+                            .retain_reported_blocks(worker_id, reported_blocks);
                         self.follower_block_report_state
                             .mark_full_report_complete(worker_id);
                     }
