@@ -15,7 +15,6 @@
 use curvine_config::ClusterConf;
 use curvine_master::master::fs::{DeleteMode, MasterFilesystem};
 use curvine_master::master::journal::JournalSystem;
-use curvine_master::master::meta::trash;
 use curvine_master::Master;
 use curvine_raft::raft::RoleState;
 use curvine_runtime::common::Utils;
@@ -59,8 +58,10 @@ fn seed_trash(fs: &MasterFilesystem, entries: usize, per_dir: usize) -> u64 {
 }
 
 fn pending_children(fs: &MasterFilesystem) -> usize {
-    fs.list_options(trash::TRASH_PENDING_ROOT, Default::default())
-        .map(|children| children.len())
+    // `.pending` is hidden from client-facing listings, so count it through the
+    // purger's own scan.
+    fs.scan_pending_trash(usize::MAX, None)
+        .map(|page| page.paths.len())
         .unwrap_or(0)
 }
 

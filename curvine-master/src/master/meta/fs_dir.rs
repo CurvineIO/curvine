@@ -509,7 +509,16 @@ impl FsDir {
             if claim.is_dir {
                 parent.dec_nlink(mtime);
             }
-            let _ = parent.delete_child(claim.child_id, &claim.name)?;
+            // The store batch already committed, so the child is gone from the
+            // durable tree. Aborting here would drop `total`, and the block
+            // locations it carries could then never be released; report the
+            // in-memory divergence instead of losing the reclamation.
+            if let Err(e) = parent.delete_child(claim.child_id, &claim.name) {
+                warn!(
+                    "purge: {} is deleted from the store but could not be dropped from the in-memory tree: {}",
+                    claim.name, e
+                );
+            }
         }
 
         Ok(total)
@@ -619,6 +628,44 @@ impl FsDir {
             purge_pending: true,
             ..DeleteResult::new()
         })
+    }
+
+    /// Claims a retention-expired trash entry for reclamation by moving it from
+    /// `/.Trash/<name>` to `/.Trash/.pending/<name>` in one journaled rename.
+    ///
+    /// The purger releases the namespace lock between batches; an entry left
+    /// directly under `/.Trash` would stay restorable while its subtree is
+    /// partially deleted. Once claimed, `RestoreTrash` rejects the path (it is
+    /// no longer a direct trash child), so a restore either wins before the
+    /// claim or fails cleanly. Returns the pending path, or `None` when the
+    /// entry is already gone (restored or emptied after the scan).
+    pub fn claim_trash_entry_for_purge(&mut self, trash_path: &str) -> FsResult<Option<String>> {
+        if !trash::is_trash_entry_path(trash_path) {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} is not a trash entry",
+                trash_path
+            )));
+        }
+
+        let src_inp = InodePath::resolve(self.root_ptr(), trash_path, &self.store)?;
+        if src_inp.get_last_inode().is_none() {
+            return Ok(None);
+        }
+
+        self.ensure_pending_root()?;
+        let dst_path = trash::pending_entry_path(src_inp.name());
+        let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+
+        // Trash markers are kept: the entry stays a trash entry, only no longer
+        // a restorable one.
+        self.rename_with_mtime(
+            &src_inp,
+            &dst_inp,
+            RenameFlags::NO_REPLACE,
+            LocalTime::mills() as i64,
+        )?;
+        debug!("claimed {} for purge as {}", trash_path, dst_path);
+        Ok(Some(dst_path))
     }
 
     fn ensure_trash_root(&mut self) -> FsResult<()> {

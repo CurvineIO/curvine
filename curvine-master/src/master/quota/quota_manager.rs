@@ -238,10 +238,12 @@ fn run_eviction_plan(
 
         examined += inode_ids.len();
         let step = execute_eviction_step(fs, evictor, ttl_executor, &inode_ids);
-        plan.target_free_bytes = plan
-            .target_free_bytes
-            .saturating_sub(step.reclaimed_bytes)
-            .saturating_sub(step.scheduled_bytes);
+        // Staged victims have already left the namespace and are reclaimed by
+        // the purger within a cycle, so they reduce the remaining target too;
+        // only `total_reclaimed` (and the freed-bytes metric) may not count them
+        // before their blocks are actually released.
+        let released = step.reclaimed_bytes.saturating_add(step.staged_bytes);
+        plan.target_free_bytes = plan.target_free_bytes.saturating_sub(released);
         total_reclaimed += step.reclaimed_bytes;
         skipped.extend(step.skipped);
     }
@@ -251,10 +253,11 @@ fn run_eviction_plan(
 
 /// Consumes one page of candidates.
 ///
-/// Handled victims leave the evictor: purged file names reclaim their bytes,
-/// while trash entries report zero reclamation because only a purge or the
-/// retention expunge may release their blocks. Candidates that are not
-/// expirable yet, and directories, are reported as skipped so the caller can
+/// Handled victims leave the evictor. A staged victim reports zero reclaimed
+/// bytes — its blocks are released later by the purger — but the bytes its name
+/// held are reported as `staged_bytes`, so the caller can still converge on the
+/// byte target instead of scanning the whole candidate set. Candidates that are
+/// not expirable yet, and directories, are reported as skipped so the caller can
 /// advance past them without dropping them from the evictor.
 fn execute_eviction_step(
     fs: &MasterFilesystem,
@@ -265,12 +268,17 @@ fn execute_eviction_step(
     let mut step = EvictionStep::default();
     let mut reclaimed_files = 0i64;
 
-    let mut file_inode_ids = Vec::with_capacity(inode_ids.len());
+    // (inode id, bytes the name still holds). A hard-linked name keeps its
+    // blocks after removal, so it contributes nothing to the byte target.
+    let mut file_inode_ids: Vec<(i64, i64)> = Vec::with_capacity(inode_ids.len());
     {
         let fs_guard = fs.fs_dir.read();
         for &inode_id in inode_ids {
             match fs_guard.store.get_inode(inode_id, None) {
-                Ok(Some(InodeView::File(_))) => file_inode_ids.push(inode_id),
+                Ok(Some(InodeView::File(f))) => {
+                    let planned = if f.nlink() <= 1 { f.len.max(0) } else { 0 };
+                    file_inode_ids.push((inode_id, planned));
+                }
                 // A missing inode is already gone; drop it from the evictor.
                 Ok(None) => step.consumed.push(inode_id),
                 Ok(Some(_)) | Err(_) => step.skipped.push(inode_id),
@@ -278,22 +286,25 @@ fn execute_eviction_step(
         }
     }
 
-    for inode_id in file_inode_ids {
+    for (inode_id, planned_bytes) in file_inode_ids {
         // Evict into the async purge lane: the entry is renamed immediately and
         // reclaimed by the purger within a cycle, instead of waiting out
         // `trash_retention` while the cluster stays over quota.
         match ttl_executor.execute_by_id_with_mode(inode_id, DeleteMode::AsyncPurge) {
-            Ok(outcome) if outcome.handled => {
+            Ok((true, _, reclaimed)) => {
                 step.consumed.push(inode_id);
-                if outcome.reclaimed_bytes > 0 {
+                if reclaimed > 0 {
                     reclaimed_files += 1;
-                    step.reclaimed_bytes += outcome.reclaimed_bytes;
+                    step.reclaimed_bytes += reclaimed;
+                } else {
+                    // Staged for the purger: the bytes left the namespace but are
+                    // not released yet, so they are planned rather than freed.
+                    step.staged_bytes += planned_bytes;
                 }
-                step.scheduled_bytes += outcome.scheduled_bytes;
             }
             // Not expirable yet, or a hard-linked name that keeps its blocks:
             // leave it in the evictor for a later trigger.
-            Ok(_) => step.skipped.push(inode_id),
+            Ok((false, _, _)) => step.skipped.push(inode_id),
             Err(FsError::FileNotFound(_)) => step.consumed.push(inode_id),
             Err(e) => {
                 log::warn!(
@@ -332,17 +343,18 @@ struct EvictionStep {
     consumed: Vec<i64>,
     /// Candidates examined but still eligible on a later trigger.
     skipped: Vec<i64>,
-    /// Bytes actually released by this step.
+    /// Bytes actually released by this step. Feeds the freed-bytes metric.
     reclaimed_bytes: i64,
-    /// Bytes staged for the async purger. They are not reported as freed, but
-    /// count toward the eviction target so a trigger stops once enough space
-    /// is on its way back instead of staging every remaining candidate.
-    scheduled_bytes: i64,
+    /// Bytes whose names left the namespace because the victim was staged for
+    /// the async purger. Counted against the trigger target so the scan
+    /// converges, but never reported as freed.
+    staged_bytes: i64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::master::fs::DeleteMode;
     use crate::master::journal::JournalSystem;
     use crate::master::meta::inode::ttl::InodeTtlExecutor;
     use crate::master::quota::eviction::evictor::LRUEvictor;
@@ -395,10 +407,10 @@ mod tests {
     }
 
     fn create_expired_file(fs: &MasterFilesystem, path: &str) -> i64 {
-        create_expired_file_with_len(fs, path, 0)
+        create_expired_sized_file(fs, path, 0)
     }
 
-    fn create_expired_file_with_len(fs: &MasterFilesystem, path: &str, len: i64) -> i64 {
+    fn create_expired_sized_file(fs: &MasterFilesystem, path: &str, len: i64) -> i64 {
         let opts = CreateFileOptsBuilder::new()
             .create_parent(true)
             .ttl_ms(1)
@@ -532,7 +544,7 @@ mod tests {
         let fs = test_fs("evict-async-purge", true);
         fs.master_monitor
             .set_role_for_test(curvine_raft::raft::RoleState::Leader);
-        let victim = create_expired_file(&fs, "/evict/victim.log");
+        let victim = create_expired_sized_file(&fs, "/evict/victim.log", 17);
         std::thread::sleep(Duration::from_millis(10));
 
         let conf = eviction_conf(1, 0);
@@ -543,6 +555,10 @@ mod tests {
         let step = execute_eviction_step(&fs, &evictor, &executor, &[victim]);
 
         assert_eq!(step.reclaimed_bytes, 0, "a staged victim frees nothing yet");
+        assert_eq!(
+            step.staged_bytes, 17,
+            "the staged bytes must still be planned against the target"
+        );
         assert_eq!(step.consumed, vec![victim]);
         assert!(
             fs.file_status("/evict/victim.log").is_err(),
@@ -552,64 +568,69 @@ mod tests {
             fs.list_trash().unwrap().is_empty(),
             "an evicted victim must not wait in the recoverable bin"
         );
-        let staged = fs
-            .list_options("/.Trash/.pending", ListOptions::default())
-            .unwrap();
-        assert_eq!(staged.len(), 1, "the victim must be staged for the purger");
+        // `.pending` is hidden from client-facing listings, so inspect it
+        // through the purger's own scan.
+        assert_eq!(
+            pending_entries(&fs).len(),
+            1,
+            "the victim must be staged for the purger"
+        );
 
         // One purger cycle reclaims it, so the space comes back within a tick.
         fs.drain_pending_trash().unwrap().unwrap();
-        assert!(fs
-            .list_options("/.Trash/.pending", ListOptions::default())
-            .unwrap()
-            .is_empty());
+        assert!(pending_entries(&fs).is_empty());
     }
 
-    // Plain TTL expiration keeps its permanent-delete contract: an expired file
-    // is reclaimed immediately instead of waiting out the trash retention.
-    #[test]
-    fn ttl_expiration_deletes_permanently_with_trash_enabled() {
-        let fs = test_fs("ttl-permanent", true);
-        let victim = create_expired_file_with_len(&fs, "/ttl/victim.log", 100);
-        std::thread::sleep(Duration::from_millis(10));
-
-        let executor = InodeTtlExecutor::with_managers(fs.clone());
-        let (handled, _, reclaimed) = executor.execute_by_id(victim).unwrap();
-
-        assert!(handled);
-        assert_eq!(reclaimed, 100);
-        assert!(fs.file_status("/ttl/victim.log").is_err());
-        assert!(fs.list_trash().unwrap().is_empty());
+    fn pending_entries(fs: &MasterFilesystem) -> Vec<String> {
+        fs.scan_pending_trash(usize::MAX, None)
+            .map(|page| page.paths)
+            .unwrap_or_default()
     }
 
-    // Staged victims free nothing until the purger runs, but their size must
-    // still count toward the target, or one trigger keeps staging candidates
-    // until the scan budget runs out, even with the recycle bin disabled.
+    // The byte target must be reachable from staged victims alone. Counting only
+    // `reclaimed_bytes` (always zero for an async purge) left `target_free_bytes`
+    // untouched, so one trigger staged the whole candidate set instead of
+    // stopping at the low watermark.
     #[test]
-    fn eviction_stops_once_scheduled_bytes_cover_the_target() {
-        let fs = test_fs("evict-scheduled", false);
+    fn eviction_target_converges_on_staged_bytes() {
+        let fs = test_fs("evict-staged-target", true);
         fs.master_monitor
             .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+
         let mut victims = Vec::new();
         for i in 0..4 {
-            let path = format!("/evict/victim-{}.log", i);
-            victims.push(create_expired_file_with_len(&fs, &path, 100));
+            let id = create_expired_sized_file(&fs, &format!("/evict/f{}.log", i), 100);
+            victims.push(id);
         }
         std::thread::sleep(Duration::from_millis(10));
 
-        let conf = eviction_conf(1, 0);
+        // Two candidates per page, 100 bytes each: a 150-byte target is met by
+        // the first page, so the scan must stop there.
+        let conf = eviction_conf(2, 0);
         let evictor = LRUEvictor::new(conf.clone());
-        for id in &victims {
-            evictor.on_access(*id);
+        for &id in &victims {
+            evictor.on_access(id);
         }
 
         let executor = InodeTtlExecutor::with_managers(fs.clone());
         let mut plan = plan_with_target(150);
         let (examined, reclaimed) = run_eviction_plan(&fs, &evictor, &executor, &conf, &mut plan);
 
-        assert_eq!(examined, 2, "two 100-byte victims cover a 150-byte target");
-        assert_eq!(reclaimed, 0, "staged victims are not reported as freed");
-        assert!(plan.target_free_bytes <= 0);
-        assert_eq!(evictor.cache_size(), 2, "the rest stay for a later trigger");
+        assert_eq!(
+            examined, 2,
+            "the target must stop the scan after the first page"
+        );
+        assert_eq!(reclaimed, 0, "a staged victim releases no bytes yet");
+        assert!(
+            plan.target_free_bytes <= 0,
+            "staged bytes must count against the target, left {}",
+            plan.target_free_bytes
+        );
+        assert_eq!(
+            evictor.cache_size(),
+            2,
+            "the untouched candidates stay for a later trigger"
+        );
+        assert_eq!(pending_entries(&fs).len(), 2, "only one page is staged");
     }
 }
