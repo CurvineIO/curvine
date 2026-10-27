@@ -251,7 +251,7 @@ fn rejected_remove_node_keeps_the_existing_session_fence() {
     assert!(node.raw.raft.prs().get(3).is_some());
 }
 
-fn hold_current_ready(node: &mut RaftNode<MemLogStorage, HashAppStorage<String, String>>) {
+fn hold_current_ready<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>) {
     if !node.raw.has_ready() {
         node.raw.raft.become_candidate();
     }
@@ -309,11 +309,19 @@ fn pending_ready_keeps_ping_available_and_rejects_raft_mutation() {
 fn snapshot_completion_advances_the_held_ready_exactly_once() {
     let rt = JournalConf::with_test().create_runtime();
     let mut node = test_node(rt.clone(), 1);
+    seed_applied_state(&node, 100);
     hold_current_ready(&mut node);
+    node.last_snapshot_op_id = 0;
+    node.last_snapshot_ms = 0;
     let mut promise = HashMap::new();
 
     rt.block_on(node.complete_pending_snapshot(Ok(()), &mut promise))
         .unwrap();
+    assert_eq!(
+        node.last_snapshot_op_id, 100,
+        "completing a snapshot must re-anchor the entry counter at the applied state"
+    );
+    assert!(node.last_snapshot_ms > 0);
     assert!(node.pending_ready.is_none());
     let error = rt
         .block_on(node.complete_pending_snapshot(Ok(()), &mut promise))
@@ -350,24 +358,32 @@ fn wait_for_snapshot_job(node: &RaftNode<MemLogStorage, HashAppStorage<String, S
     }
 }
 
-fn seed_applied_state(node: &RaftNode<MemLogStorage, HashAppStorage<String, String>>, op_id: u64) {
-    node.rt
-        .block_on(node.storage.app_store.apply_snapshot(SnapshotData {
-            snapshot_id: 1,
-            node_id: node.id(),
-            create_time: LocalTime::mills(),
-            bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
-            files_data: None,
-            fsm_state: FsmState {
-                applied: AppliedIndex {
-                    term: 1,
-                    index: 1,
-                    op_id,
-                    rpc_id: 0,
-                },
-                ..Default::default()
+fn applied_state(node_id: u64, op_id: u64) -> SnapshotData {
+    SnapshotData {
+        snapshot_id: 1,
+        node_id,
+        create_time: LocalTime::mills(),
+        bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
+        files_data: None,
+        fsm_state: FsmState {
+            applied: AppliedIndex {
+                term: 1,
+                index: 1,
+                op_id,
+                rpc_id: 0,
             },
-        }))
+            ..Default::default()
+        },
+    }
+}
+
+fn seed_applied_state<A: LogStorage, B: AppStorage>(node: &RaftNode<A, B>, op_id: u64) {
+    node.rt
+        .block_on(
+            node.storage
+                .app_store
+                .apply_snapshot(applied_state(node.id(), op_id)),
+        )
         .unwrap();
 }
 
@@ -455,6 +471,146 @@ fn zero_snapshot_entries_disables_follower_snapshots() {
         node.storage.can_generate_snapshot(),
         "no snapshot job may be scheduled when snapshot creation is disabled"
     );
+}
+
+// Drive the real startup path: the counter must come from the restored state
+// through `new_candidate`, not from test scaffolding.
+#[test]
+fn a_restarting_candidate_anchors_the_snapshot_marker_at_the_restored_state() {
+    let mut conf = JournalConf::with_test();
+    conf.rpc_retry_max_duration_ms = 0;
+    conf.conn_retry_max_duration_ms = 0;
+    conf.journal_dir = std::env::temp_dir()
+        .join(format!("curvine-raft-anchor-{}", Utils::rand_id()))
+        .to_str()
+        .unwrap()
+        .to_string();
+    conf.journal_addrs = vec![1, 2, 3]
+        .into_iter()
+        .map(|peer_id| {
+            let port = if peer_id == 1 {
+                conf.rpc_port
+            } else {
+                NetUtils::get_available_port()
+            };
+            RaftPeer::new(peer_id, &conf.hostname, port)
+        })
+        .collect();
+    let group = RaftGroup::from_conf(&conf);
+    let node_id = group.get_node_id(&conf.local_addr()).unwrap();
+    assert_eq!(node_id, 1);
+    let journal_dir = conf.journal_dir.clone();
+
+    // A restarted node restores op_id 100 from its journal before it applies
+    // anything new, and no raft snapshot exists yet.
+    let log_store = RocksLogStorage::from_conf(&conf, true);
+    log_store
+        .set_conf_state(&raft::eraftpb::ConfState {
+            voters: group.voters(),
+            ..Default::default()
+        })
+        .unwrap();
+    log_store
+        .append(&[Entry {
+            index: 1,
+            term: 1,
+            ..Default::default()
+        }])
+        .unwrap();
+    log_store
+        .set_hard_state(&HardState {
+            term: 1,
+            commit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let app_store: HashAppStorage<String, String> = HashAppStorage::new();
+    let rt = Arc::new(Runtime::new("test-snapshot-anchor", 2, 2));
+    rt.block_on(app_store.apply_snapshot(applied_state(node_id, 100)))
+        .unwrap();
+
+    let (sender, receiver) = mpsc::channel(conf.message_size);
+    let mut node = rt
+        .block_on(RaftNode::new_candidate(
+            rt.clone(),
+            &conf,
+            log_store,
+            app_store,
+            RoleMonitor::new(),
+            receiver,
+            sender,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        ))
+        .unwrap();
+
+    assert_eq!(node.storage.get_fsm_state().op_id(), 100);
+    assert_eq!(
+        node.last_snapshot_op_id, 100,
+        "the constructor must count the restored entries as already snapshotted"
+    );
+
+    // The restored state is the anchor, not a batch of unsnapshotted entries.
+    // `finish_ready` calls this for a Ready without a role change, so it covers
+    // the first Ready after startup.
+    node.snapshot_interval_ms = 0;
+    node.snapshot_min_interval_ms = 0;
+    node.snapshot_entries = 10;
+    let anchored_ms = node.last_snapshot_ms;
+    node.apply_create_snapshot().unwrap();
+    assert_eq!(node.last_snapshot_op_id, 100);
+    assert_eq!(node.last_snapshot_ms, anchored_ms);
+    assert!(
+        node.storage.can_generate_snapshot(),
+        "startup must not schedule a snapshot job"
+    );
+
+    drop(node);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+// Stepping down reinstalls the local snapshot; the counters must move with it
+// instead of counting the reinstalled state as new work.
+#[test]
+fn leader_step_down_reinstalls_the_local_snapshot_and_reanchors_the_markers() {
+    let rt = Arc::new(Runtime::new("test-step-down-anchor", 2, 2));
+    let (mut node, conf) = test_rocks_node(rt.clone(), 1);
+    let journal_dir = conf.journal_dir.clone();
+
+    seed_applied_state(&node, 100);
+    node.last_snapshot_op_id = 0;
+    node.last_snapshot_ms = 0;
+    hold_current_ready(&mut node);
+    let pending = node.pending_ready.take().unwrap();
+
+    // The role monitor still reports leader while raft has stepped down, which
+    // is the transition that reinstalls the local snapshot.
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: 1,
+        raft_state: raft::StateRole::Leader,
+    });
+    assert!(node.role_monitor.is_leader());
+    assert!(!node.is_leader());
+
+    let mut promise = HashMap::new();
+    rt.block_on(node.finish_ready(
+        pending.ready,
+        Some(SoftState {
+            leader_id: 2,
+            raft_state: raft::StateRole::Follower,
+        }),
+        &mut promise,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        node.last_snapshot_op_id, 100,
+        "the local snapshot reinstall must re-anchor the entry counter"
+    );
+    assert!(node.last_snapshot_ms > 0);
+
+    drop(node);
+    let _ = std::fs::remove_dir_all(&journal_dir);
 }
 
 #[test]

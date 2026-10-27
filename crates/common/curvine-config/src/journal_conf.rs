@@ -50,7 +50,8 @@ pub struct JournalConf {
 
     // Follower time trigger for creating a snapshot. Entry count can also
     // request one, but `snapshot_min_interval` still allows only one snapshot
-    // inside that window.
+    // inside that window. The follower timer never fires while
+    // `snapshot_entries` is zero, since that value disables follower snapshots.
     pub snapshot_interval: String,
 
     // Minimum gap between snapshots on the leader and on followers.
@@ -72,6 +73,8 @@ pub struct JournalConf {
     pub leader_create_snapshot: Option<bool>,
 
     // How many entries are created after creating snapshots.
+    // Zero disables snapshot creation: the leader stops counting entries and a
+    // follower skips both this trigger and the `snapshot_interval` timer.
     pub snapshot_entries: u64,
 
     pub snapshot_read_chunk_size: usize,
