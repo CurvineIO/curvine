@@ -2990,7 +2990,6 @@ mod tests {
             .is_empty());
     }
 
-    #[test]
     // Expiry is a permanent removal. Sending it through the recycle bin kept
     // the blocks for another retention window while the executor reported the
     // length as reclaimed, so the freed space never showed up.
@@ -3029,6 +3028,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn ttl_does_not_expunge_trashed_entries() {
         use crate::master::meta::inode::ttl::InodeTtlExecutor;
 
