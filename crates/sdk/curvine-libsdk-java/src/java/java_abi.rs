@@ -270,6 +270,19 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_delete(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_deleteAsync(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+    path: JString,
+    recursive: jboolean,
+) -> jlong {
+    let fs = &*fs_ptr;
+    java_err!(env, fs.delete_async(&mut env, path, recursive));
+    SUCCESS
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn Java_io_curvine_CurvineNative_free(
     mut env: JNIEnv,
     _this: JObject,

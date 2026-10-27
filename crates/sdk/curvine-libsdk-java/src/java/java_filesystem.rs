@@ -171,6 +171,19 @@ impl JavaFilesystem {
         self.inner.delete(path, JavaUtils::jbool_to_bool(recursive))
     }
 
+    /// Deletes without waiting for the master to reclaim the entry. The returned
+    /// counts are zero because nothing has been reclaimed yet.
+    pub fn delete_async(
+        &self,
+        env: &mut JNIEnv,
+        path: JString,
+        recursive: jboolean,
+    ) -> FsResult<DeleteResult> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        self.inner
+            .delete_async(path, JavaUtils::jbool_to_bool(recursive))
+    }
+
     pub fn free(&self, env: &mut JNIEnv, path: JString, recursive: jboolean) -> FsResult<jarray> {
         let path = JavaUtils::jstring_to_string(env, &path)?;
         let result = self.inner.free(path, JavaUtils::jbool_to_bool(recursive))?;

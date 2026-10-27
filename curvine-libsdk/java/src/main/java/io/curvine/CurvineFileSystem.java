@@ -300,11 +300,27 @@ public class CurvineFileSystem extends FileSystem {
 
     @Override
     public boolean delete(Path f, boolean recursive) throws IOException {
+        return delete(f, recursive, false);
+    }
+
+    /**
+     * Delete a path, optionally through the master's async lane.
+     *
+     * <p>With {@code asyncDelete} the path leaves the namespace immediately and the master
+     * reclaims the blocks in the background, so the call does not pay for walking the subtree.
+     * Mounted paths stay synchronous, because their backing UFS object is deleted first and there
+     * would be nothing left to restore.
+     */
+    public boolean delete(Path f, boolean recursive, boolean asyncDelete) throws IOException {
         if (statistics != null) {
             statistics.incrementWriteOps(1);
         }
         try {
-            libFs.delete(formatPath(f), recursive);
+            if (asyncDelete) {
+                libFs.deleteAsync(formatPath(f), recursive);
+            } else {
+                libFs.delete(formatPath(f), recursive);
+            }
             return true;
         } catch (FileNotFoundException e) {
             return false;

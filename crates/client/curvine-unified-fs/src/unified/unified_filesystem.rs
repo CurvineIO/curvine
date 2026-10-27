@@ -946,8 +946,30 @@ impl UnifiedFileSystem {
         recursive: bool,
         skip_trash: bool,
     ) -> FsResult<DeleteResult> {
+        self.delete_mode(path, recursive, skip_trash, false).await
+    }
+
+    /// Deletes without waiting for the master to reclaim the entry: it is staged
+    /// under `/.Trash/.pending` and purged in the background, so the returned
+    /// counts are zero.
+    ///
+    /// Only Curvine paths can be staged. A path under a mount is still deleted
+    /// synchronously, because the caller (or the FUSE request) already deleted
+    /// the backing UFS object and there is nothing left to restore.
+    pub async fn delete_async(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
+        self.delete_mode(path, recursive, false, true).await
+    }
+
+    async fn delete_mode(
+        &self,
+        path: &Path,
+        recursive: bool,
+        skip_trash: bool,
+        async_delete: bool,
+    ) -> FsResult<DeleteResult> {
         let fut = async {
             match self.get_mount_checked(path, RpcCode::Delete).await? {
+                None if async_delete && !skip_trash => self.cv.delete_async(path, recursive).await,
                 None => self.cv.delete_with_opts(path, recursive, skip_trash).await,
                 Some((ufs_path, mount)) => {
                     if path.path() == mount.info.cv_path {
@@ -1018,6 +1040,13 @@ impl UnifiedFileSystem {
 
     pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
         self.cv.empty_trash().await
+    }
+
+    /// Empties the recycle bin by staging the entries for the background purger
+    /// and returns `(accepted, reclaimed)`, where reclamation usually reports
+    /// zeros because the purge has not run yet.
+    pub async fn empty_trash_async(&self) -> FsResult<(u64, DeleteResult)> {
+        self.cv.empty_trash_async().await
     }
 }
 

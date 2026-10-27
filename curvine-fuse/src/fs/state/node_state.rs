@@ -31,7 +31,7 @@ use curvine_client::unified::UnifiedFileSystem;
 use curvine_config::ClusterConf;
 use curvine_config::{ClientConf, FuseConf};
 use curvine_core_error::err_box;
-use curvine_error::FsError;
+use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{FileSystem, ListStream, Path};
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{
@@ -737,6 +737,19 @@ impl NodeState {
         }
     }
 
+    /// Deletes `path` on the master, honouring `fuse.async_delete`.
+    ///
+    /// Both lanes have the same namespace effect, so callers keep treating `Ok`
+    /// as "the name is gone". The async lane only moves the physical
+    /// reclamation into the master's background purger and reports no counts.
+    pub async fn delete_path(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
+        if self.fs.conf().fuse.async_delete {
+            self.fs.delete_async(path, recursive).await
+        } else {
+            self.fs.delete(path, recursive).await
+        }
+    }
+
     pub async fn fs_unlink(&self, parent: u64, name: &str) -> FuseResult<()> {
         let path = {
             let dir = self.dir_read();
@@ -754,7 +767,7 @@ impl NodeState {
         // already-gone as success so recursive cleanup (LTP tst_rmdir) is
         // not failed by ENOENT on a stale name.
         let Some(ino) = ino else {
-            return match self.fs.delete(&path, false).await {
+            return match self.delete_path(&path, false).await {
                 Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
                 Err(e) => Err(e.into()),
             };
@@ -777,7 +790,7 @@ impl NodeState {
                 self.repoint_canonical_from_master(ino, parent, name)
                     .await?;
             }
-            match self.fs.delete(&path, false).await {
+            match self.delete_path(&path, false).await {
                 Ok(_) | Err(FsError::FileNotFound(_)) => (),
                 Err(e) => {
                     self.restore_unlink_state(rollback)?;
@@ -802,7 +815,7 @@ impl NodeState {
             return Ok(());
         }
 
-        match self.fs.delete(&path, false).await {
+        match self.delete_path(&path, false).await {
             Ok(_) => (),
             Err(FsError::FileNotFound(_)) => (),
             Err(e) => {

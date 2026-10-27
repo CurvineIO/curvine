@@ -199,6 +199,12 @@ impl CurvineFileSystem {
             .await
     }
 
+    /// Deletes without waiting for the master to reclaim the entry; see
+    /// [`FsClient::delete_async`].
+    pub async fn delete_async(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
+        self.fs_client.delete_async(path, recursive).await
+    }
+
     pub async fn list_trash_page(
         &self,
         page_token: Option<String>,
@@ -222,6 +228,10 @@ impl CurvineFileSystem {
 
     pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
         self.fs_client.empty_trash().await
+    }
+
+    pub async fn empty_trash_async(&self) -> FsResult<(u64, DeleteResult)> {
+        self.fs_client.empty_trash_async().await
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {

@@ -390,6 +390,15 @@ public class CurvineNative {
 
     public static native long delete(long nativeHandle, String path, boolean recursive) throws IOException;
 
+    /**
+     * Delete a path without waiting for the master to reclaim it.
+     *
+     * <p>The entry is staged under {@code /.Trash/.pending} and purged in the background, so the
+     * call returns as soon as the name is removed from the namespace. Mounted paths stay
+     * synchronous because their backing UFS object is deleted first.
+     */
+    public static native long deleteAsync(long nativeHandle, String path, boolean recursive) throws IOException;
+
     /** Release Curvine blocks and metadata for a path and return the released totals. */
     public static native byte[] free(long nativeHandle, String path, boolean recursive) throws IOException;
 
