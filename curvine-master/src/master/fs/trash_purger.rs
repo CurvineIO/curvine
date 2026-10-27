@@ -463,7 +463,7 @@ mod tests {
             "only applied batches contribute inodes"
         );
         assert!(
-            metrics.trash_purge_errors.get() >= errors + 1,
+            metrics.trash_purge_errors.get() > errors,
             "failed batches are counted separately"
         );
     }
