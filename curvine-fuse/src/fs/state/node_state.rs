@@ -38,7 +38,7 @@ use curvine_model::{
     CreateFileOpts, DeleteResult, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags,
     RenameFlags, SetAttrOpts,
 };
-use curvine_runtime::common::FastHashMap;
+use curvine_runtime::common::{FastHashMap, LocalTime};
 use curvine_runtime::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
@@ -48,6 +48,17 @@ use std::sync::Arc;
 enum StatProbe {
     Hit(FileStatus),
     Miss(Path),
+}
+
+/// Outcome of one `NodeState::clear` sweep over the dcache.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EvictStats {
+    /// Expired, handle-free inodes found by the read-lock scan.
+    pub candidates: usize,
+    /// Inodes actually removed; a candidate can become ineligible between scan and removal.
+    pub evicted: usize,
+    /// Inodes removed during each write-lock hold, in order. `sum() == evicted`.
+    pub batches: Vec<usize>,
 }
 
 pub struct NodeState {
@@ -242,10 +253,43 @@ impl NodeState {
         Ok(attr)
     }
 
-    pub fn clear(&self) -> FuseResult<()> {
-        let mut dir = self.dir_write();
-        dir.clear(|ino| self.has_open_handles(ino));
-        Ok(())
+    /// Max inodes removed per dcache write-lock hold during `clear`.
+    const EVICT_BATCH_SIZE: usize = 1024;
+
+    /// Evicts expired inodes. The scan holds only the read lock, and removals
+    /// take the write lock per batch so foreground metadata ops are not starved
+    /// for the whole sweep.
+    pub fn clear(&self) -> FuseResult<EvictStats> {
+        let start = LocalTime::mills();
+        let candidates = self
+            .dir_read()
+            .evict_candidates(|ino| self.has_open_handles(ino));
+
+        // One write-lock hold per batch; the per-batch counts are returned so a test
+        // can pin that bound instead of only checking that everything was removed.
+        let batches: Vec<usize> = candidates
+            .chunks(Self::EVICT_BATCH_SIZE)
+            .map(|batch| {
+                self.dir_write()
+                    .evict(batch, |ino| self.has_open_handles(ino))
+            })
+            .collect();
+
+        let stats = EvictStats {
+            candidates: candidates.len(),
+            evicted: batches.iter().sum(),
+            batches,
+        };
+        info!(
+            "node_state::clear: evicted {} of {} expired inodes in {} batches, remaining {}, \
+             cost {} ms",
+            stats.evicted,
+            stats.candidates,
+            stats.batches.len(),
+            self.dir_read().inode_lens(),
+            LocalTime::mills() - start
+        );
+        Ok(stats)
     }
 
     pub async fn lookup_common(&self, parent: u64, name: &str) -> FuseResult<fuse_attr> {
@@ -1614,6 +1658,51 @@ mod test {
             state.dir_read().get_inode(ino, None::<&str>).is_none(),
             "the expired inode should be evicted after its directory handle is released"
         );
+    }
+
+    #[test]
+    fn clear_evicts_across_multiple_batches() {
+        crate::FuseMetrics::ensure_init().unwrap();
+        let rt = Arc::new(AsyncRuntime::single());
+        let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+        let total = 2 * NodeState::EVICT_BATCH_SIZE + 3;
+        {
+            let mut tree = state.dir_write();
+            for i in 0..total {
+                let name = format!("f{i}");
+                let status = FileStatus::with_name(0, name.clone(), false);
+                let ino = tree.lookup(FUSE_ROOT_ID, &name, status, true).unwrap().ino;
+                tree.forget(ino, 1).unwrap();
+                tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            }
+        }
+        let before = state.dir_read().inode_lens();
+
+        let stats = state.clear().unwrap();
+
+        // The bound this refactor promises is 1024 removals per write-lock hold. Keep it literal
+        // instead of deriving it from `EVICT_BATCH_SIZE`: weakening the constant (e.g. to
+        // `usize::MAX`, or collapsing the loop into one `dir_write().evict(&candidates, ..)`)
+        // would otherwise relax the expectation along with the implementation.
+        const MAX_REMOVALS_PER_HOLD: usize = 1024;
+        assert_eq!(stats.candidates, total);
+        assert_eq!(stats.evicted, total);
+        assert_eq!(
+            stats.batches.len(),
+            total.div_ceil(MAX_REMOVALS_PER_HOLD),
+            "one write-lock hold per batch: {:?}",
+            stats.batches
+        );
+        assert!(
+            stats.batches.iter().all(|&n| n <= MAX_REMOVALS_PER_HOLD),
+            "a write-lock hold may not cover more than {MAX_REMOVALS_PER_HOLD} removals: {:?}",
+            stats.batches
+        );
+
+        let dir = state.dir_read();
+        assert_eq!(dir.inode_lens(), before - total);
+        assert!(dir.get_dir_check(FUSE_ROOT_ID).unwrap().children.is_empty());
     }
 
     #[test]

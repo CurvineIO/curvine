@@ -25,7 +25,6 @@ use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{FileStatus, SetAttrOpts};
 use curvine_runtime::common::{FastHashMap, LocalTime};
 use curvine_runtime::sync::AtomicCounter;
-use log::info;
 use std::collections::hash_map::Iter;
 
 /// Snapshot of dentry state before `unlink`, used to roll back local mutations when
@@ -704,30 +703,56 @@ impl DirTree {
         self.inodes.iter()
     }
 
-    pub fn clear(&mut self, has_handle: impl Fn(u64) -> bool) {
-        let now = LocalTime::mills();
+    /// Finds expired inodes that may be evicted, returning their inode numbers. Runs under the
+    /// read lock, so it must not mutate.
+    ///
+    /// The result is **advisory**: a snapshot taken under one lock hold, not an eviction decision.
+    /// `evict` must re-run `can_evict` and the open-handle check under the write lock, because a
+    /// candidate can be re-referenced by a LOOKUP, opened, marked for delete, or get a child again
+    /// before its batch runs.
+    ///
+    /// Every read taken here is therefore only a pre-filter -- including `n_lookup` inside
+    /// `can_evict`, which is why that counter may be read without stronger ordering guarantees; the
+    /// load that actually decides an eviction is the one `evict` takes under the write lock.
+    ///
+    /// The snapshot is a full `Vec<u64>` of expired inos: 8 bytes each, so ~8 MB for a million
+    /// candidates, allocated before the first batch is evicted. That is deliberate -- evicting
+    /// while scanning would either hold the write lock for the whole sweep (what this split
+    /// replaced) or force a rescan from the start for every batch.
+    pub fn evict_candidates(&self, has_handle: impl Fn(u64) -> bool) -> Vec<u64> {
         let ttl = self.cache_ttl;
-
-        let removed: Vec<(u64, u64, String)> = self
-            .inodes
+        self.inodes
             .values()
             .filter(|inode| inode.can_evict(ttl) && !has_handle(inode.ino))
-            .map(|i| (i.ino, i.parent, i.name.clone()))
-            .collect();
+            .map(|inode| inode.ino)
+            .collect()
+    }
 
-        for (ino, parent, name) in &removed {
-            if let Some(dir) = self.inodes.get_mut(parent) {
-                dir.remove_child(name)
+    /// Evicts `inos`, re-checking each one: the tree may have changed since
+    /// `evict_candidates` ran under a separate lock.
+    pub fn evict(&mut self, inos: &[u64], has_handle: impl Fn(u64) -> bool) -> usize {
+        let ttl = self.cache_ttl;
+        let mut evicted = 0;
+        for ino in inos {
+            let Some(inode) = self.inodes.get(ino) else {
+                continue;
+            };
+            // Mandatory, not redundant. This write-lock hold is where the eviction decision is
+            // taken; the candidate came from a scan under a *different* lock hold and may have been
+            // re-looked-up, opened, marked deleted, or given a child since. Removing this check
+            // would evict a live inode.
+            if !inode.can_evict(ttl) || has_handle(*ino) {
+                continue;
+            }
+            let parent = inode.parent;
+            let name = inode.name.clone();
+            if let Some(dir) = self.inodes.get_mut(&parent) {
+                dir.remove_child(&name)
             }
             self.remove_inode(*ino);
+            evicted += 1;
         }
-
-        info!(
-            "DirTree::clear: evicted {} expired inodes, remaining {}, cost {} ms",
-            removed.len(),
-            self.inodes.len(),
-            LocalTime::mills() - now
-        );
+        evicted
     }
 }
 
@@ -743,6 +768,13 @@ mod test {
     use crate::FUSE_ROOT_ID;
     use curvine_config::FuseConf;
     use curvine_model::FileStatus;
+
+    /// Unbatched scan + evict in one call, for tests only. Production eviction goes through
+    /// `NodeState::clear`, which releases the write lock between batches.
+    fn evict_all(t: &mut DirTree, has_handle: impl Fn(u64) -> bool) {
+        let candidates = t.evict_candidates(&has_handle);
+        t.evict(&candidates, &has_handle);
+    }
 
     fn dir_st(name: &str, id: i64) -> FileStatus {
         FileStatus {
@@ -1321,7 +1353,7 @@ mod test {
         t.get_inode_mut(d3, None).unwrap().last_access = 0;
 
         // Run clear; treat f3 as having an open handle
-        t.clear(|ino| ino == f3);
+        evict_all(&mut t, |ino| ino == f3);
 
         assert!(
             t.get_inode(f1, None::<&str>).is_some(),
@@ -1368,11 +1400,45 @@ mod test {
             .ino;
         t0.forget(fx, 1).unwrap();
         t0.get_inode_mut(fx, None).unwrap().last_access = 0;
-        t0.clear(|_| false);
+        evict_all(&mut t0, |_| false);
         assert!(
             t0.get_inode(fx, None::<&str>).is_none(),
             "cache_ttl=0 still evicts when last_access + ttl <= now"
         );
+    }
+
+    /// `evict` runs under a different lock hold than `evict_candidates`, so it
+    /// must re-validate every candidate instead of trusting the earlier scan.
+    #[test]
+    fn evict_rechecks_candidates_changed_after_scan() {
+        let mut tree = DirTree::default();
+        let expired = |tree: &mut DirTree, name: &str| {
+            let ino = tree
+                .lookup(FUSE_ROOT_ID, name, file_st(name, 0), true)
+                .unwrap()
+                .ino;
+            tree.forget(ino, 1).unwrap();
+            tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            ino
+        };
+        let relooked = expired(&mut tree, "relooked");
+        let opened = expired(&mut tree, "opened");
+        let gone = expired(&mut tree, "gone");
+
+        let mut candidates = tree.evict_candidates(|_| false);
+        candidates.sort_unstable();
+        let mut want = vec![relooked, opened, gone];
+        want.sort_unstable();
+        assert_eq!(candidates, want);
+
+        tree.lookup(FUSE_ROOT_ID, "relooked", file_st("relooked", 0), true)
+            .unwrap();
+        assert_eq!(tree.evict(&[gone], |_| false), 1);
+
+        assert_eq!(tree.evict(&candidates, |ino| ino == opened), 0);
+        assert!(tree.get_inode(FUSE_ROOT_ID, Some("relooked")).is_some());
+        assert!(tree.get_inode(FUSE_ROOT_ID, Some("opened")).is_some());
+        assert!(tree.get_inode(gone, None::<&str>).is_none());
     }
 
     /// The kernel may continue addressing an inode by nodeid until it sends FORGET.
@@ -1386,7 +1452,7 @@ mod test {
             .ino;
         tree.get_inode_mut(ino, None).unwrap().last_access = 0;
 
-        tree.clear(|_| false);
+        evict_all(&mut tree, |_| false);
 
         assert!(
             tree.get_inode(ino, None::<&str>).is_some(),
@@ -1407,7 +1473,7 @@ mod test {
         tree.unlink(FUSE_ROOT_ID, "pending", true).unwrap();
         tree.get_inode_mut(ino, None).unwrap().last_access = 0;
 
-        tree.clear(|_| false);
+        evict_all(&mut tree, |_| false);
 
         assert!(
             tree.pending_delete(ino),
@@ -1421,7 +1487,7 @@ mod test {
         );
 
         tree.clear_mark_delete(ino).unwrap();
-        tree.clear(|_| false);
+        evict_all(&mut tree, |_| false);
         assert!(
             tree.get_inode(ino, None::<&str>).is_none(),
             "completed deferred-delete state may be evicted after TTL expiry"

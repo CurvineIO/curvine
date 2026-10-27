@@ -23,8 +23,9 @@ use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Kernel lookup count. Atomic so a dcache-hit LOOKUP can bump it under the read lock;
-/// every read that drives eviction happens under the write lock, so Relaxed suffices.
+/// Kernel lookup count. Atomic so a dcache-hit LOOKUP can bump it under the read lock.
+/// Relaxed suffices: read-lock readers (e.g. `DirTree::evict_candidates`) only pre-filter,
+/// and the eviction decision is taken under the write lock, where `DirTree::evict` rechecks it.
 #[derive(Default, Debug, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct LookupCount(AtomicU64);
