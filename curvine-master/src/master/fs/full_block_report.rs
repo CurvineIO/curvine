@@ -228,6 +228,21 @@ impl FullReportTracker {
         state.rounds.remove(&worker_id);
     }
 
+    /// Whether a full report has batches still in flight for this worker. A
+    /// follower heartbeat must not request a second snapshot between batches;
+    /// the sender preserves FIFO order and will finish the open round or mark
+    /// the peer stale when delivery fails.
+    pub(super) fn has_open_session(&self, worker_id: u32, now: u64) -> bool {
+        let mut state = self.state.lock();
+        if state.sessions.get(&worker_id).is_some_and(|session| {
+            now.saturating_sub(session.update_time_ms) <= FULL_BLOCK_REPORT_TTL_MS
+        }) {
+            return true;
+        }
+        state.sessions.remove(&worker_id);
+        false
+    }
+
     /// An incremental report arrived while a full report was in progress, so the
     /// blocks accumulated so far can no longer be trusted.
     pub(super) fn invalidate_session(&self, worker_id: u32, now: u64) {
@@ -293,6 +308,18 @@ mod tests {
             tracker.collect(&batch(1, 7, 3, &[3]), T0),
             FullReportProgress::Duplicate
         ));
+    }
+
+    #[test]
+    fn open_session_is_visible_until_report_ttl_expires() {
+        let tracker = FullReportTracker::default();
+        assert!(matches!(
+            tracker.collect(&batch(1, 7, 3, &[1]), T0),
+            FullReportProgress::Partial
+        ));
+        assert!(tracker.has_open_session(1, T0));
+        assert!(!tracker.has_open_session(1, T0 + FULL_BLOCK_REPORT_TTL_MS + 1));
+        assert!(!tracker.has_open_session(1, T0 + FULL_BLOCK_REPORT_TTL_MS + 1));
     }
 
     #[test]
