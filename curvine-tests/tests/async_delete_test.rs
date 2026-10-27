@@ -118,3 +118,60 @@ fn async_delete_space_is_reclaimed_by_the_purger() -> CommonResult<()> {
     }
     Ok(())
 }
+
+/// Manual comparison of the two lanes. Run with:
+/// `cargo test -p curvine-tests --test async_delete_test bench_ -- --ignored --nocapture`
+#[test]
+#[ignore = "manual benchmark: measures sync vs async recursive delete"]
+fn bench_sync_vs_async_delete() -> CommonResult<()> {
+    // Override with BENCH_INODES to measure a different tree size.
+    let inodes: usize = std::env::var("BENCH_INODES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5_000);
+    let fs = get_fs(false);
+
+    // Warm the client and the master connection so the first call is not skewed.
+    let warm = Path::from_str("/bench-warm")?;
+    fs.clone_runtime()
+        .block_on(async { fs.create(&warm, true).await })?;
+    fs.clone_runtime()
+        .block_on(async { fs.delete(&warm, true).await })?;
+
+    let sync_root = Path::from_str("/bench-sync")?;
+    seed(&fs, "/bench-sync", 50, inodes / 50);
+    let started = Instant::now();
+    fs.clone_runtime()
+        .block_on(async { fs.delete(&sync_root, true).await })?;
+    let sync_delete = started.elapsed();
+
+    let async_root = Path::from_str("/bench-async")?;
+    seed(&fs, "/bench-async", 50, inodes / 50);
+    let started = Instant::now();
+    let res = fs
+        .clone_runtime()
+        .block_on(async { fs.delete_async(&async_root, true).await })?;
+    let async_delete = started.elapsed();
+
+    // Purge lag: how long until the master has reclaimed the staged tree.
+    let started = Instant::now();
+    let mut purge_lag = None;
+    while started.elapsed() < Duration::from_secs(120) {
+        let pending = fs
+            .clone_runtime()
+            .block_on(async { fs.get_status(&Path::from_str("/.Trash/.pending")?).await });
+        if pending.map(|status| status.len == 0).unwrap_or(true) {
+            purge_lag = Some(started.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    println!(
+        "inodes={inodes} sync_delete={sync_delete:?} async_delete={async_delete:?} \
+         purge_pending={} purge_lag={:?}",
+        res.purge_pending, purge_lag
+    );
+    assert!(res.purge_pending);
+    Ok(())
+}

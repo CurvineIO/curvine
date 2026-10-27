@@ -202,6 +202,12 @@ attr_timeout = "1s"       # kernel attribute cache; 0 disables it
 entry_timeout = "1s"      # kernel dentry (name lookup) cache; 0 disables it
 negative_timeout = 0      # negative-lookup (ENOENT) cache; 0 = disabled
 
+# Route unlink/rmdir through the master's async delete lane: the name leaves the
+# namespace immediately and the master reclaims the blocks in the background
+# (see docs/async-delete.md). Off by default because POSIX users expect the space
+# to be free when the call returns. Mounted paths always stay synchronous.
+# async_delete = false
+
 # The log configuration of the customer service side, and the customer service side of rust, java, and fuse use this log file.
 [log]
 level = "info"
