@@ -332,6 +332,7 @@ struct EvictionStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::master::fs::DeleteMode;
     use crate::master::journal::JournalSystem;
     use crate::master::meta::inode::ttl::InodeTtlExecutor;
     use crate::master::quota::eviction::evictor::LRUEvictor;
@@ -435,7 +436,7 @@ mod tests {
     fn eviction_consumes_trash_candidates_without_counting_them() {
         let fs = test_fs("trash-consumed", true);
         let victim = fs.create("/trash/victim.log", true).unwrap().id;
-        fs.delete_with_opts("/trash/victim.log", false, false)
+        fs.delete_with_mode("/trash/victim.log", false, DeleteMode::Default)
             .unwrap();
 
         let mut entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
