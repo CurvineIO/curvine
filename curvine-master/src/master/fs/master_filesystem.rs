@@ -1269,6 +1269,11 @@ impl MasterFilesystem {
         self.fs_dir.clone()
     }
 
+    pub fn create_leader_snapshot(&self) -> FsResult<LeaderSnapshotInfo> {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.create_snapshot()
+    }
+
     // Add a test worker and unit tests will use it.
     pub fn add_test_worker(&self, worker: WorkerInfo) {
         let mut wm = self.worker_manager.write();

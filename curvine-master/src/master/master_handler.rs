@@ -1003,6 +1003,19 @@ impl MasterHandler {
         ctx.response(MetricsReportResponse {})
     }
 
+    fn create_leader_snapshot(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let _: CreateLeaderSnapshotRequest = ctx.parse_header()?;
+        ctx.set_audit(Some("leader-snapshot".to_string()), None);
+
+        let info = self.fs.create_leader_snapshot()?;
+
+        ctx.response(CreateLeaderSnapshotResponse {
+            dir: info.dir,
+            inode_id: info.inode_id,
+            cost_ms: info.cost_ms as i64,
+        })
+    }
+
     fn link_retry_check(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: LinkRequest = ctx.parse_header()?;
         ctx.set_audit(
@@ -1289,6 +1302,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::GetMountInfo => self.get_mount_info(ctx),
 
                 RpcCode::MetricsReport => self.metrics_report(ctx),
+                RpcCode::CreateLeaderSnapshot => self.create_leader_snapshot(ctx),
 
                 // Worker related requests
                 RpcCode::WorkerHeartbeat => self.worker_heartbeat(ctx),

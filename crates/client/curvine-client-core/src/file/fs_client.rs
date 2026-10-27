@@ -933,6 +933,20 @@ impl FsClient {
         Ok(rep.conflict.map(ProtoUtils::file_lock_from_pb))
     }
 
+    pub async fn create_leader_snapshot(&self) -> FsResult<LeaderSnapshotInfo> {
+        let rep: CreateLeaderSnapshotResponse = self
+            .rpc(
+                RpcCode::CreateLeaderSnapshot,
+                CreateLeaderSnapshotRequest::default(),
+            )
+            .await?;
+        Ok(LeaderSnapshotInfo {
+            dir: rep.dir,
+            inode_id: rep.inode_id,
+            cost_ms: rep.cost_ms.max(0) as u64,
+        })
+    }
+
     pub async fn rpc<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>
     where
         T: PMessage + Default,

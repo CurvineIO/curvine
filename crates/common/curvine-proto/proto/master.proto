@@ -470,3 +470,11 @@ message GetCvMetadataSnapshotPageResponse {
     optional string next_page_token = 2;
     required uint64 epoch = 3;
 }
+
+message CreateLeaderSnapshotRequest {}
+
+message CreateLeaderSnapshotResponse {
+    required string dir = 1;
+    required int64 inode_id = 2;
+    required int64 cost_ms = 3;
+}

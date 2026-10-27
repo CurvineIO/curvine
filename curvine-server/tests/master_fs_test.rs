@@ -28,10 +28,10 @@ use curvine_model::{
 use curvine_model::{ListOptions, OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
-    CreateFileRequest, DeleteRequest, EmptyTrashRequest, EmptyTrashResponse,
-    GetFilesystemInfoRequest, ListTrashRequest, ListTrashResponse, MkdirOptsProto, MkdirRequest,
-    MountRequest, RenameRequest, RestoreTrashRequest, RestoreTrashResponse, WorkerHeartbeatRequest,
-    WorkerHeartbeatResponse,
+    CreateFileRequest, CreateLeaderSnapshotRequest, DeleteRequest, EmptyTrashRequest,
+    EmptyTrashResponse, GetFilesystemInfoRequest, ListTrashRequest, ListTrashResponse,
+    MkdirOptsProto, MkdirRequest, MountRequest, RenameRequest, RestoreTrashRequest,
+    RestoreTrashResponse, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -2458,6 +2458,26 @@ fn trash_rpc_dispatches_through_handle() -> CommonResult<()> {
     let empty_rep: EmptyTrashResponse = empty_rep.parse_header()?;
     assert_eq!(empty_rep.res.inodes, 1);
     assert!(fs.list_trash()?.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn create_leader_snapshot_rpc_is_dispatched_and_requires_journal() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_active_master("leader-snapshot-no-journal", |_| {});
+
+    let msg = Builder::new_rpc(RpcCode::CreateLeaderSnapshot)
+        .proto_header(CreateLeaderSnapshotRequest {})
+        .build();
+    let rep = handler.handle(&msg)?;
+
+    assert!(!rep.is_success());
+    assert!(
+        rep.to_error_msg().contains("journal.enable"),
+        "unexpected error: {}",
+        rep.to_error_msg()
+    );
 
     Ok(())
 }
