@@ -196,6 +196,7 @@ impl FollowerBlockReportState {
     }
 
     /// Remove stale entries for a worker after its full report completes.
+    #[cfg(test)]
     pub(super) fn retain_reported_blocks(&self, worker_id: u32, reported: &HashSet<i64>) {
         self.0
             .write()
@@ -210,6 +211,7 @@ impl FollowerBlockReportState {
         self.remove_deferred(worker_id, block_id);
     }
 
+    #[cfg(test)]
     pub(super) fn mark_full_report_complete(&self, worker_id: u32) {
         let mut state = self.0.write();
         state.workers.insert(worker_id);

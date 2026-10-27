@@ -189,7 +189,7 @@ impl FullReportTracker {
         {
             sessions.remove(&list.worker_id);
         }
-        if !sessions.contains_key(&list.worker_id) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = sessions.entry(list.worker_id) {
             let inventory_slot = match self.max_inflight_inventories {
                 Some(limit) => {
                     match ReportInventorySlot::try_acquire(&self.inflight_inventories, limit) {
@@ -200,19 +200,16 @@ impl FullReportTracker {
                 None => None,
             };
 
-            sessions.insert(
-                list.worker_id,
-                Session {
-                    report_id: list.report_id,
-                    total_len: list.total_len,
-                    update_time_ms: now,
-                    // Avoid trusting the worker's total_len as an allocation
-                    // hint. The bounded slot limits concurrent inventories;
-                    // gradual growth follows the actual received block ids.
-                    reported_blocks: HashSet::with_capacity((list.total_len as usize).min(4096)),
-                    inventory_slot,
-                },
-            );
+            entry.insert(Session {
+                report_id: list.report_id,
+                total_len: list.total_len,
+                update_time_ms: now,
+                // Avoid trusting the worker's total_len as an allocation
+                // hint. The bounded slot limits concurrent inventories;
+                // gradual growth follows the actual received block ids.
+                reported_blocks: HashSet::with_capacity((list.total_len as usize).min(4096)),
+                inventory_slot,
+            });
         }
 
         let session = sessions.get_mut(&list.worker_id).expect("session inserted");
