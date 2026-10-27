@@ -754,11 +754,6 @@ impl DirTree {
         }
         evicted
     }
-
-    pub fn clear(&mut self, has_handle: impl Fn(u64) -> bool) -> usize {
-        let candidates = self.evict_candidates(&has_handle);
-        self.evict(&candidates, &has_handle)
-    }
 }
 
 impl Default for DirTree {
@@ -773,6 +768,13 @@ mod test {
     use crate::FUSE_ROOT_ID;
     use curvine_config::FuseConf;
     use curvine_model::FileStatus;
+
+    /// Unbatched scan + evict in one call, for tests only. Production eviction goes through
+    /// `NodeState::clear`, which releases the write lock between batches.
+    fn evict_all(t: &mut DirTree, has_handle: impl Fn(u64) -> bool) {
+        let candidates = t.evict_candidates(&has_handle);
+        t.evict(&candidates, &has_handle);
+    }
 
     fn dir_st(name: &str, id: i64) -> FileStatus {
         FileStatus {
@@ -1351,7 +1353,7 @@ mod test {
         t.get_inode_mut(d3, None).unwrap().last_access = 0;
 
         // Run clear; treat f3 as having an open handle
-        t.clear(|ino| ino == f3);
+        evict_all(&mut t, |ino| ino == f3);
 
         assert!(
             t.get_inode(f1, None::<&str>).is_some(),
@@ -1398,7 +1400,7 @@ mod test {
             .ino;
         t0.forget(fx, 1).unwrap();
         t0.get_inode_mut(fx, None).unwrap().last_access = 0;
-        t0.clear(|_| false);
+        evict_all(&mut t0, |_| false);
         assert!(
             t0.get_inode(fx, None::<&str>).is_none(),
             "cache_ttl=0 still evicts when last_access + ttl <= now"
@@ -1450,7 +1452,7 @@ mod test {
             .ino;
         tree.get_inode_mut(ino, None).unwrap().last_access = 0;
 
-        tree.clear(|_| false);
+        evict_all(&mut tree, |_| false);
 
         assert!(
             tree.get_inode(ino, None::<&str>).is_some(),
@@ -1471,7 +1473,7 @@ mod test {
         tree.unlink(FUSE_ROOT_ID, "pending", true).unwrap();
         tree.get_inode_mut(ino, None).unwrap().last_access = 0;
 
-        tree.clear(|_| false);
+        evict_all(&mut tree, |_| false);
 
         assert!(
             tree.pending_delete(ino),
@@ -1485,7 +1487,7 @@ mod test {
         );
 
         tree.clear_mark_delete(ino).unwrap();
-        tree.clear(|_| false);
+        evict_all(&mut tree, |_| false);
         assert!(
             tree.get_inode(ino, None::<&str>).is_none(),
             "completed deferred-delete state may be evicted after TTL expiry"
