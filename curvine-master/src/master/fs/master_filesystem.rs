@@ -1466,10 +1466,8 @@ impl MasterFilesystem {
             // worker session. The report lock keeps reports from observing the
             // old map between these operations.
             self.observe_passive_worker_heartbeat_locked(status, worker_id, &worker_manager);
-            update(&mut worker_manager)?;
-        } else {
-            update(&mut worker_manager)?;
         }
+        update(&mut worker_manager)?;
         let current_snapshot = self.master_monitor.follower_readiness_snapshot();
         if self.master_monitor.is_active()
             || current_snapshot.role != RoleState::Follower

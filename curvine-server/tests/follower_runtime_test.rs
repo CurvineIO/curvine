@@ -829,9 +829,11 @@ fn run_cluster(mirror_reports: bool) {
                     let header: GetBlockLocationsResponse =
                         leader_locations.parse_header().unwrap();
                     let expected = ProtoUtils::file_blocks_from_pb(header.blocks);
-                    marked_file_blocks(&confs[0], stable_follower_index, &path)
-                        .await
-                        .is_some_and(|actual| same_block_locations(&actual, &expected))
+                    !expected.block_locs.is_empty()
+                        && expected.block_locs.iter().all(|block| !block.locs.is_empty())
+                        && marked_file_blocks(&confs[0], stable_follower_index, &path)
+                            .await
+                            .is_some_and(|actual| same_block_locations(&actual, &expected))
                 } else {
                     false
                 };
