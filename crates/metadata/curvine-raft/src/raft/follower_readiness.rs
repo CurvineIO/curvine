@@ -234,8 +234,8 @@ impl FollowerReadinessMonitor {
         state.term = term;
         state.leader_id = leader_id;
         state.commit_index = commit_index;
-        Self::update_lag_timer(&mut state, now);
-        Self::update_replication_lag_timer(&mut state, now, local_commit_advanced);
+        Self::update_lag_timer(state, now);
+        Self::update_replication_lag_timer(state, now, local_commit_advanced);
     }
 
     /// Records contact only when the Raft caller has verified that the
@@ -282,7 +282,7 @@ impl FollowerReadinessMonitor {
                             .map_or(commit, |observed| observed.max(commit)),
                     );
                     state.leader_commit_contact_proven = true;
-                    Self::update_replication_lag_timer(&mut state, now, false);
+                    Self::update_replication_lag_timer(state, now, false);
                 }
                 None => {
                     // Preserve the epoch's high watermark for a later
