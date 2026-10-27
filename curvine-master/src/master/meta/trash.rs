@@ -21,6 +21,16 @@ pub const TRASH_ROOT: &str = "/.Trash";
 
 const TRASH_ROOT_PREFIX: &str = ".Trash/";
 
+// Staging directory for asynchronous deletes. It lives inside the reserved trash
+// namespace, so entries under it are never listed, restored or swept by the
+// retention pass: `list_trash` and `empty_trash` filter children by
+// `parse_entry_delete_ms`, and `scan_expired_trash` requires trash xattrs.
+pub const TRASH_PENDING_NAME: &str = ".pending";
+
+pub const TRASH_PENDING_ROOT: &str = "/.Trash/.pending";
+
+const TRASH_PENDING_PREFIX: &str = ".Trash/.pending/";
+
 // Internal xattr keys. The NUL prefix keeps them out of client-visible
 // xattr listings, matching the convention used for \0curvine.ctime.
 pub const TRASH_XATTR_ORIGIN: &str = "\0curvine.trash.origin";
@@ -48,6 +58,27 @@ pub fn trash_entry_name(delete_ms: i64, inode_id: i64) -> String {
 
 pub fn trash_entry_path(entry_name: &str) -> String {
     format!("{}{}{}", TRASH_ROOT, PATH_SEPARATOR, entry_name)
+}
+
+// True for the pending staging root itself and every path below it.
+pub fn is_pending_path(path: &str) -> bool {
+    match path.strip_prefix(TRASH_PENDING_ROOT) {
+        Some(rest) => rest.is_empty() || rest.starts_with(PATH_SEPARATOR),
+        None => false,
+    }
+}
+
+// Pending entries are always direct children of the pending root.
+pub fn is_pending_entry_path(path: &str) -> bool {
+    let path = path.trim_start_matches(PATH_SEPARATOR);
+    match path.strip_prefix(TRASH_PENDING_PREFIX) {
+        Some(name) => !name.is_empty() && !name.contains(PATH_SEPARATOR),
+        None => false,
+    }
+}
+
+pub fn pending_entry_path(entry_name: &str) -> String {
+    format!("{}{}{}", TRASH_PENDING_ROOT, PATH_SEPARATOR, entry_name)
 }
 
 // Trash entries are always direct children of the trash root.
@@ -102,6 +133,19 @@ mod tests {
         assert!(!is_trash_path("/"));
         assert!(!is_trash_path("/.Trashy"));
         assert!(!is_trash_path("/a/.Trash"));
+    }
+
+    #[test]
+    fn identifies_pending_paths() {
+        assert!(is_pending_path(TRASH_PENDING_ROOT));
+        assert!(is_pending_path("/.Trash/.pending/entry"));
+        assert!(!is_pending_path(TRASH_ROOT));
+        assert!(!is_pending_path("/.Trash/.pendingx"));
+
+        assert!(is_pending_entry_path("/.Trash/.pending/1-2"));
+        assert!(!is_pending_entry_path(TRASH_PENDING_ROOT));
+        assert!(!is_pending_entry_path("/.Trash/.pending/a/b"));
+        assert!(!is_pending_entry_path("/.Trash/1-2"));
     }
 
     #[test]

@@ -264,6 +264,29 @@ impl JournalWriter {
         self.send(fs_dir, JournalEntry::Delete(entry))
     }
 
+    /// Journals one bounded purge batch of `entry`. The batch names the paths it
+    /// removed, so replay applies exactly the same slice the leader applied.
+    pub fn log_trash_purge<P: AsRef<str>>(
+        &self,
+        fs_dir: &FsDir,
+        entry: P,
+        mtime: i64,
+        paths: Vec<String>,
+    ) -> FsResult<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let entry = TrashPurgeEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            entry: entry.as_ref().to_string(),
+            mtime,
+            paths,
+        };
+        self.send(fs_dir, JournalEntry::TrashPurge(entry))
+    }
+
     pub fn log_free<P: AsRef<str>>(
         &self,
         fs_dir: &FsDir,

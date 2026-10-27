@@ -89,6 +89,22 @@ impl RestoreTimer {
     }
 }
 
+/// One namespace entry removed by [`InodeStore::apply_purge`].
+pub struct PurgeItem {
+    /// Parent directory metadata with the batch's mtime/nlink updates applied.
+    /// Directory edges live in their own column family, so children are absent.
+    pub parent: InodeView,
+    /// The removed dentry: a directory's metadata, or the id of the file inode
+    /// released by a file or `FileEntry` dentry.
+    pub target: PurgeTarget,
+    pub name: String,
+}
+
+pub enum PurgeTarget {
+    Dir(InodeView),
+    File(i64),
+}
+
 // Currently, only RockSDB is supported.
 // Note: InodeStore is intentionally NOT Clone.
 // Cloning InodeStore increases Arc<RocksInodeStore> refcount, which prevents
@@ -136,6 +152,75 @@ impl InodeStore {
         }
 
         Ok(())
+    }
+
+    /// Removes a bounded batch of namespace entries with a single store commit.
+    ///
+    /// Directories are removed as empty inodes only: descendants are never
+    /// walked, so the caller must ensure every listed directory is empty once
+    /// the earlier paths of the batch are gone. In-memory indexes (TTL buckets
+    /// and file counts) and the returned block lists are published only after
+    /// the batch commits, so a failed commit applies nothing instead of leaving
+    /// paths durable without their reclamation results.
+    pub fn apply_purge(&self, items: Vec<PurgeItem>, ctime: i64) -> CommonResult<DeleteResult> {
+        let mut batch = self.store.new_batch();
+        // Multiple names (hard links) of one inode may appear in a batch; the
+        // cache makes each decrement see the staged value instead of re-reading
+        // the pre-batch nlink from the store. `None` marks an inode deleted by
+        // an earlier item.
+        let mut staged: HashMap<i64, Option<InodeView>> = HashMap::new();
+        let mut ttl_removals = Vec::new();
+        let mut del_res = DeleteResult::new();
+        let mut deleted_files = 0i64;
+        let mut deleted_dirs = 0i64;
+
+        for item in items {
+            let PurgeItem {
+                parent,
+                target,
+                name,
+            } = item;
+
+            batch.write_inode(&parent)?;
+            batch.delete_child(parent.id(), &name)?;
+
+            match target {
+                PurgeTarget::Dir(dir) => {
+                    batch.delete_inode(dir.id())?;
+                    if dir.id() != ROOT_INODE_ID {
+                        deleted_dirs += 1;
+                    }
+                    ttl_removals.push(dir);
+                }
+                PurgeTarget::File(inode_id) => {
+                    let res = self.stage_decrement_nlink(
+                        inode_id,
+                        ctime,
+                        &mut batch,
+                        &mut staged,
+                        &mut ttl_removals,
+                    )?;
+                    del_res.inodes += res.inodes;
+                    del_res.bytes += res.bytes;
+                    del_res.blocks.extend(res.blocks);
+                    deleted_files += 1;
+                }
+            }
+        }
+
+        batch.commit()?;
+
+        for inode in &ttl_removals {
+            self.ttl_bucket_list.remove(inode);
+        }
+        if deleted_files > 0 {
+            self.fs_stats.add_file_count(-deleted_files);
+        }
+        if deleted_dirs > 0 {
+            self.fs_stats.add_dir_count(-deleted_dirs);
+        }
+
+        Ok(del_res)
     }
 
     pub fn apply_delete(
@@ -479,34 +564,65 @@ impl InodeStore {
         ctime: i64,
         batch: &mut InodeWriteBatch<'_>,
     ) -> CommonResult<DeleteResult> {
+        let mut staged = HashMap::new();
+        let mut ttl_removals = Vec::new();
+        let del_res =
+            self.stage_decrement_nlink(inode_id, ctime, batch, &mut staged, &mut ttl_removals)?;
+
+        for inode in &ttl_removals {
+            self.ttl_bucket_list.remove(inode);
+        }
+        Ok(del_res)
+    }
+
+    // Stages one nlink decrement, reading through `staged` so repeated names of
+    // the same inode inside a purge batch accumulate instead of resetting.
+    fn stage_decrement_nlink(
+        &self,
+        inode_id: i64,
+        ctime: i64,
+        batch: &mut InodeWriteBatch<'_>,
+        staged: &mut HashMap<i64, Option<InodeView>>,
+        ttl_removals: &mut Vec<InodeView>,
+    ) -> CommonResult<DeleteResult> {
         let mut del_res = DeleteResult::new();
-        // Load the inode from storage
-        if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
-            match &mut inode_view {
-                InodeView::File(f) => {
-                    let remaining_links = f.decrement_nlink(ctime);
-                    if remaining_links == 0 {
-                        batch.delete_inode(inode_id)?;
+        let mut inode_view = match staged.remove(&inode_id) {
+            Some(Some(inode)) => inode,
+            Some(None) => return err_box!("Inode {} not found when decrementing nlink", inode_id),
+            None => match self.get_inode(inode_id, None)? {
+                Some(inode) => inode,
+                None => return err_box!("Inode {} not found when decrementing nlink", inode_id),
+            },
+        };
 
-                        // Collect block info
-                        let locs = f.get_locs(self)?;
-                        del_res.inodes = 1;
-                        del_res.bytes = u64::try_from(f.get_locs_bytes(&locs)).unwrap_or(0);
-                        del_res.blocks.extend(locs);
-
-                        self.ttl_bucket_list.remove(&inode_view);
-                    } else {
-                        // Write the updated inode back to storage
-                        batch.write_inode(&inode_view)?;
-                    }
-                }
-                _ => {
-                    return err_box!("Cannot decrement nlink for non-file inode {}", inode_id);
+        let last_link = match &mut inode_view {
+            InodeView::File(f) => {
+                if f.decrement_nlink(ctime) == 0 {
+                    // Collect block info
+                    let locs = f.get_locs(self)?;
+                    del_res.inodes = 1;
+                    del_res.bytes = u64::try_from(f.get_locs_bytes(&locs)).unwrap_or(0);
+                    del_res.blocks.extend(locs);
+                    true
+                } else {
+                    false
                 }
             }
+            _ => {
+                return err_box!("Cannot decrement nlink for non-file inode {}", inode_id);
+            }
+        };
+
+        if last_link {
+            batch.delete_inode(inode_id)?;
+            ttl_removals.push(inode_view);
+            staged.insert(inode_id, None);
         } else {
-            return err_box!("Inode {} not found when decrementing nlink", inode_id);
+            // Write the updated inode back to storage
+            batch.write_inode(&inode_view)?;
+            staged.insert(inode_id, Some(inode_view));
         }
+
         Ok(del_res)
     }
 

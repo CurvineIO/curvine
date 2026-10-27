@@ -42,6 +42,14 @@ const IO_SIZE_BUCKETS: &[f64] = &[
 
 const READDIR_ENTRIES_BUCKETS: &[f64] = &[1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0];
 
+const LOCK_DURATION_BUCKETS_US: &[f64] = &[
+    1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 25000.0,
+    100000.0,
+];
+
+pub(crate) const DCACHE_LOCK_MODE_READ: &str = "read";
+pub(crate) const DCACHE_LOCK_MODE_WRITE: &str = "write";
+
 pub(crate) const REPLY_TYPE_REPLIED: &str = "replied";
 pub(crate) const REPLY_TYPE_NO_REPLY: &str = "no_reply";
 
@@ -204,6 +212,8 @@ pub struct FuseMetrics {
     pub(crate) negative_entry_returned_total: Counter,
     pub(crate) readdir_entries: HistogramVec,
     pub(crate) readdir_duration_us: HistogramVec,
+    pub(crate) dcache_lock_wait_us: HistogramVec,
+    pub(crate) dcache_lock_hold_us: HistogramVec,
 
     pub(crate) state_persist_total: CounterVec,
     pub(crate) state_persist_stage_duration_us: HistogramVec,
@@ -539,6 +549,20 @@ impl FuseMetrics {
                  opendir/list_stream backend init)",
                 &["status"],
                 REQUEST_DURATION_BUCKETS_US,
+            )?,
+            dcache_lock_wait_us: m::new_histogram_vec_with_buckets(
+                "curvine_fuse_dcache_lock_wait_us",
+                "Time spent waiting to acquire the process-wide dcache (DirTree) lock, in \
+                 microseconds. mode=read|write",
+                &["mode"],
+                LOCK_DURATION_BUCKETS_US,
+            )?,
+            dcache_lock_hold_us: m::new_histogram_vec_with_buckets(
+                "curvine_fuse_dcache_lock_hold_us",
+                "Time the process-wide dcache (DirTree) lock is held per acquisition, in \
+                 microseconds. mode=read|write",
+                &["mode"],
+                LOCK_DURATION_BUCKETS_US,
             )?,
 
             // state recovery + session lifecycle.

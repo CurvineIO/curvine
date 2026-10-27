@@ -21,6 +21,46 @@ use curvine_model::{FileStatus, LocatedBlock, SetAttrOpts, SetAttrOptsBuilder};
 use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Kernel lookup count. Atomic so a dcache-hit LOOKUP can bump it under the read lock.
+/// Relaxed suffices: read-lock readers (e.g. `DirTree::evict_candidates`) only pre-filter,
+/// and the eviction decision is taken under the write lock, where `DirTree::evict` rechecks it.
+#[derive(Default, Debug, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct LookupCount(AtomicU64);
+
+impl LookupCount {
+    fn new(v: u64) -> Self {
+        Self(AtomicU64::new(v))
+    }
+
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn add(&self, v: u64) -> u64 {
+        let prev = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(v))
+            })
+            .unwrap_or_else(|n| n);
+        prev.saturating_add(v)
+    }
+
+    fn sub(&mut self, v: u64) -> u64 {
+        let n = self.0.get_mut();
+        *n = n.saturating_sub(v);
+        *n
+    }
+}
+
+impl Clone for LookupCount {
+    fn clone(&self) -> Self {
+        Self::new(self.get())
+    }
+}
 
 #[derive(Default, Deserialize, Serialize, Clone, Debug)]
 pub struct Inode {
@@ -33,7 +73,7 @@ pub struct Inode {
 
     pub lifecycle: Lifecycle,
 
-    pub n_lookup: u64,
+    n_lookup: LookupCount,
     pub ref_ctr: u64,
     pub last_access: u64,
 
@@ -62,7 +102,7 @@ impl Inode {
             status: root_st,
             locs: None,
             lifecycle: Lifecycle::Invalid,
-            n_lookup: 0,
+            n_lookup: LookupCount::new(0),
             ref_ctr: 0,
             last_access: LocalTime::mills(),
             dir,
@@ -94,7 +134,7 @@ impl Inode {
             status,
             locs: None,
             lifecycle: Lifecycle::Cached,
-            n_lookup,
+            n_lookup: LookupCount::new(n_lookup),
             ref_ctr: 1,
             last_access: LocalTime::mills(),
             dir,
@@ -153,14 +193,16 @@ impl Inode {
         self.ino == FUSE_ROOT_ID
     }
 
-    pub fn add_lookup(&mut self, v: u64) -> u64 {
-        self.n_lookup = self.n_lookup.saturating_add(v);
-        self.n_lookup
+    pub fn n_lookup(&self) -> u64 {
+        self.n_lookup.get()
+    }
+
+    pub fn add_lookup(&self, v: u64) -> u64 {
+        self.n_lookup.add(v)
     }
 
     pub fn sub_lookup(&mut self, v: u64) -> u64 {
-        self.n_lookup = self.n_lookup.saturating_sub(v);
-        self.n_lookup
+        self.n_lookup.sub(v)
     }
 
     pub fn add_ref(&mut self, v: u64) -> u64 {
@@ -174,7 +216,7 @@ impl Inode {
     }
 
     pub fn should_unref(&self) -> bool {
-        self.n_lookup == 0 && self.ref_ctr == 0 && !self.is_root()
+        self.n_lookup() == 0 && self.ref_ctr == 0 && !self.is_root()
     }
 
     pub fn is_unlinked(&self) -> bool {
@@ -213,7 +255,7 @@ impl Inode {
             // A failed deferred delete must remain observable until cleanup
             // succeeds or reports that the backend entry is already absent.
             && !self.mark_delete
-            && self.n_lookup == 0
+            && self.n_lookup() == 0
             && self.last_access + ttl < LocalTime::mills()
             && self.dir.as_ref().is_none_or(|d| d.children.is_empty())
     }
@@ -313,5 +355,24 @@ impl Deref for Inode {
 impl DerefMut for Inode {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.status
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Inode;
+    use curvine_model::FileStatus;
+
+    #[test]
+    fn n_lookup_serializes_as_plain_number() {
+        let inode = Inode::with_status(7, 1, "f", FileStatus::default(), 3);
+        inode.add_lookup(2);
+
+        let json = serde_json::to_value(&inode).unwrap();
+        assert_eq!(json["n_lookup"], serde_json::json!(5));
+
+        let restored: Inode = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.n_lookup(), 5);
+        assert_eq!(restored.clone().n_lookup(), 5);
     }
 }

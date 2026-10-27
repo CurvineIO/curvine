@@ -39,6 +39,9 @@ pub struct DeleteResult {
     pub blocks: HashMap<i64, Vec<BlockLocation>>,
     // True when the entry was moved into /.Trash instead of being purged.
     pub trashed: bool,
+    // True when the entry was staged under /.Trash/.pending and will be
+    // reclaimed asynchronously, so the counts above are zero.
+    pub purge_pending: bool,
 }
 
 impl DeleteResult {
@@ -48,6 +51,7 @@ impl DeleteResult {
             bytes: 0,
             blocks: Default::default(),
             trashed: false,
+            purge_pending: false,
         }
     }
 }
@@ -69,6 +73,7 @@ impl From<FreeResult> for DeleteResult {
             bytes: u64::try_from(value.bytes).unwrap_or(0),
             blocks: value.blocks,
             trashed: false,
+            purge_pending: false,
         }
     }
 }
@@ -80,6 +85,7 @@ mod tests {
     #[test]
     fn delete_result_to_free_result_clamps_large_counts() {
         let delete_result = DeleteResult {
+            purge_pending: false,
             inodes: i64::MAX as u64 + 1,
             bytes: u64::MAX,
             blocks: HashMap::new(),

@@ -202,3 +202,84 @@ fn legacy_rename_batch_rejects_trailing_bytes() {
 
     assert!(JournalBatch::deserialize_compat(&bytes).is_err());
 }
+
+#[test]
+fn trash_purge_variant_is_appended_after_existing_discriminants() {
+    // bincode encodes an enum variant as its positional index, so appending
+    // TrashPurge must not move Delete or CacheInvalidation. Pin both ends of
+    // the enum: an accidental reorder breaks the older side first.
+    let delete = SerdeUtils::serialize(&JournalEntry::Delete(DeleteEntry {
+        op_id: 1,
+        rpc_id: 2,
+        path: "/deleted".to_string(),
+        mtime: 3,
+    }))
+    .unwrap();
+    assert_eq!(
+        delete[..4],
+        7u32.to_le_bytes(),
+        "Delete must stay variant 7"
+    );
+
+    let invalidation =
+        SerdeUtils::serialize(&JournalEntry::CacheInvalidation(CacheInvalidationEntry {
+            op_id: 4,
+            rpc_id: 5,
+            inodes: vec![],
+        }))
+        .unwrap();
+    assert_eq!(
+        invalidation[..4],
+        17u32.to_le_bytes(),
+        "CacheInvalidation must stay variant 17"
+    );
+
+    let purge = SerdeUtils::serialize(&JournalEntry::TrashPurge(TrashPurgeEntry {
+        op_id: 6,
+        rpc_id: 0,
+        entry: "/.Trash/1-2".to_string(),
+        mtime: 7,
+        paths: vec!["/.Trash/1-2/a".to_string(), "/.Trash/1-2/b".to_string()],
+    }))
+    .unwrap();
+    assert_eq!(
+        purge[..4],
+        18u32.to_le_bytes(),
+        "TrashPurge must be appended as variant 18"
+    );
+}
+
+#[test]
+fn trash_purge_batch_round_trips_its_paths() {
+    let current = JournalBatch {
+        seq_id: 45,
+        batch: vec![JournalEntry::TrashPurge(TrashPurgeEntry {
+            op_id: 12,
+            rpc_id: 0,
+            entry: "/.Trash/9-42".to_string(),
+            mtime: 15,
+            paths: vec![
+                "/.Trash/9-42/dir/file-a".to_string(),
+                "/.Trash/9-42/dir/file-b".to_string(),
+                "/.Trash/9-42/dir".to_string(),
+            ],
+        })],
+    };
+    let bytes = SerdeUtils::serialize(&current).unwrap();
+
+    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let JournalEntry::TrashPurge(entry) = &batch.batch[0] else {
+        panic!("expected trash purge journal entry");
+    };
+    assert_eq!(entry.op_id, 12);
+    assert_eq!(entry.entry, "/.Trash/9-42");
+    assert_eq!(entry.mtime, 15);
+    assert_eq!(
+        entry.paths,
+        vec![
+            "/.Trash/9-42/dir/file-a".to_string(),
+            "/.Trash/9-42/dir/file-b".to_string(),
+            "/.Trash/9-42/dir".to_string(),
+        ]
+    );
+}
