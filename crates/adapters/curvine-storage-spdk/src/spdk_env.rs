@@ -2900,6 +2900,8 @@ mod test {
 
         assert_eq!(env.controllers[0].state(), ControllerState::Detached);
         assert_eq!(env.qpair_pool.controller_stats(0x1000), (0, 0));
+        assert_eq!(detach_calls.load(Ordering::Acquire), 1);
+        assert_eq!(register_calls.load(Ordering::Acquire), 0);
         assert_eq!(env.active_bdev_count(), 0);
         assert!(env.bdevs().is_empty());
         assert!(env.get_bdev("nvme-0").is_none());
