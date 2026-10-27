@@ -20,7 +20,7 @@ mod daemon;
 use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::ClusterConf;
 use curvine_fs_api::{Path, RpcCode};
-use curvine_model::{HeartbeatStatus, ProtoUtils};
+use curvine_model::{FileBlocks, HeartbeatStatus, ProtoUtils};
 use curvine_net::net::InetAddr;
 use curvine_proto::{
     GetBlockLocationsRequest, GetBlockLocationsResponse, GetFileStatusRequest,
@@ -217,6 +217,35 @@ fn response_has_live_worker(response: &Message, worker_id: u32) -> bool {
             })
 }
 
+async fn marked_file_blocks(conf: &ClusterConf, index: usize, path: &Path) -> Option<FileBlocks> {
+    let response = direct(
+        conf,
+        index,
+        RpcCode::GetBlockLocations,
+        GetBlockLocationsRequest {
+            path: path.encode(),
+        },
+        true,
+    )
+    .await;
+    if !response.is_success() {
+        return None;
+    }
+    let header = response.parse_header::<GetBlockLocationsResponse>().ok()?;
+    Some(ProtoUtils::file_blocks_from_pb(header.blocks))
+}
+
+fn same_block_locations(actual: &FileBlocks, expected: &FileBlocks) -> bool {
+    actual.block_locs.len() == expected.block_locs.len()
+        && actual
+            .block_locs
+            .iter()
+            .zip(&expected.block_locs)
+            .all(|(actual, expected)| {
+                actual.block.id == expected.block.id && actual.locs == expected.locs
+            })
+}
+
 fn signal(pid: u32, name: &str) {
     assert!(Command::new("kill")
         .args([name, &pid.to_string()])
@@ -365,39 +394,26 @@ fn run_cluster(mirror_reports: bool) {
         let follower_index = (leader_index + 1) % 3;
         let deadline = Instant::now() + Duration::from_secs(30);
         if mirror_reports {
-            loop {
-                let rep = direct(
-                    &confs[0],
-                    follower_index,
-                    RpcCode::GetBlockLocations,
-                    GetBlockLocationsRequest {
-                        path: path.encode(),
-                    },
-                    true,
-                )
-                .await;
-                if rep.is_success() {
-                    let header: GetBlockLocationsResponse = rep.parse_header().unwrap();
-                    let follower_blocks = ProtoUtils::file_blocks_from_pb(header.blocks);
-                    // Replay and passive reports progress independently. A locally
-                    // fresh response can precede the leader's latest inode update;
-                    // wait for controlled convergence before comparing placements.
-                    if follower_blocks.block_locs.len() == leader_blocks.block_locs.len()
-                        && follower_blocks
-                            .block_locs
-                            .iter()
-                            .zip(&leader_blocks.block_locs)
-                            .all(|(a, b)| a.block.id == b.block.id && a.locs == b.locs)
+            let follower_indices: Vec<_> = (0..confs.len())
+                .filter(|index| *index != leader_index)
+                .collect();
+            for index in &follower_indices {
+                loop {
+                    // Replay and passive reports progress independently. Wait
+                    // for both followers to converge before testing an election,
+                    // so whichever remains a follower has a known ready view.
+                    if marked_file_blocks(&confs[0], *index, &path)
+                        .await
+                        .is_some_and(|blocks| same_block_locations(&blocks, &leader_blocks))
                     {
                         break;
                     }
+                    assert!(
+                        Instant::now() < deadline,
+                        "follower {index} locations never became ready"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "follower locations never ready: {}",
-                    rep.to_error_msg()
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
         if !mirror_reports {
@@ -676,6 +692,171 @@ fn run_cluster(mirror_reports: bool) {
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
+        } else {
+            // Both followers were ready before the election. Stop the current
+            // leader and let the other follower be elected; the remaining node
+            // is then the same follower across the term change.
+            let old_leader_index = active_master_index(&confs, None)
+                .await
+                .expect("active leader missing before election regression");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let current_leader_blocks = loop {
+                let leader_response = direct(
+                    &confs[0],
+                    old_leader_index,
+                    RpcCode::GetBlockLocations,
+                    GetBlockLocationsRequest {
+                        path: path.encode(),
+                    },
+                    false,
+                )
+                .await;
+                if leader_response.is_success() {
+                    let header: GetBlockLocationsResponse =
+                        leader_response.parse_header().unwrap();
+                    let blocks = ProtoUtils::file_blocks_from_pb(header.blocks);
+                    if !blocks.block_locs.is_empty() {
+                        break blocks;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "current leader locations did not recover before election"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            for index in 0..confs.len() {
+                if index == old_leader_index {
+                    continue;
+                }
+                loop {
+                    if marked_file_blocks(&confs[0], index, &path)
+                        .await
+                        .is_some_and(|blocks| {
+                            same_block_locations(&blocks, &current_leader_blocks)
+                        })
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "follower {index} did not recover after the contact-loss check"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+
+            signal(daemons[old_leader_index].id(), "-STOP");
+
+            let deadline = Instant::now() + Duration::from_secs(40);
+            let new_leader_index = loop {
+                for (index, daemon) in daemons.iter_mut().enumerate() {
+                    if index != old_leader_index {
+                        daemon.assert_running();
+                    }
+                }
+                if let Some(index) = active_master_index(&confs, Some(old_leader_index)).await {
+                    break index;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "no replacement master was elected for mirrored recovery"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            assert_ne!(new_leader_index, old_leader_index);
+
+            let stable_follower_index = (0..confs.len())
+                .find(|index| *index != old_leader_index && *index != new_leader_index)
+                .unwrap();
+
+            signal(daemons[old_leader_index].id(), "-CONT");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let old_master = direct(
+                    &confs[0],
+                    old_leader_index,
+                    RpcCode::GetFilesystemInfo,
+                    GetFilesystemInfoRequest::default(),
+                    false,
+                )
+                .await;
+                if !old_master.is_success() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "old leader did not step down");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            // Keep the worker process running throughout the election. Its
+            // ordinary leader heartbeat and mirrored report fanout must drive
+            // recovery; this test sends no manual worker report.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                worker.assert_running();
+                let stable_role = direct(
+                    &confs[0],
+                    stable_follower_index,
+                    RpcCode::GetFilesystemInfo,
+                    GetFilesystemInfoRequest::default(),
+                    false,
+                )
+                .await;
+                let new_master = direct(
+                    &confs[0],
+                    new_leader_index,
+                    RpcCode::GetFilesystemInfo,
+                    GetFilesystemInfoRequest::default(),
+                    false,
+                )
+                .await;
+                let leader_locations = direct(
+                    &confs[0],
+                    new_leader_index,
+                    RpcCode::GetBlockLocations,
+                    GetBlockLocationsRequest {
+                        path: path.encode(),
+                    },
+                    false,
+                )
+                .await;
+                let recovered = if !stable_role.is_success()
+                    && response_has_live_worker(&new_master, worker_id)
+                    && leader_locations.is_success()
+                {
+                    let header: GetBlockLocationsResponse =
+                        leader_locations.parse_header().unwrap();
+                    let expected = ProtoUtils::file_blocks_from_pb(header.blocks);
+                    marked_file_blocks(&confs[0], stable_follower_index, &path)
+                        .await
+                        .is_some_and(|actual| same_block_locations(&actual, &expected))
+                } else {
+                    false
+                };
+                if recovered {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "stable follower {stable_follower_index} did not restore worker locations after election"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            assert!(
+                !direct(
+                    &confs[0],
+                    stable_follower_index,
+                    RpcCode::GetFilesystemInfo,
+                    GetFilesystemInfoRequest::default(),
+                    false,
+                )
+                .await
+                .is_success(),
+                "location reads recovered on a node that became leader"
+            );
         }
 
         worker.terminate().await;
