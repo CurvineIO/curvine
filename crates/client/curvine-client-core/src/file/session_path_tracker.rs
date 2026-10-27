@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use curvine_fs_api::Path;
-use std::collections::{HashMap, HashSet};
+use std::borrow::Borrow;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,13 +36,14 @@ pub(crate) struct SessionPathTracker {
 
 #[derive(Default)]
 struct TrackerState {
-    paths: HashMap<PathKey, Expiry>,
+    paths: BTreeMap<PathKey, Expiry>,
+    expiry_index: BTreeMap<Instant, BTreeSet<PathKey>>,
     overflow_until: Option<Expiry>,
-    in_flight_paths: HashMap<PathKey, usize>,
+    in_flight_paths: BTreeMap<PathKey, usize>,
     in_flight_overflow: usize,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct PathKey(Arc<str>);
 
 #[derive(Clone, Copy)]
@@ -70,23 +72,50 @@ impl Expiry {
     }
 }
 
-impl PathKey {
-    fn from_path(path: &Path) -> Self {
-        // Metadata RPCs encode Path::path(), which is also the component form
-        // used by Path::has_prefix. This intentionally treats cv://authority/x
-        // and /x as the same Curvine path and follows Path's normalization for
-        // repeated and trailing slashes, relative paths, and dot components.
-        Self(Arc::from(path.path()))
-    }
-
-    fn matches_or_contains(&self, other: &Self) -> bool {
-        Path::has_prefix(&self.0, &other.0) || Path::has_prefix(&other.0, &self.0)
+impl Borrow<str> for PathKey {
+    fn borrow(&self) -> &str {
+        &self.0
     }
 }
 
 impl TrackerState {
+    fn remove_expiry_index(&mut self, key: &PathKey, expiry: Expiry) {
+        let Expiry::At(deadline) = expiry else {
+            return;
+        };
+        let remove_bucket = self.expiry_index.get_mut(&deadline).is_some_and(|keys| {
+            keys.remove(key);
+            keys.is_empty()
+        });
+        if remove_bucket {
+            self.expiry_index.remove(&deadline);
+        }
+    }
+
+    fn add_expiry_index(&mut self, key: PathKey, expiry: Expiry) {
+        if let Expiry::At(deadline) = expiry {
+            self.expiry_index.entry(deadline).or_default().insert(key);
+        }
+    }
+
     fn prune(&mut self, now: Instant) {
-        self.paths.retain(|_, expiry| expiry.is_live_at(now));
+        while self
+            .expiry_index
+            .first_key_value()
+            .is_some_and(|(deadline, _)| *deadline <= now)
+        {
+            let (deadline, keys) = self.expiry_index.pop_first().unwrap();
+            for key in keys {
+                if self
+                    .paths
+                    .get(&key)
+                    .is_some_and(|expiry| !expiry.is_live_at(now))
+                {
+                    self.paths.remove(&key);
+                }
+            }
+            debug_assert!(deadline <= now);
+        }
         if self
             .overflow_until
             .is_some_and(|expiry| !expiry.is_live_at(now))
@@ -101,16 +130,18 @@ impl TrackerState {
             return;
         }
 
-        if let Some(existing) = self.paths.get_mut(&key) {
-            *existing = expiry;
-        } else if self.paths.len() < capacity {
-            self.paths.insert(key, expiry);
-        } else {
+        if !self.paths.contains_key(&key) && self.paths.len() >= capacity {
             // Keep the table bounded. Since an untracked live mutation might
             // overlap any later read, pin all reads to the leader until it
             // expires instead of evicting an older path silently.
             self.extend_overflow(expiry);
+            return;
         }
+
+        if let Some(previous) = self.paths.insert(key.clone(), expiry) {
+            self.remove_expiry_index(&key, previous);
+        }
+        self.add_expiry_index(key, expiry);
     }
 
     fn extend_overflow(&mut self, expiry: Expiry) {
@@ -120,7 +151,7 @@ impl TrackerState {
         });
     }
 
-    fn is_sticky(&mut self, key: &PathKey, now: Instant) -> bool {
+    fn is_sticky(&mut self, key: &str, now: Instant) -> bool {
         self.prune(now);
         if self.in_flight_overflow > 0
             || self
@@ -130,14 +161,69 @@ impl TrackerState {
             return true;
         }
 
-        self.in_flight_paths
-            .keys()
-            .any(|marked| marked.matches_or_contains(key))
-            || self
-                .paths
-                .iter()
-                .any(|(marked, expiry)| expiry.is_live_at(now) && marked.matches_or_contains(key))
+        path_index_has_related_path(&self.in_flight_paths, key).0
+            || path_index_has_related_path(&self.paths, key).0
     }
+}
+
+/// Match `Path::has_prefix` component semantics without normalizing, splitting
+/// into allocated Strings, or scanning every retained key. `Path::path()` is
+/// already slash-normalized. The probe count supports a deterministic scale
+/// test showing that lookup operations do not grow with the retained table.
+fn path_index_has_related_path<V>(index: &BTreeMap<PathKey, V>, path: &str) -> (bool, usize) {
+    if path == "/" {
+        // Path::get_components("/") is empty, so root is a prefix of every
+        // component sequence and every indexed path is related to this query.
+        return (!index.is_empty(), 1);
+    }
+
+    let mut probes = 1;
+    if index.contains_key(path) {
+        return (true, probes);
+    }
+
+    probes += 1;
+    if index.contains_key("/") {
+        return (true, probes);
+    }
+
+    // A tracked key is an ancestor when it ends at a slash boundary. Looking
+    // up slices avoids allocating one String per path component. The empty key
+    // is a component prefix of absolute paths, matching Path::has_prefix.
+    for (slash, _) in path.match_indices('/') {
+        if slash > MAX_TRACKED_PATH_BYTES {
+            break;
+        }
+        probes += 1;
+        if index.contains_key(&path[..slash]) {
+            return (true, probes);
+        }
+    }
+
+    // Indexed paths are capped at MAX_TRACKED_PATH_BYTES. A strict descendant
+    // needs at least one separator and one component byte, so longer queries
+    // cannot have an indexed descendant. This also caps the temporary prefix
+    // allocation below, even when a read request contains an unusually long
+    // path.
+    if path.len() >= MAX_TRACKED_PATH_BYTES - 1 {
+        return (false, probes);
+    }
+
+    // Find a tracked descendant using one ordered range lookup. The slash
+    // boundary preserves component matching (`/data` does not match `/data2`).
+    // For the empty relative path this searches absolute descendants; `/` was
+    // already handled as the special zero-component root key above.
+    let mut descendant_prefix = String::with_capacity(path.len() + 1);
+    descendant_prefix.push_str(path);
+    descendant_prefix.push('/');
+    probes += 1;
+    if let Some((candidate, _)) = index.range::<str, _>(descendant_prefix.as_str()..).next() {
+        if candidate.0.starts_with(&descendant_prefix) {
+            return (true, probes);
+        }
+    }
+
+    (false, probes)
 }
 
 /// Keeps a mutation's paths sticky for the full time its RPC is in flight,
@@ -293,17 +379,16 @@ impl SessionPathTracker {
     }
 
     fn is_sticky_at(&self, path: &Path, now: Instant) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .is_sticky(&PathKey::from_path(path), now)
+        self.state.lock().unwrap().is_sticky(path.path(), now)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::SessionPathTracker;
+    use super::{path_index_has_related_path, PathKey, SessionPathTracker};
     use curvine_fs_api::Path;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn path(value: &str) -> Path {
@@ -352,6 +437,64 @@ mod tests {
     }
 
     #[test]
+    fn ordered_path_index_matches_path_component_semantics() {
+        let values = [
+            "",
+            "/",
+            "relative",
+            "relative/child",
+            "relative/../outside",
+            "outside",
+            "/relative/child",
+            "/same//component/",
+            "cv://cluster-a/same/component",
+            "cv://cluster-b/same/component/child",
+            "/same/component2",
+        ];
+
+        for marked in values {
+            let marked = path(marked);
+            let mut index = BTreeMap::new();
+            index.insert(PathKey(Arc::from(marked.path())), ());
+
+            for query in values {
+                let query = path(query);
+                let expected = Path::has_prefix(query.path(), marked.path())
+                    || Path::has_prefix(marked.path(), query.path());
+                let actual = path_index_has_related_path(&index, query.path()).0;
+                assert_eq!(actual, expected, "marked={}, query={}", marked, query);
+            }
+        }
+    }
+
+    #[test]
+    fn lookup_probe_count_stays_bounded_with_a_full_path_table() {
+        let capacity = 1_024;
+        let tracker = SessionPathTracker::new(capacity, Duration::from_secs(30));
+        let marked: Vec<_> = (0..capacity)
+            .map(|index| path(&format!("/scale/{index:04}/file")))
+            .collect();
+        tracker.mark_mutations(marked.iter());
+
+        let state = tracker.state.lock().unwrap();
+        assert_eq!(state.paths.len(), capacity);
+        assert_eq!(
+            state
+                .expiry_index
+                .values()
+                .map(|keys| keys.len())
+                .sum::<usize>(),
+            capacity
+        );
+        let (matched, probes) = path_index_has_related_path(&state.paths, "/unrelated/path");
+        assert!(!matched);
+        assert!(
+            probes <= 5,
+            "lookup performed {probes} ordered index probes"
+        );
+    }
+
+    #[test]
     fn rename_marks_both_subtrees_and_their_listing_ancestors() {
         let tracker = SessionPathTracker::new(16, Duration::from_secs(30));
         tracker.mark_rename(&path("/src/tree"), &path("/dst/tree"));
@@ -375,6 +518,31 @@ mod tests {
         tracker.mark_mutations_at([&overflow], start + Duration::from_secs(1));
         assert!(tracker.is_sticky_at(&unrelated, start + Duration::from_secs(10)));
         assert!(!tracker.is_sticky_at(&unrelated, start + Duration::from_secs(11)));
+    }
+
+    #[test]
+    fn refreshing_a_path_replaces_its_expiry_index_entry() {
+        let tracker = SessionPathTracker::new(2, Duration::from_secs(10));
+        let target = path("/refresh");
+        let start = Instant::now();
+
+        tracker.mark_mutations_at([&target], start);
+        tracker.mark_mutations_at([&target], start + Duration::from_secs(5));
+        {
+            let state = tracker.state.lock().unwrap();
+            assert_eq!(state.paths.len(), 1);
+            assert_eq!(
+                state
+                    .expiry_index
+                    .values()
+                    .map(|keys| keys.len())
+                    .sum::<usize>(),
+                1
+            );
+        }
+
+        assert!(tracker.is_sticky_at(&target, start + Duration::from_secs(10)));
+        assert!(!tracker.is_sticky_at(&target, start + Duration::from_secs(15)));
     }
 
     #[test]
