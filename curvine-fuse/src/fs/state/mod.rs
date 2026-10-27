@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod node_state;
-pub use self::node_state::NodeState;
+pub use self::node_state::{EvictStats, NodeState};
 
 mod file_handle;
 pub use self::file_handle::*;
