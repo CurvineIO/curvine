@@ -15,6 +15,7 @@
 use crate::fs::dcache::DirTree;
 use crate::fs::state::file_handle::FileHandle;
 use crate::fs::state::DirHandle;
+use crate::fs::state::{DirTreeLock, DirTreeReadGuard, DirTreeWriteGuard};
 use crate::fs::{FuseReader, FuseWriter};
 use crate::fuse_metrics::{
     StateStageTimer, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT, CACHE_STATUS,
@@ -30,22 +31,38 @@ use curvine_client::unified::UnifiedFileSystem;
 use curvine_config::ClusterConf;
 use curvine_config::{ClientConf, FuseConf};
 use curvine_core_error::err_box;
-use curvine_error::FsError;
+use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{FileSystem, ListStream, Path};
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{
     CreateFileOpts, DeleteResult, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags,
     RenameFlags, SetAttrOpts,
 };
-use curvine_runtime::common::FastHashMap;
+use curvine_runtime::common::{FastHashMap, LocalTime};
 use curvine_runtime::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use std::borrow::Cow;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::Arc;
+
+enum StatProbe {
+    Hit(FileStatus),
+    Miss(Path),
+}
+
+/// Outcome of one `NodeState::clear` sweep over the dcache.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EvictStats {
+    /// Expired, handle-free inodes found by the read-lock scan.
+    pub candidates: usize,
+    /// Inodes actually removed; a candidate can become ineligible between scan and removal.
+    pub evicted: usize,
+    /// Inodes removed during each write-lock hold, in order. `sum() == evicted`.
+    pub batches: Vec<usize>,
+}
 
 pub struct NodeState {
-    dir_tree: RwLock<DirTree>,
+    dir_tree: DirTreeLock,
     writers: AsyncSharedMap<u64, FuseWriter>,
     handles: RwLockHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
     dir_handles: RwLockHashMap<u64, FastHashMap<u64, Arc<DirHandle>>>,
@@ -64,7 +81,7 @@ impl NodeState {
         let enable_meta_cache = conf.enable_meta_cache;
 
         let state = Self {
-            dir_tree: RwLock::new(DirTree::new(conf.clone())),
+            dir_tree: DirTreeLock::new(DirTree::new(conf.clone()), conf.metrics_enabled),
             writers: AsyncSharedMap::default(),
             handles: RwLockHashMap::default(),
             dir_handles: RwLockHashMap::default(),
@@ -84,12 +101,12 @@ impl NodeState {
         Ok(state)
     }
 
-    pub fn dir_write(&self) -> RwLockWriteGuard<'_, DirTree> {
-        self.dir_tree.write().unwrap()
+    pub fn dir_write(&self) -> DirTreeWriteGuard<'_> {
+        self.dir_tree.write()
     }
 
-    pub fn dir_read(&self) -> RwLockReadGuard<'_, DirTree> {
-        self.dir_tree.read().unwrap()
+    pub fn dir_read(&self) -> DirTreeReadGuard<'_> {
+        self.dir_tree.read()
     }
 
     pub fn client_conf(&self) -> &ClientConf {
@@ -236,10 +253,43 @@ impl NodeState {
         Ok(attr)
     }
 
-    pub fn clear(&self) -> FuseResult<()> {
-        let mut dir = self.dir_write();
-        dir.clear(|ino| self.has_open_handles(ino));
-        Ok(())
+    /// Max inodes removed per dcache write-lock hold during `clear`.
+    const EVICT_BATCH_SIZE: usize = 1024;
+
+    /// Evicts expired inodes. The scan holds only the read lock, and removals
+    /// take the write lock per batch so foreground metadata ops are not starved
+    /// for the whole sweep.
+    pub fn clear(&self) -> FuseResult<EvictStats> {
+        let start = LocalTime::mills();
+        let candidates = self
+            .dir_read()
+            .evict_candidates(|ino| self.has_open_handles(ino));
+
+        // One write-lock hold per batch; the per-batch counts are returned so a test
+        // can pin that bound instead of only checking that everything was removed.
+        let batches: Vec<usize> = candidates
+            .chunks(Self::EVICT_BATCH_SIZE)
+            .map(|batch| {
+                self.dir_write()
+                    .evict(batch, |ino| self.has_open_handles(ino))
+            })
+            .collect();
+
+        let stats = EvictStats {
+            candidates: candidates.len(),
+            evicted: batches.iter().sum(),
+            batches,
+        };
+        info!(
+            "node_state::clear: evicted {} of {} expired inodes in {} batches, remaining {}, \
+             cost {} ms",
+            stats.evicted,
+            stats.candidates,
+            stats.batches.len(),
+            self.dir_read().inode_lens(),
+            LocalTime::mills() - start
+        );
+        Ok(stats)
     }
 
     pub async fn lookup_common(&self, parent: u64, name: &str) -> FuseResult<fuse_attr> {
@@ -687,6 +737,19 @@ impl NodeState {
         }
     }
 
+    /// Deletes `path` on the master, honouring `fuse.async_delete`.
+    ///
+    /// Both lanes have the same namespace effect, so callers keep treating `Ok`
+    /// as "the name is gone". The async lane only moves the physical
+    /// reclamation into the master's background purger and reports no counts.
+    pub async fn delete_path(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
+        if self.fs.conf().fuse.async_delete {
+            self.fs.delete_async(path, recursive).await
+        } else {
+            self.fs.delete(path, recursive).await
+        }
+    }
+
     pub async fn fs_unlink(&self, parent: u64, name: &str) -> FuseResult<()> {
         let path = {
             let dir = self.dir_read();
@@ -704,7 +767,7 @@ impl NodeState {
         // already-gone as success so recursive cleanup (LTP tst_rmdir) is
         // not failed by ENOENT on a stale name.
         let Some(ino) = ino else {
-            return match self.fs.delete(&path, false).await {
+            return match self.delete_path(&path, false).await {
                 Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
                 Err(e) => Err(e.into()),
             };
@@ -727,7 +790,7 @@ impl NodeState {
                 self.repoint_canonical_from_master(ino, parent, name)
                     .await?;
             }
-            match self.fs.delete(&path, false).await {
+            match self.delete_path(&path, false).await {
                 Ok(_) | Err(FsError::FileNotFound(_)) => (),
                 Err(e) => {
                     self.restore_unlink_state(rollback)?;
@@ -752,7 +815,7 @@ impl NodeState {
             return Ok(());
         }
 
-        match self.fs.delete(&path, false).await {
+        match self.delete_path(&path, false).await {
             Ok(_) => (),
             Err(FsError::FileNotFound(_)) => (),
             Err(e) => {
@@ -814,6 +877,12 @@ impl NodeState {
         Self::insert_dir_handle_locked(&mut lock, ino, handle.fh, handle.clone());
 
         Ok(handle)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_dir_handle(&self, handle: Arc<DirHandle>) {
+        let mut lock = self.dir_handles.write();
+        Self::insert_dir_handle_locked(&mut lock, handle.ino, handle.fh, handle);
     }
 
     pub fn all_handles(&self) -> Vec<Arc<FileHandle>> {
@@ -896,18 +965,16 @@ impl NodeState {
             return Ok(None);
         }
 
-        let status = if add_lookup {
-            let mut dir = self.dir_write();
-            dir.check_deleted_child(ino, name)?;
-
-            dir.lookup_valid_inode_mut(ino, name, self.meta_cache_ttl)
-                .map(|inode| inode.status.clone())
-        } else {
+        let status = {
             let dir = self.dir_read();
             dir.check_deleted_child(ino, name)?;
 
-            dir.get_valid_inode(ino, name, self.meta_cache_ttl)
-                .map(|inode| inode.status.clone())
+            let inode = if add_lookup {
+                dir.lookup_valid_inode(ino, name, self.meta_cache_ttl)
+            } else {
+                dir.get_valid_inode(ino, name, self.meta_cache_ttl)
+            };
+            inode.map(|inode| inode.status.clone())
         };
 
         // Hit/miss recorded the moment the cache read resolves (before any backend
@@ -1023,20 +1090,46 @@ impl NodeState {
             .map(|inode| inode.clone_status())
     }
 
-    pub async fn fs_stat(&self, ino: u64, name: Option<&str>) -> FuseResult<FileStatus> {
-        // An unlinked inode can remain addressable by nodeid until the kernel
-        // releases its lookup/open references. Its former path no longer exists.
-        if name.is_none() {
-            if let Some(status) = self.unlinked_status(ino) {
-                return Ok(status);
+    /// Resolve unlinked status, cached status, or the backend path under one read guard.
+    fn probe_status(&self, ino: u64, name: Option<&str>) -> FuseResult<StatProbe> {
+        let cached = {
+            let dir = self.dir_read();
+            // An unlinked inode can remain addressable by nodeid until the kernel
+            // releases its lookup/open references. Its former path no longer exists.
+            if name.is_none() {
+                if let Some(inode) = dir.get_inode(ino, None).filter(|i| i.is_unlinked()) {
+                    return Ok(StatProbe::Hit(inode.clone_status()));
+                }
             }
-        }
 
-        if let Some(status) = self.get_cached_status(ino, name, false)? {
-            return Ok(status);
-        }
+            dir.check_deleted_child(ino, name)?;
+            let cached = if self.enable_meta_cache {
+                dir.get_valid_inode(ino, name, self.meta_cache_ttl)
+                    .map(|inode| inode.status.clone())
+            } else {
+                None
+            };
+            cached.ok_or_else(|| dir.get_path_common(ino, name))
+        };
 
-        let path = self.get_path_common(ino, name)?;
+        if self.enable_meta_cache {
+            self.record_status_cache(if cached.is_ok() {
+                CACHE_RESULT_HIT
+            } else {
+                CACHE_RESULT_MISS
+            });
+        }
+        match cached {
+            Ok(status) => Ok(StatProbe::Hit(status)),
+            Err(path) => Ok(StatProbe::Miss(path?)),
+        }
+    }
+
+    pub async fn fs_stat(&self, ino: u64, name: Option<&str>) -> FuseResult<FileStatus> {
+        let path = match self.probe_status(ino, name)? {
+            StatProbe::Hit(status) => return Ok(status),
+            StatProbe::Miss(path) => path,
+        };
         let status = self.fs.get_status(&path).await?;
 
         self.cache_resolved_status(ino, name, &status);
@@ -1045,14 +1138,10 @@ impl NodeState {
     }
 
     pub async fn fs_stat_guarded(&self, ino: u64) -> FuseResult<FileStatus> {
-        if let Some(status) = self.unlinked_status(ino) {
-            return Ok(status);
-        }
-        if let Some(status) = self.get_cached_status(ino, None, false)? {
-            return Ok(status);
-        }
-
-        let path = self.get_path(ino)?;
+        let path = match self.probe_status(ino, None)? {
+            StatProbe::Hit(status) => return Ok(status),
+            StatProbe::Miss(path) => path,
+        };
         let _guard = self.lock_path(&path).await;
         if let Some(status) = self.unlinked_status(ino) {
             return Ok(status);
@@ -1591,6 +1680,51 @@ mod test {
     }
 
     #[test]
+    fn clear_evicts_across_multiple_batches() {
+        crate::FuseMetrics::ensure_init().unwrap();
+        let rt = Arc::new(AsyncRuntime::single());
+        let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+        let total = 2 * NodeState::EVICT_BATCH_SIZE + 3;
+        {
+            let mut tree = state.dir_write();
+            for i in 0..total {
+                let name = format!("f{i}");
+                let status = FileStatus::with_name(0, name.clone(), false);
+                let ino = tree.lookup(FUSE_ROOT_ID, &name, status, true).unwrap().ino;
+                tree.forget(ino, 1).unwrap();
+                tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            }
+        }
+        let before = state.dir_read().inode_lens();
+
+        let stats = state.clear().unwrap();
+
+        // The bound this refactor promises is 1024 removals per write-lock hold. Keep it literal
+        // instead of deriving it from `EVICT_BATCH_SIZE`: weakening the constant (e.g. to
+        // `usize::MAX`, or collapsing the loop into one `dir_write().evict(&candidates, ..)`)
+        // would otherwise relax the expectation along with the implementation.
+        const MAX_REMOVALS_PER_HOLD: usize = 1024;
+        assert_eq!(stats.candidates, total);
+        assert_eq!(stats.evicted, total);
+        assert_eq!(
+            stats.batches.len(),
+            total.div_ceil(MAX_REMOVALS_PER_HOLD),
+            "one write-lock hold per batch: {:?}",
+            stats.batches
+        );
+        assert!(
+            stats.batches.iter().all(|&n| n <= MAX_REMOVALS_PER_HOLD),
+            "a write-lock hold may not cover more than {MAX_REMOVALS_PER_HOLD} removals: {:?}",
+            stats.batches
+        );
+
+        let dir = state.dir_read();
+        assert_eq!(dir.inode_lens(), before - total);
+        assert!(dir.get_dir_check(FUSE_ROOT_ID).unwrap().children.is_empty());
+    }
+
+    #[test]
     fn resolved_root_status_is_cached_when_metadata_cache_is_disabled() {
         let rt = Arc::new(AsyncRuntime::single());
         let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
@@ -1619,6 +1753,46 @@ mod test {
         let root = dir.get_inode(FUSE_ROOT_ID, None).unwrap();
         assert_eq!(root.lifecycle, crate::fs::dcache::Lifecycle::Cached);
         assert_eq!(root.mode, 0o755);
+    }
+
+    #[test]
+    fn cached_lookup_counts_concurrent_hits_under_read_lock() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = true;
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let ino = state
+            .dir_write()
+            .lookup(
+                FUSE_ROOT_ID,
+                "f",
+                FileStatus::with_name(9, "f".to_string(), false),
+                true,
+            )
+            .unwrap()
+            .ino;
+
+        let (threads, per_thread) = (8, 100);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    for _ in 0..per_thread {
+                        let hit = state.get_cached_status(FUSE_ROOT_ID, Some("f"), true);
+                        assert!(hit.unwrap().is_some());
+                    }
+                });
+            }
+        });
+
+        let n_lookup = state
+            .dir_read()
+            .get_inode_check(ino, None)
+            .unwrap()
+            .n_lookup();
+        assert_eq!(n_lookup, 1 + threads * per_thread);
     }
 
     #[test]
@@ -1697,7 +1871,7 @@ mod test {
                     .dir_read()
                     .get_inode_check(ino, None)
                     .unwrap()
-                    .n_lookup,
+                    .n_lookup(),
                 1
             );
         });

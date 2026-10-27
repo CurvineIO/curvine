@@ -63,6 +63,12 @@ impl MasterMonitor {
         }
     }
 
+    /// Test-only role switch, mirroring `JournalSystem::fs_only_for_test`.
+    #[doc(hidden)]
+    pub fn set_role_for_test(&self, state: curvine_raft::raft::RoleState) {
+        self.journal_ctl.set_state(state);
+    }
+
     pub fn is_stop(&self) -> bool {
         let cur: RoleState = self.journal_ctl.state();
         cur == RoleState::Exit

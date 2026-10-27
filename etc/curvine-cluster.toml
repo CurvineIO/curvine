@@ -64,9 +64,18 @@ meta_dir = "testing/meta"
 # trash_retention: how long entries stay in the bin before the master purges
 #   them; "0" disables automatic purging.
 # trash_check_interval: how often the master scans /.Trash for expired entries.
+# trash_purge_batch_inodes: inodes a single purge batch removes before the master
+#   releases the namespace lock again (default 4096).
+# trash_purge_yield_ms: milliseconds the purger yields between batches so
+#   foreground metadata operations are not starved (default 5).
+# trash_purge_interval: how often the master drains /.Trash/.pending, i.e. the
+#   entries staged by async deletes; runs even while trash_enabled is false.
 # trash_enabled = false
 # trash_retention = "7d"
 # trash_check_interval = "1h"
+# trash_purge_batch_inodes = 4096
+# trash_purge_yield_ms = 5
+# trash_purge_interval = "1s"
 # Log rotation applies when log_dir is a directory; stdout and stderr are not rotated.
 # max_file_size_mb: rotate when the file reaches this size in MB (default 100, 0 = no size limit).
 # time_rotation: "daily" or "hourly" (default none). Combined with max_file_size_mb, whichever

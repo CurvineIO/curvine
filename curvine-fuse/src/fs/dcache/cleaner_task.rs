@@ -44,7 +44,7 @@ impl LoopTask for CleanerTask {
 
     fn run(&self) -> Result<(), Self::Error> {
         match self.state.upgrade() {
-            Some(state) => state.clear(),
+            Some(state) => state.clear().map(|_| ()),
             None => Ok(()),
         }
     }

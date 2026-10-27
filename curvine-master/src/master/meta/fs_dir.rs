@@ -17,7 +17,7 @@ use crate::master::journal::{JournalEntry, JournalWriter};
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
-use crate::master::meta::store::{InodeStore, RocksInodeStore};
+use crate::master::meta::store::{InodeStore, PurgeItem, PurgeTarget, RocksInodeStore};
 use crate::master::meta::{trash, BlockMeta, InodeId};
 use crate::master::quota::eviction::evictor::Evictor;
 use curvine_config::ClusterConf;
@@ -67,6 +67,19 @@ impl CacheInvalidationResult {
         self.invalidated_block_ids
             .extend(other.invalidated_block_ids);
     }
+}
+
+// One path claimed by a purge batch. Kept until the store batch commits so the
+// in-memory tree can be updated with the same state that was persisted.
+// The claimed child is not kept as a pointer: `InodePath::resolve` hydrates a
+// terminal `FileEntry` into an owned inode that is freed when the path drops.
+struct PurgeClaim {
+    parent: InodePtr,
+    child_id: i64,
+    name: String,
+    expired: bool,
+    is_dir: bool,
+    dir_meta: Option<InodeView>,
 }
 
 // One page of a trash listing. `next` is the sort key of the last scanned
@@ -374,6 +387,143 @@ impl FsDir {
         Ok(del_res)
     }
 
+    /// Removes the given paths without journaling one record per path.
+    ///
+    /// The trash purger supplies bounded, leaf-first batches, so every listed
+    /// path is a file or a directory the earlier paths of the same batch empty.
+    /// The whole batch is staged in one store write batch: either all listed
+    /// paths are removed or none is, so a failure never leaves paths durable
+    /// without the block locations they returned.
+    ///
+    /// Paths that no longer resolve are skipped, which keeps a replayed batch
+    /// idempotent. A directory that still holds children after the paths
+    /// already claimed in this batch is skipped as well, so a purge never
+    /// removes inodes the batch did not list.
+    pub fn purge_paths(&mut self, paths: &[String], mtime: i64) -> FsResult<DeleteResult> {
+        let mut claims: Vec<PurgeClaim> = Vec::new();
+        // (parent id, name) pairs already claimed, so a duplicated path is not
+        // counted twice.
+        let mut claimed: HashSet<(i64, String)> = HashSet::new();
+        // Children claimed per directory: a later directory entry in the same
+        // batch is empty once these paths are gone.
+        let mut pending: HashMap<i64, HashSet<String>> = HashMap::new();
+        // Parent metadata staged once per directory, with this batch's mtime
+        // and nlink updates applied.
+        let mut parents: HashMap<i64, InodeView> = HashMap::new();
+
+        for path in paths {
+            // A missing path resolves to a truncated InodePath and is skipped
+            // below; an error here is a store failure, not a missing path, and
+            // must fail replay instead of advancing past an undeleted inode.
+            let inp = InodePath::resolve(self.root_ptr(), path, &self.store)?;
+
+            let Some(child) = inp.get_last_inode() else {
+                debug!("purge: skip vanished path {}", path);
+                continue;
+            };
+            let Some(parent) = inp.get_inode(-2) else {
+                return err_box!("purge: path {} has no parent directory", path);
+            };
+            let name = inp.name().to_string();
+            if claimed.contains(&(parent.id(), name.clone())) {
+                continue;
+            }
+
+            let is_dir = child.as_ref().is_dir();
+            if let Dir(dir) = child.as_ref() {
+                let removed = pending.get(&child.id()).map_or(0, HashSet::len);
+                if dir.children_len() > removed {
+                    warn!(
+                        "purge: skip non-empty directory {} ({} unlisted children)",
+                        path,
+                        dir.children_len() - removed
+                    );
+                    continue;
+                }
+            }
+
+            let parent_meta = parents
+                .entry(parent.id())
+                .or_insert_with(|| parent.as_ref().clone_metadata());
+            let expired = matches!(parent_meta.expiration_ms(), Ok(Some(exp)) if mtime > exp);
+            if !expired {
+                parent_meta.update_mtime(mtime);
+            }
+            if is_dir {
+                parent_meta.dec_nlink(mtime);
+            }
+
+            let dir_meta = if is_dir {
+                Some(child.as_ref().clone_metadata())
+            } else {
+                None
+            };
+
+            claimed.insert((parent.id(), name.clone()));
+            pending.entry(parent.id()).or_default().insert(name.clone());
+            claims.push(PurgeClaim {
+                parent,
+                child_id: child.id(),
+                name,
+                expired,
+                is_dir,
+                dir_meta,
+            });
+        }
+
+        if claims.is_empty() {
+            return Ok(DeleteResult::new());
+        }
+
+        let items = claims
+            .iter()
+            .map(|claim| PurgeItem {
+                parent: parents[&claim.parent.id()].clone_metadata(),
+                target: match claim.dir_meta {
+                    Some(ref dir) => PurgeTarget::Dir(dir.clone()),
+                    None => PurgeTarget::File(claim.child_id),
+                },
+                name: claim.name.clone(),
+            })
+            .collect();
+
+        // The store batch is the only durable change; the in-memory tree and
+        // file counts are published only after it commits.
+        let total = self.store.apply_purge(items, mtime)?;
+
+        for claim in claims {
+            let parent = claim.parent.as_mut();
+            // Re-read the live child: a hydrated `FileEntry` copy was already
+            // freed with its InodePath, and only a tree-resident file inode
+            // holds the shared nlink.
+            if let Some(child) = parent.get_child_ptr(&claim.name) {
+                // Files keep their shared inode when other names still link to it.
+                if matches!(child.as_ref(), File(f) if f.nlink() > 1) {
+                    child.as_mut().dec_nlink(mtime);
+                }
+            }
+
+            if !claim.expired {
+                parent.update_mtime(mtime);
+            }
+            if claim.is_dir {
+                parent.dec_nlink(mtime);
+            }
+            // The store batch already committed, so the child is gone from the
+            // durable tree. Aborting here would drop `total`, and the block
+            // locations it carries could then never be released; report the
+            // in-memory divergence instead of losing the reclamation.
+            if let Err(e) = parent.delete_child(claim.child_id, &claim.name) {
+                warn!(
+                    "purge: {} is deleted from the store but could not be dropped from the in-memory tree: {}",
+                    claim.name, e
+                );
+            }
+        }
+
+        Ok(total)
+    }
+
     // Move an entry into /.Trash instead of removing it. Blocks stay on the
     // workers so the entry can be restored until retention expires.
     pub fn trash(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
@@ -420,16 +570,119 @@ impl FsDir {
             op_ms,
         )?;
         debug!("moved {} to trash as {}", inp.path(), dst_path);
-        Ok(DeleteResult::new())
+        Ok(DeleteResult {
+            trashed: true,
+            ..DeleteResult::new()
+        })
+    }
+
+    /// Moves `inp` into the asynchronous staging directory `/.Trash/.pending`.
+    ///
+    /// This is the `async_delete` path: the client gets the same immediate
+    /// namespace effect as a soft delete, while the purger reclaims the entry
+    /// without waiting for `trash_retention`. It is independent of
+    /// `trash_enabled` because `/.Trash` is reserved either way.
+    pub fn trash_pending(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
+        let op_ms = LocalTime::mills() as i64;
+
+        if inp.is_root() {
+            return err_box!("The root is not allowed to be deleted");
+        }
+
+        if inp.is_empty() || inp.get_last_inode().is_none() {
+            return err_ext!(FsError::file_not_found(inp.path()));
+        }
+
+        if !inp.is_empty_dir() && !recursive {
+            return err_ext!(FsError::dir_not_empty(inp.path()));
+        }
+
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        // A shared inode must be unlinked rather than moved, and unresolved
+        // entries cannot be renamed; both stay synchronous and bounded because
+        // they only remove a single name.
+        if inode.is_file_entry() || matches!(inode.as_ref(), File(f) if f.nlink() > 1) {
+            return self.delete(inp, recursive);
+        }
+
+        self.ensure_trash_root()?;
+        self.ensure_pending_root()?;
+
+        let entry_name = self.unique_trash_entry_name(op_ms, inode.id())?;
+        let dst_path = trash::pending_entry_path(&entry_name);
+        let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+
+        self.rename_with_mtime(
+            inp,
+            &dst_inp,
+            RenameFlags::NO_REPLACE | RenameFlags::TRASH,
+            op_ms,
+        )?;
+        debug!("staged {} for async purge as {}", inp.path(), dst_path);
+        Ok(DeleteResult {
+            trashed: true,
+            purge_pending: true,
+            ..DeleteResult::new()
+        })
+    }
+
+    /// Claims a retention-expired trash entry for reclamation by moving it from
+    /// `/.Trash/<name>` to `/.Trash/.pending/<name>` in one journaled rename.
+    ///
+    /// The purger releases the namespace lock between batches; an entry left
+    /// directly under `/.Trash` would stay restorable while its subtree is
+    /// partially deleted. Once claimed, `RestoreTrash` rejects the path (it is
+    /// no longer a direct trash child), so a restore either wins before the
+    /// claim or fails cleanly. Returns the pending path, or `None` when the
+    /// entry is already gone (restored or emptied after the scan).
+    pub fn claim_trash_entry_for_purge(&mut self, trash_path: &str) -> FsResult<Option<String>> {
+        if !trash::is_trash_entry_path(trash_path) {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} is not a trash entry",
+                trash_path
+            )));
+        }
+
+        let src_inp = InodePath::resolve(self.root_ptr(), trash_path, &self.store)?;
+        if src_inp.get_last_inode().is_none() {
+            return Ok(None);
+        }
+
+        self.ensure_pending_root()?;
+        let dst_path = trash::pending_entry_path(src_inp.name());
+        let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+
+        // Trash markers are kept: the entry stays a trash entry, only no longer
+        // a restorable one.
+        self.rename_with_mtime(
+            &src_inp,
+            &dst_inp,
+            RenameFlags::NO_REPLACE,
+            LocalTime::mills() as i64,
+        )?;
+        debug!("claimed {} for purge as {}", trash_path, dst_path);
+        Ok(Some(dst_path))
     }
 
     fn ensure_trash_root(&mut self) -> FsResult<()> {
-        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store)?;
+        self.ensure_trash_dir(trash::TRASH_ROOT)
+    }
+
+    fn ensure_pending_root(&mut self) -> FsResult<()> {
+        self.ensure_trash_dir(trash::TRASH_PENDING_ROOT)
+    }
+
+    fn ensure_trash_dir(&mut self, path: &str) -> FsResult<()> {
+        let inp = InodePath::resolve(self.root_ptr(), path, &self.store)?;
         match inp.get_last_inode() {
             Some(inode) if inode.is_dir() => Ok(()),
             Some(_) => err_ext!(FsError::invalid_argument(format!(
                 "{} exists and is not a directory",
-                trash::TRASH_ROOT
+                path
             ))),
             None => {
                 self.mkdir(inp, MkdirOpts::with_create(false))?;
@@ -446,9 +699,15 @@ impl FsDir {
             } else {
                 format!("{}-{}", base, seq)
             };
-            let path = trash::trash_entry_path(&name);
-            let inp = InodePath::resolve(self.root_ptr(), &path, &self.store)?;
-            if inp.get_last_inode().is_none() {
+            let mut candidates = vec![trash::trash_entry_path(&name)];
+            // Pending entries share the trash-root name space by name only, not
+            // by directory, so both locations must be free to reuse a name.
+            candidates.push(trash::pending_entry_path(&name));
+            if candidates.iter().all(|path| {
+                InodePath::resolve(self.root_ptr(), path, &self.store)
+                    .map(|inp| inp.get_last_inode().is_none())
+                    .unwrap_or(false)
+            }) {
                 return Ok(name);
             }
         }
@@ -668,6 +927,45 @@ impl FsDir {
         Ok(TrashScanPage { paths, next_after })
     }
 
+    /// Returns one bounded page of `/.Trash/.pending` entry paths. Every entry
+    /// here is due for immediate reclamation; there is no retention cutoff.
+    pub fn scan_pending_trash(
+        &self,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> FsResult<TrashScanPage> {
+        let limit = limit.max(1);
+        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_PENDING_ROOT, &self.store)?;
+        let Some(inode) = inp.get_last_inode() else {
+            return Ok(TrashScanPage::default());
+        };
+        let Dir(dir) = inode.as_ref() else {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} exists and is not a directory",
+                trash::TRASH_PENDING_ROOT
+            )));
+        };
+
+        let mut children = dir.list_options(&ListOptions {
+            limit: Some(limit.saturating_add(1)),
+            start_after: start_after.map(str::to_string),
+        });
+        let has_more = children.len() > limit;
+        children.truncate(limit);
+        let next_after = if has_more {
+            children.last().map(|child| child.name().to_string())
+        } else {
+            None
+        };
+
+        let paths = children
+            .into_iter()
+            .map(|child| trash::pending_entry_path(child.name()))
+            .collect();
+
+        Ok(TrashScanPage { paths, next_after })
+    }
+
     pub fn restore_trash(
         &mut self,
         trash_path: &str,
@@ -749,41 +1047,70 @@ impl FsDir {
         };
         Ok(dir
             .children_iter()
-            .map(|child| child.name().to_string())
+            .filter_map(|child| {
+                let name = child.name();
+                // Keep the purge scope identical to the listing scope: a child
+                // whose name is not a trash entry name is invisible to
+                // ListTrash, so EmptyTrash must not delete it silently.
+                if trash::parse_entry_delete_ms(name).is_none() {
+                    warn!(
+                        "skipping foreign child under {}: {}",
+                        trash::TRASH_ROOT,
+                        name
+                    );
+                    return None;
+                }
+                Some(name.to_string())
+            })
             .collect())
     }
 
     // Purge one batch of names. Keeping the loop in the caller lets the
     // write lock be released between batches instead of blocking every
     // metadata mutation for the whole purge.
-    pub fn empty_trash_batch(&mut self, names: &[String]) -> (DeleteResult, FsResult<()>) {
-        let mut total = DeleteResult::new();
+    /// Moves the named recycle-bin entries into the async staging directory.
+    ///
+    /// Renaming a whole entry is O(1) and keeps its origin/delete-time xattrs,
+    /// so `EmptyTrash` can acknowledge immediately and let the purger reclaim the
+    /// subtrees in bounded batches. Entries that disappeared since the snapshot
+    /// (restored, purged, or staged by another node) are skipped, which keeps a
+    /// retried empty idempotent.
+    pub fn stage_trash_entries(&mut self, names: &[String]) -> FsResult<u64> {
+        if names.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_pending_root()?;
 
-        // Keep deleting the remaining entries after a failure: the caller
-        // needs the partial result to release the blocks of entries that were
-        // already removed, and those block lists cannot be recovered later.
-        let mut first_err = None;
+        let mtime = LocalTime::mills() as i64;
+        let mut staged = 0;
         for name in names {
-            let path = trash::trash_entry_path(name);
-            let res = match InodePath::resolve(self.root_ptr(), &path, &self.store) {
-                Ok(child_inp) => self.delete(&child_inp, true),
-                Err(e) => Err(e.into()),
-            };
-            match res {
-                Ok(res) => {
-                    total.inodes += res.inodes;
-                    total.bytes += res.bytes;
-                    total.blocks.extend(res.blocks);
-                }
+            let src_path = trash::trash_entry_path(name);
+            let dst_path = trash::pending_entry_path(name);
+
+            let src = match InodePath::resolve(self.root_ptr(), &src_path, &self.store) {
+                Ok(inp) => inp,
                 Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
+                    debug!("stage: skip unresolvable trash entry {}: {}", src_path, e);
+                    continue;
                 }
+            };
+            if src.get_last_inode().is_none() {
+                continue;
             }
+
+            let dst = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+            if dst.get_last_inode().is_some() {
+                debug!("stage: {} is already staged", dst_path);
+                continue;
+            }
+
+            // No TRASH flag: the entry already carries its origin and delete
+            // time, and re-stamping them would rewrite the user-visible origin.
+            self.rename_with_mtime(&src, &dst, RenameFlags::NO_REPLACE, mtime)?;
+            staged += 1;
         }
 
-        (total, first_err.map_or(Ok(()), Err))
+        Ok(staged)
     }
 
     pub fn free(&mut self, inp: &InodePath, recursive: bool) -> FsResult<FreeResult> {

@@ -25,7 +25,7 @@ use curvine_model::{
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::{ByteUnit, LocalTime};
 use log::{info, warn};
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 
 pub struct WorkerManager {
@@ -209,9 +209,24 @@ impl WorkerManager {
         self.worker_map.remove_expired(id)
     }
 
+    pub fn remove_expired_worker_if_stale(
+        &mut self,
+        id: u32,
+        now: u64,
+        baseline: u64,
+        lost_ms: u64,
+    ) -> Option<WorkerInfo> {
+        match self.worker_map.workers.get(&id) {
+            Some(worker) if now > worker.last_update.max(baseline) + lost_ms => {
+                self.worker_map.remove_expired(id)
+            }
+            _ => None,
+        }
+    }
+
     pub fn add_blacklist_worker(&mut self, id: u32) -> Option<WorkerInfo> {
         match self.worker_map.workers.get_mut(&id) {
-            Some(v) if v.status != WorkerStatus::Blacklist => {
+            Some(v) if v.status == WorkerStatus::Live => {
                 v.status = WorkerStatus::Blacklist;
                 Some(v.clone())
             }
@@ -316,43 +331,75 @@ impl WorkerManager {
     }
 
     pub fn add_dcm(&mut self, list: Vec<String>) -> Vec<String> {
-        let mut set = HashSet::new();
-        for addr in list {
-            set.insert(addr);
-        }
-
+        let hosts: BTreeSet<String> = list.into_iter().collect();
         let mut res = vec![];
-        for (_, worker) in self.worker_map.workers.iter_mut() {
-            if set.contains(&worker.address.hostname) {
+        for host in hosts {
+            for worker in self.host_workers_mut(&host) {
                 worker.status = WorkerStatus::Decommission;
-                res.push(worker.simple_string());
             }
+            res.extend(self.host_dcm_entries(&host, WorkerStatus::Decommission));
+            self.worker_map.decommissioned_hosts.insert(host);
         }
         res
     }
 
     pub fn get_dcm(&self) -> Vec<String> {
+        let hosts: BTreeSet<&String> = self.worker_map.decommissioned_hosts.iter().collect();
+        hosts
+            .into_iter()
+            .flat_map(|host| self.host_dcm_entries(host, WorkerStatus::Decommission))
+            .collect()
+    }
+
+    pub fn remove_dcm(&mut self, list: Vec<String>) -> Vec<String> {
+        let hosts: BTreeSet<String> = list.into_iter().collect();
         let mut res = vec![];
-        for (_, worker) in self.worker_map.workers.iter() {
-            if worker.status == WorkerStatus::Decommission {
-                res.push(worker.simple_string());
+        for host in hosts {
+            if !self.worker_map.decommissioned_hosts.remove(&host) {
+                continue;
             }
+            for worker in self.host_workers_mut(&host) {
+                if worker.status == WorkerStatus::Decommission {
+                    worker.status = WorkerStatus::Live;
+                }
+            }
+            res.extend(self.host_dcm_entries(&host, WorkerStatus::Live));
         }
         res
     }
 
-    pub fn remove_dcm(&mut self, list: Vec<String>) -> Vec<String> {
-        let mut set = HashSet::new();
-        for addr in list {
-            set.insert(addr);
-        }
+    fn host_workers_mut<'a>(
+        &'a mut self,
+        host: &'a str,
+    ) -> impl Iterator<Item = &'a mut WorkerInfo> + 'a {
+        let wm = &mut self.worker_map;
+        wm.workers
+            .values_mut()
+            .chain(wm.lost_workers.values_mut())
+            .filter(move |worker| worker.address.hostname == host)
+    }
 
-        let mut res = vec![];
-        for (_, worker) in self.worker_map.workers.iter_mut() {
-            if set.contains(&worker.address.hostname) {
-                worker.status = WorkerStatus::Live;
-                res.push(worker.simple_string());
-            }
+    // Offline hosts fall back to lost entries, then to "-,<host>,<status>" in the same shape.
+    fn host_dcm_entries(&self, host: &str, status: WorkerStatus) -> Vec<String> {
+        let on_host = |worker: &&WorkerInfo| worker.address.hostname == host;
+        let mut res: Vec<String> = self
+            .worker_map
+            .workers
+            .values()
+            .filter(on_host)
+            .map(|worker| worker.simple_string())
+            .collect();
+        if res.is_empty() {
+            res = self
+                .worker_map
+                .lost_workers
+                .values()
+                .filter(on_host)
+                .map(|worker| worker.simple_string())
+                .collect();
+        }
+        if res.is_empty() {
+            res.push(format!("-,{},{:?}", host, status));
         }
         res
     }
@@ -622,6 +669,7 @@ mod tests {
         let mut conf = ClusterConf::default();
         conf.master.worker_policy = "robin".to_string();
         conf.master.heartbeat_interval = "1ms".to_string();
+        conf.master.worker_check_interval = "1ms".to_string();
         conf.master.worker_lost_interval = "10ms".to_string();
         conf.master.init().unwrap();
         let mut manager = WorkerManager::new(&conf).unwrap();
@@ -660,5 +708,163 @@ mod tests {
             .unwrap();
 
         assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 0);
+    }
+
+    fn host_addr(worker_id: u32, hostname: &str) -> WorkerAddress {
+        WorkerAddress {
+            worker_id,
+            hostname: hostname.to_string(),
+            ip_addr: "127.0.0.1".to_string(),
+            rpc_port: 8997,
+            ..Default::default()
+        }
+    }
+
+    fn send_heartbeat(manager: &mut WorkerManager, status: HeartbeatStatus, addr: WorkerAddress) {
+        let cluster_id = manager.cluster_id.clone();
+        manager
+            .heartbeat(
+                &cluster_id,
+                status,
+                addr,
+                1,
+                String::new(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![storage(1 << 30, 1 << 30)],
+                None,
+            )
+            .unwrap();
+    }
+
+    fn restart(manager: &mut WorkerManager, addr: WorkerAddress) {
+        send_heartbeat(manager, HeartbeatStatus::Start, addr.clone());
+        send_heartbeat(manager, HeartbeatStatus::Running, addr);
+    }
+
+    fn status_of(manager: &WorkerManager, id: u32) -> WorkerStatus {
+        manager.get_known_worker(id).unwrap().status
+    }
+
+    #[test]
+    fn decommission_survives_blacklist_timeout() {
+        let mut manager = robin_manager();
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(1, "a"));
+        assert_eq!(manager.add_dcm(vec!["a".to_string()]).len(), 1);
+
+        assert!(manager.add_blacklist_worker(1).is_none());
+        assert_eq!(status_of(&manager, 1), WorkerStatus::Decommission);
+    }
+
+    #[test]
+    fn decommission_survives_lost_eviction_and_restart() {
+        let mut manager = robin_manager();
+        let addr = host_addr(1, "a");
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, addr.clone());
+        manager.add_dcm(vec!["a".to_string()]);
+
+        manager.add_blacklist_worker(1);
+        manager.remove_expired_worker(1).unwrap();
+        assert_eq!(status_of(&manager, 1), WorkerStatus::Decommission);
+
+        restart(&mut manager, addr);
+        assert_eq!(status_of(&manager, 1), WorkerStatus::Decommission);
+        assert_eq!(manager.get_dcm().len(), 1);
+        assert!(manager
+            .choose_worker(ChooseContext::with_num(1, 128 << 20, vec![]))
+            .is_err());
+    }
+
+    #[test]
+    fn decommission_survives_restart_with_new_worker_id() {
+        let mut manager = robin_manager();
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(1, "a"));
+        manager.add_dcm(vec!["a".to_string()]);
+        manager.remove_expired_worker(1).unwrap();
+
+        restart(&mut manager, host_addr(2, "a"));
+        assert_eq!(status_of(&manager, 2), WorkerStatus::Decommission);
+    }
+
+    #[test]
+    fn decommission_applies_to_worker_registered_later() {
+        let mut manager = robin_manager();
+        assert_eq!(
+            manager.add_dcm(vec!["a".to_string()]),
+            vec!["-,a,Decommission"]
+        );
+        assert_eq!(manager.get_dcm(), vec!["-,a,Decommission"]);
+
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(1, "a"));
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(2, "b"));
+        assert_eq!(status_of(&manager, 1), WorkerStatus::Decommission);
+        assert_eq!(status_of(&manager, 2), WorkerStatus::Live);
+        assert_eq!(manager.get_dcm(), vec!["1,a:8997,Decommission"]);
+    }
+
+    #[test]
+    fn dcm_reports_lost_and_unregistered_hosts() {
+        let mut manager = robin_manager();
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(1, "a"));
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(2, "b"));
+        manager.remove_expired_worker(1).unwrap();
+
+        let added = manager.add_dcm(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            added,
+            vec![
+                "1,a:8997,Decommission",
+                "2,b:8997,Decommission",
+                "-,c,Decommission"
+            ]
+        );
+        assert_eq!(manager.get_dcm(), added);
+
+        // The CLI matches requested hosts on the hostname in field 1.
+        for (entry, host) in added.iter().zip(["a", "b", "c"]) {
+            let addr = entry.split(',').nth(1).unwrap();
+            assert_eq!(addr.split(':').next(), Some(host));
+        }
+
+        let removed = manager.remove_dcm(vec!["a".to_string(), "c".to_string(), "d".to_string()]);
+        assert_eq!(removed, vec!["1,a:8997,Live", "-,c,Live"]);
+        assert_eq!(manager.get_dcm(), vec!["2,b:8997,Decommission"]);
+    }
+
+    #[test]
+    fn remove_dcm_while_lost_restores_live_on_register() {
+        let mut manager = robin_manager();
+        let addr = host_addr(1, "a");
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, addr.clone());
+        manager.add_dcm(vec!["a".to_string()]);
+        manager.remove_expired_worker(1).unwrap();
+
+        assert_eq!(
+            manager.remove_dcm(vec!["a".to_string()]),
+            vec!["1,a:8997,Live"]
+        );
+        assert_eq!(status_of(&manager, 1), WorkerStatus::Live);
+
+        restart(&mut manager, addr);
+        assert_eq!(status_of(&manager, 1), WorkerStatus::Live);
+        assert!(manager.get_dcm().is_empty());
+        manager
+            .choose_worker(ChooseContext::with_num(1, 128 << 20, vec![]))
+            .unwrap();
+    }
+
+    #[test]
+    fn blacklisted_worker_recovers_live_on_heartbeat() {
+        let mut manager = robin_manager();
+        let addr = host_addr(1, "a");
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, addr.clone());
+
+        assert!(manager.add_blacklist_worker(1).is_some());
+        assert!(manager.remove_dcm(vec!["a".to_string()]).is_empty());
+        assert_eq!(status_of(&manager, 1), WorkerStatus::Blacklist);
+
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, addr);
+        assert_eq!(status_of(&manager, 1), WorkerStatus::Live);
     }
 }

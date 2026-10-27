@@ -172,14 +172,21 @@ pub fn python_io_curvine_curvine_native_rename(
 }
 
 #[pyfunction]
+#[pyo3(signature = (ptr, path, recursive, async_delete = false))]
 pub fn python_io_curvine_curvine_native_delete(
     ptr: usize,
     path: String,
     recursive: bool,
+    async_delete: bool,
 ) -> PyResult<()> {
     let fs_ptr = ptr as *mut PythonFilesystem;
     let fs = unsafe { &*fs_ptr };
-    fs.delete(path, recursive).map_err(|e| e.into_py_err())?;
+    if async_delete {
+        fs.delete_async(path, recursive)
+            .map_err(|e| e.into_py_err())?;
+    } else {
+        fs.delete(path, recursive).map_err(|e| e.into_py_err())?;
+    }
     Ok(())
 }
 
