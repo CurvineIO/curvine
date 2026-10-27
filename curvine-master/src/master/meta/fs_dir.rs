@@ -561,16 +561,119 @@ impl FsDir {
             op_ms,
         )?;
         debug!("moved {} to trash as {}", inp.path(), dst_path);
-        Ok(DeleteResult::new())
+        Ok(DeleteResult {
+            trashed: true,
+            ..DeleteResult::new()
+        })
+    }
+
+    /// Moves `inp` into the asynchronous staging directory `/.Trash/.pending`.
+    ///
+    /// This is the `async_delete` path: the client gets the same immediate
+    /// namespace effect as a soft delete, while the purger reclaims the entry
+    /// without waiting for `trash_retention`. It is independent of
+    /// `trash_enabled` because `/.Trash` is reserved either way.
+    pub fn trash_pending(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
+        let op_ms = LocalTime::mills() as i64;
+
+        if inp.is_root() {
+            return err_box!("The root is not allowed to be deleted");
+        }
+
+        if inp.is_empty() || inp.get_last_inode().is_none() {
+            return err_ext!(FsError::file_not_found(inp.path()));
+        }
+
+        if !inp.is_empty_dir() && !recursive {
+            return err_ext!(FsError::dir_not_empty(inp.path()));
+        }
+
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        // A shared inode must be unlinked rather than moved, and unresolved
+        // entries cannot be renamed; both stay synchronous and bounded because
+        // they only remove a single name.
+        if inode.is_file_entry() || matches!(inode.as_ref(), File(f) if f.nlink() > 1) {
+            return self.delete(inp, recursive);
+        }
+
+        self.ensure_trash_root()?;
+        self.ensure_pending_root()?;
+
+        let entry_name = self.unique_trash_entry_name(op_ms, inode.id())?;
+        let dst_path = trash::pending_entry_path(&entry_name);
+        let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+
+        self.rename_with_mtime(
+            inp,
+            &dst_inp,
+            RenameFlags::NO_REPLACE | RenameFlags::TRASH,
+            op_ms,
+        )?;
+        debug!("staged {} for async purge as {}", inp.path(), dst_path);
+        Ok(DeleteResult {
+            trashed: true,
+            purge_pending: true,
+            ..DeleteResult::new()
+        })
+    }
+
+    /// Claims a retention-expired trash entry for reclamation by moving it from
+    /// `/.Trash/<name>` to `/.Trash/.pending/<name>` in one journaled rename.
+    ///
+    /// The purger releases the namespace lock between batches; an entry left
+    /// directly under `/.Trash` would stay restorable while its subtree is
+    /// partially deleted. Once claimed, `RestoreTrash` rejects the path (it is
+    /// no longer a direct trash child), so a restore either wins before the
+    /// claim or fails cleanly. Returns the pending path, or `None` when the
+    /// entry is already gone (restored or emptied after the scan).
+    pub fn claim_trash_entry_for_purge(&mut self, trash_path: &str) -> FsResult<Option<String>> {
+        if !trash::is_trash_entry_path(trash_path) {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} is not a trash entry",
+                trash_path
+            )));
+        }
+
+        let src_inp = InodePath::resolve(self.root_ptr(), trash_path, &self.store)?;
+        if src_inp.get_last_inode().is_none() {
+            return Ok(None);
+        }
+
+        self.ensure_pending_root()?;
+        let dst_path = trash::pending_entry_path(src_inp.name());
+        let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+
+        // Trash markers are kept: the entry stays a trash entry, only no longer
+        // a restorable one.
+        self.rename_with_mtime(
+            &src_inp,
+            &dst_inp,
+            RenameFlags::NO_REPLACE,
+            LocalTime::mills() as i64,
+        )?;
+        debug!("claimed {} for purge as {}", trash_path, dst_path);
+        Ok(Some(dst_path))
     }
 
     fn ensure_trash_root(&mut self) -> FsResult<()> {
-        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store)?;
+        self.ensure_trash_dir(trash::TRASH_ROOT)
+    }
+
+    fn ensure_pending_root(&mut self) -> FsResult<()> {
+        self.ensure_trash_dir(trash::TRASH_PENDING_ROOT)
+    }
+
+    fn ensure_trash_dir(&mut self, path: &str) -> FsResult<()> {
+        let inp = InodePath::resolve(self.root_ptr(), path, &self.store)?;
         match inp.get_last_inode() {
             Some(inode) if inode.is_dir() => Ok(()),
             Some(_) => err_ext!(FsError::invalid_argument(format!(
                 "{} exists and is not a directory",
-                trash::TRASH_ROOT
+                path
             ))),
             None => {
                 self.mkdir(inp, MkdirOpts::with_create(false))?;
@@ -587,9 +690,15 @@ impl FsDir {
             } else {
                 format!("{}-{}", base, seq)
             };
-            let path = trash::trash_entry_path(&name);
-            let inp = InodePath::resolve(self.root_ptr(), &path, &self.store)?;
-            if inp.get_last_inode().is_none() {
+            let mut candidates = vec![trash::trash_entry_path(&name)];
+            // Pending entries share the trash-root name space by name only, not
+            // by directory, so both locations must be free to reuse a name.
+            candidates.push(trash::pending_entry_path(&name));
+            if candidates.iter().all(|path| {
+                InodePath::resolve(self.root_ptr(), path, &self.store)
+                    .map(|inp| inp.get_last_inode().is_none())
+                    .unwrap_or(false)
+            }) {
                 return Ok(name);
             }
         }
@@ -805,6 +914,45 @@ impl FsDir {
                 paths.push(trash::trash_entry_path(child.name()));
             }
         }
+
+        Ok(TrashScanPage { paths, next_after })
+    }
+
+    /// Returns one bounded page of `/.Trash/.pending` entry paths. Every entry
+    /// here is due for immediate reclamation; there is no retention cutoff.
+    pub fn scan_pending_trash(
+        &self,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> FsResult<TrashScanPage> {
+        let limit = limit.max(1);
+        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_PENDING_ROOT, &self.store)?;
+        let Some(inode) = inp.get_last_inode() else {
+            return Ok(TrashScanPage::default());
+        };
+        let Dir(dir) = inode.as_ref() else {
+            return err_ext!(FsError::invalid_argument(format!(
+                "{} exists and is not a directory",
+                trash::TRASH_PENDING_ROOT
+            )));
+        };
+
+        let mut children = dir.list_options(&ListOptions {
+            limit: Some(limit.saturating_add(1)),
+            start_after: start_after.map(str::to_string),
+        });
+        let has_more = children.len() > limit;
+        children.truncate(limit);
+        let next_after = if has_more {
+            children.last().map(|child| child.name().to_string())
+        } else {
+            None
+        };
+
+        let paths = children
+            .into_iter()
+            .map(|child| trash::pending_entry_path(child.name()))
+            .collect();
 
         Ok(TrashScanPage { paths, next_after })
     }

@@ -141,6 +141,12 @@ pub struct MasterConf {
     // operations can take the namespace lock.
     pub trash_purge_yield_ms: u64,
 
+    // How often the master drains /.Trash/.pending, i.e. the entries staged by
+    // async deletes. Runs regardless of trash_enabled.
+    pub trash_purge_interval: String,
+    #[serde(skip)]
+    pub trash_purge_interval_unit: DurationUnit,
+
     // Eviction configuration
     pub enable_quota_eviction: bool,
     pub quota_eviction_mode: String,
@@ -198,6 +204,7 @@ impl MasterConf {
         self.ttl_retry_interval_unit = DurationUnit::from_str(&self.ttl_retry_interval)?;
         self.trash_retention_unit = DurationUnit::from_str(&self.trash_retention)?;
         self.trash_check_interval_unit = DurationUnit::from_str(&self.trash_check_interval)?;
+        self.trash_purge_interval_unit = DurationUnit::from_str(&self.trash_purge_interval)?;
         self.block_replication_retry_interval_unit =
             DurationUnit::from_str(&self.block_replication_retry_interval)?;
         self.block_replication_submit_timeout_unit =
@@ -238,6 +245,10 @@ impl MasterConf {
 
         if self.trash_check_interval_ms() == 0 {
             return err_box!("master.trash_check_interval must be greater than zero");
+        }
+
+        if self.trash_purge_interval_ms() == 0 {
+            return err_box!("master.trash_purge_interval must be greater than zero");
         }
 
         Ok(())
@@ -304,6 +315,10 @@ impl MasterConf {
 
     pub fn trash_retention_ms(&self) -> u64 {
         self.trash_retention_unit.as_millis()
+    }
+
+    pub fn trash_purge_interval_ms(&self) -> u64 {
+        self.trash_purge_interval_unit.as_millis()
     }
 
     pub fn trash_check_interval_ms(&self) -> u64 {
@@ -410,6 +425,9 @@ impl Default for MasterConf {
 
             trash_purge_batch_inodes: 4096,
             trash_purge_yield_ms: 5,
+
+            trash_purge_interval: "1s".to_string(),
+            trash_purge_interval_unit: Default::default(),
 
             // Eviction configuration defaults
             enable_quota_eviction: false,
