@@ -186,9 +186,11 @@ impl DirList {
         self.dir_iter()
             .map(|dir| {
                 let failed = match dir.check_dir() {
-                    Ok(_) => false,
+                    Ok(_) => dir.is_failed(),
                     Err(e) => {
-                        error!("check_dir {}: {}", dir.id(), e);
+                        if !dir.is_failed() {
+                            error!("check_dir {}: {}", dir.id(), e);
+                        }
                         dir.set_failed();
                         true
                     }
@@ -334,6 +336,34 @@ mod tests {
         assert_eq!(group.available(), before);
         dir.reserve_space(false, 10 * ByteUnit::MB as i64);
         assert_eq!(group.available(), before - 10 * ByteUnit::MB as i64);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_dir_stays_failed_and_stops_allocation() -> CommonResult<()> {
+        FileUtils::delete_path("../testing/dir-failed-sticky", true)?;
+        let dir = VfsDir::from_dir(
+            "",
+            WorkerDataDir::from_str("[SSD:100MB]../testing/dir-failed-sticky")?,
+        )?;
+        let dir_id = dir.id();
+        let mut group = DirList::new(vec![dir])?;
+        assert_eq!(group.failed_count(), 0);
+
+        group.get_dir(dir_id).unwrap().set_failed();
+        assert_eq!(group.failed_count(), 1);
+
+        // A passing directory check must not resurrect a failed directory.
+        let storages = group.get_and_check_storages(0);
+        assert_eq!(storages.len(), 1);
+        assert!(
+            storages[0].failed,
+            "sticky failure must survive a healthy check"
+        );
+
+        assert!(group
+            .choose_dir(StorageRequest::new(StorageType::Ssd, 1)?)
+            .is_err());
         Ok(())
     }
 

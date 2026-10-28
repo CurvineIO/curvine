@@ -26,6 +26,7 @@ pub struct WriteContext {
     pub short_circuit: bool,
     pub off: i64,
     pub block_size: i64,
+    pub dir_id: u32,
 }
 
 impl WriteContext {
@@ -39,6 +40,7 @@ impl WriteContext {
             short_circuit: req.short_circuit,
             off: req.off,
             block_size: req.block_size,
+            dir_id: 0,
         };
 
         Ok(context)
@@ -55,6 +57,7 @@ pub struct ReadContext {
     pub enable_read_ahead: bool,
     pub read_ahead_len: i64,
     pub drop_cache_len: i64,
+    pub dir_id: u32,
 }
 
 impl ReadContext {
@@ -70,6 +73,7 @@ impl ReadContext {
             enable_read_ahead: req.enable_read_ahead,
             read_ahead_len: req.read_ahead_len,
             drop_cache_len: req.drop_cache_len,
+            dir_id: 0,
         };
 
         Ok(context)

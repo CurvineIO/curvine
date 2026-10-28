@@ -225,9 +225,18 @@ impl BatchWriteHandler {
             commit_blocks.push(block);
         }
 
-        for file in files.iter_mut() {
+        for (i, file) in files.iter_mut().enumerate() {
             if let Some(file) = file.as_mut() {
-                file.flush()?;
+                if let Err(e) = file.flush() {
+                    if let Some(context) = contexts.get(i) {
+                        WriteHandler::record_write_error(
+                            self.write_handler.metrics,
+                            context.dir_id,
+                            &e,
+                        );
+                    }
+                    return Err(e.into());
+                }
             }
         }
         for file in files.iter_mut() {
