@@ -95,6 +95,161 @@ fn test_node(rt: Arc<Runtime>, id: u64) -> RaftNode<MemLogStorage, HashAppStorag
     }
 }
 
+#[test]
+fn only_current_leader_replication_messages_can_refresh_contact() {
+    assert!(is_leader_contact_message(MessageType::MsgAppend));
+    assert!(is_leader_contact_message(MessageType::MsgHeartbeat));
+    assert!(is_leader_contact_message(MessageType::MsgSnapshot));
+
+    assert!(!is_leader_contact_message(MessageType::MsgRequestVote));
+    assert!(!is_leader_contact_message(MessageType::MsgRequestPreVote));
+    assert!(!is_leader_contact_message(MessageType::MsgAppendResponse));
+    assert!(!is_leader_contact_message(
+        MessageType::MsgHeartbeatResponse
+    ));
+}
+
+fn send_readiness_heartbeat(
+    node: &mut RaftNode<MemLogStorage, HashAppStorage<String, String>>,
+    rt: &Arc<Runtime>,
+    term: u64,
+    message_commit: u64,
+    leader_commit: Option<u64>,
+) {
+    let mut message = raft::eraftpb::Message {
+        from: 2,
+        to: node.id(),
+        term,
+        commit: message_commit,
+        ..Default::default()
+    };
+    message.set_msg_type(MessageType::MsgHeartbeat);
+    let request = RaftRequest {
+        message,
+        sender_session: Some(201),
+        receiver_session: None,
+        leader_commit,
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let rpc = Builder::new_rpc(RaftCode::Raft)
+        .proto_header(request)
+        .build();
+    node.handle_available(Envelope::new(rpc, tx), &mut HashMap::new())
+        .unwrap();
+    let response = rt.block_on(rx).unwrap().unwrap();
+    assert_eq!(response.response_status(), ResponseStatus::Success);
+}
+
+#[test]
+fn follower_readiness_uses_monotonic_leader_commit_proof_from_accepted_heartbeats() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone(), 3);
+    let local_commit = 10;
+    let entries: Vec<Entry> = (1..=local_commit)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            ..Default::default()
+        })
+        .collect();
+    node.storage.log_store.append(&entries).unwrap();
+    node.storage
+        .log_store
+        .set_hard_state_commit(local_commit)
+        .unwrap();
+    node.raw.raft.raft_log.committed = local_commit;
+    node.raw.raft.term = 2;
+    node.raw.raft.state = raft::StateRole::Follower;
+    node.role_monitor
+        .follower_readiness()
+        .observe_applied(local_commit);
+    node.role_monitor
+        .follower_readiness()
+        .set_replay_ready(true);
+
+    // raft-rs caps this heartbeat's commit at the leader's matched index,
+    // while Curvine carries the leader's actual commit separately.
+    send_readiness_heartbeat(&mut node, &rt, 2, local_commit, Some(100));
+    let monitor = node.role_monitor.follower_readiness();
+    let behind = monitor.snapshot();
+    assert_eq!(behind.commit_index, local_commit);
+    assert_eq!(behind.applied_index, Some(local_commit));
+    assert_eq!(behind.leader_commit_index, Some(100));
+    assert!(behind.leader_contact_age.is_some());
+    assert_eq!(
+        behind.refusal_reason(Duration::from_secs(5), 0, Duration::from_secs(60)),
+        Some(FollowerReadRefusal::CommitLag)
+    );
+    assert_eq!(
+        behind.refusal_reason(Duration::from_secs(5), 90, Duration::from_secs(60)),
+        None,
+        "recent network lag within the configured index allowance remains eligible"
+    );
+    let mut stalled_replication = behind.clone();
+    stalled_replication.replication_no_progress_age = Some(Duration::from_secs(61));
+    assert_eq!(
+        stalled_replication.refusal_reason(Duration::from_secs(5), 90, Duration::from_secs(60)),
+        Some(FollowerReadRefusal::ReplicationStalled)
+    );
+
+    // A delayed RPC from earlier progress must not lower the observed commit.
+    send_readiness_heartbeat(&mut node, &rt, 2, local_commit, Some(50));
+    assert_eq!(monitor.snapshot().leader_commit_index, Some(100));
+
+    // A legacy or mixed-version contact refreshes Raft contact but cannot
+    // reuse the previous commit proof to authorize a read.
+    send_readiness_heartbeat(&mut node, &rt, 2, local_commit, None);
+    let missing = monitor.snapshot();
+    assert_eq!(missing.leader_commit_index, None);
+    assert!(missing.leader_contact_age.is_some());
+    assert_eq!(
+        missing.refusal_reason(Duration::from_secs(5), 0, Duration::from_secs(60)),
+        Some(FollowerReadRefusal::LeaderCommitUnknown)
+    );
+
+    // A term transition invalidates the old watermark before accepting new
+    // proof. An older commit value from the new term must not inherit 100.
+    let old_epoch = missing.leadership_epoch;
+    send_readiness_heartbeat(&mut node, &rt, 3, local_commit, None);
+    let new_epoch_unknown = monitor.snapshot();
+    assert!(new_epoch_unknown.leadership_epoch > old_epoch);
+    assert_eq!(new_epoch_unknown.leader_commit_index, None);
+    send_readiness_heartbeat(&mut node, &rt, 3, local_commit, Some(5));
+    assert_eq!(monitor.snapshot().leader_commit_index, Some(5));
+    assert_eq!(
+        monitor
+            .snapshot()
+            .refusal_reason(Duration::from_secs(5), 0, Duration::from_secs(60)),
+        None
+    );
+}
+
+#[test]
+fn snapshot_readiness_is_invalidated_only_for_real_or_malformed_snapshot_state() {
+    let placeholder = SnapshotData::default();
+    let snapshot = Snapshot {
+        data: placeholder.encode_to_vec(),
+        ..Default::default()
+    };
+    assert!(!snapshot_carries_metadata(&snapshot));
+
+    let materialized = Snapshot {
+        data: SnapshotData {
+            snapshot_id: 1,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        ..Default::default()
+    };
+    assert!(snapshot_carries_metadata(&materialized));
+
+    let malformed = Snapshot {
+        data: vec![0xff],
+        ..Default::default()
+    };
+    assert!(snapshot_carries_metadata(&malformed));
+}
+
 fn test_rocks_node(
     rt: Arc<Runtime>,
     id: u64,

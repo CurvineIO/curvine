@@ -228,6 +228,10 @@ impl RpcClient {
         self.state.set_closed()
     }
 
+    pub(crate) fn same_connection(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     pub fn remote_addr(&self) -> &InetAddr {
         &self.state.remote_addr
     }

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use curvine_raft::raft::RoleState;
+use curvine_raft::raft::{FollowerReadinessMonitor, FollowerReadinessSnapshot};
 use curvine_runtime::sync::StateCtl;
 use num_enum::{FromPrimitive, IntoPrimitive};
 
@@ -37,14 +38,30 @@ pub enum MasterState {
 pub struct MasterMonitor {
     pub(crate) journal_ctl: StateCtl,
     pub fs_ctl: StateCtl,
+    follower_readiness: FollowerReadinessMonitor,
 }
 
 impl MasterMonitor {
     pub fn new(journal_ctl: StateCtl, fs_ctl: StateCtl) -> Self {
+        Self::with_follower_readiness(journal_ctl, fs_ctl, FollowerReadinessMonitor::default())
+    }
+
+    pub fn with_follower_readiness(
+        journal_ctl: StateCtl,
+        fs_ctl: StateCtl,
+        follower_readiness: FollowerReadinessMonitor,
+    ) -> Self {
         Self {
             journal_ctl,
             fs_ctl,
+            follower_readiness,
         }
+    }
+
+    /// Returns current Raft contact and actual journal replay observations.
+    /// RPC admission remains controlled separately by master configuration.
+    pub fn follower_readiness_snapshot(&self) -> FollowerReadinessSnapshot {
+        self.follower_readiness.snapshot()
     }
 
     // Determine whether the current node is an active node.

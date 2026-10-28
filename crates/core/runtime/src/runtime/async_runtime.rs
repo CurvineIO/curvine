@@ -20,7 +20,7 @@ use tokio::time::Duration;
 
 #[derive(Debug)]
 pub struct AsyncRuntime {
-    inner: Runtime,
+    inner: Option<Runtime>,
     name_prefix: String,
     io_threads: usize,
     worker_threads: usize,
@@ -40,7 +40,7 @@ impl AsyncRuntime {
 
         let rt = builder.build().unwrap();
         AsyncRuntime {
-            inner: rt,
+            inner: Some(rt),
             name_prefix: String::from(name_prefix.as_ref()),
             io_threads,
             worker_threads,
@@ -56,7 +56,7 @@ impl AsyncRuntime {
             .unwrap();
 
         AsyncRuntime {
-            inner: rt,
+            inner: Some(rt),
             name_prefix: name.to_string(),
             io_threads: 1,
             worker_threads: 0,
@@ -72,8 +72,30 @@ impl AsyncRuntime {
         Self::new("single", 1, 1)
     }
 
-    pub fn shutdown_background(self) {
-        self.inner.shutdown_background();
+    pub fn shutdown_background(mut self) {
+        if let Some(runtime) = self.inner.take() {
+            runtime.shutdown_background();
+        }
+    }
+
+    fn inner(&self) -> &Runtime {
+        self.inner.as_ref().expect("runtime is already shut down")
+    }
+}
+
+impl Drop for AsyncRuntime {
+    fn drop(&mut self) {
+        let Some(runtime) = self.inner.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // A client or background task can release the final Runtime Arc.
+            // Tokio's blocking destructor panics in an async context; its
+            // documented background shutdown is safe from that context.
+            runtime.shutdown_background();
+        } else {
+            drop(runtime);
+        }
     }
 }
 
@@ -95,14 +117,14 @@ impl RpcRuntime for AsyncRuntime {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.inner.spawn(task)
+        self.inner().spawn(task)
     }
 
     fn block_on<F>(&self, task: F) -> F::Output
     where
         F: Future,
     {
-        self.inner.block_on(task)
+        self.inner().block_on(task)
     }
 
     fn spawn_blocking<F, R>(&self, task: F) -> JoinHandle<R>
@@ -110,6 +132,40 @@ impl RpcRuntime for AsyncRuntime {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        self.inner.spawn_blocking(task)
+        self.inner().spawn_blocking(task)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{mpsc, Arc};
+
+    #[test]
+    fn runtime_can_be_dropped_inside_another_runtime() {
+        let outer = AsyncRuntime::single();
+        outer.block_on(async {
+            let inner = AsyncRuntime::single();
+            assert_eq!(inner.spawn(async { 42 }).await.unwrap(), 42);
+            drop(inner);
+        });
+    }
+
+    #[test]
+    fn last_runtime_owner_can_be_released_by_its_own_task() {
+        let runtime = Arc::new(AsyncRuntime::single());
+        let task_owner = runtime.clone();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (finished, done) = mpsc::channel();
+        runtime.spawn(async move {
+            released.await.unwrap();
+            drop(task_owner);
+            finished.send(()).unwrap();
+        });
+        // Ensure the task holds the only external runtime owner when it drops.
+        drop(runtime);
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("dropping the task's runtime owner panicked or blocked");
     }
 }

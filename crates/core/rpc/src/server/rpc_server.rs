@@ -130,7 +130,7 @@ where
         self.monitor.advance_shutdown();
 
         // Perform a cleanup operation.
-        self.do_shutdown_hook();
+        self.do_shutdown_hook().await;
 
         self.monitor.advance_stop();
 
@@ -234,23 +234,86 @@ where
         state.push(Box::new(hook));
     }
 
-    fn do_shutdown_hook(&self) {
-        let mut state = self.shutdown_hook.lock().unwrap();
-        let mut hooks = vec![];
-        while let Some(func) = state.pop() {
-            hooks.push(func);
-        }
+    async fn do_shutdown_hook(&self) {
+        let hooks = {
+            let mut state = self.shutdown_hook.lock().unwrap();
+            std::mem::take(&mut *state)
+        };
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        // Hooks may block on this server's runtime to finish network cleanup.
+        // Await their completion instead of joining on an I/O thread, which
+        // deadlocks a single-thread runtime needed by those same hooks.
         thread::spawn(move || {
-            for func in hooks {
+            for func in hooks.into_iter().rev() {
                 func()
             }
-        })
-        .join()
-        .unwrap()
+            let _ = done_tx.send(());
+        });
+        done_rx.await.expect("server shutdown hook thread panicked");
     }
 
     fn get_bind_addr(&self) -> String {
         let hostname = env::var(Self::ORPC_BIND_HOSTNAME).unwrap_or(self.addr.hostname.to_string());
         format!("{}:{}", hostname, self.addr.port)
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use crate::handler::MessageHandler;
+    use crate::message::Message;
+    use curvine_core_error::{CommonErrorExt, CommonResultExt};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct Echo;
+
+    impl MessageHandler for Echo {
+        type Error = CommonErrorExt;
+
+        fn handle(&self, message: &Message) -> CommonResultExt<Message> {
+            Ok(message.success())
+        }
+    }
+
+    impl HandlerService for Echo {
+        type Item = Echo;
+
+        fn get_message_handler(&self, _: Option<curvine_net::net::ConnState>) -> Self::Item {
+            Echo
+        }
+    }
+
+    #[test]
+    fn shutdown_hooks_leave_single_io_thread_available_and_keep_lifo_order() {
+        let rt = Arc::new(Runtime::single());
+        let server = Arc::new(RpcServer::with_rt(
+            rt.clone(),
+            ServerConf::with_hostname("127.0.0.1", 0),
+            Echo,
+        ));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let first_order = order.clone();
+        server.add_shutdown_hook(move || first_order.lock().unwrap().push(1));
+        let second_order = order.clone();
+        let hook_rt = rt.clone();
+        server.add_shutdown_hook(move || {
+            let (send, receive) = mpsc::channel();
+            hook_rt.spawn(async move {
+                // Real registration cleanup needs the same I/O runtime to
+                // keep polling while the synchronous shutdown hook waits.
+                tokio::task::yield_now().await;
+                send.send(()).unwrap();
+            });
+            receive
+                .recv_timeout(Duration::from_secs(2))
+                .expect("shutdown blocked the only I/O thread");
+            second_order.lock().unwrap().push(2);
+        });
+
+        let task = rt.spawn(async move { server.do_shutdown_hook().await });
+        rt.block_on(task).unwrap();
+        assert_eq!(*order.lock().unwrap(), [2, 1]);
     }
 }

@@ -13,7 +13,12 @@
 // limitations under the License.
 
 use crate::master::fs::context::ValidateAddBlock;
-use crate::master::fs::full_block_report::{FullReportProgress, FullReportTracker};
+use crate::master::fs::follower_block_report::{
+    DeferredBlockReport, FollowerBlockReportState, MAX_DEFERRED_FOLLOWER_REPORTS,
+};
+use crate::master::fs::full_block_report::{
+    FullReportInventory, FullReportProgress, FullReportTracker,
+};
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
@@ -21,6 +26,7 @@ use crate::master::meta::{
     trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
 };
 
+use crate::master::fs::worker_manager::WorkerManager;
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
@@ -30,14 +36,16 @@ use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::*;
+use curvine_raft::raft::{FollowerReadRefusal, FollowerReadinessSnapshot, RoleState};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// How a delete treats the recycle bin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +86,10 @@ pub struct MasterFilesystem {
     pub master_monitor: MasterMonitor,
     pub conf: Arc<MasterConf>,
     full_report_tracker: FullReportTracker,
+    follower_full_report_tracker: FullReportTracker,
+    follower_block_report_state: FollowerBlockReportState,
+    follower_block_report_lock: Arc<RwLock<()>>,
+    follower_read_contact_timeout_ms: u64,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
     /// Serialises drains of `/.Trash/.pending`. The blocking empty-trash call
@@ -132,8 +144,19 @@ struct FullBlockReconcileJob {
     reported_blocks: HashSet<i64>,
 }
 
+struct FollowerFullBlockReconcileJob {
+    worker_id: u32,
+    generation: u64,
+    term: u64,
+    leadership_epoch: u64,
+    worker_session_id: String,
+    report_id: u64,
+    inventory: FullReportInventory,
+}
+
 const FULL_BLOCK_RECONCILE_THREADS: usize = 2;
 const FULL_BLOCK_RECONCILE_QUEUE_SIZE: usize = 128;
+const FOLLOWER_FULL_REPORT_INVENTORY_LIMIT: usize = FULL_BLOCK_RECONCILE_THREADS;
 
 impl MasterFilesystem {
     // Max block-report location updates applied under a single fs_dir write lock.
@@ -169,12 +192,22 @@ impl MasterFilesystem {
         worker_manager: SyncWorkerManager,
         master_monitor: MasterMonitor,
     ) -> Self {
+        let follower_read_contact_timeout_ms = conf
+            .journal
+            .follower_read_contact_timeout_ms()
+            .unwrap_or_default();
         Self {
             fs_dir,
             worker_manager,
             master_monitor,
             conf: Arc::new(conf.master.clone()),
             full_report_tracker: Default::default(),
+            follower_full_report_tracker: FullReportTracker::with_inventory_limit(
+                FOLLOWER_FULL_REPORT_INVENTORY_LIMIT,
+            ),
+            follower_block_report_state: Default::default(),
+            follower_block_report_lock: Default::default(),
+            follower_read_contact_timeout_ms,
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
@@ -186,12 +219,22 @@ impl MasterFilesystem {
     }
 
     pub fn with_js(conf: &ClusterConf, js: &JournalSystem) -> Self {
+        let follower_read_contact_timeout_ms = conf
+            .journal
+            .follower_read_contact_timeout_ms()
+            .unwrap_or_default();
         Self {
             fs_dir: js.fs().fs_dir.clone(),
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
             conf: Arc::new(conf.master.clone()),
             full_report_tracker: Default::default(),
+            follower_full_report_tracker: FullReportTracker::with_inventory_limit(
+                FOLLOWER_FULL_REPORT_INVENTORY_LIMIT,
+            ),
+            follower_block_report_state: Default::default(),
+            follower_block_report_lock: Default::default(),
+            follower_read_contact_timeout_ms,
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
@@ -1169,6 +1212,15 @@ impl MasterFilesystem {
         // Location reads only need the caller's namespace guard. Acquire worker
         // state afterwards so RocksDB lookups do not delay heartbeats.
         let wm = self.worker_manager.read();
+        Self::get_block_locs_from_locations(path, file, &file_locs, &wm)
+    }
+
+    fn get_block_locs_from_locations(
+        path: &str,
+        file: &InodeFile,
+        file_locs: &HashMap<i64, Vec<BlockLocation>>,
+        wm: &WorkerManager,
+    ) -> FsResult<Vec<LocatedBlock>> {
         let mut block_locs = Vec::with_capacity(file_locs.len());
 
         for (index, meta) in file.blocks.iter().enumerate() {
@@ -1503,6 +1555,323 @@ impl MasterFilesystem {
         fs_dir.block_inode_state(id)
     }
 
+    fn follower_worker_state_enabled(&self) -> bool {
+        self.conf.follower_worker_state_enabled || self.conf.follower_reads_enabled
+    }
+
+    /// Evaluate the configured follower-read freshness policy against one
+    /// immutable Raft/journal observation.
+    pub fn follower_read_refusal(
+        &self,
+        snapshot: &FollowerReadinessSnapshot,
+    ) -> Option<FollowerReadRefusal> {
+        snapshot.refusal_reason(
+            Duration::from_millis(self.follower_read_contact_timeout_ms),
+            self.conf.follower_read_max_commit_lag,
+            Duration::from_millis(self.conf.follower_read_apply_stall_timeout_ms()),
+        )
+    }
+
+    /// Caller holds the write side of `follower_block_report_lock`.
+    fn reset_passive_view_for_current_epoch(&self) {
+        let snapshot = self.master_monitor.follower_readiness_snapshot();
+        if snapshot.role != curvine_raft::raft::RoleState::Follower {
+            return;
+        }
+        for worker_id in self
+            .follower_block_report_state
+            .reset_for_epoch(snapshot.term, snapshot.leadership_epoch)
+        {
+            self.follower_full_report_tracker.reset(worker_id);
+        }
+    }
+
+    /// Record the registration state needed by follower block-location reads.
+    /// This state is local and is reset whenever the worker starts a new session.
+    #[cfg(test)]
+    fn observe_passive_worker_heartbeat(&self, status: HeartbeatStatus, worker_id: u32) {
+        let _serial = self.follower_block_report_lock.write();
+        if self.master_monitor.is_active()
+            || self.master_monitor.follower_readiness_snapshot().role
+                != curvine_raft::raft::RoleState::Follower
+        {
+            return;
+        }
+        self.reset_passive_view_for_current_epoch();
+        let worker_manager = self.worker_manager.read();
+        self.observe_passive_worker_heartbeat_locked(status, worker_id, &worker_manager);
+    }
+
+    fn observe_passive_worker_heartbeat_locked(
+        &self,
+        status: HeartbeatStatus,
+        worker_id: u32,
+        worker_manager: &WorkerManager,
+    ) {
+        let mut retained_workers: HashSet<u32> = worker_manager
+            .get_last_heartbeat()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        if status == HeartbeatStatus::Start {
+            // A provisional Start may not yet be visible in WorkerManager,
+            // but its new session still needs a full report.
+            retained_workers.insert(worker_id);
+        }
+        for stale_worker in self
+            .follower_block_report_state
+            .retain_workers(&retained_workers)
+        {
+            self.follower_full_report_tracker.reset(stale_worker);
+        }
+        match status {
+            HeartbeatStatus::Start => {
+                self.follower_full_report_tracker.reset(worker_id);
+                self.follower_block_report_state
+                    .observe_worker(worker_id, true);
+            }
+            HeartbeatStatus::Running => {
+                self.follower_block_report_state
+                    .observe_worker(worker_id, false);
+            }
+            HeartbeatStatus::End => {
+                self.follower_full_report_tracker.reset(worker_id);
+                self.follower_block_report_state.forget_worker(worker_id);
+            }
+        }
+    }
+
+    /// Apply a passive worker heartbeat while holding the follower report lock
+    /// across registration validation, readiness invalidation, and the worker
+    /// map update. Reports and location reads take the same lock before the
+    /// worker map, so an old session cannot restore readiness between a Start
+    /// reset and installation of the new session.
+    pub(crate) fn process_passive_worker_heartbeat<V, U>(
+        &self,
+        status: HeartbeatStatus,
+        worker_id: u32,
+        validate: V,
+        update: U,
+    ) -> FsResult<()>
+    where
+        V: FnOnce(&WorkerManager) -> FsResult<()>,
+        U: FnOnce(&mut WorkerManager) -> FsResult<()>,
+    {
+        let _serial = self.follower_block_report_lock.write();
+        let initial_snapshot = self.master_monitor.follower_readiness_snapshot();
+        if self.master_monitor.is_active() || initial_snapshot.role != RoleState::Follower {
+            return err_box!("Passive worker heartbeats are not accepted by the active master");
+        }
+        self.reset_passive_view_for_current_epoch();
+
+        let mut worker_manager = self.worker_manager.write();
+        let current_snapshot = self.master_monitor.follower_readiness_snapshot();
+        if self.master_monitor.is_active()
+            || current_snapshot.role != RoleState::Follower
+            || current_snapshot.leadership_epoch != initial_snapshot.leadership_epoch
+        {
+            return err_box!("Passive worker heartbeat crossed a leadership epoch");
+        }
+        validate(&worker_manager)?;
+        if status == HeartbeatStatus::Start {
+            // Revoke readiness after validation but before publishing the new
+            // worker session. The report lock keeps reports from observing the
+            // old map between these operations.
+            self.observe_passive_worker_heartbeat_locked(status, worker_id, &worker_manager);
+        }
+        update(&mut worker_manager)?;
+        let current_snapshot = self.master_monitor.follower_readiness_snapshot();
+        if self.master_monitor.is_active()
+            || current_snapshot.role != RoleState::Follower
+            || current_snapshot.leadership_epoch != initial_snapshot.leadership_epoch
+        {
+            return err_box!("Passive worker heartbeat crossed a leadership epoch");
+        }
+        if status != HeartbeatStatus::Start {
+            self.observe_passive_worker_heartbeat_locked(status, worker_id, &worker_manager);
+        }
+        drop(worker_manager);
+
+        if status == HeartbeatStatus::Running
+            && self
+                .follower_block_report_state
+                .requires_full_report(worker_id)
+            && !self
+                .follower_block_report_state
+                .reconcile_pending(worker_id)
+            && !self
+                .follower_full_report_tracker
+                .has_open_session(worker_id, LocalTime::mills())
+        {
+            return Err(FsError::in_progress_msg(format!(
+                "ResyncRequired: worker {} must send a full report to refresh follower state",
+                worker_id
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Forget a worker's passive state after local heartbeat expiry. No block
+    /// rows are removed here; only the active leader may run lost-worker cleanup.
+    pub fn forget_passive_worker(&self, worker_id: u32) {
+        let _serial = self.follower_block_report_lock.write();
+        if self.master_monitor.is_active()
+            || self.master_monitor.follower_readiness_snapshot().role
+                != curvine_raft::raft::RoleState::Follower
+        {
+            return;
+        }
+        self.reset_passive_view_for_current_epoch();
+        self.follower_full_report_tracker.reset(worker_id);
+        self.follower_block_report_state.forget_worker(worker_id);
+    }
+
+    fn follower_file_locations_ready(
+        &self,
+        file: &InodeFile,
+        file_locations: &HashMap<i64, Vec<BlockLocation>>,
+        worker_manager: &WorkerManager,
+    ) -> Option<HashMap<i64, Vec<BlockLocation>>> {
+        if file.blocks.is_empty() {
+            // Empty files and UFS-only files legitimately have no Curvine
+            // block locations. A nonempty Curvine-backed file does not.
+            return (file.len == 0 || file.storage_policy.ufs_only()).then(HashMap::new);
+        }
+
+        let now_ms = LocalTime::mills();
+        let max_worker_age_ms = self.conf.worker_blacklist_interval_ms();
+        self.follower_block_report_state
+            .with_readiness(|readiness| {
+                let mut safe_locations = HashMap::with_capacity(file.blocks.len());
+                for block in &file.blocks {
+                    if readiness.has_deferred_block(block.id) {
+                        return None;
+                    }
+                    let locations = file_locations.get(&block.id)?;
+                    let usable = locations
+                        .iter()
+                        .filter(|location| {
+                            readiness.worker_ready(location.worker_id)
+                                && worker_manager.get_worker(location.worker_id).is_some_and(
+                                    |worker| {
+                                        worker.is_live()
+                                            && now_ms.saturating_sub(worker.last_update)
+                                                <= max_worker_age_ms
+                                    },
+                                )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if usable.is_empty() {
+                        return None;
+                    }
+                    safe_locations.insert(block.id, usable);
+                }
+                Some(safe_locations)
+            })
+    }
+
+    /// Return a block-location snapshot only when both the Raft/journal state
+    /// and at least one current, report-ready replica per block are available.
+    /// The follower report read lock, namespace guard, and worker-state guard
+    /// remain held through construction and the final epoch check. A report
+    /// writer makes this method fail fast with `None`, allowing RPC fallback
+    /// instead of queueing behind a potentially long report scan.
+    pub fn follower_get_block_locations_if_ready<T: AsRef<str>>(
+        &self,
+        path: T,
+    ) -> FsResult<Option<FileBlocks>> {
+        if !self.follower_worker_state_enabled() {
+            return Ok(None);
+        }
+
+        let Some(mut _serial) = self.follower_block_report_lock.try_read() else {
+            return Ok(None);
+        };
+        let initial_snapshot = self.master_monitor.follower_readiness_snapshot();
+        if initial_snapshot.role != RoleState::Follower
+            || self.follower_read_refusal(&initial_snapshot).is_some()
+        {
+            return Ok(None);
+        }
+        if !self
+            .follower_block_report_state
+            .has_epoch(initial_snapshot.term, initial_snapshot.leadership_epoch)
+        {
+            drop(_serial);
+            let Some(_reset_guard) = self.follower_block_report_lock.try_write() else {
+                return Ok(None);
+            };
+            let reset_snapshot = self.master_monitor.follower_readiness_snapshot();
+            if self.master_monitor.is_active()
+                || reset_snapshot.role != RoleState::Follower
+                || reset_snapshot.leadership_epoch != initial_snapshot.leadership_epoch
+                || self.follower_read_refusal(&reset_snapshot).is_some()
+            {
+                return Ok(None);
+            }
+            self.reset_passive_view_for_current_epoch();
+            drop(_reset_guard);
+            let Some(read_guard) = self.follower_block_report_lock.try_read() else {
+                return Ok(None);
+            };
+            _serial = read_guard;
+            let reset_complete_snapshot = self.master_monitor.follower_readiness_snapshot();
+            if self.master_monitor.is_active()
+                || reset_complete_snapshot.role != RoleState::Follower
+                || reset_complete_snapshot.leadership_epoch != initial_snapshot.leadership_epoch
+                || self
+                    .follower_read_refusal(&reset_complete_snapshot)
+                    .is_some()
+                || !self.follower_block_report_state.has_epoch(
+                    reset_complete_snapshot.term,
+                    reset_complete_snapshot.leadership_epoch,
+                )
+            {
+                return Ok(None);
+            }
+        }
+
+        let fs_dir = self.fs_dir.read();
+        let worker_manager = self.worker_manager.read();
+        let path = path.as_ref();
+        let result: FsResult<Option<FileBlocks>> = (|| {
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let Some(inode) = inp.get_last_inode() else {
+                return Err(FsError::file_not_found(path));
+            };
+            let file = inode.as_file_ref()?;
+            let file_locations = fs_dir.get_file_locations(file)?;
+            let Some(safe_file_locations) =
+                self.follower_file_locations_ready(file, &file_locations, &worker_manager)
+            else {
+                return Ok(None);
+            };
+            let block_locs = Self::get_block_locs_from_locations(
+                path,
+                file,
+                &safe_file_locations,
+                &worker_manager,
+            )?;
+            Ok(Some(FileBlocks {
+                status: inode.to_file_status(path)?,
+                block_locs,
+            }))
+        })();
+
+        let final_snapshot = self.master_monitor.follower_readiness_snapshot();
+        if self.master_monitor.is_active()
+            || initial_snapshot.leadership_epoch != final_snapshot.leadership_epoch
+            || final_snapshot.role != RoleState::Follower
+            || self.follower_read_refusal(&final_snapshot).is_some()
+        {
+            return Ok(None);
+        }
+
+        result
+    }
+
     pub fn reset_full_block_report(&self, worker_id: u32) {
         self.full_report_tracker.reset(worker_id);
         self.invalidate_full_block_reconcile(worker_id);
@@ -1582,8 +1951,17 @@ impl MasterFilesystem {
                     ),
                 )));
             }
-            FullReportProgress::Complete(blocks) => Some(blocks),
+            FullReportProgress::Complete(inventory) => Some(inventory.into_blocks()),
             FullReportProgress::Partial => None,
+            FullReportProgress::CapacityExceeded => {
+                return Err(FsError::io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "full block report inventory limit reached for worker {}",
+                        list.worker_id
+                    ),
+                )))
+            }
         };
         if list.blocks.is_empty() && full_reported_blocks.is_none() {
             return Ok(BlockReportResult {
@@ -1700,7 +2078,7 @@ impl MasterFilesystem {
                     list.worker_id,
                     list.report_id,
                     list.total_len,
-                    blocks,
+                    FullReportInventory::without_slot(blocks),
                     now,
                 ),
             }
@@ -1708,6 +2086,578 @@ impl MasterFilesystem {
         applied?;
 
         Ok(BlockReportResult { delete_blocks })
+    }
+
+    /// Apply worker reports to a follower's local location view only. This
+    /// method never updates BlockMap, returns delete commands, or schedules
+    /// replication, quota, blacklist, or lost-worker cleanup work.
+    pub fn passive_block_report(
+        &self,
+        list: BlockReportList,
+        worker_session_id: Option<&str>,
+    ) -> FsResult<()> {
+        if !self.follower_worker_state_enabled()
+            || self.master_monitor.follower_readiness_snapshot().role
+                != curvine_raft::raft::RoleState::Follower
+        {
+            return err_box!("Passive worker reports are not enabled on this master");
+        }
+
+        let _serial = self.follower_block_report_lock.write();
+        let report_snapshot = self.master_monitor.follower_readiness_snapshot();
+        if self.master_monitor.is_active() || report_snapshot.role != RoleState::Follower {
+            return err_box!("Passive worker reports are not accepted by the active master");
+        }
+        self.reset_passive_view_for_current_epoch();
+        let worker_session_id = {
+            let wm = self.worker_manager.read();
+            if list.cluster_id != wm.cluster_id {
+                return err_box!(
+                    "Registered cluster_id mismatch, expected {}, actual: {}",
+                    wm.cluster_id,
+                    list.cluster_id
+                );
+            }
+            let Some(worker) = wm.get_worker(list.worker_id) else {
+                return Err(FsError::in_progress_msg(format!(
+                    "NotRegistered: worker {} must complete registration before reporting blocks",
+                    list.worker_id
+                )));
+            };
+            if worker.status == WorkerStatus::Lost {
+                return Err(FsError::in_progress_msg(format!(
+                    "NotRegistered: worker {} has expired on this follower",
+                    list.worker_id
+                )));
+            }
+            if !worker_session_id
+                .is_some_and(|session| !session.is_empty() && session == worker.worker_session_id)
+            {
+                return Err(FsError::in_progress_msg(format!(
+                    "NotRegistered: worker {} report does not match its current registration session",
+                    list.worker_id
+                )));
+            }
+            worker.worker_session_id.clone()
+        };
+
+        let worker_id = list.worker_id;
+        let report_id = list.report_id;
+        let total_len = list.total_len;
+        let full_report = list.full_report;
+        if self
+            .follower_block_report_state
+            .reconcile_pending(worker_id)
+        {
+            return Err(FsError::io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "full block report reconciliation is still running for worker {}",
+                    worker_id
+                ),
+            )));
+        }
+        if !full_report
+            && self
+                .follower_block_report_state
+                .requires_full_report(worker_id)
+        {
+            return Err(FsError::in_progress_msg(format!(
+                "ResyncRequired: worker {} must complete a full report before incremental reports",
+                worker_id
+            )));
+        }
+        let now = LocalTime::mills();
+        self.follower_block_report_state
+            .observe_worker(worker_id, false);
+
+        if !full_report
+            && list.blocks.iter().any(|block| {
+                matches!(
+                    block.status,
+                    BlockReportStatus::Finalized | BlockReportStatus::Writing
+                )
+            })
+        {
+            self.follower_full_report_tracker
+                .invalidate_session(worker_id, now);
+        }
+
+        let progress = self.follower_full_report_tracker.collect(&list, now);
+        if full_report && !matches!(&progress, FullReportProgress::Duplicate) {
+            self.follower_block_report_state
+                .require_full_report(worker_id);
+        }
+        let mut full_report_inventory = match progress {
+            FullReportProgress::Duplicate => None,
+            FullReportProgress::InFlight => {
+                return Err(FsError::io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "full block report {} from worker {} is still being processed",
+                        report_id, worker_id
+                    ),
+                )));
+            }
+            FullReportProgress::Complete(inventory) => Some(inventory),
+            FullReportProgress::Partial => None,
+            FullReportProgress::CapacityExceeded => {
+                return Err(FsError::io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "follower full block report inventory limit reached for worker {}",
+                        worker_id
+                    ),
+                )))
+            }
+        };
+
+        // Record adds whose inode has not reached this follower's applied
+        // journal state yet. A report is acknowledged only if every deferred
+        // entry fits in the bounded queue.
+        let observed_contact_sequence = self
+            .master_monitor
+            .follower_readiness_snapshot()
+            .leader_contact_sequence;
+        let mut batch = Vec::with_capacity(list.blocks.len());
+        let mut deferred_reports = Vec::new();
+        let mut clear_deferred = Vec::new();
+        for item in list.blocks {
+            let location = BlockLocation::new(worker_id, item.storage_type);
+            match item.status {
+                BlockReportStatus::Deleted => {
+                    batch.push((false, item.id, location));
+                    clear_deferred.push(item.id);
+                }
+                BlockReportStatus::Finalized | BlockReportStatus::Writing => {
+                    let inode_state = match self.block_inode_state(item.id) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            if let Some(inventory) = full_report_inventory.take() {
+                                self.follower_full_report_tracker
+                                    .abort(worker_id, report_id, total_len, inventory, now);
+                            }
+                            return Err(error);
+                        }
+                    };
+                    match inode_state {
+                        BlockInodeState::File => {
+                            batch.push((true, item.id, location));
+                            clear_deferred.push(item.id);
+                        }
+                        BlockInodeState::Missing | BlockInodeState::NotFile => {
+                            deferred_reports.push(DeferredBlockReport {
+                                worker_id,
+                                block_id: item.id,
+                                storage_type: item.storage_type,
+                                remove_if_missing: full_report
+                                    || item.status == BlockReportStatus::Finalized,
+                                leader_contact_sequence: observed_contact_sequence,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        for report in deferred_reports.iter().copied() {
+            if !self.follower_block_report_state.defer(report) {
+                if let Some(inventory) = full_report_inventory.take() {
+                    self.follower_full_report_tracker
+                        .abort(worker_id, report_id, total_len, inventory, now);
+                }
+                return Err(FsError::io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "deferred block report queue is full for worker {} (limit {})",
+                        worker_id, MAX_DEFERRED_FOLLOWER_REPORTS
+                    ),
+                )));
+            }
+        }
+
+        let applied = self.apply_block_report_batch_fenced(batch, || {
+            let current_snapshot = self.master_monitor.follower_readiness_snapshot();
+            if self.master_monitor.is_active()
+                || current_snapshot.role != RoleState::Follower
+                || current_snapshot.term != report_snapshot.term
+                || current_snapshot.leadership_epoch != report_snapshot.leadership_epoch
+            {
+                return Err(FsError::in_progress_msg(
+                    "Passive worker report crossed its follower leadership epoch",
+                ));
+            }
+            if !self
+                .worker_manager
+                .read()
+                .get_worker(worker_id)
+                .is_some_and(|worker| {
+                    worker.worker_session_id == worker_session_id
+                        && worker.status != WorkerStatus::Lost
+                })
+            {
+                return Err(FsError::in_progress_msg(format!(
+                    "NotRegistered: worker {} session changed while applying its report",
+                    worker_id
+                )));
+            }
+            Ok(true)
+        });
+
+        let applied = match applied {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(FsError::in_progress_msg(
+                "Passive worker report crossed its follower leadership epoch",
+            )),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = applied {
+            if let Some(inventory) = full_report_inventory.take() {
+                self.follower_full_report_tracker
+                    .abort(worker_id, report_id, total_len, inventory, now);
+            }
+            return Err(error);
+        }
+
+        if let Some(inventory) = full_report_inventory.take() {
+            let generation = self.follower_block_report_state.begin_reconcile(worker_id);
+            let job = FollowerFullBlockReconcileJob {
+                worker_id,
+                generation,
+                term: report_snapshot.term,
+                leadership_epoch: report_snapshot.leadership_epoch,
+                worker_session_id,
+                report_id,
+                inventory,
+            };
+            self.submit_follower_full_block_reconcile(job, total_len)?;
+        }
+
+        for block_id in clear_deferred {
+            self.follower_block_report_state
+                .remove_deferred(worker_id, block_id);
+        }
+
+        Ok(())
+    }
+
+    /// Retry unknown-inode reports after journal replay catches up. Missing or
+    /// non-file inodes are discarded only with fresh leader-commit proof and an
+    /// applied index that covers both the local and leader commit watermarks.
+    pub fn retry_passive_block_reports(&self) -> FsResult<()> {
+        if !self.follower_worker_state_enabled() {
+            return Ok(());
+        }
+
+        let _serial = self.follower_block_report_lock.write();
+        if self.master_monitor.is_active()
+            || self.master_monitor.follower_readiness_snapshot().role
+                != curvine_raft::raft::RoleState::Follower
+        {
+            return Ok(());
+        }
+        self.reset_passive_view_for_current_epoch();
+        let deferred = self.follower_block_report_state.deferred_snapshot();
+        let snapshot = self.master_monitor.follower_readiness_snapshot();
+        let contact_timeout = Duration::from_millis(self.follower_read_contact_timeout_ms);
+        let replay_is_current = |snapshot: &FollowerReadinessSnapshot| {
+            snapshot.role == RoleState::Follower
+                && snapshot.replay_ready
+                && snapshot.leader_commit_index.is_some_and(|leader_commit| {
+                    snapshot
+                        .applied_index
+                        .is_some_and(|applied| applied >= snapshot.commit_index.max(leader_commit))
+                })
+                && snapshot
+                    .leader_contact_age
+                    .is_some_and(|age| age <= contact_timeout)
+        };
+        let mut candidates = Vec::new();
+        for report in deferred {
+            if self
+                .follower_block_report_state
+                .reconcile_pending(report.worker_id)
+            {
+                continue;
+            }
+            if !replay_is_current(&snapshot)
+                || snapshot.leader_contact_sequence <= report.leader_contact_sequence
+            {
+                continue;
+            }
+            candidates.push(report);
+        }
+
+        if !self.apply_deferred_block_reports_fenced(&candidates, &snapshot, contact_timeout)? {
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    fn apply_deferred_block_reports_fenced(
+        &self,
+        reports: &[DeferredBlockReport],
+        initial_snapshot: &FollowerReadinessSnapshot,
+        contact_timeout: Duration,
+    ) -> FsResult<bool> {
+        let replay_is_current = |snapshot: &FollowerReadinessSnapshot| {
+            snapshot.role == RoleState::Follower
+                && snapshot.replay_ready
+                && snapshot.leader_commit_index.is_some_and(|leader_commit| {
+                    snapshot
+                        .applied_index
+                        .is_some_and(|applied| applied >= snapshot.commit_index.max(leader_commit))
+                })
+                && snapshot
+                    .leader_contact_age
+                    .is_some_and(|age| age <= contact_timeout)
+        };
+        let mut resolved = Vec::with_capacity(reports.len());
+        for chunk in reports.chunks(Self::BLOCK_REPORT_WRITE_CHUNK) {
+            let mut fs_dir = self.fs_dir.write();
+            let current_snapshot = self.master_monitor.follower_readiness_snapshot();
+            if self.master_monitor.is_active()
+                || !replay_is_current(&current_snapshot)
+                || current_snapshot.leadership_epoch != initial_snapshot.leadership_epoch
+            {
+                return Ok(false);
+            }
+
+            let mut batch = Vec::with_capacity(chunk.len());
+            let mut resolved_chunk = Vec::with_capacity(chunk.len());
+            for report in chunk {
+                if current_snapshot.leader_contact_sequence <= report.leader_contact_sequence {
+                    continue;
+                }
+                match fs_dir.block_inode_state(report.block_id)? {
+                    BlockInodeState::File => {
+                        batch.push((
+                            true,
+                            report.block_id,
+                            BlockLocation::new(report.worker_id, report.storage_type),
+                        ));
+                        resolved_chunk.push((report.worker_id, report.block_id));
+                    }
+                    BlockInodeState::Missing | BlockInodeState::NotFile => {
+                        if report.remove_if_missing {
+                            batch.push((
+                                false,
+                                report.block_id,
+                                BlockLocation::with_id(report.worker_id),
+                            ));
+                        }
+                        resolved_chunk.push((report.worker_id, report.block_id));
+                    }
+                }
+            }
+
+            if !batch.is_empty() {
+                fs_dir.block_report(batch)?;
+            }
+            resolved.extend(resolved_chunk);
+        }
+
+        let final_snapshot = self.master_monitor.follower_readiness_snapshot();
+        if self.master_monitor.is_active()
+            || !replay_is_current(&final_snapshot)
+            || final_snapshot.leadership_epoch != initial_snapshot.leadership_epoch
+        {
+            return Ok(false);
+        }
+        for (worker_id, block_id) in resolved {
+            self.follower_block_report_state
+                .mark_deferred_resolved(worker_id, block_id);
+        }
+        Ok(true)
+    }
+
+    /// Submit the follower's stale-location scan without retaining the global
+    /// report writer. The tracker owns the bounded inventory slot until this
+    /// job either completes or resets the report session.
+    fn submit_follower_full_block_reconcile(
+        &self,
+        job: FollowerFullBlockReconcileJob,
+        total_len: u64,
+    ) -> FsResult<()> {
+        let worker_id = job.worker_id;
+        let report_id = job.report_id;
+        let generation = job.generation;
+        let job_slot = Arc::new(Mutex::new(Some(job)));
+        let task_slot = job_slot.clone();
+        let fs = self.clone();
+        match self
+            .full_block_reconcile_executor
+            .fixed_try_spawn(worker_id as i64, move || {
+                if let Some(job) = task_slot.lock().take() {
+                    fs.run_follower_full_block_reconcile(job);
+                }
+            }) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let Some(job) = job_slot.lock().take() else {
+                    return err_box!(
+                        "follower full report reconcile submission failed after task start"
+                    );
+                };
+                self.follower_block_report_state
+                    .fail_reconcile(worker_id, generation);
+                self.follower_full_report_tracker.abort(
+                    worker_id,
+                    report_id,
+                    total_len,
+                    job.inventory,
+                    LocalTime::mills(),
+                );
+                error!(
+                    "submit follower full block report reconcile for worker {} failed: {}",
+                    worker_id, error
+                );
+                Err(FsError::io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "follower full block report reconciliation could not be queued for worker {}",
+                        worker_id
+                    ),
+                )))
+            }
+        }
+    }
+
+    fn run_follower_full_block_reconcile(&self, job: FollowerFullBlockReconcileJob) {
+        if !self
+            .follower_block_report_state
+            .reconcile_is_current(job.worker_id, job.generation)
+        {
+            return;
+        }
+
+        // The namespace scan can be large. Do it outside the follower report
+        // lock; pending state rejects other reports for this worker and defers
+        // replay reconciliation, so its location set cannot change meanwhile.
+        let stale_block_ids = {
+            let fs_dir = self.fs_dir.read();
+            fs_dir.get_worker_block_ids(job.worker_id).map(|existing| {
+                existing
+                    .into_iter()
+                    .filter(|block_id| !job.inventory.blocks().contains(block_id))
+                    .collect::<Vec<_>>()
+            })
+        };
+        self.finish_follower_full_block_reconcile(job, stale_block_ids);
+    }
+
+    fn follower_reconcile_context_current(&self, job: &FollowerFullBlockReconcileJob) -> bool {
+        let snapshot = self.master_monitor.follower_readiness_snapshot();
+        if self.master_monitor.is_active()
+            || snapshot.role != RoleState::Follower
+            || snapshot.term != job.term
+            || snapshot.leadership_epoch != job.leadership_epoch
+        {
+            return false;
+        }
+
+        let worker_matches = self
+            .worker_manager
+            .read()
+            .get_worker(job.worker_id)
+            .is_some_and(|worker| {
+                worker.worker_session_id == job.worker_session_id
+                    && worker.status != WorkerStatus::Lost
+            });
+        worker_matches
+            && self
+                .follower_block_report_state
+                .reconcile_is_current(job.worker_id, job.generation)
+    }
+
+    fn finish_follower_full_block_reconcile(
+        &self,
+        job: FollowerFullBlockReconcileJob,
+        stale_block_ids: FsResult<Vec<i64>>,
+    ) {
+        let _serial = self.follower_block_report_lock.write();
+        if !self
+            .follower_block_report_state
+            .reconcile_is_current(job.worker_id, job.generation)
+        {
+            return;
+        }
+
+        let stale_block_ids = match stale_block_ids {
+            Ok(block_ids) if self.follower_reconcile_context_current(&job) => block_ids,
+            Ok(_) => {
+                self.fail_follower_full_block_reconcile(&job, "fencing context changed");
+                return;
+            }
+            Err(error) => {
+                self.fail_follower_full_block_reconcile(&job, &error.to_string());
+                return;
+            }
+        };
+
+        let stale_block_count = stale_block_ids.len();
+        let batch = stale_block_ids
+            .into_iter()
+            .map(|block_id| (false, block_id, BlockLocation::with_id(job.worker_id)))
+            .collect();
+        match self.apply_block_report_batch_fenced(batch, || {
+            Ok(self.follower_reconcile_context_current(&job))
+        }) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.fail_follower_full_block_reconcile(
+                    &job,
+                    "fencing context changed during apply",
+                );
+                return;
+            }
+            Err(error) => {
+                self.fail_follower_full_block_reconcile(&job, &error.to_string());
+                return;
+            }
+        }
+
+        // The worker or Raft role may have changed while chunked removals were
+        // applied. Leave the view unreadable and require a new report if so.
+        if !self.follower_reconcile_context_current(&job) {
+            self.fail_follower_full_block_reconcile(&job, "fencing context changed during apply");
+            return;
+        }
+
+        if !self.follower_block_report_state.finish_reconcile(
+            job.worker_id,
+            job.generation,
+            job.inventory.blocks(),
+        ) {
+            return;
+        }
+        self.follower_full_report_tracker
+            .finish(job.worker_id, job.report_id, LocalTime::mills());
+        if stale_block_count > 0 {
+            info!(
+                "follower full block report reconciled {} stale block locations for worker {}",
+                stale_block_count, job.worker_id
+            );
+        }
+    }
+
+    fn fail_follower_full_block_reconcile(
+        &self,
+        job: &FollowerFullBlockReconcileJob,
+        reason: &str,
+    ) {
+        if self
+            .follower_block_report_state
+            .fail_reconcile(job.worker_id, job.generation)
+        {
+            // The report RPC has already returned success. Drop its inventory
+            // and round so the next Running heartbeat requests a fresh report.
+            self.follower_full_report_tracker.reset(job.worker_id);
+            warn!(
+                "follower full block report reconcile failed for worker {}: {}; requesting a fresh report",
+                job.worker_id, reason
+            );
+        }
     }
 
     fn submit_full_block_reconcile(
@@ -1859,8 +2809,24 @@ impl MasterFilesystem {
     /// independent add/remove for one block location, so chunk boundaries do
     /// not break cross-entry invariants.
     fn apply_block_report_batch(&self, batch: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
+        self.apply_block_report_batch_fenced(batch, || Ok(true))
+            .map(|_| ())
+    }
+
+    /// Apply block-location chunks only after acquiring the namespace writer
+    /// and validating the caller's fence under that same lock. A role change
+    /// after the check cannot let an active writer overtake this chunk: active
+    /// block-report and replication updates use the same fs_dir writer.
+    fn apply_block_report_batch_fenced<F>(
+        &self,
+        batch: Vec<(bool, i64, BlockLocation)>,
+        mut validate: F,
+    ) -> FsResult<bool>
+    where
+        F: FnMut() -> FsResult<bool>,
+    {
         if batch.is_empty() {
-            return Ok(());
+            return validate();
         }
 
         let mut iter = batch.into_iter();
@@ -1870,9 +2836,12 @@ impl MasterFilesystem {
                 break;
             }
             let mut fs_dir = self.fs_dir.write();
+            if !validate()? {
+                return Ok(false);
+            }
             fs_dir.block_report(chunk)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn is_full_block_reconcile_current(&self, worker_id: u32, generation: u64) -> bool {
@@ -2100,7 +3069,9 @@ mod tests {
     use super::*;
     use curvine_core_error::ErrorExt;
     use curvine_error::ErrorKind;
+    use curvine_raft::raft::{FollowerReadinessMonitor, RoleState};
     use curvine_runtime::common::Utils;
+    use curvine_runtime::sync::StateCtl;
 
     fn test_fs(name: &str) -> MasterFilesystem {
         Master::init_test_metrics();
@@ -2118,6 +3089,880 @@ mod tests {
             Utils::rand_str(6)
         ));
         JournalSystem::fs_only_for_test(&conf).unwrap()
+    }
+
+    fn use_current_follower_view(fs: &mut MasterFilesystem) -> FollowerReadinessMonitor {
+        let readiness = FollowerReadinessMonitor::default();
+        readiness.observe_raft_state(RoleState::Follower, 1, 2, 0);
+        readiness.observe_applied(0);
+        readiness.set_replay_ready(true);
+        readiness.observe_leader_contact(1, 2, Some(0));
+        fs.master_monitor = MasterMonitor::with_follower_readiness(
+            StateCtl::new(RoleState::Follower.into()),
+            StateCtl::new(0),
+            readiness.clone(),
+        );
+        readiness
+    }
+
+    fn apply_test_passive_heartbeat(
+        fs: &MasterFilesystem,
+        status: HeartbeatStatus,
+        address: WorkerAddress,
+        worker_session_id: &str,
+    ) -> FsResult<()> {
+        let worker_id = address.worker_id;
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        let validate_cluster_id = cluster_id.clone();
+        let validate_address = address.clone();
+        let update_address = address.clone();
+        let update_session = worker_session_id.to_string();
+        fs.process_passive_worker_heartbeat(
+            status,
+            worker_id,
+            move |wm| {
+                if status == HeartbeatStatus::Start {
+                    wm.validate_passive_start(&validate_cluster_id, &validate_address)
+                } else {
+                    Ok(())
+                }
+            },
+            move |wm| {
+                wm.heartbeat_passive(
+                    &cluster_id,
+                    status,
+                    update_address,
+                    1,
+                    update_session,
+                    TransferWorkerCapabilities::default(),
+                    String::new(),
+                    0,
+                    vec![],
+                    None,
+                )
+            },
+        )
+    }
+
+    fn wait_for_follower_reconcile(fs: &MasterFilesystem, worker_id: u32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while fs.follower_block_report_state.reconcile_pending(worker_id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "follower full report reconciliation timed out for worker {worker_id}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn passive_block_report_from_unregistered_worker_is_retryable() {
+        let mut fs = test_fs("passive-block-report-unregistered");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        let error = fs
+            .passive_block_report(
+                BlockReportList {
+                    cluster_id,
+                    worker_id: 7,
+                    full_report: false,
+                    total_len: 0,
+                    report_id: 0,
+                    blocks: Vec::new(),
+                },
+                None,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error.kind(), ErrorKind::InProgress));
+        assert!(error.to_string().starts_with("NotRegistered:"));
+    }
+
+    #[test]
+    fn passive_full_report_must_match_current_worker_session() {
+        let mut fs = test_fs("passive-block-report-session");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+
+        let address = WorkerAddress {
+            worker_id: 7,
+            hostname: "worker-7".to_string(),
+            ..Default::default()
+        };
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        fs.observe_passive_worker_heartbeat(HeartbeatStatus::Start, 7);
+        fs.worker_manager
+            .write()
+            .heartbeat_passive(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                address,
+                1,
+                "current-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        let report = || BlockReportList {
+            cluster_id: cluster_id.clone(),
+            worker_id: 7,
+            full_report: true,
+            total_len: 1,
+            report_id: 10,
+            blocks: vec![BlockReportInfo::new(
+                (50_000_i64 << 24) | 1,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                128,
+            )],
+        };
+        let error = fs
+            .passive_block_report(report(), Some("previous-session"))
+            .unwrap_err();
+        assert!(matches!(error.kind(), ErrorKind::InProgress));
+        assert!(error.to_string().starts_with("NotRegistered:"));
+        assert!(!fs.follower_block_report_state.worker_ready(7));
+
+        fs.passive_block_report(report(), Some("current-session"))
+            .unwrap();
+        wait_for_follower_reconcile(&fs, 7);
+        assert!(fs.follower_block_report_state.worker_ready(7));
+        assert!(fs
+            .follower_block_report_state
+            .has_deferred_block((50_000_i64 << 24) | 1));
+    }
+
+    #[test]
+    fn passive_start_serializes_readiness_reset_with_session_replacement() {
+        let mut fs = test_fs("passive-start-session-serialization");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+
+        let address = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address.clone(), "old-session")
+            .unwrap();
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        let block_id = (50_000_i64 << 24) | 1;
+        let report = |report_id| BlockReportList {
+            cluster_id: cluster_id.clone(),
+            worker_id: 7,
+            full_report: true,
+            total_len: 1,
+            report_id,
+            blocks: vec![BlockReportInfo::new(
+                block_id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                128,
+            )],
+        };
+        fs.passive_block_report(report(10), Some("old-session"))
+            .unwrap();
+        wait_for_follower_reconcile(&fs, 7);
+        assert!(fs.follower_block_report_state.worker_ready(7));
+
+        let rejected = fs.process_passive_worker_heartbeat(
+            HeartbeatStatus::Start,
+            7,
+            |wm| wm.validate_passive_start("wrong-cluster", &address),
+            |_| panic!("invalid Start must not update the worker"),
+        );
+        assert!(rejected.is_err());
+        assert!(fs.follower_block_report_state.worker_ready(7));
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(7)
+                .unwrap()
+                .worker_session_id,
+            "old-session"
+        );
+
+        let start_fs = fs.clone();
+        let callback_fs = fs.clone();
+        let start_cluster_id = cluster_id.clone();
+        let start_update_cluster_id = cluster_id.clone();
+        let start_address = address.clone();
+        let (start_paused_tx, start_paused_rx) = std::sync::mpsc::channel();
+        let (resume_start_tx, resume_start_rx) = std::sync::mpsc::channel();
+        let start_thread = std::thread::spawn(move || {
+            start_fs.process_passive_worker_heartbeat(
+                HeartbeatStatus::Start,
+                7,
+                move |wm| wm.validate_passive_start(&start_cluster_id, &start_address),
+                move |wm| {
+                    assert!(callback_fs.follower_block_report_lock.try_write().is_none());
+                    assert!(!callback_fs.follower_block_report_state.worker_ready(7));
+                    start_paused_tx.send(()).unwrap();
+                    resume_start_rx.recv().unwrap();
+                    wm.heartbeat_passive(
+                        &start_update_cluster_id,
+                        HeartbeatStatus::Start,
+                        address,
+                        1,
+                        "new-session".to_string(),
+                        TransferWorkerCapabilities::default(),
+                        String::new(),
+                        0,
+                        vec![],
+                        None,
+                    )
+                },
+            )
+        });
+        start_paused_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let report_fs = fs.clone();
+        let old_report = report(11);
+        let (report_attempted_tx, report_attempted_rx) = std::sync::mpsc::channel();
+        let (report_result_tx, report_result_rx) = std::sync::mpsc::channel();
+        let report_thread = std::thread::spawn(move || {
+            assert!(report_fs.follower_block_report_lock.try_write().is_none());
+            report_attempted_tx.send(()).unwrap();
+            report_result_tx
+                .send(report_fs.passive_block_report(old_report, Some("old-session")))
+                .unwrap();
+        });
+        report_attempted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        resume_start_tx.send(()).unwrap();
+        start_thread.join().unwrap().unwrap();
+        let stale_report_error = report_result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        report_thread.join().unwrap();
+
+        assert!(matches!(stale_report_error.kind(), ErrorKind::InProgress));
+        assert!(stale_report_error.to_string().starts_with("NotRegistered:"));
+        assert!(!fs.follower_block_report_state.worker_ready(7));
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(7)
+                .unwrap()
+                .worker_session_id,
+            "new-session"
+        );
+    }
+
+    #[test]
+    fn follower_reconcile_runs_without_report_lock_and_old_session_cannot_finish_it() {
+        let mut fs = test_fs("follower-reconcile-restart-fence");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+
+        let address = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address.clone(), "old-session")
+            .unwrap();
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        let report = |report_id| BlockReportList {
+            cluster_id: cluster_id.clone(),
+            worker_id: 7,
+            full_report: true,
+            total_len: 0,
+            report_id,
+            blocks: Vec::new(),
+        };
+
+        // An empty report needs no namespace lookup on the RPC thread. Holding
+        // the namespace writer therefore pauses only the asynchronous scan.
+        let namespace_guard = fs.fs_dir.write();
+        fs.passive_block_report(report(10), Some("old-session"))
+            .unwrap();
+        assert!(fs.follower_block_report_state.reconcile_pending(7));
+        assert!(!fs.follower_block_report_state.worker_ready(7));
+        let report_lock = fs
+            .follower_block_report_lock
+            .try_write()
+            .expect("the completed report must release its global writer before scanning");
+        drop(report_lock);
+        assert!(apply_test_passive_heartbeat(
+            &fs,
+            HeartbeatStatus::Running,
+            address.clone(),
+            "old-session"
+        )
+        .is_ok());
+
+        // Restart invalidates the generation while the scan still owns the old
+        // inventory. A queue barrier on the same fixed executor shard proves
+        // the stale job has exited before checking the new session's state.
+        apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address.clone(), "new-session")
+            .unwrap();
+        drop(namespace_guard);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        fs.full_block_reconcile_executor
+            .fixed_try_spawn(7, move || done_tx.send(()).unwrap())
+            .unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the stale reconcile should leave the executor shard");
+        assert!(!fs.follower_block_report_state.worker_ready(7));
+
+        fs.passive_block_report(report(11), Some("new-session"))
+            .unwrap();
+        wait_for_follower_reconcile(&fs, 7);
+        assert!(fs.follower_block_report_state.worker_ready(7));
+    }
+
+    #[test]
+    fn failed_follower_reconcile_requests_a_fresh_full_report() {
+        let mut fs = test_fs("follower-reconcile-retry");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+
+        let address = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address.clone(), "session-7")
+            .unwrap();
+        fs.follower_block_report_state.require_full_report(7);
+        let report = BlockReportList {
+            cluster_id: fs.worker_manager.read().cluster_id.clone(),
+            worker_id: 7,
+            full_report: true,
+            total_len: 1,
+            report_id: 10,
+            blocks: vec![BlockReportInfo::new(
+                1,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                1,
+            )],
+        };
+        let inventory = match fs
+            .follower_full_report_tracker
+            .collect(&report, LocalTime::mills())
+        {
+            FullReportProgress::Complete(inventory) => inventory,
+            _ => panic!("test report should be complete"),
+        };
+        let snapshot = fs.master_monitor.follower_readiness_snapshot();
+        let generation = fs.follower_block_report_state.begin_reconcile(7);
+        let job = FollowerFullBlockReconcileJob {
+            worker_id: 7,
+            generation,
+            term: snapshot.term,
+            leadership_epoch: snapshot.leadership_epoch,
+            worker_session_id: "session-7".to_string(),
+            report_id: 10,
+            inventory,
+        };
+
+        fs.finish_follower_full_block_reconcile(
+            job,
+            Err(FsError::io(std::io::Error::other("injected scan failure"))),
+        );
+        assert!(!fs.follower_block_report_state.reconcile_pending(7));
+        assert!(!fs.follower_block_report_state.worker_ready(7));
+        let retry =
+            apply_test_passive_heartbeat(&fs, HeartbeatStatus::Running, address, "session-7")
+                .unwrap_err();
+        assert!(retry.to_string().starts_with("ResyncRequired:"));
+
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        fs.passive_block_report(
+            BlockReportList {
+                cluster_id,
+                worker_id: 7,
+                full_report: true,
+                total_len: 0,
+                report_id: 11,
+                blocks: Vec::new(),
+            },
+            Some("session-7"),
+        )
+        .unwrap();
+        wait_for_follower_reconcile(&fs, 7);
+        assert!(fs.follower_block_report_state.worker_ready(7));
+    }
+
+    #[test]
+    fn follower_stale_chunk_rechecks_role_after_acquiring_namespace_writer() {
+        let mut fs = test_fs("follower-reconcile-promotion-fence");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        let readiness = use_current_follower_view(&mut fs);
+
+        let address = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address, "session-7").unwrap();
+        fs.follower_block_report_state.require_full_report(7);
+        let snapshot = fs.master_monitor.follower_readiness_snapshot();
+        let generation = fs.follower_block_report_state.begin_reconcile(7);
+        let job = FollowerFullBlockReconcileJob {
+            worker_id: 7,
+            generation,
+            term: snapshot.term,
+            leadership_epoch: snapshot.leadership_epoch,
+            worker_session_id: "session-7".to_string(),
+            report_id: 10,
+            inventory: FullReportInventory::without_slot(HashSet::new()),
+        };
+        let block_id = 1_i64;
+
+        // Hold FsDir so the stale chunk can only validate after this test has
+        // promoted the node and installed the authoritative location.
+        let namespace_guard = fs.fs_dir.write();
+        let chunk_fs = fs.clone();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let chunk = std::thread::spawn(move || {
+            assert!(chunk_fs.follower_reconcile_context_current(&job));
+            attempted_tx.send(()).unwrap();
+            let result = chunk_fs.apply_block_report_batch_fenced(
+                vec![(false, block_id, BlockLocation::with_id(7))],
+                || Ok(chunk_fs.follower_reconcile_context_current(&job)),
+            );
+            result_tx.send(result).unwrap();
+        });
+        attempted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stale chunk should start while namespace writer is held");
+
+        readiness.observe_raft_state(RoleState::Leader, 2, 1, 0);
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        namespace_guard
+            .add_block_location(block_id, BlockLocation::with_id(7))
+            .unwrap();
+        drop(namespace_guard);
+
+        assert!(!result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stale chunk should recheck the promoted role")
+            .unwrap());
+        chunk.join().unwrap();
+        assert_eq!(
+            fs.fs_dir
+                .read()
+                .get_block_locations(block_id)
+                .unwrap()
+                .iter()
+                .map(|location| location.worker_id)
+                .collect::<Vec<_>>(),
+            vec![7],
+            "a follower stale chunk must not delete a location installed after promotion"
+        );
+    }
+
+    #[test]
+    fn deferred_replay_rechecks_commit_fence_under_namespace_writer() {
+        let mut fs = test_fs("deferred-replay-promotion-fence");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        let readiness = use_current_follower_view(&mut fs);
+        let report = DeferredBlockReport {
+            worker_id: 7,
+            block_id: 1,
+            storage_type: StorageType::Disk,
+            remove_if_missing: true,
+            leader_contact_sequence: 0,
+        };
+        let initial_snapshot = fs.master_monitor.follower_readiness_snapshot();
+
+        let namespace_guard = fs.fs_dir.write();
+        namespace_guard
+            .add_block_location(report.block_id, BlockLocation::with_id(report.worker_id))
+            .unwrap();
+        let replay_fs = fs.clone();
+        let replay_snapshot = initial_snapshot.clone();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let replay = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let result = replay_fs.apply_deferred_block_reports_fenced(
+                &[report],
+                &replay_snapshot,
+                Duration::from_secs(5),
+            );
+            result_tx.send(result).unwrap();
+        });
+        attempted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deferred replay should start while namespace writer is held");
+
+        readiness.observe_raft_state(RoleState::Leader, 2, 1, 0);
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        drop(namespace_guard);
+
+        assert!(!result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deferred replay should recheck role under the writer")
+            .unwrap());
+        replay.join().unwrap();
+        assert_eq!(
+            fs.fs_dir
+                .read()
+                .get_block_locations(1)
+                .unwrap()
+                .iter()
+                .map(|location| location.worker_id)
+                .collect::<Vec<_>>(),
+            vec![7],
+            "deferred replay must not remove locations after leadership changes"
+        );
+    }
+
+    #[test]
+    fn follower_resyncs_surviving_worker_after_term_change() {
+        let mut fs = test_fs("follower-term-worker-resync");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        let readiness = use_current_follower_view(&mut fs);
+
+        let file_path = "/term-resync.log";
+        let block_id = replication_file(&fs, file_path);
+        let mut address = WorkerInfo::default().address;
+        address.worker_id = 100;
+        apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address.clone(), "session-100")
+            .unwrap();
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        let full_report = |report_id, total_len, blocks| BlockReportList {
+            cluster_id: cluster_id.clone(),
+            worker_id: 100,
+            full_report: true,
+            total_len,
+            report_id,
+            blocks,
+        };
+        fs.passive_block_report(
+            full_report(
+                10,
+                1,
+                vec![BlockReportInfo::new(
+                    block_id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    128,
+                )],
+            ),
+            Some("session-100"),
+        )
+        .unwrap();
+        wait_for_follower_reconcile(&fs, 100);
+        assert!(fs
+            .follower_get_block_locations_if_ready(file_path)
+            .unwrap()
+            .is_some());
+
+        readiness.observe_raft_state(RoleState::Follower, 2, 3, 0);
+        readiness.observe_leader_contact(2, 3, Some(0));
+        let resync_signal = apply_test_passive_heartbeat(
+            &fs,
+            HeartbeatStatus::Running,
+            address.clone(),
+            "session-100",
+        )
+        .unwrap_err();
+        assert!(matches!(resync_signal.kind(), ErrorKind::InProgress));
+        assert!(resync_signal.to_string().starts_with("ResyncRequired:"));
+        assert!(fs
+            .follower_get_block_locations_if_ready(file_path)
+            .unwrap()
+            .is_none());
+
+        let incremental_error = fs
+            .passive_block_report(
+                BlockReportList {
+                    cluster_id: cluster_id.clone(),
+                    worker_id: 100,
+                    full_report: false,
+                    total_len: 0,
+                    report_id: 0,
+                    blocks: Vec::new(),
+                },
+                Some("session-100"),
+            )
+            .unwrap_err();
+        assert!(incremental_error.to_string().starts_with("ResyncRequired:"));
+
+        let later_block_id = (50_000_i64 << 24) | 99;
+        fs.passive_block_report(
+            full_report(
+                11,
+                2,
+                vec![BlockReportInfo::new(
+                    block_id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    128,
+                )],
+            ),
+            Some("session-100"),
+        )
+        .unwrap();
+        assert!(apply_test_passive_heartbeat(
+            &fs,
+            HeartbeatStatus::Running,
+            address.clone(),
+            "session-100",
+        )
+        .is_ok());
+        fs.passive_block_report(
+            full_report(
+                11,
+                2,
+                vec![BlockReportInfo::new(
+                    later_block_id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    128,
+                )],
+            ),
+            Some("session-100"),
+        )
+        .unwrap();
+        wait_for_follower_reconcile(&fs, 100);
+        assert!(fs
+            .follower_get_block_locations_if_ready(file_path)
+            .unwrap()
+            .is_some());
+        apply_test_passive_heartbeat(&fs, HeartbeatStatus::Running, address, "session-100")
+            .unwrap();
+    }
+
+    #[test]
+    fn passive_block_report_defers_unknown_inode_until_fresh_replay_contact() {
+        let mut fs = test_fs("passive-block-report-replay");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        let readiness = use_current_follower_view(&mut fs);
+
+        let address = WorkerAddress {
+            worker_id: 7,
+            hostname: "worker-7".to_string(),
+            ..Default::default()
+        };
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        fs.worker_manager
+            .write()
+            .heartbeat_passive(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                address,
+                1,
+                "worker-session-7".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        fs.observe_passive_worker_heartbeat(HeartbeatStatus::Running, 7);
+
+        let block_id = (50_000_i64 << 24) | 1;
+        fs.passive_block_report(
+            BlockReportList {
+                cluster_id,
+                worker_id: 7,
+                full_report: true,
+                total_len: 1,
+                report_id: 10,
+                blocks: vec![BlockReportInfo::new(
+                    block_id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    128,
+                )],
+            },
+            Some("worker-session-7"),
+        )
+        .unwrap();
+
+        wait_for_follower_reconcile(&fs, 7);
+
+        assert_eq!(fs.follower_block_report_state.deferred_len(), 1);
+        fs.retry_passive_block_reports().unwrap();
+        assert_eq!(fs.follower_block_report_state.deferred_len(), 1);
+
+        // Only accepted current-term leader traffic after the report can
+        // authorize treating the still-missing inode as a stale worker block.
+        readiness.observe_leader_contact(1, 2, None);
+        fs.retry_passive_block_reports().unwrap();
+        assert_eq!(fs.follower_block_report_state.deferred_len(), 1);
+
+        // A known remote watermark that the local FSM has not applied cannot
+        // authorize removal of a report whose inode is still missing locally.
+        readiness.observe_leader_contact(1, 2, Some(10));
+        fs.retry_passive_block_reports().unwrap();
+        assert_eq!(fs.follower_block_report_state.deferred_len(), 1);
+
+        readiness.observe_raft_state(RoleState::Follower, 1, 2, 10);
+        readiness.observe_applied(10);
+        readiness.observe_leader_contact(1, 2, Some(10));
+        fs.retry_passive_block_reports().unwrap();
+        assert_eq!(fs.follower_block_report_state.deferred_len(), 0);
+        assert!(fs.follower_block_report_state.worker_ready(7));
+    }
+
+    #[test]
+    fn follower_location_reads_filter_to_any_safe_replica_per_block() {
+        let mut fs = test_fs("follower-location-readiness");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+
+        let file_path = "/replicated.log";
+        let block_id = replication_file(&fs, file_path);
+        let mut worker = WorkerInfo::default();
+        worker.address.worker_id = 400;
+        fs.add_test_worker(worker);
+        for worker_id in [100, 200, 300, 400] {
+            fs.observe_passive_worker_heartbeat(HeartbeatStatus::Running, worker_id);
+        }
+
+        assert!(fs
+            .follower_get_block_locations_if_ready(file_path)
+            .unwrap()
+            .is_none());
+        fs.follower_block_report_state
+            .mark_full_report_complete(100);
+        for worker_id in [300, 400] {
+            fs.follower_block_report_state
+                .mark_full_report_complete(worker_id);
+        }
+        for worker_id in [200, 300, 400] {
+            fs.fs_dir
+                .write()
+                .add_block_location(block_id, BlockLocation::with_id(worker_id))
+                .unwrap();
+        }
+        {
+            let mut wm = fs.worker_manager.write();
+            wm.worker_map.workers.get_mut(&100).unwrap().last_update = LocalTime::mills();
+            wm.worker_map.workers.get_mut(&300).unwrap().status = WorkerStatus::Blacklist;
+            wm.worker_map.workers.get_mut(&400).unwrap().last_update =
+                LocalTime::mills().saturating_sub(fs.conf.worker_blacklist_interval_ms() + 1);
+        }
+
+        let locations = fs
+            .follower_get_block_locations_if_ready(file_path)
+            .unwrap()
+            .expect("one safe replica should keep the block readable");
+        assert_eq!(locations.block_locs.len(), 1);
+        assert_eq!(
+            locations.block_locs[0]
+                .locs
+                .iter()
+                .map(|address| address.worker_id)
+                .collect::<Vec<_>>(),
+            vec![100],
+            "unready, blacklisted, and heartbeat-stale replicas must be omitted"
+        );
+
+        fs.worker_manager
+            .write()
+            .worker_map
+            .workers
+            .get_mut(&100)
+            .unwrap()
+            .status = WorkerStatus::Lost;
+        assert!(
+            fs.follower_get_block_locations_if_ready(file_path)
+                .unwrap()
+                .is_none(),
+            "a block with no safe replicas must fall back to the leader"
+        );
+
+        assert!(fs
+            .create_with_opts(
+                "/empty.log",
+                CreateFileOpts::with_create(false),
+                OpenFlags::new_create(),
+            )
+            .is_ok());
+        assert!(fs
+            .follower_get_block_locations_if_ready("/empty.log")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn follower_read_lock_is_shared_and_fails_fast_during_report_writes() {
+        let mut fs = test_fs("follower-read-lock-contention");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+
+        let file_path = "/read-lock.log";
+        replication_file(&fs, file_path);
+        fs.observe_passive_worker_heartbeat(HeartbeatStatus::Running, 100);
+        fs.follower_block_report_state
+            .mark_full_report_complete(100);
+        fs.worker_manager
+            .write()
+            .worker_map
+            .workers
+            .get_mut(&100)
+            .unwrap()
+            .last_update = LocalTime::mills();
+        assert!(fs
+            .follower_get_block_locations_if_ready(file_path)
+            .unwrap()
+            .is_some());
+
+        let first_read = fs.follower_block_report_lock.try_read().unwrap();
+        let second_read = fs.follower_block_report_lock.try_read().unwrap();
+        assert!(
+            fs.follower_block_report_lock.try_write().is_none(),
+            "a report writer must not interleave with a location snapshot"
+        );
+        drop(second_read);
+        drop(first_read);
+
+        let report_guard = fs.follower_block_report_lock.write();
+        let read_fs = fs.clone();
+        let read_path = file_path.to_string();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            result_tx
+                .send(read_fs.follower_get_block_locations_if_ready(read_path))
+                .unwrap();
+        });
+        let result = result_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("read RPC must fail fast instead of waiting for a report scan")
+            .unwrap();
+        assert!(result.is_none());
+        drop(report_guard);
+        reader.join().unwrap();
     }
 
     // Seeds an entry under the reserved root through FsDir, since the public

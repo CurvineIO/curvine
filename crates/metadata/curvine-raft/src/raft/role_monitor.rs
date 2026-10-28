@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::raft::follower_readiness::FollowerReadinessMonitor;
 use curvine_core_error::CommonResult;
 use curvine_runtime::sync::{StateCtl, StateListener, StateMonitor};
 use num_enum::{FromPrimitive, IntoPrimitive};
@@ -19,7 +20,7 @@ use raft::{SoftState, StateRole};
 
 // raft node status.
 #[repr(i8)]
-#[derive(PartialEq, PartialOrd, Debug, Clone, Copy, IntoPrimitive, FromPrimitive)]
+#[derive(PartialEq, Eq, PartialOrd, Debug, Clone, Copy, IntoPrimitive, FromPrimitive)]
 pub enum RoleState {
     // The raft node has not joined the cluster yet.
     #[num_enum(default)]
@@ -30,11 +31,17 @@ pub enum RoleState {
 }
 
 // Asynchronous Task Status Monitor.
-pub struct RoleMonitor(StateMonitor);
+pub struct RoleMonitor {
+    state: StateMonitor,
+    follower_readiness: FollowerReadinessMonitor,
+}
 
 impl RoleMonitor {
     pub fn new() -> Self {
-        Self(StateMonitor::new(RoleState::Init.into()))
+        Self {
+            state: StateMonitor::new(RoleState::Init.into()),
+            follower_readiness: FollowerReadinessMonitor::default(),
+        }
     }
 
     // Node role conversion.
@@ -46,13 +53,18 @@ impl RoleMonitor {
                 RoleState::Follower
             };
 
-            let cur: RoleState = self.0.state();
+            let cur: RoleState = self.state.state();
             if cur == RoleState::Init {
-                self.0.advance_state(now, true);
+                self.state.advance_state(now, true);
             } else {
-                self.0.advance_state(now, false);
+                self.state.advance_state(now, false);
             }
         }
+    }
+
+    /// Read/write handle shared with the journal FSM and master RPC layer.
+    pub fn follower_readiness(&self) -> FollowerReadinessMonitor {
+        self.follower_readiness.clone()
     }
 
     pub fn is_leader(&self) -> bool {
@@ -60,19 +72,26 @@ impl RoleMonitor {
     }
 
     pub fn advance_exit(&self) {
-        self.0.advance_state(RoleState::Exit, true);
+        self.state.advance_state(RoleState::Exit, true);
+        let snapshot = self.follower_readiness.snapshot();
+        self.follower_readiness.observe_raft_state(
+            RoleState::Exit,
+            snapshot.term,
+            0,
+            snapshot.commit_index,
+        );
     }
 
     pub fn new_listener(&self) -> RoleStateListener {
-        RoleStateListener(self.0.new_listener())
+        RoleStateListener(self.state.new_listener())
     }
 
     pub fn read_ctl(&self) -> StateCtl {
-        self.0.read_ctl()
+        self.state.read_ctl()
     }
 
     pub fn state(&self) -> RoleState {
-        self.0.state()
+        self.state.state()
     }
 
     pub fn is_running(&self) -> bool {

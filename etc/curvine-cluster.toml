@@ -56,6 +56,14 @@ meta_dir = "testing/meta"
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"
 
+# Optional follower metadata reads. See docs/follower-reads.md for rollout and
+# consistency limits. Commit lag is 0..10000 entries; the stall timeout is
+# 1ms..10m and separately covers local apply stalls and replication stalls.
+# follower_reads_enabled = false
+# follower_worker_state_enabled = false
+# follower_read_max_commit_lag = 0
+# follower_read_apply_stall_timeout = "30s"
+
 # Recycle bin. While enabled, deletes on Curvine-native paths move entries to
 # /.Trash instead of freeing blocks immediately. Mounted paths (cache_mode /
 # fs_mode) always bypass the bin, because the client removes the UFS object
@@ -133,6 +141,20 @@ journal_dir = "testing/journal"
 # This is trusted administrator configuration and is not capped by the master.
 weight = 1
 dir_reserved = "0"
+# Optional follower worker-state mirroring. The byte budget must accommodate
+# the full block inventory plus per-peer Start messages and queue descriptors;
+# otherwise follower location reads fall back to the leader. Limits: 1..4096
+# queued operations, 1..1073741824 bytes, 1..32 peers and concurrent RPCs.
+# Retry timeout is 1..300000ms; retry delays are positive, max is <=60000ms,
+# min <= max, and min <= timeout.
+# follower_reports_enabled = false
+# follower_report_queue_max_ops = 256
+# follower_report_queue_max_bytes = 67108864
+# follower_report_max_peer_queues = 32
+# follower_report_max_concurrency = 16
+# follower_report_retry_timeout_ms = 30000
+# follower_report_retry_min_ms = 100
+# follower_report_retry_max_ms = 5000
 # Strict physical free-space floor for Curvine write admission. The worker
 # reports only bytes above this floor, so both new blocks and FileLayout rewrite
 # staging copies are rejected if their full reservation would cross it. Existing
@@ -175,6 +197,9 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 
 # Customer service configuration.
 [client]
+# Follower reads are opt-in. The sticky window must be positive when enabled.
+# follower_reads_enabled = false
+# follower_write_sticky_ms = 5000
 
 [transfer]
 # Set to true to start the standalone Transfer service. Local SQLite storage,
