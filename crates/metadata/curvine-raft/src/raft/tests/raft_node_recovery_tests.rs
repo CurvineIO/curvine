@@ -147,11 +147,11 @@ fn test_rocks_node_with_conf(
             RaftPeer::new(peer_id, &conf.hostname, port)
         })
         .collect();
-    let group = RaftGroup::from_conf(&conf);
+    let group = RaftGroup::from_conf(conf);
     let node_id = group.get_node_id(&conf.local_addr()).unwrap();
     assert_eq!(node_id, id);
     let client = RaftClient::new(rt.clone(), &group, conf.new_client_conf());
-    let log_store = RocksLogStorage::from_conf(&conf, true);
+    let log_store = RocksLogStorage::from_conf(conf, true);
     log_store
         .set_conf_state(&raft::eraftpb::ConfState {
             voters: group.voters(),
@@ -164,7 +164,7 @@ fn test_rocks_node_with_conf(
         log_store,
         HashAppStorage::new(),
         client.clone(),
-        &conf,
+        conf,
     );
     let raw = RawNode::new(
         &conf.new_raft_conf(node_id, 0),
@@ -175,7 +175,7 @@ fn test_rocks_node_with_conf(
     let (sender, receiver) = mpsc::channel(conf.message_size);
     let (session_sender, session_receiver) = mpsc::unbounded_channel();
 
-    let node = RaftNode {
+    RaftNode {
         rt,
         raw,
         client,
@@ -184,7 +184,7 @@ fn test_rocks_node_with_conf(
         heartbeat_sequence: 0,
         session_sender,
         session_receiver,
-        recovery: Recovery::load(&conf, node_id).unwrap(),
+        recovery: Recovery::load(conf, node_id).unwrap(),
         pending_ready: None,
         snapshot_done: None,
         storage,
@@ -199,8 +199,7 @@ fn test_rocks_node_with_conf(
         snapshot_entries: conf.snapshot_entries,
         last_snapshot_ms: 0,
         last_snapshot_op_id: 0,
-    };
-    node
+    }
 }
 
 fn become_leader_and_fence<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>) {
@@ -243,7 +242,6 @@ fn freeze_applied_index<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>,
             fsm_state: FsmState {
                 applied: applied.clone(),
                 ufs_applied: applied,
-                ..Default::default()
             },
         }))
         .unwrap();
@@ -440,7 +438,6 @@ fn reported_snapshot(node_id: u64, index: u64) -> SnapshotData {
         fsm_state: FsmState {
             applied: applied.clone(),
             ufs_applied: applied,
-            ..Default::default()
         },
     }
 }
