@@ -26,8 +26,8 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TrashEntry, TtlAction,
-    WorkerAddress, INTERNAL_CTIME_XATTR,
+    FreeResult, LeaderSnapshotInfo, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts,
+    TrashEntry, TtlAction, WorkerAddress, INTERNAL_CTIME_XATTR,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::AtomicCounter;
@@ -1840,6 +1840,10 @@ impl FsDir {
 
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
         self.store.create_checkpoint(id)
+    }
+
+    pub(crate) fn create_snapshot(&self, force: bool) -> FsResult<LeaderSnapshotInfo> {
+        self.journal_writer.create_snapshot(self, force)
     }
 
     pub fn restore<T: AsRef<str>>(&mut self, path: T, checkpoint_size: u64) -> CommonResult<()> {

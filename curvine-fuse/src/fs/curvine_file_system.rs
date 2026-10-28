@@ -2511,6 +2511,72 @@ mod tests {
     }
 
     #[test]
+    fn create_missing_uid_gid_retains_owner_write_access() {
+        use super::{CurvineFileSystem, OpenAction};
+        use crate::fs::operator::Create;
+        use crate::raw::fuse_abi::fuse_create_in;
+        use crate::FuseUtils;
+        use curvine_config::ClusterConf;
+        use curvine_runtime::runtime::AsyncRuntime;
+        use curvine_sys as sys;
+        use std::ffi::OsStr;
+        use std::sync::Arc;
+
+        let id = (1_000_000_000..1_000_000_100)
+            .find(|&id| {
+                sys::get_username_by_uid(id).is_none() && sys::get_groupname_by_gid(id).is_none()
+            })
+            .expect("test requires a UID/GID without an NSS entry");
+        let mut conf = ClusterConf::default();
+        conf.fuse.uid = 0;
+        conf.fuse.gid = 0;
+        conf.fuse.check_permission = true;
+        conf.fuse.metrics_enabled = false;
+        let rt = Arc::new(AsyncRuntime::single());
+        let fs = CurvineFileSystem::new(conf, rt).unwrap();
+        let caller = hdr(id, id, 0);
+
+        for mode in [0o600, 0o644, 0o660] {
+            let arg = fuse_create_in {
+                flags: (libc::O_CREAT | libc::O_RDWR) as u32,
+                mode: libc::S_IFREG | mode,
+                umask: 0,
+                padding: 0,
+            };
+            let op = Create {
+                header: &caller,
+                arg: &arg,
+                name: OsStr::new("job.0.0"),
+            };
+            let opts = FuseUtils::create_opts(&op, &fs.fs, mode);
+            // The master persists these ACL fields from CreateFileOpts into the inode.
+            let mut status = FileStatus::with_name(2, "job.0.0".to_string(), false);
+            status.owner = opts.owner;
+            status.group = opts.group;
+            status.mode = opts.mode;
+
+            let attr = FuseUtils::status_to_attr(&fs.conf, &status).unwrap();
+            assert_eq!((attr.uid, attr.gid), (id, id));
+            for action in [OpenAction::WriteOnly, OpenAction::ReadWrite] {
+                let mask = CurvineFileSystem::open_userspace_acl_mask(action).unwrap();
+                fs.check_access_permissions(&status, &caller, mask).unwrap();
+                // Non-Linux builds bypass permission bits entirely.
+                #[cfg(target_os = "linux")]
+                {
+                    let denied = fs
+                        .check_access_permissions(&status, &hdr(id + 1, id + 1, 0), mask)
+                        .unwrap_err();
+                    assert_eq!(denied.errno(), libc::EACCES);
+                }
+                if mode == 0o660 {
+                    fs.check_access_permissions(&status, &hdr(id + 1, id, 0), mask)
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn statfs_block_counts_normalize_invalid_values() {
         use super::CurvineFileSystem;
 

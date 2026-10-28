@@ -15,12 +15,13 @@
 use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::{InodePath, InodeView, PATH_SEPARATOR};
 use crate::master::meta::FsDir;
+use crate::master::Master;
 use crate::master::MasterMonitor;
 use curvine_error::{FsError, FsResult};
 use curvine_model::ListOptions;
 use curvine_runtime::runtime::LoopTask;
 use log::{debug, info, warn};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Bound on how many children one directory page examines per namespace lock
 // hold. Keeps a directory with millions of children from building the whole
@@ -138,8 +139,21 @@ impl TrashPurger {
                 return Ok(Some(outcome));
             }
 
-            let Some((inodes, bytes)) = self.fs.purge_trash_batch(entry, &batch)? else {
-                return Ok(None);
+            let started = Instant::now();
+            let applied = self.fs.purge_trash_batch(entry, &batch);
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+
+            let (inodes, bytes) = match applied {
+                Ok(Some(applied)) => {
+                    Self::record_batch(elapsed_ms, applied.0, true);
+                    applied
+                }
+                // A demotion is not a purge failure: this node simply stopped.
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    Self::record_batch(elapsed_ms, 0, false);
+                    return Err(e);
+                }
             };
             outcome.batches += 1;
             outcome.inodes += inodes;
@@ -155,6 +169,23 @@ impl TrashPurger {
             if self.yield_ms > 0 {
                 std::thread::sleep(Duration::from_millis(self.yield_ms));
             }
+        }
+    }
+
+    /// Records one applied (or failed) batch. Metrics are best-effort: a missing
+    /// registry must never fail a purge.
+    fn record_batch(elapsed_ms: u64, inodes: u64, applied: bool) {
+        let Ok(metrics) = Master::get_metrics() else {
+            return;
+        };
+        metrics.trash_purge_batches.inc();
+        metrics
+            .trash_purge_batch_duration_ms
+            .inc_by(elapsed_ms as i64);
+        if applied {
+            metrics.trash_purge_inodes.inc_by(inodes as i64);
+        } else {
+            metrics.trash_purge_errors.inc();
         }
     }
 
@@ -333,6 +364,14 @@ impl PendingTrashPurger {
         let mut bytes = 0u64;
         let mut start_after = None;
 
+        // Sample the queue depth once per cycle. The probe is one bounded page,
+        // so a backlog larger than the page reports the page size.
+        if let Ok(probe) = self.fs.scan_pending_trash(self.scan_batch, None) {
+            if let Ok(metrics) = Master::get_metrics() {
+                metrics.trash_pending_entries.set(probe.paths.len() as i64);
+            }
+        }
+
         loop {
             if !self.monitor.is_active() {
                 return Ok(None);
@@ -388,5 +427,43 @@ impl LoopTask for PendingTrashPurger {
 
     fn terminate(&self) -> bool {
         self.monitor.is_stop()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrashPurger;
+    use crate::master::Master;
+
+    // Counters only increase, so delta assertions stay valid even when other
+    // tests in this binary purge concurrently and add their own increments.
+    #[test]
+    fn records_batch_metrics() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let batches = metrics.trash_purge_batches.get();
+        let duration = metrics.trash_purge_batch_duration_ms.get();
+        let inodes = metrics.trash_purge_inodes.get();
+        let errors = metrics.trash_purge_errors.get();
+
+        TrashPurger::record_batch(7, 3, true);
+        TrashPurger::record_batch(5, 4, false);
+
+        assert!(
+            metrics.trash_purge_batches.get() >= batches + 2,
+            "every batch must be counted"
+        );
+        assert!(
+            metrics.trash_purge_batch_duration_ms.get() >= duration + 12,
+            "batch durations must be summed"
+        );
+        assert!(
+            metrics.trash_purge_inodes.get() >= inodes + 3,
+            "only applied batches contribute inodes"
+        );
+        assert!(
+            metrics.trash_purge_errors.get() > errors,
+            "failed batches are counted separately"
+        );
     }
 }

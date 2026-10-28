@@ -36,6 +36,15 @@ impl SnapshotFetcher {
         mut data: SnapshotData,
     ) -> RaftResult<Self> {
         if node_id == data.node_id {
+            if let Some(files) = data.files_data.as_ref() {
+                if !Self::local_snapshot_ready(&files.dir, &files.files) {
+                    return err_box!(
+                        "local snapshot {} is incomplete under {}, it cannot be reused",
+                        data.snapshot_id,
+                        files.dir
+                    );
+                }
+            }
             return Ok(Self::Local(data));
         }
 

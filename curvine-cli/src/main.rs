@@ -231,6 +231,7 @@ fn main() -> CommonResult<()> {
             Some(Commands::Mount(cmd)) => cmd.execute(curvine_fs).await,
             Some(Commands::UnMount(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Node(cmd)) => cmd.execute(fs_client, conf.clone()).await,
+            Some(Commands::Snapshot(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Version) | None => Ok(()),
         };
 
@@ -297,6 +298,19 @@ mod tests {
                 "accepted {value}"
             );
         }
+    }
+
+    #[test]
+    fn snapshot_create_subcommand_is_available() {
+        let args = CurvineArgs::try_parse_from(["curvine", "snapshot", "create"])
+            .expect("snapshot create should parse");
+
+        assert!(matches!(args.command, Some(Commands::Snapshot(_))));
+
+        let args = CurvineArgs::try_parse_from(["curvine", "snapshot", "create", "--force"])
+            .expect("snapshot create --force should parse");
+
+        assert!(matches!(args.command, Some(Commands::Snapshot(_))));
     }
 
     #[test]

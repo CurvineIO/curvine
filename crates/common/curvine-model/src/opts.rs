@@ -196,8 +196,9 @@ impl CreateFileOptsBuilder {
     }
 
     pub fn acl(mut self, uid: u32, gid: u32, mode: u32) -> Self {
-        self.owner = sys::get_username_by_uid(uid).unwrap_or("".to_string());
-        self.group = sys::get_groupname_by_gid(gid).unwrap_or("".to_string());
+        // Container users may have no local NSS entry. Preserve their numeric identity.
+        self.owner = sys::get_username_by_uid(uid).unwrap_or_else(|| uid.to_string());
+        self.group = sys::get_groupname_by_gid(gid).unwrap_or_else(|| gid.to_string());
         self.mode = mode;
         self
     }
@@ -545,6 +546,60 @@ impl fmt::Display for ListOptions {
             (Some(l), None) => write!(f, "{}-none", l),
             (None, Some(s)) => write!(f, "none-{}", s),
             (None, None) => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CreateFileOpts, CreateFileOptsBuilder, MkdirOptsBuilder};
+    use curvine_sys as sys;
+
+    fn unmapped_id() -> u32 {
+        (1_000_000_000..1_000_000_100)
+            .find(|&id| {
+                sys::get_username_by_uid(id).is_none() && sys::get_groupname_by_gid(id).is_none()
+            })
+            .expect("test requires a UID/GID without an NSS entry")
+    }
+
+    #[test]
+    fn create_acl_missing_uid_gid_preserves_numeric_identity() {
+        let id = unmapped_id();
+        for mode in [0o600, 0o644] {
+            let opts = CreateFileOptsBuilder::new().acl(id, id, mode).build();
+            let dir = MkdirOptsBuilder::new().acl(id, id, mode).build();
+            assert_eq!(opts.owner, id.to_string());
+            assert_eq!(opts.group, id.to_string());
+            assert_eq!(
+                (opts.owner.as_str(), opts.group.as_str()),
+                (dir.owner.as_str(), dir.group.as_str())
+            );
+            assert_eq!(opts.mode, mode);
+
+            let encoded = serde_json::to_string(&opts).unwrap();
+            let decoded: CreateFileOpts = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.owner, opts.owner);
+            assert_eq!(decoded.group, opts.group);
+            assert_eq!(decoded.mode, mode);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_acl_missing_uid_or_gid_preserves_resolvable_names() {
+        let id = unmapped_id();
+        let user = sys::get_username_by_uid(0).expect("root user must resolve");
+        let group = sys::get_groupname_by_gid(0).expect("root group must resolve");
+        for (uid, gid, owner, group) in [
+            (id, 0, id.to_string(), group.clone()),
+            (0, id, user.clone(), id.to_string()),
+            (0, 0, user, group),
+        ] {
+            let opts = CreateFileOptsBuilder::new().acl(uid, gid, 0o640).build();
+            assert_eq!(opts.owner, owner);
+            assert_eq!(opts.group, group);
+            assert_eq!(opts.mode, 0o640);
         }
     }
 }
