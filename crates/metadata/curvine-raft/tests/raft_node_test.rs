@@ -864,22 +864,40 @@ fn test_client(conf: &JournalConf, rt: Arc<Runtime>) -> RaftClient {
     RaftClient::new(rt, &group, conf.new_client_conf())
 }
 
-/// A snapshot this member owns is used directly, without any download.
+/// A snapshot this member owns is reused without any download, but only while
+/// its files still exist: a wiped local data dir must fail instead of reuse.
 #[test]
-fn snapshot_fetcher_treats_matching_node_as_local() {
+fn snapshot_fetcher_treats_matching_node_as_local() -> CommonResult<()> {
     let conf = JournalConf::with_test();
     let rt = conf.create_runtime();
+    let dir = Utils::test_sub_dir(format!("snapshot-owned-{}", Utils::rand_id()));
+    FileUtils::delete_path(&dir, true)?;
+    FileUtils::create_dir(&dir, true)?;
+    std::fs::write(Path::new(&dir).join("checkpoint.db"), vec![0u8; 16])?;
+
     let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0);
     let mut data = reported_snapshot(5, 7);
-    data.files_data = Some(remote_files());
+    data.files_data = Some(files_in_dir(&dir));
 
     let fetcher =
-        SnapshotFetcher::new(7, &app, &conf, test_client(&conf, rt.clone()), data).unwrap();
+        SnapshotFetcher::new(7, &app, &conf, test_client(&conf, rt.clone()), data.clone()).unwrap();
 
     assert!(
         matches!(fetcher, SnapshotFetcher::Local(_)),
         "snapshot owned by this member must not be downloaded"
     );
+
+    // The leader keeps this member registered as the owner, so the same
+    // snapshot comes back after the files are gone.
+    FileUtils::delete_path(&dir, true)?;
+    let err = SnapshotFetcher::new(7, &app, &conf, test_client(&conf, rt.clone()), data)
+        .err()
+        .expect("an owned snapshot whose files are gone must not be reused");
+    assert!(
+        err.to_string().contains(&dir),
+        "the error must name the missing directory: {err}"
+    );
+    Ok(())
 }
 
 /// A remote snapshot without a file list cannot be downloaded and must error.

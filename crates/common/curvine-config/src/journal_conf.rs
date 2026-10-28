@@ -76,6 +76,13 @@ pub struct JournalConf {
 
     pub snapshot_read_chunk_size: usize,
 
+    // How many snapshot files are transferred at the same time when this node
+    // downloads a snapshot from its owner. Each file uses its own connection,
+    // so the value also bounds the number of download connections. 1 keeps the
+    // transfer serial; raising it speeds up large snapshots at the cost of more
+    // concurrent reads on the owner.
+    pub snapshot_download_parallel: usize,
+
     // Network configuration between raft node communications.
     // Set the client service connection timeout and retry policy.
     pub conn_retry_max_duration_ms: u64,
@@ -313,6 +320,7 @@ impl Default for JournalConf {
             leader_create_snapshot: None,
             snapshot_entries: 1_000_000,
             snapshot_read_chunk_size: 1024 * 1024,
+            snapshot_download_parallel: 8,
 
             conn_retry_max_duration_ms: 0,
             conn_retry_min_sleep_ms: 10 * 1000,
