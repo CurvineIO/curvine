@@ -21,15 +21,18 @@ use std::fmt::{Debug, Formatter};
 pub struct WorkerMetrics {
     store: BlockStore,
 
-    pub(crate) write_bytes: Counter,
-    pub(crate) write_time_us: Counter,
-    pub(crate) write_count: Counter,
+    pub(crate) write_bytes: CounterVec,
+    pub(crate) write_time_us: CounterVec,
+    pub(crate) write_count: CounterVec,
     pub(crate) write_blocks: CounterVec,
+    pub(crate) slow_write_count: CounterVec,
+    pub(crate) write_error_count: CounterVec,
 
     pub(crate) read_bytes: Counter,
     pub(crate) read_time_us: Counter,
     pub(crate) read_count: Counter,
     pub(crate) read_blocks: CounterVec,
+    pub(crate) read_error_count: CounterVec,
 
     pub(crate) block_store_stripe_lock_wait_us: HistogramVec,
     pub(crate) block_dataset_write_lock_wait_us: HistogramVec,
@@ -55,15 +58,42 @@ impl WorkerMetrics {
         let wm = Self {
             store,
 
-            write_bytes: m::new_counter("write_bytes", "worker writes total bytes")?,
-            write_time_us: m::new_counter("write_time_us", "Microseconds spent writing")?,
-            write_count: m::new_counter("write_count", "Number of writes")?,
-            write_blocks: m::new_counter_vec("write_blocks", "write_blocks", &["type"])?,
+            write_bytes: m::new_counter_vec(
+                "write_bytes",
+                "worker writes total bytes",
+                &["dir_id"],
+            )?,
+            write_time_us: m::new_counter_vec(
+                "write_time_us",
+                "Microseconds spent writing",
+                &["dir_id"],
+            )?,
+            write_count: m::new_counter_vec(
+                "write_count",
+                "Number of writes",
+                &["dir_id"],
+            )?,
+            write_blocks: m::new_counter_vec("write_blocks", "write_blocks", &["dir_id", "type"])?,
+            slow_write_count: m::new_counter_vec(
+                "slow_write_count",
+                "Writes slower than the io_slow_threshold",
+                &["dir_id"],
+            )?,
+            write_error_count: m::new_counter_vec(
+                "write_error_count",
+                "Writes that failed with an IO error",
+                &["dir_id"],
+            )?,
 
             read_bytes: m::new_counter("read_bytes", "worker read total bytes")?,
             read_time_us: m::new_counter("read_time_us", "Microseconds spent read")?,
             read_count: m::new_counter("read_count", "Number of reads")?,
             read_blocks: m::new_counter_vec("read_blocks", "read_blocks", &["type"])?,
+            read_error_count: m::new_counter_vec(
+                "read_error_count",
+                "Reads that failed with an IO error",
+                &["dir_id"],
+            )?,
 
             block_store_stripe_lock_wait_us: m::new_histogram_vec(
                 "block_store_stripe_lock_wait_us",

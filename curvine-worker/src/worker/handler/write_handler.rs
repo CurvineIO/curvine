@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockStore, BlockWriteLease};
-use crate::worker::handler::WriteContext;
+use crate::worker::handler::{DirWriteMetrics, WriteContext};
 use crate::worker::storage::BlockWriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_core_error::{err_box, ternary, try_option_mut, CommonResult};
@@ -73,6 +73,19 @@ impl WriteHandler {
         })
     }
 
+    pub(crate) fn record_write_error(
+        metrics: &WorkerMetrics,
+        dir_id: u32,
+        e: &impl std::fmt::Display,
+    ) {
+        let dir_id = dir_id.to_string();
+        warn!("Write to storage dir {} failed: {}", dir_id, e);
+        metrics
+            .write_error_count
+            .with_label_values(&[dir_id.as_str()])
+            .inc();
+    }
+
     pub fn resize(file: &mut BlockWriteContext, ctx: &WriteContext) -> FsResult<()> {
         let opts = if let Some(opts) = &ctx.block.alloc_opts {
             opts
@@ -109,7 +122,7 @@ impl WriteHandler {
     }
 
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
-        let context = WriteContext::from_req(msg)?;
+        let mut context = WriteContext::from_req(msg)?;
         if context.off < 0 || context.off > context.block_size {
             return err_box!(
                 "Invalid write offset: {}, block size: {}",
@@ -140,6 +153,8 @@ impl WriteHandler {
                 return Err(map_storage_open_error(e));
             }
         };
+        context.dir_id = meta.dir_id();
+        context.dir_metrics = Some(DirWriteMetrics::new(self.metrics, context.dir_id));
         let mut file = match self.store.open_writer(&meta, context.off) {
             Ok(file) => file,
             Err(e) => {
@@ -213,10 +228,14 @@ impl WriteHandler {
         };
 
         let _ = mem::replace(&mut self.file, file);
+        let dir_id = context.dir_id.to_string();
         let _ = self.context.replace(context);
         self.lease = lease;
 
-        self.metrics.write_blocks.with_label_values(&[label]).inc();
+        self.metrics
+            .write_blocks
+            .with_label_values(&[dir_id.as_str(), label])
+            .inc();
 
         info!("{}", log_msg);
         Ok(Builder::success(msg).proto_header(response).build())
@@ -268,24 +287,37 @@ impl WriteHandler {
         let data_len = msg.data_len() as i64;
         if data_len > 0 {
             let spend = TimeSpent::new();
-            file.write_region(&msg.data)?;
+            if let Err(e) = file.write_region(&msg.data) {
+                Self::record_write_error(self.metrics, context.dir_id, &e);
+                return Err(e.into());
+            }
 
             let used = spend.used_us();
+            let dir_metrics = context.dir_metrics.as_ref();
             if used >= self.io_slow_us {
                 warn!(
-                    "Slow write data from disk cost: {}us (threshold={}us), path: {} ",
+                    "Slow write data from disk cost: {}us (threshold={}us), dir: {}, path: {} ",
                     used,
                     self.io_slow_us,
+                    context.dir_id,
                     file.path()
                 );
+                if let Some(dir_metrics) = dir_metrics {
+                    dir_metrics.slow_write_count.inc();
+                }
             }
-            self.metrics.write_bytes.inc_by(msg.data_len() as i64);
-            self.metrics.write_time_us.inc_by(used as i64);
-            self.metrics.write_count.inc();
+            if let Some(dir_metrics) = dir_metrics {
+                dir_metrics.write_bytes.inc_by(data_len);
+                dir_metrics.write_time_us.inc_by(used as i64);
+                dir_metrics.write_count.inc();
+            }
         }
 
         if need_flush {
-            file.flush()?;
+            if let Err(e) = file.flush() {
+                Self::record_write_error(self.metrics, context.dir_id, &e);
+                return Err(e.into());
+            }
         }
 
         Ok(msg.success())
@@ -309,6 +341,7 @@ impl WriteHandler {
             };
         }
 
+        let write_dir_id = self.context.as_ref().map(|c| c.dir_id);
         if let Some(context) = self.context.take() {
             Self::check_context(&context, msg)?;
         }
@@ -318,6 +351,9 @@ impl WriteHandler {
         if let Some(mut file) = file {
             if let Err(flush_err) = file.flush() {
                 drop(file);
+                if let Some(dir_id) = write_dir_id {
+                    Self::record_write_error(self.metrics, dir_id, &flush_err);
+                }
                 if let Err(abort_err) = self.store.abort_block(&context.block) {
                     log::warn!(
                         "failed to abort block {} after flush error: {}",
@@ -587,6 +623,8 @@ mod tests {
             short_circuit: false,
             off: 0,
             block_size,
+            dir_id: 0,
+            dir_metrics: None,
         };
 
         let store = create_test_store("flush-order")?;
@@ -645,6 +683,8 @@ mod tests {
             short_circuit: false,
             off: 0,
             block_size,
+            dir_id: 4242,
+            dir_metrics: None,
         };
 
         let store = create_test_store("flush-error")?;
@@ -682,6 +722,64 @@ mod tests {
         assert!(
             err.to_string().contains("flush failed"),
             "unexpected error: {err}"
+        );
+
+        // The failure must be attributed to the opened storage dir, not to the
+        // default `dir_id` of a freshly built context.
+        assert_eq!(
+            handler
+                .metrics
+                .write_error_count
+                .with_label_values(&["4242"])
+                .get(),
+            1,
+            "a failed flush must increment write_error_count for its own dir_id"
+        );
+
+        Ok(())
+    }
+
+    // `open()` must attribute the writer to the directory that actually owns
+    // the block, and resolve the per-dir counters from that label once.
+    #[test]
+    fn open_attributes_writer_to_block_storage_dir() -> FsResult<()> {
+        let block_size = 512_i64;
+        let store = create_test_store("open-dir-id")?;
+        let block = ExtendedBlock::new(1, 0, StorageType::Mem, FileType::File);
+
+        let mut handler = WriteHandler::new(store, "test".to_string())?;
+        let req = curvine_proto::BlockWriteRequest {
+            block: curvine_model::ProtoUtils::extend_block_to_pb(ExtendedBlock {
+                len: block_size,
+                ..block.clone()
+            }),
+            off: 0,
+            block_size,
+            short_circuit: false,
+            client_name: "test".to_string(),
+            chunk_size: block_size as i32,
+            pipeline_stream: Vec::new(),
+            component_info: None,
+        };
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Open)
+            .req_id(1)
+            .seq_id(0)
+            .proto_header(req)
+            .build();
+
+        handler.open(&msg)?;
+
+        let meta = handler.store.get_block(block.id).map_err(FsError::from)?;
+        let context = handler
+            .context
+            .as_ref()
+            .expect("open must keep the write context");
+        assert_eq!(context.dir_id, meta.dir_id());
+        assert!(
+            context.dir_metrics.is_some(),
+            "open must resolve the per-dir counters"
         );
 
         Ok(())

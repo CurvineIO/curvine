@@ -217,7 +217,7 @@ impl Default for WorkerConf {
             dir_reserved: "0".to_string(),
             free_ratio: 0.0,
             data_dir: vec![],
-            io_slow_threshold: "300ms".to_string(),
+            io_slow_threshold: "100ms".to_string(),
             io_threads: 32,
             worker_threads: Utils::worker_threads(32),
             io_timeout: "10m".to_string(),
@@ -258,6 +258,13 @@ mod tests {
     #[test]
     fn free_ratio_defaults_to_zero() {
         assert_eq!(WorkerConf::default().free_ratio, 0.0);
+    }
+
+    #[test]
+    fn io_slow_threshold_defaults_to_100ms() {
+        // 128KB write chunk at 100ms is ~1.25MB/s: clearly abnormal on any local
+        // disk, while 300ms would only fire on an almost hung device.
+        assert_eq!(WorkerConf::default().io_slow_us(), 100_000);
     }
 
     #[test]

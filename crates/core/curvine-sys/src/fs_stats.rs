@@ -14,20 +14,24 @@
 
 use crate as sys;
 use crate::SysResult;
+use curvine_runtime::sync::AtomicCounter;
 use log::warn;
+use std::fmt::{self, Debug, Formatter};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
 pub struct FsStats {
     path: PathBuf,
-    device_id: u64,
+    device_id: AtomicCounter,
 }
 
 impl FsStats {
     pub fn new<P: AsRef<str>>(path: P) -> Self {
         let path = PathBuf::from(path.as_ref());
         let device_id = sys::get_device_id(path.as_path());
-        Self { path, device_id }
+        Self {
+            path,
+            device_id: AtomicCounter::new(device_id),
+        }
     }
 
     pub fn exists(&self) -> bool {
@@ -47,7 +51,7 @@ impl FsStats {
     }
 
     pub fn device_id(&self) -> u64 {
-        self.device_id
+        self.device_id.get()
     }
 
     pub fn len(&self) -> u64 {
@@ -97,10 +101,35 @@ impl FsStats {
             );
         }
 
-        let new_device_id = sys::get_device_id(self.path());
-        if new_device_id != self.device_id {
-            warn!("The device ID associated with the directory {:?} has changed. Previous device ID: {},\
-             Current device ID: {}", self.path(), self.device_id, new_device_id)
+        self.check_device()
+    }
+
+    fn check_device(&self) -> SysResult<()> {
+        let current = sys::get_device_id(self.path());
+        if current == 0 {
+            let baseline = self.device_id.get();
+            if baseline != 0 {
+                return sys_error!(format!(
+                    "The device of the directory {:?} is no longer observable. Previous device ID: {}",
+                    self.path(),
+                    baseline
+                ));
+            }
+            return Ok(());
+        }
+
+        if self.device_id.compare_and_set(0, current) {
+            return Ok(());
+        }
+
+        let baseline = self.device_id.get();
+        if baseline != current {
+            return sys_error!(format!(
+                "The device ID associated with the directory {:?} has changed. Previous device ID: {}, Current device ID: {}",
+                self.path(),
+                baseline,
+                current
+            ));
         }
 
         Ok(())
@@ -117,9 +146,62 @@ impl FsStats {
     }
 }
 
+impl Debug for FsStats {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FsStats")
+            .field("path", &self.path)
+            .field("device_id", &self.device_id.get())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::FsStats;
+    use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn check_dir_rejects_device_change() {
+        let path = std::env::temp_dir();
+        let observed = sys::get_device_id(path.as_path());
+        assert_ne!(observed, 0, "temp dir must resolve to a device on linux");
+        let fs = FsStats {
+            path,
+            device_id: AtomicCounter::new(observed + 1),
+        };
+        let err = fs.check_dir().unwrap_err();
+        assert!(
+            err.to_string().contains("device ID"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn check_dir_adopts_device_baseline_when_unset() {
+        let path = std::env::temp_dir();
+        let observed = sys::get_device_id(path.as_path());
+        assert_ne!(observed, 0, "temp dir must resolve to a device on linux");
+        let fs = FsStats {
+            path,
+            device_id: AtomicCounter::new(0),
+        };
+        fs.check_dir().unwrap();
+        assert_eq!(fs.device_id(), observed);
+    }
+
+    #[test]
+    fn check_device_rejects_lost_baseline() {
+        let fs = FsStats {
+            path: PathBuf::from("/nonexistent-curvine-device-probe"),
+            device_id: AtomicCounter::new(123),
+        };
+        let err = fs.check_device().unwrap_err();
+        assert!(
+            err.to_string().contains("no longer observable"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     pub fn space() {
