@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::master::meta::inode::InodeView;
+use crate::master::meta::store::OwnerKind;
 use crate::master::meta::LockMeta;
 use curvine_core_error::CommonResult;
 use curvine_model::{BlockLocation, FileLock, MountInfo};
@@ -41,6 +42,12 @@ impl RocksInodeStore {
 
     pub const PREFIX_MOUNT: u8 = 0x01;
     pub const PREFIX_LOCK: u8 = 0x02;
+    /// Client ownership index: which inodes a client owns lock/writer state on
+    /// (#1880). Key layout:
+    /// `[PREFIX_CLIENT_OWNER][client_id len u8][client_id][kind u8][inode id i64]`.
+    /// The length prefix keeps the client-id prefix unambiguous for ids that are
+    /// not fixed width (uuid, `curvine-lancedb:<pid>`, ...).
+    pub const PREFIX_CLIENT_OWNER: u8 = 0x03;
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
@@ -295,6 +302,83 @@ impl RocksInodeStore {
             let value = Serde::serialize(&lock)?;
             self.db.put_cf(RocksInodeStore::CF_COMMON, key, value)
         }
+    }
+
+    fn client_owner_prefix(client_id: &str, kind: Option<OwnerKind>) -> Vec<u8> {
+        let bytes = client_id.as_bytes();
+        let mut key = Vec::with_capacity(bytes.len() + 4);
+        key.push(Self::PREFIX_CLIENT_OWNER);
+        key.push(bytes.len() as u8);
+        key.extend_from_slice(bytes);
+        if let Some(kind) = kind {
+            key.push(kind.as_u8());
+        }
+        key
+    }
+
+    fn client_owner_key(client_id: &str, kind: OwnerKind, ino: i64) -> Vec<u8> {
+        let mut key = Self::client_owner_prefix(client_id, Some(kind));
+        key.extend_from_slice(&ino.to_be_bytes());
+        key
+    }
+
+    /// Record that `client_id` owns `kind` state on `ino`. Idempotent.
+    pub fn add_client_owner(&self, client_id: &str, kind: OwnerKind, ino: i64) -> CommonResult<()> {
+        let key = Self::client_owner_key(client_id, kind, ino);
+        self.db.put_cf(Self::CF_COMMON, key, [])
+    }
+
+    /// Drop one ownership hint. Idempotent.
+    pub fn remove_client_owner(
+        &self,
+        client_id: &str,
+        kind: OwnerKind,
+        ino: i64,
+    ) -> CommonResult<()> {
+        let key = Self::client_owner_key(client_id, kind, ino);
+        self.db.delete_cf(Self::CF_COMMON, key)
+    }
+
+    /// Every ownership hint held by `client_id`, in key order.
+    pub fn get_client_owners(&self, client_id: &str) -> CommonResult<Vec<(OwnerKind, i64)>> {
+        let prefix = Self::client_owner_prefix(client_id, None);
+        let iter = self.db.prefix_scan(Self::CF_COMMON, prefix.as_slice())?;
+        let kind_offset = prefix.len();
+        let mut owners = Vec::new();
+        for item in iter {
+            let (key, _) = item?;
+            if key.len() != kind_offset + 1 + 8 {
+                continue;
+            }
+            let Some(kind) = OwnerKind::from_u8(key[kind_offset]) else {
+                continue;
+            };
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(&key[kind_offset + 1..kind_offset + 9]);
+            owners.push((kind, i64::from_be_bytes(raw)));
+        }
+        Ok(owners)
+    }
+
+    /// Number of index entries held by `client_id` for `kind`.
+    pub fn count_client_owners(&self, client_id: &str, kind: OwnerKind) -> CommonResult<usize> {
+        let prefix = Self::client_owner_prefix(client_id, Some(kind));
+        let mut count = 0;
+        for item in self.db.prefix_scan(Self::CF_COMMON, prefix.as_slice())? {
+            item?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Drop every ownership hint held by `client_id`. Used when its session is
+    /// reaped, so a stale hint can never outlive the session that produced it.
+    pub fn clear_client_owners(&self, client_id: &str) -> CommonResult<usize> {
+        let owners = self.get_client_owners(client_id)?;
+        for (kind, ino) in &owners {
+            self.remove_client_owner(client_id, *kind, *ino)?;
+        }
+        Ok(owners.len())
     }
 
     pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {

@@ -164,6 +164,19 @@ pub struct SetLocksEntry {
     pub(crate) locks: Vec<FileLock>,
 }
 
+/// Removes exactly one client's writer marker from one inode (#1880).
+///
+/// `client` is required: another client may be writing the same file, and clearing
+/// the whole `WriteFeature` would mark that file complete while it is still being
+/// written.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ReleaseWriterEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) ino: i64,
+    pub(crate) client: String,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct FreeEntry {
     pub(crate) op_id: u64,
@@ -222,6 +235,10 @@ pub enum JournalEntry {
     // Keep new variants appended so existing journal discriminants remain stable.
     CacheInvalidation(CacheInvalidationEntry),
     TrashPurge(TrashPurgeEntry),
+    /// Drop one client's writer marker (#1880). Emitted by the session reaper when
+    /// a client that was writing a file is gone; the journal entry is what makes
+    /// "the file is complete again" durable and replayable.
+    ReleaseWriter(ReleaseWriterEntry),
 }
 
 impl JournalEntry {
@@ -246,6 +263,7 @@ impl JournalEntry {
             JournalEntry::UfsApplied(e) => e.op_id,
             JournalEntry::Snapshot(e) => e.op_id,
             JournalEntry::TrashPurge(e) => e.op_id,
+            JournalEntry::ReleaseWriter(e) => e.op_id,
         }
     }
 
@@ -270,6 +288,7 @@ impl JournalEntry {
             JournalEntry::UfsApplied(e) => e.rpc_id,
             JournalEntry::Snapshot(e) => e.rpc_id,
             JournalEntry::TrashPurge(e) => e.rpc_id,
+            JournalEntry::ReleaseWriter(e) => e.rpc_id,
         }
     }
 
@@ -282,6 +301,7 @@ impl JournalEntry {
             JournalEntry::CompleteFile(e) => Some(e.file.id),
             JournalEntry::Symlink(e) => Some(e.new_inode.id),
             JournalEntry::SetLocks(e) => Some(e.ino),
+            JournalEntry::ReleaseWriter(e) => Some(e.ino),
             _ => None,
         }
     }

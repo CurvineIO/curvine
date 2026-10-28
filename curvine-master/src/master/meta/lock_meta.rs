@@ -111,6 +111,20 @@ impl LockValidity {
     }
 }
 
+/// Distinct client ids holding a session-owned lock in `locks`.
+///
+/// Only these need an entry in the client ownership index (#1880): legacy locks
+/// keep the `lock_expire_time` path and are never reclaimed per client.
+pub(crate) fn session_owned_clients(locks: &[FileLock]) -> Vec<String> {
+    let mut clients: Vec<String> = Vec::new();
+    for lock in locks.iter().filter(|lock| lock.session_owned) {
+        if !clients.contains(&lock.client_id) {
+            clients.push(lock.client_id.clone());
+        }
+    }
+    clients
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct LockMeta {
     plock: HashMap<String, Vec<FileLock>>,

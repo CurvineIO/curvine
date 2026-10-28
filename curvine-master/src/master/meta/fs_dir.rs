@@ -2371,6 +2371,30 @@ impl FsDir {
         Ok(meta.find_conflict(lock, validity, LocalTime::mills()))
     }
 
+    /// Drop one client's writer marker (#1880).
+    ///
+    /// Idempotent: a replayed or duplicated entry must not fail, and it must never
+    /// touch another client's marker. Uses the reopen apply path so the client
+    /// ownership index is reconciled in exactly one place.
+    pub fn release_writer(&mut self, ino: i64, client: &str) -> FsResult<bool> {
+        let Some(mut inode) = self.store.get_inode(ino, None)? else {
+            // The inode is gone; nothing to release. The reaper drops the stale
+            // index hint itself.
+            return Ok(false);
+        };
+
+        let changed = match inode.as_file_mut() {
+            Ok(file) => file.remove_writer(client),
+            Err(_) => false,
+        };
+        if !changed {
+            return Ok(false);
+        }
+
+        self.store.apply_reopen_file(&inode)?;
+        Ok(true)
+    }
+
     pub fn set_lock(
         &self,
         inp: InodePath,

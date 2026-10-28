@@ -36,7 +36,7 @@ mod glob_utils;
 pub use glob_utils::*;
 
 mod lock_meta;
-pub(crate) use self::lock_meta::LegacyFileLock;
+pub(crate) use self::lock_meta::{session_owned_clients, LegacyFileLock};
 pub use self::lock_meta::{LockMeta, LockValidity};
 
 pub mod trash;
