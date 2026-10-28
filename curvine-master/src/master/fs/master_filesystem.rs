@@ -26,6 +26,7 @@ use crate::master::fs::state::{SessionHeartbeat, SessionMap};
 use crate::master::fs::worker_manager::WorkerManager;
 use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
+use crate::master::meta::store::OwnerKind;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncSessionMap, SyncWorkerManager};
 use curvine_config::{ClusterConf, MasterConf};
@@ -2524,6 +2525,27 @@ impl MasterFilesystem {
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         fs_dir.set_lock(inp, lock, &validity)
+    }
+
+    /// Ownership hints held by `client_id`, used by the session reaper (#1884).
+    pub fn get_client_owners(&self, client_id: &str) -> FsResult<Vec<(OwnerKind, i64)>> {
+        Ok(self.fs_dir.read().store.get_client_owners(client_id)?)
+    }
+
+    /// Drop one ownership hint. The reaper removes hints that no longer match any
+    /// state, so a stale hint is never revisited.
+    pub fn remove_client_owner(&self, client_id: &str, kind: OwnerKind, ino: i64) -> FsResult<()> {
+        Ok(self
+            .fs_dir
+            .read()
+            .store
+            .remove_client_owner(client_id, kind, ino)?)
+    }
+
+    /// Release one client's session-owned locks on `ino`, journalled as `SetLocks`.
+    pub fn release_client_locks(&self, ino: i64, client_id: &str) -> FsResult<bool> {
+        let fs_dir = self.fs_dir.write();
+        fs_dir.release_client_locks(ino, client_id)
     }
 
     /// Lock lifetime policy for this request (#1879).

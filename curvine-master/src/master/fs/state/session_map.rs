@@ -134,6 +134,18 @@ impl SessionMap {
         self.created_at
     }
 
+    /// Earliest instant at which state owned by a client that is *not* live may be
+    /// reclaimed (#1884).
+    ///
+    /// Two full lease windows from the start of the epoch: the first gives every
+    /// client time to re-register after a leader change, the second absorbs a
+    /// dropped heartbeat. Like [`SessionMap::created_at`], it is only meaningful
+    /// after [`SessionMap::adopt`] has observed the current term.
+    pub fn reclaim_after(&self) -> u64 {
+        self.created_at
+            .saturating_add(self.session_timeout_ms.saturating_mul(2))
+    }
+
     /// Adopt the map for `term`, the raft term this master is serving (#1883 review).
     ///
     /// Returns `true` when a new lease epoch started. A term always increases
