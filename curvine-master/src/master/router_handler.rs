@@ -28,7 +28,7 @@ use curvine_model::{FileBlocks, FileStatus, WorkerInfo};
 use curvine_runtime::common::LocalTime;
 use curvine_web::router::RouterHandler;
 
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{MasterFilesystem, SessionSummary};
 use crate::master::MasterMetrics;
 
 #[derive(Clone)]
@@ -251,6 +251,15 @@ async fn remove_dcm(
     }
 }
 
+/// Client session leases with their ownership footprint (#1885). A zombie mount is
+/// identifiable here — host, mount point, whether its lease is still live — without
+/// reading the metadata database.
+async fn sessions(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+) -> FsResult<Json<Vec<SessionSummary>>> {
+    Ok(Json(instance.fs.session_summary()?))
+}
+
 async fn workers1(
     Extension(instance): Extension<Arc<MasterRouterHandler>>,
 ) -> FsResult<Json<Vec<String>>> {
@@ -275,6 +284,7 @@ impl RouterHandler for MasterRouterHandler {
             .route("/get-dcm", get(get_dcm))
             .route("/remove-dcm", get(remove_dcm))
             .route("/workers", get(workers1))
+            .route("/api/sessions", get(sessions))
             .layer(Extension(instance));
 
         self.fault_http.mount(router)

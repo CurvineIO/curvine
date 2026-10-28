@@ -142,6 +142,7 @@ impl SessionReaper {
         }
 
         if !report.is_empty() {
+            self.publish_metrics(&report);
             info!(
                 "session reaper: {} sessions, {} locks, {} writer markers, {} stale hints \
                  released (budget exhausted: {})",
@@ -154,6 +155,24 @@ impl SessionReaper {
         }
 
         Ok(report)
+    }
+
+    /// Publish the tick's outcome plus the current session count (#1885).
+    fn publish_metrics(&self, report: &ReapReport) {
+        let Ok(metrics) = crate::master::Master::get_metrics() else {
+            return;
+        };
+        metrics
+            .expired_sessions_total
+            .inc_by(report.sessions as i64);
+        metrics.reaped_locks_total.inc_by(report.locks as i64);
+        metrics.reaped_writers_total.inc_by(report.writers as i64);
+        metrics
+            .reaped_stale_hints_total
+            .inc_by(report.stale_hints as i64);
+        metrics
+            .active_sessions
+            .set(self.fs.session_map.read().len() as i64);
     }
 
     /// Release everything `client_id` owns. Returns `false` when the work budget ran
@@ -595,5 +614,71 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn reaping_publishes_session_metrics() {
+        let fs = test_fs("metrics");
+        create_file(&fs, "/metrics.log", "dead-client");
+        set_lock(&fs, "/metrics.log", "dead-client", true);
+        register(&fs, "dead-client", 1_000);
+
+        let metrics = Master::get_metrics().unwrap();
+        let expired_before = metrics.expired_sessions_total.get();
+        let locks_before = metrics.reaped_locks_total.get();
+        let writers_before = metrics.reaped_writers_total.get();
+        assert_eq!(
+            metrics.active_sessions.get(),
+            1,
+            "registering a session must publish the active count"
+        );
+
+        let report = SessionReaper::new(fs.clone(), fs.master_monitor.clone())
+            .reap_once(far_future(&fs))
+            .unwrap();
+        assert_eq!(report.sessions, 1);
+
+        assert_eq!(
+            metrics.expired_sessions_total.get(),
+            expired_before + 1,
+            "an expired session must be counted"
+        );
+        assert_eq!(metrics.reaped_locks_total.get(), locks_before + 1);
+        assert_eq!(metrics.reaped_writers_total.get(), writers_before + 1);
+        assert_eq!(
+            metrics.active_sessions.get(),
+            0,
+            "the gauge must drop back once the session is gone"
+        );
+    }
+
+    #[test]
+    fn session_summary_reports_ownership_footprint() {
+        let fs = test_fs("summary");
+        let ino = create_file(&fs, "/summary.log", "watched-client");
+        set_lock(&fs, "/summary.log", "watched-client", true);
+        // The summary judges liveness against the real clock, so register now.
+        register(&fs, "watched-client", LocalTime::mills());
+
+        let summary = fs.session_summary().unwrap();
+        assert_eq!(summary.len(), 1);
+        let entry = &summary[0];
+        assert_eq!(entry.client_id, "watched-client");
+        assert_eq!(entry.hostname, "host");
+        assert_eq!(entry.mount_point, None);
+        assert!(entry.live, "the lease was just renewed");
+        assert_eq!(entry.lock_hints, 1);
+        assert_eq!(entry.writer_hints, 1);
+        assert_eq!(entry.lock_hints + entry.writer_hints, 2);
+        assert!(entry.expire_at > entry.last_heartbeat);
+        assert_eq!(
+            owners(&fs, "watched-client"),
+            vec![(OwnerKind::Lock, ino), (OwnerKind::Writer, ino)]
+        );
+
+        // A legacy lock is not part of the footprint: it is never reclaimed per
+        // client, so it must not inflate the number an operator reads.
+        set_lock(&fs, "/summary.log", "legacy-client", false);
+        assert!(fs.session_summary().unwrap()[0].lock_hints == 1);
     }
 }
