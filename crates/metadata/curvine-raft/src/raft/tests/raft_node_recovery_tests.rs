@@ -313,10 +313,18 @@ fn snapshot_completion_advances_the_held_ready_exactly_once() {
     hold_current_ready(&mut node);
     node.last_snapshot_op_id = 0;
     node.last_snapshot_ms = 0;
+    // Isolate the re-anchor: the create-snapshot branch must not fire, so only
+    // `anchor_snapshot_markers()` can move the counters.
+    node.snapshot_interval_ms = u64::MAX;
+    node.snapshot_entries = u64::MAX;
     let mut promise = HashMap::new();
 
     rt.block_on(node.complete_pending_snapshot(Ok(()), &mut promise))
         .unwrap();
+    assert!(
+        node.storage.can_generate_snapshot(),
+        "completing a snapshot must not schedule a create job"
+    );
     assert_eq!(
         node.last_snapshot_op_id, 100,
         "completing a snapshot must re-anchor the entry counter at the applied state"
