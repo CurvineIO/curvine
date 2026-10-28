@@ -237,7 +237,13 @@ function Sidebar({
       <div
         data-slot="sidebar-container"
         className={cn(
-          'fixed inset-y-0 z-10 hidden h-svh w-(--sidebar-width) transition-[left,right,width] duration-200 ease-linear md:flex',
+          /* `z-30` outranks the content's `z-10` (the console header and the
+             sticky table header). While both were `z-10` the header, being later
+             in the DOM, won the tie and painted over the rail whenever the page
+             was scrolled sideways — the "content bleeding through the sidebar"
+             report. The rail stays under the overlays (`z-50`: dialogs, menus,
+             the mobile sheet). */
+          'fixed inset-y-0 z-30 hidden h-svh w-(--sidebar-width) transition-[left,right,width] duration-200 ease-linear md:flex',
           // The transition eases a toggle nicely but makes the panel lag a drag, so
           // it only applies once the rail is released.
           'group-data-[resizing=true]/sidebar-wrapper:transition-none',
@@ -371,8 +377,15 @@ function SidebarInset({ className, ...props }: React.ComponentProps<'main'>) {
   return (
     <main
       data-slot="sidebar-inset"
+      /* `min-w-0` is load-bearing, not cosmetic. This is a flex item of the
+         `sidebar-wrapper`, and a flex item's default `min-width: auto` floors it
+         at its content's min-content width. A table that is sized to its content
+         (the file browser's `w-max`) then pushes that floor past the viewport and
+         widens the whole page, header and sidebar included, instead of scrolling
+         inside its own card. With `min-w-0` the item can shrink and the overflow
+         stays where the page put it. */
       className={cn(
-        'relative flex w-full flex-1 flex-col bg-background md:peer-data-[variant=inset]:m-2 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-xl md:peer-data-[variant=inset]:border md:peer-data-[variant=inset]:border-border md:peer-data-[variant=inset]:shadow-sm',
+        'relative flex w-full min-w-0 flex-1 flex-col bg-background md:peer-data-[variant=inset]:m-2 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-xl md:peer-data-[variant=inset]:border md:peer-data-[variant=inset]:border-border md:peer-data-[variant=inset]:shadow-sm',
         className
       )}
       {...props}

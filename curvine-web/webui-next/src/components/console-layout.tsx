@@ -87,7 +87,12 @@ function ClusterSwitcher() {
     >
       <SelectTrigger
         size="sm"
-        className="w-[11.25rem]"
+        /* 11.25rem is the comfortable width, but it is also a floor the bar cannot
+           go under: at 320px the switcher alone was enough to push the page
+           sideways. Below the container breakpoint it drops to icon size; the
+           current cluster id is still reachable from the open list, and the
+           trigger keeps its `aria-label`. */
+        className="w-9 @[44rem]:w-[11.25rem]"
         aria-label={t('layout.clusterLabel')}
         aria-busy={loading || undefined}
         data-testid="cluster-switcher"
@@ -132,7 +137,12 @@ export function ConsoleLayout() {
     <SidebarProvider>
       <AppSidebar />
       <SidebarInset>
-        <header className="sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 border-b border-border bg-background/95 px-3 backdrop-blur">
+        {/* `@container` is load-bearing: the space actually available to this bar
+            depends on the sidebar's dragged width, not on the viewport, so media
+            queries cannot answer it. The controls below shed their labels as the
+            bar narrows (see the `@[…]` variants) instead of forcing a 419px
+            minimum that pushed the whole page sideways on small screens. */}
+        <header className="@container sticky top-0 z-10 flex h-14 shrink-0 items-center gap-1.5 border-b border-border bg-background/95 px-2 backdrop-blur @[44rem]:gap-2 @[44rem]:px-3">
           <SidebarTrigger data-testid="sidebar-trigger" />
           <Separator orientation="vertical" className="mr-1 h-4" />
           <Breadcrumb className="min-w-0">
@@ -151,7 +161,11 @@ export function ConsoleLayout() {
             </BreadcrumbList>
           </Breadcrumb>
 
-          <div className="ml-auto flex items-center gap-2">
+          {/* No `min-w-0` here: the controls are `shrink-0`, so a toolbar allowed to
+              shrink below its content spills its last button out of the bar instead
+              of scrolling anywhere. The breadcrumb beside it is the part that gives
+              up room (`min-w-0` above). */}
+          <div className="ml-auto flex items-center gap-1.5 @[44rem]:gap-2">
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
@@ -174,7 +188,7 @@ export function ConsoleLayout() {
             <Select value={locale} onValueChange={(value) => setLocale(value as AppLocale)}>
               <SelectTrigger
                 size="sm"
-                className="w-[7.5rem]"
+                className="w-9 @[44rem]:w-[7.5rem]"
                 aria-label={t('common.language')}
                 data-testid="locale-select"
               >
@@ -200,7 +214,7 @@ export function ConsoleLayout() {
                   data-testid="global-refresh"
                 >
                   <RefreshCwIcon data-icon="inline-start" />
-                  {t('common.refresh')}
+                  <span className="hidden @[44rem]:inline">{t('common.refresh')}</span>
                 </Button>
               </TooltipTrigger>
               <TooltipContent>{t('layout.masterReadyHint')}</TooltipContent>
@@ -218,7 +232,9 @@ export function ConsoleLayout() {
                   className="gap-1.5 px-2 text-[13px]"
                 >
                   <TimerIcon className="size-3.5" />
-                  {autoRefresh ? t('common.on') : t('common.off')}
+                  <span className="hidden @[44rem]:inline">
+                    {autoRefresh ? t('common.on') : t('common.off')}
+                  </span>
                 </Toggle>
               </TooltipTrigger>
               <TooltipContent>{t('common.autoRefresh')}</TooltipContent>
@@ -231,7 +247,7 @@ export function ConsoleLayout() {
               data-testid="sign-out"
             >
               <LogOutIcon data-icon="inline-start" />
-              {t('common.logout')}
+              <span className="hidden @[44rem]:inline">{t('common.logout')}</span>
             </Button>
           </div>
         </header>

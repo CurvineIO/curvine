@@ -1086,6 +1086,61 @@ describe('Console shell', () => {
     expect(screen.getByTestId('sync-jobs-refresh')).toBeInTheDocument()
   })
 
+  it('keeps the sidebar above the content it sits beside', async () => {
+    renderApp('/overview', createStubClient())
+    await screen.findByTestId('sidebar-brand')
+
+    // Both used to be `z-10`. Equal z-index is decided by DOM order, and the header
+    // comes after the rail, so on a horizontally scrolled page (a wide table) the
+    // header and the sticky table head painted over the sidebar. The rail must
+    // outrank the content's `z-10` while staying under the overlays' `z-50`.
+    // jsdom does not resolve Tailwind to computed styles, so the stacking order is
+    // pinned on the classes: the rail's `z-30` must beat the content's `z-10`, and
+    // stay below the overlays' `z-50` (dialogs, popovers, the mobile sidebar sheet).
+    const container = document.querySelector('[data-slot="sidebar-container"]') as HTMLElement
+    const header = document.querySelector('header') as HTMLElement
+    expect(container).not.toBeNull()
+    const classZ = (el: HTMLElement) => {
+      const match = el.className.match(/(?:^|\s)z-(\d+)(?:\s|$)/)
+      return match ? Number(match[1]) : null
+    }
+    expect(classZ(container)).toBe(30)
+    expect(classZ(header)).toBe(10)
+    expect(classZ(container)!).toBeLessThan(50)
+  })
+
+  it('sheds the topbar control labels instead of widening the page', async () => {
+    renderApp('/overview', createStubClient())
+    await screen.findByTestId('sidebar-brand')
+
+    // The bar is a container query host because the space it gets depends on the
+    // sidebar's dragged width, not on the viewport. Its controls were a fixed 419px
+    // that no window narrower than that could absorb, so the whole page scrolled.
+    const header = document.querySelector('header') as HTMLElement
+    expect(header.className).toContain('@container')
+
+    // Every labelled control keeps its icon and hides only the text below the
+    // breakpoint; none of them may be dropped, the buttons stay usable.
+    for (const testId of ['global-refresh', 'auto-refresh-toggle', 'sign-out']) {
+      const button = screen.getByTestId(testId)
+      expect(button.querySelector('span.hidden')).not.toBeNull()
+      expect(button.querySelector('svg')).not.toBeNull()
+    }
+    const locale = screen.getByTestId('locale-select')
+    expect(locale.className).toMatch(/w-9/)
+    expect(locale.className).toMatch(/@\[44rem\]:w-\[7\.5rem\]/)
+
+    // The cluster switcher is the widest control in the bar; at its comfortable
+    // 11.25rem it was on its own enough to push a 320px window sideways.
+    const cluster = screen.getByTestId('cluster-switcher')
+    expect(cluster.className).toMatch(/w-9/)
+    expect(cluster.className).toMatch(/@\[44rem\]:w-\[11\.25rem\]/)
+
+    // The breadcrumb is the part that yields its room, so it must be shrinkable.
+    const breadcrumb = document.querySelector('[data-slot="breadcrumb"]') as HTMLElement
+    expect(breadcrumb.className).toContain('min-w-0')
+  })
+
   it('keeps the sidebar ruler inside the panel at any width', async () => {
     renderApp('/overview', createStubClient())
     await screen.findByTestId('sidebar-brand')

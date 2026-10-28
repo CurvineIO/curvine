@@ -1427,8 +1427,13 @@ export function BrowsePage() {
         <div className="min-w-48 flex-1">
           <PathBreadcrumb path={pathFromUrl} onNavigate={navigateTo} />
         </div>
+        {/* `min-w-0` on both the form and the input: the row wraps onto its own line
+            on a narrow window, and without these the input's 16rem width was a floor
+            the flex line could not go under, so the Go button hung past the right
+            edge and the page scrolled sideways. The input now shrinks with the row
+            instead (still 16rem wide whenever there is room). */}
         <form
-          className="flex items-center gap-2"
+          className="flex min-w-0 items-center gap-2"
           onSubmit={(event) => {
             event.preventDefault()
             navigateTo(browsePath)
@@ -1439,7 +1444,7 @@ export function BrowsePage() {
             onChange={(event) => setBrowsePath(event.target.value)}
             placeholder={t('browse.pathPlaceholder')}
             aria-label={t('browse.pathPlaceholder')}
-            className="w-64"
+            className="w-64 min-w-0"
             data-testid="browse-path"
           />
           <Button type="submit" size="sm" data-testid="browse-go">
@@ -1593,7 +1598,14 @@ export function BrowsePage() {
       )}
 
       <Card className="gap-0 overflow-hidden py-0">
-        <Table>
+        {/* One line per row, always. Every cell is `whitespace-nowrap` and the
+            table is sized to its content (`w-max`) instead of to the card, so a
+            narrow window scrolls the list sideways — inside its own overflow-x
+            container, not the page — rather than squeezing columns until dates
+            and names wrap onto a second line and every row grows taller. The
+            name column keeps its own cap (see the cell below) so one very long
+            file name cannot stretch the table across several screens. */}
+        <Table className="w-max min-w-full [&_td]:whitespace-nowrap">
           <TableHeader className="sticky top-0 z-10 bg-card">
             <TableRow>
               <TableHead className="w-10">
