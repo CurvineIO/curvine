@@ -24,7 +24,11 @@ impl CatCommand {
                     Ok(status) => {
                         if status.is_dir {
                             eprintln!("cat: Cannot display '{}': Is a directory", path.full_path());
-                            return Err("Is a directory".into());
+                            return Err(format!(
+                                "Cannot display '{}': Is a directory",
+                                path.full_path()
+                            )
+                            .into());
                         }
 
                         // Open the file for reading

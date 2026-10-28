@@ -34,13 +34,15 @@ impl PutCommand {
                         "Error: Local file '{}' does not exist",
                         local_path.display()
                     );
-                    return Err("Local file does not exist".into());
+                    return Err(
+                        format!("Local file '{}' does not exist", local_path.display()).into(),
+                    );
                 }
 
                 // Check if local path is a file (not directory)
                 if !local_path.is_file() {
                     eprintln!("Error: '{}' is not a file", local_path.display());
-                    return Err("Local path is not a file".into());
+                    return Err(format!("'{}' is not a file", local_path.display()).into());
                 }
 
                 // Get file size for progress tracking
