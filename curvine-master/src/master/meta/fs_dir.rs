@@ -18,7 +18,7 @@ use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, PurgeItem, PurgeTarget, RocksInodeStore};
-use crate::master::meta::{trash, BlockMeta, InodeId};
+use crate::master::meta::{trash, BlockMeta, InodeId, LockValidity};
 use crate::master::quota::eviction::evictor::Evictor;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
@@ -2351,27 +2351,31 @@ impl FsDir {
         }
     }
 
+    /// Answer `F_GETLK` without mutating lock state (#1879).
+    ///
+    /// Reclaiming locks from a query would turn a read-only hot path into a
+    /// journaled write. Expired locks are skipped when the answer is computed and
+    /// left for `set_lock` or the session reaper to reclaim.
     pub fn get_lock(
         &self,
         inp: InodePath,
         lock: &FileLock,
-        expire_ms: u64,
+        validity: &LockValidity,
     ) -> FsResult<Option<FileLock>> {
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
 
-        let mut meta = self.store.get_locks(inode.id())?;
-        let conflict = meta.check_conflict(lock, expire_ms);
-        Ok(conflict)
+        let meta = self.store.get_locks(inode.id())?;
+        Ok(meta.find_conflict(lock, validity, LocalTime::mills()))
     }
 
     pub fn set_lock(
         &self,
         inp: InodePath,
         lock: FileLock,
-        expire_ms: u64,
+        validity: &LockValidity,
     ) -> FsResult<Option<FileLock>> {
         let inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -2379,7 +2383,7 @@ impl FsDir {
         };
 
         let mut meta = self.store.get_locks(inode.id())?;
-        let (conflict, changed) = meta.set_lock_with_change(lock, expire_ms);
+        let (conflict, changed) = meta.set_lock_with_change(lock, validity, LocalTime::mills());
 
         if !changed {
             return Ok(conflict);

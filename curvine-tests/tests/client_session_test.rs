@@ -30,13 +30,21 @@ const HEARTBEAT_MS: u64 = 200;
 const SESSION_TIMEOUT: &str = "2s";
 
 fn start_cluster(heartbeat_interval_ms: u64) -> (Testing, Arc<MiniCluster>) {
+    start_cluster_with(heartbeat_interval_ms, |_| {})
+}
+
+fn start_cluster_with(
+    heartbeat_interval_ms: u64,
+    extra: impl Fn(&mut curvine_config::ClusterConf) + Send + Sync + 'static,
+) -> (Testing, Arc<MiniCluster>) {
     let testing = Testing::builder()
         .workers(1)
         .mutate_conf(move |conf| {
             conf.client.heartbeat_interval_ms = heartbeat_interval_ms;
             conf.master.client_session_timeout = SESSION_TIMEOUT.to_string();
-            // The duration unit is parsed by `init`; mutating the string alone
-            // leaves the previously parsed window in place.
+            extra(conf);
+            // The duration unit is parsed by `init`; mutating a duration string
+            // alone leaves the previously parsed window in place.
             conf.master.init().expect("master conf must stay valid");
         })
         .build()
@@ -222,4 +230,52 @@ fn heartbeat_client_stamps_session_ownership_on_its_locks() {
         "a heartbeat client's locks must be marked session-owned so #1879 can \
          judge them by session liveness"
     );
+}
+
+/// The regression #1879 exists for: an application that holds a lock longer than
+/// `lock_expire_time` must keep it while its client keeps heartbeating.
+#[test]
+fn heartbeat_client_keeps_its_lock_past_the_legacy_ttl() {
+    let (testing, cluster) = start_cluster_with(HEARTBEAT_MS, |conf| {
+        conf.master.lock_expire_time = "1ms".to_string();
+    });
+
+    let holder = client_fs(&testing);
+    let holder_id = holder.fs_context_ref().clone_client_name();
+    wait_until(
+        "the holder session to register",
+        Duration::from_secs(15),
+        || session_of(&cluster, &holder_id).is_some(),
+    );
+
+    let path = Path::from_str(format!("/session-lock-{}", std::process::id())).unwrap();
+    create_file(&holder, &path);
+    holder
+        .clone_runtime()
+        .block_on(async {
+            holder
+                .set_lock(&path, write_lock(holder_id.clone(), 21))
+                .await
+        })
+        .unwrap();
+
+    // Far past the 1ms legacy TTL, but the holder is still heartbeating.
+    std::thread::sleep(Duration::from_millis(50));
+
+    // A second client (its own session) must not be able to take the lock.
+    let contender = client_fs(&testing);
+    let contender_id = contender.fs_context_ref().clone_client_name();
+    assert_ne!(contender_id, holder_id);
+    let conflict = contender
+        .clone_runtime()
+        .block_on(async {
+            contender
+                .set_lock(&path, write_lock(contender_id, 22))
+                .await
+        })
+        .unwrap();
+
+    let conflict = conflict.expect("a heartbeating owner's lock must not be stolen");
+    assert_eq!(conflict.client_id, holder_id);
+    assert!(conflict.session_owned);
 }
