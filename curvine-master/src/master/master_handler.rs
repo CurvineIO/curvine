@@ -1378,6 +1378,24 @@ impl MasterHandler {
         ctx.response(MetricsReportResponse {})
     }
 
+    fn create_leader_snapshot(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let req: CreateLeaderSnapshotRequest = ctx.parse_header()?;
+        let force = req.force;
+        let audit = if force {
+            "leader-snapshot --force"
+        } else {
+            "leader-snapshot"
+        };
+        ctx.set_audit(Some(audit.to_string()), None);
+
+        let info = self.fs.create_leader_snapshot(force)?;
+
+        ctx.response(CreateLeaderSnapshotResponse {
+            dir: info.dir,
+            cost_ms: info.cost_ms,
+        })
+    }
+
     fn link_retry_check(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: LinkRequest = ctx.parse_header()?;
         ctx.set_audit(
@@ -1679,6 +1697,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::UpdateRuntimeConfig => self.update_runtime_config(ctx),
                 RpcCode::GetRuntimeConfig => self.get_runtime_config(ctx),
                 RpcCode::ResetRuntimeConfig => self.reset_runtime_config(ctx),
+                RpcCode::CreateLeaderSnapshot => self.create_leader_snapshot(ctx),
 
                 // Worker related requests. Heartbeats are dispatched above so a
                 // standby can record local presence.

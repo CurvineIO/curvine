@@ -110,6 +110,8 @@ pub enum RpcCode {
     GetRuntimeConfig = 63,
     ResetRuntimeConfig = 64,
 
+    CreateLeaderSnapshot = 70,
+
     // block interface.
     WriteBlock = 80,
     ReadBlock = 81,

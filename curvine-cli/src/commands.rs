@@ -79,6 +79,10 @@ pub enum Commands {
     #[command(name = "admin")]
     Admin(AdminCommand),
 
+    /// Master metadata snapshot command
+    #[command(name = "snapshot")]
+    Snapshot(SnapshotCommand),
+
     /// show cli version
     #[command(name = "version")]
     Version,

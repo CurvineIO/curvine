@@ -628,3 +628,13 @@ message ContentSummaryProto {
 message GetContentSummaryResponse {
     optional ContentSummaryProto summary = 1;
 }
+
+message CreateLeaderSnapshotRequest {
+    // Create the checkpoint even if the previous one is inside snapshot_min_interval.
+    required bool force = 1;
+}
+
+message CreateLeaderSnapshotResponse {
+    required string dir = 1;
+    required uint64 cost_ms = 2;
+}
