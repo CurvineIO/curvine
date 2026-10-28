@@ -5,6 +5,14 @@
 format_master = false
 format_worker = false
 
+# Operator visible alias of this cluster, exported as the `cluster_name` metric
+# label. It is cosmetic only: no storage path, worker registration check or
+# discovery key reads it, so it can be renamed at any time without touching the
+# cluster identity. Can also be set with the CURVINE_CLUSTER_NAME env var. When
+# unset, the label falls back to cluster_id, so uncommenting is only needed to
+# give this cluster its own name in Prometheus.
+# cluster_name = "curvine-prod"
+
 # Network interface (e.g. "eth0") used to auto-resolve this node's local IPv4.
 # When set (non-empty), on startup the resolved IPv4 is applied to the
 # master/mds/journal/worker/client hostnames, and the CURVINE_*_HOSTNAME env vars

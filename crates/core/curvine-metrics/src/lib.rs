@@ -28,16 +28,30 @@ use prometheus::{default_registry, Encoder, HistogramOpts, Opts, Registry, TextE
 
 pub use prometheus::proto::MetricType as MetricFamilyType;
 
-/// Label injected on every exported sample to identify the cluster a process
-/// belongs to. Its value is the configured `cluster_id`, written by each
-/// component at startup (see [`Metrics::set_cluster_id`]) and appended at
+/// Label carrying the operator visible name of the cluster a process belongs
+/// to.
+///
+/// The name is an alias: several deployments may share one `cluster_id` and
+/// still be told apart in Prometheus, and the alias can be renamed at any time
+/// without touching the cluster identity (storage paths, worker registration
+/// and discovery keys all key off `cluster_id`). It is written by every
+/// component at startup (see [`Metrics::set_cluster_name`]) and appended at
 /// gather time, so existing metric definitions never have to declare it.
+pub const CLUSTER_NAME_LABEL: &str = "cluster_name";
+
+/// Label carrying the immutable cluster identity, so a series stays
+/// attributable to its cluster after the alias in [`CLUSTER_NAME_LABEL`] is
+/// renamed.
 pub const CLUSTER_ID_LABEL: &str = "cluster_id";
 
-/// Process wide cluster id exported as [`CLUSTER_ID_LABEL`]. Written once at
-/// startup; later writes are ignored so that a process cannot end up with
+/// Process wide cluster identity exported as [`CLUSTER_ID_LABEL`]. Written once
+/// at startup; later writes are ignored so that a process cannot end up with
 /// mixed labels on one scrape.
 static CLUSTER_ID: OnceCell<String> = OnceCell::new();
+
+/// Process wide cluster alias exported as [`CLUSTER_NAME_LABEL`]. Same
+/// write-once rule as [`CLUSTER_ID`].
+static CLUSTER_NAME: OnceCell<String> = OnceCell::new();
 
 pub type Counter = GenericCounter<AtomicI64>;
 pub type CounterVec = GenericCounterVec<AtomicI64>;
@@ -193,39 +207,55 @@ impl Metrics {
     }
 
     /// Gather every registered metric family and attach the process wide
-    /// cluster label to each sample.
+    /// cluster labels to each sample.
     ///
     /// Labels are added here - on the gathered snapshot - instead of on the
     /// collectors because metrics are registered as soon as they are created
     /// and a collector cannot be re-labelled afterwards. The operation is
-    /// idempotent: a metric that already carries `cluster_id` keeps its own
-    /// value.
+    /// idempotent: a metric that already carries one of these labels keeps its
+    /// own value.
     pub fn gather() -> Vec<MetricFamily> {
         let mut families = default_registry().gather();
-        let Some(cluster_id) = Self::cluster_id() else {
+        let process_labels = Self::process_labels();
+        if process_labels.is_empty() {
             return families;
-        };
+        }
 
         for family in families.iter_mut() {
             for metric in family.mut_metric().iter_mut() {
-                if metric
-                    .get_label()
+                let missing: Vec<(&'static str, &'static str)> = process_labels
                     .iter()
-                    .any(|l| l.get_name() == CLUSTER_ID_LABEL)
-                {
+                    .copied()
+                    .filter(|(name, _)| !metric.get_label().iter().any(|l| l.get_name() == *name))
+                    .collect();
+                if missing.is_empty() {
                     continue;
                 }
 
                 let mut labels = metric.take_label();
-                let mut pair = LabelPair::default();
-                pair.set_name(CLUSTER_ID_LABEL.to_string());
-                pair.set_value(cluster_id.to_string());
-                labels.push(pair);
+                for (name, value) in missing {
+                    let mut pair = LabelPair::default();
+                    pair.set_name(name.to_string());
+                    pair.set_value(value.to_string());
+                    labels.push(pair);
+                }
                 metric.set_label(labels);
             }
         }
 
         families
+    }
+
+    /// Cluster labels this process exports, in a stable order.
+    fn process_labels() -> Vec<(&'static str, &'static str)> {
+        let mut labels = Vec::with_capacity(2);
+        if let Some(cluster_id) = Self::cluster_id() {
+            labels.push((CLUSTER_ID_LABEL, cluster_id));
+        }
+        if let Some(cluster_name) = Self::cluster_name() {
+            labels.push((CLUSTER_NAME_LABEL, cluster_name));
+        }
+        labels
     }
 
     /// Set the cluster id exported as the `cluster_id` label value.
@@ -246,6 +276,25 @@ impl Metrics {
     /// Cluster id currently exported as the `cluster_id` label value.
     pub fn cluster_id() -> Option<&'static str> {
         CLUSTER_ID.get().map(|s| s.as_str())
+    }
+
+    /// Set the cluster alias exported as the `cluster_name` label value.
+    ///
+    /// Same write-once rule as [`Self::set_cluster_id`]. A blank name is
+    /// ignored, so the caller (`ClusterConf::metric_cluster_name`) can keep the
+    /// fallback to `cluster_id` instead of tagging series with an empty value.
+    pub fn set_cluster_name(cluster_name: impl Into<String>) {
+        let cluster_name = cluster_name.into();
+        let cluster_name = cluster_name.trim();
+        if cluster_name.is_empty() {
+            return;
+        }
+        let _ = CLUSTER_NAME.set(cluster_name.to_string());
+    }
+
+    /// Cluster alias currently exported as the `cluster_name` label value.
+    pub fn cluster_name() -> Option<&'static str> {
+        CLUSTER_NAME.get().map(|s| s.as_str())
     }
 
     pub fn registry() -> &'static Registry {
@@ -319,7 +368,7 @@ impl Drop for MetricTimerVec {
 
 #[cfg(test)]
 mod test {
-    use crate::{Metrics, CLUSTER_ID_LABEL};
+    use crate::{Metrics, CLUSTER_ID_LABEL, CLUSTER_NAME_LABEL};
 
     #[test]
     fn sample() {
@@ -359,12 +408,14 @@ mod test {
     }
 
     #[test]
-    fn cluster_id_label_is_appended_to_every_sample() {
-        // The process wide value may already be set by another test in this
-        // binary; either way it must never be empty and must appear on both
+    fn cluster_labels_are_appended_to_every_sample() {
+        // The process wide values may already be set by another test in this
+        // binary; either way they must never be blank and must appear on both
         // labelled and unlabelled metrics.
         Metrics::set_cluster_id("cluster-metrics-test");
+        Metrics::set_cluster_name("cluster-metrics-test-alias");
         let cluster_id = Metrics::cluster_id().expect("cluster id must be set");
+        let cluster_name = Metrics::cluster_name().expect("cluster name must be set");
 
         Metrics::new_counter("cluster_label_plain", "cluster label test").unwrap();
         Metrics::new_counter_vec("cluster_label_vec", "cluster label test", &["result"])
@@ -375,17 +426,17 @@ mod test {
         let output = Metrics::text_output().unwrap();
         assert!(
             output.contains(&format!(
-                "cluster_label_plain{{{}=\"{}\"}}",
-                CLUSTER_ID_LABEL, cluster_id
+                "cluster_label_plain{{{}=\"{}\",{}=\"{}\"}}",
+                CLUSTER_ID_LABEL, cluster_id, CLUSTER_NAME_LABEL, cluster_name
             )),
-            "unlabelled metric misses {CLUSTER_ID_LABEL}: {output}"
+            "unlabelled metric misses the cluster labels: {output}"
         );
         assert!(
             output.contains(&format!(
-                "cluster_label_vec{{result=\"timeout\",{}=\"{}\"}}",
-                CLUSTER_ID_LABEL, cluster_id
+                "cluster_label_vec{{result=\"timeout\",{}=\"{}\",{}=\"{}\"}}",
+                CLUSTER_ID_LABEL, cluster_id, CLUSTER_NAME_LABEL, cluster_name
             )),
-            "labelled metric misses {CLUSTER_ID_LABEL}: {output}"
+            "labelled metric misses the cluster labels: {output}"
         );
     }
 }

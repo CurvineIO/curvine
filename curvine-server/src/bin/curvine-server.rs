@@ -44,9 +44,12 @@ fn main() -> CommonResult<()> {
     let service = args.get_service()?;
     let (mut conf, config_sources) = args.get_conf_with_sources(&service)?;
 
-    // Every metric served by this process is tagged with the cluster_id it
-    // belongs to, so one Prometheus can tell clusters apart.
+    // Every metric served by this process carries the cluster it belongs to:
+    // `cluster_name` is the alias an operator may rename at will, `cluster_id`
+    // the identity behind it. Together they let one Prometheus tell clusters
+    // apart without any scrape side labels.
     curvine_metrics::Metrics::set_cluster_id(&conf.cluster_id);
+    curvine_metrics::Metrics::set_cluster_name(conf.metric_cluster_name());
 
     Utils::set_panic_exit_hook();
 

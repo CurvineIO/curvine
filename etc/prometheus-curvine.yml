@@ -2,9 +2,14 @@
 # Keep the component labels: the observability query provider uses them to
 # distinguish master, worker, Transfer and FUSE series and validates the master contract.
 #
-# Every component also exports a `cluster_id` label on all of its series. The
-# value is the process's own cluster_id (`curvine` when unset), so scrapes of
-# several clusters stay distinguishable without any label here.
+# Every component also exports two cluster labels on all of its series:
+#   cluster_name - operator visible alias. Set it with the `cluster_name`
+#                  config key or CURVINE_CLUSTER_NAME; renaming it touches no
+#                  storage, worker registration or discovery key. Falls back to
+#                  cluster_id when unset.
+#   cluster_id   - the immutable cluster identity behind that alias.
+# Both are produced by the process itself, so several clusters scraped by the
+# same Prometheus stay distinguishable without any label in this file.
 global:
   scrape_interval: 30s
   scrape_timeout: 10s

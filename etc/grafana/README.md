@@ -223,13 +223,19 @@ posture, overview, master, worker, client SDK / scrape / process, and transfer.
 3. Open the panel information icon for the Chinese description: what the metric
    means, and what an up or down trend means.
 
-Every Curvine component exports a `cluster_id` label on **all** of its
-series. Its value is the cluster's configured `cluster_id` (`curvine` when the
-config omits it), so one Prometheus can scrape several clusters and still tell them
-apart: `sum by (cluster_id) (rate(curvine_master_rpc_total[$interval]))`. This
-label is produced by the process, not by the scrape config — Prometheus needs no
-`labels:` entry for it, and it stays distinct from any platform label your
-relabeling adds.
+Every Curvine component exports two cluster labels on **all** of its series:
+
+| Label | Value | Stable? |
+| --- | --- | --- |
+| `cluster_name` | the `cluster_name` config key, or `CURVINE_CLUSTER_NAME`; falls back to `cluster_id` (`curvine` by default) | renameable at will |
+| `cluster_id` | the configured `cluster_id` | the cluster identity |
+
+`cluster_name` is the alias to group by, because renaming it touches no storage
+path, worker registration or discovery key: `sum by (cluster_name)
+(rate(curvine_master_rpc_total[$interval]))`. `cluster_id` stays behind it so two
+deployments that share one id can still be traced. Both labels are produced by
+the process, not by the scrape config — Prometheus needs no `labels:` entry for
+them, and they stay distinct from any platform label your relabeling adds.
 
 Readiness is `up / scraped targets`, not a fixed fleet size. Master and worker
 CPU panels are `100 * rate(process_cpu_seconds_total)`: 100 means one full core.

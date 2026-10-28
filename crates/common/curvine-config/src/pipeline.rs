@@ -113,6 +113,10 @@ pub const ENV_HOSTNAME_OVERRIDES: &[EnvOverride] = &[
 /// Document key holding the NIC used to auto-resolve local IPv4 hostnames.
 const NET_INTERFACE_KEY: &str = "net_interface";
 
+/// Document key holding the cluster alias exported as a metric label. It is
+/// not an address, so it is handled outside [`ENV_HOSTNAME_OVERRIDES`].
+const CLUSTER_NAME_KEY: &str = "cluster_name";
+
 // ---------------------------------------------------------------------------
 // Document assembly
 // ---------------------------------------------------------------------------
@@ -222,6 +226,21 @@ fn apply_env_layer_with_sources(
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> CommonResult<ConfigSourceMap> {
     let mut sources = ConfigSourceMap::new();
+
+    // `cluster_name` is an identity, not an address: it applies for both load
+    // profiles and before the net_interface branch below. That branch returns
+    // early (which would skip this write entirely) and rewrites hostname entries
+    // with the resolved NIC IP (which would set the alias to an IP address).
+    if let Some(value) = lookup(ClusterConf::ENV_CLUSTER_NAME) {
+        let value = value.trim().to_string();
+        // A blank alias means "unset": keeping the file value lets
+        // `metric_cluster_name` fall back to cluster_id.
+        if !value.is_empty() {
+            set_dotted(doc, CLUSTER_NAME_KEY, toml::Value::String(value))?;
+            sources.insert(CLUSTER_NAME_KEY.to_string(), ConfigSource::Env);
+        }
+    }
+
     let scoped: Vec<&EnvOverride> = ENV_HOSTNAME_OVERRIDES
         .iter()
         .filter(|o| match profile {
@@ -555,6 +574,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(doc_string(&doc, &["master", "hostname"]), Some("h2".into()));
+    }
+
+    #[test]
+    fn cluster_name_env_applies_to_both_profiles() {
+        for profile in [LoadProfile::Full, LoadProfile::Transfer] {
+            let mut doc: toml::Value = toml::from_str("cluster_name = \"file-name\"\n").unwrap();
+            let env = lookup(&[(ClusterConf::ENV_CLUSTER_NAME, " alias-a ")]);
+            let sources = apply_env_layer_with_sources(&mut doc, profile, &env).unwrap();
+
+            assert_eq!(
+                doc_string(&doc, &[CLUSTER_NAME_KEY]),
+                Some("alias-a".into())
+            );
+            assert_eq!(sources.get(CLUSTER_NAME_KEY), Some(&ConfigSource::Env));
+        }
+    }
+
+    #[test]
+    fn net_interface_does_not_overwrite_cluster_name() {
+        let mut doc: toml::Value = toml::from_str("net_interface = \"lo\"\n").unwrap();
+        let env = lookup(&[(ClusterConf::ENV_CLUSTER_NAME, "alias-a")]);
+        apply_env_layer_with(&mut doc, LoadProfile::Full, &env).unwrap();
+
+        // The NIC branch rewrites hostnames, but the alias is not an address.
+        assert_eq!(
+            doc_string(&doc, &[CLUSTER_NAME_KEY]),
+            Some("alias-a".into())
+        );
+    }
+
+    #[test]
+    fn blank_cluster_name_env_keeps_file_value() {
+        let mut doc: toml::Value = toml::from_str("cluster_name = \"file-name\"\n").unwrap();
+        let env = lookup(&[(ClusterConf::ENV_CLUSTER_NAME, "   ")]);
+        apply_env_layer_with(&mut doc, LoadProfile::Full, &env).unwrap();
+
+        assert_eq!(
+            doc_string(&doc, &[CLUSTER_NAME_KEY]),
+            Some("file-name".into())
+        );
     }
 
     #[test]

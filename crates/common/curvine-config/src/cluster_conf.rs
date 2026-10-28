@@ -45,6 +45,15 @@ pub struct ClusterConf {
 
     pub cluster_id: String,
 
+    /// Operator visible alias of this cluster, exported as the `cluster_name`
+    /// metric label.
+    ///
+    /// Purely cosmetic: no storage path, worker registration check or discovery
+    /// key reads it, so it can be renamed at any time without touching the
+    /// cluster identity. Empty means "use `cluster_id`"; see
+    /// [`Self::metric_cluster_name`].
+    pub cluster_name: String,
+
     /// Network interface (e.g. `eth0`) used to resolve the local IPv4 address
     /// that is applied to the master/journal/worker/client hostnames. Empty by
     /// default: when empty, the original hostname configuration is kept as-is.
@@ -101,6 +110,8 @@ impl ClusterConf {
     pub const ENV_WORKER_HOSTNAME: &'static str = "CURVINE_WORKER_HOSTNAME";
     pub const ENV_CLIENT_HOSTNAME: &'static str = "CURVINE_CLIENT_HOSTNAME";
     pub const ENV_TRANSFER_HOSTNAME: &'static str = "CURVINE_TRANSFER_HOSTNAME";
+    /// Overrides `cluster_name` for this process without editing the config file.
+    pub const ENV_CLUSTER_NAME: &'static str = "CURVINE_CLUSTER_NAME";
     pub const ENV_CONF_FILE: &'static str = "CURVINE_CONF_FILE";
 
     /// Loads through the unified pipeline:
@@ -225,6 +236,7 @@ impl ClusterConf {
 
     fn normalize_whitespace(&mut self) {
         self.cluster_id = self.cluster_id.trim().to_string();
+        self.cluster_name = self.cluster_name.trim().to_string();
         self.net_interface = self.net_interface.trim().to_string();
         self.master.hostname = self.master.hostname.trim().to_string();
         self.mds.hostname = self.mds.hostname.trim().to_string();
@@ -417,6 +429,21 @@ impl ClusterConf {
     }
 
     // Master service starts configuration.
+    /// Cluster name used as the `cluster_name` metric label value.
+    ///
+    /// Falls back to `cluster_id` so every deployment is labelled, including
+    /// ones that never set a name. Unlike `cluster_id` this value is never
+    /// validated and never reaches storage or discovery, which is what makes it
+    /// safe to rename.
+    pub fn metric_cluster_name(&self) -> &str {
+        let name = self.cluster_name.trim();
+        if name.is_empty() {
+            &self.cluster_id
+        } else {
+            name
+        }
+    }
+
     pub fn master_server_conf(&self) -> ServerConf {
         let mut conf = ServerConf::with_hostname(&self.master.hostname, self.master.rpc_port);
         conf.name = format!("{}-master", self.cluster_id);
@@ -611,6 +638,7 @@ impl Default for ClusterConf {
             format_worker: true,
             testing: false,
             cluster_id: "curvine".to_string(),
+            cluster_name: String::new(),
             net_interface: String::new(),
             master: Default::default(),
             mds: Default::default(),
@@ -770,6 +798,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn normalize_whitespace_trims_cluster_name() {
+        let mut conf = ClusterConf::default();
+        conf.cluster_name = " curvine-prod ".to_string();
+        conf.normalize_whitespace();
+        assert_eq!(conf.cluster_name, "curvine-prod");
+    }
+
+    #[test]
+    fn metric_cluster_name_falls_back_to_cluster_id() {
+        let conf = ClusterConf::default();
+        assert_eq!(conf.cluster_name, "");
+        assert_eq!(conf.cluster_id, "curvine");
+        assert_eq!(conf.metric_cluster_name(), "curvine");
+    }
+
+    #[test]
+    fn metric_cluster_name_prefers_explicit_name() {
+        let conf = ClusterConf {
+            cluster_id: "curvine".to_string(),
+            cluster_name: "prod-a".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(conf.metric_cluster_name(), "prod-a");
+    }
+
+    #[test]
+    fn metric_cluster_name_ignores_blank_name() {
+        let conf = ClusterConf {
+            cluster_name: "   ".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(conf.metric_cluster_name(), "curvine");
     }
 
     #[test]

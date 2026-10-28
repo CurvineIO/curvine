@@ -99,8 +99,9 @@ fn main() -> CommonResult<()> {
         }
     };
 
-    // Tag every metric this gateway exports with its cluster_id.
+    // Tag every metric this gateway exports with its cluster.
     curvine_metrics::Metrics::set_cluster_id(&conf.cluster_id);
+    curvine_metrics::Metrics::set_cluster_name(conf.metric_cluster_name());
 
     curvine_runtime::common::Logger::init(conf.master.log.clone());
 
