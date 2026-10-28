@@ -16,7 +16,7 @@ use crate::proto::raft::SnapshotData;
 use crate::raft::{RaftError, RaftResult, LOG_START_INDEX};
 use crate::rocksdb::{DBConf, DBEngine, RocksUtils, WriteBatch};
 use curvine_core_error::{err_box, err_ext, CommonResult, ErrorExt};
-use log::warn;
+use log::{info, warn};
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot, SnapshotMetadata};
 use raft::{GetEntriesContext, RaftState};
@@ -395,6 +395,13 @@ impl RocksStorageCore {
         batch.commit()?;
 
         let _ = self.first_index.replace(compact_index);
+
+        let removed = compact_index - start;
+        let last_index = self.last_index();
+        info!(
+            "journal compacted: first_index {} -> {}, removed {}, last_index {}",
+            start, compact_index, removed, last_index
+        );
 
         Ok(())
     }

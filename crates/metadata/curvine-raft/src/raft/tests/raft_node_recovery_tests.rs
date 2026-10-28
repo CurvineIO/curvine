@@ -21,10 +21,17 @@ use raft::Storage;
 use std::time::Instant;
 
 fn test_node(rt: Arc<Runtime>, id: u64) -> RaftNode<MemLogStorage, HashAppStorage<String, String>> {
+    test_node_with_voters(rt, id, vec![1, 2, 3])
+}
+
+fn test_node_with_voters(
+    rt: Arc<Runtime>,
+    id: u64,
+    mut peer_ids: Vec<u64>,
+) -> RaftNode<MemLogStorage, HashAppStorage<String, String>> {
     let mut conf = JournalConf::with_test();
     conf.rpc_retry_max_duration_ms = 0;
     conf.conn_retry_max_duration_ms = 0;
-    let mut peer_ids = vec![1, 2, 3];
     if !peer_ids.contains(&id) {
         peer_ids.push(id);
     }
@@ -103,6 +110,15 @@ fn test_rocks_node(
     JournalConf,
 ) {
     let mut conf = JournalConf::with_test();
+    let node = test_rocks_node_with_conf(rt, id, &mut conf);
+    (node, conf)
+}
+
+fn test_rocks_node_with_conf(
+    rt: Arc<Runtime>,
+    id: u64,
+    conf: &mut JournalConf,
+) -> RaftNode<RocksLogStorage, HashAppStorage<String, String>> {
     conf.rpc_retry_max_duration_ms = 0;
     conf.conn_retry_max_duration_ms = 0;
     let root = std::env::temp_dir().join(format!(
@@ -131,11 +147,11 @@ fn test_rocks_node(
             RaftPeer::new(peer_id, &conf.hostname, port)
         })
         .collect();
-    let group = RaftGroup::from_conf(&conf);
+    let group = RaftGroup::from_conf(conf);
     let node_id = group.get_node_id(&conf.local_addr()).unwrap();
     assert_eq!(node_id, id);
     let client = RaftClient::new(rt.clone(), &group, conf.new_client_conf());
-    let log_store = RocksLogStorage::from_conf(&conf, true);
+    let log_store = RocksLogStorage::from_conf(conf, true);
     log_store
         .set_conf_state(&raft::eraftpb::ConfState {
             voters: group.voters(),
@@ -148,7 +164,7 @@ fn test_rocks_node(
         log_store,
         HashAppStorage::new(),
         client.clone(),
-        &conf,
+        conf,
     );
     let raw = RawNode::new(
         &conf.new_raft_conf(node_id, 0),
@@ -159,7 +175,7 @@ fn test_rocks_node(
     let (sender, receiver) = mpsc::channel(conf.message_size);
     let (session_sender, session_receiver) = mpsc::unbounded_channel();
 
-    let node = RaftNode {
+    RaftNode {
         rt,
         raw,
         client,
@@ -168,7 +184,7 @@ fn test_rocks_node(
         heartbeat_sequence: 0,
         session_sender,
         session_receiver,
-        recovery: Recovery::load(&conf, node_id).unwrap(),
+        recovery: Recovery::load(conf, node_id).unwrap(),
         pending_ready: None,
         snapshot_done: None,
         storage,
@@ -183,11 +199,10 @@ fn test_rocks_node(
         snapshot_entries: conf.snapshot_entries,
         last_snapshot_ms: 0,
         last_snapshot_op_id: 0,
-    };
-    (node, conf)
+    }
 }
 
-fn become_leader_and_fence(node: &mut RaftNode<MemLogStorage, HashAppStorage<String, String>>) {
+fn become_leader_and_fence<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>) {
     node.raw.raft.become_candidate();
     node.raw.raft.become_leader();
     let term = node.raw.raft.term;
@@ -206,6 +221,30 @@ fn become_leader_and_fence(node: &mut RaftNode<MemLogStorage, HashAppStorage<Str
         },
     );
     assert_eq!(node.peer_sessions.get(3), Some(301));
+}
+
+/// Freeze the app store at `index` so the compaction ceiling derived from the
+/// fsm state is predictable.
+fn freeze_applied_index<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>, index: u64) {
+    let applied = AppliedIndex {
+        term: 1,
+        index,
+        op_id: 0,
+        rpc_id: 0,
+    };
+    node.rt
+        .block_on(node.storage.app_store.apply_snapshot(SnapshotData {
+            snapshot_id: index,
+            node_id: 1,
+            create_time: LocalTime::mills(),
+            bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
+            files_data: None,
+            fsm_state: FsmState {
+                applied: applied.clone(),
+                ufs_applied: applied,
+            },
+        }))
+        .unwrap();
 }
 
 fn remove_entry(id: u64) -> Entry {
@@ -363,6 +402,43 @@ fn wait_for_snapshot_job(node: &RaftNode<MemLogStorage, HashAppStorage<String, S
             "the snapshot job did not finish in time"
         );
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_first_index<A: LogStorage, B: AppStorage>(node: &RaftNode<A, B>, expected: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let first_index = node.storage.log_store.first_index().unwrap();
+        if first_index == expected {
+            return first_index;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the journal first index settled at {} instead of {}",
+            first_index,
+            expected
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn reported_snapshot(node_id: u64, index: u64) -> SnapshotData {
+    let applied = AppliedIndex {
+        term: 1,
+        index,
+        op_id: index,
+        rpc_id: 0,
+    };
+    SnapshotData {
+        snapshot_id: 1,
+        node_id,
+        create_time: LocalTime::mills(),
+        bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
+        files_data: None,
+        fsm_state: FsmState {
+            applied: applied.clone(),
+            ufs_applied: applied,
+        },
     }
 }
 
@@ -729,6 +805,197 @@ fn follower_snapshot_is_throttled_by_min_interval() {
     );
     assert_eq!(node.last_snapshot_op_id, 4);
     wait_for_snapshot_job(&node);
+}
+
+#[test]
+fn min_commit_is_unbounded_on_a_follower() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    freeze_applied_index(&mut node, 100);
+
+    // A follower trims only its own log, so no peer bounds it and the applied
+    // index caps it where the snapshot itself is trimmed.
+    assert_eq!(node.min_commit(), None);
+}
+
+#[test]
+fn min_commit_on_a_leader_follows_the_slowest_live_voter() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+        pr.recent_active = true;
+    }
+
+    assert_eq!(node.min_commit(), Some(50));
+}
+
+#[test]
+fn min_commit_drops_a_voter_that_stopped_responding() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+    }
+    node.raw.raft.mut_prs().get_mut(2).unwrap().recent_active = true;
+    // Voter 3 has been silent for longer than an election timeout, so its last
+    // reported commit must not hold the ceiling back.
+
+    assert_eq!(node.min_commit(), Some(80));
+}
+
+#[test]
+fn min_commit_holds_at_a_voter_installing_a_snapshot() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+    }
+    node.raw.raft.mut_prs().get_mut(2).unwrap().recent_active = true;
+    // Voter 3 is installing a snapshot at 60 and still reports 50. It cannot
+    // answer heartbeats while the snapshot is applied, so the quorum check has
+    // cleared its liveness flag; the ceiling must still stay at 50 instead of
+    // jumping to the healthy voter or to the local applied index.
+    let pr = node.raw.raft.mut_prs().get_mut(3).unwrap();
+    pr.become_snapshot(60);
+    assert!(!pr.recent_active);
+
+    assert_eq!(node.min_commit(), Some(50));
+}
+
+#[test]
+fn min_commit_without_a_live_voter_uses_the_last_known_commit() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+    }
+    // The periodic quorum check resets liveness, so no voter is marked active
+    // right now; the ceiling must not jump to the local applied index.
+
+    assert_eq!(node.min_commit(), Some(50));
+}
+
+#[test]
+fn min_commit_is_unbounded_on_a_single_voter_leader() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node_with_voters(rt, 1, vec![1]);
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+    freeze_applied_index(&mut node, 100);
+
+    // A single-voter group has nobody to hold the trim back, so the local
+    // applied index is the only limit.
+    assert_eq!(node.min_commit(), None);
+}
+
+#[test]
+fn min_commit_with_unreported_voters_trims_nothing() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    // Voters that never reported keep `Progress::new()`'s zero commit, so the
+    // ceiling stays at 0 and the trim is a no-op instead of falling back to the
+    // local applied index.
+    for voter in [2, 3] {
+        node.raw
+            .raft
+            .mut_prs()
+            .get_mut(voter)
+            .unwrap()
+            .recent_active = true;
+    }
+
+    assert_eq!(node.min_commit(), Some(0));
+}
+
+#[test]
+fn reported_snapshot_trims_the_journal_up_to_the_peer_watermark() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut conf = JournalConf::with_test();
+    // An empty retention window keeps the trim right at the bound.
+    conf.snapshot_entries = 0;
+    let mut node = test_rocks_node_with_conf(rt, 1, &mut conf);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    let entries: Vec<Entry> = (1..=100)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            ..Default::default()
+        })
+        .collect();
+    node.storage.append(&entries).unwrap();
+    node.storage.set_hard_state_commit(100).unwrap();
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+        pr.recent_active = true;
+    }
+
+    // The reporter has applied up to 90, but voter 3 still needs 51 onwards.
+    node.storage
+        .register_snapshot(reported_snapshot(2, 90), node.min_commit())
+        .unwrap();
+
+    assert_eq!(wait_for_first_index(&node, 50), 50);
+}
+
+#[test]
+fn reported_snapshot_with_unreported_voters_trims_nothing() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut conf = JournalConf::with_test();
+    conf.snapshot_entries = 0;
+    let mut node = test_rocks_node_with_conf(rt, 1, &mut conf);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    let entries: Vec<Entry> = (1..=100)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            ..Default::default()
+        })
+        .collect();
+    node.storage.append(&entries).unwrap();
+    node.storage.set_hard_state_commit(100).unwrap();
+
+    // Voters that never reported keep `Progress::new()`'s zero commit, so the
+    // trim must be a no-op instead of falling back to the local applied index.
+    for voter in [2, 3] {
+        node.raw
+            .raft
+            .mut_prs()
+            .get_mut(voter)
+            .unwrap()
+            .recent_active = true;
+    }
+
+    node.storage
+        .register_snapshot(reported_snapshot(2, 90), node.min_commit())
+        .unwrap();
+
+    assert_eq!(wait_for_first_index(&node, 1), 1);
 }
 
 #[test]

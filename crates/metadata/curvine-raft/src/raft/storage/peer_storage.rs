@@ -268,7 +268,7 @@ where
             let mut snap_data = rt.block_on(app_store.create_snapshot())?;
             snap_data.node_id = id;
             log_store.create_snapshot(snap_data.clone())?;
-            log_store.compact(snap_data.fsm_state.compact())?;
+            log_store.compact(snap_data.fsm_state.compact_upto(None))?;
 
             info!(
                 "create new snapshot, dir {}, fsm_state: {:?}, used {} ms",
@@ -292,7 +292,11 @@ where
         Ok(())
     }
 
-    pub fn register_snapshot(&self, snapshot: SnapshotData) -> RaftResult<bool> {
+    pub fn register_snapshot(
+        &self,
+        snapshot: SnapshotData,
+        min_commit: Option<u64>,
+    ) -> RaftResult<bool> {
         let spent = TimeSpent::new();
 
         let store = self.log_store.clone();
@@ -309,7 +313,7 @@ where
 
         if accepted {
             self.executor.spawn(move || {
-                if let Err(e) = store.compact(snapshot.fsm_state.compact()) {
+                if let Err(e) = store.compact(snapshot.fsm_state.compact_upto(min_commit)) {
                     warn!("log store compact failed: {}", e);
                 }
             })?;
