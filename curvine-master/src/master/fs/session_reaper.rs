@@ -281,8 +281,19 @@ mod tests {
     use curvine_proto::{ClientAddressProto, ClientHeartbeatRequest};
     use curvine_raft::raft::RoleState;
     use curvine_runtime::common::Utils;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
+
+    /// Master metrics are process-wide, so tests that assert exact counter values
+    /// must not run concurrently with another reaping test.
+    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn serial() -> MutexGuard<'static, ()> {
+        SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn test_fs(name: &str) -> MasterFilesystem {
         Master::init_test_metrics();
@@ -378,6 +389,7 @@ mod tests {
 
     #[test]
     fn reaps_locks_and_writer_markers_of_an_expired_session() {
+        let _serial = serial();
         let fs = test_fs("full");
         let ino = create_file(&fs, "/owned.log", "dead-client");
         set_lock(&fs, "/owned.log", "dead-client", true);
@@ -411,6 +423,7 @@ mod tests {
 
     #[test]
     fn leader_change_grace_window_blocks_reaping() {
+        let _serial = serial();
         let fs = test_fs("grace");
         create_file(&fs, "/grace.log", "dead-client");
         let now = 1_000;
@@ -445,6 +458,7 @@ mod tests {
 
     #[test]
     fn legacy_owners_are_never_reaped() {
+        let _serial = serial();
         let fs = test_fs("legacy");
         let ino = create_file(&fs, "/legacy.log", "legacy-client");
         set_lock(&fs, "/legacy.log", "legacy-client", false);
@@ -467,6 +481,7 @@ mod tests {
 
     #[test]
     fn active_session_is_not_reaped() {
+        let _serial = serial();
         let fs = test_fs("alive");
         let ino = create_file(&fs, "/alive.log", "alive-client");
         register(&fs, "alive-client", 1_000);
@@ -480,6 +495,7 @@ mod tests {
 
     #[test]
     fn work_budget_bounds_one_tick_and_resumes_on_the_next() {
+        let _serial = serial();
         let fs = test_fs("budget");
         for index in 0..3 {
             create_file(&fs, &format!("/budget-{index}.log"), "dead-client");
@@ -505,6 +521,7 @@ mod tests {
 
     #[test]
     fn stale_hints_are_dropped_instead_of_retried() {
+        let _serial = serial();
         let fs = test_fs("stale");
         let ino = create_file(&fs, "/stale.log", "ghost-client");
         register(&fs, "ghost-client", 1_000);
@@ -543,6 +560,7 @@ mod tests {
 
     #[test]
     fn inactive_master_does_not_reap() {
+        let _serial = serial();
         let mut conf = ClusterConf::format();
         conf.testing = true;
         conf.journal.enable = false;
@@ -572,6 +590,7 @@ mod tests {
     /// the reaper snapshots sessions before `fs_dir` and never holds both.
     #[test]
     fn concurrent_lock_traffic_and_reaping_do_not_deadlock() {
+        let _serial = serial();
         let fs = test_fs("concurrent");
         for index in 0..4 {
             create_file(&fs, &format!("/concurrent-{index}.log"), "dead-client");
@@ -618,6 +637,7 @@ mod tests {
 
     #[test]
     fn reaping_publishes_session_metrics() {
+        let _serial = serial();
         let fs = test_fs("metrics");
         create_file(&fs, "/metrics.log", "dead-client");
         set_lock(&fs, "/metrics.log", "dead-client", true);
@@ -654,6 +674,7 @@ mod tests {
 
     #[test]
     fn session_summary_reports_ownership_footprint() {
+        let _serial = serial();
         let fs = test_fs("summary");
         let ino = create_file(&fs, "/summary.log", "watched-client");
         set_lock(&fs, "/summary.log", "watched-client", true);
