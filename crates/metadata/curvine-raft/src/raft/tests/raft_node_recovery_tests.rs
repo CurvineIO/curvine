@@ -854,6 +854,7 @@ fn min_commit_without_a_live_voter_uses_the_last_known_commit() {
 fn min_commit_is_unbounded_on_a_single_voter_leader() {
     let rt = JournalConf::with_test().create_runtime();
     let mut node = test_node_with_voters(rt, 1, vec![1]);
+    node.raw.raft.become_candidate();
     node.raw.raft.become_leader();
     freeze_applied_index(&mut node, 100);
 
@@ -873,7 +874,12 @@ fn min_commit_with_unreported_voters_trims_nothing() {
     // ceiling stays at 0 and the trim is a no-op instead of falling back to the
     // local applied index.
     for voter in [2, 3] {
-        node.raw.raft.mut_prs().get_mut(voter).unwrap().recent_active = true;
+        node.raw
+            .raft
+            .mut_prs()
+            .get_mut(voter)
+            .unwrap()
+            .recent_active = true;
     }
 
     assert_eq!(node.min_commit(), Some(0));
