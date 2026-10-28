@@ -100,10 +100,39 @@ pub struct PurgeItem {
     pub name: String,
 }
 
+/// What a client owns on an inode, as recorded in the ownership index (#1880).
+///
+/// The index is derived state: it is rebuilt from the inode/lock records if it is
+/// ever lost, and every entry is verified against the inode before it is acted on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum OwnerKind {
+    /// A lock in the per-inode lock table (session-owned owners only).
+    Lock = 1,
+    /// A writer marker inside the inode (`WriteFeature`).
+    Writer = 2,
+}
+
+impl OwnerKind {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Lock),
+            2 => Some(Self::Writer),
+            _ => None,
+        }
+    }
+}
+
 pub enum PurgeTarget {
     Dir(InodeView),
     File(i64),
 }
+
+use crate::master::meta::session_owned_clients;
 
 // Currently, only RockSDB is supported.
 // Note: InodeStore is intentionally NOT Clone.
@@ -129,6 +158,83 @@ impl InodeStore {
         self.ttl_bucket_list.clone()
     }
 
+    /// Writer markers the *stored* inode carries. Apply paths call this before they
+    /// overwrite an inode, so the ownership index sees a real transition.
+    fn stored_writer_clients(&self, id: i64) -> CommonResult<Vec<String>> {
+        Ok(self
+            .get_inode(id, None)?
+            .map(|inode| inode.writer_clients())
+            .unwrap_or_default())
+    }
+
+    /// Reconcile the client ownership index for one inode's writer markers.
+    ///
+    /// Lives in the apply path so the leader, followers and journal replay all
+    /// derive the same index from the same journaled facts.
+    fn sync_writer_owners(
+        &self,
+        ino: i64,
+        before: &[String],
+        after: &[String],
+    ) -> CommonResult<()> {
+        for client in after.iter().filter(|client| !before.contains(client)) {
+            self.store
+                .add_client_owner(client, OwnerKind::Writer, ino)?;
+        }
+        for client in before.iter().filter(|client| !after.contains(client)) {
+            self.store
+                .remove_client_owner(client, OwnerKind::Writer, ino)?;
+        }
+        Ok(())
+    }
+
+    /// Reconcile the client ownership index for one inode's session-owned locks.
+    fn sync_lock_owners(
+        &self,
+        ino: i64,
+        before: &[FileLock],
+        after: &[FileLock],
+    ) -> CommonResult<()> {
+        let before = session_owned_clients(before);
+        let after = session_owned_clients(after);
+        for client in after.iter().filter(|client| !before.contains(client)) {
+            self.store.add_client_owner(client, OwnerKind::Lock, ino)?;
+        }
+        for client in before.iter().filter(|client| !after.contains(client)) {
+            self.store
+                .remove_client_owner(client, OwnerKind::Lock, ino)?;
+        }
+        Ok(())
+    }
+
+    /// Record one ownership hint. Used by the rebuild path (the lock table is the
+    /// source of truth) and by the apply paths above.
+    pub fn add_client_owner(&self, client_id: &str, kind: OwnerKind, ino: i64) -> CommonResult<()> {
+        self.store.add_client_owner(client_id, kind, ino)
+    }
+
+    /// Ownership hints held by `client_id`, for the session reaper (#1884).
+    pub fn get_client_owners(&self, client_id: &str) -> CommonResult<Vec<(OwnerKind, i64)>> {
+        self.store.get_client_owners(client_id)
+    }
+
+    /// Drop one ownership hint. The reaper calls this after acting on a hint, and
+    /// also when the hint turned out to be stale (inode or ownership already
+    /// gone), which is what keeps stale hints from accumulating.
+    pub fn remove_client_owner(
+        &self,
+        client_id: &str,
+        kind: OwnerKind,
+        ino: i64,
+    ) -> CommonResult<()> {
+        self.store.remove_client_owner(client_id, kind, ino)
+    }
+
+    /// Drop every ownership hint of `client_id`; used when its session is reaped.
+    pub fn clear_client_owners(&self, client_id: &str) -> CommonResult<usize> {
+        self.store.clear_client_owners(client_id)
+    }
+
     pub fn apply_add(&self, parent: &InodeView, child: &InodeView) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
@@ -137,6 +243,12 @@ impl InodeStore {
         batch.add_child(parent.id(), child.name(), child.id())?;
 
         batch.commit()?;
+
+        // A freshly allocated inode has no stored predecessor, so every writer
+        // marker it carries is new (#1880).
+        if child.is_file() {
+            self.sync_writer_owners(child.id(), &[], &child.writer_clients())?;
+        }
 
         self.ttl_bucket_list.add(child);
 
@@ -261,6 +373,12 @@ impl InodeStore {
 
                 _ => {
                     deleted_files += 1;
+                    // The writer holders are visible on the inode already in hand, so
+                    // pruning their hints costs no extra read (#1880).
+                    for client in inode.writer_clients() {
+                        self.store
+                            .remove_client_owner(&client, OwnerKind::Writer, inode.id())?;
+                    }
                     let res = self.decrement_inode_nlink(inode.id(), ctime, &mut batch)?;
                     del_res.inodes += res.inodes;
                     del_res.bytes += res.bytes;
@@ -381,6 +499,9 @@ impl InodeStore {
         file: &InodeView,
         commit_blocks: &[CommitBlock],
     ) -> CommonResult<()> {
+        // Read the stored writer markers first: completing the file removes this
+        // client's marker, and the index has to see that transition (#1880).
+        let writers_before = self.stored_writer_clients(file.id())?;
         let mut batch = self.store.new_batch();
 
         batch.write_inode(file)?;
@@ -396,19 +517,25 @@ impl InodeStore {
         // file.complete() advanced mtime (TTL expiration = mtime + ttl_ms).
         self.ttl_bucket_list.add(file);
 
+        self.sync_writer_owners(file.id(), &writers_before, &file.writer_clients())?;
+
         Ok(())
     }
 
     pub fn apply_overwrite_file(&self, file: &InodeView) -> CommonResult<()> {
+        let writers_before = self.stored_writer_clients(file.id())?;
         let mut batch = self.store.new_batch();
         batch.write_inode(file)?;
-        batch.commit()
+        batch.commit()?;
+        self.sync_writer_owners(file.id(), &writers_before, &file.writer_clients())
     }
 
     pub fn apply_reopen_file(&self, file: &InodeView) -> CommonResult<()> {
+        let writers_before = self.stored_writer_clients(file.id())?;
         let mut batch = self.store.new_batch();
         batch.write_inode(file)?;
-        batch.commit()
+        batch.commit()?;
+        self.sync_writer_owners(file.id(), &writers_before, &file.writer_clients())
     }
 
     pub fn apply_set_attr(&self, inodes: Vec<InodeView>) -> CommonResult<()> {
@@ -1071,7 +1198,12 @@ impl InodeStore {
     }
 
     pub fn apply_set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
-        self.store.set_locks(id, lock)
+        // Read the previous lock set first: the index tracks the transition, and
+        // doing it here keeps leader, follower and replay derived from the same
+        // journaled facts (#1880).
+        let before = self.store.get_locks(id)?.to_vec();
+        self.store.set_locks(id, lock)?;
+        self.sync_lock_owners(id, &before, lock)
     }
 
     pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {

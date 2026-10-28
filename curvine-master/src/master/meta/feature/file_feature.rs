@@ -46,14 +46,20 @@ impl FileFeature {
         self.x_attr = map
     }
 
-    pub fn complete_write(&mut self, client_name: impl AsRef<str>) {
+    /// Drop one client's writer marker. Returns whether the marker existed.
+    ///
+    /// Only the named client is removed: another client may be writing the same
+    /// file, and a blanket clear would make the file look complete while it is
+    /// still being written (#1880).
+    pub fn complete_write(&mut self, client_name: impl AsRef<str>) -> bool {
         match self.file_write {
-            None => (),
+            None => false,
             Some(ref mut f) => {
-                f.clients.remove(client_name.as_ref());
+                let removed = f.clients.remove(client_name.as_ref());
                 if f.clients.is_empty() {
                     let _ = self.file_write.take();
                 }
+                removed
             }
         }
     }

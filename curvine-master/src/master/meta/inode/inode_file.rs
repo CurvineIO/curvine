@@ -174,6 +174,20 @@ impl InodeFile {
         self.features.file_write.as_ref()
     }
 
+    /// Client ids currently marked as writing this file.
+    pub fn writer_clients(&self) -> Vec<String> {
+        self.features
+            .file_write
+            .as_ref()
+            .map(|w| w.clients.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Drop one client's writer marker (#1880). Returns whether it existed.
+    pub fn remove_writer(&mut self, client_name: impl AsRef<str>) -> bool {
+        self.features.complete_write(client_name)
+    }
+
     pub fn add_block(&mut self, id: BlockMeta) {
         self.blocks.push(id)
     }

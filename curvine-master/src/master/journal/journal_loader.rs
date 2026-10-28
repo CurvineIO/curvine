@@ -679,6 +679,7 @@ impl JournalLoader {
             JournalEntry::Link(e) => self.link(e),
 
             JournalEntry::SetLocks(e) => self.set_locks(e),
+            JournalEntry::ReleaseWriter(e) => self.release_writer(e),
 
             JournalEntry::UfsApplied(e) => self.ufs_applied(e),
 
@@ -941,6 +942,12 @@ impl JournalLoader {
     pub fn set_locks(&self, entry: SetLocksEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
         fs_dir.store.apply_set_locks(entry.ino, &entry.locks)
+    }
+
+    pub fn release_writer(&self, entry: ReleaseWriterEntry) -> CommonResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        fs_dir.release_writer(entry.ino, &entry.client)?;
+        Ok(())
     }
 
     pub fn ufs_applied(&self, entry: UfsAppliedEntry) -> CommonResult<()> {
