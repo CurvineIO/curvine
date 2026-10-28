@@ -240,6 +240,7 @@ impl SessionReaper {
         }
 
         if !report.is_empty() || report.skipped > 0 {
+            self.publish_metrics(&report);
             info!(
                 "session reaper: {} sessions, {} locks, {} writer markers, {} stale hints \
                  released, {} skipped (budget exhausted: {})",
@@ -253,6 +254,24 @@ impl SessionReaper {
         }
 
         Ok(report)
+    }
+
+    /// Publish the tick's outcome plus the current session count (#1885).
+    fn publish_metrics(&self, report: &ReapReport) {
+        let Ok(metrics) = crate::master::Master::get_metrics() else {
+            return;
+        };
+        metrics
+            .expired_sessions_total
+            .inc_by(report.sessions as i64);
+        metrics.reaped_locks_total.inc_by(report.locks as i64);
+        metrics.reaped_writers_total.inc_by(report.writers as i64);
+        metrics
+            .reaped_stale_hints_total
+            .inc_by(report.stale_hints as i64);
+        metrics
+            .active_sessions
+            .set(self.fs.session_map.read().len() as i64);
     }
 
     /// Release what `claim`'s client owns, spending from the tick's `budget`.
@@ -390,6 +409,19 @@ mod tests {
     use curvine_raft::raft::RoleState;
     use curvine_runtime::common::Utils;
     use std::sync::mpsc;
+    use std::sync::{Mutex, OnceLock};
+
+    // Reap metrics (`master_expired_sessions_total`, `master_active_sessions`, ...) are
+    // process-global (`master_server::MASTER_METRICS`), so a concurrent test's
+    // `reap_once` publish would blur the exact delta a test asserts on (#1885).
+    static REAPER_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn reaper_test_serial() -> std::sync::MutexGuard<'static, ()> {
+        REAPER_TEST_SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
     use std::time::Duration;
 
     fn test_fs(name: &str) -> MasterFilesystem {
@@ -491,6 +523,7 @@ mod tests {
 
     #[test]
     fn reaps_locks_and_writer_markers_of_an_expired_session() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("full");
         let ino = create_file(&fs, "/owned.log", "dead-client");
         set_lock(&fs, "/owned.log", "dead-client", true);
@@ -524,6 +557,7 @@ mod tests {
 
     #[test]
     fn leader_change_grace_window_blocks_reaping() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("grace");
         create_file(&fs, "/grace.log", "dead-client");
         let now = 1_000;
@@ -558,6 +592,7 @@ mod tests {
 
     #[test]
     fn legacy_owners_are_never_reaped() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("legacy");
         let ino = create_file(&fs, "/legacy.log", "legacy-client");
         set_lock(&fs, "/legacy.log", "legacy-client", false);
@@ -580,6 +615,7 @@ mod tests {
 
     #[test]
     fn active_session_is_not_reaped() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("alive");
         let ino = create_file(&fs, "/alive.log", "alive-client");
         register(&fs, "alive-client", 1_000);
@@ -593,6 +629,7 @@ mod tests {
 
     #[test]
     fn work_budget_bounds_one_tick_and_resumes_on_the_next() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("budget");
         for index in 0..3 {
             create_file(&fs, &format!("/budget-{index}.log"), "dead-client");
@@ -618,6 +655,7 @@ mod tests {
 
     #[test]
     fn stale_hints_are_dropped_instead_of_retried() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("stale");
         let ino = create_file(&fs, "/stale.log", "ghost-client");
         register(&fs, "ghost-client", 1_000);
@@ -661,6 +699,7 @@ mod tests {
 
     #[test]
     fn inactive_master_does_not_reap() {
+        let _reaper_serial = reaper_test_serial();
         let mut conf = ClusterConf::format();
         conf.testing = true;
         conf.journal.enable = false;
@@ -693,6 +732,7 @@ mod tests {
     /// the reaper snapshots sessions before `fs_dir` and never holds both.
     #[test]
     fn concurrent_lock_traffic_and_reaping_do_not_deadlock() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("concurrent");
         for index in 0..4 {
             create_file(&fs, &format!("/concurrent-{index}.log"), "dead-client");
@@ -750,6 +790,7 @@ mod tests {
     /// epoch, and drops the previous term's sessions.
     #[test]
     fn re_election_restarts_the_grace_window() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("re-elect");
         fs.master_monitor.set_term_for_test(1);
         create_file(&fs, "/re-elect.log", "dead-client");
@@ -790,6 +831,7 @@ mod tests {
     /// the fresh session must survive.
     #[test]
     fn re_registration_after_the_snapshot_keeps_locks_and_session() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("renewal");
         let ino = create_file(&fs, "/renewal.log", "busy-client");
         register(&fs, "busy-client", 1_000);
@@ -837,6 +879,7 @@ mod tests {
     /// #1884: leadership is re-checked before every release, not once per session.
     #[test]
     fn demotion_between_two_releases_stops_the_second() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("demote");
         fs.master_monitor.set_term_for_test(1);
         let first = create_file(&fs, "/demote-1.log", "dead-client");
@@ -884,6 +927,7 @@ mod tests {
     /// #1884: one budget bounds the whole tick, not each session.
     #[test]
     fn work_budget_is_shared_across_sessions() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("shared-budget");
         for client in ["dead-a", "dead-b", "dead-c"] {
             for index in 0..2 {
@@ -918,6 +962,7 @@ mod tests {
     /// #1884: a tick examines at most `session_batch` expired sessions.
     #[test]
     fn session_batch_bounds_expired_sessions_per_tick() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("batch");
         for client in ["dead-a", "dead-b", "dead-c"] {
             register(&fs, client, 1_000);
@@ -934,6 +979,7 @@ mod tests {
     /// #1884: the reaper reads O(budget) hints of a client, not its whole backlog.
     #[test]
     fn owner_reads_are_bounded() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("bounded-read");
         for index in 0..5 {
             create_file(&fs, &format!("/bounded-{index}.log"), "busy-client");
@@ -956,6 +1002,7 @@ mod tests {
     /// by the orphan pass once the new epoch's grace window has passed.
     #[test]
     fn locks_of_a_client_missing_after_failover_are_released() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("orphan");
         fs.master_monitor.set_term_for_test(1);
         let dead = create_file(&fs, "/orphan.log", "other-writer");
@@ -995,6 +1042,7 @@ mod tests {
     /// #1884: the orphan pass is resumable under a small budget.
     #[test]
     fn orphan_pass_resumes_across_ticks() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("orphan-resume");
         fs.master_monitor.set_term_for_test(1);
         for index in 0..3 {
@@ -1023,6 +1071,7 @@ mod tests {
     /// orphan pass.
     #[test]
     fn lock_lease_off_leaves_locks_to_the_legacy_ttl() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs_with("lease-off", false);
         let ino = create_file(&fs, "/lease-off.log", "dead-client");
         let orphan = create_file(&fs, "/lease-off-orphan.log", "other-writer");
@@ -1044,6 +1093,7 @@ mod tests {
 
     #[test]
     fn terminates_only_when_the_master_stops() {
+        let _reaper_serial = reaper_test_serial();
         let fs = test_fs("terminate");
         let reaper = SessionReaper::new(fs.clone(), fs.master_monitor.clone());
         assert!(!reaper.terminate());
@@ -1054,5 +1104,77 @@ mod tests {
         );
         fs.master_monitor.set_role_for_test(RoleState::Exit);
         assert!(reaper.terminate());
+    }
+
+    #[test]
+    fn reaping_publishes_session_metrics() {
+        let _reaper_serial = reaper_test_serial();
+        let fs = test_fs("metrics");
+        create_file(&fs, "/metrics.log", "dead-client");
+        set_lock(&fs, "/metrics.log", "dead-client", true);
+        register(&fs, "dead-client", 1_000);
+
+        let metrics = Master::get_metrics().unwrap();
+        let expired_before = metrics.expired_sessions_total.get();
+        let locks_before = metrics.reaped_locks_total.get();
+        let writers_before = metrics.reaped_writers_total.get();
+        assert_eq!(
+            metrics.active_sessions.get(),
+            1,
+            "registering a session must publish the active count"
+        );
+
+        let report = SessionReaper::new(fs.clone(), fs.master_monitor.clone())
+            .reap_once(far_future(&fs))
+            .unwrap();
+        assert_eq!(report.sessions, 1);
+
+        assert_eq!(
+            metrics.expired_sessions_total.get(),
+            expired_before + 1,
+            "an expired session must be counted"
+        );
+        assert_eq!(metrics.reaped_locks_total.get(), locks_before + 1);
+        assert_eq!(metrics.reaped_writers_total.get(), writers_before + 1);
+        assert_eq!(
+            metrics.active_sessions.get(),
+            0,
+            "the gauge must drop back once the session is gone"
+        );
+    }
+
+    #[test]
+    fn session_summary_reports_ownership_footprint() {
+        let _reaper_serial = reaper_test_serial();
+        let fs = test_fs("summary");
+        let ino = create_file(&fs, "/summary.log", "watched-client");
+        set_lock(&fs, "/summary.log", "watched-client", true);
+        // The summary judges liveness against the real clock, so register now.
+        register(
+            &fs,
+            "watched-client",
+            curvine_runtime::common::LocalTime::mills(),
+        );
+
+        let summary = fs.session_summary().unwrap();
+        assert_eq!(summary.len(), 1);
+        let entry = &summary[0];
+        assert_eq!(entry.client_id, "watched-client");
+        assert_eq!(entry.hostname, "host");
+        assert_eq!(entry.mount_point, None);
+        assert!(entry.live, "the lease was just renewed");
+        assert_eq!(entry.lock_hints, 1);
+        assert_eq!(entry.writer_hints, 1);
+        assert_eq!(entry.lock_hints + entry.writer_hints, 2);
+        assert!(entry.expire_at > entry.last_heartbeat);
+        assert_eq!(
+            owners(&fs, "watched-client"),
+            vec![(OwnerKind::Lock, ino), (OwnerKind::Writer, ino)]
+        );
+
+        // A legacy lock is not part of the footprint: it is never reclaimed per
+        // client, so it must not inflate the number an operator reads.
+        set_lock(&fs, "/summary.log", "legacy-client", false);
+        assert!(fs.session_summary().unwrap()[0].lock_hints == 1);
     }
 }
