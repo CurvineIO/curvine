@@ -7,10 +7,14 @@ import {
   requestJson,
   type HttpClientOptions
 } from './http'
+import { ApiError } from './error'
 import type {
   AuthSession,
   BlockLocationData,
   BrowseData,
+  ClusterProbe,
+  ClusterSummary,
+  ClusterValidation,
   ConfigData,
   ConfigUpdate,
   ConfigUpdateResult,
@@ -130,6 +134,68 @@ export interface ApiClient {
   fetchObservabilityDashboard(params?: DashboardQueryParams): Promise<ObservabilityDashboard>
   fetchObservabilityOperations(): Promise<OperationsPayload>
   fetchObservabilityDiagnostics(): Promise<DiagnosticsPayload>
+
+  /** Every cluster this console can switch to, including the default one. */
+  fetchClusters(): Promise<ClusterSummary[]>
+  /** Parse and check a TOML payload without persisting it. */
+  validateCluster(toml: string): Promise<ClusterValidation>
+  createCluster(toml: string): Promise<ClusterSummary>
+  updateCluster(id: string, toml: string): Promise<ClusterSummary>
+  deleteCluster(id: string): Promise<void>
+  /** Connectivity probe of one cluster's master. */
+  probeCluster(id: string): Promise<ClusterProbe>
+  /** Re-read the clusters directory from disk. */
+  reloadClusters(): Promise<ClusterSummary[]>
+  /**
+   * One cluster's on-disk TOML, verbatim (comments included).
+   *
+   * `fetchClusters` only projects a summary, so the editor reads the document
+   * back before letting the user change it. The default cluster answers 409 and
+   * an unknown one 404; both carry the standard error envelope.
+   */
+  getClusterConfig(id: string): Promise<string>
+}
+
+/**
+ * Tolerant list decode.
+ *
+ * The cluster endpoints answer with a JSON array, but accepting the wrapped
+ * forms too keeps the console working if the backend decides to page the list
+ * (`{ clusters: [...] }`) — a shape mismatch would otherwise read as "no
+ * clusters at all" and silently disable the switcher.
+ */
+function asClusterList(data: unknown): ClusterSummary[] {
+  if (Array.isArray(data)) return data as ClusterSummary[]
+  if (data && typeof data === 'object') {
+    const wrapped = data as { clusters?: unknown; items?: unknown }
+    if (Array.isArray(wrapped.clusters)) return wrapped.clusters as ClusterSummary[]
+    if (Array.isArray(wrapped.items)) return wrapped.items as ClusterSummary[]
+  }
+  return []
+}
+
+/**
+ * Normalise a failed `getClusterConfig` call.
+ *
+ * The request asks for `text`, so an error body — the standard JSON envelope —
+ * reaches the interceptor as a raw string: the interceptor then reports the
+ * whole envelope as the message and cannot read the `code` out of it. Parsing it
+ * back here keeps `not_removable` (409) and `unknown_cluster` (404) available to
+ * the caller and turns the message into prose.
+ */
+function clusterConfigError(error: unknown): unknown {
+  if (!(error instanceof ApiError)) return error
+  try {
+    const envelope = JSON.parse(error.message) as { error?: { code?: unknown; message?: unknown } }
+    const code = typeof envelope.error?.code === 'string' ? envelope.error.code : undefined
+    const message =
+      typeof envelope.error?.message === 'string' && envelope.error.message
+        ? envelope.error.message
+        : error.message
+    return new ApiError(error.status, message, code)
+  } catch {
+    return error
+  }
 }
 
 /**
@@ -139,7 +205,11 @@ export interface ApiClient {
  */
 export function createApiClient(options: HttpClientOptions = {}): ApiClient {
   const request: AxiosInstance = createHttpClient(options)
-  const downloadClient: AxiosInstance = createDownloadClient()
+  const downloadClient: AxiosInstance = createDownloadClient(options.clusterId)
+  /** TOML is the payload of the cluster endpoints, never JSON. */
+  const tomlConfig = (): AxiosRequestConfig => ({
+    headers: { 'Content-Type': 'text/plain' }
+  })
 
   function get<T>(url: string, config?: AxiosRequestConfig): Promise<T> {
     return requestJson<T>(request, { url, method: 'get', ...config })
@@ -276,6 +346,44 @@ export function createApiClient(options: HttpClientOptions = {}): ApiClient {
     fetchObservabilityDiagnostics: async () => {
       const payload = await get<OperationsPayload>('/v1/observability/operations')
       return payload.diagnostics
+    },
+
+    fetchClusters: async () => {
+      const data = await get<unknown>('/v1/clusters')
+      return asClusterList(data)
+    },
+    validateCluster: (toml) => post<ClusterValidation>('/v1/clusters/validate', toml, tomlConfig()),
+    createCluster: (toml) => post<ClusterSummary>('/v1/clusters', toml, tomlConfig()),
+    updateCluster: (id, toml) =>
+      put<ClusterSummary>(`/v1/clusters/${encodeURIComponent(id)}`, toml, tomlConfig()),
+    deleteCluster: async (id) => {
+      await requestJson(request, {
+        url: `/v1/clusters/${encodeURIComponent(id)}`,
+        method: 'delete'
+      })
+    },
+    probeCluster: (id) =>
+      post<ClusterProbe>(`/v1/clusters/${encodeURIComponent(id)}/probe`, {}),
+    reloadClusters: async () => {
+      const data = await post<unknown>('/v1/clusters/reload', {})
+      return asClusterList(data)
+    },
+    getClusterConfig: async (id) => {
+      try {
+        const response = await request.request<string>({
+          url: `/v1/clusters/${encodeURIComponent(id)}/config`,
+          method: 'get',
+          // The body is the file itself: TOML with the author's comments, so no
+          // JSON parsing step may run over it (responseType 'text' plus an
+          // identity transform pins that down).
+          responseType: 'text',
+          transformResponse: [(data: unknown) => data],
+          headers: { Accept: 'text/plain' }
+        })
+        return typeof response.data === 'string' ? response.data : String(response.data ?? '')
+      } catch (error) {
+        throw clusterConfigError(error)
+      }
     }
   }
 }

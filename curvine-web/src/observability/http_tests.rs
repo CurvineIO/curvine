@@ -21,7 +21,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::Router;
+use axum::{Extension, Router};
 use curvine_config::ClusterConf;
 use curvine_runtime::runtime::Runtime;
 use curvine_unified_fs::UnifiedFileSystem;
@@ -40,7 +40,10 @@ fn test_service() -> Arc<ObservabilityService> {
 }
 
 fn test_app(service: Arc<ObservabilityService>) -> Router {
-    router(service)
+    // The production router injects the per-cluster service through the cluster
+    // resolution middleware; these unit tests nest the API router directly, so
+    // they insert the extension themselves.
+    router().layer(Extension(service))
 }
 
 async fn response_json(response: axum::response::Response) -> Value {
@@ -101,8 +104,9 @@ async fn require_test_auth(request: Request<Body>, next: Next) -> Response {
 
 fn authed_app(service: Arc<ObservabilityService>) -> Router {
     Router::new()
-        .nest("/api/v1/observability", router(service))
+        .nest("/api/v1/observability", router())
         .route_layer(middleware::from_fn(require_test_auth))
+        .layer(Extension(service))
 }
 
 #[tokio::test]

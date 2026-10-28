@@ -551,3 +551,41 @@ export interface OperationsPayload {
   diagnostics: DiagnosticsPayload
   alerts: OperationsAlert[]
 }
+
+/**
+ * One cluster the console can target, as `GET /api/v1/clusters` reports it.
+ *
+ * `default` is the cluster the process itself is configured with (always present,
+ * never editable or removable); `file` entries come from the clusters directory
+ * and can be updated/deleted. Credentials are deliberately absent — the backend
+ * projects them away before answering.
+ */
+export type ClusterStatus = 'ready' | 'invalid' | 'unreachable'
+
+export interface ClusterSummary {
+  id: string
+  display_name: string
+  source: 'default' | 'file'
+  master_addrs: string[]
+  status: ClusterStatus
+  error?: string | null
+  editable: boolean
+  removable: boolean
+}
+
+/** Dry-run answer for a TOML payload: parsed, but not persisted. */
+export interface ClusterValidation {
+  ok: boolean
+  cluster?: ClusterSummary | null
+  errors: string[]
+  warnings: string[]
+}
+
+/** Connectivity probe of one cluster's master, used before switching to it. */
+export interface ClusterProbe {
+  reachable: boolean
+  active_master?: string | null
+  version?: string | null
+  latency_ms?: number | null
+  message?: string | null
+}

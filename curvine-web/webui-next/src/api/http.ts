@@ -37,18 +37,66 @@ function extractMessage(error: unknown, status: number): string {
   return typeof message === 'string' && message ? message : 'Unknown error'
 }
 
+/**
+ * Machine-readable code from the backend error envelope.
+ *
+ * The envelope is `{ success: false, error: { code, message } }`; endpoints such
+ * as the cluster config read distinguish "default cluster, not editable" (409
+ * `not_removable`) from "unknown cluster" (404 `unknown_cluster`) by that code.
+ */
+function extractCode(error: unknown): string | undefined {
+  const data = (error as { response?: { data?: unknown } } | null)?.response?.data
+  if (!data || typeof data !== 'object') return undefined
+  const typed = data as { code?: unknown; error?: { code?: unknown } }
+  if (typeof typed.error?.code === 'string' && typed.error.code) return typed.error.code
+  if (typeof typed.code === 'string' && typed.code) return typed.code
+  return undefined
+}
+
 /** 401 is the single sign-out exit: the handler clears the session instead of hard-reloading. */
 export interface HttpClientOptions {
   onUnauthorized?: () => void
+  /**
+   * Console-level cluster selection. Empty/undefined means "follow the backend's
+   * default cluster", which is why the header is omitted rather than sent empty:
+   * the backend treats a missing header as the default, an empty one as invalid.
+   */
+  clusterId?: string
 }
 
-export function createHttpClient({ onUnauthorized }: HttpClientOptions = {}): AxiosInstance {
-  const client = axios.create({
-    baseURL: API_BASE,
-    timeout: 10000,
-    withCredentials: true,
-    headers: { Accept: 'application/json' }
+/** Request header the backend uses to resolve which cluster a call targets. */
+export const CLUSTER_HEADER = 'X-Curvine-Cluster'
+
+/**
+ * Stamp every request with the selected cluster.
+ *
+ * A header the caller already set wins: `uploadFile`-style calls that pin a
+ * cluster explicitly must not be overridden by the ambient selection.
+ */
+function withClusterHeader(client: AxiosInstance, clusterId?: string): AxiosInstance {
+  if (!clusterId) return client
+  client.interceptors.request.use((config) => {
+    if (!config.headers.has(CLUSTER_HEADER)) {
+      config.headers.set(CLUSTER_HEADER, clusterId)
+    }
+    return config
   })
+  return client
+}
+
+export function createHttpClient({
+  onUnauthorized,
+  clusterId
+}: HttpClientOptions = {}): AxiosInstance {
+  const client = withClusterHeader(
+    axios.create({
+      baseURL: API_BASE,
+      timeout: 10000,
+      withCredentials: true,
+      headers: { Accept: 'application/json' }
+    }),
+    clusterId
+  )
 
   client.interceptors.response.use(
     (response) => response,
@@ -57,7 +105,7 @@ export function createHttpClient({ onUnauthorized }: HttpClientOptions = {}): Ax
       if (status === 401) {
         onUnauthorized?.()
       }
-      throw new ApiError(status, extractMessage(error, status))
+      throw new ApiError(status, extractMessage(error, status), extractCode(error))
     }
   )
 
@@ -65,13 +113,16 @@ export function createHttpClient({ onUnauthorized }: HttpClientOptions = {}): Ax
 }
 
 /** Uploads and downloads need a much longer budget than the 10s API default. */
-export function createDownloadClient(): AxiosInstance {
-  return axios.create({
-    baseURL: API_BASE,
-    timeout: 120000,
-    withCredentials: true,
-    headers: { Accept: 'application/json' }
-  })
+export function createDownloadClient(clusterId?: string): AxiosInstance {
+  return withClusterHeader(
+    axios.create({
+      baseURL: API_BASE,
+      timeout: 120000,
+      withCredentials: true,
+      headers: { Accept: 'application/json' }
+    }),
+    clusterId
+  )
 }
 
 export async function parseDownloadError(error: unknown): Promise<string> {

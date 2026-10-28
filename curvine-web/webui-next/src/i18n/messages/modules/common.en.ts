@@ -82,6 +82,9 @@ export default {
     brandSubtitle: 'Admin Console',
     masterReady: 'Master Service',
     masterReadyHint: 'Ready for refresh',
+    clusterLabel: 'Cluster',
+    clusterDefault: 'Default cluster',
+    clusterInvalidToast: "Selected cluster '{id}' no longer exists",
   },
   nav: {
     groupOverview: 'Overview',
@@ -108,7 +111,9 @@ export default {
     syncJobs: 'UFS Sync Progress',
     syncJobsSubtitle: 'FS mode sync to UFS, per path',
     config: 'Config',
-    configSubtitle: 'Readonly cluster configuration'
+    configSubtitle: 'Readonly cluster configuration',
+    clusters: 'Clusters',
+    clustersSubtitle: 'Registered clusters, switching and TOML import'
   },
   login: {
     title: 'Curvine',

@@ -25,10 +25,93 @@ import { Toggle } from '@/components/ui/toggle'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { Spinner } from '@/components/ui/spinner'
 import { useAuth } from '@/auth/auth-context'
+import { DEFAULT_CLUSTER_OPTION, useOptionalCluster } from '@/cluster/cluster-context'
+import type { ClusterStatus } from '@/api/types'
 import { useI18n, localeOptions, type AppLocale } from '@/i18n'
+import { cn } from '@/lib/utils'
 import { useRefresh } from '@/refresh/refresh-context'
 import { useTheme } from '@/theme/theme-context'
 import { findNavigation } from '@/navigation'
+
+/** Status → dot colour. Semantic tokens only, so dark mode follows the theme. */
+const CLUSTER_STATUS_DOT: Record<ClusterStatus, string> = {
+  ready: 'bg-emerald-500',
+  invalid: 'bg-destructive',
+  unreachable: 'bg-muted-foreground'
+}
+
+function ClusterStatusDot({ status }: { status: ClusterStatus }) {
+  return (
+    <span
+      aria-hidden="true"
+      data-status={status}
+      className={cn('size-2 shrink-0 rounded-full', CLUSTER_STATUS_DOT[status])}
+    />
+  )
+}
+
+/**
+ * Cluster switcher in the topbar.
+ *
+ * `''` (no selection) is rendered through a `default` sentinel because a Radix
+ * `SelectItem` cannot carry an empty value: an empty value would make the
+ * trigger blank, and the backend's own cluster is a real, selectable choice
+ * ("follow the default") rather than "nothing".
+ */
+function ClusterSwitcher() {
+  const { t } = useI18n()
+  const { triggerRefresh } = useRefresh()
+  const cluster = useOptionalCluster()
+
+  const clusters = cluster?.clusters ?? []
+  const clusterId = cluster?.clusterId ?? ''
+  const loading = cluster?.clustersLoading ?? false
+  // No list yet (first load, or the endpoint failed): nothing to switch to, so
+  // the control shows the default cluster and stays disabled.
+  const enabled = clusters.length > 0
+  const value = enabled ? clusterId || DEFAULT_CLUSTER_OPTION : DEFAULT_CLUSTER_OPTION
+
+  return (
+    <Select
+      value={value}
+      disabled={!enabled}
+      onValueChange={(next) => {
+        // Switching cluster invalidates every page's data: the client is rebuilt
+        // from the new id, and the refresh signal makes mounted pages re-read.
+        cluster?.setClusterId(next === DEFAULT_CLUSTER_OPTION ? '' : next)
+        triggerRefresh()
+      }}
+    >
+      <SelectTrigger
+        size="sm"
+        className="w-[11.25rem]"
+        aria-label={t('layout.clusterLabel')}
+        aria-busy={loading || undefined}
+        data-testid="cluster-switcher"
+      >
+        <SelectValue placeholder={t('layout.clusterDefault')} />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectGroup>
+          <SelectItem value={DEFAULT_CLUSTER_OPTION} textValue={t('layout.clusterDefault')}>
+            {t('layout.clusterDefault')}
+          </SelectItem>
+          {clusters.map((item) => (
+            <SelectItem
+              key={item.id}
+              value={item.id}
+              textValue={item.display_name || item.id}
+              title={item.error || undefined}
+            >
+              <ClusterStatusDot status={item.status} />
+              <span className="truncate">{item.display_name || item.id}</span>
+            </SelectItem>
+          ))}
+        </SelectGroup>
+      </SelectContent>
+    </Select>
+  )
+}
 
 export function ConsoleLayout() {
   const { t, locale, setLocale } = useI18n()
@@ -85,6 +168,8 @@ export function ConsoleLayout() {
                 {resolved === 'dark' ? t('common.switchToLight') : t('common.switchToDark')}
               </TooltipContent>
             </Tooltip>
+
+            <ClusterSwitcher />
 
             <Select value={locale} onValueChange={(value) => setLocale(value as AppLocale)}>
               <SelectTrigger

@@ -11,6 +11,7 @@ import syncJobs from './modules/sync-jobs.zh-CN'
 import observability from './modules/observability.zh-CN'
 import operations from './modules/operations.zh-CN'
 import delta from './modules/delta.zh-CN'
+import clusters from './modules/clusters.zh-CN'
 
 export default {
   ...common,
@@ -25,5 +26,6 @@ export default {
   ...syncJobs,
   ...observability,
   ...operations,
-  ...delta
+  ...delta,
+  ...clusters
 }

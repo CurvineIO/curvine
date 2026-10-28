@@ -49,10 +49,20 @@ fn start_web(args: StartArgs) -> CommonResult<()> {
     let web_conf = conf.standalone_web_conf(&conf.web.hostname, conf.web.port);
 
     let rt = Arc::new(web_conf.create_runtime());
+    // Imported cluster configurations live next to the served configuration
+    // unless the operator points somewhere else explicitly.
+    let clusters_dir = match args.clusters_dir.as_deref().filter(|v| !v.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => {
+            curvine_web::cluster::clusters_dir_for(&conf, Some(std::path::Path::new(&args.conf)))
+        }
+    };
+    println!("clusters dir: {}", clusters_dir.display());
+
     // The console no longer publishes its own configuration view: `GET
     // /api/v1/config` proxies the active master, so this process's layer map has
     // no reader left to serve.
-    let service = AdminWebService::new(conf, rt.clone());
+    let service = AdminWebService::with_clusters_dir(conf, rt.clone(), clusters_dir);
     let web = WebServer::with_rt(rt, web_conf, service);
     web.block_on_start();
     Ok(())
@@ -80,4 +90,9 @@ struct StartArgs {
 
     #[arg(long)]
     port: Option<u16>,
+
+    /// Directory holding imported cluster configurations (`<id>.toml`).
+    /// Defaults to `web.clusters_dir`, or `<conf dir>/clusters`.
+    #[arg(long)]
+    clusters_dir: Option<String>,
 }

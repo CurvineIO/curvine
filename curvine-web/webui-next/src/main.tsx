@@ -4,6 +4,7 @@ import { BrowserRouter } from 'react-router-dom'
 
 import { App } from './App'
 import { AuthProvider } from '@/auth/auth-context'
+import { ClusterSelectionProvider } from '@/cluster/cluster-context'
 import { I18nProvider } from '@/i18n'
 import { MasterRuntimeProvider } from '@/master-runtime/master-runtime-context'
 import { RefreshProvider } from '@/refresh/refresh-context'
@@ -23,19 +24,21 @@ createRoot(container).render(
     <BrowserRouter>
       <ThemeProvider>
         <I18nProvider>
-          <AuthProvider>
-            <MasterRuntimeProvider>
-              <RefreshProvider>
-                <ToastProvider>
-                  <CopyFallbackProvider>
-                    <TooltipProvider>
-                      <App />
-                    </TooltipProvider>
-                  </CopyFallbackProvider>
-                </ToastProvider>
-              </RefreshProvider>
-            </MasterRuntimeProvider>
-          </AuthProvider>
+          <ClusterSelectionProvider>
+            <AuthProvider>
+              <MasterRuntimeProvider>
+                <RefreshProvider>
+                  <ToastProvider>
+                    <CopyFallbackProvider>
+                      <TooltipProvider>
+                        <App />
+                      </TooltipProvider>
+                    </CopyFallbackProvider>
+                  </ToastProvider>
+                </RefreshProvider>
+              </MasterRuntimeProvider>
+            </AuthProvider>
+          </ClusterSelectionProvider>
         </I18nProvider>
       </ThemeProvider>
     </BrowserRouter>

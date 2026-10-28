@@ -5,6 +5,7 @@ import { ApiProvider } from '@/api/api-context'
 import { createApiClient, type ApiClient } from '@/api/client'
 import { ApiError } from '@/api/error'
 import type { AuthSession } from '@/api/types'
+import { useOptionalCluster } from '@/cluster/cluster-context'
 
 export type AuthStatus = 'unknown' | 'authenticated' | 'unauthenticated'
 
@@ -28,6 +29,11 @@ export function AuthProvider({
   const [status, setStatus] = React.useState<AuthStatus>('unknown')
   const [session, setSession] = React.useState<AuthSession | null>(null)
 
+  // Switching clusters rebuilds the client below, which changes the `useApi()`
+  // identity every page depends on — so pages re-fetch on their own (useAsync /
+  // useEffect deps) without any per-page cluster logic.
+  const clusterId = useOptionalCluster()?.clusterId ?? ''
+
   // 401 from any request clears the session; RequireAuth then redirects to /login.
   const client = React.useMemo<ApiClient>(
     () =>
@@ -36,9 +42,10 @@ export function AuthProvider({
         onUnauthorized: () => {
           setSession(null)
           setStatus('unauthenticated')
-        }
+        },
+        clusterId
       }),
-    [injectedClient]
+    [injectedClient, clusterId]
   )
 
   const refreshSession = React.useCallback(async () => {

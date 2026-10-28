@@ -606,7 +606,7 @@ mod tests {
 
         use axum::body::{to_bytes, Body};
         use axum::http::{Request, StatusCode};
-        use axum::Router;
+        use axum::{Extension, Router};
         use curvine_config::ClusterConf;
         use curvine_runtime::runtime::Runtime;
         use curvine_unified_fs::UnifiedFileSystem;
@@ -682,7 +682,10 @@ mod tests {
         );
         assert_eq!(series[0].points.last().map(|point| point.1), Some(1000.0));
 
-        let app = Router::new().nest("/api/v1/observability", router(service.clone()));
+        let app = Router::new()
+            .nest("/api/v1/observability", router())
+            .layer(Extension(service.clone()));
+
         let response = app
             .oneshot(
                 Request::builder()

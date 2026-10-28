@@ -25,6 +25,19 @@ pub struct WebConf {
     pub hostname: String,
     pub port: u16,
     pub observability: ObservabilityConf,
+    /// Directory scanned for imported cluster configurations (`*.toml`).
+    ///
+    /// Empty means "derive it from the location of the config file" — see
+    /// `curvine-web`'s `ClusterRegistry::default_dir`.
+    pub clusters_dir: String,
+    /// Upper bound on simultaneously registered clusters (imported + default).
+    ///
+    /// Each cluster holds its own client and in-memory observability TSDB, so
+    /// this is a memory guard as much as a policy limit.
+    pub max_clusters: usize,
+    /// Human-readable name for the local (default) cluster shown in the
+    /// cluster switcher. Empty means "use the cluster id".
+    pub display_name: String,
 }
 
 impl Default for WebConf {
@@ -33,6 +46,9 @@ impl Default for WebConf {
             hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
             port: ClusterConf::DEFAULT_WEB_PORT,
             observability: ObservabilityConf::default(),
+            clusters_dir: String::new(),
+            max_clusters: ClusterConf::DEFAULT_MAX_CLUSTERS,
+            display_name: String::new(),
         }
     }
 }

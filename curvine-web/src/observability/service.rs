@@ -78,6 +78,10 @@ pub struct ObservabilityService {
     provider_fallback_reason: RwLock<Option<String>>,
     query_fallback_reason: RwLock<Option<String>>,
     prometheus_healthy: RwLock<bool>,
+    /// Set by [`ObservabilityService::stop`] so the health loop can exit; the
+    /// loop holds an `Arc<Self>`, so it would otherwise outlive the cluster it
+    /// belongs to.
+    shutdown: AtomicBool,
 }
 
 impl ObservabilityService {
@@ -102,7 +106,26 @@ impl ObservabilityService {
             provider_fallback_reason: RwLock::new(None),
             query_fallback_reason: RwLock::new(None),
             prometheus_healthy: RwLock::new(false),
+            shutdown: AtomicBool::new(false),
         }
+    }
+
+    /// Stops the background work [`Self::start`] began.
+    ///
+    /// Called when a cluster is removed or replaced: its collector, discovery
+    /// loop and health loop must not keep scraping a configuration nobody
+    /// serves (and must not keep its TSDB alive).
+    pub fn stop(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.builtin.stop_collector();
+        self.builtin.stop_discovery();
+        if let Ok(mut stored) = self.runtime.write() {
+            *stored = None;
+        }
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
     }
 
     pub fn start(self: &Arc<Self>, rt: Arc<Runtime>) {
@@ -682,6 +705,9 @@ impl ObservabilityService {
             loop {
                 service.sync_provider_for_prometheus_modes().await;
                 sleep(Duration::from_millis(AUTO_HEALTH_CHECK_INTERVAL_MS)).await;
+                if service.stopped() {
+                    break;
+                }
             }
         });
     }

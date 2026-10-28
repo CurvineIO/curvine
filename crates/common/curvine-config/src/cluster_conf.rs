@@ -93,6 +93,8 @@ impl ClusterConf {
     pub const DEFAULT_MASTER_WEB_PORT: u16 = 9010;
     pub const DEFAULT_WORKER_WEB_PORT: u16 = 9002;
     pub const DEFAULT_FUSE_WEB_PORT: u16 = 9003;
+    /// Upper bound on clusters the web console keeps registered at once.
+    pub const DEFAULT_MAX_CLUSTERS: usize = 8;
 
     pub const ENV_MASTER_HOSTNAME: &'static str = "CURVINE_MASTER_HOSTNAME";
     pub const ENV_MDS_HOSTNAME: &'static str = "CURVINE_MDS_HOSTNAME";
@@ -138,6 +140,52 @@ impl ClusterConf {
         validation::warn_unknown_keys(&text);
         let (doc, sources) = pipeline::build_transfer_document_with_sources(&text, &[])?;
         Self::finalize_transfer(doc, sources)
+    }
+
+    /// Parses an imported cluster configuration without the process environment
+    /// layer: `CURVINE_*` hostname overrides and `net_interface` describe THIS
+    /// host, which is the wrong fact for a cluster imported from elsewhere.
+    ///
+    /// Everything else matches [`Self::from`]: the same normalization, validation,
+    /// `discovery.init` and derived `client.master_addrs`.
+    pub fn from_text_import(text: &str) -> CommonResult<Self> {
+        validation::warn_unknown_keys(text);
+        // Deliberately a plain parse rather than `pipeline::build_document*`.
+        // The pipeline's environment layer is not just the `CURVINE_*_HOSTNAME`
+        // allowlist: when the document sets `net_interface` it resolves that NIC
+        // on THIS machine (`pipeline.rs`, `ClusterConf::interface_ipv4`) and
+        // overwrites every role hostname with the resulting IPv4 — so importing a
+        // cluster that uses `net_interface` would either fail here or silently
+        // rebind the imported hostnames to this host's address. Skipping the
+        // layer keeps the imported file exactly as written.
+        let doc: toml::Value = try_err!(toml::from_str(text));
+        Self::require_import_cluster_id(&doc)?;
+
+        let mut conf: Self = doc.try_into()?;
+        conf.normalize_whitespace();
+        conf.normalize_split_web_ports();
+        conf.validate()?;
+        conf.discovery.init(&conf.cluster_id)?;
+        conf.resolve_master_addrs();
+        Ok(conf)
+    }
+
+    /// Rejects an import that does not name its cluster.
+    ///
+    /// `ClusterConf` is `#[serde(default)]`, so a file without `cluster_id`
+    /// deserializes to the built-in default id ("curvine") and would silently
+    /// claim the identity of the local default cluster. An import is a distinct
+    /// cluster by definition, so the id must be explicit.
+    fn require_import_cluster_id(doc: &toml::Value) -> CommonResult<()> {
+        let stated = doc
+            .get("cluster_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        if stated.is_empty() {
+            return err_box!("imported cluster configuration must set a non-empty 'cluster_id'");
+        }
+        Ok(())
     }
 
     /// Post-deserialization tail of [`Self::from`], carrying the source map.

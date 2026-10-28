@@ -14,6 +14,7 @@
 
 // pub mod load_handler;
 pub mod admin_handler;
+pub mod cluster_api;
 mod router_handler;
 pub mod runtime_config;
 

@@ -30,8 +30,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::cluster::{
+    clusters_dir_for, is_cluster_api_path, ClusterCtx, ClusterRegistry, CLUSTER_HEADER,
+};
 use crate::job_display::{build_job_display_name, format_job_timestamp_ms, job_path_slug};
 use crate::observability::{self, ObservabilityService};
+use crate::router::cluster_api;
 use crate::router::RouterHandler;
 use crate::util::addr::{
     configured_master_addrs, display_addr_text_for_cluster, display_inet_addr_with_hint,
@@ -280,8 +284,14 @@ struct UfsSyncJobsQuery {
     failed_only: Option<bool>,
 }
 
+/// One mount-resync task, as tracked by the console.
+///
+/// Public only because [`crate::cluster::ClusterCtx`] (public) holds the table
+/// that stores these; every field stays private, so the type cannot be built
+/// outside this module. The table itself is per cluster on purpose: two clusters
+/// may use the same task id, and a shared table would report the wrong state.
 #[derive(Debug, Clone, Serialize)]
-struct ResyncTaskState {
+pub struct ResyncTaskState {
     id: String,
     cv_path: String,
     mount_path: String,
@@ -534,15 +544,46 @@ async fn fetch_master_config_view(
 
 #[derive(Clone)]
 pub struct AdminRouterHandler {
+    // Cluster-scoped: replaced per request by `resolve_cluster` with the
+    // selected cluster's snapshot (see `snapshot`).
     conf: ClusterConf,
     unified_fs: UnifiedFileSystem,
-    rt: Arc<Runtime>,
-    start_time: String,
     resync_tasks: Arc<Mutex<HashMap<String, ResyncTaskState>>>,
     load_jobs: Arc<Mutex<VecDeque<String>>>,
     load_job_cache: Arc<Mutex<HashMap<String, Value>>>,
-    auth_sessions: Arc<Mutex<HashMap<String, i64>>>,
+    /// The selected cluster's collector. Handlers read it from the request
+    /// extensions (see [`resolve_cluster`]) rather than from this field, which is
+    /// what keeps the observability handlers cluster-agnostic; it is kept here so
+    /// a snapshot stays a complete description of its cluster.
+    #[allow(dead_code)]
     observability: Arc<ObservabilityService>,
+
+    // Console-scoped: identical for every cluster.
+    rt: Arc<Runtime>,
+    start_time: String,
+    auth_sessions: Arc<Mutex<HashMap<String, i64>>>,
+    registry: Arc<ClusterRegistry>,
+}
+
+/// Builds the handler a single request runs against.
+///
+/// Cluster-scoped fields come from `ctx`; console-scoped ones (runtime, cookie
+/// sessions, the registry itself) are shared with `console`. Every handler body
+/// keeps reading `instance.conf` / `instance.unified_fs` / `instance.resync_tasks`
+/// as before — only the value of those fields changes with the request.
+pub(crate) fn snapshot(console: &AdminRouterHandler, ctx: &Arc<ClusterCtx>) -> AdminRouterHandler {
+    AdminRouterHandler {
+        conf: ctx.conf.clone(),
+        unified_fs: ctx.unified_fs.clone(),
+        resync_tasks: Arc::clone(&ctx.resync_tasks),
+        load_jobs: Arc::clone(&ctx.load_jobs),
+        load_job_cache: Arc::clone(&ctx.load_job_cache),
+        observability: Arc::clone(&ctx.observability),
+        rt: Arc::clone(&console.rt),
+        start_time: console.start_time.clone(),
+        auth_sessions: Arc::clone(&console.auth_sessions),
+        registry: Arc::clone(&console.registry),
+    }
 }
 
 const AUTH_COOKIE_NAME: &str = "curvine_web_session";
@@ -722,7 +763,7 @@ async fn require_auth(
     unauthorized_response()
 }
 
-fn api_success(data: Value) -> Json<Value> {
+pub(crate) fn api_success(data: Value) -> Json<Value> {
     Json(json!({
         "success": true,
         "data": data,
@@ -730,7 +771,11 @@ fn api_success(data: Value) -> Json<Value> {
     }))
 }
 
-fn api_error_response(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+pub(crate) fn api_error_response(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+) -> Response {
     (
         status,
         Json(json!({
@@ -740,6 +785,54 @@ fn api_error_response(status: StatusCode, code: &str, message: impl Into<String>
         })),
     )
         .into_response()
+}
+
+/// Binds the request to the cluster named by `X-Curvine-Cluster`.
+///
+/// A missing header resolves to the default cluster, so a browser that knows
+/// nothing about clusters keeps the exact pre-multi-cluster behaviour. The
+/// resolved cluster's handler snapshot **replaces** the console-wide
+/// `Arc<AdminRouterHandler>` inserted by the outer `Extension` layer, which is
+/// why none of the individual handlers had to change.
+///
+/// Cluster paths bypass resolution on purpose:
+/// * `/api/v1/clusters*` is cluster management — it must answer even when the
+///   header names a cluster that no longer exists;
+/// * `/api/v1/auth*` decides which clusters a caller may use, so it cannot
+///   depend on that choice;
+/// * non-`/api/` paths are the SPA shell and the Prometheus scrape endpoint.
+async fn resolve_cluster(
+    Extension(console): Extension<Arc<AdminRouterHandler>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if !path.starts_with("/api/") || is_cluster_api_path(path) || path.starts_with("/api/v1/auth") {
+        return next.run(request).await;
+    }
+
+    let header = request
+        .headers()
+        .get(CLUSTER_HEADER)
+        .and_then(|value| value.to_str().ok());
+
+    let ctx = match console.registry.resolve(header) {
+        Ok(ctx) => ctx,
+        // Reached only for authenticated callers: `require_auth` is an outer
+        // layer, so an anonymous probe cannot use this to enumerate clusters.
+        Err(err) => {
+            return api_error_response(StatusCode::NOT_FOUND, "unknown_cluster", err.to_string());
+        }
+    };
+
+    let snapshot = Arc::new(snapshot(&console, &ctx));
+    // The observability API is nested as its own router and reads its service
+    // from the request extensions; hand it the selected cluster's collector.
+    request
+        .extensions_mut()
+        .insert(Arc::clone(&ctx.observability));
+    request.extensions_mut().insert(snapshot);
+    next.run(request).await
 }
 
 fn journal_addr_for_id(conf: &ClusterConf, node_id: u64) -> Option<String> {
@@ -1697,21 +1790,31 @@ impl AdminRouterHandler {
     }
 
     pub fn with_rt(conf: ClusterConf, rt: Arc<Runtime>) -> FsResult<Self> {
-        let unified_fs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
-        let observability = Arc::new(ObservabilityService::new(conf.clone(), unified_fs.clone()));
-        observability.start(rt.clone());
+        let dir = clusters_dir_for(&conf, None);
+        let max = conf.web.max_clusters;
+        let registry = ClusterRegistry::new(conf, rt.clone(), dir, max)
+            .map_err(|err| FsError::common(err.to_string()))?;
+        Ok(Self::with_registry(rt, Arc::new(registry)))
+    }
 
-        Ok(Self {
-            conf,
-            unified_fs,
+    /// Builds the console handler around an already constructed registry.
+    ///
+    /// Used by the standalone `curvine-web` binary, which knows the config file
+    /// path and can therefore default `clusters_dir` to `<conf dir>/clusters`.
+    pub fn with_registry(rt: Arc<Runtime>, registry: Arc<ClusterRegistry>) -> Self {
+        let default = registry.default_ctx();
+        Self {
+            conf: default.conf.clone(),
+            unified_fs: default.unified_fs.clone(),
+            resync_tasks: Arc::clone(&default.resync_tasks),
+            load_jobs: Arc::clone(&default.load_jobs),
+            load_job_cache: Arc::clone(&default.load_job_cache),
+            observability: Arc::clone(&default.observability),
             rt,
             start_time: LocalTime::now_datetime(),
-            resync_tasks: Arc::new(Mutex::new(HashMap::new())),
-            load_jobs: Arc::new(Mutex::new(VecDeque::new())),
-            load_job_cache: Arc::new(Mutex::new(HashMap::new())),
             auth_sessions: Arc::new(Mutex::new(HashMap::new())),
-            observability,
-        })
+            registry,
+        }
     }
 
     fn unified_client(&self, cache_only: bool) -> UnifiedFileSystem {
@@ -1741,6 +1844,188 @@ async fn current_master_info(instance: &AdminRouterHandler) -> FsResult<Filesyst
         Ok(result) => result,
         Err(_) => err_box!("master info request timed out"),
     }
+}
+
+/// Same as [`current_master_info`] with a caller-supplied bound.
+///
+/// The cluster probe uses a short 3s budget: it must feel instantaneous in the
+/// cluster manager, and a slow answer is already the answer ("unreachable").
+///
+/// The failure is classified instead of formatted from the raw error: the probe
+/// result is shown to the user verbatim (cluster page, top-bar tooltip), and
+/// `err_box!` decorates every message with `(path/to/file.rs:line)`, which is
+/// noise in a UI and needless internal detail.
+pub(crate) async fn current_master_info_within(
+    instance: &AdminRouterHandler,
+    limit: Duration,
+) -> Result<FilesystemInfo, MasterInfoFailure> {
+    match timeout(limit, instance.unified_fs.get_filesystem_info()).await {
+        Ok(Ok(info)) => Ok(info),
+        Ok(Err(err)) => Err(MasterInfoFailure::Unreachable(sanitize_error_text(
+            &err.to_string(),
+        ))),
+        Err(_) => Err(MasterInfoFailure::Timeout(limit)),
+    }
+}
+
+/// Why a short-budget master-info call failed, in user-facing terms.
+pub(crate) enum MasterInfoFailure {
+    Timeout(Duration),
+    /// The transport error with source locations removed; may be empty.
+    Unreachable(String),
+}
+
+impl MasterInfoFailure {
+    /// One sentence for the UI: no source paths, no line numbers.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Timeout(limit) => {
+                format!("master info request timed out after {}s", limit.as_secs())
+            }
+            Self::Unreachable(detail) if detail.trim().is_empty() => {
+                "the cluster could not be reached".to_string()
+            }
+            Self::Unreachable(detail) => detail.clone(),
+        }
+    }
+}
+
+/// Drops internal decorations from an error chain so it can be shown to a user.
+///
+/// Three kinds of noise are removed:
+/// * `err_box!` appends `(path/to/file.rs:123)` to every message it wraps;
+/// * an error that already travelled through the logger comes back as
+///   `[alpha-web] ERROR: …`;
+/// * a `toml` parse failure arrives with a rendered snippet (` | `,
+///   `1 | cluster_id = x`, `|     ^`) that is unreadable inside a UI list.
+///
+/// The informative parts are kept: `TOML parse error at line 1, column 5`
+/// survives, and so does its hint line (`expected `.`, `=`).
+pub(crate) fn sanitize_error_text(text: &str) -> String {
+    let text = strip_log_prefixes(text);
+    let text = strip_source_locations(&text);
+
+    let mut kept: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_diagnostic_art(line))
+        .collect();
+
+    // A diagnostic is a headline plus hint lines ("invalid string", "expected
+    // `.`, `=`"). Rejoining them with prose punctuation keeps it one readable
+    // sentence instead of "… column 14 invalid string expected".
+    let message = match kept.len() {
+        0 => String::new(),
+        1 => kept.remove(0).to_string(),
+        _ => {
+            let headline = kept.remove(0);
+            let separator = if headline.ends_with(['.', ':', '!', '?']) {
+                " "
+            } else {
+                ": "
+            };
+            format!("{headline}{separator}{}", kept.join("; "))
+        }
+    };
+
+    message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .trim_end_matches(':')
+        .trim()
+        .to_string()
+}
+
+/// Peels `[tag] ` and `ERROR: ` / `WARN: ` … prefixes off the front.
+fn strip_log_prefixes(text: &str) -> String {
+    let mut rest = text.trim();
+
+    loop {
+        if let Some(tag) = rest
+            .strip_prefix('[')
+            .and_then(|after| after.find(']').map(|close| &after[close + 1..]))
+        {
+            let candidate = tag.trim_start();
+            // `[whole sentence]` is part of the message, not a logger tag.
+            if strip_level(candidate).is_some() {
+                rest = candidate;
+                continue;
+            }
+        }
+
+        match strip_level(rest) {
+            Some(next) => rest = next,
+            None => break,
+        }
+    }
+
+    rest.to_string()
+}
+
+fn strip_level(text: &str) -> Option<&str> {
+    const LEVELS: [&str; 6] = ["ERROR", "WARN", "WARNING", "INFO", "DEBUG", "TRACE"];
+
+    for level in LEVELS {
+        if let Some(rest) = text.strip_prefix(level) {
+            if let Some(rest) = rest.strip_prefix(':') {
+                return Some(rest.trim_start());
+            }
+        }
+    }
+
+    None
+}
+
+/// Removes every `(...file.rs:123)` group.
+fn strip_source_locations(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(open) = rest.find('(') {
+        let Some(close) = rest[open..].find(')').map(|offset| open + offset) else {
+            break;
+        };
+        let inner = &rest[open + 1..close];
+        // `err_box!` appends `(path:line)` and nothing else in parentheses looks
+        // like that, so anything else is kept as part of the message.
+        let looks_like_source = inner
+            .rsplit_once(':')
+            .is_some_and(|(_, line)| !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()))
+            && (inner.contains(".rs") || inner.contains('/'));
+
+        if looks_like_source {
+            out.push_str(&rest[..open]);
+            rest = &rest[close + 1..];
+        } else {
+            out.push_str(&rest[..=close]);
+            rest = &rest[close + 1..];
+        }
+    }
+    out.push_str(rest);
+
+    out
+}
+
+/// One row of a rendered diagnostic snippet: the gutter, the quoted source line,
+/// or the caret that follows the source location.
+fn is_diagnostic_art(line: &str) -> bool {
+    let trimmed = line.trim();
+
+    if trimmed.starts_with('|') {
+        return true;
+    }
+    if trimmed
+        .chars()
+        .all(|c| matches!(c, '|' | '^' | '-' | '+' | '~' | ' '))
+    {
+        return true;
+    }
+
+    // `1 | cluster_id = alpha`: a line number followed by the gutter.
+    let after_digits = trimmed.trim_start_matches(|c: char| c.is_ascii_digit());
+    after_digits.len() != trimmed.len() && after_digits.trim_start().starts_with('|')
 }
 
 async fn metrics(Extension(instance): Extension<Arc<AdminRouterHandler>>) -> String {
@@ -4566,15 +4851,22 @@ async fn workers1(
     Ok(Json(master_info.live_workers).into_response())
 }
 
+/// Legacy `/api/config`: the effective configuration of the *selected* cluster.
+///
+/// Previously a closure over the handler's own `conf`, which would have ignored
+/// `X-Curvine-Cluster`.
+async fn raw_config(Extension(instance): Extension<Arc<AdminRouterHandler>>) -> Json<ClusterConf> {
+    Json(instance.conf.clone())
+}
+
 impl RouterHandler for AdminRouterHandler {
     fn router(&self) -> Router {
         let instance = Arc::new(self.clone());
-        let conf = self.conf.clone();
         Router::new()
             .route("/metrics", get(metrics))
             .route("/report", get(report))
             .route("/api/overview", get(overview))
-            .route("/api/config", get(|| async { Json(conf) }))
+            .route("/api/config", get(raw_config))
             .route("/api/browse", get(browse))
             .route("/api/block_locations", get(block_locations))
             .route("/api/workers", get(workers))
@@ -4645,10 +4937,8 @@ impl RouterHandler for AdminRouterHandler {
                 get(transfer_status_v1).delete(transfer_cancel_v1),
             )
             .route("/api/v1/transfers/:job_id/retry", post(transfer_retry_v1))
-            .nest(
-                "/api/v1/observability",
-                observability::router(self.observability.clone()),
-            )
+            .merge(cluster_api::router(Arc::clone(&self.registry)))
+            .nest("/api/v1/observability", observability::router())
             .route("/add-dcm", get(add_dcm))
             .route("/get-dcm", get(get_dcm))
             .route("/remove-dcm", get(remove_dcm))
@@ -4664,8 +4954,14 @@ impl RouterHandler for AdminRouterHandler {
             .route("/preview", get(spa_index))
             .route("/observability", get(spa_index))
             .route("/operations", get(spa_index))
+            .route("/clusters", get(spa_index))
             .route("/workers", get(workers1))
             .route("/workers/:id", get(spa_index))
+            // Layer order (axum applies the last added layer outermost, so it
+            // runs first): console handler -> cookie auth -> cluster resolution.
+            // Keeping resolution inside auth means an anonymous caller cannot
+            // probe which clusters exist.
+            .route_layer(middleware::from_fn(resolve_cluster))
             .route_layer(middleware::from_fn(require_auth))
             .layer(Extension(instance))
     }
@@ -5412,5 +5708,373 @@ mod config_view_proxy_tests {
         // Not JSON: keep the text so the operator still sees what was stored
         // instead of a parse error replacing the value.
         assert_eq!(parse_json_text("1800000ms"), json!("1800000ms"));
+    }
+}
+
+/// Multi-cluster request routing.
+///
+/// These tests exercise `resolve_cluster` through a real axum stack rather than
+/// calling handlers directly, because the behaviour under test *is* the
+/// composition of the layers: console extension -> cookie auth -> cluster
+/// resolution.
+#[cfg(test)]
+mod cluster_routing_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::OnceLock;
+    use tower::ServiceExt;
+
+    const HEADER: &str = "x-curvine-cluster";
+    const TOKEN: &str = "test-session-token";
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "curvine-web-cluster-routing-{tag}-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, AtomicOrdering::SeqCst)
+            ));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_rt() -> Arc<Runtime> {
+        static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
+        Arc::clone(RT.get_or_init(|| Arc::new(Runtime::single())))
+    }
+
+    const OTHER_CLUSTER: &str = r#"
+    cluster_id = "cluster-b"
+    net_interface = ""
+
+    [master]
+    hostname = "cluster-b-master.example"
+
+    [journal]
+    hostname = "cluster-b-journal.example"
+
+    [web.observability]
+    enabled = false
+"#;
+
+    /// The temporary clusters directory is returned alongside the handler: the
+    /// registry persists registrations under it, so it must outlive the test.
+    fn console_handler() -> (TempDir, Arc<AdminRouterHandler>) {
+        let dir = TempDir::new("registry");
+        let mut conf = ClusterConf {
+            cluster_id: "default-cluster".to_string(),
+            ..Default::default()
+        };
+        conf.master.hostname = "default-master.example".to_string();
+        conf.journal.hostname = "default-journal.example".to_string();
+        conf.web.observability.enabled = false;
+        let registry =
+            ClusterRegistry::new(conf, test_rt(), dir.path().to_path_buf(), 4).expect("registry");
+        registry
+            .register_from_text(OTHER_CLUSTER)
+            .expect("register cluster-b");
+        let handler = Arc::new(AdminRouterHandler::with_registry(
+            test_rt(),
+            Arc::new(registry),
+        ));
+        assert!(handler
+            .auth_sessions
+            .lock()
+            .expect("sessions")
+            .insert(TOKEN.to_string(), now_secs() + 3600)
+            .is_none());
+        (dir, handler)
+    }
+
+    /// Reports which cluster the handler was bound to.
+    async fn echo_cluster(Extension(instance): Extension<Arc<AdminRouterHandler>>) -> Json<Value> {
+        api_success(json!({
+            "cluster_id": instance.conf.cluster_id,
+            "master_hostname": instance.conf.master.hostname,
+        }))
+    }
+
+    /// The handler layers exactly as `router()` composes them.
+    fn test_app(handler: Arc<AdminRouterHandler>) -> Router {
+        Router::new()
+            .route("/api/v1/echo", get(echo_cluster))
+            .route("/api/v1/clusters", get(echo_cluster))
+            .route("/api/v1/auth/session", get(echo_cluster))
+            .route_layer(middleware::from_fn(resolve_cluster))
+            .route_layer(middleware::from_fn(require_auth))
+            .layer(Extension(handler))
+    }
+
+    fn request(uri: &str, cluster: Option<&str>) -> Request {
+        let mut builder = Request::builder()
+            .uri(uri)
+            .header(header::COOKIE, format!("{AUTH_COOKIE_NAME}={TOKEN}"));
+        if let Some(cluster) = cluster {
+            builder = builder.header(HEADER, cluster);
+        }
+        builder.body(Body::empty()).expect("request")
+    }
+
+    async fn body_json(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    #[tokio::test]
+    async fn missing_header_serves_the_default_cluster() {
+        let (_dir, handler) = console_handler();
+        let app = test_app(handler);
+        let response = app.oneshot(request("/api/v1/echo", None)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["data"]["cluster_id"], json!("default-cluster"));
+        assert_eq!(
+            body["data"]["master_hostname"],
+            json!("default-master.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn header_selects_the_imported_cluster() {
+        let (_dir, handler) = console_handler();
+        let app = test_app(handler);
+        let response = app
+            .oneshot(request("/api/v1/echo", Some("cluster-b")))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["data"]["cluster_id"], json!("cluster-b"));
+        assert_eq!(
+            body["data"]["master_hostname"],
+            json!("cluster-b-master.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_cluster_header_is_not_found() {
+        let (_dir, handler) = console_handler();
+        let app = test_app(handler);
+        let response = app
+            .oneshot(request("/api/v1/echo", Some("ghost")))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = body_json(response).await;
+        assert_eq!(body["error"]["code"], json!("unknown_cluster"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ghost"),
+            "{body}"
+        );
+    }
+
+    /// The cluster management API must answer regardless of the header: it is
+    /// how a UI recovers from a stale cluster selection.
+    #[tokio::test]
+    async fn cluster_api_ignores_the_header() {
+        let (_dir, handler) = console_handler();
+        let app = test_app(handler);
+        for header_value in [None, Some("ghost"), Some("cluster-b")] {
+            let response = app
+                .clone()
+                .oneshot(request("/api/v1/clusters", header_value))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{header_value:?}");
+            let body = body_json(response).await;
+            // Always the console's own (default) handler.
+            assert_eq!(body["data"]["cluster_id"], json!("default-cluster"));
+        }
+    }
+
+    /// Auth order matters: unauthenticated callers must not be able to tell an
+    /// existing cluster from a missing one.
+    #[tokio::test]
+    async fn unauthenticated_request_cannot_probe_cluster_existence() {
+        let (_dir, handler) = console_handler();
+        let app = test_app(handler);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/echo")
+                    .header(HEADER, "ghost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_paths_bypass_cluster_resolution() {
+        let (_dir, handler) = console_handler();
+        let app = test_app(handler);
+        let response = app
+            .oneshot(request("/api/v1/auth/session", Some("ghost")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await["data"]["cluster_id"],
+            json!("default-cluster")
+        );
+    }
+
+    /// The real router: `/clusters` must be routed (it is the SPA entry for the
+    /// cluster manager). The handler itself fails without a built `webui`
+    /// bundle, so the assertion is about routing, not about the payload.
+    #[tokio::test]
+    async fn real_router_routes_the_cluster_pages() {
+        let (_dir, handler) = console_handler();
+        let app = handler.router();
+
+        let response = app
+            .clone()
+            .oneshot(request("/clusters", None))
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+
+        // Contrast: an unregistered SPA path is still a 404.
+        let response = app.oneshot(request("/no-such-page", None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn real_router_serves_the_cluster_api_with_a_session() {
+        let (_dir, handler) = console_handler();
+        let app = handler.router();
+        let response = app
+            .oneshot(request("/api/v1/clusters", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let clusters = body["data"].as_array().expect("cluster list");
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0]["id"], json!("default-cluster"));
+        assert_eq!(clusters[0]["source"], json!("default"));
+        assert_eq!(clusters[1]["id"], json!("cluster-b"));
+        assert_eq!(clusters[1]["source"], json!("file"));
+    }
+
+    #[tokio::test]
+    async fn real_router_requires_auth_for_the_cluster_api() {
+        let (_dir, handler) = console_handler();
+        let app = handler.router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/clusters")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn real_router_scopes_the_legacy_config_endpoint_to_the_selected_cluster() {
+        let (_dir, handler) = console_handler();
+        let app = handler.router();
+        let response = app
+            .oneshot(request("/api/config", Some("cluster-b")))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["cluster_id"], json!("cluster-b"));
+    }
+
+    // -- probe messages are user-facing --------------------------------------
+
+    #[test]
+    fn probe_timeout_message_is_a_sentence() {
+        let failure = MasterInfoFailure::Timeout(Duration::from_secs(3));
+        assert_eq!(failure.message(), "master info request timed out after 3s");
+    }
+
+    #[test]
+    fn sanitize_strips_source_locations() {
+        // Exactly the string the E2E run surfaced to the browser.
+        assert_eq!(
+            sanitize_error_text(
+                "master info request timed out(curvine-web/src/router/admin_handler.rs:1859): "
+            ),
+            "master info request timed out"
+        );
+        assert_eq!(
+            sanitize_error_text(
+                "connect to 127.0.0.1:18995 failed(crates/core/net/src/net/inet_addr.rs:77): \
+                 connection refused"
+            ),
+            "connect to 127.0.0.1:18995 failed: connection refused"
+        );
+    }
+
+    #[test]
+    fn sanitize_keeps_parentheses_that_are_not_source_locations() {
+        assert_eq!(
+            sanitize_error_text("connection refused (os error 111)"),
+            "connection refused (os error 111)"
+        );
+        assert_eq!(sanitize_error_text("  "), "");
+    }
+
+    #[test]
+    fn sanitize_strips_logger_prefixes_and_diagnostic_snippets() {
+        // What `POST /api/v1/clusters/validate` used to return for a text that is
+        // not TOML: a logger tag, the rendered snippet and a source location.
+        let raw = "[alpha-web] ERROR: TOML parse error at line 1, column 14\n  |\n\
+                   1 | cluster_id = alpha\n  |              ^^^^^\ninvalid string\n\
+                   expected `\"`, `'`\n\
+                   (crates/common/curvine-config/src/cluster_conf.rs:161)";
+        assert_eq!(
+            sanitize_error_text(raw),
+            "TOML parse error at line 1, column 14: invalid string; expected `\"`, `'`"
+        );
+
+        // `err_box!` messages arrive with the same logger wrapper and no snippet.
+        assert_eq!(
+            sanitize_error_text(
+                "[alpha-web] ERROR: imported cluster configuration must set a non-empty \
+                 'cluster_id'(crates/common/curvine-config/src/cluster_conf.rs:186)"
+            ),
+            "imported cluster configuration must set a non-empty 'cluster_id'"
+        );
+    }
+
+    #[test]
+    fn an_empty_failure_detail_still_produces_a_message() {
+        let failure = MasterInfoFailure::Unreachable(String::new());
+        assert_eq!(failure.message(), "the cluster could not be reached");
     }
 }

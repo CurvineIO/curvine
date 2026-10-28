@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use curvine_config::ClusterConf;
 use curvine_runtime::runtime::Runtime;
 
+use crate::cluster::{clusters_dir_for, ClusterRegistry};
 use crate::router::AdminRouterHandler;
 use crate::server::WebHandlerService;
 
@@ -24,11 +26,28 @@ use crate::server::WebHandlerService;
 pub struct AdminWebService {
     conf: ClusterConf,
     rt: Arc<Runtime>,
+    /// Overrides the import directory; `None` derives it from `conf` (either
+    /// `web.clusters_dir` or `<cwd>/clusters`).
+    clusters_dir: Option<PathBuf>,
 }
 
 impl AdminWebService {
     pub fn new(conf: ClusterConf, rt: Arc<Runtime>) -> Self {
-        Self { conf, rt }
+        Self {
+            conf,
+            rt,
+            clusters_dir: None,
+        }
+    }
+
+    /// Same as [`AdminWebService::new`] but with an explicit cluster import
+    /// directory, which the binary derives from the `--conf` location.
+    pub fn with_clusters_dir(conf: ClusterConf, rt: Arc<Runtime>, dir: PathBuf) -> Self {
+        Self {
+            conf,
+            rt,
+            clusters_dir: Some(dir),
+        }
     }
 }
 
@@ -36,7 +55,13 @@ impl WebHandlerService for AdminWebService {
     type Item = AdminRouterHandler;
 
     fn get_handler(&self) -> Self::Item {
-        AdminRouterHandler::with_rt(self.conf.clone(), self.rt.clone())
-            .expect("failed to initialize standalone web router")
+        let dir = self
+            .clusters_dir
+            .clone()
+            .unwrap_or_else(|| clusters_dir_for(&self.conf, None));
+        let max = self.conf.web.max_clusters;
+        let registry = ClusterRegistry::new(self.conf.clone(), self.rt.clone(), dir, max)
+            .expect("failed to initialize the cluster registry");
+        AdminRouterHandler::with_registry(self.rt.clone(), Arc::new(registry))
     }
 }

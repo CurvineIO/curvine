@@ -3,6 +3,7 @@ import {
   ArrowLeftRightIcon,
   FolderTreeIcon,
   HardDriveIcon,
+  LayersIcon,
   LayoutDashboardIcon,
   ListChecksIcon,
   RefreshCwIcon,
@@ -54,7 +55,13 @@ export const navigationGroups: NavigationGroup[] = [
         subtitleKey: 'nav.browseSubtitle',
         icon: FolderTreeIcon
       },
-      { to: '/mounts', labelKey: 'nav.mounts', subtitleKey: 'nav.mountsSubtitle', icon: HardDriveIcon }
+      { to: '/mounts', labelKey: 'nav.mounts', subtitleKey: 'nav.mountsSubtitle', icon: HardDriveIcon },
+      {
+        to: '/clusters',
+        labelKey: 'nav.clusters',
+        subtitleKey: 'nav.clustersSubtitle',
+        icon: LayersIcon
+      }
     ]
   },
   {

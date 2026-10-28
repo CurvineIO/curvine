@@ -107,6 +107,7 @@ export function TextAreaField({
   description,
   rows = 10,
   className,
+  disabled = false,
   testId
 }: {
   label: string
@@ -117,6 +118,7 @@ export function TextAreaField({
   description?: string
   rows?: number
   className?: string
+  disabled?: boolean
   testId?: string
 }) {
   return (
@@ -129,6 +131,7 @@ export function TextAreaField({
           placeholder={placeholder}
           rows={rows}
           spellCheck={false}
+          disabled={disabled}
           data-testid={testId}
           className="font-mono text-xs"
           onChange={(event) => onChange(event.target.value)}

@@ -30,7 +30,13 @@ use super::operations::build_operations;
 use super::prometheus_provider::validate_prometheus_metric_name;
 use super::service::ObservabilityService;
 
-pub fn router(service: Arc<ObservabilityService>) -> Router {
+/// Observability API for one cluster.
+///
+/// The service is *not* baked in: `curvine-web` may serve several clusters from
+/// one process, so the per-request [`crate::router::admin_handler`] middleware
+/// inserts the selected cluster's `Arc<ObservabilityService>` into the request
+/// extensions and every handler here reads that extension.
+pub fn router() -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/settings", get(settings).put(update_settings))
@@ -41,7 +47,6 @@ pub fn router(service: Arc<ObservabilityService>) -> Router {
         .route("/query", get(query))
         .route("/dashboard", get(dashboard))
         .route("/operations", get(operations))
-        .layer(Extension(service))
 }
 
 async fn operations(Extension(service): Extension<Arc<ObservabilityService>>) -> Json<Value> {

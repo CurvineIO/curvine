@@ -2,6 +2,7 @@ import { lazy } from 'react'
 import { Navigate, Route, Routes } from 'react-router-dom'
 
 import { RequireAuth } from '@/auth/auth-context'
+import { ClusterListBridge } from '@/cluster/cluster-context'
 import { ConsoleLayout } from '@/components/console-layout'
 import { LoginPage } from '@/pages/login-page'
 
@@ -50,6 +51,9 @@ const ConfigPage = lazy(() =>
 const BlocksPage = lazy(() =>
   import('@/pages/blocks-page').then((module) => ({ default: module.BlocksPage }))
 )
+const ClustersPage = lazy(() =>
+  import('@/pages/clusters-page').then((module) => ({ default: module.ClustersPage }))
+)
 
 /**
  * Route paths must stay in sync with the SPA whitelist hardcoded in
@@ -63,6 +67,7 @@ export function App() {
       <Route
         element={
           <RequireAuth>
+            <ClusterListBridge />
             <ConsoleLayout />
           </RequireAuth>
         }
@@ -78,6 +83,7 @@ export function App() {
         <Route path="observability" element={<ObservabilityPage />} />
         <Route path="operations" element={<OperationsPage />} />
         <Route path="config" element={<ConfigPage />} />
+        <Route path="clusters" element={<ClustersPage />} />
         <Route path="blocks" element={<BlocksPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/overview" replace />} />

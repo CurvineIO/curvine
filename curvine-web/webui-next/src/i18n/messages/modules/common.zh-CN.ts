@@ -81,6 +81,9 @@ export default {
     brandSubtitle: '管理控制台',
     masterReady: 'Master 服务',
     masterReadyHint: '可手动刷新',
+    clusterLabel: '集群',
+    clusterDefault: '默认集群',
+    clusterInvalidToast: "选中的集群 '{id}' 已不存在",
   },
   nav: {
     groupOverview: '概览',
@@ -107,7 +110,9 @@ export default {
     syncJobs: 'UFS 同步进度',
     syncJobsSubtitle: 'FS 模式同步到 UFS 的逐路径进度',
     config: '配置',
-    configSubtitle: '只读集群配置'
+    configSubtitle: '只读集群配置',
+    clusters: '集群',
+    clustersSubtitle: '已注册集群、切换与 TOML 导入'
   },
   login: {
     title: 'Curvine',
