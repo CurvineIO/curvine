@@ -631,7 +631,10 @@ where
             return Self::send_not_leader(self.leader(), env, &self.group);
         }
 
-        match self.storage.register_snapshot(request.snapshot) {
+        match self
+            .storage
+            .register_snapshot(request.snapshot, self.min_commit())
+        {
             Ok(accepted) => {
                 let msg = Builder::success(&env.msg)
                     .proto_header(ReportSnapshotResponse { accepted })
@@ -765,6 +768,33 @@ where
             self.apply_create_snapshot()?;
         }
         Ok(())
+    }
+
+    /// The lowest commit index among voters that still need the log, or `None`
+    /// when no peer bounds the trim (a follower, or a leader without peers).
+    fn min_commit(&self) -> Option<u64> {
+        let raft = &self.raw.raft;
+
+        if !self.is_leader() {
+            return None;
+        }
+
+        let (mut live, mut all) = (u64::MAX, u64::MAX);
+        for (id, pr) in raft.prs().iter() {
+            if *id == raft.id {
+                continue;
+            }
+            all = all.min(pr.committed_index);
+            if pr.recent_active {
+                live = live.min(pr.committed_index);
+            }
+        }
+
+        if all == u64::MAX {
+            return None;
+        }
+
+        Some(if live == u64::MAX { all } else { live })
     }
 
     async fn send_messages(&mut self, msgs: Vec<LibRaftMessage>) -> RaftResult<()> {

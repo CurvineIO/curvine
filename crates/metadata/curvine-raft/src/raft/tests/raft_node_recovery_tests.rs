@@ -21,10 +21,17 @@ use raft::Storage;
 use std::time::Instant;
 
 fn test_node(rt: Arc<Runtime>, id: u64) -> RaftNode<MemLogStorage, HashAppStorage<String, String>> {
+    test_node_with_voters(rt, id, vec![1, 2, 3])
+}
+
+fn test_node_with_voters(
+    rt: Arc<Runtime>,
+    id: u64,
+    mut peer_ids: Vec<u64>,
+) -> RaftNode<MemLogStorage, HashAppStorage<String, String>> {
     let mut conf = JournalConf::with_test();
     conf.rpc_retry_max_duration_ms = 0;
     conf.conn_retry_max_duration_ms = 0;
-    let mut peer_ids = vec![1, 2, 3];
     if !peer_ids.contains(&id) {
         peer_ids.push(id);
     }
@@ -206,6 +213,34 @@ fn become_leader_and_fence(node: &mut RaftNode<MemLogStorage, HashAppStorage<Str
         },
     );
     assert_eq!(node.peer_sessions.get(3), Some(301));
+}
+
+/// Freeze the app store at `index` so the compaction ceiling derived from the
+/// fsm state is predictable.
+fn freeze_applied_index(
+    node: &mut RaftNode<MemLogStorage, HashAppStorage<String, String>>,
+    index: u64,
+) {
+    let applied = AppliedIndex {
+        term: 1,
+        index,
+        op_id: 0,
+        rpc_id: 0,
+    };
+    node.rt
+        .block_on(node.storage.app_store.apply_snapshot(SnapshotData {
+            snapshot_id: index,
+            node_id: 1,
+            create_time: LocalTime::mills(),
+            bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
+            files_data: None,
+            fsm_state: FsmState {
+                applied: applied.clone(),
+                ufs_applied: applied,
+                ..Default::default()
+            },
+        }))
+        .unwrap();
 }
 
 fn remove_entry(id: u64) -> Entry {
@@ -729,6 +764,123 @@ fn follower_snapshot_is_throttled_by_min_interval() {
     );
     assert_eq!(node.last_snapshot_op_id, 4);
     wait_for_snapshot_job(&node);
+}
+
+#[test]
+fn min_commit_is_unbounded_on_a_follower() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    freeze_applied_index(&mut node, 100);
+
+    // A follower trims only its own log, so no peer bounds it and the applied
+    // index caps it where the snapshot itself is trimmed.
+    assert_eq!(node.min_commit(), None);
+}
+
+#[test]
+fn min_commit_on_a_leader_follows_the_slowest_live_voter() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+        pr.recent_active = true;
+    }
+
+    assert_eq!(node.min_commit(), Some(50));
+}
+
+#[test]
+fn min_commit_drops_a_voter_that_stopped_responding() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+    }
+    node.raw.raft.mut_prs().get_mut(2).unwrap().recent_active = true;
+    // Voter 3 has been silent for longer than an election timeout, so its last
+    // reported commit must not hold the ceiling back.
+
+    assert_eq!(node.min_commit(), Some(80));
+}
+
+#[test]
+fn min_commit_holds_at_a_voter_installing_a_snapshot() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+    }
+    node.raw.raft.mut_prs().get_mut(2).unwrap().recent_active = true;
+    // Voter 3 is installing a snapshot at 60 but keeps answering heartbeats, so
+    // it still reports 50: the ceiling must stay there instead of jumping to
+    // the snapshot boundary or to the local applied index.
+    let pr = node.raw.raft.mut_prs().get_mut(3).unwrap();
+    pr.become_snapshot(60);
+    pr.recent_active = true;
+
+    assert_eq!(node.min_commit(), Some(50));
+}
+
+#[test]
+fn min_commit_without_a_live_voter_uses_the_last_known_commit() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+    }
+    // The periodic quorum check resets liveness, so no voter is marked active
+    // right now; the ceiling must not jump to the local applied index.
+
+    assert_eq!(node.min_commit(), Some(50));
+}
+
+#[test]
+fn min_commit_is_unbounded_on_a_single_voter_leader() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node_with_voters(rt, 1, vec![1]);
+    node.raw.raft.become_leader();
+    freeze_applied_index(&mut node, 100);
+
+    // A single-voter group has nobody to hold the trim back, so the local
+    // applied index is the only limit.
+    assert_eq!(node.min_commit(), None);
+}
+
+#[test]
+fn min_commit_with_unreported_voters_trims_nothing() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    // Voters that never reported keep `Progress::new()`'s zero commit, so the
+    // ceiling stays at 0 and the trim is a no-op instead of falling back to the
+    // local applied index.
+    for voter in [2, 3] {
+        node.raw.raft.mut_prs().get_mut(voter).unwrap().recent_active = true;
+    }
+
+    assert_eq!(node.min_commit(), Some(0));
+    assert_eq!(
+        node.storage.get_fsm_state().compact_upto(node.min_commit()),
+        0
+    );
 }
 
 #[test]
