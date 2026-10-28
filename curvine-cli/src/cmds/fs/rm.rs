@@ -46,7 +46,7 @@ impl RmCommand {
                         // If it's a directory and recursive is not set, return error
                         if status.is_dir && !recursive {
                             eprintln!("rm: Cannot remove '{}': Is a directory", path.full_path());
-                            return Ok(());
+                            return Err("Is a directory".into());
                         }
 
                         let deleted = if *async_delete && !*skip_trash {

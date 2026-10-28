@@ -32,7 +32,7 @@ impl GetCommand {
                                 "get: Cannot download '{}': Is a directory",
                                 path.full_path()
                             );
-                            return Ok(());
+                            return Err("Is a directory".into());
                         }
 
                         // Determine the final local path
@@ -61,7 +61,7 @@ impl GetCommand {
                         if let Some(parent) = final_local_path.parent() {
                             if !parent.exists() {
                                 eprintln!("Error: Parent directory '{}' does not exist. Please create it first.", parent.display());
-                                return Ok(());
+                                return Err("Parent directory does not exist".into());
                             }
                         }
 
@@ -84,7 +84,7 @@ impl GetCommand {
                             Ok(file) => file,
                             Err(e) => {
                                 eprintln!("Error creating local file: {}", e);
-                                return Ok(());
+                                return Err(e.into());
                             }
                         };
 
