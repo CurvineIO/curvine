@@ -966,6 +966,7 @@ fn set_lock() {
             lock_flags: LockFlags::Plock,
             start: 0,
             end: 100,
+            session_owned: false,
         };
 
         let conflict = fs.set_lock(&file_path, plock_read.clone()).await.unwrap();

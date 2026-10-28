@@ -280,8 +280,8 @@ impl RocksInodeStore {
         let bytes = self.db.get_cf(Self::CF_COMMON, key)?;
 
         if let Some(bytes) = bytes {
-            let locks: Vec<FileLock> = Serde::deserialize(&bytes)?;
-            Ok(LockMeta::with_vec(locks))
+            // Tolerates records written before session ownership (#1878).
+            Ok(LockMeta::decode_persisted(&bytes)?)
         } else {
             Ok(LockMeta::default())
         }

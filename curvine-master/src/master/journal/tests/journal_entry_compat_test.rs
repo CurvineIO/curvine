@@ -13,8 +13,30 @@
 // limitations under the License.
 
 use super::*;
+use curvine_model::{FileLock, LockFlags, LockType};
 use curvine_runtime::common::SerdeUtils;
 use serde::Serialize;
+
+/// `FileLock` as it was written before session ownership (#1878).
+#[derive(Serialize)]
+struct LegacyFileLock {
+    client_id: String,
+    owner_id: u64,
+    pid: u32,
+    acquire_time: u64,
+    lock_type: LockType,
+    lock_flags: LockFlags,
+    start: u64,
+    end: u64,
+}
+
+#[derive(Serialize)]
+struct LegacySetLocksEntry {
+    op_id: u64,
+    rpc_id: i64,
+    ino: i64,
+    locks: Vec<LegacyFileLock>,
+}
 
 #[derive(Serialize)]
 struct LegacyRenameEntry {
@@ -50,7 +72,7 @@ enum LegacyJournalEntry {
     SetAttr(SetAttrEntry),
     Symlink(SymlinkEntry),
     Link(LinkEntry),
-    SetLocks(SetLocksEntry),
+    SetLocks(LegacySetLocksEntry),
     Free(LegacyFreeEntry),
     UfsApplied(UfsAppliedEntry),
     Snapshot(SnapshotEntry),
@@ -281,5 +303,51 @@ fn trash_purge_batch_round_trips_its_paths() {
             "/.Trash/9-42/dir/file-b".to_string(),
             "/.Trash/9-42/dir".to_string(),
         ]
+    );
+}
+
+/// Locks persisted before #1878 have no trailing `session_owned` flag. Replaying
+/// such a batch must still work: a master restart with an old journal cannot be
+/// allowed to fail, and the replayed locks belong to the legacy TTL path.
+#[test]
+fn legacy_set_locks_batch_replays_as_not_session_owned() {
+    let legacy = LegacyJournalBatch {
+        seq_id: 7,
+        batch: vec![LegacyJournalEntry::SetLocks(LegacySetLocksEntry {
+            op_id: 21,
+            rpc_id: 22,
+            ino: 33,
+            locks: vec![LegacyFileLock {
+                client_id: "legacy-client".to_string(),
+                owner_id: 44,
+                pid: 55,
+                acquire_time: 66,
+                lock_type: LockType::WriteLock,
+                lock_flags: LockFlags::Plock,
+                start: 0,
+                end: 100,
+            }],
+        })],
+    };
+    let bytes = SerdeUtils::serialize(&legacy).unwrap();
+
+    assert!(
+        SerdeUtils::deserialize::<JournalBatch>(&bytes).is_err(),
+        "the current schema must not silently misread the legacy layout"
+    );
+
+    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let JournalEntry::SetLocks(entry) = &batch.batch[0] else {
+        panic!("expected set-locks journal entry");
+    };
+    assert_eq!(entry.ino, 33);
+    assert_eq!(entry.locks.len(), 1);
+    let lock: &FileLock = &entry.locks[0];
+    assert_eq!(lock.client_id, "legacy-client");
+    assert_eq!(lock.owner_id, 44);
+    assert_eq!(lock.acquire_time, 66);
+    assert!(
+        !lock.session_owned,
+        "a lock from before #1878 must not claim a session lease"
     );
 }

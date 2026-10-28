@@ -959,6 +959,14 @@ impl FsClient {
     }
 
     pub async fn set_lock(&self, path: &Path, lock: FileLock) -> FsResult<Option<FileLock>> {
+        // Stamp session ownership at the RPC boundary: FUSE and SDK callers do not
+        // know whether heartbeats are enabled, and the master needs the flag to
+        // decide between session-expiry and `lock_expire_time` reclamation.
+        // `get_lock` deliberately does not stamp anything: it is a query, and the
+        // master judges the locks that already exist.
+        let mut lock = lock;
+        lock.session_owned = self.context.heartbeat_enabled();
+
         let req = SetLockRequest {
             path: path.encode(),
             lock: ProtoUtils::file_lock_to_pb(lock),

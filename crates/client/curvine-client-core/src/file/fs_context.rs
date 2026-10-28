@@ -16,19 +16,20 @@ use crate::block::{BlockClient, BlockClientPool};
 use crate::file::{FsClient, MasterHandshake, WorkerPrecheck};
 use crate::ClientMetrics;
 use curvine_config::ClusterConf;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
+use curvine_fs_api::RpcCode;
 use curvine_io::CacheManager;
 use curvine_io::IOResult;
 use curvine_model::ProtoUtils;
 use curvine_model::{ClientAddress, WorkerAddress, WorkerInfo};
 use curvine_net::net::NetUtils;
-use curvine_proto::ClientAddressProto;
+use curvine_proto::{ClientAddressProto, ClientHeartbeatRequest, ClientHeartbeatResponse};
 use curvine_rpc::client::{ClientConf, ClusterConnector};
 use curvine_runtime::common::{TimeSpent, Utils};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::FastRwLock;
 use fxhash::FxHasher;
-use log::warn;
+use log::{debug, info, warn};
 use moka::policy::EvictionPolicy;
 use moka::sync::{Cache, CacheBuilder};
 use once_cell::sync::OnceCell;
@@ -345,6 +346,93 @@ impl FsContext {
 
     pub fn exclude_workers(&self) -> Vec<u32> {
         self.failed_workers.iter().map(|x| x.1.worker_id).collect()
+    }
+
+    /// Heartbeat cadence this client agreed to, in milliseconds. `0` disables the
+    /// client session lease entirely.
+    pub fn heartbeat_interval_ms(&self) -> u64 {
+        self.conf.client.heartbeat_interval_ms
+    }
+
+    /// Whether this client keeps a master session alive.
+    ///
+    /// Locks acquired by a session-owning client are reclaimed by session expiry
+    /// instead of `lock_expire_time`, so this is stamped onto every `SetLock`.
+    pub fn heartbeat_enabled(&self) -> bool {
+        self.heartbeat_interval_ms() > 0
+    }
+
+    /// Start the client session heartbeat task (T2 of #1867).
+    ///
+    /// The task holds only a `Weak` context and returns as soon as the last strong
+    /// `Arc<FsContext>` is dropped, so a client that goes away stops renewing its
+    /// lease and the master reclaims what it owned after
+    /// `master.client_session_timeout`.
+    ///
+    /// Every client type inherits this by constructing `FsContext` through
+    /// `CurvineFileSystem`, so FUSE, SDK, CLI and libsdk all report liveness
+    /// without per-caller work. `client.heartbeat_interval_ms = 0` opts out.
+    pub fn start_heartbeat_task(context: &Arc<FsContext>) {
+        let interval_ms = context.heartbeat_interval_ms();
+        if interval_ms == 0 {
+            info!("client session heartbeat disabled (client.heartbeat_interval_ms = 0)");
+            return;
+        }
+
+        let context = Arc::downgrade(context);
+        let interval = Duration::from_millis(interval_ms);
+        if let Some(strong_context) = context.upgrade() {
+            strong_context.clone_runtime().spawn(async move {
+                Self::run_heartbeat_task(context, interval).await;
+            });
+        }
+    }
+
+    async fn run_heartbeat_task(context: Weak<FsContext>, interval: Duration) {
+        // The first tick fires immediately, so a session exists before the client
+        // can take its first lock.
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+
+            let Some(context) = context.upgrade() else {
+                return;
+            };
+            if let Err(e) = Self::client_heartbeat(&context).await {
+                // A demoted master answers NotLeader while the client is already
+                // discovering the new leader: expected during failover, so it must
+                // not look like an error in the log.
+                if matches!(e, FsError::NotLeaderMaster(_)) {
+                    debug!("client session heartbeat: master is not active yet: {}", e);
+                } else {
+                    warn!("client session heartbeat: {}", e);
+                }
+            }
+        }
+    }
+
+    async fn client_heartbeat(context: &Arc<FsContext>) -> FsResult<()> {
+        let req = ClientHeartbeatRequest {
+            client: context.client_addr_pb(),
+            heartbeat_interval_ms: context.heartbeat_interval_ms(),
+            pid: std::process::id().into(),
+            mount_point: None,
+            client_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        };
+        let rep: ClientHeartbeatResponse = FsClient::new(context.clone())
+            .rpc(RpcCode::ClientHeartbeat, req)
+            .await?;
+
+        if rep.new_session {
+            info!(
+                "registered client session {} with the master (lease {}ms, heartbeat {}ms)",
+                context.client_addr.client_name,
+                rep.session_timeout_ms,
+                context.heartbeat_interval_ms()
+            );
+        }
+        Ok(())
     }
 
     pub fn start_clean_task(context: &Arc<FsContext>, pool: Arc<BlockClientPool>) {

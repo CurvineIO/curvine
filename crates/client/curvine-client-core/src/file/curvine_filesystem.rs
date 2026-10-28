@@ -55,6 +55,9 @@ impl CurvineFileSystem {
         };
 
         FsContext::start_clean_task(&fs.fs_context, fs.fs_context.block_pool.clone());
+        // Keep the master-side session lease alive so state owned by this client
+        // (locks, writer markers) is reclaimed after a crash instead of lingering.
+        FsContext::start_heartbeat_task(&fs.fs_context);
 
         let c = &fs.conf().client;
         info!(
