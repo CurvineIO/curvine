@@ -1036,10 +1036,44 @@ impl MasterHandler {
             client_version: header.client_version,
         };
 
+        let client_name = hb.address.client_name.clone();
+        let hostname = hb.address.hostname.clone();
+        let mount_point = hb.mount_point.clone();
+        let interval_ms = hb.heartbeat_interval_ms;
+
         let mut sessions = fs.session_map.write();
         let new_session = sessions.heartbeat(hb, now);
+        let session_timeout_ms = sessions.session_timeout_ms();
+        drop(sessions);
+
+        if new_session {
+            // The lease window is the master's, not the client's: a client (or a
+            // modified SDK) reporting a slower interval than the lease allows would
+            // flap between alive and expired, and the reaper could release its locks
+            // while it is still working. Tell the operator once, on first contact.
+            if interval_ms > 0 && interval_ms.saturating_mul(5) > session_timeout_ms {
+                log::warn!(
+                    "client {} reports a {}ms heartbeat interval, which is outside the \
+                     {}ms session lease (expected about {}ms); the master enforces its own \
+                     window, so this session may expire between heartbeats",
+                    client_name,
+                    interval_ms,
+                    session_timeout_ms,
+                    session_timeout_ms / 5
+                );
+            } else {
+                log::info!(
+                    "register client session {} from {} (mount point {:?}, lease {}ms)",
+                    client_name,
+                    hostname,
+                    mount_point,
+                    session_timeout_ms
+                );
+            }
+        }
+
         Ok(ClientHeartbeatResponse {
-            session_timeout_ms: sessions.session_timeout_ms(),
+            session_timeout_ms,
             new_session,
         })
     }
@@ -1559,6 +1593,31 @@ mod tests {
         assert_eq!(s.address.hostname, "client-host");
         assert!(sessions.is_live("c-1", 43_000));
         assert!(!sessions.is_live("c-1", 43_001));
+    }
+
+    #[test]
+    fn process_client_heartbeat_lease_comes_from_the_master_timeout() {
+        let fs = client_heartbeat_fs(&Utils::rand_str(6));
+
+        // The client asks for a lease far longer than the master allows; the
+        // enforced window must stay the master's `client_session_timeout`.
+        let mut header = client_heartbeat_req("greedy-client");
+        header.heartbeat_interval_ms = 3_600_000;
+
+        let first = MasterHandler::process_client_heartbeat(&fs, header, 1_000).unwrap();
+        assert_eq!(first.session_timeout_ms, 30_000);
+
+        let sessions = fs.session_map.read();
+        let s = sessions.get("greedy-client").unwrap();
+        assert_eq!(
+            s.expire_at - s.last_heartbeat,
+            30_000,
+            "a client-reported interval must never widen the enforced lease"
+        );
+        assert_eq!(
+            s.heartbeat_interval_ms, 3_600_000,
+            "the reported interval is still recorded for diagnostics"
+        );
     }
 
     #[test]

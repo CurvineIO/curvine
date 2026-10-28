@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use curvine_model::ClientAddress;
-use std::collections::HashMap;
+use curvine_runtime::common::LocalTime;
+use std::collections::{HashMap, HashSet};
 
 /// Fallback used when the master configuration was not initialized
 /// (for example in tests that build `ClusterConf` without calling `init`).
@@ -57,9 +58,28 @@ pub struct SessionHeartbeat {
 /// Sessions are intentionally not journaled: renewing them through raft on
 /// every heartbeat would be too expensive. A newly elected leader starts with
 /// an empty map and clients re-register on their next heartbeat.
+///
+/// # Lock ordering
+///
+/// This map must never be acquired while `fs_dir` (or anything taken under it)
+/// is held. Paths that need both take a liveness snapshot first and then the
+/// namespace lock:
+///
+/// ```text
+/// session snapshot -> fs_dir -> inode_store
+/// ```
+///
+/// [`SessionMap::live_ids`] exists for exactly that: the lock path snapshots the
+/// live client ids and releases this map before touching any inode, so the
+/// heartbeat handler, the lock path and the session reaper can never take the two
+/// locks in opposite orders.
 pub struct SessionMap {
     sessions: HashMap<String, ClientSession>,
     session_timeout_ms: u64,
+    /// Master-clock instant this map was created (leader epoch start). Consumers
+    /// that must not act on a freshly adopted map -- the reaper's grace window --
+    /// measure from here instead of from a session deadline.
+    created_at: u64,
 }
 
 impl SessionMap {
@@ -72,11 +92,18 @@ impl SessionMap {
         Self {
             sessions: HashMap::new(),
             session_timeout_ms,
+            created_at: LocalTime::mills(),
         }
     }
 
     pub fn session_timeout_ms(&self) -> u64 {
         self.session_timeout_ms
+    }
+
+    /// Start of the current lease epoch: when this map was created, or when the
+    /// last [`SessionMap::clear`] ran.
+    pub fn created_at(&self) -> u64 {
+        self.created_at
     }
 
     /// Register a new session or renew an existing one.
@@ -138,9 +165,25 @@ impl SessionMap {
         self.sessions.remove(client_id)
     }
 
-    /// Drop every session, e.g. when this master steps down from leader.
-    pub fn clear(&mut self) {
+    /// Client ids whose lease is still valid at `now`.
+    ///
+    /// This is the snapshot the lock path uses: take it, drop this map's guard,
+    /// then read `fs_dir`. Expired-but-not-yet-reaped sessions are excluded, so a
+    /// client that stopped heartbeating is not treated as alive.
+    pub fn live_ids(&self, now: u64) -> HashSet<String> {
+        self.sessions
+            .values()
+            .filter(|s| !s.is_expired_at(now))
+            .map(|s| s.client_id().to_string())
+            .collect()
+    }
+
+    /// Drop every session; called when this master steps down from leader. The
+    /// lease epoch restarts at `now`, which is what the reaper's leader-change
+    /// grace window measures from.
+    pub fn clear(&mut self, now: u64) {
         self.sessions.clear();
+        self.created_at = now;
     }
 
     pub fn len(&self) -> usize {
@@ -250,8 +293,30 @@ mod tests {
         assert!(map.remove("c1").is_none());
         assert_eq!(map.len(), 1);
 
-        map.clear();
+        let epoch_before = map.created_at();
+        map.clear(epoch_before + 5_000);
         assert!(map.is_empty());
+        assert_eq!(
+            map.created_at(),
+            epoch_before + 5_000,
+            "a step-down restarts the lease epoch for the grace window"
+        );
+    }
+
+    #[test]
+    fn live_ids_excludes_expired_sessions() {
+        let mut map = SessionMap::new(TIMEOUT);
+        map.heartbeat(hb("c1"), 1_000);
+        map.heartbeat(hb("c2"), 40_000);
+
+        let live = map.live_ids(1_000 + TIMEOUT);
+        assert!(live.contains("c1"), "a lease is live through its deadline");
+        assert!(live.contains("c2"));
+
+        let live = map.live_ids(1_000 + TIMEOUT + 1);
+        assert!(!live.contains("c1"), "expired sessions must not be live");
+        assert!(live.contains("c2"));
+        assert_eq!(map.live_ids(1_000 + TIMEOUT + 1).len(), 1);
     }
 
     #[test]
