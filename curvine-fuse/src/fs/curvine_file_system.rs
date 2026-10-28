@@ -2560,10 +2560,14 @@ mod tests {
             for action in [OpenAction::WriteOnly, OpenAction::ReadWrite] {
                 let mask = CurvineFileSystem::open_userspace_acl_mask(action).unwrap();
                 fs.check_access_permissions(&status, &caller, mask).unwrap();
-                let denied = fs
-                    .check_access_permissions(&status, &hdr(id + 1, id + 1, 0), mask)
-                    .unwrap_err();
-                assert_eq!(denied.errno(), libc::EACCES);
+                // Non-Linux builds bypass permission bits entirely.
+                #[cfg(target_os = "linux")]
+                {
+                    let denied = fs
+                        .check_access_permissions(&status, &hdr(id + 1, id + 1, 0), mask)
+                        .unwrap_err();
+                    assert_eq!(denied.errno(), libc::EACCES);
+                }
                 if mode == 0o660 {
                     fs.check_access_permissions(&status, &hdr(id + 1, id, 0), mask)
                         .unwrap();
