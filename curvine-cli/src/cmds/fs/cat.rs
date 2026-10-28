@@ -93,16 +93,89 @@ async fn copy_to<R: Reader, W: Write>(
 #[cfg(test)]
 mod tests {
     use super::copy_to;
+    use bytes::Bytes;
+    use curvine_error::FsResult;
     use curvine_fs_api::local::LocalReader;
-    use curvine_fs_api::Path;
+    use curvine_fs_api::state::FileStatus;
+    use curvine_fs_api::{Path, Reader};
+    use curvine_io::DataSlice;
+    use std::io::{self, Write};
 
-    async fn cat_bytes(content: &[u8], reader_chunk: usize, cat_chunk: usize) -> Vec<u8> {
-        let dir = tempfile::tempdir().unwrap();
+    /// Reports `len` bytes but serves only `data`, then hits end of file.
+    struct TruncatedReader {
+        path: Path,
+        status: FileStatus,
+        data: Option<Bytes>,
+        len: i64,
+        pos: i64,
+        chunk: DataSlice,
+    }
+
+    impl Reader for TruncatedReader {
+        fn status(&self) -> &FileStatus {
+            &self.status
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn len(&self) -> i64 {
+            self.len
+        }
+
+        fn chunk_mut(&mut self) -> &mut DataSlice {
+            &mut self.chunk
+        }
+
+        fn chunk_size(&self) -> usize {
+            self.len as usize
+        }
+
+        fn pos(&self) -> i64 {
+            self.pos
+        }
+
+        fn pos_mut(&mut self) -> &mut i64 {
+            &mut self.pos
+        }
+
+        async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
+            Ok(self.data.take().map_or(DataSlice::Empty, DataSlice::bytes))
+        }
+
+        async fn seek(&mut self, _pos: i64) -> FsResult<()> {
+            unimplemented!()
+        }
+
+        async fn complete(&mut self) -> FsResult<()> {
+            Ok(())
+        }
+    }
+
+    struct BrokenPipe;
+
+    impl Write for BrokenPipe {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn local_reader(dir: &tempfile::TempDir, content: &[u8], chunk_size: usize) -> LocalReader {
         let file = dir.path().join("data");
         std::fs::write(&file, content).unwrap();
 
         let path = Path::from_str(file.to_str().unwrap()).unwrap();
-        let mut reader = LocalReader::new(&path, reader_chunk).unwrap();
+        LocalReader::new(&path, chunk_size).unwrap()
+    }
+
+    async fn cat_bytes(content: &[u8], reader_chunk: usize, cat_chunk: usize) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = local_reader(&dir, content, reader_chunk);
         let mut out = Vec::new();
         copy_to(&mut reader, &mut out, cat_chunk).await.unwrap();
         out
@@ -124,5 +197,30 @@ mod tests {
     #[tokio::test]
     async fn copies_empty_file() {
         assert!(cat_bytes(b"", 64, 100).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fails_on_premature_end_of_file() {
+        let mut reader = TruncatedReader {
+            path: Path::from_str("/data").unwrap(),
+            status: FileStatus::default(),
+            data: Some(Bytes::from_static(b"12345")),
+            len: 10,
+            pos: 0,
+            chunk: DataSlice::Empty,
+        };
+        let mut out = Vec::new();
+        let err = copy_to(&mut reader, &mut out, 4).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unexpected end of file at 5 of 10 bytes"));
+        assert_eq!(out, b"12345");
+    }
+
+    #[tokio::test]
+    async fn returns_write_error_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = local_reader(&dir, b"hello", 64);
+        assert!(copy_to(&mut reader, &mut BrokenPipe, 100).await.is_err());
     }
 }
