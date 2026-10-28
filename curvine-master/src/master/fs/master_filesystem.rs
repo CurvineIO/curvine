@@ -38,6 +38,7 @@ use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
 use parking_lot::Mutex;
+use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -66,6 +67,27 @@ pub struct CvMetadataSnapshotPage {
     pub entries: Vec<CvMetadataSnapshotEntry>,
     pub next_page_token: Option<String>,
     pub epoch: u64,
+}
+
+/// One client session as reported by the master status surface (#1885).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SessionSummary {
+    pub client_id: String,
+    pub hostname: String,
+    pub ip_addr: String,
+    pub pid: Option<u32>,
+    pub mount_point: Option<String>,
+    pub client_version: Option<String>,
+    pub heartbeat_interval_ms: u64,
+    pub started_at: u64,
+    pub last_heartbeat: u64,
+    pub expire_at: u64,
+    /// Whether the lease is still valid at the time of the snapshot.
+    pub live: bool,
+    /// Locks this client owns that are indexed for reclamation.
+    pub lock_hints: usize,
+    /// Writer markers this client owns.
+    pub writer_hints: usize,
 }
 
 struct CompleteFileOptions {
@@ -2107,6 +2129,48 @@ impl MasterFilesystem {
         fs_dir.set_lock(inp, lock, &validity)
     }
 
+    /// Point-in-time view of the client sessions for the status surface (#1885).
+    ///
+    /// Hint counts come from the ownership index, so a session that owns a lot of
+    /// state is visible *before* it expires.
+    pub fn session_summary(&self) -> FsResult<Vec<SessionSummary>> {
+        let sessions = self.session_map.read();
+        let now = LocalTime::mills();
+        let mut summary = Vec::with_capacity(sessions.len());
+
+        for session in sessions.sessions() {
+            let owners = self
+                .fs_dir
+                .read()
+                .store
+                .get_client_owners(session.client_id())?;
+            let mut summary_entry = SessionSummary {
+                client_id: session.client_id().to_string(),
+                hostname: session.address.hostname.clone(),
+                ip_addr: session.address.ip_addr.clone(),
+                pid: session.pid,
+                mount_point: session.mount_point.clone(),
+                client_version: session.client_version.clone(),
+                heartbeat_interval_ms: session.heartbeat_interval_ms,
+                started_at: session.started_at,
+                last_heartbeat: session.last_heartbeat,
+                expire_at: session.expire_at,
+                live: !session.is_expired_at(now),
+                lock_hints: 0,
+                writer_hints: 0,
+            };
+            for (kind, _) in owners {
+                match kind {
+                    OwnerKind::Lock => summary_entry.lock_hints += 1,
+                    OwnerKind::Writer => summary_entry.writer_hints += 1,
+                }
+            }
+            summary.push(summary_entry);
+        }
+
+        Ok(summary)
+    }
+
     /// Ownership hints held by `client_id`, used by the session reaper (#1884).
     pub fn get_client_owners(&self, client_id: &str) -> FsResult<Vec<(OwnerKind, i64)>> {
         Ok(self.fs_dir.read().store.get_client_owners(client_id)?)
@@ -2182,7 +2246,11 @@ impl MasterFilesystem {
         let mut sessions = self.session_map.write();
         let new_session = sessions.heartbeat(hb, now);
         let session_timeout_ms = sessions.session_timeout_ms();
+        let active = sessions.len() as i64;
         drop(sessions);
+        if let Ok(metrics) = Master::get_metrics() {
+            metrics.active_sessions.set(active);
+        }
 
         if new_session {
             // The lease window is the master's, not the client's: a client reporting
