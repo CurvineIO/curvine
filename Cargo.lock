@@ -2157,6 +2157,7 @@ dependencies = [
  "reqwest 0.12.25",
  "serde",
  "serde_json",
+ "tempfile",
  "tikv-jemallocator",
  "tokio",
 ]
