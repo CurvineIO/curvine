@@ -177,6 +177,12 @@ pub struct MasterConf {
     #[serde(skip)]
     pub lock_expire_time_unit: DurationUnit,
 
+    // Whether `session_owned` locks are released only by their owner or the
+    // session reaper instead of `lock_expire_time` (#1879). Defaults to false:
+    // until the reaper (#1884) exists, a crashed client's lock must still expire
+    // on the legacy TTL. #1884 flips this default to true.
+    pub client_session_lock_lease: bool,
+
     // Client session lease: a client session that has not sent a ClientHeartbeat
     // within this window is considered expired. Should be several times the
     // client heartbeat interval (default 12s).
@@ -469,6 +475,8 @@ impl Default for MasterConf {
             lock_expire_time: "5m".to_string(),
             lock_expire_time_unit: Default::default(),
 
+            client_session_lock_lease: false,
+
             client_session_timeout: "60s".to_string(),
             client_session_timeout_unit: Default::default(),
 
@@ -567,6 +575,17 @@ mod tests {
         assert!(error
             .to_string()
             .contains("trash_check_interval must be greater than zero"));
+    }
+
+    #[test]
+    fn client_session_lock_lease_defaults_off() {
+        let mut conf = MasterConf::default();
+        conf.init().unwrap();
+
+        assert!(
+            !conf.client_session_lock_lease,
+            "session-owned locks must keep the legacy TTL until the reaper exists"
+        );
     }
 
     #[test]

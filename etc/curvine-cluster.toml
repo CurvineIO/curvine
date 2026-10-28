@@ -88,6 +88,13 @@ meta_dir = "testing/meta"
 # and should be several times the client heartbeat interval, otherwise a healthy
 # client can flap between alive and expired between two heartbeats.
 # client_session_timeout = "60s"
+# client_session_lock_lease exempts session-owned locks from lock_expire_time:
+# while it is on, only the owning client or the session reaper releases them.
+# Lock lifetime is decided from each master's local config, so every master in
+# the group must run the same value. A gate-off leader would still expire a
+# healthy client's lock after lock_expire_time, which is the regression #1879
+# fixes. Default false; #1884 enables it once the reaper exists.
+# client_session_lock_lease = false
 # Log rotation applies when log_dir is a directory; stdout and stderr are not rotated.
 # max_file_size_mb: rotate when the file reaches this size in MB (default 100, 0 = no size limit).
 # time_rotation: "daily" or "hourly" (default none). Combined with max_file_size_mb, whichever
