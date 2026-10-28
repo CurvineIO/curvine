@@ -2371,6 +2371,29 @@ impl FsDir {
         Ok(meta.find_conflict(lock, validity, LocalTime::mills()))
     }
 
+    /// Drop every session-owned lock of one client on this inode (#1884).
+    ///
+    /// Only session-owned records are touched: a legacy lock of the same client has
+    /// no lease behind it and keeps the `lock_expire_time` path. Returns whether the
+    /// stored lock table changed; the change is persisted and journalled through the
+    /// same `SetLocks` entry a normal unlock uses, so replay reproduces it.
+    pub fn release_client_locks(&self, ino: i64, client_id: &str) -> FsResult<bool> {
+        let meta = self.store.get_locks(ino)?;
+        let before = meta.to_vec();
+        let kept: Vec<FileLock> = before
+            .iter()
+            .filter(|lock| !(lock.session_owned && lock.client_id == client_id))
+            .cloned()
+            .collect();
+        if kept.len() == before.len() {
+            return Ok(false);
+        }
+
+        self.store.apply_set_locks(ino, &kept)?;
+        self.journal_writer.log_set_locks(self, ino, kept)?;
+        Ok(true)
+    }
+
     /// Drop one client's writer marker (#1880).
     ///
     /// Idempotent: a replayed or duplicated entry must not fail, and it must never

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::state::SessionHeartbeat;
 use crate::master::fs::{DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
 use crate::master::meta::trash::TrashCursor;
@@ -1021,61 +1020,7 @@ impl MasterHandler {
         header: ClientHeartbeatRequest,
         now: u64,
     ) -> FsResult<ClientHeartbeatResponse> {
-        let address = ProtoUtils::client_address_from_pb(header.client);
-        if address.client_name.is_empty() {
-            return Err(FsError::invalid_argument(
-                "client heartbeat requires a non-empty client_name",
-            ));
-        }
-
-        let hb = SessionHeartbeat {
-            address,
-            heartbeat_interval_ms: header.heartbeat_interval_ms,
-            pid: header.pid,
-            mount_point: header.mount_point,
-            client_version: header.client_version,
-        };
-
-        let client_name = hb.address.client_name.clone();
-        let hostname = hb.address.hostname.clone();
-        let mount_point = hb.mount_point.clone();
-        let interval_ms = hb.heartbeat_interval_ms;
-
-        let mut sessions = fs.session_map.write();
-        let new_session = sessions.heartbeat(hb, now);
-        let session_timeout_ms = sessions.session_timeout_ms();
-        drop(sessions);
-
-        if new_session {
-            // The lease window is the master's, not the client's: a client (or a
-            // modified SDK) reporting a slower interval than the lease allows would
-            // flap between alive and expired, and the reaper could release its locks
-            // while it is still working. Tell the operator once, on first contact.
-            if interval_ms > 0 && interval_ms.saturating_mul(5) > session_timeout_ms {
-                log::warn!(
-                    "client {} reports a {}ms heartbeat interval, which is outside the \
-                     {}ms session lease (expected about {}ms); the master enforces its own \
-                     window, so this session may expire between heartbeats",
-                    client_name,
-                    interval_ms,
-                    session_timeout_ms,
-                    session_timeout_ms / 5
-                );
-            } else {
-                log::info!(
-                    "register client session {} from {} (mount point {:?}, lease {}ms)",
-                    client_name,
-                    hostname,
-                    mount_point,
-                    session_timeout_ms
-                );
-            }
-        }
-
-        Ok(ClientHeartbeatResponse {
-            session_timeout_ms,
-            new_session,
-        })
+        fs.client_heartbeat_at(header, now)
     }
 
     fn metrics_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {

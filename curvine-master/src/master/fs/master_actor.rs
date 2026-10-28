@@ -14,7 +14,7 @@
 
 use crate::master::fs::heartbeat_checker::HeartbeatChecker;
 use crate::master::fs::master_filesystem::MasterFilesystem;
-use crate::master::fs::{FsDirWatchdog, PendingTrashPurger, TrashExpunger};
+use crate::master::fs::{FsDirWatchdog, PendingTrashPurger, SessionReaper, TrashExpunger};
 use crate::master::meta::inode::ttl::TtlHeartbeatChecker;
 use crate::master::meta::inode::ttl::TtlHeartbeatConfig;
 use crate::master::meta::inode::ttl::{InodeTtlExecutor, InodeTtlManager};
@@ -67,8 +67,33 @@ impl MasterActor {
             self.quota_manager.clone(),
         )?;
         Self::start_fs_dir_watchdog(self.fs.clone())?;
+        self.start_session_reaper()?;
         self.start_trash_expunger()?;
         self.start_pending_trash_purger()?;
+        Ok(())
+    }
+
+    /// Reclaim what expired client sessions own (#1884).
+    ///
+    /// Runs at half the session timeout, so a dead client's locks and writer
+    /// markers are released within a bounded multiple of its lease. The reaper
+    /// keeps the leader-change grace window itself, so starting it unconditionally
+    /// is safe.
+    fn start_session_reaper(&mut self) -> CommonResult<()> {
+        let timeout_ms = self.fs.conf.client_session_timeout_ms();
+        if timeout_ms == 0 {
+            info!("session reaper disabled (client_session_timeout = 0)");
+            return Ok(());
+        }
+
+        let interval_ms = (timeout_ms / 2).max(1_000);
+        let reaper = SessionReaper::new(self.fs.clone(), self.master_monitor.clone());
+        let scheduler = ScheduledExecutor::new("session-reaper", interval_ms);
+        scheduler.start(reaper)?;
+        info!(
+            "session reaper started, interval {} ms, session timeout {} ms",
+            interval_ms, timeout_ms
+        );
         Ok(())
     }
 

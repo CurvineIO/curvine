@@ -3441,6 +3441,104 @@ fn test_idempotent_set_locks() -> CommonResult<()> {
     Ok(())
 }
 
+/// A reap must be reproducible on a follower: the reaper only emits `SetLocks` and
+/// `ReleaseWriter`, so replaying the journal has to land on the same lock table,
+/// the same writer markers and the same ownership hints (#1884).
+#[test]
+fn replay_after_a_session_reap_keeps_lock_and_writer_state_consistent() -> CommonResult<()> {
+    use curvine_server::master::fs::SessionReaper;
+
+    let _serial = master_fs_test_serial();
+    let (fs, js, loader, _js2, fs2) = setup_pair("session-reap");
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
+    fs2.master_monitor.set_role_for_test(RoleState::Leader);
+
+    // Leader: one client owns a file (writer marker) and a session-owned lock.
+    let client = "reaped-client".to_string();
+    let mut opts = curvine_model::CreateFileOpts::with_create(true);
+    opts.client_name = client.clone();
+    fs.create_with_opts(
+        "/reaped.log",
+        opts,
+        curvine_model::OpenFlags::new_create().set_overwrite(true),
+    )?;
+    fs.set_lock(
+        "/reaped.log",
+        curvine_model::FileLock {
+            client_id: client.clone(),
+            owner_id: 1,
+            lock_type: curvine_model::LockType::WriteLock,
+            lock_flags: curvine_model::LockFlags::Plock,
+            start: 0,
+            end: 100,
+            session_owned: true,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(
+        fs.get_client_owners(&client)?.len(),
+        2,
+        "the client owns a lock and a writer marker"
+    );
+
+    // Register the session, then reap it once its lease and the grace window are
+    // behind us.
+    fs.client_heartbeat_at(
+        ClientHeartbeatRequest {
+            client: ClientAddressProto {
+                client_name: client.clone(),
+                hostname: "host".to_string(),
+                ip_addr: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            heartbeat_interval_ms: 12_000,
+            pid: Some(1),
+            mount_point: None,
+            client_version: None,
+        },
+        1_000,
+    )?;
+    let now = fs.session_map.read().reclaim_after() + 1;
+    let report = SessionReaper::new(fs.clone(), fs.master_monitor.clone()).reap_once(now)?;
+    assert_eq!(report.writers, 1, "the writer marker must be released");
+    assert_eq!(report.locks, 1, "the session-owned lock must be released");
+    assert!(fs.get_client_owners(&client)?.is_empty());
+
+    replay_all_then_duplicate_last(&js, &loader)?;
+
+    let leader = fs.file_status("/reaped.log")?;
+    let follower = fs2.file_status("/reaped.log")?;
+    assert!(
+        leader.is_complete,
+        "the leader's file must be complete after the writer marker was reaped"
+    );
+    assert!(
+        follower.is_complete,
+        "replay must reproduce the reaped state, so the file is complete again"
+    );
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
+
+    // A probe from another client must find no conflicting lock on either side.
+    let probe = curvine_model::FileLock {
+        client_id: "probe".to_string(),
+        ..Default::default()
+    };
+    assert!(
+        fs.get_lock("/reaped.log", probe.clone())?.is_none(),
+        "the reaped client's lock must be gone on the leader"
+    );
+    assert!(
+        fs2.get_lock("/reaped.log", probe)?.is_none(),
+        "replayed lock table must match the leader's"
+    );
+    assert!(
+        fs2.get_client_owners(&client)?.is_empty(),
+        "replayed ownership hints must match the leader's"
+    );
+    assert_eq!(leader.id, follower.id);
+    Ok(())
+}
+
 #[test]
 fn resize_rejects_extreme_file_size() {
     let _serial = master_fs_test_serial();
