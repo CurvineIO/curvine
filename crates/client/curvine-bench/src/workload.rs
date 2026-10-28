@@ -31,6 +31,7 @@ pub enum BenchOp {
     Stat,
     Rename,
     Delete,
+    DeleteAsync,
     Mkdir,
     Rmdir,
     List,
@@ -50,6 +51,7 @@ impl BenchOp {
             BenchOp::Stat => "stat",
             BenchOp::Rename => "rename",
             BenchOp::Delete => "delete",
+            BenchOp::DeleteAsync => "delete_async",
             BenchOp::Mkdir => "mkdir",
             BenchOp::Rmdir => "rmdir",
             BenchOp::List => "list",
@@ -69,6 +71,7 @@ impl BenchOp {
             BenchOp::Stat => "Stat file",
             BenchOp::Rename => "Rename file",
             BenchOp::Delete => "Delete file",
+            BenchOp::DeleteAsync => "Delete file (async lane)",
             BenchOp::Mkdir => "Mkdir",
             BenchOp::Rmdir => "Rmdir",
             BenchOp::List => "List dir",
@@ -88,6 +91,7 @@ impl BenchOp {
             "stat" | "get_status" => Some(BenchOp::Stat),
             "rename" => Some(BenchOp::Rename),
             "delete" | "unlink" => Some(BenchOp::Delete),
+            "delete_async" => Some(BenchOp::DeleteAsync),
             "mkdir" => Some(BenchOp::Mkdir),
             "rmdir" => Some(BenchOp::Rmdir),
             "list" | "list_status" | "readdir" => Some(BenchOp::List),
@@ -105,6 +109,7 @@ impl BenchOp {
                 | BenchOp::Stat
                 | BenchOp::Rename
                 | BenchOp::Delete
+                | BenchOp::DeleteAsync
                 | BenchOp::Mkdir
                 | BenchOp::Rmdir
                 | BenchOp::List

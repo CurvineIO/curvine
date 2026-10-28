@@ -164,6 +164,15 @@ pub struct MasterMetrics {
     pub(crate) eviction_files_deleted: Counter,
     pub(crate) eviction_bytes_freed: Counter,
 
+    // Trash purge progress. `trash_pending_entries` is the number of entries
+    // waiting in `/.Trash/.pending`; the counters let operators derive average
+    // batch cost and purge throughput without a per-entry histogram.
+    pub(crate) trash_pending_entries: Gauge,
+    pub(crate) trash_purge_batches: Counter,
+    pub(crate) trash_purge_batch_duration_ms: Counter,
+    pub(crate) trash_purge_inodes: Counter,
+    pub(crate) trash_purge_errors: Counter,
+
     pub(crate) ttl_bucket_len: Gauge,
     pub(crate) ttl_total_inodes: Gauge,
     pub(crate) ttl_skipped_inodes: Counter,
@@ -320,6 +329,27 @@ impl MasterMetrics {
                 "eviction_bytes_freed",
                 "Total bytes freed by eviction",
             )?,
+            trash_pending_entries: m::new_gauge(
+                "trash_pending_entries",
+                "Trash entries staged for the async purger in /.Trash/.pending",
+            )?,
+            trash_purge_batches: m::new_counter(
+                "trash_purge_batches",
+                "Number of bounded trash purge batches applied",
+            )?,
+            trash_purge_batch_duration_ms: m::new_counter(
+                "trash_purge_batch_duration_ms",
+                "Total time spent applying trash purge batches (ms); divide by trash_purge_batches for the average",
+            )?,
+            trash_purge_inodes: m::new_counter(
+                "trash_purge_inodes",
+                "Inodes reclaimed by the trash purger",
+            )?,
+            trash_purge_errors: m::new_counter(
+                "trash_purge_errors",
+                "Failed trash purge batches",
+            )?,
+
             ttl_bucket_len: m::new_gauge("ttl_bucket_len", "Number of TTL buckets")?,
             ttl_total_inodes: m::new_gauge("ttl_total_inodes", "Total number of inodes")?,
             ttl_skipped_inodes: m::new_counter(
