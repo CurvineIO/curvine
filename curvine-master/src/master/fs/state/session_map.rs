@@ -106,6 +106,19 @@ impl SessionMap {
         self.created_at
     }
 
+    /// Earliest instant at which state owned by a client that is *not* live may be
+    /// reclaimed.
+    ///
+    /// Two full lease windows from the start of the epoch: the first gives every
+    /// client time to re-register after a leader change, the second absorbs a
+    /// dropped heartbeat. Without this window a failover would reclaim the locks
+    /// of perfectly healthy clients, because a new leader starts with an empty
+    /// map (#1879, #1884).
+    pub fn reclaim_after(&self) -> u64 {
+        self.created_at
+            .saturating_add(self.session_timeout_ms.saturating_mul(2))
+    }
+
     /// Register a new session or renew an existing one.
     /// Returns `true` when the heartbeat created a new session.
     pub fn heartbeat(&mut self, hb: SessionHeartbeat, now: u64) -> bool {

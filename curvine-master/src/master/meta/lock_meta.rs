@@ -1,22 +1,8 @@
-// Copyright 2025 OPPO.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use curvine_core_error::CommonResult;
 use curvine_model::{FileLock, LockFlags, LockType};
-use curvine_runtime::common::{LocalTime, SerdeUtils as Serde};
+use curvine_runtime::common::SerdeUtils as Serde;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// `FileLock` as it was persisted before session ownership (#1878).
 ///
@@ -69,6 +55,62 @@ pub(crate) fn decode_persisted_locks(bytes: &[u8]) -> CommonResult<Vec<FileLock>
     }
 }
 
+/// How a lock's lifetime is judged at one instant (#1879).
+///
+/// Session ownership replaces the fixed TTL for clients that keep a lease alive:
+/// a lock must not be stolen merely because it is old, while a client that
+/// stopped heartbeating must lose its locks in bounded time.
+///
+/// * `session_owned` lock, owner live -> never expired, however old it is.
+/// * `session_owned` lock, owner unknown or expired -> reclaimable only after
+///   [`LockValidity::reclaim_after`]. That window covers a leader change, where
+///   every session is unknown until the clients re-register; without it a
+///   failover would steal the locks of healthy clients.
+/// * legacy lock (`session_owned == false`) -> historical `lock_expire_time` from
+///   `acquire_time`, unchanged, so pre-#1878 clients and their persisted locks
+///   keep working.
+#[derive(Debug, Clone, Default)]
+pub struct LockValidity {
+    /// TTL applied to legacy (non session-owned) locks.
+    pub legacy_expire_ms: u64,
+    /// Client ids whose session lease is valid at the instant of the snapshot.
+    pub live_clients: HashSet<String>,
+    /// Earliest instant (master clock, ms) a session-owned lock may be reclaimed
+    /// when its owner is not live. See [`SessionMap::reclaim_after`].
+    pub reclaim_after: u64,
+}
+
+impl LockValidity {
+    pub fn new(legacy_expire_ms: u64, live_clients: HashSet<String>, reclaim_after: u64) -> Self {
+        Self {
+            legacy_expire_ms,
+            live_clients,
+            reclaim_after,
+        }
+    }
+
+    /// A validity view that treats every session-owned lock as live. Used by
+    /// callers that have no session state at hand (tests, replay paths).
+    pub fn legacy_only(legacy_expire_ms: u64) -> Self {
+        Self::new(legacy_expire_ms, HashSet::new(), u64::MAX)
+    }
+
+    /// Whether `lock` may be reclaimed at `now`.
+    pub fn is_expired(&self, lock: &FileLock, now: u64) -> bool {
+        if lock.session_owned {
+            if self.live_clients.contains(&lock.client_id) {
+                return false;
+            }
+            return now >= self.reclaim_after;
+        }
+
+        if lock.acquire_time == 0 {
+            return true;
+        }
+        now.saturating_sub(lock.acquire_time) > self.legacy_expire_ms
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct LockMeta {
     plock: HashMap<String, Vec<FileLock>>,
@@ -114,13 +156,6 @@ impl LockMeta {
 
     fn key(lock: &FileLock) -> String {
         format!("{}{}", lock.client_id, lock.owner_id)
-    }
-
-    fn is_lock_expired_at(lock: &FileLock, expire_ms: u64, now: u64) -> bool {
-        if lock.acquire_time == 0 {
-            return true;
-        }
-        now.saturating_sub(lock.acquire_time) > expire_ms
     }
 
     pub fn len(&self) -> usize {
@@ -170,15 +205,18 @@ impl LockMeta {
         )
     }
 
-    fn purge_expired_plocks(&mut self, expire_ms: u64) {
+    /// Drop expired POSIX ranges. Returns whether anything was removed.
+    fn purge_expired_plocks(&mut self, validity: &LockValidity, now: u64) -> bool {
         if self.plock.is_empty() {
-            return;
+            return false;
         }
-        let now = LocalTime::mills();
+
+        let before = self.len();
         self.plock.retain(|_, owner_locks| {
-            owner_locks.retain(|lock| !Self::is_lock_expired_at(lock, expire_ms, now));
+            owner_locks.retain(|lock| !validity.is_expired(lock, now));
             !owner_locks.is_empty()
         });
+        self.len() != before
     }
 
     fn subtract_owner_regions(owner_locks: &mut Vec<FileLock>, remove_start: u64, remove_end: u64) {
@@ -197,9 +235,14 @@ impl LockMeta {
         *owner_locks = next;
     }
 
-    fn check_plock_conflict(&mut self, lock: &FileLock, expire_ms: u64) -> Option<FileLock> {
-        self.purge_expired_plocks(expire_ms);
-
+    /// Pure conflict query for POSIX ranges: expired locks are skipped, never
+    /// removed.
+    fn find_plock_conflict(
+        &self,
+        lock: &FileLock,
+        validity: &LockValidity,
+        now: u64,
+    ) -> Option<FileLock> {
         let mut conflict_lock = None;
         for existing_lock in self.plock.values().flatten() {
             if Self::same_owner(lock, existing_lock) {
@@ -210,6 +253,9 @@ impl LockMeta {
             }
             if !Self::regions_overlap(lock.start, lock.end, existing_lock.start, existing_lock.end)
             {
+                continue;
+            }
+            if validity.is_expired(existing_lock, now) {
                 continue;
             }
 
@@ -225,59 +271,55 @@ impl LockMeta {
         conflict_lock
     }
 
-    fn check_flock_conflict(&mut self, lock: &FileLock, expire_ms: u64) -> Option<FileLock> {
-        let mut conflict_lock = None;
-        let now = LocalTime::mills();
-
-        self.flock.retain(|_key, existing_lock| {
-            if Self::is_lock_expired_at(existing_lock, expire_ms, now) {
-                return false;
-            }
-
-            if conflict_lock.is_none()
-                && (existing_lock.client_id != lock.client_id
-                    || existing_lock.owner_id != lock.owner_id)
-            {
-                let is_conflict = matches!(
-                    (lock.lock_type, existing_lock.lock_type),
-                    (LockType::WriteLock, _) | (_, LockType::WriteLock)
-                );
-
-                if is_conflict {
-                    conflict_lock = Some(existing_lock.clone());
-                }
-            }
-
-            true
-        });
-
-        conflict_lock
+    /// Pure conflict query for BSD locks: expired owners are skipped, never
+    /// removed.
+    fn find_flock_conflict(
+        &self,
+        lock: &FileLock,
+        validity: &LockValidity,
+        now: u64,
+    ) -> Option<FileLock> {
+        self.flock
+            .values()
+            .find(|existing| {
+                !Self::same_owner(lock, existing)
+                    && !validity.is_expired(existing, now)
+                    && matches!(
+                        (lock.lock_type, existing.lock_type),
+                        (LockType::WriteLock, _) | (_, LockType::WriteLock)
+                    )
+            })
+            .cloned()
     }
 
-    /// Check if a lock conflicts with existing locks.
+    /// Conflict query without side effects (#1879): `F_GETLK` must not write.
     ///
-    /// During conflict checking, expired locks are automatically removed.
-    /// An expired lock is one where (current_time - acquire_time) > expire_ms.
-    ///
-    /// # Arguments
-    /// * `lock` - The lock to check for conflicts
-    /// * `expire_ms` - Lock expiration time in milliseconds
-    ///
-    /// # Returns
-    /// * `Some(FileLock)` - If a conflicting lock is found, returns the conflicting lock
-    /// * `None` - If no conflict exists (or if lock is UnLock type)
-    pub fn check_conflict(&mut self, lock: &FileLock, expire_ms: u64) -> Option<FileLock> {
+    /// Expired locks are skipped when the answer is computed and left for
+    /// [`LockMeta::set_lock_with_change`] or the session reaper to reclaim. There
+    /// is deliberately no mutating variant: a query that reclaims cannot report
+    /// the change, so the caller would neither persist nor journal it.
+    pub fn find_conflict(
+        &self,
+        lock: &FileLock,
+        validity: &LockValidity,
+        now: u64,
+    ) -> Option<FileLock> {
         if lock.lock_type == LockType::UnLock {
             return None;
         }
 
         match lock.lock_flags {
-            LockFlags::Plock => self.check_plock_conflict(lock, expire_ms),
-            LockFlags::Flock => self.check_flock_conflict(lock, expire_ms),
+            LockFlags::Plock => self.find_plock_conflict(lock, validity, now),
+            LockFlags::Flock => self.find_flock_conflict(lock, validity, now),
         }
     }
 
-    fn set_plock(&mut self, mut lock: FileLock, expire_ms: u64) -> (Option<FileLock>, bool) {
+    fn set_plock(
+        &mut self,
+        mut lock: FileLock,
+        validity: &LockValidity,
+        now: u64,
+    ) -> (Option<FileLock>, bool) {
         let key = Self::key(&lock);
 
         if lock.lock_type == LockType::UnLock {
@@ -287,12 +329,7 @@ impl LockMeta {
                 return (None, false);
             }
 
-            let mut changed = false;
-            let len_before_purge = self.len();
-            self.purge_expired_plocks(expire_ms);
-            if self.len() != len_before_purge {
-                changed = true;
-            }
+            let mut changed = self.purge_expired_plocks(validity, now);
 
             if lock.start == 0 && lock.end == u64::MAX {
                 changed |= self.plock.remove(&key).is_some();
@@ -314,23 +351,30 @@ impl LockMeta {
             return (None, changed);
         }
 
-        let len_before = self.len();
-        // check_plock_conflict already purges expired entries; do not purge again.
-        if let Some(conflict) = self.check_plock_conflict(&lock, expire_ms) {
-            return (Some(conflict), self.len() != len_before);
+        // The persisted state changes whenever expiry reclamation drops something,
+        // even if the new lock itself conflicts.
+        let mut changed = self.purge_expired_plocks(validity, now);
+        if let Some(conflict) = self.find_plock_conflict(&lock, validity, now) {
+            return (Some(conflict), changed);
         }
 
         if let Some(owner_locks) = self.plock.get_mut(&key) {
             Self::subtract_owner_regions(owner_locks, lock.start, lock.end);
         }
 
-        lock.acquire_time = LocalTime::mills();
+        lock.acquire_time = now;
         self.plock.entry(key).or_default().push(lock);
 
-        (None, true)
+        changed = true;
+        (None, changed)
     }
 
-    fn set_flock(&mut self, mut lock: FileLock, expire_ms: u64) -> (Option<FileLock>, bool) {
+    fn set_flock(
+        &mut self,
+        mut lock: FileLock,
+        validity: &LockValidity,
+        now: u64,
+    ) -> (Option<FileLock>, bool) {
         let key = Self::key(&lock);
 
         if lock.lock_type == LockType::UnLock {
@@ -339,46 +383,53 @@ impl LockMeta {
         }
 
         let len_before = self.flock.len();
-        if let Some(conflict) = self.check_flock_conflict(&lock, expire_ms) {
-            return (Some(conflict), self.flock.len() != len_before);
+        self.flock
+            .retain(|_, existing| !validity.is_expired(existing, now));
+        let mut changed = self.flock.len() != len_before;
+
+        if let Some(conflict) = self.find_flock_conflict(&lock, validity, now) {
+            return (Some(conflict), changed);
         }
 
-        lock.acquire_time = LocalTime::mills();
+        lock.acquire_time = now;
         self.flock.insert(key, lock);
 
-        (None, true)
+        changed = true;
+        (None, changed)
     }
 
     /// Set a lock (acquire or release).
     ///
-    /// This method handles both POSIX locks (Plock) and BSD locks (Flock).
-    /// Before setting a new lock, expired locks are automatically cleaned up.
+    /// Locks whose owner is judged reclaimable by `validity` are dropped as part
+    /// of the update, so the caller persists and journals the reclaimed state.
     ///
     /// # Arguments
     /// * `lock` - The lock to set. If lock_type is UnLock, the lock will be released.
-    /// * `expire_ms` - Lock expiration time in milliseconds. Used to clean up expired locks.
+    /// * `validity` - Session liveness view used to judge existing locks.
+    /// * `now` - Master clock (ms) the decision is made at.
     ///
     /// # Returns
     /// * `Some(FileLock)` - If setting the lock would conflict with an existing lock, returns the conflicting lock
     /// * `None` - If the lock was successfully set (or released)
-    ///
-    /// # Behavior
-    /// * For UnLock type: Removes the specified lock(s) from the metadata
-    /// * For ReadLock/WriteLock: Checks for conflicts, removes expired locks, and sets the new lock
-    /// * The acquire_time of the new lock is automatically set to the current time
-    pub fn set_lock(&mut self, lock: FileLock, expire_ms: u64) -> Option<FileLock> {
-        self.set_lock_with_change(lock, expire_ms).0
+    pub fn set_lock(
+        &mut self,
+        lock: FileLock,
+        validity: &LockValidity,
+        now: u64,
+    ) -> Option<FileLock> {
+        self.set_lock_with_change(lock, validity, now).0
     }
 
     /// Like [`Self::set_lock`], but also reports whether persistent lock state changed.
     pub fn set_lock_with_change(
         &mut self,
         lock: FileLock,
-        expire_ms: u64,
+        validity: &LockValidity,
+        now: u64,
     ) -> (Option<FileLock>, bool) {
         match lock.lock_flags {
-            LockFlags::Plock => self.set_plock(lock, expire_ms),
-            LockFlags::Flock => self.set_flock(lock, expire_ms),
+            LockFlags::Plock => self.set_plock(lock, validity, now),
+            LockFlags::Flock => self.set_flock(lock, validity, now),
         }
     }
 }
@@ -386,8 +437,15 @@ impl LockMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use curvine_runtime::common::LocalTime;
+    use std::collections::HashSet;
     use std::thread;
     use std::time::Duration;
+
+    /// Validity view with no sessions at all: reproduces the pre-#1879 TTL rules.
+    fn legacy(expire_ms: u64) -> LockValidity {
+        LockValidity::legacy_only(expire_ms)
+    }
 
     fn create_plock(
         client_id: &str,
@@ -429,7 +487,7 @@ mod tests {
         let expire_ms = 3000;
 
         let lock1 = create_plock("client1", 100, LockType::ReadLock, 0, 100);
-        let result = meta.set_lock(lock1.clone(), expire_ms);
+        let result = meta.set_lock(lock1.clone(), &legacy(expire_ms), LocalTime::mills());
         assert!(result.is_none(), "should successfully set read lock");
 
         let locks = meta.to_vec();
@@ -444,7 +502,7 @@ mod tests {
         let expire_ms = 3000;
 
         let lock1 = create_plock("client1", 100, LockType::WriteLock, 0, 100);
-        let result = meta.set_lock(lock1.clone(), expire_ms);
+        let result = meta.set_lock(lock1.clone(), &legacy(expire_ms), LocalTime::mills());
         assert!(result.is_none(), "should successfully set write lock");
 
         let locks = meta.to_vec();
@@ -458,7 +516,7 @@ mod tests {
         let expire_ms = 3000;
 
         let lock1 = create_flock("client1", 100, LockType::ReadLock);
-        let result = meta.set_lock(lock1.clone(), expire_ms);
+        let result = meta.set_lock(lock1.clone(), &legacy(expire_ms), LocalTime::mills());
         assert!(result.is_none(), "should successfully set BSD read lock");
 
         let locks = meta.to_vec();
@@ -472,7 +530,7 @@ mod tests {
         let expire_ms = 3000;
 
         let lock1 = create_flock("client1", 100, LockType::WriteLock);
-        let result = meta.set_lock(lock1.clone(), expire_ms);
+        let result = meta.set_lock(lock1.clone(), &legacy(expire_ms), LocalTime::mills());
         assert!(result.is_none(), "should successfully set BSD write lock");
 
         let locks = meta.to_vec();
@@ -486,10 +544,12 @@ mod tests {
         let expire_ms = 3000;
 
         let lock1 = create_plock("client1", 100, LockType::WriteLock, 0, 100);
-        assert!(meta.set_lock(lock1, expire_ms).is_none());
+        assert!(meta
+            .set_lock(lock1, &legacy(expire_ms), LocalTime::mills())
+            .is_none());
 
         let lock2 = create_plock("client2", 200, LockType::WriteLock, 50, 150);
-        let conflict = meta.set_lock(lock2, expire_ms);
+        let conflict = meta.set_lock(lock2, &legacy(expire_ms), LocalTime::mills());
         assert!(conflict.is_some(), "should detect conflict");
         assert_eq!(conflict.unwrap().client_id, "client1");
     }
@@ -500,10 +560,12 @@ mod tests {
         let expire_ms = 3000;
 
         let lock1 = create_flock("client1", 100, LockType::WriteLock);
-        assert!(meta.set_lock(lock1, expire_ms).is_none());
+        assert!(meta
+            .set_lock(lock1, &legacy(expire_ms), LocalTime::mills())
+            .is_none());
 
         let lock2 = create_flock("client2", 200, LockType::WriteLock);
-        let conflict = meta.set_lock(lock2, expire_ms);
+        let conflict = meta.set_lock(lock2, &legacy(expire_ms), LocalTime::mills());
         assert!(conflict.is_some(), "should detect conflict");
         assert_eq!(conflict.unwrap().client_id, "client1");
     }
@@ -519,14 +581,29 @@ mod tests {
         let locks_before = meta.to_vec();
         assert_eq!(locks_before.len(), 1);
 
-        thread::sleep(Duration::from_millis(100));
-
         let new_lock = create_plock("client2", 200, LockType::WriteLock, 0, 100);
-        let conflict = meta.check_conflict(&new_lock, expire_ms);
-        assert!(conflict.is_none(), "expired lock should not conflict");
+        let validity = legacy(expire_ms);
+        assert!(
+            meta.find_conflict(&new_lock, &validity, LocalTime::mills())
+                .is_none(),
+            "an expired lock must not conflict"
+        );
+        assert_eq!(
+            meta.to_vec().len(),
+            1,
+            "a query must not reclaim: F_GETLK is a read path"
+        );
 
+        let (conflict, changed) =
+            meta.set_lock_with_change(new_lock, &validity, LocalTime::mills());
+        assert!(conflict.is_none());
+        assert!(
+            changed,
+            "the reclaim must be reported so it can be journaled"
+        );
         let locks_after = meta.to_vec();
-        assert_eq!(locks_after.len(), 0, "expired lock should be removed");
+        assert_eq!(locks_after.len(), 1);
+        assert_eq!(locks_after[0].client_id, "client2");
     }
 
     #[test]
@@ -540,14 +617,29 @@ mod tests {
         let locks_before = meta.to_vec();
         assert_eq!(locks_before.len(), 1);
 
-        thread::sleep(Duration::from_millis(100));
-
         let new_lock = create_flock("client2", 200, LockType::WriteLock);
-        let conflict = meta.check_conflict(&new_lock, expire_ms);
-        assert!(conflict.is_none(), "expired lock should not conflict");
+        let validity = legacy(expire_ms);
+        assert!(
+            meta.find_conflict(&new_lock, &validity, LocalTime::mills())
+                .is_none(),
+            "an expired flock must not conflict"
+        );
+        assert_eq!(
+            meta.to_vec().len(),
+            1,
+            "a query must not reclaim: F_GETLK is a read path"
+        );
 
+        let (conflict, changed) =
+            meta.set_lock_with_change(new_lock, &validity, LocalTime::mills());
+        assert!(conflict.is_none());
+        assert!(
+            changed,
+            "the reclaim must be reported so it can be journaled"
+        );
         let locks_after = meta.to_vec();
-        assert_eq!(locks_after.len(), 0, "expired lock should be removed");
+        assert_eq!(locks_after.len(), 1);
+        assert_eq!(locks_after[0].client_id, "client2");
     }
 
     #[test]
@@ -556,10 +648,12 @@ mod tests {
         let expire_ms = 3000;
 
         let lock1 = create_plock("client1", 100, LockType::WriteLock, 0, 100);
-        assert!(meta.set_lock(lock1, expire_ms).is_none());
+        assert!(meta
+            .set_lock(lock1, &legacy(expire_ms), LocalTime::mills())
+            .is_none());
 
         let lock2 = create_plock("client2", 200, LockType::WriteLock, 50, 150);
-        let conflict = meta.check_conflict(&lock2, expire_ms);
+        let conflict = meta.find_conflict(&lock2, &legacy(expire_ms), LocalTime::mills());
         assert!(conflict.is_some(), "non-expired lock should conflict");
         assert_eq!(conflict.unwrap().client_id, "client1");
     }
@@ -570,10 +664,12 @@ mod tests {
         let expire_ms = 3000;
 
         let lock1 = create_flock("client1", 100, LockType::WriteLock);
-        assert!(meta.set_lock(lock1, expire_ms).is_none());
+        assert!(meta
+            .set_lock(lock1, &legacy(expire_ms), LocalTime::mills())
+            .is_none());
 
         let lock2 = create_flock("client2", 200, LockType::WriteLock);
-        let conflict = meta.check_conflict(&lock2, expire_ms);
+        let conflict = meta.find_conflict(&lock2, &legacy(expire_ms), LocalTime::mills());
         assert!(conflict.is_some(), "non-expired lock should conflict");
         assert_eq!(conflict.unwrap().client_id, "client1");
     }
@@ -584,10 +680,12 @@ mod tests {
         let expire_ms = 3000;
 
         let lock1 = create_plock("client1", 100, LockType::ReadLock, 0, 100);
-        assert!(meta.set_lock(lock1, expire_ms).is_none());
+        assert!(meta
+            .set_lock(lock1, &legacy(expire_ms), LocalTime::mills())
+            .is_none());
 
         let lock2 = create_plock("client2", 200, LockType::ReadLock, 50, 150);
-        let conflict = meta.check_conflict(&lock2, expire_ms);
+        let conflict = meta.find_conflict(&lock2, &legacy(expire_ms), LocalTime::mills());
         assert!(conflict.is_none(), "read locks should not conflict");
     }
 
@@ -597,10 +695,12 @@ mod tests {
         let expire_ms = 3000;
 
         let lock1 = create_flock("client1", 100, LockType::ReadLock);
-        assert!(meta.set_lock(lock1, expire_ms).is_none());
+        assert!(meta
+            .set_lock(lock1, &legacy(expire_ms), LocalTime::mills())
+            .is_none());
 
         let lock2 = create_flock("client2", 200, LockType::ReadLock);
-        let conflict = meta.check_conflict(&lock2, expire_ms);
+        let conflict = meta.find_conflict(&lock2, &legacy(expire_ms), LocalTime::mills());
         assert!(conflict.is_none(), "read locks should not conflict");
     }
 
@@ -612,18 +712,22 @@ mod tests {
         assert!(meta
             .set_lock(
                 create_plock("client1", 100, LockType::WriteLock, 10, 14),
-                expire_ms
+                &legacy(expire_ms),
+                LocalTime::mills(),
             )
             .is_none());
         assert!(meta
             .set_lock(
                 create_plock("client1", 100, LockType::ReadLock, 1, 5),
-                expire_ms
+                &legacy(expire_ms),
+                LocalTime::mills(),
             )
             .is_none());
 
         let query = create_plock("client2", 200, LockType::WriteLock, 0, u64::MAX);
-        let conflict = meta.check_conflict(&query, expire_ms).expect("conflict");
+        let conflict = meta
+            .find_conflict(&query, &legacy(expire_ms), LocalTime::mills())
+            .expect("conflict");
         assert_eq!(conflict.lock_type, LockType::ReadLock);
         assert_eq!(conflict.start, 1);
         assert_eq!(conflict.end, 5);
@@ -638,13 +742,15 @@ mod tests {
         assert!(meta
             .set_lock(
                 create_plock("client1", 100, LockType::WriteLock, 10, 14),
-                expire_ms
+                &legacy(expire_ms),
+                LocalTime::mills(),
             )
             .is_none());
         assert!(meta
             .set_lock(
                 create_plock("client1", 100, LockType::UnLock, 5, 10),
-                expire_ms
+                &legacy(expire_ms),
+                LocalTime::mills(),
             )
             .is_none());
 
@@ -663,13 +769,15 @@ mod tests {
         assert!(meta
             .set_lock(
                 create_plock("client1", 100, LockType::WriteLock, 0, 100),
-                expire_ms
+                &legacy(expire_ms),
+                LocalTime::mills(),
             )
             .is_none());
         assert!(meta
             .set_lock(
                 create_plock("client1", 100, LockType::WriteLock, 50, 60),
-                expire_ms
+                &legacy(expire_ms),
+                LocalTime::mills(),
             )
             .is_none());
 
@@ -692,13 +800,15 @@ mod tests {
         assert!(meta
             .set_lock(
                 create_plock("client1", 100, LockType::WriteLock, 10, 20),
-                expire_ms
+                &legacy(expire_ms),
+                LocalTime::mills(),
             )
             .is_none());
         assert!(meta
             .set_lock(
                 create_plock("client1", 100, LockType::UnLock, 12, 15),
-                expire_ms
+                &legacy(expire_ms),
+                LocalTime::mills(),
             )
             .is_none());
 
@@ -718,7 +828,8 @@ mod tests {
 
         let (conflict, changed) = meta.set_lock_with_change(
             create_plock("client1", 100, LockType::UnLock, 0, u64::MAX),
-            expire_ms,
+            &legacy(expire_ms),
+            LocalTime::mills(),
         );
         assert!(conflict.is_none());
         assert!(!changed);
@@ -733,13 +844,15 @@ mod tests {
         assert!(meta
             .set_lock(
                 create_plock("client1", 100, LockType::WriteLock, 0, 10),
-                expire_ms
+                &legacy(expire_ms),
+                LocalTime::mills(),
             )
             .is_none());
 
         let (conflict, changed) = meta.set_lock_with_change(
             create_plock("client2", 200, LockType::UnLock, 0, u64::MAX),
-            expire_ms,
+            &legacy(expire_ms),
+            LocalTime::mills(),
         );
         assert!(conflict.is_none());
         assert!(!changed);
@@ -754,13 +867,15 @@ mod tests {
         assert!(meta
             .set_lock(
                 create_plock("client1", 100, LockType::WriteLock, 10, 20),
-                expire_ms
+                &legacy(expire_ms),
+                LocalTime::mills(),
             )
             .is_none());
 
         let (conflict, changed) = meta.set_lock_with_change(
             create_plock("client1", 100, LockType::UnLock, 12, 15),
-            expire_ms,
+            &legacy(expire_ms),
+            LocalTime::mills(),
         );
         assert!(conflict.is_none());
         assert!(changed);
@@ -782,13 +897,15 @@ mod tests {
         assert!(meta
             .set_lock(
                 create_plock("client1", 100, LockType::WriteLock, 10, 20),
-                expire_ms
+                &legacy(expire_ms),
+                LocalTime::mills(),
             )
             .is_none());
 
         let (conflict, changed) = meta.set_lock_with_change(
             create_plock("client1", 100, LockType::UnLock, 30, 40),
-            expire_ms,
+            &legacy(expire_ms),
+            LocalTime::mills(),
         );
         assert!(conflict.is_none());
         assert!(!changed);
@@ -805,7 +922,8 @@ mod tests {
         assert!(meta
             .set_lock(
                 create_plock("client1", 100, LockType::WriteLock, 0, 10),
-                expire_ms
+                &legacy(expire_ms),
+                LocalTime::mills(),
             )
             .is_none());
         thread::sleep(Duration::from_millis(expire_ms + 20));
@@ -813,7 +931,8 @@ mod tests {
         // Unlock a different owner so only expiry purge can mutate state.
         let (conflict, changed) = meta.set_lock_with_change(
             create_plock("client2", 200, LockType::UnLock, 0, u64::MAX),
-            expire_ms,
+            &legacy(expire_ms),
+            LocalTime::mills(),
         );
         assert!(conflict.is_none());
         assert!(changed);
@@ -855,5 +974,118 @@ mod tests {
         let meta = LockMeta::decode_persisted(&bytes).unwrap();
 
         assert!(meta.to_vec()[0].session_owned);
+    }
+
+    fn plock(client: &str, owner: u64, lock_type: LockType) -> FileLock {
+        create_plock(client, owner, lock_type, 0, 100)
+    }
+
+    #[test]
+    fn session_owned_lock_outlives_the_legacy_ttl_while_its_owner_stays_live() {
+        let mut meta = LockMeta::default();
+        let validity = LockValidity::new(1_000, HashSet::from(["live-client".to_string()]), 61_000);
+
+        let mut lock = plock("live-client", 1, LockType::WriteLock);
+        lock.session_owned = true;
+        assert!(meta.set_lock(lock, &validity, 1_000).is_none());
+
+        // Ten legacy TTLs later the owner is still heartbeating: the lock must not
+        // be treated as stale, and a competing writer must be rejected.
+        let later = 1_000 + 10_000;
+        let query = plock("other-client", 2, LockType::WriteLock);
+        assert!(
+            meta.find_conflict(&query, &validity, later).is_some(),
+            "a live owner's lock must never be expired by the legacy TTL"
+        );
+        assert!(meta.set_lock(query, &validity, later).is_some());
+        assert_eq!(meta.to_vec().len(), 1);
+        assert_eq!(meta.to_vec()[0].client_id, "live-client");
+    }
+
+    #[test]
+    fn session_owned_lock_is_reclaimed_when_its_owner_is_gone_and_grace_passed() {
+        let mut meta = LockMeta::default();
+        let validity = LockValidity::new(1_000, HashSet::new(), 5_000);
+
+        let mut lock = plock("dead-client", 1, LockType::WriteLock);
+        lock.session_owned = true;
+        assert!(meta.set_lock(lock, &validity, 1_000).is_none());
+
+        let query = plock("other-client", 2, LockType::WriteLock);
+        assert!(
+            meta.find_conflict(&query, &validity, 4_999).is_some(),
+            "before the grace deadline an owner-less lock is still protected"
+        );
+        assert!(
+            meta.find_conflict(&query, &validity, 5_000).is_none(),
+            "past the grace deadline the dead owner's lock is reclaimable"
+        );
+
+        let (conflict, changed) = meta.set_lock_with_change(query, &validity, 5_000);
+        assert!(conflict.is_none());
+        assert!(changed, "reclaiming the stale lock must be journaled");
+        let locks = meta.to_vec();
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].client_id, "other-client");
+    }
+
+    #[test]
+    fn leader_change_grace_window_protects_locks_of_not_yet_reregistered_owners() {
+        // After a leader change the session map is empty, so every session-owned
+        // lock looks owner-less until its client re-registers.
+        let mut meta = LockMeta::default();
+        let validity = LockValidity::new(1_000, HashSet::new(), 121_000);
+
+        let mut lock = plock("re-registering-client", 1, LockType::WriteLock);
+        lock.session_owned = true;
+        assert!(meta.set_lock(lock, &validity, 1_000).is_none());
+
+        let query = plock("other-client", 2, LockType::WriteLock);
+        assert!(
+            meta.find_conflict(&query, &validity, 120_999).is_some(),
+            "a failover must not hand a healthy client's lock to someone else"
+        );
+        assert!(meta.find_conflict(&query, &validity, 121_000).is_none());
+    }
+
+    #[test]
+    fn legacy_lock_keeps_the_ttl_behaviour() {
+        let mut meta = LockMeta::default();
+        let validity = LockValidity::new(1_000, HashSet::new(), u64::MAX);
+
+        let lock = plock("legacy-client", 1, LockType::WriteLock);
+        assert!(meta.set_lock(lock, &validity, 1_000).is_none());
+
+        let query = plock("other-client", 2, LockType::WriteLock);
+        assert!(meta.find_conflict(&query, &validity, 2_000).is_some());
+        // Strictly greater than the TTL, exactly as before #1879.
+        assert!(meta.find_conflict(&query, &validity, 2_001).is_none());
+    }
+
+    #[test]
+    fn find_conflict_does_not_reclaim_anything() {
+        let mut meta = LockMeta::default();
+        let validity = LockValidity::legacy_only(1_000);
+
+        let lock = plock("dead-client", 1, LockType::WriteLock);
+        assert!(meta.set_lock(lock, &validity, 1_000).is_none());
+
+        let query = plock("other-client", 2, LockType::WriteLock);
+        assert!(
+            meta.find_conflict(&query, &validity, 10_000).is_none(),
+            "an expired lock must not be reported as a conflict"
+        );
+        assert_eq!(
+            meta.to_vec().len(),
+            1,
+            "F_GETLK must not reclaim: the read path has to stay free of journals"
+        );
+
+        // The mutating path is what reclaims, and it reports the change so the
+        // caller can persist and journal it.
+        let (conflict, changed) = meta.set_lock_with_change(query, &validity, 10_000);
+        assert!(conflict.is_none());
+        assert!(changed);
+        assert_eq!(meta.to_vec()[0].client_id, "other-client");
     }
 }
