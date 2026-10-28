@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
-use crate::master::meta::BlockMeta;
+use crate::master::meta::{BlockMeta, LegacyFileLock};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
 use curvine_runtime::common::SerdeUtils;
@@ -387,10 +387,32 @@ enum LegacyJournalEntry {
     SetAttr(SetAttrEntry),
     Symlink(SymlinkEntry),
     Link(LinkEntry),
-    SetLocks(SetLocksEntry),
+    SetLocks(LegacySetLocksEntry),
     Free(LegacyFreeEntry),
     UfsApplied(UfsAppliedEntry),
     Snapshot(SnapshotEntry),
+}
+
+/// `SetLocks` as written before session ownership (#1878): the lock payload has
+/// no trailing `session_owned` flag. Batches carrying it only decode through this
+/// legacy mirror, which is why `JournalBatch::deserialize_compat` exists.
+#[derive(Deserialize)]
+struct LegacySetLocksEntry {
+    op_id: u64,
+    rpc_id: i64,
+    ino: i64,
+    locks: Vec<LegacyFileLock>,
+}
+
+impl From<LegacySetLocksEntry> for SetLocksEntry {
+    fn from(entry: LegacySetLocksEntry) -> Self {
+        Self {
+            op_id: entry.op_id,
+            rpc_id: entry.rpc_id,
+            ino: entry.ino,
+            locks: entry.locks.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -442,7 +464,7 @@ impl From<LegacyJournalEntry> for JournalEntry {
             LegacyJournalEntry::SetAttr(entry) => Self::SetAttr(entry),
             LegacyJournalEntry::Symlink(entry) => Self::Symlink(entry),
             LegacyJournalEntry::Link(entry) => Self::Link(entry),
-            LegacyJournalEntry::SetLocks(entry) => Self::SetLocks(entry),
+            LegacyJournalEntry::SetLocks(entry) => Self::SetLocks(entry.into()),
             LegacyJournalEntry::Free(entry) => Self::Free(FreeEntry {
                 op_id: entry.op_id,
                 rpc_id: entry.rpc_id,
