@@ -27,17 +27,30 @@ pub struct SnapshotCommand {
 #[derive(Subcommand, Debug)]
 pub enum SnapshotAction {
     /// Ask the active master to create a metadata snapshot now
+    ///
+    /// The checkpoint runs on the master and cannot be cancelled. On a large
+    /// namespace it can exceed `client.rpc_timeout_ms` (120s by default) even
+    /// though the snapshot succeeds; the retry then reports `a leader snapshot
+    /// is already in progress`. Raise `client.rpc_timeout_ms` in the
+    /// configuration file passed with `--conf` before running this on a large
+    /// namespace.
+    ///
+    /// A call inside `snapshot_min_interval` is rejected; `--force` runs the
+    /// checkpoint anyway, stalling metadata writes for its duration.
     #[command(name = "create")]
-    Create,
+    Create {
+        /// Create the checkpoint even if the last one is inside snapshot_min_interval
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 impl SnapshotCommand {
     pub async fn execute(&self, client: Arc<FsClient>) -> CommonResult<()> {
         match self.action {
-            SnapshotAction::Create => {
-                let info = handle_rpc_result(client.create_leader_snapshot()).await;
+            SnapshotAction::Create { force } => {
+                let info = handle_rpc_result(client.create_leader_snapshot(force)).await;
                 println!("snapshot dir: {}", info.dir);
-                println!("last inode id: {}", info.inode_id);
                 println!("checkpoint cost: {} ms", info.cost_ms);
                 println!("journal truncation and checkpoint retention are applied asynchronously");
                 Ok(())

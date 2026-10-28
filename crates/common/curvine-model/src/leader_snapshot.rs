@@ -16,6 +16,5 @@
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LeaderSnapshotInfo {
     pub dir: String,
-    pub inode_id: i64,
     pub cost_ms: u64,
 }

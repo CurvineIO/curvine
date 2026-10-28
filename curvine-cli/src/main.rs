@@ -306,6 +306,11 @@ mod tests {
             .expect("snapshot create should parse");
 
         assert!(matches!(args.command, Some(Commands::Snapshot(_))));
+
+        let args = CurvineArgs::try_parse_from(["curvine", "snapshot", "create", "--force"])
+            .expect("snapshot create --force should parse");
+
+        assert!(matches!(args.command, Some(Commands::Snapshot(_))));
     }
 
     #[test]

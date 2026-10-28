@@ -1529,8 +1529,8 @@ impl FsDir {
         self.store.create_checkpoint(id)
     }
 
-    pub(crate) fn create_snapshot(&self) -> FsResult<LeaderSnapshotInfo> {
-        self.journal_writer.create_snapshot(self)
+    pub(crate) fn create_snapshot(&self, force: bool) -> FsResult<LeaderSnapshotInfo> {
+        self.journal_writer.create_snapshot(self, force)
     }
 
     pub fn restore<T: AsRef<str>>(&mut self, path: T, checkpoint_size: u64) -> CommonResult<()> {

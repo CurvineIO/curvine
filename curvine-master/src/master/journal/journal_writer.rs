@@ -136,11 +136,10 @@ impl JournalWriter {
         })?;
 
         let cost_ms = spend.used_ms();
-        let inode_id = fs_dir.inode_id.current();
 
         info!(
-            "create leader snapshot, source {}, dir {}, entries {}, cost {} ms, inode_id {}",
-            source, dir, entries, cost_ms, inode_id
+            "create leader snapshot, source {}, dir {}, entries {}, cost {} ms",
+            source, dir, entries, cost_ms
         );
 
         let snapshot_entry = JournalEntry::Snapshot(SnapshotEntry {
@@ -163,11 +162,7 @@ impl JournalWriter {
         self.entries_since_snapshot.set(0);
         self.last_snapshot_ms.set(now);
 
-        Ok(LeaderSnapshotInfo {
-            dir,
-            inode_id,
-            cost_ms,
-        })
+        Ok(LeaderSnapshotInfo { dir, cost_ms })
     }
 
     fn next_checkpoint_id(&self, fs_dir: &FsDir) -> u64 {
@@ -178,9 +173,17 @@ impl JournalWriter {
         id
     }
 
-    pub fn create_snapshot(&self, fs_dir: &FsDir) -> FsResult<LeaderSnapshotInfo> {
+    pub fn create_snapshot(&self, fs_dir: &FsDir, force: bool) -> FsResult<LeaderSnapshotInfo> {
         if !self.enable {
             return err_box!("leader snapshot requires journal.enable = true");
+        }
+
+        if !force && self.inside_snapshot_interval() {
+            return err_box!(
+                "the last leader snapshot was {} ms ago, snapshot_min_interval is {} ms; retry later or pass --force",
+                self.last_snapshot_age_ms(),
+                self.snapshot_min_interval_ms
+            );
         }
 
         if !self.snapshot_in_flight.compare_and_set(false, true) {
@@ -190,6 +193,15 @@ impl JournalWriter {
         let info = self.emit_snapshot(fs_dir, "operator", self.entries_since_snapshot.get());
         self.snapshot_in_flight.set(false);
         info
+    }
+
+    fn inside_snapshot_interval(&self) -> bool {
+        let last = self.last_snapshot_ms.get();
+        last > 0 && self.last_snapshot_age_ms() < self.snapshot_min_interval_ms
+    }
+
+    fn last_snapshot_age_ms(&self) -> u64 {
+        LocalTime::mills().saturating_sub(self.last_snapshot_ms.get())
     }
 
     pub fn log_mkdir(&self, fs_dir: &FsDir, path: impl AsRef<str>, dir: &InodeDir) -> FsResult<()> {
@@ -710,7 +722,7 @@ mod tests {
         let writer = Arc::new(build_writer(&conf)?);
         let fs_dir = build_fs_dir(&conf, writer.clone())?;
 
-        let info = writer.create_snapshot(&fs_dir)?;
+        let info = writer.create_snapshot(&fs_dir, false)?;
 
         assert!(Path::new(&info.dir).exists(), "checkpoint should be kept");
         let entry = writer
@@ -744,9 +756,34 @@ mod tests {
         writer.snapshot_in_flight.set(true);
 
         let err = writer
-            .create_snapshot(&fs_dir)
+            .create_snapshot(&fs_dir, false)
             .expect_err("a concurrent snapshot must be rejected");
         assert!(err.to_string().contains("already in progress"));
+        Ok(())
+    }
+
+    #[test]
+    fn create_snapshot_respects_the_min_interval_unless_forced() -> FsResult<()> {
+        let mut conf = test_conf("snapshot_operator_min_interval");
+        conf.journal.writer_channel_size = 8;
+        conf.journal.snapshot_min_interval = DurationUnit::new(10 * DurationUnit::MINUTE);
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        writer.create_snapshot(&fs_dir, false)?;
+
+        let err = writer
+            .create_snapshot(&fs_dir, false)
+            .expect_err("a second call inside the interval must be rejected");
+        assert!(
+            err.to_string().contains("snapshot_min_interval"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(checkpoint_dirs(&conf).len(), 1);
+
+        writer.create_snapshot(&fs_dir, true)?;
+        assert_eq!(checkpoint_dirs(&conf).len(), 2);
         Ok(())
     }
 
@@ -757,8 +794,8 @@ mod tests {
         let writer = Arc::new(build_writer(&conf)?);
         let fs_dir = build_fs_dir(&conf, writer.clone())?;
 
-        let first = writer.create_snapshot(&fs_dir)?;
-        let second = writer.create_snapshot(&fs_dir)?;
+        let first = writer.create_snapshot(&fs_dir, true)?;
+        let second = writer.create_snapshot(&fs_dir, true)?;
 
         assert_ne!(first.dir, second.dir);
         assert!(
@@ -776,7 +813,7 @@ mod tests {
         let fs_dir = build_fs_dir(&conf, writer.clone())?;
 
         let err = writer
-            .create_snapshot(&fs_dir)
+            .create_snapshot(&fs_dir, false)
             .expect_err("journal disabled must reject operator snapshots");
         assert!(err.to_string().contains("journal.enable"));
         Ok(())
@@ -808,7 +845,7 @@ mod tests {
         let fs_dir = build_fs_dir(&conf, writer.clone())?;
 
         let before = LocalTime::mills();
-        writer.create_snapshot(&fs_dir)?;
+        writer.create_snapshot(&fs_dir, false)?;
 
         assert!(writer.last_snapshot_ms.get() >= before);
         assert!(
