@@ -93,6 +93,8 @@ pub enum RpcCode {
     RestoreTrash = 62,
     EmptyTrash = 63,
 
+    CreateLeaderSnapshot = 70,
+
     // block interface.
     WriteBlock = 80,
     ReadBlock = 81,

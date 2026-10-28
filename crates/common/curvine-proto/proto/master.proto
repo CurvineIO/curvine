@@ -485,3 +485,13 @@ message GetCvMetadataSnapshotPageResponse {
     optional string next_page_token = 2;
     required uint64 epoch = 3;
 }
+
+message CreateLeaderSnapshotRequest {
+    // Create the checkpoint even if the previous one is inside snapshot_min_interval.
+    required bool force = 1;
+}
+
+message CreateLeaderSnapshotResponse {
+    required string dir = 1;
+    required uint64 cost_ms = 2;
+}

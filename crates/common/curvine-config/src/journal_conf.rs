@@ -65,10 +65,16 @@ pub struct JournalConf {
     /// back to: a snapshot is created only when the raft group has a single
     /// node. Set `true` or `false` to override that for every group size.
     ///
-    /// When the leader does not create snapshots, the leader raft log has no
-    /// compaction path until the follower snapshot reporting path lands, so a
-    /// multi-node group must not rely on this default in production yet. A
-    /// running master logs an error every few minutes while it is disabled.
+    /// This switch only gates the periodic trigger. `curvine snapshot create`
+    /// still checkpoints the active master and enqueues a snapshot entry, so an
+    /// operator can compact the leader raft log while the periodic path stays
+    /// off; a multi-node group must not rely on this default in production yet.
+    /// A running master logs an error every few minutes while it is disabled.
+    ///
+    /// A checkpoint flushes RocksDB and copies the metadata store while the
+    /// metadata read lock is held, so metadata writes stall for its duration.
+    /// That write stall is the cost this switch opts out of, and the operator
+    /// path pays it on every call.
     pub leader_create_snapshot: Option<bool>,
 
     // How many entries are created after creating snapshots.
