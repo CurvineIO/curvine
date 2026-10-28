@@ -83,7 +83,7 @@ export default {
     masterReady: 'Master Service',
     masterReadyHint: 'Ready for refresh',
     clusterLabel: 'Cluster',
-    clusterDefault: 'Default cluster',
+    clusterPlaceholder: 'Select cluster',
     clusterInvalidToast: "Selected cluster '{id}' no longer exists",
   },
   nav: {

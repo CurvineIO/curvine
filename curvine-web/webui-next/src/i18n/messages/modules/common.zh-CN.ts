@@ -82,7 +82,7 @@ export default {
     masterReady: 'Master 服务',
     masterReadyHint: '可手动刷新',
     clusterLabel: '集群',
-    clusterDefault: '默认集群',
+    clusterPlaceholder: '选择集群',
     clusterInvalidToast: "选中的集群 '{id}' 已不存在",
   },
   nav: {

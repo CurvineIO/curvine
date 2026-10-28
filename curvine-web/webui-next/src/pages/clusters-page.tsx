@@ -378,8 +378,9 @@ export function ClustersPage() {
   const clusters = useMemo<ClusterSummary[]>(() => (Array.isArray(data) ? data : []), [data])
 
   /**
-   * An empty selection means "follow the backend default", so the default row
-   * is the current one when nothing is pinned.
+   * The selection is a concrete id once the registry answered; until then an
+   * empty value stands for the backend's declared default cluster, which is the
+   * row the switcher itself will settle on.
    */
   const currentId = clusterId || clusters.find((cluster) => cluster.source === 'default')?.id || ''
 

@@ -26,6 +26,27 @@ const EAST: ClusterSummary = {
   removable: true
 }
 
+const WEST: ClusterSummary = {
+  id: 'west',
+  display_name: 'West Lake',
+  source: 'file',
+  master_addrs: ['10.0.0.2:9000'],
+  status: 'ready',
+  editable: true,
+  removable: true
+}
+
+/** The `--conf` cluster: an ordinary list entry that reports `source: 'default'`. */
+const HOME: ClusterSummary = {
+  id: 'home',
+  display_name: 'Home',
+  source: 'default',
+  master_addrs: ['10.0.0.9:9000'],
+  status: 'ready',
+  editable: false,
+  removable: false
+}
+
 /** Exposes the selection state so tests can assert on it without a page. */
 function Probe() {
   const { clusterId, clusters, clustersLoading } = useCluster()
@@ -61,7 +82,7 @@ function renderTree(client: ApiClient, { bridge = false }: { bridge?: boolean } 
             <ToastProvider>
               {bridge ? <ClusterListBridge /> : null}
               <Probe />
-              <SwitchTo id="west" />
+              <SwitchTo id="east" />
               <SwitchTo id="" />
             </ToastProvider>
           </RefreshProvider>
@@ -91,13 +112,13 @@ describe('ClusterSelectionProvider', () => {
     expect(screen.getByTestId('cluster-id').textContent).toBe('')
   })
 
-  it('persists a selection and can be reset to the default', async () => {
+  it('persists a selection and accepts the unresolved (empty) value', async () => {
     const user = userEvent.setup()
     renderTree(makeClient([EAST]).client)
 
-    await user.click(screen.getByRole('button', { name: 'switch to west' }))
-    expect(screen.getByTestId('cluster-id')).toHaveTextContent('west')
-    expect(window.localStorage.getItem(CLUSTER_STORAGE_KEY)).toBe('west')
+    await user.click(screen.getByRole('button', { name: 'switch to east' }))
+    expect(screen.getByTestId('cluster-id')).toHaveTextContent('east')
+    expect(window.localStorage.getItem(CLUSTER_STORAGE_KEY)).toBe('east')
 
     await user.click(screen.getByRole('button', { name: 'switch to default' }))
     expect(screen.getByTestId('cluster-id').textContent).toBe('')
@@ -133,16 +154,47 @@ describe('ClusterListBridge', () => {
     expect(screen.getByTestId('cluster-id')).toHaveTextContent('east')
   })
 
+  it('selects the backend default cluster when nothing is stored', async () => {
+    renderTree(makeClient([EAST, HOME, WEST]).client, { bridge: true })
+
+    // No "follow the default" state: the switcher lists concrete clusters, so
+    // the backend's own cluster is preselected and persisted.
+    await waitFor(() => {
+      expect(screen.getByTestId('cluster-id')).toHaveTextContent('home')
+    })
+    expect(window.localStorage.getItem(CLUSTER_STORAGE_KEY)).toBe('home')
+  })
+
   it('falls back to the default cluster when the stored id is unknown', async () => {
     window.localStorage.setItem(CLUSTER_STORAGE_KEY, 'gone')
 
-    renderTree(makeClient([EAST]).client, { bridge: true })
+    renderTree(makeClient([WEST, HOME]).client, { bridge: true })
 
     await waitFor(() => {
-      expect(screen.getByTestId('cluster-id').textContent).toBe('')
+      expect(screen.getByTestId('cluster-id')).toHaveTextContent('home')
     })
-    expect(window.localStorage.getItem(CLUSTER_STORAGE_KEY)).toBe('')
+    expect(window.localStorage.getItem(CLUSTER_STORAGE_KEY)).toBe('home')
     // The disappearance is explained, not silent.
     expect(await screen.findByTestId('toast-error')).toHaveTextContent(/no longer exists/i)
+  })
+
+  it('prefers a ready cluster when the declared default is not usable', async () => {
+    const brokenHome: ClusterSummary = { ...HOME, status: 'invalid', error: 'bad toml' }
+
+    renderTree(makeClient([brokenHome, WEST]).client, { bridge: true })
+
+    await waitFor(() => {
+      expect(screen.getByTestId('cluster-id')).toHaveTextContent('west')
+    })
+  })
+
+  it('leaves an empty list alone: no registry, so no header and no selection', async () => {
+    renderTree(makeClient([]).client, { bridge: true })
+
+    await waitFor(() => {
+      expect(screen.getByTestId('cluster-loading')).toHaveTextContent('false')
+    })
+    expect(screen.getByTestId('cluster-count')).toHaveTextContent('0')
+    expect(screen.getByTestId('cluster-id').textContent).toBe('')
   })
 })

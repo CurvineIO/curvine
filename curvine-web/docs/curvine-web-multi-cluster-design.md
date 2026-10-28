@@ -217,15 +217,24 @@ ClusterSelectionProvider (localStorage: curvine-cluster)
 ```
 
 - **Header injection**: `createHttpClient({ clusterId })` and `createDownloadClient(clusterId)` add
-  `X-Curvine-Cluster` in a request interceptor; an explicitly set header wins, and an empty selection
-  sends no header at all (so the backend default applies). Uploads/downloads use the same client.
+  `X-Curvine-Cluster` in a request interceptor; an explicitly set header wins. Uploads and downloads
+  use the same client. The header is present on every request as soon as the registry answers, because
+  the selection is always a concrete cluster id; it is absent only before the first list arrives and on
+  a deployment whose backend serves no list at all, which is the single-cluster case where the backend
+  default applies anyway.
+- **The switcher lists clusters, not "default"**: options are labeled by cluster id, and the `--conf`
+  cluster is just one of them (it reports `source: 'default'`). An empty selection is therefore not a
+  user-visible state: as soon as the list arrives the console picks a concrete cluster — the stored id
+  when it is still there, else the declared default cluster when it is ready, else any ready cluster.
+  The clusters page keeps showing the `default` / `file` source badge, so "which one is the built-in
+  cluster" is answered there rather than in the switcher.
 - **Refetch on switch, for free**: the `ApiClient` identity changes with the selection, so every page
   built on `useAsync`/`useApi` re-runs its loader. The switcher additionally fires the existing
   refresh signal, which covers loaders that are not keyed on the api client.
 - **Stale selection**: the stored id is validated against the live list; if the backend no longer
-  knows it, the console falls back to the default cluster and toasts instead of leaving every page on
+  knows it, the console selects the default cluster and toasts instead of leaving every page on
   `404 unknown_cluster`. An empty list is treated as "could not read", not as "cluster removed", so a
-  degraded backend cannot silently reset the operator's choice.
+  degraded backend cannot silently reset the operator's choice (and the switcher stays disabled).
 - **`/clusters` page**: table of registered clusters (status dot, source, master addresses, editable /
   removable), import sheet with validate-before-save, delete with typed confirmation, probe button,
   refresh and rescan (reload).
@@ -326,8 +335,9 @@ file mode on everything written, and the security surface (`401` without a sessi
   probe was not worth it yet.
 - `/report` (the human-readable HTML report) is not cluster-aware; it always renders the default
   cluster. It is a navigation URL, so it cannot carry the header.
-- The built-in cluster switcher lists the default cluster twice (once as the `default` sentinel, once
-  as its own id). Selecting the id is equivalent to the sentinel; the duplication is cosmetic.
+- The cluster switcher labels every entry by cluster id; `display_name` is only a tooltip, because the
+  operator is reasoning about the ids that appear in configs and logs. A deployment that wants pretty
+  names in the topbar needs a small follow-up (show `display_name` with the id as subtitle).
 - No RBAC across clusters: any console session can operate every registered cluster.
 - No HA for imported cluster definitions; they are local files under the console's clusters directory.
 - An import whose master addresses derive to the built-in `localhost` defaults is only a warning today;

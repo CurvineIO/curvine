@@ -25,7 +25,7 @@ import { Toggle } from '@/components/ui/toggle'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { Spinner } from '@/components/ui/spinner'
 import { useAuth } from '@/auth/auth-context'
-import { DEFAULT_CLUSTER_OPTION, useOptionalCluster } from '@/cluster/cluster-context'
+import { useOptionalCluster } from '@/cluster/cluster-context'
 import type { ClusterStatus } from '@/api/types'
 import { useI18n, localeOptions, type AppLocale } from '@/i18n'
 import { cn } from '@/lib/utils'
@@ -53,10 +53,13 @@ function ClusterStatusDot({ status }: { status: ClusterStatus }) {
 /**
  * Cluster switcher in the topbar.
  *
- * `''` (no selection) is rendered through a `default` sentinel because a Radix
- * `SelectItem` cannot carry an empty value: an empty value would make the
- * trigger blank, and the backend's own cluster is a real, selectable choice
- * ("follow the default") rather than "nothing".
+ * Options are the real clusters, labelled by cluster id. There is no "default
+ * cluster" pseudo-option: the backend's own cluster is already a normal entry
+ * in the list (it reports `source: 'default'`) and is preselected when the
+ * console carries no usable stored choice, so a user always picks one concrete
+ * cluster. The control only sits disabled while the registry serves no list at
+ * all, which is exactly the single-cluster deployment that has nothing to
+ * switch between.
  */
 function ClusterSwitcher() {
   const { t } = useI18n()
@@ -66,19 +69,19 @@ function ClusterSwitcher() {
   const clusters = cluster?.clusters ?? []
   const clusterId = cluster?.clusterId ?? ''
   const loading = cluster?.clustersLoading ?? false
-  // No list yet (first load, or the endpoint failed): nothing to switch to, so
-  // the control shows the default cluster and stays disabled.
-  const enabled = clusters.length > 0
-  const value = enabled ? clusterId || DEFAULT_CLUSTER_OPTION : DEFAULT_CLUSTER_OPTION
+  // A Radix `Select` can only display a value that exists as an item, so an id
+  // stored for a list that has not arrived yet would blank the trigger. Fall
+  // back to `''` and show the pending id as placeholder text instead.
+  const value = clusters.some((item) => item.id === clusterId) ? clusterId : ''
 
   return (
     <Select
       value={value}
-      disabled={!enabled}
+      disabled={clusters.length === 0}
       onValueChange={(next) => {
         // Switching cluster invalidates every page's data: the client is rebuilt
         // from the new id, and the refresh signal makes mounted pages re-read.
-        cluster?.setClusterId(next === DEFAULT_CLUSTER_OPTION ? '' : next)
+        cluster?.setClusterId(next)
         triggerRefresh()
       }}
     >
@@ -89,22 +92,19 @@ function ClusterSwitcher() {
         aria-busy={loading || undefined}
         data-testid="cluster-switcher"
       >
-        <SelectValue placeholder={t('layout.clusterDefault')} />
+        <SelectValue placeholder={clusterId || t('layout.clusterPlaceholder')} />
       </SelectTrigger>
       <SelectContent>
         <SelectGroup>
-          <SelectItem value={DEFAULT_CLUSTER_OPTION} textValue={t('layout.clusterDefault')}>
-            {t('layout.clusterDefault')}
-          </SelectItem>
           {clusters.map((item) => (
             <SelectItem
               key={item.id}
               value={item.id}
-              textValue={item.display_name || item.id}
-              title={item.error || undefined}
+              textValue={item.id}
+              title={item.error || item.display_name || undefined}
             >
               <ClusterStatusDot status={item.status} />
-              <span className="truncate">{item.display_name || item.id}</span>
+              <span className="truncate">{item.id}</span>
             </SelectItem>
           ))}
         </SelectGroup>

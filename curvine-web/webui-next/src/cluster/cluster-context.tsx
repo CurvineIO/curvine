@@ -9,14 +9,32 @@ import { useRefreshSignal } from '@/refresh/refresh-context'
 /**
  * Selected cluster, persisted the same way the locale and theme are
  * (`curvine-theme`, `curvine-locale` — the same dash-separated key convention).
- * An empty value means "not selected": the request then carries no cluster
- * header and the backend answers with its own default cluster, which is the
- * behaviour of a single-cluster deployment.
+ *
+ * Once the cluster list is known the selection is always a concrete cluster id:
+ * the switcher lists real clusters only, with no "follow the default" option to
+ * fall back to. An empty value therefore means "not resolved yet" — the moment
+ * before the first list arrives, or a deployment whose backend serves no list
+ * at all. Those requests carry no cluster header and the backend answers with
+ * its own default cluster, which is the single-cluster behaviour.
  */
 export const CLUSTER_STORAGE_KEY = 'curvine-cluster'
 
-/** Sentinel `Select` value for "follow the backend default cluster". */
-export const DEFAULT_CLUSTER_OPTION = 'default'
+/**
+ * Cluster to select when the user has not chosen one, or chose one that is
+ * gone: the backend's declared default cluster when it is usable, else any
+ * ready cluster, else the declared default, else the first entry. A list that
+ * is readable but holds only broken entries still yields a selection — a
+ * visibly invalid cluster beats a switcher with nothing in it.
+ */
+export function defaultClusterId(clusters: ClusterSummary[]): string {
+  const ready = clusters.filter((cluster) => cluster.status === 'ready')
+  const pick =
+    ready.find((cluster) => cluster.source === 'default') ??
+    ready[0] ??
+    clusters.find((cluster) => cluster.source === 'default') ??
+    clusters[0]
+  return pick?.id ?? ''
+}
 
 function readStoredCluster(): string {
   try {
@@ -28,7 +46,7 @@ function readStoredCluster(): string {
 }
 
 interface ClusterContextValue {
-  /** Empty means "follow the backend default cluster". */
+  /** A concrete cluster id once the list is known; empty only before that. */
   clusterId: string
   setClusterId(id: string): void
   clusters: ClusterSummary[]
@@ -129,16 +147,21 @@ function ClusterListSync({ cluster }: { cluster: ClusterContextValue }) {
       setClusters(next)
       setClustersError(null)
 
-      // A stored id that the backend no longer knows about (cluster removed, or a
-      // stale localStorage from another deployment) falls back to the default
-      // cluster instead of leaving every page on a 404. An empty list is *not* a
-      // removal signal: it means the list could not be read, so the selection is
-      // kept rather than silently reset by a degraded backend.
+      // The switcher offers real clusters only, so "nothing selected" is not a
+      // state the user can be left in. The first list, and a stored id that the
+      // backend no longer knows about (cluster removed, or stale localStorage
+      // from another deployment), both resolve to a concrete id instead of
+      // leaving every page on a bare-`/api` 404 wall. An empty list is *not* a
+      // removal signal: it means the list could not be read, or the backend has
+      // no registry at all, so the selection is kept and requests go out without
+      // a cluster header.
+      if (next.length === 0) return
+
       const stored = clusterIdRef.current
-      if (stored && next.length > 0 && !next.some((cluster) => cluster.id === stored)) {
-        setClusterId('')
-        toast.error(t('layout.clusterInvalidToast', { id: stored }))
-      }
+      if (stored && next.some((cluster) => cluster.id === stored)) return
+
+      setClusterId(defaultClusterId(next))
+      if (stored) toast.error(t('layout.clusterInvalidToast', { id: stored }))
     } catch (error) {
       setClustersError(error instanceof Error ? error.message : String(error))
     } finally {
