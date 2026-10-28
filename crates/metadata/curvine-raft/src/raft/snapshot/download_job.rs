@@ -95,9 +95,14 @@ impl DownloadJob {
         let semaphore = Arc::new(Semaphore::new(parallel));
         let mut tasks: JoinSet<RaftResult<()>> = JoinSet::new();
 
-        for file in self.files.files.iter().cloned() {
-            let path = self.get_write_path(&file)?;
+        // Resolve and create every parent directory before the first transfer
+        // starts, so a setup failure cannot return while tasks are running.
+        let mut paths = Vec::with_capacity(total);
+        for file in &self.files.files {
+            paths.push(self.get_write_path(file)?);
+        }
 
+        for (file, path) in self.files.files.iter().cloned().zip(paths) {
             let semaphore = semaphore.clone();
             let client = self.client.clone();
             let dir = self.files.dir.clone();
