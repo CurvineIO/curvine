@@ -25,6 +25,7 @@ use crate::master::meta::{
 use crate::master::fs::state::SessionMap;
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
+use crate::master::meta::store::OwnerKind;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncSessionMap, SyncWorkerManager};
 use curvine_config::{ClusterConf, MasterConf};
@@ -2104,6 +2105,115 @@ impl MasterFilesystem {
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         fs_dir.set_lock(inp, lock, &validity)
+    }
+
+    /// Ownership hints held by `client_id`, used by the session reaper (#1884).
+    pub fn get_client_owners(&self, client_id: &str) -> FsResult<Vec<(OwnerKind, i64)>> {
+        Ok(self.fs_dir.read().store.get_client_owners(client_id)?)
+    }
+
+    /// Drop one ownership hint. The reaper removes hints that no longer match any
+    /// state, so a stale hint is never revisited.
+    pub fn remove_client_owner(&self, client_id: &str, kind: OwnerKind, ino: i64) -> FsResult<()> {
+        Ok(self
+            .fs_dir
+            .read()
+            .store
+            .remove_client_owner(client_id, kind, ino)?)
+    }
+
+    /// Release one client's session-owned locks on `ino`, journalled as `SetLocks`.
+    pub fn release_client_locks(&self, ino: i64, client_id: &str) -> FsResult<bool> {
+        let fs_dir = self.fs_dir.write();
+        fs_dir.release_client_locks(ino, client_id)
+    }
+
+    /// Release one client's writer marker on `ino`, journalled as `ReleaseWriter`.
+    ///
+    /// `FsDir::release_writer` only applies state: the journal entry is written
+    /// here, on the leader path, so replay through `JournalLoader` cannot journal
+    /// its own application.
+    pub fn release_writer(&self, ino: i64, client_id: &str) -> FsResult<bool> {
+        let mut fs_dir = self.fs_dir.write();
+        if !fs_dir.release_writer(ino, client_id)? {
+            return Ok(false);
+        }
+
+        let fs_dir_view: &FsDir = &fs_dir;
+        fs_dir_view
+            .journal_writer
+            .log_release_writer(fs_dir_view, ino, client_id)?;
+        Ok(true)
+    }
+
+    /// Register or renew the lease of one client session (#1877).
+    ///
+    /// The master is the sole authority for the lease window: the interval a client
+    /// reports is recorded for diagnostics only and never extends the lease. `now`
+    /// is a parameter so the expiry and grace boundaries are testable.
+    pub fn client_heartbeat_at(
+        &self,
+        header: curvine_proto::ClientHeartbeatRequest,
+        now: u64,
+    ) -> FsResult<curvine_proto::ClientHeartbeatResponse> {
+        use crate::master::fs::state::SessionHeartbeat;
+        use curvine_proto::ClientHeartbeatResponse;
+
+        let address = ProtoUtils::client_address_from_pb(header.client);
+        if address.client_name.is_empty() {
+            return Err(FsError::invalid_argument(
+                "client heartbeat requires a non-empty client_name",
+            ));
+        }
+
+        let hb = SessionHeartbeat {
+            address,
+            heartbeat_interval_ms: header.heartbeat_interval_ms,
+            pid: header.pid,
+            mount_point: header.mount_point,
+            client_version: header.client_version,
+        };
+
+        let client_name = hb.address.client_name.clone();
+        let hostname = hb.address.hostname.clone();
+        let mount_point = hb.mount_point.clone();
+        let interval_ms = hb.heartbeat_interval_ms;
+
+        let mut sessions = self.session_map.write();
+        let new_session = sessions.heartbeat(hb, now);
+        let session_timeout_ms = sessions.session_timeout_ms();
+        drop(sessions);
+
+        if new_session {
+            // The lease window is the master's, not the client's: a client reporting
+            // a slower interval than the lease allows would flap between alive and
+            // expired, and the reaper could release its locks while it is still
+            // working. Report it once, on first contact.
+            if interval_ms > 0 && interval_ms.saturating_mul(5) > session_timeout_ms {
+                log::warn!(
+                    "client {} reports a {}ms heartbeat interval, which is outside the \
+                     {}ms session lease (expected about {}ms); the master enforces its own \
+                     window, so this session may expire between heartbeats",
+                    client_name,
+                    interval_ms,
+                    session_timeout_ms,
+                    session_timeout_ms / 5
+                );
+            } else {
+                log::info!(
+                    "register client session {} from {} (mount point {:?}, lease {}ms)",
+                    client_name,
+                    hostname,
+                    mount_point,
+                    session_timeout_ms
+                );
+            }
+        }
+
+        Ok(ClientHeartbeatResponse {
+            session_timeout_ms,
+            new_session,
+        })
     }
 
     /// Session liveness view used to judge existing locks (#1879).

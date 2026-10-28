@@ -47,3 +47,6 @@ pub mod policy;
 pub mod context;
 
 pub mod state;
+
+mod session_reaper;
+pub use self::session_reaper::{ReapReport, SessionReaper};
