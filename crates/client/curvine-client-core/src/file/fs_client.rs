@@ -107,6 +107,7 @@ impl_with_client_context!(
 impl_without_client_context!(
     BlockReportListRequest,
     CancelJobRequest,
+    CreateLeaderSnapshotRequest,
     EmptyTrashRequest,
     GetCvMetadataSnapshotPageRequest,
     GetFileBlockDetailsRequest,

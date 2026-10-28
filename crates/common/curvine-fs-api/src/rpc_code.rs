@@ -104,13 +104,14 @@ pub enum RpcCode {
     RestoreTrash = 71,
     EmptyTrash = 72,
 
+    // main-next remapped trash to 70-72; community uses 70 for CreateLeaderSnapshot.
+    CreateLeaderSnapshot = 73,
+
     MetricsReport = 60,
     GetBlockLocationsBatch = 61,
     UpdateRuntimeConfig = 62,
     GetRuntimeConfig = 63,
     ResetRuntimeConfig = 64,
-
-    CreateLeaderSnapshot = 70,
 
     // block interface.
     WriteBlock = 80,

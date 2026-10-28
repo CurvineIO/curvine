@@ -563,7 +563,7 @@ impl fmt::Display for ListOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+
     use super::{CreateFileOpts, CreateFileOptsBuilder, MkdirOptsBuilder};
     use crate::ttl_type::TtlType;
     use crate::{ClientConfDefaults, StorageType, TtlAction, INTERNAL_TTL_TYPE_XATTR};
