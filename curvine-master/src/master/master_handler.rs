@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::master::fs::state::SessionHeartbeat;
 use crate::master::fs::{DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
 use crate::master::meta::trash::TrashCursor;
@@ -37,6 +38,7 @@ use curvine_net::net::ConnState;
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::Message;
+use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::{GroupExecutor, Runtime};
 use dashmap::DashMap;
 use prost::Message as _;
@@ -1008,6 +1010,40 @@ impl MasterHandler {
         ctx.response(SymlinkResponse::default())
     }
 
+    fn client_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: ClientHeartbeatRequest = ctx.parse_header()?;
+        let rep_header = Self::process_client_heartbeat(&self.fs, header, LocalTime::mills())?;
+        ctx.response(rep_header)
+    }
+
+    pub(crate) fn process_client_heartbeat(
+        fs: &MasterFilesystem,
+        header: ClientHeartbeatRequest,
+        now: u64,
+    ) -> FsResult<ClientHeartbeatResponse> {
+        let address = ProtoUtils::client_address_from_pb(header.client);
+        if address.client_name.is_empty() {
+            return Err(FsError::invalid_argument(
+                "client heartbeat requires a non-empty client_name",
+            ));
+        }
+
+        let hb = SessionHeartbeat {
+            address,
+            heartbeat_interval_ms: header.heartbeat_interval_ms,
+            pid: header.pid,
+            mount_point: header.mount_point,
+            client_version: header.client_version,
+        };
+
+        let mut sessions = fs.session_map.write();
+        let new_session = sessions.heartbeat(hb, now);
+        Ok(ClientHeartbeatResponse {
+            session_timeout_ms: sessions.session_timeout_ms(),
+            new_session,
+        })
+    }
+
     fn metrics_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: MetricsReportRequest = ctx.parse_header()?;
 
@@ -1321,6 +1357,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::GetMountInfo => self.get_mount_info(ctx),
 
                 RpcCode::MetricsReport => self.metrics_report(ctx),
+                RpcCode::ClientHeartbeat => self.client_heartbeat(ctx),
                 RpcCode::CreateLeaderSnapshot => self.create_leader_snapshot(ctx),
 
                 // Worker related requests
@@ -1464,6 +1501,74 @@ mod tests {
         // Structured version metadata survives heartbeat -> WorkerInfo ->
         // WorkerInfoProto (filesystem_info) -> WorkerInfo round trip.
         assert_eq!(worker.component_info, Some(component_info));
+    }
+
+    fn client_heartbeat_req(client_name: &str) -> ClientHeartbeatRequest {
+        ClientHeartbeatRequest {
+            client: ClientAddressProto {
+                client_name: client_name.to_string(),
+                hostname: "client-host".to_string(),
+                ip_addr: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            heartbeat_interval_ms: 12_000,
+            pid: Some(4242),
+            mount_point: Some("/mnt/curvine".to_string()),
+            client_version: Some("0.1.0-test".to_string()),
+        }
+    }
+
+    fn client_heartbeat_fs(test_name: &str) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-handler-test/meta-{}", test_name));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-handler-test/journal-{}", test_name));
+        conf.master.client_session_timeout = "30s".to_string();
+        conf.master.init().unwrap();
+        JournalSystem::fs_only_for_test(&conf).unwrap()
+    }
+
+    #[test]
+    fn process_client_heartbeat_registers_then_renews_session() {
+        let fs = client_heartbeat_fs(&Utils::rand_str(6));
+
+        let first =
+            MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 1_000)
+                .unwrap();
+        assert!(first.new_session);
+        assert_eq!(first.session_timeout_ms, 30_000);
+
+        let second =
+            MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 13_000)
+                .unwrap();
+        assert!(!second.new_session);
+
+        // Clones of MasterFilesystem share the same session map.
+        let shared = fs.clone();
+        let sessions = shared.session_map.read();
+        let s = sessions.get("c-1").unwrap();
+        assert_eq!(s.started_at, 1_000);
+        assert_eq!(s.last_heartbeat, 13_000);
+        assert_eq!(s.expire_at, 43_000);
+        assert_eq!(s.pid, Some(4242));
+        assert_eq!(s.mount_point.as_deref(), Some("/mnt/curvine"));
+        assert_eq!(s.address.hostname, "client-host");
+        assert!(sessions.is_live("c-1", 43_000));
+        assert!(!sessions.is_live("c-1", 43_001));
+    }
+
+    #[test]
+    fn process_client_heartbeat_rejects_empty_client_name() {
+        let fs = client_heartbeat_fs(&Utils::rand_str(6));
+
+        let err = MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req(""), 0)
+            .expect_err("empty client_name must be rejected");
+        assert!(err.to_string().contains("non-empty client_name"));
+        assert!(fs.session_map.read().is_empty());
     }
 
     #[test]

@@ -21,10 +21,11 @@ use crate::master::meta::{
     trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
 };
 
+use crate::master::fs::state::SessionMap;
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
-use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
+use crate::master::{Master, MasterMonitor, SyncFsDir, SyncSessionMap, SyncWorkerManager};
 use curvine_config::{ClusterConf, MasterConf};
 use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
 use curvine_error::FsError;
@@ -76,6 +77,8 @@ pub struct MasterFilesystem {
     pub fs_dir: SyncFsDir,
     pub worker_manager: SyncWorkerManager,
     pub master_monitor: MasterMonitor,
+    /// Leader-local client session leases (not journaled).
+    pub session_map: SyncSessionMap,
     pub conf: Arc<MasterConf>,
     full_report_tracker: FullReportTracker,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
@@ -173,6 +176,7 @@ impl MasterFilesystem {
             fs_dir,
             worker_manager,
             master_monitor,
+            session_map: ArcRwLock::new(SessionMap::new(conf.master.client_session_timeout_ms())),
             conf: Arc::new(conf.master.clone()),
             full_report_tracker: Default::default(),
             full_block_reconciles: Default::default(),
@@ -190,6 +194,7 @@ impl MasterFilesystem {
             fs_dir: js.fs().fs_dir.clone(),
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
+            session_map: ArcRwLock::new(SessionMap::new(conf.master.client_session_timeout_ms())),
             conf: Arc::new(conf.master.clone()),
             full_report_tracker: Default::default(),
             full_block_reconciles: Default::default(),

@@ -27,11 +27,12 @@ use curvine_model::{
 };
 use curvine_model::{ListOptions, OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
-    BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
-    CreateFileRequest, CreateLeaderSnapshotRequest, CreateLeaderSnapshotResponse, DeleteRequest,
-    EmptyTrashRequest, EmptyTrashResponse, GetFilesystemInfoRequest, ListTrashRequest,
-    ListTrashResponse, MkdirOptsProto, MkdirRequest, MountRequest, RenameRequest,
-    RestoreTrashRequest, RestoreTrashResponse, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
+    BlockReportInfoProto, BlockReportListRequest, ClientAddressProto, ClientHeartbeatRequest,
+    ClientHeartbeatResponse, CompleteFileRequest, CompleteFileResponse, CreateFileRequest,
+    CreateLeaderSnapshotRequest, CreateLeaderSnapshotResponse, DeleteRequest, EmptyTrashRequest,
+    EmptyTrashResponse, GetFilesystemInfoRequest, ListTrashRequest, ListTrashResponse,
+    MkdirOptsProto, MkdirRequest, MountRequest, RenameRequest, RestoreTrashRequest,
+    RestoreTrashResponse, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -39,7 +40,7 @@ use curvine_raft::raft::RoleState;
 use curvine_rpc::handler::MessageHandler;
 #[cfg(feature = "fault-injection")]
 use curvine_rpc::message::ResponseStatus;
-use curvine_rpc::message::{Builder, MAX_DATE_SIZE};
+use curvine_rpc::message::{Builder, Message, MAX_DATE_SIZE};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
@@ -400,6 +401,61 @@ fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     assert!(!response.is_success());
     let err = response.check_error_ext::<FsError>().unwrap_err();
     assert!(matches!(err, FsError::NotLeaderMaster(_)));
+    Ok(())
+}
+
+fn client_heartbeat_msg(client_name: &str) -> Message {
+    Builder::new_rpc(RpcCode::ClientHeartbeat)
+        .proto_header(ClientHeartbeatRequest {
+            client: ClientAddressProto {
+                client_name: client_name.to_string(),
+                hostname: "client-host".to_string(),
+                ip_addr: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            heartbeat_interval_ms: 12_000,
+            pid: Some(1),
+            mount_point: None,
+            client_version: None,
+        })
+        .build()
+}
+
+#[test]
+fn client_heartbeat_rpc_registers_session_on_leader() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_active_master("client-heartbeat", |_| {});
+    let msg = client_heartbeat_msg("client-heartbeat-1");
+    assert!(
+        handler.is_sync(&msg),
+        "ClientHeartbeat must use the sync handler"
+    );
+
+    let first: ClientHeartbeatResponse = handler.handle(&msg)?.parse_header()?;
+    assert!(first.new_session);
+    assert!(first.session_timeout_ms > 0);
+
+    let second: ClientHeartbeatResponse = handler.handle(&msg)?.parse_header()?;
+    assert!(!second.new_session);
+
+    let fs = handler.clone_fs();
+    let sessions = fs.session_map.read();
+    assert_eq!(sessions.len(), 1);
+    assert!(sessions.get("client-heartbeat-1").is_some());
+    Ok(())
+}
+
+#[test]
+fn client_heartbeat_rpc_to_standby_is_rejected() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler();
+
+    let response = handler.handle(&client_heartbeat_msg("client-heartbeat-standby"))?;
+
+    assert!(!response.is_success());
+    let err = response.check_error_ext::<FsError>().unwrap_err();
+    assert!(matches!(err, FsError::NotLeaderMaster(_)));
+    assert!(handler.clone_fs().session_map.read().is_empty());
     Ok(())
 }
 
