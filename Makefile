@@ -227,40 +227,35 @@ build-hdfs: check-env
 all: build
 
 # 12. Distribution packaging
+VERSION_SH := build/version.sh
+
 dist: all
 	@$(MAKE) dist-only
 
+# The package version comes from the same resolver build.sh uses, so the
+# tar.gz here and the zip from build.sh are named after the same git identity
+# (tag when HEAD is tagged, else branch, always with the short commit).
+# BUILD_VERSION / RELEASE_VERSION still override, for release CI.
 dist-only:
 	@echo "Creating distribution package..."
 	@if [ ! -d "build/dist" ]; then \
 		echo "Error: build/dist directory not found. Please run 'make all' first."; \
 		exit 1; \
 	fi
-	@# Get version from environment variable only
-	@PLATFORM=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	@. $(VERSION_SH); \
+	PLATFORM=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
 	ARCH=$$(uname -m); \
-	if [ -n "$$RELEASE_VERSION" ]; then \
-		VERSION="$$RELEASE_VERSION"; \
-		echo "Using provided version: $$VERSION"; \
-		if [ -n "$$GITHUB_ACTIONS" ]; then \
-			DIST_NAME="curvine-$${VERSION}-$${PLATFORM}-$${ARCH}"; \
-			echo "GitHub Actions detected - using clean naming"; \
-		else \
-			TIMESTAMP=$$(date +%Y%m%d-%H%M%S); \
-			DIST_NAME="curvine-$${VERSION}-$${PLATFORM}-$${ARCH}-$${TIMESTAMP}"; \
-			echo "Local build - adding timestamp"; \
-		fi; \
-	else \
-		echo "No version provided via RELEASE_VERSION environment variable"; \
-		if [ -n "$$GITHUB_ACTIONS" ]; then \
-			DIST_NAME="curvine-$${PLATFORM}-$${ARCH}"; \
-			echo "GitHub Actions detected - no version in package name"; \
-		else \
-			TIMESTAMP=$$(date +%Y%m%d-%H%M%S); \
-			DIST_NAME="curvine-$${PLATFORM}-$${ARCH}-$${TIMESTAMP}"; \
-			echo "Local build - no version, adding timestamp"; \
-		fi; \
+	if [ -n "$$RELEASE_VERSION" ] && [ -z "$$BUILD_VERSION" ]; then \
+		BUILD_VERSION=$$(tag_to_release_version "$$RELEASE_VERSION"); \
+		export BUILD_VERSION; \
 	fi; \
+	VERSION=$$(get_package_version Cargo.toml .); \
+	if [ -z "$$VERSION" ]; then \
+		echo "Error: failed to resolve package version" >&2; \
+		exit 1; \
+	fi; \
+	DIST_NAME="curvine-$${VERSION}-$${PLATFORM}-$${ARCH}"; \
+	echo "Package version: $$VERSION"; \
 	echo "Packaging as: $${DIST_NAME}.tar.gz"; \
 	cd build/dist && tar -czf "../../$${DIST_NAME}.tar.gz" . && cd ../..; \
 	echo "Distribution package created: $${DIST_NAME}.tar.gz"; \
