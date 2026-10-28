@@ -33,7 +33,7 @@ use log::{debug, error, info, warn};
 use prost::Message as PMessage;
 use raft::eraftpb::{ConfChange, Entry, EntryType, MessageType, Snapshot};
 use raft::prelude::ConfChangeType;
-use raft::{RawNode, Ready, SoftState};
+use raft::{Progress, ProgressState, RawNode, Ready, SoftState};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -631,7 +631,10 @@ where
             return Self::send_not_leader(self.leader(), env, &self.group);
         }
 
-        match self.storage.register_snapshot(request.snapshot) {
+        match self
+            .storage
+            .register_snapshot(request.snapshot, self.min_commit())
+        {
             Ok(accepted) => {
                 let msg = Builder::success(&env.msg)
                     .proto_header(ReportSnapshotResponse { accepted })
@@ -765,6 +768,37 @@ where
             self.apply_create_snapshot()?;
         }
         Ok(())
+    }
+
+    /// The lowest commit index among voters that still need the log, or `None`
+    /// when no peer bounds the trim (a follower, or a leader without peers).
+    fn min_commit(&self) -> Option<u64> {
+        let raft = &self.raw.raft;
+
+        if !self.is_leader() {
+            return None;
+        }
+
+        let (mut live, mut all) = (u64::MAX, u64::MAX);
+        for (id, pr) in raft.prs().iter() {
+            if *id == raft.id {
+                continue;
+            }
+            all = all.min(pr.committed_index);
+            if Self::needs_the_log(pr) {
+                live = live.min(pr.committed_index);
+            }
+        }
+
+        if all == u64::MAX {
+            return None;
+        }
+
+        Some(if live == u64::MAX { all } else { live })
+    }
+
+    fn needs_the_log(pr: &Progress) -> bool {
+        pr.recent_active || pr.state == ProgressState::Snapshot || pr.pending_snapshot > 0
     }
 
     async fn send_messages(&mut self, msgs: Vec<LibRaftMessage>) -> RaftResult<()> {
