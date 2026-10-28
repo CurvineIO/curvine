@@ -243,8 +243,9 @@ impl SpdkBdev {
             let info = match env.get_bdev(name) {
                 Some(v) => v,
                 None => {
+                    let msg = env.describe_missing_bdev(name);
                     env.release_handle();
-                    return err_box!("bdev '{}' not found in SpdkEnv", name);
+                    return err_box!("{}", msg);
                 }
             };
 

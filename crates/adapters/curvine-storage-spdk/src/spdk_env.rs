@@ -1360,6 +1360,21 @@ impl SpdkEnv {
             .filter(|b| self.is_bdev_active(b))
     }
 
+    /// Diagnostic for a failed `get_bdev()` lookup: distinguishes unknown vs. inactive-controller.
+    pub fn describe_missing_bdev(&self, name: &str) -> String {
+        match self.bdevs.iter().find(|b| b.name == name) {
+            Some(bdev) => match self.controllers.iter().find(|e| e.ctrlr == bdev.ctrlr) {
+                Some(entry) => format!(
+                    "bdev '{}' exists but its controller is {:?} (not Active), refusing open",
+                    name,
+                    entry.state()
+                ),
+                None => format!("bdev '{}' not found in SpdkEnv", name),
+            },
+            None => format!("bdev '{}' not found in SpdkEnv", name),
+        }
+    }
+
     /// Total capacity across currently active bdevs, in bytes.
     pub fn total_capacity(&self) -> u64 {
         self.active_bdevs().map(|b| b.size_bytes).sum()
@@ -2526,6 +2541,32 @@ mod test {
             .to_string();
         assert!(err.contains("refusing to remap"), "unexpected error: {err}");
         assert_eq!(env.active_bdev_at_slot(1).unwrap().name, "nvme-b");
+    }
+
+    /// Regression: unknown-name vs. inactive-controller must be distinguishable.
+    #[test]
+    fn describe_missing_bdev_distinguishes_unknown_from_inactive() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.controllers[0]
+            .state
+            .store(ControllerState::Detaching as u8, Ordering::Release);
+
+        let unknown = env.describe_missing_bdev("nvme-999");
+        assert!(
+            unknown.contains("not found"),
+            "unexpected message: {unknown}"
+        );
+
+        let inactive = env.describe_missing_bdev("nvme-0");
+        assert!(
+            inactive.contains("exists but its controller is"),
+            "unexpected message: {inactive}"
+        );
+        assert!(
+            inactive.contains("Detaching"),
+            "unexpected message: {inactive}"
+        );
     }
 
     #[test]
