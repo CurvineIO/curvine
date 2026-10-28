@@ -126,12 +126,10 @@ where
             }
 
             SnapshotState::Generating(st) => {
-                let finish = match st.state() {
-                    JobState::Cancelled => true,
-                    JobState::Finished => true,
-                    JobState::Failed => panic!("snap generating"),
-                    _ => false,
-                };
+                let finish = matches!(
+                    st.state(),
+                    JobState::Cancelled | JobState::Finished | JobState::Failed
+                );
 
                 if finish {
                     *snap_state = SnapshotState::Relax;
@@ -139,12 +137,10 @@ where
             }
 
             SnapshotState::Applying(st) => {
-                let finish = match st.state() {
-                    JobState::Cancelled => true,
-                    JobState::Finished => true,
-                    JobState::Failed => panic!("snap applying"),
-                    _ => false,
-                };
+                let finish = matches!(
+                    st.state(),
+                    JobState::Cancelled | JobState::Finished | JobState::Failed
+                );
 
                 if finish {
                     *snap_state = SnapshotState::Relax;
@@ -171,27 +167,6 @@ where
             SnapshotState::Relax => false,
             SnapshotState::Generating(_) => false,
             SnapshotState::Applying(_) => true,
-        }
-    }
-
-    /// Wait for both log snapshot persistence and application restore before
-    /// advancing Ready or acknowledging replication. The job persists the log
-    /// snapshot first; a restart between the two stages reinstalls it locally.
-    pub async fn wait_snapshot_applied(&self) -> RaftResult<()> {
-        loop {
-            let state = self.snap_state.lock().unwrap().clone();
-            match state {
-                SnapshotState::Applying(job) => match job.state() {
-                    JobState::Finished => return Ok(()),
-                    JobState::Failed | JobState::Cancelled => {
-                        return err_box!(
-                            "snapshot application did not complete; refusing to advance Ready"
-                        );
-                    }
-                    _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
-                },
-                _ => return Ok(()),
-            }
         }
     }
 

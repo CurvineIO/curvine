@@ -21,7 +21,7 @@ use crate::raft::recovery::{PeerSessions, Recovery, SessionEvent};
 use crate::raft::storage::{AppStorage, ApplyMsg, LogStorage, PeerStorage};
 use crate::raft::*;
 use crate::utils::SerdeUtils;
-use curvine_core_error::ErrorExt;
+use curvine_core_error::{err_ext, ErrorExt};
 use curvine_io::DataSlice;
 use curvine_net::net::InetAddr;
 use curvine_rpc::client::dispatch::{Callback, Envelope};
@@ -49,6 +49,8 @@ struct PendingReady {
     ready: Ready,
     soft_state: Option<SoftState>,
 }
+
+type PendingPromises = HashMap<i64, Callback>;
 
 pub struct RaftNode<A, B>
 where
@@ -141,72 +143,6 @@ where
         let (session_sender, session_receiver) = mpsc::unbounded_channel();
         // raw.raft.become_candidate();
 
-        let node = Self {
-            rt,
-            raw,
-            client,
-            session: Utils::rand_id(),
-            peer_sessions: PeerSessions::default(),
-            heartbeat_sequence: 0,
-            session_sender,
-            session_receiver,
-            recovery,
-            pending_ready: None,
-            snapshot_done: None,
-            storage,
-            receiver,
-            sender,
-            group,
-            role_monitor,
-            tick_interval,
-            max_batch_size,
-            snapshot_interval_ms,
-            snapshot_min_interval_ms: conf.snapshot_min_interval.as_millis(),
-            snapshot_entries,
-            last_snapshot_ms: LocalTime::mills(),
-            last_snapshot_op_id,
-        };
-
-        Ok(node)
-    }
-
-    // Create a follower node.
-    pub async fn new_follower(
-        rt: Arc<Runtime>,
-        conf: &JournalConf,
-        log_store: A,
-        app_store: B,
-        role_monitor: RoleMonitor,
-        receiver: mpsc::Receiver<Envelope>,
-        sender: mpsc::Sender<Envelope>,
-        logger: &slog::Logger,
-    ) -> RaftResult<Self> {
-        let group = RaftGroup::from_conf(conf);
-        let id = group.get_node_id(&conf.local_addr())?;
-        let recovery = Recovery::load(conf, id)?;
-        let client = RaftClient::new(rt.clone(), &group, conf.new_client_conf());
-        let snapshot_interval_ms = DurationUnit::from_str(&conf.snapshot_interval)
-            .unwrap()
-            .as_millis();
-        let snapshot_entries = conf.snapshot_entries;
-        let tick_interval = Duration::from_millis(conf.raft_tick_interval_ms);
-        let max_batch_size = conf.raft_batch_size.max(1);
-
-        let storage = PeerStorage::new(rt.clone(), id, log_store, app_store, client.clone(), conf);
-        let storage_recovery = storage.recovery_state()?;
-        recovery.validate_storage(id, storage_recovery)?;
-        if recovery.active && storage_recovery != Some(id) {
-            storage.set_recovery_state(Some(id))?;
-        }
-
-        let last_snapshot_op_id = storage.get_fsm_state().op_id();
-        // raft basic configuration.
-        let config = conf.new_raft_conf(id, 0);
-        config.validate()?;
-
-        client.join_cluster(id, &conf.local_addr()).await?;
-        let raw = RawNode::new(&config, storage.clone(), logger)?;
-        let (session_sender, session_receiver) = mpsc::unbounded_channel();
         let node = Self {
             rt,
             raw,
@@ -332,14 +268,16 @@ where
     }
 
     pub async fn run(&mut self) {
-        if let Err(e) = self.run0().await {
+        let mut promise = HashMap::new();
+        if let Err(e) = self.run0(&mut promise).await {
             error!("raft node stop: {}", e);
         }
+
+        Self::fail_pending_promises(&mut promise, "raft node stopped");
         self.role_monitor.advance_exit();
     }
 
-    async fn run0(&mut self) -> RaftResult<()> {
-        let mut promise = HashMap::new();
+    async fn run0(&mut self, promise: &mut PendingPromises) -> RaftResult<()> {
         let mut ticker = interval(self.tick_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -352,7 +290,7 @@ where
                     let result = result.map_err(|_| RaftError::other(
                         "snapshot application completion sender dropped".into()
                     ))?;
-                    self.complete_pending_snapshot(result, &mut promise).await?;
+                    self.complete_pending_snapshot(result, promise).await?;
                 }
 
                 _ = ticker.tick() => {
@@ -369,16 +307,16 @@ where
 
                 result = self.receiver.recv() => {
                     let Some(env) = result else { break };
-                    self.handle_available(env, &mut promise)?;
+                    self.handle_available(env, promise)?;
 
                     for _ in 1..self.max_batch_size {
                         let Ok(env) = self.receiver.try_recv() else { break };
-                        self.handle_available(env, &mut promise)?;
+                        self.handle_available(env, promise)?;
                     }
                 }
             }
 
-            self.on_ready(&mut promise).await?;
+            self.on_ready(promise).await?;
             if self.recovery.active
                 && self.pending_ready.is_none()
                 && !self.storage.is_snapshot_applying()
@@ -419,6 +357,14 @@ where
                     }
                 }
             }
+
+            // Step-down is the only drain, but it fires on a role change and an
+            // idle follower or candidate produces no Ready at all. Whatever is
+            // still parked here outlived a term this node no longer leads, so no
+            // later entry can apply it: answer it instead of leaking the caller.
+            if !self.is_leader() && !promise.is_empty() {
+                Self::fail_pending_promises(promise, "raft node is not the leader");
+            }
         }
 
         Ok(())
@@ -436,7 +382,7 @@ where
     async fn complete_pending_snapshot(
         &mut self,
         result: RaftResult<()>,
-        promise: &mut HashMap<i64, Callback>,
+        promise: &mut PendingPromises,
     ) -> RaftResult<()> {
         result?;
         self.anchor_snapshot_markers();
@@ -448,11 +394,7 @@ where
             .await
     }
 
-    fn handle_available(
-        &mut self,
-        env: Envelope,
-        promise: &mut HashMap<i64, Callback>,
-    ) -> RaftResult<()> {
+    fn handle_available(&mut self, env: Envelope, promise: &mut PendingPromises) -> RaftResult<()> {
         if self.pending_ready.is_none() {
             return self.handle(env, promise);
         }
@@ -503,7 +445,7 @@ where
     fn handle_conf_change(
         &mut self,
         env: Envelope,
-        promise: &mut HashMap<i64, Callback>,
+        promise: &mut PendingPromises,
     ) -> RaftResult<()> {
         let header: ConfChangeRequest = match env.msg.parse_header() {
             Ok(header) => header,
@@ -576,11 +518,7 @@ where
         Ok(())
     }
 
-    fn handle_propose(
-        &mut self,
-        env: Envelope,
-        promise: &mut HashMap<i64, Callback>,
-    ) -> RaftResult<()> {
+    fn handle_propose(&mut self, env: Envelope, promise: &mut PendingPromises) -> RaftResult<()> {
         if !self.is_leader() {
             return Self::send_not_leader(self.leader(), env, &self.group);
         }
@@ -647,7 +585,7 @@ where
         Ok(())
     }
 
-    fn handle(&mut self, env: Envelope, promise: &mut HashMap<i64, Callback>) -> RaftResult<()> {
+    fn handle(&mut self, env: Envelope, promise: &mut PendingPromises) -> RaftResult<()> {
         let code = RaftCode::from(env.msg.code());
         //info!("receive: {:?} {:?}", code, env.msg);
         match code {
@@ -671,7 +609,7 @@ where
         }
     }
 
-    async fn on_ready(&mut self, promise: &mut HashMap<i64, Callback>) -> RaftResult<()> {
+    async fn on_ready(&mut self, promise: &mut PendingPromises) -> RaftResult<()> {
         if self.pending_ready.is_some() || !self.raw.has_ready() {
             return Ok(());
         }
@@ -698,7 +636,7 @@ where
         &mut self,
         mut ready: Ready,
         soft_state: Option<SoftState>,
-        promise: &mut HashMap<i64, Callback>,
+        promise: &mut PendingPromises,
     ) -> RaftResult<()> {
         // Persist entries before the HardState that may commit them. A crash may
         // leave extra uncommitted entries, but must never leave commit past tail.
@@ -753,6 +691,7 @@ where
             self.storage.role_change(ss.raft_state).await?;
             let to_follower = self.role_monitor.is_leader() && !self.is_leader();
             if to_follower {
+                Self::fail_pending_promises(promise, "raft leader stepped down");
                 Self::install_snapshot(&self.storage, self.group.voters()).await?;
                 self.anchor_snapshot_markers();
             }
@@ -764,6 +703,7 @@ where
             // Determine whether a snapshot is needed.
             self.apply_create_snapshot()?;
         }
+
         Ok(())
     }
 
@@ -827,7 +767,11 @@ where
                 Some(SerdeUtils::deserialize::<InetAddr>(change.get_context())?)
             }
             ConfChangeType::RemoveNode => None,
-            _ => unimplemented!(),
+            other => {
+                return err_ext!(RaftError::other(
+                    format!("unsupported conf change type: {:?}", other).into(),
+                ))
+            }
         };
 
         // Apply and persist Raft membership first. Transport and session state
@@ -861,7 +805,11 @@ where
                 }
             }
 
-            _ => unreachable!(),
+            other => {
+                return err_ext!(RaftError::other(
+                    format!("unsupported conf change type: {:?}", other).into(),
+                ))
+            }
         }
 
         Ok(ConfChangeResponse::default())
@@ -930,6 +878,31 @@ where
         });
     }
 
+    fn send_promise_error(req_id: i64, sender: Callback, error: RaftError) {
+        let msg = Builder::new_rpc(RaftCode::Propose)
+            .response(ResponseStatus::Error)
+            .req_id(req_id)
+            .data(DataSlice::Buffer(error.encode()))
+            .build();
+
+        if sender.send(Ok(msg)).is_err() {
+            debug!("The client connection has been closed, req {}", req_id)
+        }
+    }
+
+    fn fail_pending_promises(promise: &mut PendingPromises, reason: &str) {
+        if promise.is_empty() {
+            return;
+        }
+
+        let failed = promise.len();
+        for (req_id, sender) in promise.drain() {
+            Self::send_promise_error(req_id, sender, RaftError::leader_not_ready().ctx(reason));
+        }
+
+        info!("failed {} pending propose callbacks: {}", failed, reason);
+    }
+
     fn anchor_snapshot_markers(&mut self) {
         self.last_snapshot_op_id = self.storage.get_fsm_state().op_id();
         self.last_snapshot_ms = LocalTime::mills();
@@ -969,12 +942,19 @@ where
     async fn apply_committed_entries(
         &mut self,
         entries: Vec<Entry>,
-        client_send: &mut HashMap<i64, Callback>,
+        client_send: &mut PendingPromises,
     ) -> RaftResult<()> {
         for entry in entries {
+            if matches!(entry.get_entry_type(), EntryType::EntryConfChangeV2) {
+                return err_ext!(RaftError::other(
+                    format!("unsupported conf change v2 entry, index {}", entry.index).into(),
+                ));
+            }
+
             let is_conf_change = matches!(entry.get_entry_type(), EntryType::EntryConfChange);
-            let should_respond = self.is_leader() && !entry.get_data().is_empty();
-            let (entry_index, entry_term, entry_context) = if should_respond {
+            let has_caller = !entry.get_context().is_empty();
+            let should_respond = self.is_leader() && has_caller;
+            let (entry_index, entry_term, entry_context) = if has_caller {
                 (entry.index, entry.term, Some(entry.get_context().to_vec()))
             } else {
                 (0, 0, None)
@@ -991,17 +971,6 @@ where
                 let apply = self.apply_propose(entry, should_respond).await?;
                 if should_respond {
                     let Some(entry_context) = entry_context else {
-                        warn!(
-                            "leader committed entry has no response context, index {}, term {}",
-                            entry_index, entry_term
-                        );
-                        continue;
-                    };
-                    let Some(apply_done) = apply.apply_done else {
-                        warn!(
-                            "leader committed entry has no apply acknowledgement, index {}, term {}",
-                            entry_index, entry_term
-                        );
                         continue;
                     };
                     let req_id: i64 = match SerdeUtils::deserialize(&entry_context) {
@@ -1014,6 +983,13 @@ where
                             continue;
                         }
                     };
+                    let Some(apply_done) = apply.apply_done else {
+                        warn!(
+                            "leader committed entry has no apply acknowledgement, index {}, term {}",
+                            entry_index, entry_term
+                        );
+                        continue;
+                    };
                     match client_send.remove(&req_id) {
                         Some(sender) => Self::send_propose_response_after_apply(
                             &self.rt,
@@ -1023,15 +999,13 @@ where
                             apply_done,
                         ),
 
-                        None => {
-                            warn!("Not found client for request {}", req_id)
-                        }
+                        None => debug!("Request {} was already answered", req_id),
                     };
                 }
                 continue;
             };
 
-            // Followers only need to replay the message and do not need to respond to the customer service.
+            // Followers only replay the message: no caller is waiting on them.
             if should_respond {
                 let Some(entry_context) = entry_context else {
                     continue;
@@ -1054,9 +1028,7 @@ where
                         }
                     }
 
-                    None => {
-                        warn!("Not found client for request {}", req_id)
-                    }
+                    None => debug!("Request {} was already answered", req_id),
                 };
             }
         }

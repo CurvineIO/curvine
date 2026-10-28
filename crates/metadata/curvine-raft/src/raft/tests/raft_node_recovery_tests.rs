@@ -1748,3 +1748,38 @@ fn injected_storage_clear_failure_keeps_node_in_quarantine_and_retries_safely() 
     drop(node);
     let _ = std::fs::remove_dir_all(&journal_dir);
 }
+
+// A step-down used to drop the callbacks of proposals still waiting for their
+// entry. Dropping them is not a no-op: the server side is parked on
+// `rx.await`, so the client saw neither a response nor an error until the
+// connection broke. Every pending callback must be answered instead.
+#[test]
+fn pending_propose_callbacks_are_answered_when_the_leader_steps_down() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut promise: PendingPromises = HashMap::new();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    promise.insert(9, tx);
+
+    RaftNode::<MemLogStorage, HashAppStorage<String, String>>::fail_pending_promises(
+        &mut promise,
+        "test step down",
+    );
+
+    assert!(promise.is_empty(), "a failed promise must not stay queued");
+    let response = rt
+        .block_on(rx)
+        .expect("the callback must be answered")
+        .expect("the answer must be a response message");
+    assert_eq!(
+        response.response_status(),
+        ResponseStatus::Error,
+        "a caller whose entry will never apply must be told, not left waiting"
+    );
+
+    // Idempotent: a second step-down with nothing pending is a no-op.
+    RaftNode::<MemLogStorage, HashAppStorage<String, String>>::fail_pending_promises(
+        &mut promise,
+        "test step down",
+    );
+    assert!(promise.is_empty());
+}
