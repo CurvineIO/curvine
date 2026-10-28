@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{DeleteMode, MasterFilesystem};
 use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::trash;
 use curvine_core_error::err_ext;
@@ -82,6 +82,23 @@ impl InodeTtlExecutor {
     // bookkeeping; `reclaimed_bytes` lets quota eviction count only space that
     // was actually released.
     pub fn execute_by_id(&self, inode_id: i64) -> FsResult<(bool, InodeView, i64)> {
+        // Expiry removes the entry permanently. Routing it through the recycle
+        // bin would keep the blocks for another retention window while this
+        // executor reports the length as reclaimed, so the quota never sees the
+        // space come back. Quota eviction keeps its own explicit `AsyncPurge`.
+        self.execute_by_id_with_mode(inode_id, DeleteMode::SkipTrash)
+    }
+
+    /// Executes the TTL action for `inode_id` with an explicit delete mode.
+    ///
+    /// Quota eviction passes [`DeleteMode::AsyncPurge`] so a victim is reclaimed
+    /// by the trash purger instead of occupying the recycle bin for the whole
+    /// retention window, which would make eviction unable to relieve pressure.
+    pub fn execute_by_id_with_mode(
+        &self,
+        inode_id: i64,
+        delete_mode: DeleteMode,
+    ) -> FsResult<(bool, InodeView, i64)> {
         let inode = if let Some(inode) = self.get_inode_from_store(inode_id)? {
             inode
         } else {
@@ -128,12 +145,17 @@ impl InodeTtlExecutor {
                     return Ok((false, inode, 0));
                 }
                 // Unlinking one name of a hard-linked file keeps the shared
-                // blocks, so only the last link reclaims the file size.
+                // blocks, so only the last link reclaims the file size. A staged
+                // async purge has not reclaimed anything yet either.
                 let reclaimed = match &inode {
-                    InodeView::File(f) if f.nlink() <= 1 => f.len.max(0),
+                    InodeView::File(f)
+                        if f.nlink() <= 1 && !matches!(delete_mode, DeleteMode::AsyncPurge) =>
+                    {
+                        f.len.max(0)
+                    }
                     _ => 0,
                 };
-                self.filesystem.delete(&path, true)?;
+                self.filesystem.delete_with_mode(&path, true, delete_mode)?;
                 debug!("ttl delete {} {:?}", path, inode);
                 Ok((true, inode, reclaimed))
             }

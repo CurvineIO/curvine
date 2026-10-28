@@ -132,6 +132,21 @@ pub struct MasterConf {
     #[serde(skip)]
     pub trash_check_interval_unit: DurationUnit,
 
+    // Maximum number of inodes a single trash purge batch removes before the
+    // namespace lock is released. Every path in a batch removes exactly one
+    // inode, so this also bounds the batch's journal record.
+    pub trash_purge_batch_inodes: usize,
+
+    // Milliseconds the purger yields between batches so foreground metadata
+    // operations can take the namespace lock.
+    pub trash_purge_yield_ms: u64,
+
+    // How often the master drains /.Trash/.pending, i.e. the entries staged by
+    // async deletes. Runs regardless of trash_enabled.
+    pub trash_purge_interval: String,
+    #[serde(skip)]
+    pub trash_purge_interval_unit: DurationUnit,
+
     // Eviction configuration
     pub enable_quota_eviction: bool,
     pub quota_eviction_mode: String,
@@ -189,6 +204,7 @@ impl MasterConf {
         self.ttl_retry_interval_unit = DurationUnit::from_str(&self.ttl_retry_interval)?;
         self.trash_retention_unit = DurationUnit::from_str(&self.trash_retention)?;
         self.trash_check_interval_unit = DurationUnit::from_str(&self.trash_check_interval)?;
+        self.trash_purge_interval_unit = DurationUnit::from_str(&self.trash_purge_interval)?;
         self.block_replication_retry_interval_unit =
             DurationUnit::from_str(&self.block_replication_retry_interval)?;
         self.block_replication_submit_timeout_unit =
@@ -205,6 +221,10 @@ impl MasterConf {
 
         if self.heartbeat_interval_unit > self.worker_lost_interval_unit {
             return err_box!("Worker_lost_interval must be greater than heartbeat_interval");
+        }
+
+        if self.worker_check_interval_unit >= self.worker_lost_interval_unit {
+            return err_box!("Worker_lost_interval must be greater than worker_check_interval");
         }
 
         if self.conn_limit == 0 {
@@ -225,6 +245,10 @@ impl MasterConf {
 
         if self.trash_check_interval_ms() == 0 {
             return err_box!("master.trash_check_interval must be greater than zero");
+        }
+
+        if self.trash_purge_interval_ms() == 0 {
+            return err_box!("master.trash_purge_interval must be greater than zero");
         }
 
         Ok(())
@@ -291,6 +315,10 @@ impl MasterConf {
 
     pub fn trash_retention_ms(&self) -> u64 {
         self.trash_retention_unit.as_millis()
+    }
+
+    pub fn trash_purge_interval_ms(&self) -> u64 {
+        self.trash_purge_interval_unit.as_millis()
     }
 
     pub fn trash_check_interval_ms(&self) -> u64 {
@@ -395,6 +423,12 @@ impl Default for MasterConf {
             trash_check_interval: "1h".to_string(),
             trash_check_interval_unit: Default::default(),
 
+            trash_purge_batch_inodes: 4096,
+            trash_purge_yield_ms: 5,
+
+            trash_purge_interval: "1s".to_string(),
+            trash_purge_interval_unit: Default::default(),
+
             // Eviction configuration defaults
             enable_quota_eviction: false,
             quota_eviction_mode: "free".to_string(),
@@ -454,6 +488,21 @@ mod tests {
         assert!(error
             .to_string()
             .contains("block_replication_job_timeout must be greater than zero"));
+    }
+
+    #[test]
+    fn worker_check_interval_must_be_shorter_than_lost_interval() {
+        let mut conf = MasterConf {
+            worker_check_interval: "15m".to_string(),
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("a check cadence slower than the lost interval must be rejected");
+        assert!(error
+            .to_string()
+            .contains("Worker_lost_interval must be greater than worker_check_interval"));
     }
 
     #[test]

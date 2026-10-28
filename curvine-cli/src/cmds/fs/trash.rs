@@ -26,7 +26,14 @@ pub enum TrashCommand {
     },
 
     /// Permanently delete every entry in the recycle bin
-    Empty,
+    Empty {
+        #[clap(
+            long,
+            help = "Wait for the master to reclaim every entry and print the \
+                    reclaimed size"
+        )]
+        wait: bool,
+    },
 }
 
 impl TrashCommand {
@@ -72,13 +79,23 @@ impl TrashCommand {
                 Ok(())
             }
 
-            TrashCommand::Empty => {
-                let res = client.empty_trash().await?;
-                println!(
-                    "Emptied recycle bin: {} files, {}",
-                    res.inodes,
-                    format_size(res.bytes)
-                );
+            TrashCommand::Empty { wait } => {
+                if *wait {
+                    let res = client.empty_trash().await?;
+                    println!(
+                        "Emptied recycle bin: {} files, {}",
+                        res.inodes,
+                        format_size(res.bytes)
+                    );
+                } else {
+                    // Staging is a rename per entry, so the command returns
+                    // before the master reclaims anything.
+                    let (accepted, _) = client.empty_trash_async().await?;
+                    println!(
+                        "Staged {} entries for background purge; pass --wait to reclaim them now",
+                        accepted
+                    );
+                }
                 Ok(())
             }
         }
@@ -128,5 +145,35 @@ mod tests {
     #[test]
     fn rejects_non_curvine_destination() {
         assert!(parse_restore_paths("/.Trash/1700000000000-42", Some("s3://bucket/data")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::TrashCommand;
+    use clap::Parser;
+
+    #[derive(Parser, Debug)]
+    struct Cli {
+        #[clap(subcommand)]
+        command: TrashCommand,
+    }
+
+    #[test]
+    fn empty_defaults_to_async_ack() {
+        let cli = Cli::try_parse_from(["trash", "empty"]).unwrap();
+        let TrashCommand::Empty { wait } = cli.command else {
+            panic!("expected the empty command");
+        };
+        assert!(!wait, "empty must acknowledge by default");
+    }
+
+    #[test]
+    fn parses_empty_wait() {
+        let cli = Cli::try_parse_from(["trash", "empty", "--wait"]).unwrap();
+        let TrashCommand::Empty { wait } = cli.command else {
+            panic!("expected the empty command");
+        };
+        assert!(wait);
     }
 }
