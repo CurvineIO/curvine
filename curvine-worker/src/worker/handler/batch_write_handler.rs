@@ -376,7 +376,14 @@ impl BatchWriteHandler {
             let expected_req_id = msg.req_id() + i as i64;
             Self::check_context(context, expected_req_id)?;
             if let Some(file) = file.as_mut() {
-                file.flush()?;
+                if let Err(e) = file.flush() {
+                    WriteHandler::record_write_error(
+                        self.write_handler.metrics,
+                        context.dir_id,
+                        &e,
+                    );
+                    return Err(e.into());
+                }
             }
         }
 
