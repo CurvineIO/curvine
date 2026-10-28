@@ -110,6 +110,15 @@ fn test_rocks_node(
     JournalConf,
 ) {
     let mut conf = JournalConf::with_test();
+    let node = test_rocks_node_with_conf(rt, id, &mut conf);
+    (node, conf)
+}
+
+fn test_rocks_node_with_conf(
+    rt: Arc<Runtime>,
+    id: u64,
+    conf: &mut JournalConf,
+) -> RaftNode<RocksLogStorage, HashAppStorage<String, String>> {
     conf.rpc_retry_max_duration_ms = 0;
     conf.conn_retry_max_duration_ms = 0;
     let root = std::env::temp_dir().join(format!(
@@ -191,10 +200,10 @@ fn test_rocks_node(
         last_snapshot_ms: 0,
         last_snapshot_op_id: 0,
     };
-    (node, conf)
+    node
 }
 
-fn become_leader_and_fence(node: &mut RaftNode<MemLogStorage, HashAppStorage<String, String>>) {
+fn become_leader_and_fence<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>) {
     node.raw.raft.become_candidate();
     node.raw.raft.become_leader();
     let term = node.raw.raft.term;
@@ -217,10 +226,7 @@ fn become_leader_and_fence(node: &mut RaftNode<MemLogStorage, HashAppStorage<Str
 
 /// Freeze the app store at `index` so the compaction ceiling derived from the
 /// fsm state is predictable.
-fn freeze_applied_index(
-    node: &mut RaftNode<MemLogStorage, HashAppStorage<String, String>>,
-    index: u64,
-) {
+fn freeze_applied_index<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>, index: u64) {
     let applied = AppliedIndex {
         term: 1,
         index,
@@ -398,6 +404,44 @@ fn wait_for_snapshot_job(node: &RaftNode<MemLogStorage, HashAppStorage<String, S
             "the snapshot job did not finish in time"
         );
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_first_index<A: LogStorage, B: AppStorage>(node: &RaftNode<A, B>, expected: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let first_index = node.storage.log_store.first_index().unwrap();
+        if first_index == expected {
+            return first_index;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the journal first index settled at {} instead of {}",
+            first_index,
+            expected
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn reported_snapshot(node_id: u64, index: u64) -> SnapshotData {
+    let applied = AppliedIndex {
+        term: 1,
+        index,
+        op_id: index,
+        rpc_id: 0,
+    };
+    SnapshotData {
+        snapshot_id: 1,
+        node_id,
+        create_time: LocalTime::mills(),
+        bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
+        files_data: None,
+        fsm_state: FsmState {
+            applied: applied.clone(),
+            ufs_applied: applied,
+            ..Default::default()
+        },
     }
 }
 
@@ -823,12 +867,13 @@ fn min_commit_holds_at_a_voter_installing_a_snapshot() {
         pr.committed_index = committed;
     }
     node.raw.raft.mut_prs().get_mut(2).unwrap().recent_active = true;
-    // Voter 3 is installing a snapshot at 60 but keeps answering heartbeats, so
-    // it still reports 50: the ceiling must stay there instead of jumping to
-    // the snapshot boundary or to the local applied index.
+    // Voter 3 is installing a snapshot at 60 and still reports 50. It cannot
+    // answer heartbeats while the snapshot is applied, so the quorum check has
+    // cleared its liveness flag; the ceiling must still stay at 50 instead of
+    // jumping to the healthy voter or to the local applied index.
     let pr = node.raw.raft.mut_prs().get_mut(3).unwrap();
     pr.become_snapshot(60);
-    pr.recent_active = true;
+    assert!(!pr.recent_active);
 
     assert_eq!(node.min_commit(), Some(50));
 }
@@ -883,10 +928,77 @@ fn min_commit_with_unreported_voters_trims_nothing() {
     }
 
     assert_eq!(node.min_commit(), Some(0));
-    assert_eq!(
-        node.storage.get_fsm_state().compact_upto(node.min_commit()),
-        0
-    );
+}
+
+#[test]
+fn reported_snapshot_trims_the_journal_up_to_the_peer_watermark() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut conf = JournalConf::with_test();
+    // An empty retention window keeps the trim right at the bound.
+    conf.snapshot_entries = 0;
+    let mut node = test_rocks_node_with_conf(rt, 1, &mut conf);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    let entries: Vec<Entry> = (1..=100)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            ..Default::default()
+        })
+        .collect();
+    node.storage.append(&entries).unwrap();
+    node.storage.set_hard_state_commit(100).unwrap();
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+        pr.recent_active = true;
+    }
+
+    // The reporter has applied up to 90, but voter 3 still needs 51 onwards.
+    node.storage
+        .register_snapshot(reported_snapshot(2, 90), node.min_commit())
+        .unwrap();
+
+    assert_eq!(wait_for_first_index(&node, 50), 50);
+}
+
+#[test]
+fn reported_snapshot_with_unreported_voters_trims_nothing() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut conf = JournalConf::with_test();
+    conf.snapshot_entries = 0;
+    let mut node = test_rocks_node_with_conf(rt, 1, &mut conf);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    let entries: Vec<Entry> = (1..=100)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            ..Default::default()
+        })
+        .collect();
+    node.storage.append(&entries).unwrap();
+    node.storage.set_hard_state_commit(100).unwrap();
+
+    // Voters that never reported keep `Progress::new()`'s zero commit, so the
+    // trim must be a no-op instead of falling back to the local applied index.
+    for voter in [2, 3] {
+        node.raw
+            .raft
+            .mut_prs()
+            .get_mut(voter)
+            .unwrap()
+            .recent_active = true;
+    }
+
+    node.storage
+        .register_snapshot(reported_snapshot(2, 90), node.min_commit())
+        .unwrap();
+
+    assert_eq!(wait_for_first_index(&node, 1), 1);
 }
 
 #[test]

@@ -33,7 +33,7 @@ use log::{debug, error, info, warn};
 use prost::Message as PMessage;
 use raft::eraftpb::{ConfChange, Entry, EntryType, MessageType, Snapshot};
 use raft::prelude::ConfChangeType;
-use raft::{RawNode, Ready, SoftState};
+use raft::{Progress, ProgressState, RawNode, Ready, SoftState};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -785,7 +785,7 @@ where
                 continue;
             }
             all = all.min(pr.committed_index);
-            if pr.recent_active {
+            if Self::needs_the_log(pr) {
                 live = live.min(pr.committed_index);
             }
         }
@@ -795,6 +795,10 @@ where
         }
 
         Some(if live == u64::MAX { all } else { live })
+    }
+
+    fn needs_the_log(pr: &Progress) -> bool {
+        pr.recent_active || pr.state == ProgressState::Snapshot || pr.pending_snapshot > 0
     }
 
     async fn send_messages(&mut self, msgs: Vec<LibRaftMessage>) -> RaftResult<()> {
