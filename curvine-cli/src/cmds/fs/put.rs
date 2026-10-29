@@ -30,10 +30,6 @@ impl PutCommand {
             } => {
                 // Check if local file exists
                 if !local_path.exists() {
-                    eprintln!(
-                        "Error: Local file '{}' does not exist",
-                        local_path.display()
-                    );
                     return Err(
                         format!("Local file '{}' does not exist", local_path.display()).into(),
                     );
@@ -41,7 +37,6 @@ impl PutCommand {
 
                 // Check if local path is a file (not directory)
                 if !local_path.is_file() {
-                    eprintln!("Error: '{}' is not a file", local_path.display());
                     return Err(format!("'{}' is not a file", local_path.display()).into());
                 }
 
@@ -49,12 +44,12 @@ impl PutCommand {
                 let file_size = match local_path.metadata() {
                     Ok(metadata) => metadata.len(),
                     Err(e) => {
-                        eprintln!(
-                            "Error getting file metadata '{}': {}",
+                        return Err(format!(
+                            "Cannot read metadata of local file '{}': {}",
                             local_path.display(),
                             e
-                        );
-                        return Err(e.into());
+                        )
+                        .into());
                     }
                 };
 
@@ -69,8 +64,12 @@ impl PutCommand {
                 let file = match fs::File::open(local_path).await {
                     Ok(file) => file,
                     Err(e) => {
-                        eprintln!("Error opening local file '{}': {}", local_path.display(), e);
-                        return Err(e.into());
+                        return Err(format!(
+                            "Cannot open local file '{}': {}",
+                            local_path.display(),
+                            e
+                        )
+                        .into());
                     }
                 };
                 let mut reader = BufReader::new(file);
@@ -108,8 +107,9 @@ impl PutCommand {
                 let remote_uri = match CurvineURI::new(&final_remote_path) {
                     Ok(uri) => uri,
                     Err(e) => {
-                        eprintln!("Error parsing remote path '{}': {}", final_remote_path, e);
-                        return Err(e);
+                        return Err(
+                            format!("Invalid remote path '{}': {}", final_remote_path, e).into(),
+                        );
                     }
                 };
 
@@ -157,14 +157,21 @@ impl PutCommand {
                                             }
                                         }
                                         Err(e) => {
-                                            eprintln!("Error writing chunk: {}", e);
-                                            return Err(e.into());
+                                            return Err(format!(
+                                                "Cannot write to '{}': {}",
+                                                final_remote_path, e
+                                            )
+                                            .into());
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("Error reading from local file: {}", e);
-                                    return Err(e.into());
+                                    return Err(format!(
+                                        "Cannot read local file '{}': {}",
+                                        local_path.display(),
+                                        e
+                                    )
+                                    .into());
                                 }
                             }
                         }
@@ -178,14 +185,20 @@ impl PutCommand {
                                 );
                             }
                             Err(e) => {
-                                eprintln!("Error completing upload: {}", e);
-                                return Err(e.into());
+                                return Err(format!(
+                                    "Cannot complete upload to '{}': {}",
+                                    final_remote_path, e
+                                )
+                                .into());
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error creating remote file '{}': {}", final_remote_path, e);
-                        return Err(e.into());
+                        return Err(format!(
+                            "Cannot create remote file '{}': {}",
+                            final_remote_path, e
+                        )
+                        .into());
                     }
                 }
 

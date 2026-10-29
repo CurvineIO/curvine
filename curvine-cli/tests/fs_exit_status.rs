@@ -38,3 +38,52 @@ fn put_local_directory_exits_with_failure() {
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("is not a file"));
 }
+
+#[test]
+fn put_failure_is_reported_once() {
+    let missing =
+        std::env::temp_dir().join(format!("curvine-cli-reported-once-{}", std::process::id()));
+    assert!(!missing.exists());
+
+    let output = run_put(&missing);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr.matches("does not exist").count(),
+        1,
+        "the failure must be printed exactly once, stderr: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains(&format!(
+            "Error: Local file '{}' does not exist",
+            missing.display()
+        )),
+        "the failure must be printed in Display form, stderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn pre_runtime_failure_is_reported_in_display_form() {
+    let output = Command::new(env!("CARGO_BIN_EXE_curvine-cli"))
+        .env_remove("CURVINE_CONF_FILE")
+        .args(["--master-addrs", "bogus", "fs", "ls", "/"])
+        .output()
+        .expect("run curvine-cli with invalid --master-addrs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr
+            .matches("Invalid master_addrs format: 'bogus'")
+            .count(),
+        1,
+        "the failure must be printed exactly once, stderr: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("Error: \""),
+        "the failure must not be printed in Debug form, stderr: {}",
+        stderr
+    );
+}

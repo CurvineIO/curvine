@@ -42,10 +42,7 @@ impl CountCommand {
                         );
                         Ok(())
                     }
-                    Err(e) => {
-                        eprintln!("count: Cannot count '{}': {}", path.full_path(), e);
-                        Err(e)
-                    }
+                    Err(e) => Err(format!("Cannot count '{}': {}", path.full_path(), e).into()),
                 }
             }
         }
