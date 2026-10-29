@@ -372,12 +372,12 @@ Post only the comments the user approved.
 
 ## Wrap-up Summary (required)
 
-Close every run with the block below, in the local chat, after the last GitHub-side action. Everything posted to GitHub stays English; this block is for the user, and it ends with its Chinese translation.
+Close every run with the block below, in the local chat, after the run's last action - a posted comment, a comment drafted and awaiting approval, or a review decision. Everything posted to GitHub stays English; this block is for the user, and it ends with its Chinese translation.
 
 | Part | Content |
 | ---- | ------- |
 | Issue / PR | `#<n>` and URL, live base and head SHAs, and whether the PR was reviewed, commented on, or approved |
-| Comments | id plus `path:line`, severity prefix, and `posted` / `edited` / `skipped` (duplicate, already enforced by a gate, out of scope) |
+| Comments | `draft_id` while a comment is only drafted, the GitHub id once posted, plus `path:line`, severity prefix, and `drafted (awaiting approval)` / `posted` / `edited` / `skipped` (duplicate, already enforced by a gate, out of scope) |
 | Problem solved | per comment: the concrete defect, the failure it causes, and the impact (per request / block / RPC / lock hold when measurable) |
 | Approach | the structural or code remedy proposed, and why it fits the surrounding code |
 | Reason for raising it | the evidence behind each comment: call chain, probe, test that fails, or missing assertion |

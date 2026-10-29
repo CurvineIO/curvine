@@ -117,10 +117,11 @@ Close every run with the block below, in the local chat. The issue itself stays 
 
 | Part | Content |
 | ---- | ------- |
-| Issue | `#<n>` and URL, the title, the labels, and whether it closes, extends, or duplicates an existing issue |
+| Issue / PR | `#<n>` and URL, the title, the labels, whether it closes, extends, or duplicates an existing issue, and the parent / sub-issue links |
+| Comments | `none` when the run only created the issue, otherwise id plus `path:line`, severity, and `posted` / `edited` / `skipped` |
 | Problem solved | what the issue reports or requests, and who is affected |
 | Approach | the sections written (Goal / Not Goal / Test Plan for features), the evidence collected, and the reproduction steps |
 | Reason for the shape | why a bug report or a feature request, why those acceptance criteria, and which scope was deliberately excluded |
-| Related | parent or sub-issue links, and the next skill to run (fix, breakdown, or none) |
+| Open items | sub-issues still to file, decisions left to the user, and the next skill to run (fix, breakdown, or none) |
 
 Then append the same summary in Chinese under a `### Summary (Chinese)` heading: translate the conclusions and reasons, keep issue numbers, paths, commands and quoted output verbatim, and do not add claims that are absent above.

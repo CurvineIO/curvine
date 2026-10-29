@@ -114,7 +114,8 @@ Close every run with the block below, in the local chat, whether the run stopped
 
 | Part | Content |
 | ---- | ------- |
-| Issue | `#<n>` and URL, plus the PR number and head SHA when one was opened |
+| Issue / PR | `#<n>` and URL, plus the PR number and the base and head SHAs when one was opened |
+| Comments | `none` when no review comment was posted or addressed, otherwise id plus `path:line`, severity, and `posted` / `edited` / `skipped` |
 | Problem solved | the root cause found in the code, and the behavior the fix restores |
 | Approach | the approved plan, the files and crates changed, the tests added or updated, and the checks run |
 | Reason | why this approach over the alternatives, and why the change stayed inside the approved scope |

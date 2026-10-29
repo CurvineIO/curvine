@@ -137,7 +137,7 @@ Resolve only threads where the fix is merged in the PR branch and reply is poste
 
 ## Wrap-up Summary (required)
 
-Close every run with the block below, in the local chat, after the last thread is resolved. GitHub-facing text stays English; this block is for the user, and it ends with its Chinese translation.
+Close every run with the block below, in the local chat, at the stage the run actually reached - the analysis table awaiting approval, every comment declined with no thread to resolve, or threads replied to and resolved. GitHub-facing text stays English; this block is for the user, and it ends with its Chinese translation.
 
 | Part | Content |
 | ---- | ------- |
