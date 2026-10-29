@@ -21,7 +21,7 @@ use crate::master::meta::{
     trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
 };
 
-use crate::master::fs::state::SessionMap;
+use crate::master::fs::state::{SessionHeartbeat, SessionMap};
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
@@ -209,21 +209,34 @@ impl MasterFilesystem {
         }
     }
 
-    /// Start a new client-session lease epoch when this master begins serving a
-    /// term (#1877 review).
+    /// Adopt the client-session lease epoch for the raft term this master is
+    /// serving (#1883 review).
     ///
     /// `SessionMap::created_at` is seeded when the process starts, but the grace
     /// window it feeds (`#1879` lock validity, `#1884` reaper) must be measured
-    /// from election: a standby that is promoted hours later would otherwise find
-    /// the window already expired and could release a healthy client's locks.
+    /// from election: a standby promoted hours later would otherwise find the
+    /// window already expired and could release a healthy client's locks. The term
+    /// is published by the journal loader, so no standby hook is needed - a
+    /// promotion always observes a higher term than the leadership it replaces.
     ///
     /// Every leader-side consumer of `created_at` must call this before reading
-    /// it. A standby call is a cheap no-op that re-arms adoption for the next
-    /// term.
-    pub fn observe_session_epoch(&self, now: u64) {
+    /// it. Callers that also write a session should use [`MasterFilesystem::heartbeat_in_epoch`]
+    /// so adoption and the write share one lock.
+    pub fn adopt_session_epoch(&self, now: u64) {
         self.session_map
             .write()
-            .adopt_epoch_if_new(self.master_monitor.is_active(), now);
+            .adopt(self.master_monitor.term(), now);
+    }
+
+    /// Adopt the current term and register or renew `hb` under one lock.
+    ///
+    /// Returns `(new_session, session_timeout_ms)`, so a caller needs exactly one
+    /// session-map guard for both the epoch and the write.
+    pub(crate) fn heartbeat_in_epoch(&self, hb: SessionHeartbeat, now: u64) -> (bool, u64) {
+        let term = self.master_monitor.term();
+        let mut sessions = self.session_map.write();
+        let new_session = sessions.heartbeat_in_epoch(hb, term, now);
+        (new_session, sessions.session_timeout_ms())
     }
 
     pub fn check_parent(path: &InodePath) -> FsResult<()> {

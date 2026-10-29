@@ -98,10 +98,11 @@ pub struct SessionMap {
     /// session-aware lock validity check -- measure from here instead of from a
     /// session deadline.
     created_at: u64,
-    /// Whether [`SessionMap::created_at`] has already been reset by the term this
-    /// master is serving. `new` starts it at `false`, so the first heartbeat after
-    /// promotion adopts the map; a step-down clears it again.
-    epoch_adopted: bool,
+    /// Raft term that [`SessionMap::created_at`] was adopted for. A standby keeps
+    /// the previous value, and because a promotion always carries a higher term,
+    /// the first leader-side observation of the new term starts a new epoch
+    /// ([`SessionMap::adopt`]). `None` means the map has never been adopted.
+    term: Option<u64>,
 }
 
 impl SessionMap {
@@ -115,7 +116,7 @@ impl SessionMap {
             sessions: HashMap::new(),
             session_timeout_ms,
             created_at: monotonic_ms(),
-            epoch_adopted: false,
+            term: None,
         }
     }
 
@@ -123,47 +124,59 @@ impl SessionMap {
         self.session_timeout_ms
     }
 
-    /// Start of the current lease epoch: when the term this master is serving
-    /// adopted the map, or when the last [`SessionMap::clear`] ran.
+    /// Start of the current lease epoch: when [`SessionMap::adopt`] first observed
+    /// the term this master is serving, or when the last [`SessionMap::clear`] ran.
     ///
-    /// It is *not* process start: [`SessionMap::adopt_epoch_if_new`] resets it on
-    /// the first leader-side heartbeat after promotion, which is what the grace
-    /// window consumes.
+    /// It is *not* process start. Consumers that must not act on a freshly adopted
+    /// map (the reaper's grace window, the session-aware lock validity check) must
+    /// call [`SessionMap::adopt`] with the current raft term before reading this.
     pub fn created_at(&self) -> u64 {
         self.created_at
     }
 
-    /// Adopt the map for the term this master is serving (#1877 review).
+    /// Adopt the map for `term`, the raft term this master is serving (#1883 review).
     ///
-    /// Returns `true` when a new lease epoch started. A standby resets the
-    /// adoption flag, so the next promotion clears the sessions of the previous
-    /// term and re-arms the grace window; a served term is adopted only once.
-    ///
-    /// Every leader-side consumer of [`SessionMap::created_at`] must call this
-    /// before reading it: the lock-validity snapshot and the session reaper tick
-    /// are the two paths that judge liveness, and both run after a heartbeat has
-    /// already been served, but a promotion that is never followed by a heartbeat
-    /// would otherwise keep the previous epoch.
-    pub fn adopt_epoch_if_new(&mut self, active: bool, now: u64) -> bool {
-        if !active {
-            self.epoch_adopted = false;
-            return false;
-        }
-
-        if self.epoch_adopted {
+    /// Returns `true` when a new lease epoch started. A term always increases
+    /// across promotions, so the first leader-side observation of a new term drops
+    /// the previous term's sessions and restarts [`SessionMap::created_at`]; a
+    /// standby needs no hook of its own, because it simply keeps observing the old
+    /// term until it is promoted.
+    pub fn adopt(&mut self, term: u64, now: u64) -> bool {
+        if self.term == Some(term) {
             return false;
         }
 
         self.clear(now);
-        self.epoch_adopted = true;
+        self.term = Some(term);
         true
+    }
+
+    /// Adopt `term` and renew or register `hb` under one lock, so a heartbeat can
+    /// never write a session into an epoch it did not adopt first.
+    pub fn heartbeat_in_epoch(&mut self, hb: SessionHeartbeat, term: u64, now: u64) -> bool {
+        self.adopt(term, now);
+        self.heartbeat(hb, now)
     }
 
     /// Register a new session or renew an existing one.
     /// Returns `true` when the heartbeat created a new session.
     pub fn heartbeat(&mut self, hb: SessionHeartbeat, now: u64) -> bool {
         let expire_at = now.saturating_add(self.session_timeout_ms);
-        match self.sessions.get_mut(&hb.address.client_name) {
+        let client_id = hb.address.client_name.clone();
+
+        // A lease that lapsed but was not reaped yet must look like a new
+        // registration: `new_session` is how the client learns it may no longer
+        // own the state (plocks, writer markers) the previous lease covered
+        // (#1883). Dropping the entry here keeps the renewal path a plain update.
+        if self
+            .sessions
+            .get(&client_id)
+            .is_some_and(|session| session.is_expired_at(now))
+        {
+            self.sessions.remove(&client_id);
+        }
+
+        match self.sessions.get_mut(&client_id) {
             Some(session) => {
                 session.address = hb.address;
                 session.heartbeat_interval_ms = hb.heartbeat_interval_ms;
@@ -177,7 +190,6 @@ impl SessionMap {
             }
 
             None => {
-                let client_id = hb.address.client_name.clone();
                 let session = ClientSession {
                     address: hb.address,
                     pid: hb.pid,
@@ -233,10 +245,10 @@ impl SessionMap {
 
     /// Drop every session and restart the lease epoch at `now`.
     ///
-    /// [`SessionMap::adopt_epoch_if_new`] calls this on promotion; call it directly
-    /// only on a step-down, so a demoted master does not keep serving the previous
-    /// term's sessions. The grace window measures from `created_at`, i.e. from this
-    /// call.
+    /// [`SessionMap::adopt`] calls this on promotion. Calling it directly on a
+    /// step-down is optional: the term is unchanged, and the next promotion adopts
+    /// a higher term and clears again. The grace window measures from `created_at`,
+    /// i.e. from this call.
     pub fn clear(&mut self, now: u64) {
         self.sessions.clear();
         self.created_at = now;
@@ -277,27 +289,43 @@ mod tests {
     }
 
     #[test]
-    fn adopting_a_new_epoch_drops_sessions_and_restarts_the_grace_window() {
+    fn adopting_a_new_term_drops_sessions_and_restarts_the_grace_window() {
         let mut map = SessionMap::new(TIMEOUT);
-        map.heartbeat(hb("c1"), 1_000);
-        map.heartbeat(hb("c2"), 1_000);
+        map.heartbeat_in_epoch(hb("c1"), 1, 1_000);
+        map.heartbeat_in_epoch(hb("c2"), 1, 1_000);
         let first_epoch = map.created_at();
 
-        // A standby re-arms adoption without touching the map.
-        assert!(!map.adopt_epoch_if_new(false, 5_000));
+        // Re-observing the served term keeps the epoch and the sessions.
+        assert!(!map.adopt(1, 5_000));
         assert_eq!(map.len(), 2);
         assert_eq!(map.created_at(), first_epoch);
 
-        // Promotion adopts the map once: previous-term sessions are gone and the
-        // grace window starts at the promotion instant.
-        assert!(map.adopt_epoch_if_new(true, 5_000));
+        // A promotion always carries a higher term: previous-term sessions are
+        // gone and the grace window starts at the promotion instant.
+        assert!(map.adopt(2, 5_000));
         assert!(map.is_empty(), "a new term must not inherit old sessions");
         assert_eq!(map.created_at(), 5_000);
 
         // Further heartbeats in the same term keep the epoch.
-        map.heartbeat(hb("c1"), 6_000);
-        assert!(!map.adopt_epoch_if_new(true, 7_000));
+        map.heartbeat_in_epoch(hb("c1"), 2, 6_000);
+        assert!(!map.adopt(2, 7_000));
         assert_eq!(map.created_at(), 5_000);
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn an_expired_lease_is_renewed_as_a_new_session() {
+        let mut map = SessionMap::new(TIMEOUT);
+        assert!(map.heartbeat_in_epoch(hb("c1"), 1, 1_000));
+
+        // The lease lapsed and the reaper has not removed the entry yet: the
+        // client must learn that it owns nothing from the previous lease.
+        let renewed_at = 1_000 + TIMEOUT + 1;
+        assert!(map.heartbeat_in_epoch(hb("c1"), 1, renewed_at));
+        let session = map.get("c1").unwrap();
+        assert_eq!(session.started_at, renewed_at);
+        assert_eq!(session.last_heartbeat, renewed_at);
+        assert_eq!(session.expire_at, renewed_at + TIMEOUT);
         assert_eq!(map.len(), 1);
     }
 

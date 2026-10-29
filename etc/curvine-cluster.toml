@@ -76,6 +76,13 @@ meta_dir = "testing/meta"
 # trash_purge_batch_inodes = 4096
 # trash_purge_yield_ms = 5
 # trash_purge_interval = "1s"
+
+# Client session lease. Every client (FUSE, SDK, CLI) registers a session with
+# ClientHeartbeat; a session whose lease lapses is reaped together with the locks
+# and writer markers it owns. client_session_timeout is that lease (default 60s)
+# and should be several times the client heartbeat interval, otherwise a healthy
+# client can flap between alive and expired between two heartbeats.
+# client_session_timeout = "60s"
 # Log rotation applies when log_dir is a directory; stdout and stderr are not rotated.
 # max_file_size_mb: rotate when the file reaches this size in MB (default 100, 0 = no size limit).
 # time_rotation: "daily" or "hourly" (default none). Combined with max_file_size_mb, whichever

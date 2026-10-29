@@ -154,8 +154,11 @@ pub struct MasterMetrics {
     // above only covers processing time, so this is what exposes executor
     // saturation (e.g. a read burst occupying the blocking pool) before clients
     // start timing out. The executor label separates the two blocking pools:
-    // worker heartbeats/block reports wait on actor_rt, all other sync RPCs wait
-    // on the main runtime (see MasterHandler::uses_actor_rt).
+    // worker heartbeats/block reports and client session heartbeats wait on
+    // actor_rt, all other sync RPCs wait on the main runtime (see
+    // MasterHandler::uses_actor_rt). Client heartbeats must not queue behind a
+    // metadata burst: a stall longer than master.client_session_timeout would
+    // expire every session and release its lock ownership.
     pub(crate) rpc_queue_duration: HistogramVec,
 
     // for quota eviction (LRU)

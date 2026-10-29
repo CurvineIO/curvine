@@ -23,6 +23,8 @@ use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext};
+#[cfg(test)]
+use curvine_error::ErrorKind;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
@@ -1040,15 +1042,18 @@ impl MasterHandler {
         let mount_point = hb.mount_point.clone();
         let interval_ms = hb.heartbeat_interval_ms;
 
-        // The heartbeat is the only leader-side session path, so it is where the
-        // lease epoch is adopted: without it `created_at` stays at process start
-        // and the leader-change grace window never applies (#1877 review).
-        fs.observe_session_epoch(now);
+        // A demoted master must not own sessions: the lease epoch only advances
+        // on the leader, and a standby heartbeat would write a session into an
+        // epoch it never adopted (#1883 review).
+        if !fs.master_monitor.is_active() {
+            return Err(FsError::not_leader(
+                "client heartbeat requires the active master",
+            ));
+        }
 
-        let mut sessions = fs.session_map.write();
-        let new_session = sessions.heartbeat(hb, now);
-        let session_timeout_ms = sessions.session_timeout_ms();
-        drop(sessions);
+        // Adopt the term's lease epoch and write the session under one lock, so a
+        // heartbeat can never land in an epoch it did not adopt first.
+        let (new_session, session_timeout_ms) = fs.heartbeat_in_epoch(hb, now);
 
         if new_session {
             // The lease window is the master's, not the client's: a client (or a
@@ -1213,7 +1218,10 @@ impl MasterHandler {
     }
 
     fn uses_actor_rt(code: RpcCode) -> bool {
-        matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport)
+        matches!(
+            code,
+            RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport | RpcCode::ClientHeartbeat
+        )
     }
 
     fn record_rpc_queue_duration(&self, ctx: &RpcContext<'_>) {
@@ -1465,10 +1473,12 @@ impl MessageHandler for MasterHandler {
         }
     }
 
-    // Only WorkerHeartbeat and WorkerBlockReport are routed to actor_rt;
-    // GetFilesystemInfo (statfs) deliberately runs on the main RPC blocking pool
-    // so that FUSE/kubelet statfs bursts cannot delay heartbeats and cause workers
-    // to be marked lost.
+    // Worker heartbeats, worker block reports and client heartbeats are routed to
+    // actor_rt; GetFilesystemInfo (statfs) deliberately runs on the main RPC
+    // blocking pool so that FUSE/kubelet statfs bursts cannot delay heartbeats.
+    // Client heartbeats belong there for the same reason: a main-pool burst longer
+    // than `master.client_session_timeout` would expire every client session, and
+    // once lock validity is session-aware that becomes a mass lock release.
     fn get_rt(&self, msg: &Message) -> Option<&Runtime> {
         let code = RpcCode::from(msg.code());
         if Self::uses_actor_rt(code) {
@@ -1567,7 +1577,13 @@ mod tests {
             Utils::test_sub_dir(format!("master-handler-test/journal-{}", test_name));
         conf.master.client_session_timeout = "30s".to_string();
         conf.master.init().unwrap();
-        JournalSystem::fs_only_for_test(&conf).unwrap()
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        // `process_client_heartbeat` only serves the active master, so stand in
+        // for raft leader election (the tests that exercise a standby set the
+        // role themselves).
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        fs
     }
 
     #[test]
@@ -1606,19 +1622,33 @@ mod tests {
         let fs = client_heartbeat_fs(&Utils::rand_str(6));
 
         fs.master_monitor.set_role_for_test(RoleState::Leader);
+        fs.master_monitor.set_term_for_test(1);
         MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 1_000).unwrap();
         MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-2"), 1_000).unwrap();
         assert_eq!(fs.session_map.read().created_at(), 1_000);
         assert_eq!(fs.session_map.read().len(), 2);
 
-        // A demoted master re-arms adoption without serving a new epoch yet.
+        // A demoted master must reject the heartbeat and leave the map untouched,
+        // so it cannot own a lease in an epoch it never adopted.
         fs.master_monitor.set_role_for_test(RoleState::Follower);
-        MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 2_000).unwrap();
+        let err = MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 2_000)
+            .expect_err("a standby must not renew a client session");
+        assert!(
+            matches!(err.kind(), ErrorKind::NotLeaderMaster),
+            "a standby must answer NotLeaderMaster, got {:?}",
+            err.kind()
+        );
         assert_eq!(fs.session_map.read().created_at(), 1_000);
+        assert_eq!(
+            fs.session_map.read().get("c-1").unwrap().last_heartbeat,
+            1_000,
+            "the standby heartbeat must not renew the lease"
+        );
 
-        // Promotion adopts the map: the previous term's sessions are gone and the
-        // grace window restarts at promotion, not at process start.
+        // Promotion carries a higher term: the previous term's sessions are gone
+        // and the grace window restarts at promotion, not at process start.
         fs.master_monitor.set_role_for_test(RoleState::Leader);
+        fs.master_monitor.set_term_for_test(2);
         let rep = MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 30_000)
             .unwrap();
         assert!(
@@ -1630,12 +1660,12 @@ mod tests {
         assert_eq!(
             sessions.created_at(),
             30_000,
-            "the lease epoch must restart when the term is adopted"
+            "the lease epoch must restart when a new term is adopted"
         );
         assert_eq!(sessions.len(), 1);
         assert!(
             sessions.get("c-2").is_none(),
-            "sessions from before the demotion must not survive the new epoch"
+            "sessions from before the demotion must not survive the new term"
         );
     }
 
