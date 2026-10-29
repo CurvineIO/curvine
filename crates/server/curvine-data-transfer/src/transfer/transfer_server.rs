@@ -176,19 +176,18 @@ impl TransferServer {
         // Lease owners are process-unique. A configured static instance id
         // can be reused by two HA replicas and defeat owner-only fencing.
         let owner = uuid::Uuid::new_v4().to_string();
+        // One state object, two consumers: the planner reads the task cap while
+        // planning and the scheduler reads the worker ceiling on every dispatch
+        // decision; the registry below is its only write path.
+        let runtime_state = Arc::new(TransferRuntimeConfig::from_conf(&conf));
         let planner = TransferPlanner::new(
             fs.clone(),
             factory.clone(),
             cache.clone(),
             conf.client.clone(),
-            conf.transfer.max_tasks_per_transfer,
+            runtime_state.clone(),
             conf.transfer.ufs_max_concurrency_per_endpoint,
         );
-        // One state object, two consumers: the scheduler reads it on every
-        // dispatch decision and the registry below is its only write path.
-        // Building it here (not inside the scheduler) is what keeps a pushed
-        // value and the process's behaviour from diverging.
-        let runtime_state = Arc::new(TransferRuntimeConfig::from_conf(&conf));
         let scheduler = TransferScheduler::new(
             store.clone(),
             planner,

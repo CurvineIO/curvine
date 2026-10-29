@@ -31,7 +31,7 @@ fn scheduler_with_state(
         factory.clone(),
         cache.clone(),
         conf.client.clone(),
-        1,
+        runtime_config.clone(),
         1,
     );
     TransferScheduler::new(
@@ -241,6 +241,37 @@ async fn due_failure_beyond_backoff_batch_is_requeued() {
         .find(|task| task.task_id == "due")
         .unwrap();
     assert_eq!(due.state, TransferTaskState::Pending);
+}
+
+/// The per-job task cap must be read at planning time, not snapshotted at
+/// construction: a runtime-config push has to change the very next plan of an
+/// already-running transfer role. Mirrors `dispatch_reads_the_live_worker_task_limit`
+/// for the planner half of the same state object.
+#[test]
+fn planner_reads_the_live_task_cap() {
+    use crate::transfer::{build_transfer_runtime_registry, MAX_TASKS_PER_TRANSFER_CONFIG};
+
+    let conf = ClusterConf::default();
+    // `with_limits(1, 10_000_000)` makes the cap distinguishable from the
+    // default, so a snapshot would be visible as a wrong value.
+    let state = Arc::new(TransferRuntimeConfig::with_limits(1, 10_000_000));
+    let scheduler = scheduler_with_state(Arc::new(MemoryTransferStore::new()), state.clone());
+    let registry = build_transfer_runtime_registry(state.clone(), &conf);
+
+    assert_eq!(state.max_tasks_per_transfer(), 10_000_000);
+
+    // Lowering the live value must be visible immediately through the same
+    // state the planner was handed.
+    registry
+        .set(MAX_TASKS_PER_TRANSFER_CONFIG, "250000", None)
+        .unwrap();
+    assert_eq!(state.max_tasks_per_transfer(), 250_000);
+
+    // Resetting restores the file value rather than leaving the pushed one.
+    registry.reset(MAX_TASKS_PER_TRANSFER_CONFIG, None).unwrap();
+    assert_eq!(state.max_tasks_per_transfer(), 10_000_000);
+
+    drop(scheduler);
 }
 
 /// The concurrency ceiling must be read at dispatch time, not snapshotted at

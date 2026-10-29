@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::transfer::{job_mount_snapshot_async, ClusterMetadataCache, TransferMetrics};
+use crate::transfer::{
+    job_mount_snapshot_async, ClusterMetadataCache, TransferMetrics, TransferRuntimeConfig,
+};
 use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::{ClientConf, TransferConf};
 use curvine_core_error::err_box;
@@ -323,8 +325,17 @@ pub struct TransferPlanner {
     factory: Arc<UfsFactory>,
     cache: ClusterMetadataCache,
     client_conf: ClientConf,
-    max_tasks_per_transfer: usize,
+    /// Shared runtime state. The cap is re-read on every check so a hot-updated
+    /// value applies to the next planning pass without a restart.
+    runtime: Arc<TransferRuntimeConfig>,
     ufs_limiter: Arc<UfsEndpointLimiter>,
+}
+
+impl TransferPlanner {
+    /// Effective task cap for this planning pass.
+    fn max_tasks(&self) -> usize {
+        self.runtime.max_tasks_per_transfer()
+    }
 }
 
 /// Max concurrent directory listings during planning collection.
@@ -418,7 +429,7 @@ impl TransferPlanner {
         factory: Arc<UfsFactory>,
         cache: ClusterMetadataCache,
         client_conf: ClientConf,
-        max_tasks_per_transfer: usize,
+        runtime: Arc<TransferRuntimeConfig>,
         ufs_max_concurrency_per_endpoint: usize,
     ) -> Self {
         Self {
@@ -426,7 +437,7 @@ impl TransferPlanner {
             factory,
             cache,
             client_conf,
-            max_tasks_per_transfer,
+            runtime,
             ufs_limiter: Arc::new(UfsEndpointLimiter::new(ufs_max_concurrency_per_endpoint)),
         }
     }
@@ -823,12 +834,9 @@ impl TransferPlanner {
         };
         let (plans, outcome) =
             self.build_segment_plans(status, block_size, head, &source_version)?;
-        if tasks.len().saturating_add(plans.len()) > self.max_tasks_per_transfer {
-            return err_box!(
-                "Transfer {} files exceeds {}",
-                job.job_id,
-                self.max_tasks_per_transfer
-            );
+        let max_tasks = self.max_tasks();
+        if tasks.len().saturating_add(plans.len()) > max_tasks {
+            return err_box!("Transfer {} files exceeds {}", job.job_id, max_tasks);
         }
         if task_target.is_cv() {
             let start = Instant::now();
@@ -998,12 +1006,9 @@ impl TransferPlanner {
             replace_target,
             block_locations: Vec::new(),
         });
-        if tasks.len() > self.max_tasks_per_transfer {
-            return err_box!(
-                "Transfer {} files exceeds {}",
-                job.job_id,
-                self.max_tasks_per_transfer
-            );
+        let max_tasks = self.max_tasks();
+        if tasks.len() > max_tasks {
+            return err_box!("Transfer {} files exceeds {}", job.job_id, max_tasks);
         }
         Ok(())
     }
@@ -1061,12 +1066,9 @@ impl TransferPlanner {
             replace_target: false,
             block_locations: Vec::new(),
         });
-        if tasks.len() > self.max_tasks_per_transfer {
-            return err_box!(
-                "Transfer {} files exceeds {}",
-                job.job_id,
-                self.max_tasks_per_transfer
-            );
+        let max_tasks = self.max_tasks();
+        if tasks.len() > max_tasks {
+            return err_box!("Transfer {} files exceeds {}", job.job_id, max_tasks);
         }
         Ok(())
     }

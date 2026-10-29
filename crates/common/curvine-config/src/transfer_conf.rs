@@ -58,7 +58,13 @@ pub struct TransferConf {
     pub client_pending_queue_size: usize,
     /// Maximum number of client-side auto-cache submissions running concurrently.
     pub client_submit_concurrency: usize,
-    #[serde(skip, default = "TransferConf::default_max_tasks_per_transfer")]
+    /// Upper bound on the tasks one transfer job may plan.
+    ///
+    /// This bounds plan size, not file count: a file at or above the segment
+    /// threshold is split into multiple tasks, so one large file can consume
+    /// many slots. Configurable on disk and hot-updatable at runtime through
+    /// the transfer UpdateConfigs endpoint.
+    #[serde(default = "TransferConf::default_max_tasks_per_transfer")]
     pub max_tasks_per_transfer: usize,
     #[serde(
         skip,

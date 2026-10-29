@@ -111,3 +111,55 @@ fn task_retention_rejects_zero_and_overshoot() {
     .unwrap();
     assert!(over.init().is_err());
 }
+
+/// The per-job task cap must be settable from the configuration file.
+///
+/// It previously carried `#[serde(skip)]`, so a `max_tasks_per_transfer` entry
+/// was silently ignored and planning always enforced the built-in 100_000. A
+/// job exceeding that hard-coded cap failed with "files exceeds 100000" and no
+/// way to raise it.
+#[test]
+fn max_tasks_per_transfer_is_configurable() {
+    let conf: TransferConf = toml::from_str(
+        r#"
+        enabled = true
+        hostname = "transfer-01.example"
+        max_tasks_per_transfer = 250000
+        "#,
+    )
+    .unwrap();
+    assert_eq!(conf.max_tasks_per_transfer, 250_000);
+}
+
+/// Omitting the key keeps the historical default so existing files behave as before.
+#[test]
+fn max_tasks_per_transfer_defaults_when_absent() {
+    let conf: TransferConf = toml::from_str(
+        r#"
+        enabled = true
+        hostname = "transfer-01.example"
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        conf.max_tasks_per_transfer,
+        TransferConf::DEFAULT_MAX_TASKS_PER_TRANSFER
+    );
+}
+
+/// Zero would reject every non-empty plan, so validation refuses it.
+#[test]
+fn max_tasks_per_transfer_rejects_zero() {
+    // `TransferConf::init` runs the validator that enforces the lower bound.
+    let mut conf = TransferConf {
+        enabled: true,
+        hostname: "transfer-01.example".to_string(),
+        max_tasks_per_transfer: 0,
+        ..Default::default()
+    };
+    let err = conf.init().unwrap_err().to_string();
+    assert!(
+        err.contains("max_tasks_per_transfer"),
+        "unexpected error: {err}"
+    );
+}

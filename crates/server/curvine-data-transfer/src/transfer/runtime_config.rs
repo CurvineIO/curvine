@@ -23,7 +23,7 @@
 //! atomic that every dispatch decision re-reads, and the registry built here is
 //! the only write path.
 
-use curvine_config::{ClusterConf, RuntimeConfigRegistry};
+use curvine_config::{ClusterConf, RuntimeConfigRegistry, TransferConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::{FsError, FsResult};
 use serde_json::Value;
@@ -37,6 +37,13 @@ use std::sync::Arc;
 /// `job.worker_max_concurrent_tasks`.
 pub const WORKER_MAX_CONCURRENT_TASKS_CONFIG: &str = "worker_max_concurrent_tasks";
 
+/// Runtime key for the per-job planned-task ceiling.
+///
+/// Backed by `transfer.max_tasks_per_transfer`. Lowering it cannot invalidate an
+/// already-persisted plan: the limit is enforced while planning, so a running
+/// job keeps the task rows it already has.
+pub const MAX_TASKS_PER_TRANSFER_CONFIG: &str = "max_tasks_per_transfer";
+
 /// Transfer-role knobs that are adjustable without a restart.
 ///
 /// Cloning is not implemented on purpose: the state is shared by `Arc` so that
@@ -47,29 +54,65 @@ pub struct TransferRuntimeConfig {
     file_worker_task_limit: usize,
     /// Effective ceiling. Read on every dispatch decision (never cached).
     worker_task_limit: AtomicUsize,
+    /// Value from the configuration file, restored by `reset_max_tasks_per_transfer`.
+    file_max_tasks_per_transfer: usize,
+    /// Effective per-job task cap. Read on every planning cap check.
+    max_tasks_per_transfer: AtomicUsize,
 }
 
 impl TransferRuntimeConfig {
     /// Captures the configuration file's value as the reset target.
     pub fn from_conf(conf: &ClusterConf) -> Self {
-        Self::with_limit(conf.job.worker_max_concurrent_tasks)
+        Self::with_limits(
+            conf.job.worker_max_concurrent_tasks,
+            conf.transfer.max_tasks_per_transfer,
+        )
     }
 
     /// Builds the state from a bare limit, for callers that do not hold a
     /// `ClusterConf` (tests). The file value is the same limit.
     pub fn with_limit(limit: usize) -> Self {
+        Self::with_limits(limit, TransferConf::DEFAULT_MAX_TASKS_PER_TRANSFER)
+    }
+
+    /// Builds the state from both limits; each is floored to 1 so a zero in the
+    /// configuration file cannot park dispatch or block every plan.
+    pub fn with_limits(worker_task_limit: usize, max_tasks_per_transfer: usize) -> Self {
         Self {
-            file_worker_task_limit: limit,
-            // A zero ceiling would park every worker forever; the configuration
-            // value is floored here exactly like the previous constructor
-            // argument was, and writes below reject zero outright.
-            worker_task_limit: AtomicUsize::new(limit.max(1)),
+            file_worker_task_limit: worker_task_limit,
+            worker_task_limit: AtomicUsize::new(worker_task_limit.max(1)),
+            file_max_tasks_per_transfer: max_tasks_per_transfer,
+            max_tasks_per_transfer: AtomicUsize::new(max_tasks_per_transfer.max(1)),
         }
     }
 
     /// Effective per-worker concurrency ceiling.
     pub fn worker_task_limit(&self) -> usize {
         self.worker_task_limit.load(Ordering::Acquire)
+    }
+
+    /// Effective per-job planned-task ceiling.
+    pub fn max_tasks_per_transfer(&self) -> usize {
+        self.max_tasks_per_transfer.load(Ordering::Acquire)
+    }
+
+    /// Applies a new per-job task cap and returns the previous one.
+    pub fn update_max_tasks_per_transfer(&self, target: usize) -> FsResult<usize> {
+        if target == 0 {
+            return Err(FsError::common(format!(
+                "{} must be greater than zero",
+                MAX_TASKS_PER_TRANSFER_CONFIG
+            )));
+        }
+        Ok(self.max_tasks_per_transfer.swap(target, Ordering::AcqRel))
+    }
+
+    /// Restores the configuration file's per-job task cap and returns it.
+    pub fn reset_max_tasks_per_transfer(&self) -> usize {
+        let restored = self.file_max_tasks_per_transfer.max(1);
+        self.max_tasks_per_transfer
+            .store(restored, Ordering::Release);
+        restored
     }
 
     /// Applies a new ceiling and returns the previous one.
@@ -105,6 +148,7 @@ pub fn build_transfer_runtime_registry(
     conf: &ClusterConf,
 ) -> RuntimeConfigRegistry {
     let file_worker_task_limit = conf.job.worker_max_concurrent_tasks;
+    let file_max_tasks_per_transfer = conf.transfer.max_tasks_per_transfer;
 
     RuntimeConfigRegistry::builder()
         .register_at(
@@ -132,6 +176,31 @@ pub fn build_transfer_runtime_registry(
             {
                 let state = state.clone();
                 move || Ok(Value::from(state.reset_worker_task_limit()))
+            },
+        )
+        .register_at(
+            MAX_TASKS_PER_TRANSFER_CONFIG,
+            // Backed by `TransferConf::max_tasks_per_transfer`, i.e. `[transfer].*`.
+            Some("transfer.max_tasks_per_transfer"),
+            move || Value::from(file_max_tasks_per_transfer),
+            {
+                let state = state.clone();
+                move || Value::from(state.max_tasks_per_transfer())
+            },
+            {
+                let state = state.clone();
+                move |raw| {
+                    let target = parse_usize(MAX_TASKS_PER_TRANSFER_CONFIG, raw)?;
+                    let previous = match state.update_max_tasks_per_transfer(target) {
+                        Ok(v) => v,
+                        Err(e) => return err_box!(e.to_string()),
+                    };
+                    Ok((Value::from(previous), Value::from(target)))
+                }
+            },
+            {
+                let state = state.clone();
+                move || Ok(Value::from(state.reset_max_tasks_per_transfer()))
             },
         )
         .build()
@@ -214,5 +283,60 @@ mod tests {
         let state = TransferRuntimeConfig::with_limit(0);
         assert_eq!(state.worker_task_limit(), 1);
         assert_eq!(state.reset_worker_task_limit(), 1);
+    }
+
+    /// The task cap is a separate knob from the worker ceiling: updating one
+    /// must not disturb the other.
+    #[test]
+    fn task_cap_and_worker_ceiling_are_independent() {
+        let state = TransferRuntimeConfig::with_limits(4, 100_000);
+        assert_eq!(state.worker_task_limit(), 4);
+        assert_eq!(state.max_tasks_per_transfer(), 100_000);
+
+        assert_eq!(
+            state.update_max_tasks_per_transfer(250_000).unwrap(),
+            100_000
+        );
+        assert_eq!(state.max_tasks_per_transfer(), 250_000);
+        assert_eq!(state.worker_task_limit(), 4);
+
+        assert_eq!(state.reset_max_tasks_per_transfer(), 100_000);
+    }
+
+    /// A zero cap would reject every non-empty plan, so writes refuse it and the
+    /// effective value stays where it was.
+    #[test]
+    fn task_cap_update_rejects_zero() {
+        let state = TransferRuntimeConfig::with_limits(1, 10);
+        assert!(state.update_max_tasks_per_transfer(0).is_err());
+        assert_eq!(state.max_tasks_per_transfer(), 10);
+    }
+
+    /// The cap is hot-updatable through the same registry the UpdateConfigs
+    /// endpoint drives, and it is reported against its on-disk config path.
+    #[test]
+    fn registry_updates_the_task_cap() {
+        let conf = ClusterConf::default();
+        let state = Arc::new(TransferRuntimeConfig::from_conf(&conf));
+        let registry = build_transfer_runtime_registry(state.clone(), &conf);
+        let original = conf.transfer.max_tasks_per_transfer;
+
+        let updated = registry
+            .set(MAX_TASKS_PER_TRANSFER_CONFIG, "200000", None)
+            .unwrap();
+        assert_eq!(state.max_tasks_per_transfer(), 200_000);
+        assert_eq!(updated.previous_value, Value::from(original));
+        assert_eq!(
+            registry.config_path(MAX_TASKS_PER_TRANSFER_CONFIG),
+            Some("transfer.max_tasks_per_transfer")
+        );
+
+        assert!(registry
+            .set(MAX_TASKS_PER_TRANSFER_CONFIG, "0", None)
+            .is_err());
+        assert_eq!(state.max_tasks_per_transfer(), 200_000);
+
+        registry.reset(MAX_TASKS_PER_TRANSFER_CONFIG, None).unwrap();
+        assert_eq!(state.max_tasks_per_transfer(), original);
     }
 }

@@ -295,6 +295,14 @@ web_port = 9011
 # When full, new cache requests are skipped and foreground reads continue from UFS.
 client_pending_queue_size = 1024
 client_submit_concurrency = 64
+# Upper bound on the tasks one Load/Export job may plan, default 100000.
+# This bounds tasks, not files: a source file at or above the segment threshold
+# is split into several tasks, so a few large files can exhaust the budget. A
+# job whose plan exceeds this fails during planning with "files exceeds N".
+# Raise it for very large partitions, or split the job into smaller sources.
+# Also hot-updatable through the Transfer UpdateConfigs endpoint
+# (POST /api/update_config with key max_tasks_per_transfer).
+# max_tasks_per_transfer = 100000
 log = { level = "info", log_dir = "stdout", file_name = "transfer.log" }
 
 # fuse configuration
