@@ -18,6 +18,7 @@ use crate::session::FuseResponse;
 use bytes::Bytes;
 use curvine_client::unified::UnifiedWriter;
 use curvine_config::FuseConf;
+use curvine_core_error::ErrorExt;
 use curvine_error::FsResult;
 use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::{Path, Writer};
@@ -139,7 +140,15 @@ impl FuseWriter {
     }
 
     fn check_error(&self, e: FsError) -> FsError {
-        self.err_monitor.take_error().unwrap_or(e)
+        // Preserve the original error kind so errno mapping still applies; the
+        // writer's recorded cause is attached as context instead of replacing it.
+        if let Some(error) = self.err_monitor.take_error() {
+            return error;
+        }
+        match self.err_monitor.error_message() {
+            Some(message) => e.ctx(format!("writer task failed: {}", message)),
+            None => e,
+        }
     }
 
     fn checked_write_end(off: i64, len: usize) -> FsResult<i64> {

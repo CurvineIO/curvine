@@ -17,6 +17,7 @@ use crate::fuse_metrics::{mono_now, FuseMetrics, IO_TYPE_READ};
 use crate::session::FuseResponse;
 use curvine_client::unified::UnifiedReader;
 use curvine_config::FuseConf;
+use curvine_core_error::ErrorExt;
 use curvine_error::FsResult;
 use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::{Path, Reader};
@@ -96,7 +97,15 @@ impl FuseReader {
     }
 
     fn check_error(&self, e: FsError) -> FsError {
-        self.err_monitor.take_error().unwrap_or(e)
+        // Preserve the original error kind so errno mapping still applies; the
+        // reader's recorded cause is attached as context instead of replacing it.
+        if let Some(error) = self.err_monitor.take_error() {
+            return error;
+        }
+        match self.err_monitor.error_message() {
+            Some(message) => e.ctx(format!("reader task failed: {}", message)),
+            None => e,
+        }
     }
 
     pub async fn read(&self, op: Read<'_>, reply: FuseResponse) -> FsResult<()> {

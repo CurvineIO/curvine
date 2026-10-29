@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::file::FsWriterBase;
+use curvine_core_error::ErrorExt;
 use curvine_error::FsResult;
 use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::Path;
@@ -64,7 +65,17 @@ struct BufferChannel {
 
 impl BufferChannel {
     fn check_error(&self, e: impl Into<FsError>) -> FsError {
-        self.err_monitor.take_error().unwrap_or(e.into())
+        // Every caller must see the writer's real failure. `take_error` alone
+        // only serves the first one; later callers fell back to a bare channel
+        // symptom ("the sender dropped") that says nothing about what broke.
+        // `ctx` keeps the original error kind, so errno mapping and
+        // message-based classification still see the transport cause.
+        let fallback = e.into();
+        self.err_monitor
+            .resolve_error(|message| {
+                FsError::common(message).ctx(format!("channel closed: {}", fallback))
+            })
+            .unwrap_or(fallback)
     }
 
     async fn write(&mut self, data: DataSlice) -> FsResult<()> {
@@ -379,5 +390,59 @@ mod tests {
             .check_error(sender_dropped)
             .to_string()
             .contains("No workers available"));
+    }
+
+    /// A second failure must still explain itself. Previously `take_error`
+    /// consumed the cause, so repeat callers only saw "the sender dropped".
+    #[tokio::test]
+    async fn repeated_failure_keeps_the_writer_cause() {
+        let err_monitor = Arc::new(ErrorMonitor::new());
+        let (chunk_sender, _) = AsyncChannel::new(1).split();
+        let (task_sender, _) = AsyncChannel::new(1).split();
+        let channel = BufferChannel {
+            chunk_sender,
+            task_sender,
+            err_monitor: err_monitor.clone(),
+        };
+
+        record_writer_error(
+            FsError::common("Connection refused (os error 111)"),
+            err_monitor.as_ref(),
+        );
+
+        for _ in 0..2 {
+            let error = channel
+                .check_error(FsError::common("the sender dropped"))
+                .to_string();
+            assert!(
+                error.contains("Connection refused"),
+                "every caller must see the real cause, got: {error}"
+            );
+        }
+    }
+
+    /// With no writer error recorded, the caller keeps its own symptom instead
+    /// of inventing a cause.
+    #[tokio::test]
+    async fn failure_without_writer_error_stays_unchanged() {
+        let err_monitor = Arc::new(ErrorMonitor::new());
+        let (chunk_sender, _) = AsyncChannel::new(1).split();
+        let (task_sender, _) = AsyncChannel::new(1).split();
+        let channel = BufferChannel {
+            chunk_sender,
+            task_sender,
+            err_monitor,
+        };
+
+        let error = channel
+            .check_error(FsError::common("the sender dropped"))
+            .to_string();
+        // ErrorImpl renders as "<source>: <ctx>"; with no context the caller's
+        // message is preserved verbatim.
+        assert!(error.starts_with("the sender dropped"));
+        assert!(
+            !error.contains("writer"),
+            "unexpected fabricated cause: {error}"
+        );
     }
 }

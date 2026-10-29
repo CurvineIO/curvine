@@ -15,6 +15,7 @@
 use crate::file::{FsContext, FsReaderBase, FsReaderParallel, ReadDetector};
 use crate::{FileChunk, FileSlice};
 use curvine_core_error::err_box;
+use curvine_core_error::ErrorExt;
 use curvine_error::FsResult;
 use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::Path;
@@ -88,7 +89,14 @@ struct BufferChannel {
 
 impl BufferChannel {
     fn check_error(&self, e: impl Into<FsError>) -> FsError {
-        self.err_monitor.take_error().unwrap_or(e.into())
+        // Keep the reader's real failure visible to every caller, not just the
+        // first one that consumed the typed error.
+        let fallback = e.into();
+        self.err_monitor
+            .resolve_error(|message| {
+                FsError::common(message).ctx(format!("channel closed: {}", fallback))
+            })
+            .unwrap_or(fallback)
     }
 
     fn start_prefetch(&mut self) {
