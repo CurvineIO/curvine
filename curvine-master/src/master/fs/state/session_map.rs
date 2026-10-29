@@ -93,10 +93,15 @@ pub struct SessionHeartbeat {
 pub struct SessionMap {
     sessions: HashMap<String, ClientSession>,
     session_timeout_ms: u64,
-    /// [`monotonic_ms`] instant this map was created (leader epoch start). Consumers
-    /// that must not act on a freshly adopted map -- the reaper's grace window --
-    /// measure from here instead of from a session deadline.
+    /// [`monotonic_ms`] instant the current leader epoch started. Consumers that
+    /// must not act on a freshly adopted map -- the reaper's grace window, the
+    /// session-aware lock validity check -- measure from here instead of from a
+    /// session deadline.
     created_at: u64,
+    /// Whether [`SessionMap::created_at`] has already been reset by the term this
+    /// master is serving. `new` starts it at `false`, so the first heartbeat after
+    /// promotion adopts the map; a step-down clears it again.
+    epoch_adopted: bool,
 }
 
 impl SessionMap {
@@ -110,6 +115,7 @@ impl SessionMap {
             sessions: HashMap::new(),
             session_timeout_ms,
             created_at: monotonic_ms(),
+            epoch_adopted: false,
         }
     }
 
@@ -117,10 +123,40 @@ impl SessionMap {
         self.session_timeout_ms
     }
 
-    /// Start of the current lease epoch: when this map was created, or when the
-    /// last [`SessionMap::clear`] ran.
+    /// Start of the current lease epoch: when the term this master is serving
+    /// adopted the map, or when the last [`SessionMap::clear`] ran.
+    ///
+    /// It is *not* process start: [`SessionMap::adopt_epoch_if_new`] resets it on
+    /// the first leader-side heartbeat after promotion, which is what the grace
+    /// window consumes.
     pub fn created_at(&self) -> u64 {
         self.created_at
+    }
+
+    /// Adopt the map for the term this master is serving (#1877 review).
+    ///
+    /// Returns `true` when a new lease epoch started. A standby resets the
+    /// adoption flag, so the next promotion clears the sessions of the previous
+    /// term and re-arms the grace window; a served term is adopted only once.
+    ///
+    /// Every leader-side consumer of [`SessionMap::created_at`] must call this
+    /// before reading it: the lock-validity snapshot and the session reaper tick
+    /// are the two paths that judge liveness, and both run after a heartbeat has
+    /// already been served, but a promotion that is never followed by a heartbeat
+    /// would otherwise keep the previous epoch.
+    pub fn adopt_epoch_if_new(&mut self, active: bool, now: u64) -> bool {
+        if !active {
+            self.epoch_adopted = false;
+            return false;
+        }
+
+        if self.epoch_adopted {
+            return false;
+        }
+
+        self.clear(now);
+        self.epoch_adopted = true;
+        true
     }
 
     /// Register a new session or renew an existing one.
@@ -195,9 +231,12 @@ impl SessionMap {
             .collect()
     }
 
-    /// Drop every session; called when this master steps down from leader. The
-    /// lease epoch restarts at `now`, which is what the reaper's leader-change
-    /// grace window measures from.
+    /// Drop every session and restart the lease epoch at `now`.
+    ///
+    /// [`SessionMap::adopt_epoch_if_new`] calls this on promotion; call it directly
+    /// only on a step-down, so a demoted master does not keep serving the previous
+    /// term's sessions. The grace window measures from `created_at`, i.e. from this
+    /// call.
     pub fn clear(&mut self, now: u64) {
         self.sessions.clear();
         self.created_at = now;
@@ -235,6 +274,31 @@ mod tests {
             mount_point: Some("/mnt/cv".to_string()),
             client_version: Some("0.1.0".to_string()),
         }
+    }
+
+    #[test]
+    fn adopting_a_new_epoch_drops_sessions_and_restarts_the_grace_window() {
+        let mut map = SessionMap::new(TIMEOUT);
+        map.heartbeat(hb("c1"), 1_000);
+        map.heartbeat(hb("c2"), 1_000);
+        let first_epoch = map.created_at();
+
+        // A standby re-arms adoption without touching the map.
+        assert!(!map.adopt_epoch_if_new(false, 5_000));
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.created_at(), first_epoch);
+
+        // Promotion adopts the map once: previous-term sessions are gone and the
+        // grace window starts at the promotion instant.
+        assert!(map.adopt_epoch_if_new(true, 5_000));
+        assert!(map.is_empty(), "a new term must not inherit old sessions");
+        assert_eq!(map.created_at(), 5_000);
+
+        // Further heartbeats in the same term keep the epoch.
+        map.heartbeat(hb("c1"), 6_000);
+        assert!(!map.adopt_epoch_if_new(true, 7_000));
+        assert_eq!(map.created_at(), 5_000);
+        assert_eq!(map.len(), 1);
     }
 
     #[test]

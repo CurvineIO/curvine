@@ -209,6 +209,23 @@ impl MasterFilesystem {
         }
     }
 
+    /// Start a new client-session lease epoch when this master begins serving a
+    /// term (#1877 review).
+    ///
+    /// `SessionMap::created_at` is seeded when the process starts, but the grace
+    /// window it feeds (`#1879` lock validity, `#1884` reaper) must be measured
+    /// from election: a standby that is promoted hours later would otherwise find
+    /// the window already expired and could release a healthy client's locks.
+    ///
+    /// Every leader-side consumer of `created_at` must call this before reading
+    /// it. A standby call is a cheap no-op that re-arms adoption for the next
+    /// term.
+    pub fn observe_session_epoch(&self, now: u64) {
+        self.session_map
+            .write()
+            .adopt_epoch_if_new(self.master_monitor.is_active(), now);
+    }
+
     pub fn check_parent(path: &InodePath) -> FsResult<()> {
         // The root directory must exist.All /a does not require verification
         if path.len() > 2 {

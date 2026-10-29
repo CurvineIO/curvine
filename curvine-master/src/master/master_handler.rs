@@ -1040,6 +1040,11 @@ impl MasterHandler {
         let mount_point = hb.mount_point.clone();
         let interval_ms = hb.heartbeat_interval_ms;
 
+        // The heartbeat is the only leader-side session path, so it is where the
+        // lease epoch is adopted: without it `created_at` stays at process start
+        // and the leader-change grace window never applies (#1877 review).
+        fs.observe_session_epoch(now);
+
         let mut sessions = fs.session_map.write();
         let new_session = sessions.heartbeat(hb, now);
         let session_timeout_ms = sessions.session_timeout_ms();
@@ -1592,6 +1597,46 @@ mod tests {
         assert_eq!(s.address.hostname, "client-host");
         assert!(sessions.is_live("c-1", 43_000));
         assert!(!sessions.is_live("c-1", 43_001));
+    }
+
+    #[test]
+    fn client_heartbeat_starts_a_new_lease_epoch_after_demotion() {
+        use curvine_raft::raft::RoleState;
+
+        let fs = client_heartbeat_fs(&Utils::rand_str(6));
+
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 1_000).unwrap();
+        MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-2"), 1_000).unwrap();
+        assert_eq!(fs.session_map.read().created_at(), 1_000);
+        assert_eq!(fs.session_map.read().len(), 2);
+
+        // A demoted master re-arms adoption without serving a new epoch yet.
+        fs.master_monitor.set_role_for_test(RoleState::Follower);
+        MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 2_000).unwrap();
+        assert_eq!(fs.session_map.read().created_at(), 1_000);
+
+        // Promotion adopts the map: the previous term's sessions are gone and the
+        // grace window restarts at promotion, not at process start.
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        let rep = MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 30_000)
+            .unwrap();
+        assert!(
+            rep.new_session,
+            "the new term must not inherit the old session"
+        );
+
+        let sessions = fs.session_map.read();
+        assert_eq!(
+            sessions.created_at(),
+            30_000,
+            "the lease epoch must restart when the term is adopted"
+        );
+        assert_eq!(sessions.len(), 1);
+        assert!(
+            sessions.get("c-2").is_none(),
+            "sessions from before the demotion must not survive the new epoch"
+        );
     }
 
     #[test]
