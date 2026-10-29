@@ -368,6 +368,22 @@ Post only the comments the user approved.
 - [ ] Local verdict recorded (Approve / Request changes / Comment) with evidence
 - [ ] User decided on next action (fix / post / discuss)
 - [ ] Review posted only after explicit approval; posted comments use Critical / Required / Optional prefixes
+- [ ] Wrap-up summary emitted per the Wrap-up Summary section, including its Chinese translation
+
+## Wrap-up Summary (required)
+
+Close every run with the block below, in the local chat, after the run's last action - a posted comment, a comment drafted and awaiting approval, or a review decision. Everything posted to GitHub stays English; this block is for the user, and it ends with its Chinese translation.
+
+| Part | Content |
+| ---- | ------- |
+| Issue / PR | `#<n>` and URL, live base and head SHAs, and whether the PR was reviewed, commented on, or approved |
+| Comments | `draft_id` while a comment is only drafted, the GitHub id once posted, plus `path:line`, severity prefix, and `drafted (awaiting approval)` / `posted` / `edited` / `skipped` (duplicate, already enforced by a gate, out of scope) |
+| Problem solved | per comment: the concrete defect, the failure it causes, and the impact (per request / block / RPC / lock hold when measurable) |
+| Approach | the structural or code remedy proposed, and why it fits the surrounding code |
+| Reason for raising it | the evidence behind each comment: call chain, probe, test that fails, or missing assertion |
+| Open items | unresolved threads, duplicates intentionally not posted, follow-ups the author must file, and any decision left to the user |
+
+Then append the same summary in Chinese under a `### Summary (Chinese)` heading: translate the conclusions and reasons, keep issue/PR numbers, paths, SHAs, commands and quoted log lines verbatim, and do not add claims that are absent above.
 
 ## Related
 
