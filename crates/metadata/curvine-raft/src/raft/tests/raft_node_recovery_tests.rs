@@ -2015,3 +2015,122 @@ fn injected_storage_clear_failure_keeps_node_in_quarantine_and_retries_safely() 
     drop(node);
     let _ = std::fs::remove_dir_all(&journal_dir);
 }
+
+// Send one message through the driver channel and let the real loop run one
+// round. The ping makes the `select!` return at once instead of waiting for
+// the ticker, and the timeout bounds a loop that never returns on its own.
+fn drive_one_driver_round<A, B>(
+    rt: &Runtime,
+    node: &mut RaftNode<A, B>,
+    promise: &mut PendingPromises,
+) where
+    A: crate::raft::storage::LogStorage,
+    B: crate::raft::storage::AppStorage,
+{
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let ping = Builder::new_rpc(RaftCode::Ping).req_id(987_654).build();
+
+    rt.block_on(async {
+        node.sender.send(Envelope::new(ping, tx)).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), node.run0(promise)).await;
+    });
+}
+
+// A step-down used to drop the callbacks of proposals still waiting for their
+// entry. Dropping them is not a no-op: the server side is parked on
+// `rx.await`, so the client saw neither a response nor an error until the
+// connection broke. Every pending callback must be answered instead.
+#[test]
+fn pending_propose_callbacks_are_answered_when_the_leader_steps_down() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone(), 1);
+    let mut promise: PendingPromises = HashMap::new();
+
+    // Lead term 1 so the proposal is accepted and parked by the driver.
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+    let leader_term = node.raw.raft.term;
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: node.id(),
+        raft_state: raft::StateRole::Leader,
+    });
+    assert!(node.is_leader());
+
+    let req_id = 4242;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let msg = Builder::new_rpc(RaftCode::Propose)
+        .req_id(req_id)
+        .proto_header(ProposeRequest {
+            data: b"payload".to_vec(),
+        })
+        .build();
+    node.handle_propose(Envelope::new(msg, tx), &mut promise)
+        .unwrap();
+    assert!(
+        promise.contains_key(&req_id),
+        "the proposal must be parked until its entry applies"
+    );
+
+    // A higher term demotes this node before the entry can be applied.
+    node.raw.raft.become_follower(leader_term + 1, 2);
+    assert!(!node.is_leader());
+
+    drive_one_driver_round(&rt, &mut node, &mut promise);
+
+    assert!(
+        promise.is_empty(),
+        "a demoted node must answer its callbacks, not keep them"
+    );
+    let response = rt
+        .block_on(rx)
+        .expect("the callback must be answered")
+        .expect("the answer must be a response message");
+    assert_eq!(
+        response.response_status(),
+        ResponseStatus::Error,
+        "a caller whose entry will never apply must be told, not left waiting"
+    );
+    let error = response
+        .check_error_ext::<RaftError>()
+        .expect_err("the answer must carry the retryable reason");
+    assert!(
+        matches!(error, RaftError::LeaderNotReady(_)),
+        "expected LeaderNotReady, got {:?}",
+        error
+    );
+}
+
+// The step-down drain only fires on a role change, and an idle follower
+// produces no Ready at all. A callback left over from an older term must still
+// be answered by the loop-level drain.
+#[test]
+fn idle_follower_answers_a_callback_left_over_from_an_older_term() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone(), 1);
+    let mut promise: PendingPromises = HashMap::new();
+
+    // This node never led, so no Ready will ever carry a role change.
+    assert!(!node.is_leader());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    promise.insert(777, tx);
+
+    drive_one_driver_round(&rt, &mut node, &mut promise);
+
+    assert!(
+        promise.is_empty(),
+        "the loop-level drain must answer callbacks no Ready will reach"
+    );
+    let response = rt
+        .block_on(rx)
+        .expect("the callback must be answered")
+        .expect("the answer must be a response message");
+    assert_eq!(response.response_status(), ResponseStatus::Error);
+    let error = response
+        .check_error_ext::<RaftError>()
+        .expect_err("a non-leader must report a retryable error");
+    assert!(
+        matches!(error, RaftError::LeaderNotReady(_)),
+        "expected LeaderNotReady, got {:?}",
+        error
+    );
+}
