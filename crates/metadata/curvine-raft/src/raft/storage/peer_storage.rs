@@ -118,37 +118,47 @@ where
     }
 
     fn check_snapshot_state(&self) -> SnapshotState {
-        let mut snap_state = self.snap_state.lock().unwrap();
+        let (snap_state, failed) = {
+            let mut state = self.snap_state.lock().unwrap();
+            let mut failed = None;
 
-        match &*snap_state {
-            SnapshotState::Relax => {
-                // pass
-            }
+            match &*state {
+                SnapshotState::Relax => {
+                    // pass
+                }
 
-            SnapshotState::Generating(st) => {
-                let finish = matches!(
-                    st.state(),
-                    JobState::Cancelled | JobState::Finished | JobState::Failed
-                );
+                SnapshotState::Generating(st) => match st.state() {
+                    JobState::Cancelled | JobState::Finished => {
+                        *state = SnapshotState::Relax;
+                    }
 
-                if finish {
-                    *snap_state = SnapshotState::Relax;
+                    // The generation job reports nothing back to the driver, so a
+                    // failure is terminal. It is raised after the lock is released
+                    // to keep the snapshot state usable while the node unwinds.
+                    JobState::Failed => failed = Some("snap generating"),
+                    _ => {}
+                },
+
+                SnapshotState::Applying(st) => {
+                    let finish = matches!(
+                        st.state(),
+                        JobState::Cancelled | JobState::Finished | JobState::Failed
+                    );
+
+                    if finish {
+                        *state = SnapshotState::Relax;
+                    }
                 }
             }
 
-            SnapshotState::Applying(st) => {
-                let finish = matches!(
-                    st.state(),
-                    JobState::Cancelled | JobState::Finished | JobState::Failed
-                );
+            (state.clone(), failed)
+        };
 
-                if finish {
-                    *snap_state = SnapshotState::Relax;
-                }
-            }
+        if let Some(reason) = failed {
+            panic!("{}", reason);
         }
 
-        snap_state.clone()
+        snap_state
     }
 
     // Is it possible to create a snapshot currently?
