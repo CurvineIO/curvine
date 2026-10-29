@@ -2145,6 +2145,7 @@ dependencies = [
  "curvine-core-error",
  "curvine-error",
  "curvine-fs-api",
+ "curvine-io",
  "curvine-job-client",
  "curvine-model",
  "curvine-net",
@@ -2157,6 +2158,7 @@ dependencies = [
  "reqwest 0.12.25",
  "serde",
  "serde_json",
+ "tempfile",
  "tikv-jemallocator",
  "tokio",
 ]
