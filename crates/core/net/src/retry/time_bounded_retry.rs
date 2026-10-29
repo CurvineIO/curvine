@@ -69,6 +69,15 @@ impl TimeBondedRetry {
     pub fn count(&self) -> u32 {
         self.count
     }
+
+    /// Time left in the policy budget, or zero once it is exhausted.
+    ///
+    /// Callers use this to clamp a single attempt so one attempt cannot run past
+    /// the whole policy budget: the budget is a deadline, not just a bound on
+    /// the number of attempts.
+    pub fn remaining(&self) -> Duration {
+        self.end_time.saturating_duration_since(Instant::now())
+    }
 }
 
 #[derive(Clone)]
@@ -90,6 +99,11 @@ impl TimeBondedRetryBuilder {
     pub fn build(&self) -> TimeBondedRetry {
         TimeBondedRetry::new(self.max_duration, self.min_sleep, self.max_sleep)
     }
+
+    /// Total budget a built policy may spend, including sleeps and attempts.
+    pub fn max_duration(&self) -> Duration {
+        self.max_duration
+    }
 }
 
 impl Default for TimeBondedRetryBuilder {
@@ -104,7 +118,7 @@ impl Default for TimeBondedRetryBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::retry::TimeBondedRetry;
+    use crate::retry::{TimeBondedRetry, TimeBondedRetryBuilder};
     use curvine_runtime::common::LocalTime;
     use std::time::Duration;
 
@@ -133,5 +147,23 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(!(retry.attempt().await));
+        assert_eq!(retry.remaining(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn remaining_tracks_the_budget() {
+        let builder = TimeBondedRetryBuilder::new(
+            Duration::from_millis(200),
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+        );
+        assert_eq!(builder.max_duration(), Duration::from_millis(200));
+
+        let policy = builder.build();
+        assert!(policy.remaining() <= Duration::from_millis(200));
+        assert!(policy.remaining() > Duration::from_millis(100));
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(policy.remaining(), Duration::ZERO);
     }
 }

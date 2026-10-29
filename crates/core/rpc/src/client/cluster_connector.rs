@@ -164,12 +164,40 @@ impl ClusterConnector {
     where
         E: ErrorExt + From<IOError> + From<CommonError>,
     {
-        let client = match self.get_client_with_id(id).await {
-            Err(e) => return Err((true, e.into())),
-            Ok(v) => v,
+        self.timeout_rpc_within(id, msg, self.rpc_timeout).await
+    }
+
+    /// RPC to one node, with connection establishment and the request both
+    /// bounded by `timeout`.
+    ///
+    /// `msg` is consumed by the request, so it is only moved in after the
+    /// connection is up; a connection timeout therefore leaves no half-used
+    /// request or pooled client behind.
+    async fn timeout_rpc_within<E>(
+        &self,
+        id: u64,
+        msg: impl RefMessage,
+        timeout: Duration,
+    ) -> Result<Message, (bool, E)>
+    where
+        E: ErrorExt + From<IOError> + From<CommonError>,
+    {
+        let client = match tokio::time::timeout(timeout, self.get_client_with_id(id)).await {
+            Ok(Ok(client)) => client,
+            Ok(Err(e)) => return Err((true, e.into())),
+            Err(_) => {
+                // A blackholed peer can stall the TCP handshake for the kernel
+                // SYN retry budget, so the connect is bounded as well.
+                let err = IOError::create(format!(
+                    "connect to node {} exceeded {:?}",
+                    self.get_addr_string(id),
+                    timeout
+                ));
+                return Err((true, err.into()));
+            }
         };
 
-        match client.timeout_rpc(self.rpc_timeout, msg).await {
+        match client.timeout_rpc(timeout, msg).await {
             Ok(v) => match v.check_error_ext::<E>() {
                 Err(e) => Err((e.should_retry(), e)),
                 Ok(_) => Ok(v),
@@ -227,9 +255,19 @@ impl ClusterConnector {
         let mut last_error: Option<E> = None;
         let msg = msg.into_arc();
 
+        // One budget for the whole call. The retry policy is a deadline, not only
+        // an attempt counter, so every attempt below is clamped to what is left:
+        // otherwise the leader probe plus one retry round can each consume a full
+        // `rpc_timeout` and the call can outlive the configured budget (#1815).
+        let mut policy = self.retry_builder.build();
+
         // Send a request to the current leader node.
         if let Some(id) = self.leader_id() {
-            match self.timeout_rpc(id, msg.clone()).await {
+            let leader_timeout = self.rpc_timeout.min(policy.remaining());
+            match self
+                .timeout_rpc_within(id, msg.clone(), leader_timeout)
+                .await
+            {
                 Ok(v) => return Ok(v),
 
                 Err((false, e)) => {
@@ -252,7 +290,6 @@ impl ClusterConnector {
         // If the client returns that the current node is not the leader, we still perform polling and retry.
         // At this time, the server may be performing the master selection operation, and it is not advisable to fail directly to return.
         self.change_leader(Self::DEFAULT_LEADER_ID);
-        let mut policy = self.retry_builder.build();
         let node_list = self.node_list(false);
         if node_list.is_empty() {
             let err = err_msg!("no nodes available in cluster");
@@ -260,12 +297,17 @@ impl ClusterConnector {
         }
 
         while policy.attempt().await {
+            let attempt_timeout = self.rpc_timeout.min(policy.remaining());
+            if attempt_timeout.is_zero() {
+                break;
+            }
+
             let mut futures: Vec<_> = node_list
                 .iter()
                 .map(|&id| {
                     let msg = msg.clone();
                     Box::pin(async move {
-                        let res = self.timeout_rpc::<E>(id, msg).await;
+                        let res = self.timeout_rpc_within::<E>(id, msg, attempt_timeout).await;
                         (id, res)
                     })
                 })
