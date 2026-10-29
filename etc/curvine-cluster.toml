@@ -84,7 +84,7 @@ meta_dir = "testing/meta"
 #   valid time_rotation is set, files rotate daily so they cannot grow without limit.
 # max_log_files: number of rotated files to keep (default 10).
 # Example: log = { level = "info", log_dir = "logs", file_name = "master.log", max_file_size_mb = 200, time_rotation = "daily", max_log_files = 20 }
-log = { level = "info", log_dir = "stdout", file_name = "master.log" }
+log = { level = "info", log_dir = "logs", file_name = "master.log" }
 
 # Version compatibility policy.
 # mode: "diagnose" (default, allow with warnings) or "enforce" (reject
@@ -115,7 +115,7 @@ kv_backend = "fdb"
 # Path to the FoundationDB cluster file (the same file `fdbcli -C <path>`
 # accepts). Required when kv_backend = "fdb".
 fdb_cluster_file = "/etc/foundationdb/fdb.cluster"
-log = { level = "info", log_dir = "stdout", file_name = "mds.log" }
+log = { level = "info", log_dir = "logs", file_name = "mds.log" }
 
 
 # masta ha raft configuration.
@@ -148,7 +148,7 @@ dir_reserved = "0"
 data_dir = [
     "[DISK]testing/data",
 ]
-log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
+log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 
 # SPDK over NVMe-oF/RDMA configuration  
 [worker.spdk_disk]  
@@ -191,7 +191,7 @@ web_port = 9011
 # When full, new cache requests are skipped and foreground reads continue from UFS.
 client_pending_queue_size = 1024
 client_submit_concurrency = 64
-log = { level = "info", log_dir = "stdout", file_name = "transfer.log" }
+log = { level = "info", log_dir = "logs", file_name = "transfer.log" }
 
 # fuse configuration
 [fuse]
@@ -212,8 +212,8 @@ negative_timeout = 0      # negative-lookup (ENOENT) cache; 0 = disabled
 # The log configuration of the customer service side, and the customer service side of rust, java, and fuse use this log file.
 [log]
 level = "info"
-log_dir = "stdout"
+log_dir = "logs"
 file_name = "curvine.log"
 
 [cli]
-log = { level = "warn", log_dir = "stdout", file_name = "cli.log" }
+log = { level = "warn", log_dir = "logs", file_name = "cli.log" }
