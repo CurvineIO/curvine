@@ -44,6 +44,13 @@ pub const WORKER_MAX_CONCURRENT_TASKS_CONFIG: &str = "worker_max_concurrent_task
 /// job keeps the task rows it already has.
 pub const MAX_TASKS_PER_TRANSFER_CONFIG: &str = "max_tasks_per_transfer";
 
+/// Runtime key for the collected-entry ceiling of one planning pass.
+///
+/// Backed by `transfer.max_plan_entries`. Collection is what dominates planning
+/// memory, so this is the knob that decides how wide a source tree one job may
+/// walk before failing with "entries exceeds N during listing".
+pub const MAX_PLAN_ENTRIES_CONFIG: &str = "max_plan_entries";
+
 /// Transfer-role knobs that are adjustable without a restart.
 ///
 /// Cloning is not implemented on purpose: the state is shared by `Arc` so that
@@ -58,6 +65,10 @@ pub struct TransferRuntimeConfig {
     file_max_tasks_per_transfer: usize,
     /// Effective per-job task cap. Read on every planning cap check.
     max_tasks_per_transfer: AtomicUsize,
+    /// Value from the configuration file, restored by `reset_max_plan_entries`.
+    file_max_plan_entries: usize,
+    /// Effective collected-entry cap. Read when a planning pass starts.
+    max_plan_entries: AtomicUsize,
 }
 
 impl TransferRuntimeConfig {
@@ -66,23 +77,34 @@ impl TransferRuntimeConfig {
         Self::with_limits(
             conf.job.worker_max_concurrent_tasks,
             conf.transfer.max_tasks_per_transfer,
+            conf.transfer.max_plan_entries,
         )
     }
 
     /// Builds the state from a bare limit, for callers that do not hold a
     /// `ClusterConf` (tests). The file value is the same limit.
     pub fn with_limit(limit: usize) -> Self {
-        Self::with_limits(limit, TransferConf::DEFAULT_MAX_TASKS_PER_TRANSFER)
+        Self::with_limits(
+            limit,
+            TransferConf::DEFAULT_MAX_TASKS_PER_TRANSFER,
+            TransferConf::DEFAULT_MAX_PLAN_ENTRIES,
+        )
     }
 
-    /// Builds the state from both limits; each is floored to 1 so a zero in the
-    /// configuration file cannot park dispatch or block every plan.
-    pub fn with_limits(worker_task_limit: usize, max_tasks_per_transfer: usize) -> Self {
+    /// Builds the state from explicit limits; each is floored to 1 so a zero in
+    /// the configuration file cannot park dispatch or block every plan.
+    pub fn with_limits(
+        worker_task_limit: usize,
+        max_tasks_per_transfer: usize,
+        max_plan_entries: usize,
+    ) -> Self {
         Self {
             file_worker_task_limit: worker_task_limit,
             worker_task_limit: AtomicUsize::new(worker_task_limit.max(1)),
             file_max_tasks_per_transfer: max_tasks_per_transfer,
             max_tasks_per_transfer: AtomicUsize::new(max_tasks_per_transfer.max(1)),
+            file_max_plan_entries: max_plan_entries,
+            max_plan_entries: AtomicUsize::new(max_plan_entries.max(1)),
         }
     }
 
@@ -112,6 +134,29 @@ impl TransferRuntimeConfig {
         let restored = self.file_max_tasks_per_transfer.max(1);
         self.max_tasks_per_transfer
             .store(restored, Ordering::Release);
+        restored
+    }
+
+    /// Effective collected-entry ceiling for one planning pass.
+    pub fn max_plan_entries(&self) -> usize {
+        self.max_plan_entries.load(Ordering::Acquire)
+    }
+
+    /// Applies a new collected-entry ceiling and returns the previous one.
+    pub fn update_max_plan_entries(&self, target: usize) -> FsResult<usize> {
+        if target == 0 {
+            return Err(FsError::common(format!(
+                "{} must be greater than zero",
+                MAX_PLAN_ENTRIES_CONFIG
+            )));
+        }
+        Ok(self.max_plan_entries.swap(target, Ordering::AcqRel))
+    }
+
+    /// Restores the configuration file's collected-entry ceiling and returns it.
+    pub fn reset_max_plan_entries(&self) -> usize {
+        let restored = self.file_max_plan_entries.max(1);
+        self.max_plan_entries.store(restored, Ordering::Release);
         restored
     }
 
@@ -149,6 +194,7 @@ pub fn build_transfer_runtime_registry(
 ) -> RuntimeConfigRegistry {
     let file_worker_task_limit = conf.job.worker_max_concurrent_tasks;
     let file_max_tasks_per_transfer = conf.transfer.max_tasks_per_transfer;
+    let file_max_plan_entries = conf.transfer.max_plan_entries;
 
     RuntimeConfigRegistry::builder()
         .register_at(
@@ -201,6 +247,31 @@ pub fn build_transfer_runtime_registry(
             {
                 let state = state.clone();
                 move || Ok(Value::from(state.reset_max_tasks_per_transfer()))
+            },
+        )
+        .register_at(
+            MAX_PLAN_ENTRIES_CONFIG,
+            // Backed by `TransferConf::max_plan_entries`, i.e. `[transfer].*`.
+            Some("transfer.max_plan_entries"),
+            move || Value::from(file_max_plan_entries),
+            {
+                let state = state.clone();
+                move || Value::from(state.max_plan_entries())
+            },
+            {
+                let state = state.clone();
+                move |raw| {
+                    let target = parse_usize(MAX_PLAN_ENTRIES_CONFIG, raw)?;
+                    let previous = match state.update_max_plan_entries(target) {
+                        Ok(v) => v,
+                        Err(e) => return err_box!(e.to_string()),
+                    };
+                    Ok((Value::from(previous), Value::from(target)))
+                }
+            },
+            {
+                let state = state.clone();
+                move || Ok(Value::from(state.reset_max_plan_entries()))
             },
         )
         .build()
@@ -289,7 +360,7 @@ mod tests {
     /// must not disturb the other.
     #[test]
     fn task_cap_and_worker_ceiling_are_independent() {
-        let state = TransferRuntimeConfig::with_limits(4, 100_000);
+        let state = TransferRuntimeConfig::with_limits(4, 100_000, 500_000);
         assert_eq!(state.worker_task_limit(), 4);
         assert_eq!(state.max_tasks_per_transfer(), 100_000);
 
@@ -303,11 +374,54 @@ mod tests {
         assert_eq!(state.reset_max_tasks_per_transfer(), 100_000);
     }
 
+    /// The collected-entry ceiling is its own knob: it bounds how wide a source
+    /// tree one job may walk and must not move the task cap with it.
+    #[test]
+    fn plan_entry_cap_is_independent_and_rejects_zero() {
+        let state = TransferRuntimeConfig::with_limits(1, 100_000, 300_000);
+        assert_eq!(state.max_plan_entries(), 300_000);
+
+        assert_eq!(state.update_max_plan_entries(500_000).unwrap(), 300_000);
+        assert_eq!(state.max_plan_entries(), 500_000);
+        assert_eq!(state.max_tasks_per_transfer(), 100_000);
+
+        assert!(state.update_max_plan_entries(0).is_err());
+        assert_eq!(state.max_plan_entries(), 500_000);
+
+        assert_eq!(state.reset_max_plan_entries(), 300_000);
+    }
+
+    /// Wide partitions need a raisable entry cap; it is exposed on the same
+    /// registry the UpdateConfigs endpoint drives.
+    #[test]
+    fn registry_updates_the_plan_entry_cap() {
+        let conf = ClusterConf::default();
+        let state = Arc::new(TransferRuntimeConfig::from_conf(&conf));
+        let registry = build_transfer_runtime_registry(state.clone(), &conf);
+        let original = conf.transfer.max_plan_entries;
+
+        let updated = registry
+            .set(MAX_PLAN_ENTRIES_CONFIG, "800000", None)
+            .unwrap();
+        assert_eq!(state.max_plan_entries(), 800_000);
+        assert_eq!(updated.previous_value, Value::from(original));
+        assert_eq!(
+            registry.config_path(MAX_PLAN_ENTRIES_CONFIG),
+            Some("transfer.max_plan_entries")
+        );
+
+        assert!(registry.set(MAX_PLAN_ENTRIES_CONFIG, "0", None).is_err());
+        assert_eq!(state.max_plan_entries(), 800_000);
+
+        registry.reset(MAX_PLAN_ENTRIES_CONFIG, None).unwrap();
+        assert_eq!(state.max_plan_entries(), original);
+    }
+
     /// A zero cap would reject every non-empty plan, so writes refuse it and the
     /// effective value stays where it was.
     #[test]
     fn task_cap_update_rejects_zero() {
-        let state = TransferRuntimeConfig::with_limits(1, 10);
+        let state = TransferRuntimeConfig::with_limits(1, 10, 500_000);
         assert!(state.update_max_tasks_per_transfer(0).is_err());
         assert_eq!(state.max_tasks_per_transfer(), 10);
     }

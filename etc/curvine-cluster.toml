@@ -303,6 +303,12 @@ client_submit_concurrency = 64
 # Also hot-updatable through the Transfer UpdateConfigs endpoint
 # (POST /api/update_config with key max_tasks_per_transfer).
 # max_tasks_per_transfer = 500000
+# Upper bound on collected filesystem entries (files + directories) for one
+# planning pass, default 500000. Collection dominates planning memory, so raise
+# this for very wide partitions; a tree exceeding it fails during listing with
+# "entries exceeds N" before the task cap is even consulted.
+# Also hot-updatable through UpdateConfigs (key max_plan_entries).
+# max_plan_entries = 500000
 log = { level = "info", log_dir = "stdout", file_name = "transfer.log" }
 
 # fuse configuration

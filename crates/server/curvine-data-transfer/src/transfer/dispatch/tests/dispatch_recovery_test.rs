@@ -254,7 +254,7 @@ fn planner_reads_the_live_task_cap() {
     let conf = ClusterConf::default();
     // `with_limits(1, 10_000_000)` makes the cap distinguishable from the
     // default, so a snapshot would be visible as a wrong value.
-    let state = Arc::new(TransferRuntimeConfig::with_limits(1, 10_000_000));
+    let state = Arc::new(TransferRuntimeConfig::with_limits(1, 10_000_000, 500_000));
     let scheduler = scheduler_with_state(Arc::new(MemoryTransferStore::new()), state.clone());
     let registry = build_transfer_runtime_registry(state.clone(), &conf);
 

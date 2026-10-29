@@ -342,11 +342,10 @@ impl TransferPlanner {
 /// Bounds fan-out; per-endpoint pressure is still gated by UfsEndpointLimiter.
 const PLAN_LIST_CONCURRENCY: usize = 16;
 
-/// Hard cap on collected filesystem entries (files + directories). Listing
-/// memory is bounded independently of the task cap: batching collapses many
-/// files into one task, so a task-derived cap would both over- and
-/// under-count legal trees. Phase 2 still enforces max_tasks_per_transfer.
-const PLAN_ENTRY_CAP: usize = 300_000;
+// The collected-entry cap lives in the runtime state (`transfer.max_plan_entries`)
+// rather than a constant: it bounds listing memory independently of the task cap
+// (batching collapses many files into one task), and it has to be raisable for
+// wide partitions without a rebuild. Phase 2 still enforces max_tasks_per_transfer.
 
 /// One collected filesystem entry with its BFS position. Phase 2 sorts by
 /// (depth, seq) to replay the original serial BFS order, keeping task ids
@@ -466,7 +465,9 @@ impl TransferPlanner {
             count: AtomicUsize::new(0),
             entries: Mutex::new(Vec::new()),
             sem: tokio::sync::Semaphore::new(PLAN_LIST_CONCURRENCY),
-            collect_limit: PLAN_ENTRY_CAP,
+            // Snapshot per pass: one planning run must use a single ceiling even
+            // if the value is pushed while it is still listing.
+            collect_limit: self.runtime.max_plan_entries(),
             job_id: job_id.to_string(),
         });
         push_entry(&shared, 0, 0, root_status, root_target)?;

@@ -66,6 +66,15 @@ pub struct TransferConf {
     /// the transfer UpdateConfigs endpoint.
     #[serde(default = "TransferConf::default_max_tasks_per_transfer")]
     pub max_tasks_per_transfer: usize,
+    /// Upper bound on collected filesystem entries (files + directories) while
+    /// listing a source tree.
+    ///
+    /// Independent of `max_tasks_per_transfer`: batching and segment grouping
+    /// collapse many files into fewer tasks, so a task-derived bound would both
+    /// over- and under-count legal trees. Collection is also what dominates
+    /// planning memory, so this is the knob to raise for very wide partitions.
+    #[serde(default = "TransferConf::default_max_plan_entries")]
+    pub max_plan_entries: usize,
     #[serde(
         skip,
         default = "TransferConf::default_ufs_max_concurrency_per_endpoint"
@@ -158,6 +167,7 @@ impl TransferConf {
     pub const DEFAULT_IO_THREADS: usize = 4;
     pub const DEFAULT_WORKER_THREADS: usize = 8;
     pub const DEFAULT_MAX_TASKS_PER_TRANSFER: usize = 500_000;
+    pub const DEFAULT_MAX_PLAN_ENTRIES: usize = 500_000;
     pub const DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT: usize = 32;
     pub const DEFAULT_TASK_MAX_RETRIES: usize = 3;
 
@@ -259,6 +269,11 @@ impl TransferConf {
         if self.max_tasks_per_transfer == 0 {
             return Err(FsError::common(
                 "transfer.max_tasks_per_transfer must be greater than 0",
+            ));
+        }
+        if self.max_plan_entries == 0 {
+            return Err(FsError::common(
+                "transfer.max_plan_entries must be greater than 0",
             ));
         }
         Ok(())
@@ -406,6 +421,10 @@ impl TransferConf {
         Self::DEFAULT_MAX_TASKS_PER_TRANSFER
     }
 
+    fn default_max_plan_entries() -> usize {
+        Self::DEFAULT_MAX_PLAN_ENTRIES
+    }
+
     fn default_ufs_max_concurrency_per_endpoint() -> usize {
         Self::DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT
     }
@@ -512,6 +531,7 @@ impl Default for TransferConf {
             client_pending_queue_size: Self::DEFAULT_CLIENT_PENDING_QUEUE_SIZE,
             client_submit_concurrency: Self::DEFAULT_CLIENT_SUBMIT_CONCURRENCY,
             max_tasks_per_transfer: Self::DEFAULT_MAX_TASKS_PER_TRANSFER,
+            max_plan_entries: Self::DEFAULT_MAX_PLAN_ENTRIES,
             ufs_max_concurrency_per_endpoint: Self::DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT,
             task_max_retries: Self::DEFAULT_TASK_MAX_RETRIES,
             task_report_interval: Duration::default(),

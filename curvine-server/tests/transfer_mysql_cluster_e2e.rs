@@ -394,7 +394,7 @@ fn mysql_cluster_e2e_batch_segment_load() -> CommonResult<()> {
             factory,
             cache,
             cluster.cluster_conf.client.clone(),
-            Arc::new(TransferRuntimeConfig::with_limits(1, 100_000)),
+            Arc::new(TransferRuntimeConfig::with_limits(1, 100_000, 500_000)),
             32,
         );
 
@@ -585,7 +585,7 @@ fn mysql_cluster_e2e_batch_segment_load() -> CommonResult<()> {
             )),
             ClusterMetadataCache::new(fs.clone()),
             cluster.cluster_conf.client.clone(),
-            Arc::new(TransferRuntimeConfig::with_limits(1, 1)),
+            Arc::new(TransferRuntimeConfig::with_limits(1, 1, 500_000)),
             32,
         );
         // Fresh cache without refresh => mount snapshot missing => plan errs
@@ -756,7 +756,7 @@ fn s3_cluster_e2e_s3_source() -> CommonResult<()> {
             factory.clone(),
             cache,
             cluster.cluster_conf.client.clone(),
-            Arc::new(TransferRuntimeConfig::with_limits(1, 100_000)),
+            Arc::new(TransferRuntimeConfig::with_limits(1, 100_000, 500_000)),
             32,
         );
         let command = TransferCommand {

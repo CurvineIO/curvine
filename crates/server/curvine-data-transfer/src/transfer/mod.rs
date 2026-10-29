@@ -45,8 +45,8 @@ pub use self::job_snapshot::{job_mount_snapshot, job_mount_snapshot_async};
 
 mod runtime_config;
 pub use self::runtime_config::{
-    build_transfer_runtime_registry, TransferRuntimeConfig, MAX_TASKS_PER_TRANSFER_CONFIG,
-    WORKER_MAX_CONCURRENT_TASKS_CONFIG,
+    build_transfer_runtime_registry, TransferRuntimeConfig, MAX_PLAN_ENTRIES_CONFIG,
+    MAX_TASKS_PER_TRANSFER_CONFIG, WORKER_MAX_CONCURRENT_TASKS_CONFIG,
 };
 
 mod dispatch;

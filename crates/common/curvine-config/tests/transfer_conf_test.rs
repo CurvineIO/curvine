@@ -162,3 +162,45 @@ fn max_tasks_per_transfer_rejects_zero() {
         "unexpected error: {err}"
     );
 }
+
+/// The collected-entry cap must be settable from the configuration file; it
+/// bounds listing memory independently of the task cap.
+#[test]
+fn max_plan_entries_is_configurable() {
+    let conf: TransferConf = toml::from_str(
+        r#"
+        enabled = true
+        hostname = "transfer-01.example"
+        max_plan_entries = 800000
+        "#,
+    )
+    .unwrap();
+    assert_eq!(conf.max_plan_entries, 800_000);
+}
+
+/// Absent key keeps the built-in default. Pinned to a literal so a default
+/// change is visible here.
+#[test]
+fn max_plan_entries_defaults_when_absent() {
+    let conf: TransferConf = toml::from_str(
+        r#"
+        enabled = true
+        hostname = "transfer-01.example"
+        "#,
+    )
+    .unwrap();
+    assert_eq!(conf.max_plan_entries, 500_000);
+}
+
+/// Zero would fail every non-empty listing, so validation refuses it.
+#[test]
+fn max_plan_entries_rejects_zero() {
+    let mut conf = TransferConf {
+        enabled: true,
+        hostname: "transfer-01.example".to_string(),
+        max_plan_entries: 0,
+        ..Default::default()
+    };
+    let err = conf.init().unwrap_err().to_string();
+    assert!(err.contains("max_plan_entries"), "unexpected error: {err}");
+}
