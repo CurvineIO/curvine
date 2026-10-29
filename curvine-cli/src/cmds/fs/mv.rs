@@ -26,8 +26,7 @@ impl MvCommand {
                 let destination = CurvineURI::new(destination)?;
 
                 if !source.is_cv() || !destination.is_cv() {
-                    eprintln!("mv: Source and Destination must both be curvine uris");
-                    return Err("Invalid URI format".into());
+                    return Err("Source and destination must both be curvine URIs".into());
                 }
                 match client.get_status(&source).await {
                     Ok(_) => {
@@ -35,10 +34,7 @@ impl MvCommand {
                         println!("Renamed {} to {} successfully", source, destination);
                         Ok(())
                     }
-                    Err(e) => {
-                        eprintln!("mv: Error checking source status: {}", e);
-                        Err(e.into())
-                    }
+                    Err(e) => Err(format!("Cannot access source '{}': {}", source, e).into()),
                 }
             }
         }

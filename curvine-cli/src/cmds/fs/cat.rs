@@ -24,7 +24,6 @@ impl CatCommand {
                 match client.get_status(&path).await {
                     Ok(status) => {
                         if status.is_dir {
-                            eprintln!("cat: Cannot display '{}': Is a directory", path.full_path());
                             return Err(format!(
                                 "Cannot display '{}': Is a directory",
                                 path.full_path()
@@ -39,28 +38,32 @@ impl CatCommand {
                                 let mut stdout = std::io::stdout();
                                 if let Err(e) = copy_to(&mut reader, &mut stdout, chunk_size).await
                                 {
-                                    eprintln!("cat: Cannot display '{}': {}", path.full_path(), e);
-                                    return Err(e);
+                                    return Err(format!(
+                                        "Cannot display '{}': {}",
+                                        path.full_path(),
+                                        e
+                                    )
+                                    .into());
                                 }
 
                                 // Complete the read
                                 if let Err(e) = reader.complete().await {
-                                    eprintln!("Error completing read: {}", e);
-                                    return Err(e.into());
+                                    return Err(format!(
+                                        "Cannot complete read of '{}': {}",
+                                        path.full_path(),
+                                        e
+                                    )
+                                    .into());
                                 }
 
                                 Ok(())
                             }
                             Err(e) => {
-                                eprintln!("Error opening file: {}", e);
-                                Err(e.into())
+                                Err(format!("Cannot open '{}': {}", path.full_path(), e).into())
                             }
                         }
                     }
-                    Err(e) => {
-                        eprintln!("cat: Cannot access '{}': {}", path.full_path(), e);
-                        Err(e.into())
-                    }
+                    Err(e) => Err(format!("Cannot access '{}': {}", path.full_path(), e).into()),
                 }
             }
         }

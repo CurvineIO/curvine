@@ -44,16 +44,20 @@ impl TouchCommand {
                             Ok(mut writer) => {
                                 // Complete the write to create an empty file
                                 if let Err(e) = writer.complete().await {
-                                    eprintln!("Error creating empty file: {}", e);
-                                    return Err(e.into());
+                                    return Err(format!(
+                                        "Cannot create empty file '{}': {}",
+                                        path.full_path(),
+                                        e
+                                    )
+                                    .into());
                                 }
 
                                 println!("Created empty file: {}", path.full_path());
                                 Ok(())
                             }
                             Err(e) => {
-                                eprintln!("Error creating file: {}", e);
-                                Err(e.into())
+                                Err(format!("Cannot create file '{}': {}", path.full_path(), e)
+                                    .into())
                             }
                         }
                     }

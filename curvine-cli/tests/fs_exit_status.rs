@@ -38,3 +38,28 @@ fn put_local_directory_exits_with_failure() {
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("is not a file"));
 }
+
+#[test]
+fn put_failure_is_reported_once() {
+    let missing =
+        std::env::temp_dir().join(format!("curvine-cli-reported-once-{}", std::process::id()));
+    assert!(!missing.exists());
+
+    let output = run_put(&missing);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr.matches("does not exist").count(),
+        1,
+        "the failure must be printed exactly once, stderr: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains(&format!(
+            "Error: Local file '{}' does not exist",
+            missing.display()
+        )),
+        "the failure must be printed in Display form, stderr: {}",
+        stderr
+    );
+}

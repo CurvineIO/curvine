@@ -70,10 +70,7 @@ impl DfCommand {
 
                         Ok(())
                     }
-                    Err(e) => {
-                        eprintln!("Error getting filesystem info: {}", e);
-                        Err(e.into())
-                    }
+                    Err(e) => Err(format!("Cannot get filesystem info: {}", e).into()),
                 }
             }
         }

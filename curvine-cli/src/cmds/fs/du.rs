@@ -69,10 +69,7 @@ impl DuCommand {
                         }
                         Ok(())
                     }
-                    Err(e) => {
-                        eprintln!("du: Cannot access '{}': {}", path.full_path(), e);
-                        Err(e)
-                    }
+                    Err(e) => Err(format!("Cannot access '{}': {}", path.full_path(), e).into()),
                 }
             }
         }
