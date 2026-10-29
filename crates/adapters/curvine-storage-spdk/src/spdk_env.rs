@@ -1299,24 +1299,97 @@ impl SpdkEnv {
         self.qpair_pool.publish_metrics();
     }
 
-    /// Names of all discovered bdevs.
+    /// Names of currently active bdevs (not stable across detach).
     pub fn bdev_names(&self) -> Vec<String> {
-        self.bdevs.iter().map(|b| b.name.clone()).collect()
+        self.active_bdevs().map(|b| b.name.clone()).collect()
     }
 
-    /// All discovered bdev metadata.
-    pub fn bdevs(&self) -> &[BdevInfo] {
-        &self.bdevs
+    /// Currently active bdev metadata, borrowed (not stable across detach).
+    pub fn bdevs(&self) -> Vec<&BdevInfo> {
+        self.active_bdevs().collect()
+    }
+
+    /// Number of discovered bdev slots. Slots are stable for this SPDK env and
+    /// include detached controllers so dir_id modulo mapping never remaps.
+    pub fn bdev_slot_count(&self) -> usize {
+        self.bdevs.len()
+    }
+
+    /// Return the bdev assigned to a stable slot only if its controller is active.
+    pub fn active_bdev_at_slot(&self, slot: usize) -> CommonResult<&BdevInfo> {
+        let bdev = self.bdevs.get(slot).ok_or_else(|| {
+            err_msg!(
+                "SPDK bdev slot {} is out of range; {} slot(s) were discovered",
+                slot,
+                self.bdevs.len()
+            )
+        })?;
+        let controller = self
+            .controllers
+            .iter()
+            .find(|entry| entry.ctrlr == bdev.ctrlr)
+            .ok_or_else(|| {
+                err_msg!(
+                    "SPDK bdev slot {} ('{}') has no controller record; refusing to remap",
+                    slot,
+                    bdev.name
+                )
+            })?;
+        if controller.state() != ControllerState::Active {
+            return err_box!(
+                "SPDK bdev slot {} ('{}', target {}) is {:?}; refusing to remap dir_id to another bdev",
+                slot,
+                bdev.name,
+                controller.target_idx,
+                controller.state()
+            );
+        }
+        Ok(bdev)
+    }
+
+    /// Number of bdevs currently available for new opens.
+    pub fn active_bdev_count(&self) -> usize {
+        self.active_bdevs().count()
     }
 
     /// Look up a bdev by name.
     pub fn get_bdev(&self, name: &str) -> Option<&BdevInfo> {
-        self.bdevs.iter().find(|b| b.name == name)
+        self.bdevs
+            .iter()
+            .find(|b| b.name == name)
+            .filter(|b| self.is_bdev_active(b))
     }
 
-    /// Total capacity across all bdevs, in bytes.
+    /// Diagnostic for a failed `get_bdev()` lookup: distinguishes unknown vs. inactive-controller.
+    pub fn describe_missing_bdev(&self, name: &str) -> String {
+        match self.bdevs.iter().find(|b| b.name == name) {
+            Some(bdev) => match self.controllers.iter().find(|e| e.ctrlr == bdev.ctrlr) {
+                Some(entry) => format!(
+                    "bdev '{}' exists but its controller is {:?} (not Active), refusing open",
+                    name,
+                    entry.state()
+                ),
+                None => format!("bdev '{}' not found in SpdkEnv", name),
+            },
+            None => format!("bdev '{}' not found in SpdkEnv", name),
+        }
+    }
+
+    /// Total capacity across currently active bdevs, in bytes.
     pub fn total_capacity(&self) -> u64 {
-        self.bdevs.iter().map(|b| b.size_bytes).sum()
+        self.active_bdevs().map(|b| b.size_bytes).sum()
+    }
+
+    /// Iterate bdevs whose controller is still active and available for opens.
+    fn active_bdevs(&self) -> impl Iterator<Item = &BdevInfo> {
+        self.bdevs.iter().filter(|bdev| self.is_bdev_active(bdev))
+    }
+
+    fn is_bdev_active(&self, bdev: &BdevInfo) -> bool {
+        self.controllers
+            .iter()
+            .find(|entry| entry.ctrlr == bdev.ctrlr)
+            .is_some_and(|entry| entry.state() == ControllerState::Active)
     }
 
     /// Number of live `SpdkBdev` handles.
@@ -2421,6 +2494,82 @@ mod test {
     }
 
     #[test]
+    fn detached_controller_is_hidden_from_bdev_metadata() {
+        let mut env = SpdkEnv::new(SpdkConf::default()).unwrap();
+        env.bdevs.push(BdevInfo {
+            name: "nvme-a".into(),
+            size_bytes: 1024,
+            block_size: 512,
+            num_blocks: 2,
+            target_endpoint: "tcp://a".into(),
+            ctrlr: 0x1000,
+            ns: 0x2000,
+            io_timeout_ms: 1000,
+        });
+        env.bdevs.push(BdevInfo {
+            name: "nvme-b".into(),
+            size_bytes: 2048,
+            block_size: 512,
+            num_blocks: 4,
+            target_endpoint: "tcp://b".into(),
+            ctrlr: 0x3000,
+            ns: 0x4000,
+            io_timeout_ms: 1000,
+        });
+        env.controllers.push(ControllerEntry {
+            target_idx: 0,
+            ctrlr: 0x1000,
+            state: AtomicU8::new(ControllerState::Detached as u8),
+        });
+        env.controllers.push(ControllerEntry {
+            target_idx: 1,
+            ctrlr: 0x3000,
+            state: AtomicU8::new(ControllerState::Active as u8),
+        });
+
+        assert_eq!(env.bdev_slot_count(), 2);
+        assert_eq!(env.bdev_names(), vec!["nvme-b".to_string()]);
+        assert_eq!(env.active_bdev_count(), 1);
+        assert_eq!(env.bdevs().len(), 1);
+        assert!(env.get_bdev("nvme-a").is_none());
+        assert_eq!(env.get_bdev("nvme-b").unwrap().name, "nvme-b");
+        assert_eq!(env.total_capacity(), 2048);
+
+        let err = env
+            .active_bdev_at_slot(0)
+            .expect_err("detached slot must not remap to another bdev")
+            .to_string();
+        assert!(err.contains("refusing to remap"), "unexpected error: {err}");
+        assert_eq!(env.active_bdev_at_slot(1).unwrap().name, "nvme-b");
+    }
+
+    /// Regression: unknown-name vs. inactive-controller must be distinguishable.
+    #[test]
+    fn describe_missing_bdev_distinguishes_unknown_from_inactive() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.controllers[0]
+            .state
+            .store(ControllerState::Detaching as u8, Ordering::Release);
+
+        let unknown = env.describe_missing_bdev("nvme-999");
+        assert!(
+            unknown.contains("not found"),
+            "unexpected message: {unknown}"
+        );
+
+        let inactive = env.describe_missing_bdev("nvme-0");
+        assert!(
+            inactive.contains("exists but its controller is"),
+            "unexpected message: {inactive}"
+        );
+        assert!(
+            inactive.contains("Detaching"),
+            "unexpected message: {inactive}"
+        );
+    }
+
+    #[test]
     fn detach_preflight_rejects_open_handles() {
         let err = SpdkEnv::validate_detach_preconditions(1, 2)
             .expect_err("open handles must block detach")
@@ -2794,6 +2943,9 @@ mod test {
         assert_eq!(env.qpair_pool.controller_stats(0x1000), (0, 0));
         assert_eq!(detach_calls.load(Ordering::Acquire), 1);
         assert_eq!(register_calls.load(Ordering::Acquire), 0);
+        assert_eq!(env.active_bdev_count(), 0);
+        assert!(env.bdevs().is_empty());
+        assert!(env.get_bdev("nvme-0").is_none());
     }
 
     /// Regression: Detached must stick even if finish_controller_remove() fails, to avoid a double-detach retry.
