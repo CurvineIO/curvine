@@ -457,10 +457,20 @@ impl ClusterConnector {
         let mut last_error: Option<E> = None;
         let msg = msg.into_arc();
 
+        // One budget for the whole call. The retry policy is a deadline, not only
+        // an attempt counter, so every attempt below is clamped to what is left:
+        // otherwise the leader probe plus one retry round can each consume a full
+        // `rpc_timeout` and the call can outlive the configured budget (#1815).
+        let mut policy = self.retry_builder.build();
+
         // Send a request to the current leader node.
         if let Some(id) = self.leader_id() {
             if let Ok(peer) = self.get_addr(id) {
-                match self.timeout_rpc_to_peer::<E>(&peer, msg.clone()).await {
+                let leader_timeout = self.rpc_timeout.min(policy.remaining());
+                match self
+                    .timeout_rpc_to_peer_with_timeout::<E>(&peer, msg.clone(), leader_timeout)
+                    .await
+                {
                     Ok(v) => return Ok(v),
 
                     Err((false, e)) => {
@@ -484,8 +494,12 @@ impl ClusterConnector {
         // If the client returns that the current node is not the leader, we still perform polling and retry.
         // At this time, the server may be performing the master selection operation, and it is not advisable to fail directly to return.
         self.change_leader(Self::DEFAULT_LEADER_ID);
-        let mut policy = self.retry_builder.build();
         while policy.attempt().await {
+            let attempt_timeout = self.rpc_timeout.min(policy.remaining());
+            if attempt_timeout.is_zero() {
+                break;
+            }
+
             // Membership can change while a request is retrying. Re-read the
             // complete snapshot for each attempt so a watch update takes effect
             // without waiting for the whole retry budget to expire.
@@ -501,7 +515,9 @@ impl ClusterConnector {
                     let peer = peer.clone();
                     let msg = msg.clone();
                     Box::pin(async move {
-                        let res = self.timeout_rpc_to_peer::<E>(&peer, msg).await;
+                        let res = self
+                            .timeout_rpc_to_peer_with_timeout::<E>(&peer, msg, attempt_timeout)
+                            .await;
                         (peer, res)
                     })
                 })
