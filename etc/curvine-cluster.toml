@@ -107,7 +107,7 @@ meta_dir = "testing/meta"
 #   valid time_rotation is set, files rotate daily so they cannot grow without limit.
 # max_log_files: number of rotated files to keep (default 10).
 # Example: log = { level = "info", log_dir = "logs", file_name = "master.log", max_file_size_mb = 200, time_rotation = "daily", max_log_files = 20 }
-log = { level = "info", log_dir = "stdout", file_name = "master.log" }
+log = { level = "info", log_dir = "logs", file_name = "master.log" }
 
 # Dir-space periodic directory usage snapshots for `curvine fs du` / `count`.
 # Disabled by default; enable only after validating scan RSS, duration and
@@ -176,7 +176,7 @@ kv_backend = "fdb"
 # Path to the FoundationDB cluster file (the same file `fdbcli -C <path>`
 # accepts). Required when kv_backend = "fdb".
 fdb_cluster_file = "/etc/foundationdb/fdb.cluster"
-log = { level = "info", log_dir = "stdout", file_name = "mds.log" }
+log = { level = "info", log_dir = "logs", file_name = "mds.log" }
 
 
 # Standalone curvine-web admin console.
@@ -244,7 +244,7 @@ dir_reserved = "0"
 data_dir = [
     "[DISK]testing/data",
 ]
-log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
+log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 enable_s3_gateway = false
 
 # SPDK over NVMe-oF/RDMA configuration  
@@ -309,7 +309,7 @@ client_submit_concurrency = 64
 # "entries exceeds N" before the task cap is even consulted.
 # Also hot-updatable through UpdateConfigs (key max_plan_entries).
 # max_plan_entries = 500000
-log = { level = "info", log_dir = "stdout", file_name = "transfer.log" }
+log = { level = "info", log_dir = "logs", file_name = "transfer.log" }
 
 # fuse configuration
 [fuse]
@@ -327,10 +327,15 @@ negative_timeout = 0      # negative-lookup (ENOENT) cache; 0 = disabled
 # paths always stay synchronous.
 # async_delete = false
 
+# FUSE processes write their own file under logs/. Launch environments that
+# collect the container stdout instead (for example CSI MountPods) can set
+# log_dir = "stdout" for [fuse].
+log = { level = "info", log_dir = "logs", file_name = "fuse.log" }
+
 # The log configuration of the customer service side, and the customer service side of rust, java, and fuse use this log file.
 [log]
 level = "info"
-log_dir = "stdout"
+log_dir = "logs"
 file_name = "curvine.log"
 
 
