@@ -101,18 +101,21 @@ impl GetCommand {
                         match client.open(&path).await {
                             Ok(mut reader) => {
                                 let chunk_size = client.conf().client.read_chunk_size;
-                                let bytes_read =
-                                    match copy_to(&mut reader, &mut file, chunk_size).await {
-                                        Ok(bytes_read) => bytes_read,
-                                        Err(e) => {
-                                            return Err(format!(
-                                                "Cannot download '{}': {}",
-                                                path.full_path(),
-                                                e
-                                            )
-                                            .into());
-                                        }
-                                    };
+                                let copied = copy_to(&mut reader, &mut file, chunk_size).await;
+                                let bytes_read = match copied {
+                                    Ok(bytes_read) => bytes_read,
+                                    Err(e) => {
+                                        // Do not leave a truncated file behind.
+                                        drop(file);
+                                        let _ = fs::remove_file(&final_local_path).await;
+                                        return Err(format!(
+                                            "Cannot download '{}': {}",
+                                            path.full_path(),
+                                            e
+                                        )
+                                        .into());
+                                    }
+                                };
 
                                 if let Err(e) = reader.complete().await {
                                     eprintln!("Error completing read: {}", e);
