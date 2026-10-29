@@ -29,6 +29,10 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 comfy-table = { version = "7.2.2", default-features = false }
 mimalloc = { workspace = true, optional = true }
 
+[dev-dependencies]
+curvine-io = { workspace = true }
+tempfile = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
 
