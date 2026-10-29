@@ -45,7 +45,6 @@ impl RmCommand {
                     Ok(status) => {
                         // If it's a directory and recursive is not set, return error
                         if status.is_dir && !recursive {
-                            eprintln!("rm: Cannot remove '{}': Is a directory", path.full_path());
                             return Err(format!(
                                 "Cannot remove '{}': Is a directory",
                                 path.full_path()
@@ -73,15 +72,11 @@ impl RmCommand {
                                 Ok(())
                             }
                             Err(e) => {
-                                eprintln!("rm: Cannot remove '{}': {}", path.full_path(), e);
-                                Err(e.into())
+                                Err(format!("Cannot remove '{}': {}", path.full_path(), e).into())
                             }
                         }
                     }
-                    Err(e) => {
-                        eprintln!("rm: Cannot remove '{}': {}", path.full_path(), e);
-                        Err(e.into())
-                    }
+                    Err(e) => Err(format!("Cannot remove '{}': {}", path.full_path(), e).into()),
                 }
             }
         }

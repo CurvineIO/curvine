@@ -28,10 +28,6 @@ impl GetCommand {
                 match client.get_status(&path).await {
                     Ok(status) => {
                         if status.is_dir {
-                            eprintln!(
-                                "get: Cannot download '{}': Is a directory",
-                                path.full_path()
-                            );
                             return Err(format!(
                                 "Cannot download '{}': Is a directory",
                                 path.full_path()
@@ -64,9 +60,8 @@ impl GetCommand {
                         // Check if parent directory exists, refuse to execute if it doesn't
                         if let Some(parent) = final_local_path.parent() {
                             if !parent.exists() {
-                                eprintln!("Error: Parent directory '{}' does not exist. Please create it first.", parent.display());
                                 return Err(format!(
-                                    "Parent directory '{}' does not exist",
+                                    "Parent directory '{}' does not exist. Please create it first.",
                                     parent.display()
                                 )
                                 .into());
@@ -79,8 +74,12 @@ impl GetCommand {
                             .ends_with(std::path::MAIN_SEPARATOR)
                         {
                             if let Err(e) = fs::create_dir_all(&final_local_path).await {
-                                eprintln!("Error creating directory: {}", e);
-                                return Err(e.into());
+                                return Err(format!(
+                                    "Cannot create directory '{}': {}",
+                                    final_local_path.display(),
+                                    e
+                                )
+                                .into());
                             }
                             // Append the filename to the directory path
                             let filename = path.name();
@@ -91,8 +90,12 @@ impl GetCommand {
                         let mut file = match fs::File::create(&final_local_path).await {
                             Ok(file) => file,
                             Err(e) => {
-                                eprintln!("Error creating local file: {}", e);
-                                return Err(e.into());
+                                return Err(format!(
+                                    "Cannot create local file '{}': {}",
+                                    final_local_path.display(),
+                                    e
+                                )
+                                .into());
                             }
                         };
 
@@ -132,23 +135,26 @@ impl GetCommand {
                                 }
 
                                 if let Err(e) = reader.complete().await {
-                                    eprintln!("Error completing read: {}", e);
-                                    return Err(e.into());
+                                    return Err(format!(
+                                        "Cannot complete read of '{}': {}",
+                                        path.full_path(),
+                                        e
+                                    )
+                                    .into());
                                 }
 
                                 println!("Successfully downloaded {} bytes", bytes_read);
                                 Ok(())
                             }
-                            Err(e) => {
-                                eprintln!("Error opening remote file: {}", e);
-                                Err(e.into())
-                            }
+                            Err(e) => Err(format!(
+                                "Cannot open remote file '{}': {}",
+                                path.full_path(),
+                                e
+                            )
+                            .into()),
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Error: {}", e);
-                        Err(e.into())
-                    }
+                    Err(e) => Err(format!("Cannot access '{}': {}", path.full_path(), e).into()),
                 }
             }
         }
