@@ -34,13 +34,15 @@ impl PutCommand {
                         "Error: Local file '{}' does not exist",
                         local_path.display()
                     );
-                    return Ok(());
+                    return Err(
+                        format!("Local file '{}' does not exist", local_path.display()).into(),
+                    );
                 }
 
                 // Check if local path is a file (not directory)
                 if !local_path.is_file() {
                     eprintln!("Error: '{}' is not a file", local_path.display());
-                    return Ok(());
+                    return Err(format!("'{}' is not a file", local_path.display()).into());
                 }
 
                 // Get file size for progress tracking
@@ -52,7 +54,7 @@ impl PutCommand {
                             local_path.display(),
                             e
                         );
-                        return Ok(());
+                        return Err(e.into());
                     }
                 };
 
@@ -68,7 +70,7 @@ impl PutCommand {
                     Ok(file) => file,
                     Err(e) => {
                         eprintln!("Error opening local file '{}': {}", local_path.display(), e);
-                        return Ok(());
+                        return Err(e.into());
                     }
                 };
                 let mut reader = BufReader::new(file);
@@ -107,7 +109,7 @@ impl PutCommand {
                     Ok(uri) => uri,
                     Err(e) => {
                         eprintln!("Error parsing remote path '{}': {}", final_remote_path, e);
-                        return Ok(());
+                        return Err(e);
                     }
                 };
 
@@ -156,13 +158,13 @@ impl PutCommand {
                                         }
                                         Err(e) => {
                                             eprintln!("Error writing chunk: {}", e);
-                                            return Ok(());
+                                            return Err(e.into());
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     eprintln!("Error reading from local file: {}", e);
-                                    return Ok(());
+                                    return Err(e.into());
                                 }
                             }
                         }
@@ -177,11 +179,13 @@ impl PutCommand {
                             }
                             Err(e) => {
                                 eprintln!("Error completing upload: {}", e);
+                                return Err(e.into());
                             }
                         }
                     }
                     Err(e) => {
                         eprintln!("Error creating remote file '{}': {}", final_remote_path, e);
+                        return Err(e.into());
                     }
                 }
 
