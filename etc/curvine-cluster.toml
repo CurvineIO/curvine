@@ -175,6 +175,9 @@ max_concurrent_scrapes = 32
 max_concurrent_dashboard_queries = 8
 max_series = 100000
 max_samples_per_series = 10000
+# Upper bound on a single /metrics response body. A busy master emits per-client
+# counters and can exceed 4 MiB; too small a cap marks a healthy target as down.
+max_payload_bytes = 33554432
 
 # FUSE metrics scraping is opt-in. When enabled with empty targets, the collector
 # defaults to 127.0.0.1:{fuse.web_port}. Set explicit host:port values when

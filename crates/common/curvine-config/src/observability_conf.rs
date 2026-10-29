@@ -51,6 +51,12 @@ pub struct ObservabilityConf {
     pub max_concurrent_dashboard_queries: usize,
     pub max_series: usize,
     pub max_samples_per_series: usize,
+    /// Upper bound on one `/metrics` response body, in bytes.
+    ///
+    /// A busy master exposes per-client counters (`compat_client_verdict` and
+    /// friends) and can emit several megabytes; a hard-coded cap silently turns
+    /// a healthy cluster into a down target.
+    pub max_payload_bytes: usize,
     pub fuse: FuseObservabilityConf,
     pub prometheus: PrometheusObservabilityConf,
 }
@@ -78,6 +84,7 @@ impl Default for ObservabilityConf {
             max_concurrent_dashboard_queries: 8,
             max_series: 100_000,
             max_samples_per_series: 10_000,
+            max_payload_bytes: 32 * 1024 * 1024,
             fuse: FuseObservabilityConf::default(),
             prometheus: PrometheusObservabilityConf::default(),
         }

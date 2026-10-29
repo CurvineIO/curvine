@@ -95,7 +95,10 @@ impl BuiltinProvider {
                 max_series,
                 MAX_TOTAL_SAMPLES,
             )),
-            scraper: MetricsScraper::new(Duration::from_millis(scrape_timeout_ms)),
+            scraper: MetricsScraper::with_max_payload_bytes(
+                Duration::from_millis(scrape_timeout_ms),
+                observability.max_payload_bytes,
+            ),
             targets: RwLock::new(HashMap::new()),
             last_discovery_ms: AtomicI64::new(0),
             last_collect_ms: AtomicI64::new(0),
