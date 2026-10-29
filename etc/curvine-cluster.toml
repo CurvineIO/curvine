@@ -209,6 +209,11 @@ negative_timeout = 0      # negative-lookup (ENOENT) cache; 0 = disabled
 # paths always stay synchronous.
 # async_delete = false
 
+# FUSE processes write their own file under logs/. Launch environments that
+# collect the container stdout instead (for example CSI MountPods) can set
+# log_dir = "stdout" for [fuse].
+log = { level = "info", log_dir = "logs", file_name = "fuse.log" }
+
 # The log configuration of the customer service side, and the customer service side of rust, java, and fuse use this log file.
 [log]
 level = "info"
@@ -216,4 +221,4 @@ log_dir = "logs"
 file_name = "curvine.log"
 
 [cli]
-log = { level = "warn", log_dir = "logs", file_name = "cli.log" }
+log = { level = "warn", log_dir = "stdout", file_name = "cli.log" }

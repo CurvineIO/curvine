@@ -224,7 +224,10 @@ impl Default for WorkerConf {
             io_close_idle: false,
 
             scheduler_threads: 2,
-            log: Default::default(),
+            log: LogConf {
+                file_name: "worker.log".to_string(),
+                ..Default::default()
+            },
 
             executor_threads: 10,
             executor_channel_size: 1000,

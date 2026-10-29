@@ -31,7 +31,7 @@ use tracing_subscriber::{fmt, Layer, Registry};
 // If log_dir = "" or "stdout", logs go to stdout; "stderr" goes to stderr;
 // otherwise logs are written to files under log_dir, which is created when missing.
 // If file_name = "", defaults to "curvine".
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LogConf {
     pub level: String,
@@ -324,8 +324,16 @@ mod tests {
 
     #[test]
     fn ensure_log_dir_skips_console_targets() {
+        let stdout_dir = std::path::Path::new(Logger::TARGET_STDOUT);
+        let stderr_dir = std::path::Path::new("STDERR");
+        assert!(!stdout_dir.exists());
+        assert!(!stderr_dir.exists());
+
         Logger::ensure_log_dir("");
         Logger::ensure_log_dir(Logger::TARGET_STDOUT);
         Logger::ensure_log_dir("STDERR");
+
+        assert!(!stdout_dir.exists());
+        assert!(!stderr_dir.exists());
     }
 }
