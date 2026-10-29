@@ -271,6 +271,13 @@ impl RocksStorageCore {
         }
 
         let mut hard_state = self.raft_state.hard_state.clone();
+        // A snapshot from a newer term invalidates any vote cast in the old
+        // term. Keeping the stale vote could let this node appear to have voted
+        // twice in the higher term after a crash-restart, breaking election
+        // safety.
+        if meta.term > hard_state.term {
+            hard_state.vote = 0;
+        }
         hard_state.term = cmp::max(hard_state.term, meta.term);
         hard_state.commit = cmp::max(hard_state.commit, index);
 

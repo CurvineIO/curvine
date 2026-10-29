@@ -16,14 +16,13 @@ use crate::conf::JournalConf;
 use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
 use crate::raft::{LibRaftMessage, NodeId, RaftCode, RaftGroup, RaftResult};
-use crate::utils::SerdeUtils;
 use curvine_core_error::CommonResult;
 use curvine_net::net::{InetAddr, NodeAddr};
 use curvine_rpc::client::{ClientConf, ClusterConnector, RpcClient};
 use curvine_rpc::message::{Builder, Message, RefMessage};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use prost::Message as PMessage;
-use raft::eraftpb::{ConfChange, ConfChangeType};
+use raft::eraftpb::ConfChange;
 use std::sync::Arc;
 
 /// Raft message processing client.
