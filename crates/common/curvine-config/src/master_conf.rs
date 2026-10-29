@@ -400,7 +400,10 @@ impl Default for MasterConf {
             block_replication_submit_timeout_unit: Default::default(),
             block_replication_job_timeout: "30m".to_string(),
             block_replication_job_timeout_unit: Default::default(),
-            log: Default::default(),
+            log: LogConf {
+                file_name: "master.log".to_string(),
+                ..Default::default()
+            },
 
             ttl_checker_retry_attempts: 3,
 

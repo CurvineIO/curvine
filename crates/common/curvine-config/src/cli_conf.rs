@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_runtime::common::LogConf;
+use curvine_runtime::common::{LogConf, Logger};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +26,7 @@ impl Default for CliConf {
         CliConf {
             log: LogConf {
                 level: "warn".to_string(),
+                log_dir: Logger::TARGET_STDOUT.to_string(),
                 ..Default::default()
             },
         }

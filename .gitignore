@@ -11,6 +11,7 @@ glacier-cache.iml
 /test
 /journal
 /fs-meta
+logs/
 curvine-libsdk/java/native
 curvine-libsdk/python/*_pb2.py
 curvine-libsdk/python/curvine_libsdk/_proto/*_pb2.py
