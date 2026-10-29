@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::state::SessionHeartbeat;
+use crate::master::fs::state::{monotonic_ms, SessionHeartbeat};
 use crate::master::fs::{DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
 use crate::master::meta::trash::TrashCursor;
@@ -38,7 +38,6 @@ use curvine_net::net::ConnState;
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::Message;
-use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::{GroupExecutor, Runtime};
 use dashmap::DashMap;
 use prost::Message as _;
@@ -1012,7 +1011,7 @@ impl MasterHandler {
 
     fn client_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: ClientHeartbeatRequest = ctx.parse_header()?;
-        let rep_header = Self::process_client_heartbeat(&self.fs, header, LocalTime::mills())?;
+        let rep_header = Self::process_client_heartbeat(&self.fs, header, monotonic_ms())?;
         ctx.response(rep_header)
     }
 

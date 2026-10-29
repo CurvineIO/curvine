@@ -13,14 +13,31 @@
 // limitations under the License.
 
 use curvine_model::ClientAddress;
-use curvine_runtime::common::LocalTime;
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 /// Fallback used when the master configuration was not initialized
 /// (for example in tests that build `ClusterConf` without calling `init`).
 pub const DEFAULT_CLIENT_SESSION_TIMEOUT_MS: u64 = 60_000;
 
+/// Milliseconds on a process-local monotonic clock.
+///
+/// Lease deadlines must not follow wall-clock jumps: an NTP step forward of
+/// more than `client_session_timeout` would otherwise expire every session at
+/// once, and once the reaper exists that becomes a mass lock release. Sessions
+/// live only in this process's memory, so a process-local anchor is enough;
+/// values are not comparable across processes and must not be persisted or
+/// shown as timestamps.
+pub fn monotonic_ms() -> u64 {
+    static ANCHOR: OnceLock<Instant> = OnceLock::new();
+    ANCHOR.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// One live client session, keyed by `ClientAddress::client_name`.
+///
+/// `started_at`, `last_heartbeat` and `expire_at` are [`monotonic_ms`] values,
+/// not Unix timestamps; convert relative to `monotonic_ms()` before displaying.
 #[derive(Debug, Clone)]
 pub struct ClientSession {
     pub address: ClientAddress,
@@ -76,7 +93,7 @@ pub struct SessionHeartbeat {
 pub struct SessionMap {
     sessions: HashMap<String, ClientSession>,
     session_timeout_ms: u64,
-    /// Master-clock instant this map was created (leader epoch start). Consumers
+    /// [`monotonic_ms`] instant this map was created (leader epoch start). Consumers
     /// that must not act on a freshly adopted map -- the reaper's grace window --
     /// measure from here instead of from a session deadline.
     created_at: u64,
@@ -92,7 +109,7 @@ impl SessionMap {
         Self {
             sessions: HashMap::new(),
             session_timeout_ms,
-            created_at: LocalTime::mills(),
+            created_at: monotonic_ms(),
         }
     }
 
@@ -117,7 +134,7 @@ impl SessionMap {
                 session.pid = hb.pid.or(session.pid);
                 session.mount_point = hb.mount_point.or(session.mount_point.take());
                 session.client_version = hb.client_version.or(session.client_version.take());
-                // Never move the lease backwards if the master clock jumps.
+                // Never move the lease backwards, even if callers pass an older `now`.
                 session.last_heartbeat = session.last_heartbeat.max(now);
                 session.expire_at = session.expire_at.max(expire_at);
                 false
@@ -317,6 +334,19 @@ mod tests {
         assert!(!live.contains("c1"), "expired sessions must not be live");
         assert!(live.contains("c2"));
         assert_eq!(map.live_ids(1_000 + TIMEOUT + 1).len(), 1);
+    }
+
+    #[test]
+    fn monotonic_clock_never_goes_backwards() {
+        let a = monotonic_ms();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let b = monotonic_ms();
+        assert!(b >= a + 5, "monotonic_ms went from {a} to {b}");
+
+        // A map created now starts its epoch on the same clock.
+        let map = SessionMap::new(TIMEOUT);
+        assert!(map.created_at() >= b);
+        assert!(map.created_at() <= monotonic_ms());
     }
 
     #[test]

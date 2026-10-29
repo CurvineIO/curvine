@@ -46,6 +46,7 @@ use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use curvine_runtime::sync::StateCtl;
+use curvine_server::master::fs::state::SessionHeartbeat;
 use curvine_server::master::fs::{DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
@@ -442,6 +443,41 @@ fn client_heartbeat_rpc_registers_session_on_leader() -> CommonResult<()> {
     let sessions = fs.session_map.read();
     assert_eq!(sessions.len(), 1);
     assert!(sessions.get("client-heartbeat-1").is_some());
+    Ok(())
+}
+
+#[test]
+fn with_js_handles_share_one_session_map() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let mut conf = ClusterConf::format();
+    conf.journal.enable = false;
+    conf.change_test_meta_dir(format!("session-map-shared-{}", Utils::rand_str(8)));
+    let js = JournalSystem::from_conf(&conf)?;
+
+    // Two independently built handles on the same master, plus the journal
+    // system's own handle, must observe one set of client sessions.
+    let a = MasterFilesystem::with_js(&conf, &js);
+    let b = MasterFilesystem::with_js(&conf, &js);
+    let hb = |client: &str| SessionHeartbeat {
+        address: ClientAddress {
+            client_name: client.to_string(),
+            ..Default::default()
+        },
+        heartbeat_interval_ms: 12_000,
+        pid: None,
+        mount_point: None,
+        client_version: None,
+    };
+    assert!(a.session_map.write().heartbeat(hb("via-a"), 0));
+    assert!(js.fs().session_map.write().heartbeat(hb("via-js"), 0));
+
+    let sessions = b.session_map.read();
+    assert!(sessions.get("via-a").is_some(), "b must see a's session");
+    assert!(
+        sessions.get("via-js").is_some(),
+        "b must see js.fs()'s session"
+    );
+    assert_eq!(sessions.len(), 2);
     Ok(())
 }
 

@@ -194,7 +194,9 @@ impl MasterFilesystem {
             fs_dir: js.fs().fs_dir.clone(),
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
-            session_map: ArcRwLock::new(SessionMap::new(conf.master.client_session_timeout_ms())),
+            // Share the journal system's registry: every handle on the same
+            // master must see one set of client sessions.
+            session_map: js.fs().session_map.clone(),
             conf: Arc::new(conf.master.clone()),
             full_report_tracker: Default::default(),
             full_block_reconciles: Default::default(),
