@@ -252,6 +252,22 @@ where
             return err_box!("Currently creating snapshot");
         }
 
+        // A snapshot replaces the log prefix up to its own index. While the UFS
+        // replay is still behind, that prefix holds entries it has not consumed
+        // yet: discarding it strands the replay on a missing entry and blocks
+        // every later checkpoint. Keep the log and retry once it catches up.
+        let state = self.get_fsm_state();
+        if !state.ufs_replay_caught_up() {
+            info!(
+                "skip snapshot: UFS replay at t{} i{} is behind applied t{} i{}",
+                state.ufs_applied.term,
+                state.ufs_applied.index,
+                state.applied.term,
+                state.applied.index
+            );
+            return Ok(());
+        }
+
         let id = self.id;
         let log_store = self.log_store.clone();
         let app_store = self.app_store.clone();

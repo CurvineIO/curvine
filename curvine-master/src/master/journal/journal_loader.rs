@@ -374,17 +374,32 @@ impl JournalLoader {
 
         if let Some(e) = snapshot {
             let spent = TimeSpent::new();
-            let snap_data = self.create_snapshot0(Some(e.dir.to_string()))?;
+            // A leader snapshot claims every entry up to `applied` and lets the
+            // log drop them. If the UFS replay is behind, those entries are
+            // still owed a copy: publishing this snapshot would delete them and
+            // strand the replay forever. Skip it and keep the log.
+            let state = self.fsm_state_snapshot()?;
+            if !state.ufs_replay_caught_up() {
+                info!(
+                    "skip leader snapshot {}: UFS replay at i{} is behind applied i{}",
+                    e.dir, state.ufs_applied.index, state.applied.index
+                );
+                if let Err(err) = self.purge_checkpoint(&e.dir) {
+                    warn!("purge skipped leader snapshot {}: {}", e.dir, err);
+                }
+            } else {
+                let snap_data = self.create_snapshot0(Some(e.dir.to_string()))?;
 
-            self.log_store.create_snapshot(snap_data.clone())?;
-            self.log_store.compact(snap_data.fsm_state.compact())?;
+                self.log_store.create_snapshot(snap_data.clone())?;
+                self.log_store.compact(snap_data.fsm_state.compact())?;
 
-            info!(
-                "create leader snapshot, dir={}, cost={}ms, fsm_state={:?}",
-                e.dir,
-                spent.used_ms(),
-                snap_data.fsm_state
-            );
+                info!(
+                    "create leader snapshot, dir={}, cost={}ms, fsm_state={:?}",
+                    e.dir,
+                    spent.used_ms(),
+                    snap_data.fsm_state
+                );
+            }
         }
 
         Ok(())

@@ -87,6 +87,15 @@ impl FsmState {
     pub fn op_id(&self) -> u64 {
         self.applied.op_id.max(self.ufs_applied.op_id)
     }
+
+    /// True when the UFS replay has consumed every applied entry.
+    ///
+    /// A snapshot claims the whole applied prefix and lets the log drop it.
+    /// Publishing one while this is false deletes entries the replay still
+    /// owes a copy, which then blocks replay and checkpointing forever.
+    pub fn ufs_replay_caught_up(&self) -> bool {
+        self.ufs_applied.index >= self.applied.index
+    }
 }
 
 impl SnapshotData {

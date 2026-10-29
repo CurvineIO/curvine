@@ -521,6 +521,10 @@ impl PopulatedRefuseEmptySnapshotAppStorage {
     fn with_applied_index(index: u64) -> Self {
         let mut fsm = FsmState::default();
         fsm.applied.index = index;
+        // A healthy store never lags behind on the UFS replay. Snapshot
+        // publication is gated on that (see fsm_snapshot_bound_test); a
+        // fixture leaving this at zero would model a stalled replay.
+        fsm.ufs_applied.index = index;
         Self {
             fsm_state: Arc::new(Mutex::new(fsm)),
             apply_snapshot_calls: Arc::new(Mutex::new(0)),
@@ -1038,6 +1042,10 @@ impl RecordingSnapshotAppStorage {
     fn with_applied_index(index: u64) -> Self {
         let mut fsm = FsmState::default();
         fsm.applied.index = index;
+        // A healthy store never lags behind on the UFS replay. Snapshot
+        // publication is gated on that (see fsm_snapshot_bound_test); a
+        // fixture leaving this at zero would model a stalled replay.
+        fsm.ufs_applied.index = index;
         Self {
             fsm_state: Arc::new(Mutex::new(fsm)),
             applied_snapshots: Arc::new(Mutex::new(vec![])),
