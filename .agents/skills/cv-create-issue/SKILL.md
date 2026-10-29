@@ -109,3 +109,18 @@ Return issue number, URL, and suggested next step:
 - Body in English unless user requests otherwise
 - One issue per topic
 - For sub-tasks of a parent issue, prefix title with `[SUB]` and link `Parent: #<n>` in body
+- End with the Wrap-up Summary section and its Chinese translation
+
+## Wrap-up Summary (required)
+
+Close every run with the block below, in the local chat. The issue itself stays English; this block is for the user, and it ends with its Chinese translation.
+
+| Part | Content |
+| ---- | ------- |
+| Issue | `#<n>` and URL, the title, the labels, and whether it closes, extends, or duplicates an existing issue |
+| Problem solved | what the issue reports or requests, and who is affected |
+| Approach | the sections written (Goal / Not Goal / Test Plan for features), the evidence collected, and the reproduction steps |
+| Reason for the shape | why a bug report or a feature request, why those acceptance criteria, and which scope was deliberately excluded |
+| Related | parent or sub-issue links, and the next skill to run (fix, breakdown, or none) |
+
+Then append the same summary in Chinese under a `### Summary (Chinese)` heading: translate the conclusions and reasons, keep issue numbers, paths, commands and quoted output verbatim, and do not add claims that are absent above.
