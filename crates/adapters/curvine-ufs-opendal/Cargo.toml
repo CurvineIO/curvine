@@ -15,6 +15,7 @@ curvine-model = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
+tokio = { workspace = true }
 opendal = { version = "0.55" }
 [dependencies.curvine-hdfs-jni]
 workspace = true
@@ -31,3 +32,7 @@ opendal-gcs = ["opendal", "opendal/services-gcs"]
 opendal-hdfs = ["opendal", "opendal/services-hdfs", "dep:curvine-hdfs-jni", "curvine-hdfs-jni/jni"]
 opendal-webhdfs = ["opendal", "opendal/services-webhdfs"]
 opendal-hdfs-native = ["opendal", "opendal/services-hdfs-native"]
+
+[[test]]
+name = "s3_blackhole"
+required-features = ["opendal-s3"]
