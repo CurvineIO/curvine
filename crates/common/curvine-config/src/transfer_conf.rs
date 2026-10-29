@@ -157,7 +157,7 @@ impl TransferConf {
     pub const DEFAULT_WEB_PORT: u16 = 9011;
     pub const DEFAULT_IO_THREADS: usize = 4;
     pub const DEFAULT_WORKER_THREADS: usize = 8;
-    pub const DEFAULT_MAX_TASKS_PER_TRANSFER: usize = 100_000;
+    pub const DEFAULT_MAX_TASKS_PER_TRANSFER: usize = 500_000;
     pub const DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT: usize = 32;
     pub const DEFAULT_TASK_MAX_RETRIES: usize = 3;
 

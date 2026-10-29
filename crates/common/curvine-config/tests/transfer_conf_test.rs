@@ -115,9 +115,9 @@ fn task_retention_rejects_zero_and_overshoot() {
 /// The per-job task cap must be settable from the configuration file.
 ///
 /// It previously carried `#[serde(skip)]`, so a `max_tasks_per_transfer` entry
-/// was silently ignored and planning always enforced the built-in 100_000. A
-/// job exceeding that hard-coded cap failed with "files exceeds 100000" and no
-/// way to raise it.
+/// was silently ignored and planning always enforced the built-in default. A
+/// job exceeding that hard-coded cap failed with "files exceeds <default>" and
+/// no way to raise it.
 #[test]
 fn max_tasks_per_transfer_is_configurable() {
     let conf: TransferConf = toml::from_str(
@@ -141,10 +141,9 @@ fn max_tasks_per_transfer_defaults_when_absent() {
         "#,
     )
     .unwrap();
-    assert_eq!(
-        conf.max_tasks_per_transfer,
-        TransferConf::DEFAULT_MAX_TASKS_PER_TRANSFER
-    );
+    // Pinned to a literal on purpose: asserting the constant against itself
+    // would not notice a default change.
+    assert_eq!(conf.max_tasks_per_transfer, 500_000);
 }
 
 /// Zero would reject every non-empty plan, so validation refuses it.
