@@ -466,8 +466,19 @@ fn three_process_empty_member_recovery() {
         .dir(victim)
         .join("journal/member-recovery-in-progress")
         .exists());
-    let log = fs::read_to_string(c.dir(victim).join("process.log")).unwrap();
-    assert!(log.contains("refusing to advance Ready"));
+    // The refusal is asserted through observable state instead of a log line:
+    // the product logger writes to its configured log directory, not to this
+    // child's captured stdout/stderr, and the failed install must leave the state
+    // machine untouched.
+    let values = c
+        .status(victim)
+        .get("values")
+        .and_then(|values| values.as_array().cloned())
+        .expect("victim status must report its state machine values");
+    assert!(
+        values.iter().all(Value::is_null),
+        "a refused snapshot install must not apply any value, got {values:?}"
+    );
     c.stop(victim);
     fs::remove_file(c.dir(victim).join("fail-snapshot")).unwrap();
     c.start(victim, false);

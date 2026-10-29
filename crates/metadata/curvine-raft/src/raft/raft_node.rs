@@ -384,7 +384,17 @@ where
         result: RaftResult<()>,
         promise: &mut PendingPromises,
     ) -> RaftResult<()> {
-        result?;
+        // The pending Ready carries the snapshot and the commit/applied progress it
+        // restores. Publishing it after the install failed would move this member
+        // past state it never restored (including out of recovery quarantine), so
+        // the node stops instead of advancing.
+        if let Err(e) = result {
+            error!(
+                "snapshot application failed, refusing to advance Ready: {}",
+                e
+            );
+            return Err(e);
+        }
         self.anchor_snapshot_markers();
         let pending = self
             .pending_ready
