@@ -439,7 +439,11 @@ impl MasterRuntimeInfo {
     }
 }
 
-async fn fetch_master_runtime_info(conf: &ClusterConf, master_addr: &str) -> MasterRuntimeInfo {
+async fn fetch_master_runtime_info(
+    conf: &ClusterConf,
+    master_addr: &str,
+    raft_id: Option<u64>,
+) -> MasterRuntimeInfo {
     let master_addr = master_addr.trim();
     if master_addr.is_empty() {
         return MasterRuntimeInfo::default();
@@ -452,19 +456,20 @@ async fn fetch_master_runtime_info(conf: &ClusterConf, master_addr: &str) -> Mas
         Ok(client) => client,
         Err(_) => return MasterRuntimeInfo::default(),
     };
-    fetch_master_runtime_info_with_client(&client, conf, master_addr).await
+    fetch_master_runtime_info_with_client(&client, conf, master_addr, raft_id).await
 }
 
 async fn fetch_master_runtime_info_with_client(
     client: &reqwest::Client,
     conf: &ClusterConf,
     master_addr: &str,
+    raft_id: Option<u64>,
 ) -> MasterRuntimeInfo {
     let master_addr = master_addr.trim();
     if master_addr.is_empty() {
         return MasterRuntimeInfo::default();
     }
-    let url = master_runtime_scrape_url(conf, master_addr);
+    let url = master_runtime_scrape_url(conf, master_addr, raft_id);
     match timeout(
         Duration::from_secs(MASTER_HA_PING_TIMEOUT_SECS),
         client.get(&url).send(),
@@ -535,10 +540,11 @@ async fn fetch_config_view_from(client: &reqwest::Client, url: &str) -> Result<V
 async fn fetch_master_config_view(
     conf: &ClusterConf,
     active_master: &str,
+    active_raft_id: Option<u64>,
 ) -> Result<Value, String> {
     let client = master_runtime_http_client()
         .ok_or_else(|| "failed to build the master HTTP client".to_string())?;
-    let url = master_config_view_scrape_url(conf, active_master);
+    let url = master_config_view_scrape_url(conf, active_master, active_raft_id);
     fetch_config_view_from(&client, &url).await
 }
 
@@ -900,7 +906,7 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
             };
             let runtime = match http_client.as_ref() {
                 Some(client) => {
-                    fetch_master_runtime_info_with_client(client, &conf, &addr_text).await
+                    fetch_master_runtime_info_with_client(client, &conf, &addr_text, raft_id).await
                 }
                 None => MasterRuntimeInfo::default(),
             };
@@ -2103,7 +2109,7 @@ async fn overview(
     } else {
         "Active"
     };
-    let runtime = fetch_master_runtime_info(conf, &active_master).await;
+    let runtime = fetch_master_runtime_info(conf, &active_master, master_info.active_raft_id).await;
     let start_time_source = if runtime.start_time.is_some() {
         "active_master"
     } else {
@@ -2502,7 +2508,8 @@ async fn config_v1(Extension(instance): Extension<Arc<AdminRouterHandler>>) -> F
         }
     };
     let active_master = master_info.active_master.trim().to_string();
-    match fetch_master_config_view(&instance.conf, &active_master).await {
+    let active_raft_id = master_info.active_raft_id;
+    match fetch_master_config_view(&instance.conf, &active_master, active_raft_id).await {
         Ok(view) => Ok(api_success(view).into_response()),
         Err(error) => {
             log::warn!("config view fetch from master {active_master} failed: {error}");
@@ -5563,7 +5570,7 @@ mod config_view_proxy_tests {
     async fn proxies_the_view_published_by_the_active_master() {
         let port = spawn_master(r#"{"role":"master","node":"m:9010","values":{"a":1}}"#).await;
         let conf = conf_pointing_at(port);
-        let view = fetch_master_config_view(&conf, "127.0.0.1:8995")
+        let view = fetch_master_config_view(&conf, "127.0.0.1:8995", None)
             .await
             .expect("master answered with a view");
         assert_eq!(view["role"], json!("master"));
@@ -5580,7 +5587,7 @@ mod config_view_proxy_tests {
             listener.local_addr().unwrap().port()
         };
         let conf = conf_pointing_at(port);
-        let error = fetch_master_config_view(&conf, "127.0.0.1:8995")
+        let error = fetch_master_config_view(&conf, "127.0.0.1:8995", None)
             .await
             .expect_err("an unreachable master must not yield a view");
         assert!(
@@ -5593,7 +5600,7 @@ mod config_view_proxy_tests {
     async fn rejects_a_master_that_answers_with_the_wrong_shape() {
         let port = spawn_master("not json at all").await;
         let conf = conf_pointing_at(port);
-        let error = fetch_master_config_view(&conf, "127.0.0.1:8995")
+        let error = fetch_master_config_view(&conf, "127.0.0.1:8995", None)
             .await
             .expect_err("a non-JSON body must not be rendered");
         assert!(
@@ -5649,7 +5656,7 @@ mod config_view_proxy_tests {
         assert!(body["data"].is_null());
         // And the same address really is unreachable, so the test is not lying
         // about the failure path it exercises.
-        assert!(fetch_master_config_view(&conf, "127.0.0.1:8995")
+        assert!(fetch_master_config_view(&conf, "127.0.0.1:8995", None)
             .await
             .is_err());
     }
@@ -5661,7 +5668,7 @@ mod config_view_proxy_tests {
     #[test]
     fn proxy_targets_the_view_endpoint_not_the_ha_probe_route() {
         let conf = conf_pointing_at(9010);
-        let url = master_config_view_scrape_url(&conf, "127.0.0.1:8995");
+        let url = master_config_view_scrape_url(&conf, "127.0.0.1:8995", None);
         assert!(
             url.ends_with("/api/v1/master/config"),
             "unexpected scrape target: {url}"

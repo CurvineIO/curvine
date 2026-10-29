@@ -198,10 +198,88 @@ pub fn configured_master_web_addrs(conf: &ClusterConf) -> &[InetAddr] {
     &conf.client.master_web_addrs
 }
 
+/// Slot of a raft node id inside `client.master_addrs`.
+///
+/// The active master reports its own `host:port`, and in Kubernetes that is the
+/// Pod FQDN (`cv-master-0.cv-master.curvine.svc.cluster.local:8995`). A console
+/// that runs outside the cluster cannot resolve that name, so matching on the
+/// reported hostname alone silently drops the operator's explicit
+/// `client.master_web_addrs` mapping and scrapes an unreachable name instead.
+/// The raft node id does not drift: `journal.journal_addrs` ties it to a
+/// configured host, and that host's slot in `client.master_addrs` addresses the
+/// matching `client.master_web_addrs` entry.
+fn configured_master_index_for_raft_id(conf: &ClusterConf, raft_id: u64) -> Option<usize> {
+    let peer = conf
+        .journal
+        .journal_addrs
+        .iter()
+        .find(|peer| peer.id == raft_id)?;
+    configured_master_addrs(conf).iter().position(|addr| {
+        !addr.hostname.trim().is_empty()
+            && hosts_match_for_cluster_mapping(&addr.hostname, &peer.hostname)
+    })
+}
+
+/// Raft node id of a master endpoint, resolved through `journal.journal_addrs`.
+///
+/// Callers that only carry the reported `host:port` (an HA probe of one
+/// configured node, an older master without `active_raft_id`) still need the
+/// configured web/metrics mapping, so resolve the id from the address text.
+pub fn master_raft_id_for_addr(conf: &ClusterConf, master_addr: &str) -> Option<u64> {
+    let addr = InetAddr::from_str(master_addr.trim()).ok()?;
+    let peer = conf.journal.journal_addrs.iter().find(|peer| {
+        !peer.hostname.trim().is_empty()
+            && hosts_match_for_cluster_mapping(&peer.hostname, &addr.hostname)
+    });
+    peer.map(|peer| peer.id)
+}
+
+/// Configured master (RPC view) that a raft node id belongs to.
+pub fn configured_master_for_raft_id(conf: &ClusterConf, raft_id: u64) -> Option<InetAddr> {
+    let index = configured_master_index_for_raft_id(conf, raft_id)?;
+    configured_master_addrs(conf).into_iter().nth(index)
+}
+
+/// Web/metrics endpoint of the master a raft node id belongs to.
+///
+/// This is the configured address, not one derived from what the master reports
+/// about itself: an explicit `client.master_web_addrs` entry when present,
+/// otherwise the configured master host with `master.web_port`.
+pub fn configured_master_web_by_raft_id(
+    conf: &ClusterConf,
+    raft_id: Option<u64>,
+) -> Option<InetAddr> {
+    let index = configured_master_index_for_raft_id(conf, raft_id?)?;
+    if let Some(configured) = conf.client.master_web_addrs.get(index) {
+        return Some(configured.clone());
+    }
+    let host = configured_master_addrs(conf)
+        .into_iter()
+        .nth(index)?
+        .hostname
+        .trim()
+        .to_string();
+    if host.is_empty() {
+        return None;
+    }
+    Some(InetAddr::new(host, conf.master.web_port))
+}
+
+/// Configured web/metrics endpoint for the active master.
+///
+/// `raft_id` is the leader id reported by `GetMasterInfo`; it is the only key
+/// that maps a not-necessarily-resolvable reported host onto the configured
+/// address, so it is tried first. The remaining steps keep working for callers
+/// that only have the reported endpoint text (single-node clusters, older
+/// masters that do not report an id, and CLI paths).
 pub fn configured_master_web_for_active(
     conf: &ClusterConf,
     active_master: &str,
+    raft_id: Option<u64>,
 ) -> Option<InetAddr> {
+    if let Some(configured) = configured_master_web_by_raft_id(conf, raft_id) {
+        return Some(configured);
+    }
     if conf.client.master_web_addrs.is_empty() {
         return None;
     }
@@ -220,17 +298,30 @@ pub fn configured_master_web_for_active(
     }
     // Align by index with `master_addrs` when scrape host differs (LB / NodePort / host publish).
     let master_addrs = configured_master_addrs(conf);
-    let idx = master_addrs.iter().position(|configured| {
+    if let Some(idx) = master_addrs.iter().position(|configured| {
         configured.to_string() == active
             || master_host_matches_reported(&configured.hostname, &active_addr.hostname)
-    })?;
-    conf.client.master_web_addrs.get(idx).cloned()
+    }) {
+        return conf.client.master_web_addrs.get(idx).cloned();
+    }
+    log::warn!(
+        "client.master_web_addrs has {} entries but none maps to the active master \
+         (reported {}, raft id {:?}); cannot derive a scrape endpoint from configuration",
+        conf.client.master_web_addrs.len(),
+        active,
+        raft_id
+    );
+    None
 }
 
 /// Web/metrics port for the active master from explicit `client.master_web_addrs`,
 /// otherwise `master.web_port`.
-pub fn master_scrape_web_port(conf: &ClusterConf, active_master: &str) -> u16 {
-    configured_master_web_for_active(conf, active_master)
+pub fn master_scrape_web_port(
+    conf: &ClusterConf,
+    active_master: &str,
+    raft_id: Option<u64>,
+) -> u16 {
+    configured_master_web_for_active(conf, active_master, raft_id)
         .map(|addr| addr.port)
         .unwrap_or(conf.master.web_port)
 }
@@ -308,13 +399,18 @@ fn local_non_loopback_ip() -> Option<String> {
 
 /// Routable scrape host for master `/metrics` from the `curvine-web` process.
 ///
-/// When `client.master_web_addrs` matches the active master, uses the configured
-/// scrape hostname (LB / NodePort / host-published address). Otherwise falls back to
-/// the active or configured RPC master hostname. When that name resolves to loopback
-/// (common in docker demo `/etc/hosts`) but explicit web addrs are set, prefer this
-/// machine's routable IP so scrapes hit docker port mappings.
-pub fn resolve_master_scrape_hostname(conf: &ClusterConf, active_master: &str) -> String {
-    if let Some(endpoint) = configured_master_web_for_active(conf, active_master) {
+/// When the active master maps to a configured `client.master_web_addrs` entry,
+/// uses that configured scrape hostname (LB / NodePort / host-published address).
+/// Otherwise falls back to the active or configured RPC master hostname. When that
+/// name resolves to loopback (common in docker demo `/etc/hosts`) but explicit web
+/// addrs are set, prefer this machine's routable IP so scrapes hit docker port
+/// mappings.
+pub fn resolve_master_scrape_hostname(
+    conf: &ClusterConf,
+    active_master: &str,
+    raft_id: Option<u64>,
+) -> String {
+    if let Some(endpoint) = configured_master_web_for_active(conf, active_master, raft_id) {
         let configured_host = endpoint.hostname.trim();
         if !configured_host.is_empty() && !is_loopback_hostname(configured_host) {
             return configured_host.to_string();
@@ -331,7 +427,8 @@ pub fn resolve_master_scrape_hostname(conf: &ClusterConf, active_master: &str) -
     }
     let logical = master_metrics_display_hostname(conf, active_master);
     let resolved = resolve_display_ip(&logical, "");
-    if is_loopback_ip(&resolved) && configured_master_web_for_active(conf, active_master).is_some()
+    if is_loopback_ip(&resolved)
+        && configured_master_web_for_active(conf, active_master, raft_id).is_some()
     {
         if let Some(local_ip) = local_non_loopback_ip() {
             return local_ip;
@@ -341,8 +438,12 @@ pub fn resolve_master_scrape_hostname(conf: &ClusterConf, active_master: &str) -
 }
 
 /// Logical `instance` label for master metrics (scrape hostname + metrics port).
-pub fn master_metrics_instance(conf: &ClusterConf, active_master: &str) -> String {
-    if let Some(endpoint) = configured_master_web_for_active(conf, active_master) {
+pub fn master_metrics_instance(
+    conf: &ClusterConf,
+    active_master: &str,
+    raft_id: Option<u64>,
+) -> String {
+    if let Some(endpoint) = configured_master_web_for_active(conf, active_master, raft_id) {
         return format!("{}:{}", endpoint.hostname, endpoint.port);
     }
     format!(
@@ -353,29 +454,41 @@ pub fn master_metrics_instance(conf: &ClusterConf, active_master: &str) -> Strin
 }
 
 /// HTTP scrape URL for master `/metrics`.
-pub fn master_metrics_scrape_url(conf: &ClusterConf, active_master: &str) -> String {
+pub fn master_metrics_scrape_url(
+    conf: &ClusterConf,
+    active_master: &str,
+    raft_id: Option<u64>,
+) -> String {
     format!(
         "http://{}:{}/metrics",
-        resolve_master_scrape_hostname(conf, active_master),
-        master_scrape_web_port(conf, active_master)
+        resolve_master_scrape_hostname(conf, active_master, raft_id),
+        master_scrape_web_port(conf, active_master, raft_id)
     )
 }
 
 /// HTTP URL for master overview / lightweight runtime probes.
-pub fn master_overview_scrape_url(conf: &ClusterConf, master_addr: &str) -> String {
+pub fn master_overview_scrape_url(
+    conf: &ClusterConf,
+    master_addr: &str,
+    raft_id: Option<u64>,
+) -> String {
     format!(
         "http://{}:{}/api/overview",
-        resolve_master_scrape_hostname(conf, master_addr),
-        master_scrape_web_port(conf, master_addr)
+        resolve_master_scrape_hostname(conf, master_addr, raft_id),
+        master_scrape_web_port(conf, master_addr, raft_id)
     )
 }
 
 /// HTTP URL for master `/api/v1/master/runtime` (version + start_time).
-pub fn master_runtime_scrape_url(conf: &ClusterConf, master_addr: &str) -> String {
+pub fn master_runtime_scrape_url(
+    conf: &ClusterConf,
+    master_addr: &str,
+    raft_id: Option<u64>,
+) -> String {
     format!(
         "http://{}:{}/api/v1/master/runtime",
-        resolve_master_scrape_hostname(conf, master_addr),
-        master_scrape_web_port(conf, master_addr)
+        resolve_master_scrape_hostname(conf, master_addr, raft_id),
+        master_scrape_web_port(conf, master_addr, raft_id)
     )
 }
 
@@ -384,11 +497,15 @@ pub fn master_runtime_scrape_url(conf: &ClusterConf, master_addr: &str) -> Strin
 /// This is the full view (`values` + `sources` + `runtime` + `writable`), not the
 /// flat key/value map behind `GET /api/v1/master/runtime/config`, so the console
 /// reads exactly what the master process is running with.
-pub fn master_config_view_scrape_url(conf: &ClusterConf, master_addr: &str) -> String {
+pub fn master_config_view_scrape_url(
+    conf: &ClusterConf,
+    master_addr: &str,
+    raft_id: Option<u64>,
+) -> String {
     format!(
         "http://{}:{}/api/v1/master/config",
-        resolve_master_scrape_hostname(conf, master_addr),
-        master_scrape_web_port(conf, master_addr)
+        resolve_master_scrape_hostname(conf, master_addr, raft_id),
+        master_scrape_web_port(conf, master_addr, raft_id)
     )
 }
 
@@ -541,7 +658,7 @@ mod tests {
     fn master_metrics_uses_master_web_port_not_rpc_port() {
         let mut conf = ClusterConf::default();
         conf.master.hostname = "cv-master-0".to_string();
-        let instance = master_metrics_instance(&conf, "cv-master-1:8995");
+        let instance = master_metrics_instance(&conf, "cv-master-1:8995", None);
         assert_eq!(instance, "cv-master-1:9010");
     }
 
@@ -570,10 +687,10 @@ mod tests {
             InetAddr::new("10.41.54.239", 8995),
             InetAddr::new("10.41.54.242", 8995),
         ];
-        let host = resolve_master_scrape_hostname(&conf, "10.41.54.240:8995");
+        let host = resolve_master_scrape_hostname(&conf, "10.41.54.240:8995", None);
         assert_eq!(host, "10.41.54.240");
         assert_eq!(
-            master_metrics_scrape_url(&conf, "10.41.54.240:8995"),
+            master_metrics_scrape_url(&conf, "10.41.54.240:8995", None),
             "http://10.41.54.240:9010/metrics"
         );
     }
@@ -586,21 +703,21 @@ mod tests {
             InetAddr::new("cv-master-0", 8995),
             InetAddr::new("cv-master-1", 8995),
         ];
-        let host = resolve_master_scrape_hostname(&conf, "cv-master-1:8995");
+        let host = resolve_master_scrape_hostname(&conf, "cv-master-1:8995", None);
         assert_eq!(host, "cv-master-1");
     }
 
     #[test]
     fn master_scrape_hostname_falls_back_to_configured_master_when_active_is_loopback() {
         let conf = test_conf();
-        let host = resolve_master_scrape_hostname(&conf, "127.0.0.1:8995");
+        let host = resolve_master_scrape_hostname(&conf, "127.0.0.1:8995", None);
         assert_eq!(host, "cv-master-0");
     }
 
     #[test]
     fn master_scrape_hostname_falls_back_to_configured_master_when_active_missing() {
         let conf = test_conf();
-        let host = resolve_master_scrape_hostname(&conf, "");
+        let host = resolve_master_scrape_hostname(&conf, "", None);
         assert_eq!(host, "cv-master-0");
     }
 
@@ -684,17 +801,17 @@ mod tests {
     fn master_metrics_uses_explicit_master_web_addrs() {
         let conf = host_mapped_master_conf();
         assert_eq!(
-            master_metrics_instance(&conf, "cv-master-2:8995"),
+            master_metrics_instance(&conf, "cv-master-2:8995", None),
             "cv-master-2:29000"
         );
-        let url = master_metrics_scrape_url(&conf, "cv-master-2:8995");
+        let url = master_metrics_scrape_url(&conf, "cv-master-2:8995", None);
         assert_eq!(url, "http://cv-master-2:29000/metrics");
         assert_eq!(
-            master_runtime_scrape_url(&conf, "cv-master-2:8995"),
+            master_runtime_scrape_url(&conf, "cv-master-2:8995", None),
             "http://cv-master-2:29000/api/v1/master/runtime"
         );
         assert_eq!(
-            master_overview_scrape_url(&conf, "cv-master-2:8995"),
+            master_overview_scrape_url(&conf, "cv-master-2:8995", None),
             "http://cv-master-2:29000/api/overview"
         );
         assert!(!url.contains(":9000/metrics"));
@@ -707,11 +824,11 @@ mod tests {
         conf.client.master_addrs = vec![InetAddr::new("cv-master-0", 8995)];
         conf.client.master_web_addrs = vec![InetAddr::new("host-machine", 19010)];
         assert_eq!(
-            master_metrics_instance(&conf, "cv-master-0:8995"),
+            master_metrics_instance(&conf, "cv-master-0:8995", None),
             "host-machine:19010"
         );
         assert_eq!(
-            master_metrics_scrape_url(&conf, "cv-master-0:8995"),
+            master_metrics_scrape_url(&conf, "cv-master-0:8995", None),
             "http://host-machine:19010/metrics"
         );
     }
@@ -721,10 +838,120 @@ mod tests {
         let mut conf = host_mapped_master_conf();
         conf.client.master_addrs = vec![InetAddr::new("cv-master-2.svc.cluster.local", 28995)];
         conf.client.master_web_addrs = vec![InetAddr::new("cv-master-2.svc.cluster.local", 29000)];
-        assert_eq!(master_scrape_web_port(&conf, "cv-master-2:8995"), 29000);
-        let url = master_metrics_scrape_url(&conf, "cv-master-2:8995");
+        assert_eq!(
+            master_scrape_web_port(&conf, "cv-master-2:8995", None),
+            29000
+        );
+        let url = master_metrics_scrape_url(&conf, "cv-master-2:8995", None);
         assert!(url.contains(":29000/metrics"));
         assert!(!url.contains("127.0.0.1"));
+    }
+
+    /// A console that runs outside Kubernetes cannot resolve the Pod FQDN a
+    /// master reports for itself. The raft node id still ties that leader to a
+    /// configured `journal.journal_addrs` peer, so the configured web addrs must
+    /// win over the unusable reported name.
+    fn k8s_reported_fqdn_conf() -> ClusterConf {
+        let mut conf = ClusterConf::default();
+        conf.master.web_port = 9001;
+        conf.client.master_addrs = vec![
+            InetAddr::new("10.209.150.228", 8995),
+            InetAddr::new("10.209.150.229", 8995),
+            InetAddr::new("10.209.150.227", 8995),
+        ];
+        conf.client.master_web_addrs = vec![
+            InetAddr::new("10.209.150.228", 9001),
+            InetAddr::new("10.209.150.229", 9001),
+            InetAddr::new("10.209.150.227", 9001),
+        ];
+        conf.journal.journal_addrs = vec![
+            curvine_config::RaftPeer::new(1, "10.209.150.228", 8996),
+            curvine_config::RaftPeer::new(2, "10.209.150.229", 8996),
+            curvine_config::RaftPeer::new(3, "10.209.150.227", 8996),
+        ];
+        conf
+    }
+
+    #[test]
+    fn master_web_mapping_uses_raft_id_when_reported_host_is_unresolvable() {
+        let conf = k8s_reported_fqdn_conf();
+        let reported = "cv-master-1.cv-master.curvine.svc.cluster.local:8995";
+        // Without the raft id the reported name cannot be mapped at all.
+        assert!(configured_master_web_for_active(&conf, reported, None).is_none());
+        // With it, the configured entry for the same raft node is used.
+        let endpoint = configured_master_web_for_active(&conf, reported, Some(2)).expect("mapped");
+        assert_eq!(endpoint.to_string(), "10.209.150.229:9001");
+        assert_eq!(
+            master_metrics_scrape_url(&conf, reported, Some(2)),
+            "http://10.209.150.229:9001/metrics"
+        );
+        assert_eq!(
+            master_config_view_scrape_url(&conf, reported, Some(2)),
+            "http://10.209.150.229:9001/api/v1/master/config"
+        );
+    }
+
+    #[test]
+    fn raft_id_maps_through_journal_peer_to_master_web_addrs_slot() {
+        let conf = k8s_reported_fqdn_conf();
+        assert_eq!(
+            configured_master_for_raft_id(&conf, 3).map(|addr| addr.to_string()),
+            Some("10.209.150.227:8995".to_string())
+        );
+        assert!(configured_master_web_by_raft_id(&conf, Some(3)).is_some());
+        // An unknown id must not silently borrow another node's endpoint.
+        assert!(configured_master_web_by_raft_id(&conf, Some(99)).is_none());
+        assert!(configured_master_web_for_active(&conf, "", Some(99)).is_some());
+    }
+
+    #[test]
+    fn raft_id_wins_over_a_reported_host_that_maps_elsewhere() {
+        // The reported host resolves, but the raft id is authoritative: it is what
+        // ties the leader to the operator's configured address.
+        let mut conf = k8s_reported_fqdn_conf();
+        conf.journal.journal_addrs = vec![
+            curvine_config::RaftPeer::new(7, "10.209.150.227", 8996),
+            curvine_config::RaftPeer::new(8, "10.209.150.228", 8996),
+            curvine_config::RaftPeer::new(9, "10.209.150.229", 8996),
+        ];
+        assert_eq!(
+            master_metrics_scrape_url(&conf, "10.209.150.228:8995", Some(9)),
+            "http://10.209.150.229:9001/metrics"
+        );
+    }
+
+    #[test]
+    fn master_raft_id_for_addr_resolves_the_leader_endpoint() {
+        let conf = k8s_reported_fqdn_conf();
+        assert_eq!(
+            master_raft_id_for_addr(&conf, "10.209.150.229:8995"),
+            Some(2)
+        );
+        assert_eq!(master_raft_id_for_addr(&conf, ""), None);
+        assert_eq!(master_raft_id_for_addr(&conf, "10.209.150.1:8995"), None);
+    }
+
+    /// Multi-node cluster whose masters report their own Pod FQDN, as seen from a
+    /// console outside the cluster.
+    #[test]
+    fn multi_node_reported_fqdn_leader_scrapes_the_configured_address() {
+        let conf = k8s_reported_fqdn_conf();
+        assert_eq!(
+            resolve_master_scrape_hostname(
+                &conf,
+                "cv-master-0.cv-master.curvine.svc.cluster.local:8995",
+                Some(1)
+            ),
+            "10.209.150.228"
+        );
+        assert_eq!(
+            master_metrics_instance(
+                &conf,
+                "cv-master-0.cv-master.curvine.svc.cluster.local:8995",
+                Some(1)
+            ),
+            "10.209.150.228:9001"
+        );
     }
 
     #[test]
@@ -736,8 +963,11 @@ mod tests {
         conf.master.web_port = 9000;
         conf.client.master_addrs = vec![InetAddr::new("localhost", 18995)];
         conf.client.master_web_addrs = vec![InetAddr::new("localhost", 19010)];
-        assert!(configured_master_web_for_active(&conf, "127.0.0.1:18995").is_some());
-        assert_eq!(master_scrape_web_port(&conf, "127.0.0.1:18995"), 19010);
+        assert!(configured_master_web_for_active(&conf, "127.0.0.1:18995", None).is_some());
+        assert_eq!(
+            master_scrape_web_port(&conf, "127.0.0.1:18995", None),
+            19010
+        );
     }
 
     #[test]
@@ -747,8 +977,11 @@ mod tests {
         conf.client.master_addrs = vec![InetAddr::new("cv-master-does-not-resolve.invalid", 8995)];
         conf.client.master_web_addrs =
             vec![InetAddr::new("cv-master-does-not-resolve.invalid", 19010)];
-        assert!(configured_master_web_for_active(&conf, "10.41.54.240:8995").is_none());
-        assert_eq!(master_scrape_web_port(&conf, "10.41.54.240:8995"), 9000);
+        assert!(configured_master_web_for_active(&conf, "10.41.54.240:8995", None).is_none());
+        assert_eq!(
+            master_scrape_web_port(&conf, "10.41.54.240:8995", None),
+            9000
+        );
     }
 
     #[test]
@@ -757,7 +990,7 @@ mod tests {
         conf.client.master_web_addrs.clear();
         conf.client.master_addrs = vec![InetAddr::new("bad-master", 8000)];
         conf.master.web_port = 9000;
-        assert_eq!(master_scrape_web_port(&conf, "bad-master:8995"), 9000);
+        assert_eq!(master_scrape_web_port(&conf, "bad-master:8995", None), 9000);
     }
 
     #[test]

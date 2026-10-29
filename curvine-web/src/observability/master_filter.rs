@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, HashSet};
 
 use curvine_config::ClusterConf;
 
-use crate::util::addr::{master_metrics_instance, master_metrics_scrape_url};
+use crate::util::addr::{
+    master_metrics_instance, master_metrics_scrape_url, master_raft_id_for_addr,
+};
 
 use super::model::{InstantMetric, RangeSeries, TargetHealth, ACTIVE_MASTER_INSTANCE};
 
@@ -45,10 +47,17 @@ impl ActiveMasterMatchSet {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
+            // `TargetHealth` carries no raft id, so resolve it from the reported
+            // endpoint: without it the configured mapping is lost whenever the
+            // console cannot resolve the master's reported hostname.
+            let raft_id = master_raft_id_for_addr(conf, rpc);
             push_instance_key(&mut instance_keys, rpc);
-            push_instance_key(&mut instance_keys, &master_metrics_instance(conf, rpc));
+            push_instance_key(
+                &mut instance_keys,
+                &master_metrics_instance(conf, rpc, raft_id),
+            );
             push_host_key(&mut host_keys, rpc);
-            let scrape_url = master_metrics_scrape_url(conf, rpc);
+            let scrape_url = master_metrics_scrape_url(conf, rpc, raft_id);
             if let Some(authority) = url_authority(&scrape_url) {
                 push_instance_key(&mut instance_keys, &authority);
                 push_host_key(&mut host_keys, &authority);

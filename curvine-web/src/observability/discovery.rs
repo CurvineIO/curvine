@@ -48,9 +48,13 @@ pub struct DiscoveryResult {
     pub master_info: Option<FilesystemInfo>,
 }
 
-pub fn build_master_metrics_target(conf: &ClusterConf, active_master: &str) -> MetricTarget {
+pub fn build_master_metrics_target(
+    conf: &ClusterConf,
+    active_master: &str,
+    active_raft_id: Option<u64>,
+) -> MetricTarget {
     let trimmed = active_master.trim();
-    let url = master_metrics_scrape_url(conf, trimmed);
+    let url = master_metrics_scrape_url(conf, trimmed, active_raft_id);
     let active_master_rpc = if trimmed.is_empty() {
         None
     } else {
@@ -162,7 +166,11 @@ pub async fn discover_targets(
     {
         Ok(Ok(info)) => DiscoveryResult {
             master: MasterDiscovery {
-                target: build_master_metrics_target(conf, info.active_master.trim()),
+                target: build_master_metrics_target(
+                    conf,
+                    info.active_master.trim(),
+                    info.active_raft_id,
+                ),
                 error: None,
             },
             workers: discover_workers_from_master_info(&info, conf),
@@ -172,7 +180,7 @@ pub async fn discover_targets(
         },
         Ok(Err(err)) => DiscoveryResult {
             master: MasterDiscovery {
-                target: build_master_metrics_target(conf, ""),
+                target: build_master_metrics_target(conf, "", None),
                 error: Some(err.to_string()),
             },
             workers: Vec::new(),
@@ -182,7 +190,7 @@ pub async fn discover_targets(
         },
         Err(_) => DiscoveryResult {
             master: MasterDiscovery {
-                target: build_master_metrics_target(conf, ""),
+                target: build_master_metrics_target(conf, "", None),
                 error: Some(format!(
                     "master info request timed out after {MASTER_INFO_TIMEOUT_SECS}s"
                 )),
@@ -246,12 +254,12 @@ mod tests {
             InetAddr::new("cv-master-2", 29000),
             InetAddr::new("cv-master-3", 39000),
         ];
-        let target = build_master_metrics_target(&conf, "cv-master-2:8995");
+        let target = build_master_metrics_target(&conf, "cv-master-2:8995", None);
         assert_eq!(target.component, "master");
         assert_eq!(target.instance, ACTIVE_MASTER_INSTANCE);
         assert_eq!(
             target.url,
-            master_metrics_scrape_url(&conf, "cv-master-2:8995")
+            master_metrics_scrape_url(&conf, "cv-master-2:8995", None)
         );
         assert_eq!(target.id, "master:active-master");
         assert_eq!(target.active_master.as_deref(), Some("cv-master-2:8995"));
@@ -260,7 +268,7 @@ mod tests {
     #[test]
     fn builds_master_target_from_configured_master_when_active_is_loopback() {
         let conf = test_conf();
-        let target = build_master_metrics_target(&conf, "127.0.0.1:8995");
+        let target = build_master_metrics_target(&conf, "127.0.0.1:8995", None);
         assert_eq!(target.component, "master");
         assert_eq!(target.instance, ACTIVE_MASTER_INSTANCE);
         assert_eq!(target.url, "http://cv-master-0:9010/metrics");
@@ -271,7 +279,7 @@ mod tests {
     fn builds_master_target_from_active_master_in_ha() {
         let mut conf = test_conf();
         conf.master.hostname = "cv-master-0".to_string();
-        let target = build_master_metrics_target(&conf, "cv-master-1:8995");
+        let target = build_master_metrics_target(&conf, "cv-master-1:8995", None);
         assert_eq!(target.instance, ACTIVE_MASTER_INSTANCE);
         assert_eq!(target.url, "http://cv-master-1:9010/metrics");
     }
