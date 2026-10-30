@@ -76,7 +76,18 @@ impl BlockWriterLocal {
             }
         };
         let actual_storage_type = write_context.storage_type;
-        let file = LocalFile::with_write_offset(path, false, pos)?;
+        let file = match LocalFile::with_write_offset(path, false, pos) {
+            Ok(file) => file,
+            Err(e) => {
+                // Local file open failed after write_block succeeded: abort
+                // the block on the server so worker-side writing state is
+                // reclaimed before returning.
+                let _ = client
+                    .write_commit(&block, pos, block_size, req_id, 0, true)
+                    .await;
+                return Err(e.into());
+            }
+        };
 
         let writer = Self {
             rt: fs_context.clone_runtime(),

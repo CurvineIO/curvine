@@ -73,6 +73,11 @@ impl BlockWriterRemote {
             .await?;
 
         if block_size != write_context.block_size {
+            // write_block already succeeded on the worker: abort the block so
+            // worker-side writing state is reclaimed before returning.
+            let _ = client
+                .write_commit(&block, pos, block_size, req_id, 0, true)
+                .await;
             return err_box!(
                 "Abnormal block size, expected length {}, actual length {}",
                 block_size,
