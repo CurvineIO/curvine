@@ -1395,6 +1395,18 @@ mod test {
         // as a whole can no longer be trusted.
         let dir = ds.find_dir(finalized.dir_id())?;
         assert!(FileLayout.open_reader(dir, &finalized, 0, 30).is_err());
+
+        // Master-side truncate down to the surviving bytes stays readable:
+        // only min(meta.len, logical_len) bytes must be present.
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 20)?;
+        let region = reader.read_region(false, 50)?;
+        let bytes = match region {
+            DataSlice::Buffer(bytes) => bytes,
+            other => panic!("expected bounded buffered read, got {other:?}"),
+        };
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(&bytes[..], b"A".repeat(20).as_slice());
         Ok(())
     }
 
