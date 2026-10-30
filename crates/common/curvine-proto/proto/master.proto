@@ -50,10 +50,15 @@ message CreateFileRequest {
     required string path = 1;
     required CreateFileOptsProto opts = 2;
     required uint32 flags = 3;
+    // When set, the master also allocates the first block of an empty file and
+    // returns it in `first_block`, saving the separate AddBlock round trip.
+    // Masters that predate this field ignore it and clients fall back to AddBlock.
+    optional ClientAddressProto first_block_client = 4;
 }
 
 message CreateFileResponse {
     required FileStatusProto file_status = 1;
+    optional LocatedBlockProto first_block = 2;
 }
 
 message CreateFilesBatchRequest {
@@ -76,10 +81,14 @@ message OpenFileRequest {
     required string path = 1;
     required CreateFileOptsProto opts = 2;
     required uint32 flags = 3;
+    // Same as CreateFileRequest.first_block_client. Only honoured when the open
+    // leaves the file empty (O_CREAT on a missing file, or O_TRUNC).
+    optional ClientAddressProto first_block_client = 4;
 }
 
 message OpenFileResponse {
     required FileBlocksProto file_blocks = 1;
+    optional LocatedBlockProto first_block = 2;
 }
 
 
@@ -268,6 +277,9 @@ message CompleteFileRequest {
     optional SetAttrOptsProto set_attr_opts = 7;
     // Omitted by legacy clients to preserve the historical full snapshot response.
     optional bool return_file_blocks = 8 [default = true];
+    // A block pre-allocated by CreateFile/OpenFile that the client never wrote.
+    // The master drops it if it is still empty and uncommitted.
+    optional int64 release_block_id = 9;
 }
 
 message CompleteFileResponse {

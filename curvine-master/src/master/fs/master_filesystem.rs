@@ -66,10 +66,13 @@ pub struct CvMetadataSnapshotPage {
     pub epoch: u64,
 }
 
-struct CompleteFileOptions {
-    only_flush: bool,
-    return_file_blocks: bool,
-    set_attr_opts: Option<SetAttrOpts>,
+#[derive(Default)]
+pub struct CompleteFileOptions {
+    pub only_flush: bool,
+    pub return_file_blocks: bool,
+    pub set_attr_opts: Option<SetAttrOpts>,
+    /// Pre-allocated block the client never wrote; see `alloc_first_block`.
+    pub release_block_id: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -1045,6 +1048,45 @@ impl MasterFilesystem {
         }
     }
 
+    /// Allocates the first block of a file that is still empty, so a writer
+    /// can skip the AddBlock round trip after CreateFile/OpenFile.
+    ///
+    /// Best effort: returns `None` when the file already has blocks (another
+    /// writer, or a retried create) or no worker can take the block. The
+    /// client then falls back to a normal AddBlock, which is the old path.
+    pub fn alloc_first_block(
+        &self,
+        path: &str,
+        inode_id: i64,
+        client_addr: ClientAddress,
+    ) -> Option<LocatedBlock> {
+        let res = (|| -> FsResult<Option<LocatedBlock>> {
+            {
+                let fs_dir = self.fs_dir.read();
+                let inode = Self::resolve_file_inode(&fs_dir, path, Some(inode_id))?;
+                let file = inode.as_file_ref()?;
+                if !file.blocks.is_empty() || file.len != 0 {
+                    return Ok(None);
+                }
+            }
+            // `add_block` re-checks under the write lock: if a block appeared
+            // meanwhile it returns that block, which is what AddBlock would do.
+            let block =
+                self.add_block(path, Some(inode_id), client_addr, vec![], vec![], 0, None)?;
+            Ok(Some(block))
+        })();
+        match res {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "alloc_first_block {} (inode {}) skipped: {}",
+                    path, inode_id, e
+                );
+                None
+            }
+        }
+    }
+
     /// Document application to allocate a new block.
     #[allow(clippy::too_many_arguments)]
     pub fn add_block<T: AsRef<str>>(
@@ -1124,6 +1166,7 @@ impl MasterFilesystem {
                 only_flush,
                 return_file_blocks: true,
                 set_attr_opts,
+                release_block_id: None,
             },
         )
     }
@@ -1147,9 +1190,22 @@ impl MasterFilesystem {
                 only_flush: true,
                 return_file_blocks: false,
                 set_attr_opts: None,
+                release_block_id: None,
             },
         )
         .map(|_| ())
+    }
+
+    pub fn complete_file_with_opts<T: AsRef<str>>(
+        &self,
+        path: T,
+        inode_id: Option<i64>,
+        len: i64,
+        commit_blocks: Vec<CommitBlock>,
+        client_name: T,
+        options: CompleteFileOptions,
+    ) -> FsResult<Option<FileBlocks>> {
+        self.complete_file0(path, inode_id, len, commit_blocks, client_name, options)
     }
 
     fn complete_file0<T: AsRef<str>>(
@@ -1164,7 +1220,8 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
-        fs_dir.complete_file(
+        let block_size = inode.as_file_ref()?.block_size as i64;
+        let released = fs_dir.complete_file(
             path,
             &mut inode,
             len,
@@ -1172,7 +1229,15 @@ impl MasterFilesystem {
             client_name,
             options.only_flush,
             options.set_attr_opts,
+            options.release_block_id,
         )?;
+        if let Some(locs) = released.and_then(|b| b.locs) {
+            // Return the capacity reserved when the block was chosen.
+            let ids: Vec<u32> = locs.iter().map(|v| v.worker_id).collect();
+            self.worker_manager
+                .write()
+                .unschedule_worker_ids(&ids, block_size);
+        }
 
         if options.only_flush && options.return_file_blocks {
             let file = inode.as_file_ref()?;
@@ -3852,5 +3917,152 @@ mod tests {
         fs.master_monitor
             .set_role_for_test(curvine_raft::raft::RoleState::Leader);
         assert_eq!(fs.drain_pending_trash().unwrap().unwrap().inodes, 1);
+    }
+
+    fn first_block_fs(name: &str) -> MasterFilesystem {
+        let fs = test_fs(name);
+        let capacity = 1 << 30;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+        fs
+    }
+
+    fn scheduled_bytes(fs: &MasterFilesystem) -> i64 {
+        fs.worker_manager
+            .read()
+            .get_worker(1)
+            .unwrap()
+            .scheduled_bytes
+    }
+
+    fn close_opts(release_block_id: Option<i64>) -> CompleteFileOptions {
+        CompleteFileOptions {
+            release_block_id,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unwritten_first_block_is_released_on_close() {
+        let fs = first_block_fs("first-block-release");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+
+        let block = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .expect("empty file gets a first block");
+        assert_eq!(block.block.len, 0);
+        assert_eq!(block.locs.len(), 1);
+        assert_eq!(scheduled_bytes(&fs), status.block_size);
+        // The file already has block 0, so a retried create gets nothing new.
+        assert!(fs.alloc_first_block("/a.log", status.id, client).is_none());
+
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(block.block.id)),
+        )
+        .unwrap();
+
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert!(blocks.block_locs.is_empty());
+        assert_eq!(blocks.status.len, 0);
+        assert!(blocks.status.is_complete);
+        assert_eq!(scheduled_bytes(&fs), 0, "reservation must be returned");
+    }
+
+    #[test]
+    fn written_first_block_survives_a_release_request() {
+        let fs = first_block_fs("first-block-written");
+        let status = fs.create("/a.log", true).unwrap();
+        let block = fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .unwrap();
+        let commit = CommitBlock {
+            block_id: block.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+
+        // The commit in the same request makes the block non-empty, so a
+        // stale release id must not drop it.
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            10,
+            vec![commit],
+            "",
+            close_opts(Some(block.block.id)),
+        )
+        .unwrap();
+
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert_eq!(blocks.status.len, 10);
+        assert_eq!(blocks.block_locs.len(), 1);
+        assert_eq!(blocks.block_locs[0].block.id, block.block.id);
+    }
+
+    #[test]
+    fn rejected_close_keeps_the_first_block() {
+        let fs = first_block_fs("first-block-rejected");
+        let status = fs.create("/a.log", true).unwrap();
+        let block = fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .unwrap();
+
+        // len 5 with no committed data fails the length check.
+        let err = fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            5,
+            vec![],
+            "",
+            close_opts(Some(block.block.id)),
+        );
+        assert!(err.is_err());
+
+        let fs_dir = fs.fs_dir.read();
+        let inode = MasterFilesystem::resolve_file_inode(&fs_dir, "/a.log", None).unwrap();
+        let file = inode.as_file_ref().unwrap();
+        assert_eq!(file.block_ids(), vec![block.block.id]);
+        drop(fs_dir);
+        assert_eq!(scheduled_bytes(&fs), status.block_size);
+    }
+
+    #[test]
+    fn first_block_is_not_allocated_for_a_file_with_data() {
+        let fs = first_block_fs("first-block-non-empty");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let block = fs
+            .add_block("/a.log", None, client.clone(), vec![], vec![], 0, None)
+            .unwrap();
+        let commit = CommitBlock {
+            block_id: block.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        fs.complete_file("/a.log", None, 10, vec![commit], "", false, None)
+            .unwrap();
+
+        assert!(fs.alloc_first_block("/a.log", status.id, client).is_none());
+    }
+
+    #[test]
+    fn first_block_without_workers_falls_back() {
+        let fs = test_fs("first-block-no-worker");
+        let status = fs.create("/a.log", true).unwrap();
+        assert!(fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .is_none());
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert!(blocks.block_locs.is_empty());
     }
 }
