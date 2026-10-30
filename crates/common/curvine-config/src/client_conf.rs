@@ -350,6 +350,12 @@ impl ClientConf {
         self.seek_absorb_window =
             ByteUnit::from_str(&self.seek_absorb_window_str)?.as_byte() as i64;
 
+        // 0 means "unset" (e.g. the SDK FilesystemConf omits it): fall back
+        // to the default abandonment deadline.
+        if self.write_buffer_timeout_ms == 0 {
+            self.write_buffer_timeout_ms = Self::DEFAULT_WRITE_BUFFER_TIMEOUT_MS;
+        }
+
         self.small_file_size = ByteUnit::from_str(&self.small_file_size_str)?.as_byte() as i64;
 
         self.ttl_ms = DurationUnit::from_str(&self.ttl_ms_str)?.as_millis() as i64;

@@ -384,15 +384,10 @@ impl FsWriterBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{recv_task, BufferChannel, FsWriterBase, FsWriterBuffer, SelectTask, WriterTask};
-    use crate::file::FsContext;
+    use super::{recv_task, BufferChannel, SelectTask, WriterTask};
     use bytes::Bytes;
-    use curvine_config::ClusterConf;
     use curvine_error::FsResult;
-    use curvine_fs_api::Path;
     use curvine_io::DataSlice;
-    use curvine_model::FileBlocks;
-    use curvine_runtime::runtime::RpcRuntime;
     use curvine_runtime::sync::channel::{AsyncChannel, CallChannel};
     use curvine_runtime::sync::ErrorMonitor;
     use std::sync::Arc;
@@ -569,42 +564,9 @@ mod tests {
         );
     }
 
-    // End-to-end regression guard for the CI replication_test failure: the
-    // real FsWriterBuffer must not misreport a successful complete as an
-    // error when the background task replies and then exits. The background
-    // task gets the complete, replies, and exits; the reply must win over
-    // any exit/latch signal. Asserts with the async runtime created outside
-    // the test task (FsContext spawns on its own runtime).
-    #[test]
-    fn complete_reply_wins_over_task_exit_on_real_buffer() {
-        let conf = ClusterConf::default();
-        let mut conf = conf;
-        conf.client.write_buffer_timeout_ms = 10 * 1000;
-        let fs_context = Arc::new(FsContext::new(conf).unwrap());
-        let rt = fs_context.clone_runtime();
-
-        let writer = FsWriterBase::new(
-            fs_context.clone(),
-            Path::from_str("/gh-1908-e2e").unwrap(),
-            FileBlocks::new(Default::default(), vec![]),
-            0,
-        );
-        let mut buffer = FsWriterBuffer::new(writer, 2);
-
-        // The background task cannot reach a real server, so complete() is
-        // expected to fail with the backend error - but the error must be the
-        // backend failure surfaced through the task, never the spurious
-        // "task has exited" / "not responding" misclassification.
-        let res =
-            rt.block_on(async { time::timeout(Duration::from_secs(5), buffer.complete()).await });
-        assert!(res.is_ok(), "complete() hung");
-        if let Err(e) = res.unwrap() {
-            let msg = e.to_string();
-            assert!(
-                !msg.contains("has exited") && !msg.contains("not responding"),
-                "spurious latching error for a live task: {}",
-                msg
-            );
-        }
-    }
+    // End-to-end note: a full FsWriterBase-backed complete requires a live
+    // master/worker (the task's complete RPC enters the 60/120s connection
+    // retry path without one), so the reply-wins-over-exit regression is
+    // covered by the controlled in-process responder above instead of an
+    // environment-dependent server test.
 }
