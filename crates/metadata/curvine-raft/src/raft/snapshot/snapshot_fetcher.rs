@@ -20,7 +20,7 @@ use curvine_config::JournalConf;
 use curvine_core_error::err_box;
 use curvine_runtime::common::{FileUtils, Utils};
 use log::info;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub enum SnapshotFetcher {
     Local(SnapshotData),
@@ -108,15 +108,24 @@ impl SnapshotFetcher {
 
     /// Copies a snapshot that is already readable on this host into `dir` so the
     /// local member owns the files it installs. Sizes are verified against the
-    /// manifest, and a partial copy is removed by the caller.
+    /// manifest, the bytes and their directory entries are synced before the copy
+    /// can be published, and a partial copy is removed by the caller.
     fn copy_snapshot(source: &str, dir: &str, files: &[SnapshotFileInfo]) -> RaftResult<()> {
+        let mut synced_dirs: Vec<PathBuf> = Vec::new();
+
         for file in files {
             let from = Path::new(source).join(&file.path);
             let to = Path::new(dir).join(&file.path);
             if let Some(parent) = to.parent() {
                 FileUtils::create_dir(parent, true)?;
+                if !synced_dirs.iter().any(|synced| synced == parent) {
+                    synced_dirs.push(parent.to_path_buf());
+                }
             }
             std::fs::copy(&from, &to)?;
+            // The installed manifest and the trimmed journal will point at this
+            // copy, so the bytes must survive a crash before it is published.
+            std::fs::File::open(&to)?.sync_all()?;
 
             let copied = std::fs::metadata(&to)?.len();
             if copied != file.len {
@@ -127,6 +136,12 @@ impl SnapshotFetcher {
                     copied
                 );
             }
+        }
+
+        // Directory entries need their own sync, otherwise a crash can lose a
+        // file that was already appended to the directory.
+        for synced in synced_dirs.iter().rev() {
+            std::fs::File::open(synced)?.sync_all()?;
         }
 
         Ok(())
