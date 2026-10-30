@@ -32,8 +32,8 @@ async fn calculate_content_summary_impl(
     let status = client.get_status(path).await?;
 
     if !status.is_dir {
-        // For a file, return a simple summary with just the file's length
-        return Ok(ContentSummary::for_file(status.len));
+        // For a file, return a simple summary of just this file
+        return Ok(ContentSummary::for_file(&status));
     }
 
     // For a directory, we need to recursively calculate the summary
@@ -49,9 +49,8 @@ async fn calculate_content_summary_impl(
                 Box::pin(calculate_content_summary_impl(client, &child_path)).await?;
             summary.merge(&child_summary);
         } else {
-            // For files, just add their length and count
-            summary.length += child.len;
-            summary.file_count += 1;
+            // For files, add their length, replicated size and count
+            summary.merge(&ContentSummary::for_file(&child));
         }
     }
 
