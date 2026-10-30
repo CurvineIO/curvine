@@ -15,9 +15,9 @@
 use crate::common::UfsFactory;
 use crate::transfer::{
     is_store_unavailable_error, job_mount_snapshot_async, job_mount_snapshot_with_version_async,
-    record_master_rpc, transfer_failure_message, MountSnapshotError, TransferMountSnapshotUpdate,
-    TransferPlannedTasks, TransferPlanner, TransferRequeueUpdate, TransferRuntimeConfig,
-    TransferStore, TransferTaskStateUpdate,
+    merge_summaries, record_master_rpc, transfer_failure_message, MountSnapshotError, TaskCache,
+    TransferMountSnapshotUpdate, TransferPlannedTasks, TransferPlanner, TransferRequeueUpdate,
+    TransferRuntimeConfig, TransferStore, TransferTaskStateUpdate,
 };
 use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::TransferConf;
@@ -29,7 +29,7 @@ use curvine_model::{
     BlockLocation, CommitBlock, LoadJobInfo, LoadTaskInfo, LocatedBlock, SetAttrOptsBuilder,
     TaskAttemptStart, TaskBlockLocation, TransferJobRecord, TransferLease, TransferPlanKind,
     TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
-    TransferTaskReportInfo, TransferTaskState, WorkerInflight, WorkerInfo,
+    TransferTaskReportInfo, TransferTaskState, TransferTaskSummary, WorkerInflight, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::RpcRuntime;
@@ -439,6 +439,9 @@ pub struct TransferScheduler<S> {
     last_metrics_ms: Arc<AtomicU64>,
     last_task_counts_ms: Arc<AtomicU64>,
     inflight: Arc<InflightLedger>,
+    /// File-level task state. Those tasks are never persisted, so every task
+    /// read below merges this cache with the store.
+    task_cache: Arc<TaskCache>,
 }
 
 impl<S> Clone for TransferScheduler<S> {
@@ -459,6 +462,7 @@ impl<S> Clone for TransferScheduler<S> {
             last_metrics_ms: self.last_metrics_ms.clone(),
             last_task_counts_ms: self.last_task_counts_ms.clone(),
             inflight: self.inflight.clone(),
+            task_cache: self.task_cache.clone(),
         }
     }
 }
@@ -478,6 +482,7 @@ where
         report_endpoints: Vec<String>,
         conf: TransferConf,
         runtime_config: Arc<TransferRuntimeConfig>,
+        task_cache: Arc<TaskCache>,
     ) -> Self {
         let inflight_ttl =
             Duration::from_millis(TransferConf::DEFAULT_SCHEDULER_INFLIGHT_CACHE_TTL_MS);
@@ -497,6 +502,7 @@ where
             last_metrics_ms: Arc::new(AtomicU64::new(0)),
             last_task_counts_ms: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(InflightLedger::new(inflight_ttl)),
+            task_cache,
         }
     }
 
@@ -743,7 +749,10 @@ where
             record_metric(|metrics| metrics.observe_job_pending_wait(kind, wait_ms));
         }
 
-        if resuming_planning && self.store.has_transfer_tasks(&job.job_id, job.run_id)? {
+        if resuming_planning
+            && (self.store.has_transfer_tasks(&job.job_id, job.run_id)?
+                || !self.task_cache.is_empty(&job.job_id, job.run_id))
+        {
             let err = FsError::common(
                 "interrupted task-plan persistence cannot be safely recomputed; retry transfer",
             );
@@ -1047,7 +1056,20 @@ where
             .conf
             .planning_batch_size()
             .clamp(1, MAX_TASKS_PER_STORE_TRANSACTION);
-        for tasks in planned.tasks.chunks(batch_size) {
+        // Segment tasks keep their rows (they pre-allocate a shared target and
+        // resume mid-file); file-level tasks go to the in-memory cache only.
+        // Replaying a file-level task is just re-copying the file, so a row per
+        // task would buy nothing but a write.
+        let (cached_tasks, persisted_tasks): (Vec<_>, Vec<_>) =
+            planned.tasks.iter().cloned().partition(|task| {
+                !matches!(
+                    classify_transfer_plan(&task.source_read_plan_json),
+                    TransferPlanKind::Segment | TransferPlanKind::SegmentGroup
+                )
+            });
+        self.task_cache.seed(&job.job_id, job.run_id, cached_tasks);
+
+        for tasks in persisted_tasks.chunks(batch_size) {
             let appended = self.store.append_planned_tasks(TransferPlannedTasks {
                 job_id: job.job_id.clone(),
                 run_id: job.run_id,
@@ -1250,15 +1272,43 @@ where
             );
             return Ok(());
         }
+        // File-level tasks live only in this process. If a restart (or a
+        // failover) left a Dispatching/Running job with no tasks at all, the
+        // work was never planned into the store: re-plan from the source
+        // rather than letting an empty task set look like "everything done".
+        // Re-planning is safe because a file-level replay is a full re-copy.
+        if job.state != TransferState::Planning
+            && self.task_cache.is_empty(&job.job_id, job.run_id)
+            && self
+                .store
+                .claim_pending_tasks(&job.job_id, job.run_id, 1)?
+                .is_empty()
+            && !self.store.has_transfer_tasks(&job.job_id, job.run_id)?
+        {
+            warn!(
+                "re-planning transfer {} because no task state survived the restart",
+                job.job_id
+            );
+            self.requeue_for_replan(&job, &lease)?;
+            return Ok(());
+        }
         loop {
             if self.cancel_requested(&job, &lease).await? {
                 return Ok(());
             }
-            let tasks = self.store.claim_pending_tasks(
-                &job.job_id,
-                job.run_id,
-                self.conf.planning_batch_size(),
-            )?;
+            let limit = self.conf.planning_batch_size();
+            let mut tasks = self
+                .store
+                .claim_pending_tasks(&job.job_id, job.run_id, limit)?;
+            if tasks.len() < limit {
+                // File-level tasks live only in memory; top the batch up.
+                tasks.extend(self.task_cache.claim_pending(
+                    &job.job_id,
+                    job.run_id,
+                    limit - tasks.len(),
+                    now_ms(),
+                ));
+            }
             if tasks.is_empty() {
                 break;
             }
@@ -1394,6 +1444,7 @@ where
             let lease_epoch = lease.lease_epoch;
             let report_endpoints = self.report_endpoints.clone();
             let task_stale_timeout_ms = duration_ms(self.conf.task_stale_timeout);
+            let task_cache = self.task_cache.clone();
             Some(async move {
                 dispatch_one(DispatchTaskRequest {
                     store,
@@ -1406,6 +1457,7 @@ where
                     worker,
                     report_endpoints,
                     task_stale_timeout_ms,
+                    task_cache,
                 })
                 .await
             })
@@ -1415,6 +1467,33 @@ where
         .await?;
         let started_count = started.into_iter().filter(|value| *value).count();
         Ok((started_count, blocked_no_worker))
+    }
+
+    /// Sends a job back to Planning so the planner rebuilds its task set.
+    fn requeue_for_replan(&self, job: &TransferJobRecord, lease: &TransferLease) -> FsResult<()> {
+        self.store.requeue_transfer(TransferRequeueUpdate {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            owner: lease.owner.clone(),
+            lease_epoch: lease.lease_epoch,
+            message: "requeued: task state was lost across a restart".to_string(),
+            next_attempt_at_ms: now_ms(),
+            mount_snapshot_attempts: None,
+            planning_attempts: None,
+            now_ms: now_ms(),
+        })?;
+        Ok(())
+    }
+
+    /// Store summary merged with file-level (cache) counts.
+    fn task_summary(&self, job: &TransferJobRecord) -> FsResult<TransferTaskSummary> {
+        let store = self
+            .store
+            .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())?;
+        Ok(merge_summaries(
+            store,
+            self.task_cache.summary(&job.job_id, job.run_id, now_ms()),
+        ))
     }
 
     async fn planner_job_info(
@@ -1484,6 +1563,31 @@ where
         lease: TransferLease,
     ) -> FsResult<()> {
         let now = now_ms();
+        // File-level tasks live only in the cache, so every store-side guard
+        // below (has_recoverable_tasks, claim_pending_tasks) is blind to them
+        // and would complete the job with work still in flight. Handle that
+        // task set here: recycle finished attempts, re-dispatch whatever is
+        // pending, and report still-running work.
+        if !self.task_cache.is_empty(&job.job_id, job.run_id) {
+            let resumable = self
+                .task_cache
+                .claim_pending(&job.job_id, job.run_id, usize::MAX, now);
+            if !resumable.is_empty() {
+                self.transition(
+                    &job,
+                    &lease,
+                    &[TransferState::Running],
+                    TransferState::Dispatching,
+                    "redispatch file-level tasks",
+                )?;
+                self.dispatch_pending_tasks(job, lease).await?;
+                return Ok(());
+            }
+            let summary = self.task_summary(&job)?;
+            if summary.counts.running > 0 {
+                return Ok(());
+            }
+        }
         let missing_tasks = self.probe_stale_running_tasks(&job, now).await?;
         for (mut candidates, message) in [
             (
@@ -1585,7 +1689,10 @@ where
             .recover_transient_failed_tasks(&job, &lease, now)
             .await?;
 
-        if self.store.has_failed_tasks(&job.job_id, job.run_id)? && !retryable_failed {
+        if (self.store.has_failed_tasks(&job.job_id, job.run_id)?
+            || self.task_cache.has_failed(&job.job_id, job.run_id))
+            && !retryable_failed
+        {
             self.finish_failed_transfer(&job, &lease).await?;
             return Ok(());
         }
@@ -1637,8 +1744,7 @@ where
         )?;
         record_metric(|metrics| metrics.inc_terminal("completed", "all_tasks_completed"));
         let completed_size = self
-            .store
-            .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())
+            .task_summary(&job)
             .map(|summary| summary.counts.completed_size)
             .unwrap_or(0);
         record_metric(|metrics| metrics.inc_completed_bytes("completed", completed_size));
@@ -2073,9 +2179,7 @@ where
             });
             return Ok(());
         }
-        let summary = self
-            .store
-            .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())?;
+        let summary = self.task_summary(job)?;
         // Complete converged segment files before landing the terminal
         // state, so a retry skips them instead of retransmitting everything.
         // Best-effort: finalize trouble must not block failure handling.
@@ -2250,6 +2354,9 @@ where
         let message = message.into();
         if to_state.is_terminal() {
             self.snapshot_terminal(job, &message)?;
+            // Terminal snapshot carries the file-level counts; the live
+            // in-memory bucket is no longer needed and must not leak.
+            self.task_cache.remove(&job.job_id, job.run_id);
         }
         let updated = self.store.update_transfer_state(TransferStateUpdate {
             job_id: lease.job_id.clone(),
@@ -2293,9 +2400,7 @@ where
     }
 
     fn snapshot_terminal(&self, job: &TransferJobRecord, message: &str) -> FsResult<()> {
-        let summary = self
-            .store
-            .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())?;
+        let summary = self.task_summary(job)?;
         let progress = terminal_snapshot_progress(summary.progress, message);
         self.store.update_terminal_snapshot(
             &job.job_id,
@@ -2318,6 +2423,7 @@ struct DispatchTaskRequest<S> {
     worker: WorkerInfo,
     report_endpoints: Vec<String>,
     task_stale_timeout_ms: i64,
+    task_cache: Arc<TaskCache>,
 }
 
 async fn dispatch_one<S>(request: DispatchTaskRequest<S>) -> FsResult<bool>
@@ -2335,6 +2441,7 @@ where
         worker,
         report_endpoints,
         task_stale_timeout_ms,
+        task_cache,
     } = request;
     let now = now_ms();
     let attempt_id = task.attempt_id.saturating_add(1);
@@ -2365,7 +2472,7 @@ where
             return Ok(false);
         }
     };
-    let started = store.start_task_attempt(TaskAttemptStart {
+    let attempt = TaskAttemptStart {
         job_id: task.job_id.clone(),
         run_id: task.run_id,
         owner: owner.clone(),
@@ -2379,7 +2486,13 @@ where
         now_ms: now,
         stale_deadline_at: now.saturating_add(task_stale_timeout_ms),
         resume_loaded_size,
-    })?;
+    };
+    // File-level tasks are memory-only, so their attempt starts in the cache.
+    let started = if task_cache.owns_task(&task.job_id, task.run_id, &task.task_id) {
+        task_cache.start_attempt(&attempt)
+    } else {
+        store.start_task_attempt(attempt)?
+    };
     if !started {
         return Ok(false);
     }

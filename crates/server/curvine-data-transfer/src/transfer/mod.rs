@@ -8,6 +8,14 @@ use std::error::Error;
 mod store;
 pub use self::store::*;
 
+mod task_cache;
+pub use self::task_cache::{merge_summaries, JobRunKey, TaskCache};
+
+#[cfg(feature = "transfer-store-mysql")]
+mod forwarder;
+#[cfg(feature = "transfer-store-mysql")]
+pub use self::forwarder::{is_forwarded, Forwarder};
+
 mod memory_store;
 pub use self::memory_store::MemoryTransferStore;
 
@@ -66,6 +74,10 @@ mod planner_test;
 #[cfg(test)]
 #[path = "tests/report_batch_test.rs"]
 mod report_batch_test;
+
+#[cfg(test)]
+#[path = "tests/file_task_cache_test.rs"]
+mod file_task_cache_test;
 
 #[cfg(test)]
 #[path = "tests/group_recovery_test.rs"]

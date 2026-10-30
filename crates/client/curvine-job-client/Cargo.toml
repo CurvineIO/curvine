@@ -13,8 +13,13 @@ curvine-model = { workspace = true }
 curvine-proto = { workspace = true }
 curvine-core-error = { workspace = true }
 curvine-net = { workspace = true }
-curvine-rpc = { workspace = true }
 curvine-runtime = { workspace = true }
+curvine-rpc = { workspace = true }
+curvine-service-discovery = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+mysql = { workspace = true }
+prost = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
 bincode = { workspace = true }

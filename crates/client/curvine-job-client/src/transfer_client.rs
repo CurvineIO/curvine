@@ -31,15 +31,23 @@ use curvine_proto::{
     TransferTaskReportResponse, WatchTransferRequest, WatchTransferResponse,
 };
 use curvine_rpc::client::ClusterConnector;
+use curvine_rpc::RpcUtils;
 use curvine_runtime::runtime::Runtime;
 
+use crate::topology_source::MySqlTopologySource;
+use crate::transfer_router::TransferRouter;
 use curvine_client_core::file::FsContext;
 
 const TRANSFER_PROTOCOL_VERSION: u32 = 1;
+/// Fallback topology refresh: even without ack piggyback the router re-fetches
+/// at this cadence so a missed bump self-heals.
+const ROUTER_FALLBACK_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct TransferClient {
     connector: Arc<ClusterConnector>,
+    /// Present in discovery=sql mode: routes reports to the hash-ring owner.
+    router: Option<Arc<TransferRouter>>,
 }
 
 #[derive(Clone)]
@@ -93,7 +101,58 @@ impl TransferClient {
         }
         Ok(Self {
             connector: Arc::new(connector),
+            router: None,
         })
+    }
+
+    /// sql-discovery mode: reports route through the consistent hash ring.
+    /// Other RPCs (submit/status/list) keep using the connector as a fallback
+    /// target set.
+    pub fn with_discovery_sql(conf: &ClusterConf, rt: Arc<Runtime>) -> FsResult<Self> {
+        let mut client = Self::with_rt(conf, rt)?;
+        let store_url = conf.transfer.mysql_store_url().to_string();
+        client.router = Some(Arc::new(TransferRouter::new(
+            Box::new(MySqlTopologySource::new(store_url)),
+            ROUTER_FALLBACK_REFRESH,
+        )));
+        Ok(client)
+    }
+
+    /// Route a report to the hash-ring owner. Ring miss (empty ring, topology
+    /// fetch not yet done) falls back to the plain connector.
+    async fn report_to_owner<T, E>(
+        &self,
+        job_id: &str,
+        code: curvine_fs_api::RpcCode,
+        req: T,
+    ) -> Result<E, curvine_error::FsError>
+    where
+        T: prost::Message + Default,
+        E: prost::Message + Default,
+    {
+        let router = match &self.router {
+            Some(router) => router,
+            None => {
+                return Err(curvine_error::FsError::common(
+                    "transfer report router is not configured",
+                ))
+            }
+        };
+        let _ = router.maybe_refresh(0).await;
+        let addr = router.owner_addr(job_id);
+        match addr {
+            Some(addr) => {
+                let inet = curvine_net::net::InetAddr::from_str(addr)?;
+                let client = self.connector.get_client(&inet).await?;
+                let timeout = std::time::Duration::from_millis(
+                    self.connector.factory().conf().rpc_timeout_ms,
+                );
+                RpcUtils::proto_rpc(&client, timeout, code, req).await
+            }
+            None => Err(curvine_error::FsError::common(
+                "transfer topology is empty; report routing unavailable",
+            )),
+        }
     }
 
     pub async fn submit(&self, command: TransferCommand) -> FsResult<SubmitTransferResponse> {
@@ -135,6 +194,7 @@ impl TransferClient {
             job_id: job_id.as_ref().to_string(),
             page_size,
             page_token,
+            forwarded: None,
         };
         self.connector
             .proto_rpc::<_, GetTransferStatusResponse, FsError>(RpcCode::GetTransferStatus, req)
@@ -192,6 +252,7 @@ impl TransferClient {
             since_updated_at,
             page_size,
             page_token,
+            forwarded: None,
         };
         self.connector
             .proto_rpc::<_, WatchTransferResponse, FsError>(RpcCode::WatchTransfer, req)
@@ -225,6 +286,13 @@ impl TransferClient {
             info: info.clone(),
             progress,
         });
+        if self.router.is_some() {
+            let job_id = req.job_id.clone();
+            let response: TransferTaskReportResponse = self
+                .report_to_owner(&job_id, RpcCode::ReportTransferTask, req)
+                .await?;
+            return Ok(response.accepted);
+        }
         let response = self
             .connector
             .proto_rpc::<_, TransferTaskReportResponse, FsError>(RpcCode::ReportTransferTask, req)
@@ -244,19 +312,36 @@ impl TransferClient {
             reports: reports.into_iter().map(task_report_request).collect(),
             protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
         };
-        let response = self
-            .connector
-            .proto_rpc::<_, TransferTaskReportBatchResponse, FsError>(
-                RpcCode::ReportTransferTaskBatch,
-                req,
-            )
-            .await?;
+        let response: TransferTaskReportBatchResponse = if self.router.is_some() {
+            let job_id = req
+                .reports
+                .first()
+                .map(|report| report.job_id.clone())
+                .unwrap_or_default();
+            self.report_to_owner(&job_id, RpcCode::ReportTransferTaskBatch, req)
+                .await?
+        } else {
+            self.connector
+                .proto_rpc::<_, TransferTaskReportBatchResponse, FsError>(
+                    RpcCode::ReportTransferTaskBatch,
+                    req,
+                )
+                .await?
+        };
         if response.accepted.len() != report_count {
             return Err(FsError::common(format!(
                 "Transfer task report batch response count {} does not match request count {}",
                 response.accepted.len(),
                 report_count
             )));
+        }
+        // The ack carries the responder's topology version: a changed value is
+        // the only trigger for a topology refetch, so a steady state costs no
+        // discovery queries at all.
+        if let (Some(router), Some(version)) = (&self.router, response.topology_version) {
+            if version > 0 {
+                let _ = router.maybe_refresh(version).await;
+            }
         }
         Ok(response.accepted)
     }

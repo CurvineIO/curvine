@@ -35,7 +35,9 @@ use curvine_runtime::common::TimeSpent;
 
 use curvine_client_core::file::{FsClient, FsContext};
 
+mod topology_source;
 mod transfer_client;
+mod transfer_router;
 pub use transfer_client::{TransferClient, TransferTaskProgressReport};
 
 /// Job master client

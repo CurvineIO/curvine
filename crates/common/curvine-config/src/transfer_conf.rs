@@ -133,6 +133,27 @@ pub struct TransferConf {
         alias = "worker_terminal_retention_str"
     )]
     pub worker_terminal_retention_str: String,
+
+    /// Instance discovery mode for the transfer fleet.
+    /// `static` (default): workers report to the configured `endpoints` list.
+    /// `sql`: instances register in MySQL and workers route reports through a
+    /// consistent hash ring built from live instances.
+    #[serde(skip_serializing_if = "is_default_discovery", default)]
+    pub discovery: TransferDiscovery,
+}
+
+fn is_default_discovery(discovery: &TransferDiscovery) -> bool {
+    matches!(discovery, TransferDiscovery::Static)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferDiscovery {
+    /// Report to the configured `transfer.endpoints` list (legacy behavior).
+    #[default]
+    Static,
+    /// MySQL-backed registration; consistent-hash report routing.
+    Sql,
 }
 
 impl TransferConf {
@@ -549,6 +570,7 @@ impl Default for TransferConf {
             task_retention_str: Self::DEFAULT_TASK_RETENTION.to_string(),
             worker_terminal_retention: Duration::default(),
             worker_terminal_retention_str: Self::DEFAULT_WORKER_TERMINAL_RETENTION.to_string(),
+            discovery: TransferDiscovery::Static,
         }
     }
 }

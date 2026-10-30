@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use crossbeam::channel;
@@ -23,6 +24,7 @@ use curvine_model::{
     FileStatus, TaskBlockLocation, TransferCommand, TransferCountFilter, TransferJobRecord,
     TransferKind, TransferListFilter, TransferProgress, TransferState, TransferStateCounts,
     TransferTaskCounts, TransferTaskReport, TransferTaskState, TransferTaskStatus,
+    TransferTaskSummary,
 };
 use curvine_proto::{
     ListTransferTenantsRequest, ListTransferTenantsResponse, ListTransfersRequest,
@@ -37,7 +39,9 @@ use log::{info, warn};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use crate::transfer::{ClusterMetadataCache, TransferMetrics, TransferStore};
+use crate::transfer::{
+    merge_summaries, ClusterMetadataCache, TaskCache, TransferMetrics, TransferStore,
+};
 
 const PROGRESS_REPORT_COALESCE_BATCH: usize = 256;
 const MAX_BATCH_TASK_REPORTS: usize = PROGRESS_REPORT_COALESCE_BATCH;
@@ -74,6 +78,10 @@ pub struct TransferService<S> {
     /// job_key -> last auto-repair attempt time (ms).
     /// Cooldown is per-process / per-replica, not shared across transfer instances.
     auto_repair_last_attempt_ms: Arc<Mutex<HashMap<String, i64>>>,
+    /// File-level task state (None = every task lives in the store).
+    task_cache: Option<Arc<TaskCache>>,
+    /// Cached discovery topology version, piggybacked onto report acks.
+    topology_version: Arc<AtomicI64>,
 }
 
 impl<S> Clone for TransferService<S> {
@@ -84,6 +92,8 @@ impl<S> Clone for TransferService<S> {
             task_stale_timeout_ms: self.task_stale_timeout_ms,
             report_dispatcher: self.report_dispatcher.clone(),
             auto_repair_last_attempt_ms: self.auto_repair_last_attempt_ms.clone(),
+            task_cache: self.task_cache.clone(),
+            topology_version: self.topology_version.clone(),
         }
     }
 }
@@ -99,6 +109,8 @@ where
             task_stale_timeout_ms: 60_000,
             report_dispatcher: None,
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
+            task_cache: None,
+            topology_version: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -110,6 +122,8 @@ where
                 .unwrap_or(i64::MAX),
             report_dispatcher: None,
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
+            task_cache: None,
+            topology_version: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -132,6 +146,8 @@ where
                 task_report_workers,
             )?),
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
+            task_cache: None,
+            topology_version: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -147,6 +163,8 @@ where
                 .unwrap_or(i64::MAX),
             report_dispatcher: None,
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
+            task_cache: None,
+            topology_version: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -170,6 +188,8 @@ where
                 task_report_workers,
             )?),
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
+            task_cache: None,
+            topology_version: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -419,6 +439,77 @@ where
         }
     }
 
+    /// Attaches the process-wide file-level task cache. Without it every task
+    /// read/write goes to the store (the pre-cache behavior).
+    pub fn with_task_cache(mut self, task_cache: Arc<TaskCache>) -> Self {
+        self.task_cache = Some(task_cache.clone());
+        if let Err(err) = self.spawn_cache_summary_writer(task_cache) {
+            log::warn!("unable to start the transfer cache summary writer: {}", err);
+        }
+        self
+    }
+
+    /// Writes the merged (store + cache) job summary back periodically.
+    ///
+    /// File-level tasks have no rows, so nothing else refreshes the job row:
+    /// without this the console list would show 0% progress and a stale
+    /// `updated_at` for a running job. One write per active job per interval,
+    /// which is orders of magnitude below the per-task writes it replaces.
+    fn spawn_cache_summary_writer(&self, cache: Arc<TaskCache>) -> FsResult<()> {
+        let store = self.store.clone();
+        std::thread::Builder::new()
+            .name("transfer-cache-summary-write".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(JOB_SUMMARY_FLUSH_INTERVAL);
+                for (job_id, run_id) in cache.active_jobs() {
+                    let Ok(store_summary) =
+                        store.get_transfer_task_summary(&job_id, run_id, now_ms())
+                    else {
+                        continue;
+                    };
+                    let summary =
+                        merge_summaries(store_summary, cache.summary(&job_id, run_id, now_ms()));
+                    if let Err(err) = store.update_job_progress_summary(
+                        &job_id,
+                        run_id,
+                        summary.progress,
+                        now_ms(),
+                    ) {
+                        log::warn!(
+                            "write back transfer job summary failed: job={} run={} err={}",
+                            job_id,
+                            run_id,
+                            err
+                        );
+                    }
+                }
+            })
+            .map_err(|_| FsError::common("Unable to start the transfer cache summary writer"))?;
+        Ok(())
+    }
+
+    /// Shares the discovery topology version with report responses. 0 means
+    /// discovery is off, and the worker then ignores the field.
+    pub fn with_topology_version(&mut self, version: Arc<AtomicI64>) {
+        self.topology_version = version;
+    }
+
+    pub fn topology_version(&self) -> i64 {
+        self.topology_version.load(Ordering::Relaxed)
+    }
+
+    /// Store summary merged with the file-level task cache.
+    fn task_summary(&self, job_id: &str, run_id: u64) -> FsResult<TransferTaskSummary> {
+        let store = self
+            .store
+            .get_transfer_task_summary(job_id, run_id, now_ms())?;
+        let cached = self
+            .task_cache
+            .as_ref()
+            .and_then(|cache| cache.summary(job_id, run_id, now_ms()));
+        Ok(merge_summaries(store, cached))
+    }
+
     pub fn check_store_available(&self) -> FsResult<()> {
         self.store.check_available()
     }
@@ -476,9 +567,7 @@ where
         page_token: Option<String>,
     ) -> FsResult<TransferStatusPage> {
         let mut job = self.get_transfer(job_id)?;
-        let summary = self
-            .store
-            .get_transfer_task_summary(&job.job_id, job.run_id, now_ms())?;
+        let summary = self.task_summary(&job.job_id, job.run_id)?;
         let (mut progress, counts, expired) = resolve_terminal_summary(&job, &summary);
         // The live aggregate derives its message from task rows; scheduling-phase
         // reasons ("waiting for worker capacity", planning requeues) live on the
@@ -492,12 +581,30 @@ where
         if page_size == 0 {
             return Ok((job, counts, Vec::new(), None, expired));
         }
-        let (tasks, has_next) = self.store.list_transfer_task_status_page(
+        // Segment rows come from the store, file-level tasks from memory. They
+        // concatenate in that order (store first), so a page is only backed by
+        // the cache once the store page is exhausted.
+        let (mut tasks, store_has_next) = self.store.list_transfer_task_status_page(
             &job.job_id,
             job.run_id,
             offset,
-            page_size,
+            page_size + 1,
         )?;
+        if !store_has_next && tasks.len() < page_size + 1 {
+            let mut cached: Vec<TransferTaskStatus> = self
+                .task_cache
+                .as_ref()
+                .map(|cache| {
+                    let mut tasks = cache.tasks(&job.job_id, job.run_id);
+                    tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+                    tasks.into_iter().map(Into::into).collect()
+                })
+                .unwrap_or_default();
+            tasks.append(&mut cached);
+            tasks.truncate(page_size + 1);
+        }
+        let has_next = tasks.len() > page_size;
+        tasks.truncate(page_size);
         let next_page_token = has_next.then(|| offset.saturating_add(tasks.len()).to_string());
         Ok((
             job,
@@ -666,12 +773,66 @@ where
         self.report_task_with_state(report, state)
     }
 
+    /// Applies a report for a file-level (memory-only) task.
+    ///
+    /// Both the queued and the direct report paths land here, so a cache task
+    /// advances exactly once regardless of how the report arrived.
+    fn report_cached_task(
+        &self,
+        req: TransferTaskReportRequest,
+        state: TransferTaskState,
+        cache: &Arc<TaskCache>,
+    ) -> FsResult<bool> {
+        let now = now_ms();
+        let report = TransferTaskReport {
+            job_id: req.job_id.clone(),
+            run_id: req.run_id,
+            task_id: req.task_id.clone(),
+            attempt_id: req.attempt_id,
+            worker_id: req.worker_id,
+            worker_session_id: req.worker_session_id.clone(),
+            state,
+            progress: progress_from_proto(req.progress.clone()),
+            now_ms: now,
+            stale_deadline_at: now.saturating_add(self.task_stale_timeout_ms),
+            accepted_at_ms: req.accepted_at_ms.unwrap_or(0),
+            first_byte_at_ms: req.first_byte_at_ms.unwrap_or(0),
+            block_locations: block_locations_from_proto(&req.block_locations),
+        };
+        let accepted = cache.apply_report(&report).unwrap_or(false);
+        if accepted && state.is_terminal() {
+            if let Ok(metrics) = TransferMetrics::get() {
+                metrics.task_terminal(state);
+            }
+            self.observe_task_phases(
+                &req.job_id,
+                req.run_id,
+                &req.task_id,
+                ReportPhaseMarkers {
+                    attempt_started_at_ms: req.attempt_started_at_ms.unwrap_or(0),
+                    accepted_at_ms: req.accepted_at_ms.unwrap_or(0),
+                    first_byte_at_ms: req.first_byte_at_ms.unwrap_or(0),
+                    terminal_ms: req.progress.update_time,
+                },
+            );
+        }
+        Ok(accepted)
+    }
+
     fn report_task_with_state(
         &self,
         req: TransferTaskReportRequest,
         state: TransferTaskState,
     ) -> FsResult<bool> {
         if let Some(dispatcher) = &self.report_dispatcher {
+            // A file-level task lives only in memory, so it must not enter the
+            // report queue: the queue's store batch would reject it as fenced.
+            // Answer such reports here, ahead of the dispatcher.
+            if let Some(cache) = &self.task_cache {
+                if cache.owns_task(&req.job_id, req.run_id, &req.task_id) {
+                    return self.report_cached_task(req, state, cache);
+                }
+            }
             return dispatcher.report_task(req, state);
         }
         let now_ms = now_ms();
@@ -679,10 +840,10 @@ where
         let report = TransferTaskReport {
             job_id: req.job_id.clone(),
             run_id: req.run_id,
-            task_id: req.task_id,
+            task_id: req.task_id.clone(),
             attempt_id: req.attempt_id,
             worker_id: req.worker_id,
-            worker_session_id: req.worker_session_id,
+            worker_session_id: req.worker_session_id.clone(),
             state,
             progress: progress_from_proto(req.progress.clone()),
             now_ms,
@@ -691,7 +852,30 @@ where
             first_byte_at_ms: req.first_byte_at_ms.unwrap_or(0),
             block_locations: block_locations_from_proto(&req.block_locations),
         };
-        let accepted = self.store.update_task_report(report)?;
+        // File-level tasks are memory-only: their whole lifecycle happens here.
+        if let Some(cache) = &self.task_cache {
+            if cache.owns_task(&req.job_id, req.run_id, &req.task_id) {
+                return self.report_cached_task(req, state, cache);
+            }
+        }
+        let accepted = self.store.update_task_report(report.clone())?;
+        // A rejected report whose task does not exist at all means this
+        // instance is not the job's owner (a rolling deploy left the worker's
+        // ring stale). Answer with a retryable error rather than a `false`
+        // verdict: the worker treats `false` as "this attempt is fenced" and
+        // would drop the result. The check runs only on the rejection path, so
+        // the accepted hot path still costs exactly one store call.
+        if !accepted
+            && self.task_cache.is_some()
+            && !self
+                .store
+                .has_transfer_tasks(&report.job_id, report.run_id)?
+        {
+            return Err(FsError::common(format!(
+                "transfer task {}/{}/{} has no state on this instance; retry after refreshing the topology",
+                report.job_id, report.run_id, report.task_id
+            )));
+        }
         if accepted && state.is_terminal() {
             if let Ok(metrics) = TransferMetrics::get() {
                 metrics.task_terminal(state);

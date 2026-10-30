@@ -8,6 +8,7 @@ description = "Curvine service discovery abstractions and providers."
 [features]
 default = []
 etcd = ["dep:etcd-client", "dep:curvine-config", "dep:curvine-runtime", "dep:log"]
+sql = ["dep:mysql", "dep:curvine-runtime", "dep:log"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -17,6 +18,7 @@ curvine-proto = { workspace = true }
 curvine-runtime = { workspace = true, optional = true }
 etcd-client = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
+mysql = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

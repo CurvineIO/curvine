@@ -192,7 +192,22 @@ impl TaskManager {
         // short-circuiting to the local disk.
         let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone())?;
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
-        let transfer_client = TransferClient::with_context(&fs.fs_context()).ok();
+        // discovery=sql routes task reports through the consistent hash ring so
+        // each job's state lives on exactly one transfer instance. static mode
+        // keeps the legacy "report to the configured endpoints" behavior.
+        let transfer_client = if conf.transfer.discovery == curvine_config::TransferDiscovery::Sql {
+            match TransferClient::with_discovery_sql(conf, rt.clone()) {
+                Ok(client) => Some(client),
+                Err(err) => {
+                    warn!(
+                        "transfer sql discovery router unavailable, using static endpoints: {err}"
+                    );
+                    TransferClient::with_context(&fs.fs_context()).ok()
+                }
+            }
+        } else {
+            TransferClient::with_context(&fs.fs_context()).ok()
+        };
         let worker_task_semaphore = Arc::new(Semaphore::new(conf.job.worker_max_concurrent_tasks));
         let _ = WorkerTransferMetrics::get()?;
         record_metric(|metrics| {

@@ -2425,6 +2425,7 @@ dependencies = [
  "curvine-proto",
  "curvine-rpc",
  "curvine-runtime",
+ "curvine-service-discovery",
  "curvine-sys",
  "curvine-ufs-api",
  "curvine-unified-fs",
@@ -2575,6 +2576,7 @@ dependencies = [
 name = "curvine-job-client"
 version = "0.2.2"
 dependencies = [
+ "async-trait",
  "bincode",
  "curvine-client-core",
  "curvine-config",
@@ -2586,7 +2588,11 @@ dependencies = [
  "curvine-proto",
  "curvine-rpc",
  "curvine-runtime",
+ "curvine-service-discovery",
  "log",
+ "mysql",
+ "parking_lot",
+ "prost 0.11.9",
  "serde",
  "serde_json",
  "tokio",
@@ -3032,6 +3038,7 @@ dependencies = [
  "curvine-runtime",
  "etcd-client",
  "log",
+ "mysql",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

@@ -33,8 +33,9 @@ use crate::transfer::{
     MAX_JOBS_PER_STORE_TRANSACTION, MAX_TASKS_PER_STORE_TRANSACTION,
 };
 
-const TRANSFER_SCHEMA_VERSION: u64 = 4;
+const TRANSFER_SCHEMA_VERSION: u64 = 5;
 const TRANSFER_SCHEMA_V3: u64 = 3;
+const TRANSFER_SCHEMA_V4: u64 = 4;
 const MYSQL_SCHEMA_LOCK_NAME: &str = "curvine_transfer_schema";
 const MYSQL_SCHEMA_LOCK_TIMEOUT_SECS: u64 = 60;
 const MYSQL_MIGRATION_DDL_LOCK_TIMEOUT_SECS: u64 = 60;
@@ -1683,6 +1684,11 @@ fn migrate_mysql_schema(conn: &mut PooledConn, mut version: u64, now_ms: u64) ->
     }
     if version == TRANSFER_SCHEMA_V3 {
         migrate_mysql_schema_v3_to_v4(conn)?;
+        update_mysql_schema_version(conn, TRANSFER_SCHEMA_V4, now_ms)?;
+        version = TRANSFER_SCHEMA_V4;
+    }
+    if version == TRANSFER_SCHEMA_V4 {
+        migrate_mysql_schema_v4_to_v5(conn)?;
         update_mysql_schema_version(conn, TRANSFER_SCHEMA_VERSION, now_ms)?;
         version = TRANSFER_SCHEMA_VERSION;
     }
@@ -1694,6 +1700,40 @@ fn migrate_mysql_schema(conn: &mut PooledConn, mut version: u64, now_ms: u64) ->
     }
     migrate_mysql_task_runtime_columns(conn)?;
     ensure_mysql_ttl_purge_index(conn)
+}
+
+/// v5 adds the discovery tables (instance registry + topology version).
+/// Table creation is idempotent, so the migration only fills the version gap.
+fn migrate_mysql_schema_v4_to_v5(conn: &mut PooledConn) -> FsResult<()> {
+    conn.query_drop(
+        "create table if not exists transfer_instances (
+            kind varchar(32) not null,
+            instance_id varchar(128) not null,
+            host varchar(255) not null,
+            rpc_port int unsigned not null,
+            web_port int unsigned null,
+            start_epoch bigint not null,
+            heartbeat_at bigint not null,
+            lease_expire_at bigint not null,
+            primary key (kind, instance_id)
+        )",
+    )
+    .map_err(mysql_err)?;
+    conn.query_drop(
+        "create table if not exists transfer_topology (
+            id tinyint primary key,
+            topology_version bigint not null,
+            updated_at bigint not null
+        )",
+    )
+    .map_err(mysql_err)?;
+    conn.exec_drop(
+        "insert ignore into transfer_topology (id, topology_version, updated_at)
+         values (1, 1, :now_ms)",
+        params! { "now_ms" => curvine_runtime::common::LocalTime::mills() as i64 },
+    )
+    .map_err(mysql_err)?;
+    Ok(())
 }
 
 fn migrate_mysql_schema_v2_to_v3(conn: &mut PooledConn) -> FsResult<()> {

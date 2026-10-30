@@ -32,6 +32,9 @@ use crate::transfer::{
 
 pub struct TransferHandler<S> {
     service: TransferService<S>,
+    /// Present in discovery mode; relays status/watch to the job's owner.
+    #[cfg(feature = "transfer-store-mysql")]
+    forwarder: Option<std::sync::Arc<crate::transfer::Forwarder>>,
 }
 
 impl<S> TransferHandler<S>
@@ -39,7 +42,42 @@ where
     S: TransferStore,
 {
     pub fn new(service: TransferService<S>) -> Self {
-        Self { service }
+        Self {
+            service,
+            #[cfg(feature = "transfer-store-mysql")]
+            forwarder: None,
+        }
+    }
+
+    #[cfg(feature = "transfer-store-mysql")]
+    pub fn with_forwarder(mut self, forwarder: std::sync::Arc<crate::transfer::Forwarder>) -> Self {
+        self.forwarder = Some(forwarder);
+        self
+    }
+
+    #[cfg(feature = "transfer-store-mysql")]
+    /// Relays a status/watch request to the owning instance, if there is one.
+    /// Returns None whenever the request should be served here: no forwarder,
+    /// already forwarded (one hop only), no resolvable owner, or the relay
+    /// failed. A failure to relay must never fail the caller's request.
+    async fn relay<T, R>(&self, job_id: &str, code: RpcCode, req: T) -> Option<R>
+    where
+        T: prost::Message + Default,
+        R: prost::Message + Default,
+    {
+        let forwarder = self.forwarder.as_ref()?;
+        let addr = forwarder.relay_target(job_id)?;
+        match forwarder.relay::<T, R>(&addr, code, req).await {
+            Ok(response) => Some(response),
+            Err(err) => {
+                log::debug!(
+                    "transfer relay to {} failed, serving locally instead: {}",
+                    addr,
+                    err
+                );
+                None
+            }
+        }
     }
 
     fn submit_transfer(&self, msg: &Message) -> FsResult<Message> {
@@ -55,10 +93,18 @@ where
 
     fn get_transfer_status(&self, msg: &Message) -> FsResult<Message> {
         let req: GetTransferStatusRequest = msg.parse_header()?;
+        let response = self.get_transfer_status_for(&req)?;
+        Ok(Builder::success(msg).proto_header(response).build())
+    }
+
+    fn get_transfer_status_for(
+        &self,
+        req: &GetTransferStatusRequest,
+    ) -> FsResult<GetTransferStatusResponse> {
         let (job, task_summary, tasks, next_page_token, task_details_expired) = self
             .service
-            .get_transfer_status(&req.job_id, req.page_size, req.page_token)?;
-        let response = GetTransferStatusResponse {
+            .get_transfer_status(&req.job_id, req.page_size, req.page_token.clone())?;
+        Ok(GetTransferStatusResponse {
             job_id: job.job_id,
             run_id: job.run_id,
             state: transfer_state_code(job.state),
@@ -78,8 +124,7 @@ where
             cv_metadata_epoch: job.cv_metadata_epoch,
             task_summary: Some(task_summary_to_proto(task_summary)),
             task_details_expired: Some(task_details_expired),
-        };
-        Ok(Builder::success(msg).proto_header(response).build())
+        })
     }
 
     fn retry_transfer(&self, msg: &Message) -> FsResult<Message> {
@@ -107,14 +152,19 @@ where
 
     fn watch_transfer(&self, msg: &Message) -> FsResult<Message> {
         let req: WatchTransferRequest = msg.parse_header()?;
+        let response = self.watch_transfer_for(&req)?;
+        Ok(Builder::success(msg).proto_header(response).build())
+    }
+
+    fn watch_transfer_for(&self, req: &WatchTransferRequest) -> FsResult<WatchTransferResponse> {
         let (job, task_summary, tasks, next_page_token, changed, task_details_expired) =
             self.service.watch_transfer(
                 &req.job_id,
                 req.since_updated_at,
                 req.page_size,
-                req.page_token,
+                req.page_token.clone(),
             )?;
-        let response = WatchTransferResponse {
+        Ok(WatchTransferResponse {
             job_id: job.job_id,
             run_id: job.run_id,
             state: transfer_state_code(job.state),
@@ -132,8 +182,7 @@ where
             cv_metadata_epoch: job.cv_metadata_epoch,
             task_summary: Some(task_summary_to_proto(task_summary)),
             task_details_expired: Some(task_details_expired),
-        };
-        Ok(Builder::success(msg).proto_header(response).build())
+        })
     }
 
     fn cancel_transfer(&self, msg: &Message) -> FsResult<Message> {
@@ -163,7 +212,12 @@ where
             metrics.inc_report_batch_tasks(req.reports.len());
         }
         let accepted = self.service.report_tasks(req)?;
-        let response = TransferTaskReportBatchResponse { accepted };
+        // Piggyback the cached topology version so a worker only re-fetches the
+        // instance list when membership actually changed.
+        let response = TransferTaskReportBatchResponse {
+            accepted,
+            topology_version: Some(self.service.topology_version()),
+        };
         Ok(Builder::success(msg).proto_header(response).build())
     }
 }
@@ -173,6 +227,73 @@ where
     S: TransferStore,
 {
     type Error = FsError;
+
+    /// Status/watch move to the async path only when relaying is configured;
+    /// everything else keeps running on the blocking pool as before.
+    #[cfg(feature = "transfer-store-mysql")]
+    fn is_sync(&self, msg: &Message) -> bool {
+        if self.forwarder.is_none() {
+            return true;
+        }
+        !matches!(
+            RpcCode::from(msg.code()),
+            RpcCode::GetTransferStatus | RpcCode::WatchTransfer
+        )
+    }
+
+    #[cfg(feature = "transfer-store-mysql")]
+    async fn async_handle(&self, msg: Message) -> FsResult<Message> {
+        match RpcCode::from(msg.code()) {
+            RpcCode::GetTransferStatus => {
+                let mut req: GetTransferStatusRequest = msg.parse_header()?;
+                if !crate::transfer::is_forwarded(req.forwarded) {
+                    let relay = self
+                        .relay::<_, GetTransferStatusResponse>(
+                            &req.job_id,
+                            RpcCode::GetTransferStatus,
+                            GetTransferStatusRequest {
+                                forwarded: Some(true),
+                                ..req.clone()
+                            },
+                        )
+                        .await;
+                    if let Some(response) = relay {
+                        return Ok(Builder::success(&msg).proto_header(response).build());
+                    }
+                }
+                // Never relay twice, and never relay a request we already
+                // answered from our own view.
+                req.forwarded = Some(true);
+                let response = self.get_transfer_status_for(&req)?;
+                Ok(Builder::success(&msg).proto_header(response).build())
+            }
+            RpcCode::WatchTransfer => {
+                let mut req: WatchTransferRequest = msg.parse_header()?;
+                if !crate::transfer::is_forwarded(req.forwarded) {
+                    let relay = self
+                        .relay::<_, WatchTransferResponse>(
+                            &req.job_id,
+                            RpcCode::WatchTransfer,
+                            WatchTransferRequest {
+                                forwarded: Some(true),
+                                ..req.clone()
+                            },
+                        )
+                        .await;
+                    if let Some(response) = relay {
+                        return Ok(Builder::success(&msg).proto_header(response).build());
+                    }
+                }
+                req.forwarded = Some(true);
+                let response = self.watch_transfer_for(&req)?;
+                Ok(Builder::success(&msg).proto_header(response).build())
+            }
+            code => Err(FsError::common(format!(
+                "Unsupported async transfer rpc code {}",
+                code
+            ))),
+        }
+    }
 
     fn handle(&self, msg: &Message) -> FsResult<Message> {
         match RpcCode::from(msg.code()) {

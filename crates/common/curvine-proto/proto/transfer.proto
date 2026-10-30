@@ -100,6 +100,9 @@ message GetTransferStatusRequest {
   required string job_id = 1;
   optional uint32 page_size = 2;
   optional string page_token = 3;
+  // Set by an instance relaying to the job's owner. A forwarded request is
+  // always answered locally, which bounds relay depth to one hop.
+  optional bool forwarded = 4 [default = false];
 }
 
 message GetTransferStatusResponse {
@@ -175,6 +178,8 @@ message WatchTransferRequest {
   optional uint64 since_updated_at = 2;
   optional uint32 page_size = 3;
   optional string page_token = 4;
+  // See GetTransferStatusRequest.forwarded.
+  optional bool forwarded = 5 [default = false];
 }
 
 message WatchTransferResponse {
@@ -255,6 +260,10 @@ message TransferTaskReportBatchRequest {
 
 message TransferTaskReportBatchResponse {
   repeated bool accepted = 1;
+  // Responding instance's cached topology version. The worker compares it with
+  // its own and only re-fetches the instance list when it moved, so a steady
+  // state costs no topology queries at all. 0 = not advertised.
+  optional int64 topology_version = 2 [default = 0];
 }
 
 message QueryTransferTaskRequest {

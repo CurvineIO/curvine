@@ -44,6 +44,7 @@ fn scheduler_with_state(
         vec![],
         TransferConf::default(),
         runtime_config,
+        std::sync::Arc::new(crate::transfer::TaskCache::new()),
     )
 }
 
