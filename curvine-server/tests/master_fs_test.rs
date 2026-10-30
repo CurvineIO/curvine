@@ -472,8 +472,16 @@ fn with_js_handles_share_one_session_map() -> CommonResult<()> {
         mount_point: None,
         client_version: None,
     };
-    assert!(a.session_map.write().heartbeat(hb("via-a"), 0));
-    assert!(js.fs().session_map.write().heartbeat(hb("via-js"), 0));
+    let term = a.master_monitor.term();
+    assert!(a
+        .session_map
+        .write()
+        .heartbeat_in_epoch(hb("via-a"), term, 0));
+    assert!(js
+        .fs()
+        .session_map
+        .write()
+        .heartbeat_in_epoch(hb("via-js"), term, 0));
 
     let sessions = b.session_map.read();
     assert!(sessions.get("via-a").is_some(), "b must see a's session");

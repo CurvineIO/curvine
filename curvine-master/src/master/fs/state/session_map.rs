@@ -160,7 +160,11 @@ impl SessionMap {
 
     /// Register a new session or renew an existing one.
     /// Returns `true` when the heartbeat created a new session.
-    pub fn heartbeat(&mut self, hb: SessionHeartbeat, now: u64) -> bool {
+    ///
+    /// Crate-private on purpose: outside this crate the only way into the map is
+    /// [`SessionMap::heartbeat_in_epoch`], so no caller can register a session
+    /// into an epoch it did not adopt first.
+    pub(crate) fn heartbeat(&mut self, hb: SessionHeartbeat, now: u64) -> bool {
         let expire_at = now.saturating_add(self.session_timeout_ms);
         let client_id = hb.address.client_name.clone();
 
