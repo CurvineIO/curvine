@@ -540,7 +540,15 @@ impl NodeState {
         Ok(handle)
     }
 
-    async fn insert_handle_with_writer(
+    /// Test-only: register a shared writer without going through `new_handle`
+    /// (used by release-cleanup tests that inject a failing writer).
+    #[cfg(test)]
+    pub(crate) async fn insert_shared_writer_for_test(&self, ino: u64, writer: Arc<FuseWriter>) {
+        self.writers.insert::<FuseError>(ino, writer).await.unwrap();
+    }
+
+    /// Test-visible handle insertion; production callers go through `new_handle`.
+    pub(crate) async fn insert_handle_with_writer(
         &self,
         ino: u64,
         reader: Option<Arc<FuseReader>>,
@@ -2265,6 +2273,91 @@ mod test {
             assert!(state.find_handle(1, second_handle.fh()).is_err());
             assert!(!state.has_open_handles(1));
             assert!(state.find_writer(1).await.is_none());
+        });
+    }
+
+    /// Builds the issue-#1395 scenario: a root-level entry whose dcache inode
+    /// was removed entirely, so `get_path(ino)` fails with ENOENT.
+    /// Returns the file ino and a status snapshot with a resolvable path.
+    fn cached_then_forgotten_file(state: &NodeState, name: &str, id: i64) -> (u64, FileStatus) {
+        let mut status = FileStatus::with_name(id, name.to_string(), false);
+        status.path = format!("/{}", name);
+        let ino = {
+            let mut tree = state.dir_write();
+            let ino = tree
+                .lookup(FUSE_ROOT_ID, name, status.clone(), true)
+                .unwrap()
+                .ino;
+            // Simulate kernel FORGET; `clear()` then evicts the expired inode.
+            tree.forget(ino, 1).unwrap();
+            tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            ino
+        };
+        state.clear().unwrap();
+        assert!(state.get_path(ino).is_err(), "ancestor must be evicted");
+        (ino, status)
+    }
+
+    #[test]
+    fn release_without_dcache_path_still_releases_handle() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+            let (ino, status) = cached_then_forgotten_file(&state, "stale", 300);
+
+            let handle = state
+                .insert_handle_with_writer(ino, None, None, status)
+                .await;
+            assert!(state.has_open_handles(ino));
+
+            let path = state.get_path(ino);
+            assert!(path.is_err(), "precondition: dcache path unavailable");
+
+            let (handle, result) = state.release_handle(ino, handle.fh()).await.unwrap();
+            assert!(result.is_ok());
+            assert!(!state.has_open_handles(ino));
+            assert!(state.find_handle(ino, handle.fh()).is_err());
+        });
+    }
+
+    #[test]
+    fn release_without_dcache_path_completes_writer() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+            let (ino, status) = cached_then_forgotten_file(&state, "stalew", 301);
+
+            let full_path = Path::from_str("/dev/null").unwrap();
+            let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+            let fuse_writer = Arc::new(FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
+            ));
+            state
+                .writers
+                .insert::<FuseError>(ino, fuse_writer.clone())
+                .await
+                .unwrap();
+            let handle = state
+                .insert_handle_with_writer(ino, None, Some(fuse_writer.clone()), status)
+                .await;
+            fuse_writer
+                .write(0, Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+
+            assert!(handle.has_writer());
+            let (handle, result) = state.release_handle(ino, handle.fh()).await.unwrap();
+            assert!(result.is_ok(), "writer complete must succeed: {:?}", result);
+            assert!(!state.has_open_handles(ino));
+            assert!(state.find_writer(ino).await.is_none());
+            assert!(state.find_handle(ino, handle.fh()).is_err());
         });
     }
 }

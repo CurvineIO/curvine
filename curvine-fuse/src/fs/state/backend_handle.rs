@@ -227,6 +227,23 @@ impl BackendHandle {
         self.status.read().unwrap().clone()
     }
 
+    /// Best-effort backend path recorded at open time.
+    ///
+    /// Returns the status snapshot's path; when it is empty or unparseable,
+    /// falls back to the backend writer's path (write handles always know
+    /// where they were opened). Never fails: an unusable snapshot degrades
+    /// to the writer path so close-time cleanup stays addressable (#1395).
+    pub fn open_path(&self) -> String {
+        let status_path = self.status.read().unwrap().path.clone();
+        if !status_path.is_empty() && Path::from_str(&status_path).is_ok() {
+            return status_path;
+        }
+        if let Some(writer) = &self.writer {
+            return writer.path().full_path().to_owned();
+        }
+        status_path
+    }
+
     /// Replace the open-time status snapshot after a dirty-read reopen.
     fn refresh_status(&self, status: FileStatus) {
         *self.status.write().unwrap() = status;

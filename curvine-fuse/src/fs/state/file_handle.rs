@@ -58,6 +58,17 @@ impl FileHandle {
         }
     }
 
+    /// Best-effort backend path recorded at open time.
+    ///
+    /// The dcache may have dropped the inode's ancestors by RELEASE time
+    /// (unlink, TTL eviction); this snapshot keeps the master-side object
+    /// reachable for close-time cleanup (#1395).
+    pub fn open_path(&self) -> String {
+        match self {
+            FileHandle::Backend(h) => h.open_path(),
+        }
+    }
+
     /// True when this handle can satisfy write-related side effects (backend writer).
     pub fn has_writer(&self) -> bool {
         match self {

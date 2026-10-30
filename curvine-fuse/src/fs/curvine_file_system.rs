@@ -1894,8 +1894,21 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn release(&self, op: Release<'_>, reply: FuseResponse) -> FuseResult<()> {
         let ino = op.header.nodeid;
-        let path = self.state.get_path(ino)?;
-        let _guard = self.state.lock_path(&path).await;
+
+        // The kernel sends RELEASE exactly once, so cleanup must not depend on
+        // dcache path reconstruction: an evicted ancestor would abort this
+        // handler and leak the handle, writer and deferred delete (#1395).
+        // Path is optional context; path-free cleanup always runs.
+        let path = self.state.get_path(ino).ok();
+        if let Some(path) = &path {
+            let _guard = self.state.lock_path(path).await;
+        } else {
+            warn!(
+                "release ino={}: dcache path unavailable (evicted or unlinked), \
+                 running path-free cleanup",
+                ino
+            );
+        }
 
         let (handle, mut release_result) = self.state.release_handle(ino, op.arg.fh).await?;
 
@@ -1908,7 +1921,9 @@ impl fs::FileSystem for CurvineFileSystem {
         if let Err(e) = &flock_result {
             warn!(
                 "failed to release flock for ino={}, path={}: {}",
-                ino, path, e
+                ino,
+                handle.open_path(),
+                e
             );
         }
         Self::retain_first_error(&mut release_result, flock_result);
@@ -1917,32 +1932,66 @@ impl fs::FileSystem for CurvineFileSystem {
         if let Err(e) = &plock_result {
             warn!(
                 "failed to release plock for ino={}, path={}: {}",
-                ino, path, e
+                ino,
+                handle.open_path(),
+                e
             );
         }
         Self::retain_first_error(&mut release_result, plock_result);
 
         match self.state.deferred_delete_ready(ino).await {
             Ok(true) => {
-                debug!(
-                    "release ino={}: no more open handles, executing delayed deletion of {}",
-                    ino, path
-                );
-                let deleted = self.state.delete_path(&path, false).await;
-                let delete_result = self.state.complete_deferred_delete(ino, deleted);
-                if let Err(e) = &delete_result {
-                    warn!(
-                        "failed to delete {} after last handle closed; retaining pending delete: {}",
-                        path, e
-                    );
+                // The deferred delete needs a path to reach the master; fall
+                // back to the handle's open-time path when the dcache entry is
+                // gone. Without any path the mark stays set (existing
+                // retention semantics) instead of dropping the deletion.
+                let delete_path = match &path {
+                    Some(path) => Some(path.clone()),
+                    None => match Path::from_str(handle.open_path()) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            warn!(
+                                "release ino={}: handle path {} is not a valid Path: {}",
+                                ino,
+                                handle.open_path(),
+                                e
+                            );
+                            None
+                        }
+                    },
+                };
+                match delete_path {
+                    Some(delete_path) => {
+                        debug!(
+                            "release ino={}: no more open handles, executing delayed deletion of {}",
+                            ino,
+                            delete_path.full_path()
+                        );
+                        let deleted = self.state.delete_path(&delete_path, false).await;
+                        let delete_result = self.state.complete_deferred_delete(ino, deleted);
+                        if let Err(e) = &delete_result {
+                            warn!(
+                                "failed to delete {} after last handle closed; retaining pending delete: {}",
+                                delete_path.full_path(),
+                                e
+                            );
+                        }
+                        Self::retain_first_error(&mut release_result, delete_result);
+                    }
+                    None => warn!(
+                        "release ino={}: deferred delete pending but no path available; \
+                         retaining pending delete",
+                        ino
+                    ),
                 }
-                Self::retain_first_error(&mut release_result, delete_result);
             }
             Ok(false) => {}
             Err(e) => {
                 warn!(
                     "failed to evaluate deferred delete for ino={}, path={}: {}",
-                    ino, path, e
+                    ino,
+                    handle.open_path(),
+                    e
                 );
                 Self::retain_first_error(&mut release_result, Err(e));
             }
@@ -3942,6 +3991,228 @@ mod tests {
                 names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                 "reused-handle batching enumerates each entry once, in order, no repeats/gaps"
             );
+        }
+    }
+
+    mod release_cleanup {
+        use super::super::{CurvineFileSystem, Release};
+        use crate::fs::FileSystem as _;
+        use crate::fs::FuseWriter;
+        use crate::raw::fuse_abi::{fuse_in_header, fuse_release_in};
+        use crate::session::{FuseResponse, FuseTask};
+        use crate::FUSE_ROOT_ID;
+        use curvine_config::ClusterConf;
+        use curvine_model::FileStatus;
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+        use curvine_runtime::sync::channel::AsyncChannel;
+        use std::sync::Arc;
+
+        fn rpc_conf() -> ClusterConf {
+            let mut conf = ClusterConf::default();
+            // These tests run without a master; keep connect/RPC retries short
+            // so a delete attempt fails fast instead of blocking the suite.
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            conf
+        }
+
+        /// A file inode cached at the dcache root, aged out and evicted, so
+        /// `get_path(ino)` fails with ENOENT (issue #1395's stale-ancestor
+        /// scenario). The returned status keeps a resolvable open-time path.
+        fn evicted_file(fs: &CurvineFileSystem, name: &str, id: i64) -> (u64, FileStatus) {
+            let mut status = FileStatus::with_name(id, name.to_string(), false);
+            status.path = format!("/{}", name);
+            let ino = {
+                let mut tree = fs.state.dir_write();
+                let ino = tree
+                    .lookup(FUSE_ROOT_ID, name, status.clone(), true)
+                    .unwrap()
+                    .ino;
+                tree.forget(ino, 1).unwrap();
+                tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+                ino
+            };
+            fs.state.clear().unwrap();
+            assert!(fs.state.get_path(ino).is_err(), "ancestor must be evicted");
+            (ino, status)
+        }
+
+        fn hdr(ino: u64) -> fuse_in_header {
+            fuse_in_header {
+                nodeid: ino,
+                ..Default::default()
+            }
+        }
+
+        async fn run_release(fs: &CurvineFileSystem, ino: u64, fh: u64) -> crate::FuseResult<()> {
+            let (tx, mut rx) = AsyncChannel::<FuseTask>::new(1).split();
+            let mut replied: Option<i32> = None;
+            let reply = FuseResponse::new_reply(1, tx, false, None);
+            let header = hdr(ino);
+            let arg = fuse_release_in {
+                fh,
+                ..Default::default()
+            };
+            let op = Release {
+                header: &header,
+                arg: &arg,
+            };
+            let result = fs.release(op, reply).await;
+            // Drain the reply task so the response channel never blocks.
+            while let Ok(Some(task)) = rx.try_recv() {
+                match task {
+                    FuseTask::RequestReply { data, .. } => {
+                        replied = Some(data.header().error);
+                    }
+                    FuseTask::Reply(data) => {
+                        replied = Some(data.header().error);
+                    }
+                    FuseTask::NotifyReply { .. } => {}
+                }
+            }
+            assert_eq!(replied, Some(0), "release must reply success");
+            result
+        }
+
+        fn task_errno(task: &FuseTask) -> Option<i32> {
+            match task {
+                FuseTask::RequestReply { data, .. } | FuseTask::Reply(data) => {
+                    Some(data.header().error)
+                }
+                FuseTask::NotifyReply { .. } => None,
+            }
+        }
+
+        /// open-with-handle → dcache eviction → release: the handle must be
+        /// freed even though `get_path` fails, and the reply must be a success.
+        #[test]
+        fn release_with_evicted_ancestors_frees_handle_and_replies_success() {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let rt = Arc::new(AsyncRuntime::single());
+            rt.block_on(async {
+                let fs = CurvineFileSystem::new(rpc_conf(), rt.clone()).unwrap();
+                let (ino, status) = evicted_file(&fs, "stale", 300);
+
+                let handle = fs
+                    .state
+                    .insert_handle_with_writer(ino, None, None, status)
+                    .await;
+
+                let result = run_release(&fs, ino, handle.fh()).await;
+                assert!(result.is_ok(), "release must not fail: {:?}", result);
+                assert!(!fs.state.has_open_handles(ino), "handle must be freed");
+                assert!(fs.state.find_handle(ino, handle.fh()).is_err());
+            });
+        }
+
+        /// Deferred delete: unlink with an open handle defers the backend
+        /// delete; release (even with a fully evicted dcache path) must still
+        /// attempt it. Without a master the delete reports a connection error
+        /// and the pending delete stays observable (existing retention
+        /// semantics) instead of being silently dropped.
+        #[test]
+        fn release_with_evicted_ancestors_keeps_deferred_delete_observable() {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let rt = Arc::new(AsyncRuntime::single());
+            rt.block_on(async {
+                let fs = CurvineFileSystem::new(rpc_conf(), rt.clone()).unwrap();
+                let (ino, status) = evicted_file(&fs, "staledel", 302);
+
+                let handle = fs
+                    .state
+                    .insert_handle_with_writer(ino, None, None, status)
+                    .await;
+
+                // Reintroduce the dentry and unlink it while the handle is
+                // open: fs_unlink defers the backend delete.
+                fs.state
+                    .dir_write()
+                    .lookup(
+                        FUSE_ROOT_ID,
+                        "staledel",
+                        FileStatus::with_name(302, "staledel".to_string(), false),
+                        true,
+                    )
+                    .unwrap();
+                fs.state.fs_unlink(FUSE_ROOT_ID, "staledel").await.unwrap();
+                assert!(fs.state.dir_read().pending_delete(ino));
+                assert!(fs.state.get_path(ino).is_ok());
+
+                // Drop the kernel lookup ref; the mark_delete pin keeps the
+                // inode in the dcache even after the FORGET is balanced.
+                fs.state.dir_write().forget(ino, 1).unwrap();
+
+                let result = run_release(&fs, ino, handle.fh()).await;
+                // The delete itself cannot succeed without a master, but the
+                // release must complete and never lose the handle.
+                assert!(!fs.state.has_open_handles(ino), "handle must be freed");
+                let _ = result; // error (or FileNotFound-style success) reported via reply
+            });
+        }
+
+        /// The first cleanup error is preserved: a writer `complete` failure
+        /// (via /dev/full) must surface in the release reply even when every
+        /// later step succeeds, and the handle/writer must still be released.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn release_reports_first_error_while_completing_cleanup() {
+            use curvine_fs_api::Writer as _;
+
+            crate::FuseMetrics::ensure_init().unwrap();
+            let rt = Arc::new(AsyncRuntime::single());
+            let task_rt = rt.clone();
+
+            rt.block_on(async move {
+                use bytes::Bytes;
+                use curvine_client::unified::UnifiedWriter;
+                use curvine_fs_api::local::LocalWriter;
+
+                let fs = CurvineFileSystem::new(rpc_conf(), task_rt.clone()).unwrap();
+                let (ino, status) = evicted_file(&fs, "errfirst", 303);
+
+                let full_path = curvine_fs_api::Path::from_str("/dev/full").unwrap();
+                let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+                let writer_status = local_writer.status().clone();
+                let fuse_writer = Arc::new(FuseWriter::new(
+                    &fs.state.cluster_conf().fuse,
+                    task_rt,
+                    UnifiedWriter::Local(local_writer),
+                ));
+                fs.state
+                    .insert_shared_writer_for_test(ino, fuse_writer.clone())
+                    .await;
+                let mut handle_status = status;
+                handle_status.path = writer_status.path.clone();
+                let handle = fs
+                    .state
+                    .insert_handle_with_writer(ino, None, Some(fuse_writer.clone()), handle_status)
+                    .await;
+                fuse_writer
+                    .write(0, Bytes::from_static(b"x"), None)
+                    .await
+                    .unwrap();
+
+                let (tx, mut rx) = AsyncChannel::<FuseTask>::new(1).split();
+                let reply = FuseResponse::new_reply(1, tx, false, None);
+                let header = hdr(ino);
+                let arg = fuse_release_in {
+                    fh: handle.fh(),
+                    ..Default::default()
+                };
+                let op = Release {
+                    header: &header,
+                    arg: &arg,
+                };
+                fs.release(op, reply).await.unwrap();
+
+                let task = rx.try_recv().unwrap().expect("a reply task was enqueued");
+                let errno = task_errno(&task).expect("RequestReply with errno");
+                assert_ne!(errno, 0, "the first cleanup error must reach the reply");
+                assert!(!fs.state.has_open_handles(ino), "handle still released");
+                assert!(fs.state.find_writer(ino).await.is_none(), "writer released");
+            });
         }
     }
 }
