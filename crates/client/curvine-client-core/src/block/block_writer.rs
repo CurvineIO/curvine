@@ -83,10 +83,15 @@ where
     finish_all_cancellations(futures).await
 }
 
-// Opens one replica at a time. If a later replica fails to open, the
-// adapters already opened in this round are cancelled best-effort and the
-// original open error is returned. `open` is injectable for tests.
-async fn open_all<T, F, Fut>(num_replicas: usize, mut open: F) -> FsResult<Vec<T>>
+// Opens one replica at a time. If a later replica fails to open and
+// `cancel_on_failure` is set, the adapters already opened in this round are
+// cancelled best-effort and the original open error is returned. `open` is
+// injectable for tests.
+async fn open_all<T, F, Fut>(
+    num_replicas: usize,
+    cancel_on_failure: bool,
+    mut open: F,
+) -> FsResult<Vec<T>>
 where
     F: FnMut(usize) -> Fut,
     Fut: std::future::Future<Output = FsResult<T>>,
@@ -101,12 +106,14 @@ where
                 // in this round so worker-side write state is reclaimed.
                 // Cancellation errors are logged only; the original open
                 // error remains the primary error returned to the caller.
-                if let Err(cancel_err) = cancel_opened(&mut inners).await {
-                    warn!(
-                        "failed to cancel {} replicas opened before open failure: {}",
-                        inners.len(),
-                        cancel_err
-                    );
+                if cancel_on_failure {
+                    if let Err(cancel_err) = cancel_opened(&mut inners).await {
+                        warn!(
+                            "failed to cancel {} replicas opened before open failure: {}",
+                            inners.len(),
+                            cancel_err
+                        );
+                    }
                 }
                 return Err(e);
             }
@@ -273,7 +280,17 @@ impl BlockWriter {
             return err_box!("There is no available worker");
         }
 
-        let inners = open_all(locate.locs.len(), |idx| {
+        // Reopening a committed block (the master reports len > 0, or the
+        // write offset is non-zero): a cancel commit would abort the already
+        // committed replicas on the workers. SPDK rewrites reuse the extent
+        // without preserving the committed state (BdevLayout::prepare_write),
+        // so aborting such a rewrite would free an extent the master still
+        // references. Skip rollback cancellation for those and keep the
+        // pre-existing drop-only behavior; newly allocated blocks (len == 0
+        // and pos == 0) are still cancelled best-effort.
+        let committed_reopen = locate.block.len > 0 || pos > 0;
+
+        let inners = open_all(locate.locs.len(), !committed_reopen, |idx| {
             WriterAdapter::new(
                 fs_context.clone(),
                 &locate,
@@ -414,7 +431,7 @@ impl BlockWriter {
 mod tests {
     use super::{cancel_opened, finish_all_cancellations, open_all, OpenedAdapter};
     use curvine_error::{FsError, FsResult};
-    use curvine_model::WorkerAddress;
+    use curvine_model::{ExtendedBlock, FileType, LocatedBlock, StorageType, WorkerAddress};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -483,7 +500,7 @@ mod tests {
         // error of replica 1 must be returned.
         let script = vec![(false, false), (true, false)]; // (fail_open, fail_cancel)
 
-        let err = open_all(2, |idx| {
+        let err = open_all(2, true, |idx| {
             let script = script.clone();
             let calls = calls.clone();
             async move {
@@ -517,7 +534,7 @@ mod tests {
         // open. The caller must still get the original open error of replica 1.
         let script = vec![(false, true), (true, false)];
 
-        let err = open_all(2, |idx| {
+        let err = open_all(2, true, |idx| {
             let script = script.clone();
             let calls = calls.clone();
             async move {
@@ -548,7 +565,7 @@ mod tests {
     async fn successful_open_never_cancels_any_adapter() {
         let calls = Arc::new(AtomicUsize::new(0));
 
-        let inners = open_all(3, |idx| {
+        let inners = open_all(3, true, |idx| {
             let calls = calls.clone();
             async move { Ok(ScriptedWriter::new(calls, false, idx as u32)) }
         })
@@ -579,6 +596,40 @@ mod tests {
             calls.load(Ordering::SeqCst),
             3,
             "one failing cancel must not prevent the remaining cancellations"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_reopen_failure_does_not_cancel_opened_replicas() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Reopening a committed block (len > 0): rollback must not cancel the
+        // replicas opened in this round, otherwise an already committed
+        // replica would be aborted on the workers (see the Copilot review on
+        // PR #1918).
+        let block = ExtendedBlock::new(1, 64, StorageType::Ssd, FileType::File);
+        let block = ExtendedBlock { len: 64, ..block };
+        let lb = LocatedBlock::new(block, vec![]);
+        assert_eq!(lb.block.len, 64);
+
+        // Drive open_all with cancel_on_failure = false directly: the
+        // BlockWriter::new gate maps committed reopens to this flag.
+        let err = open_all(2, false, |idx| {
+            let calls = calls.clone();
+            async move {
+                if idx == 1 {
+                    Err(FsError::common("injected open failure"))
+                } else {
+                    Ok(ScriptedWriter::new(calls, false, idx as u32))
+                }
+            }
+        })
+        .await;
+
+        assert!(err.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "committed reopen must not cancel opened replicas"
         );
     }
 }

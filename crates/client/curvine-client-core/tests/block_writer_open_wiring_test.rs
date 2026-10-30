@@ -127,8 +127,58 @@ fn create_test_context() -> Arc<FsContext> {
 }
 
 fn located_block(second_addr: WorkerAddress) -> LocatedBlock {
-    let block = ExtendedBlock::new(1, 64, StorageType::Ssd, FileType::File);
+    // len = 0: a freshly allocated block, exactly what the new-block path of
+    // `FsWriterBase::get_writer` hands to `BlockWriter::new`. Only this case
+    // must roll back with cancel commits on partial open failure.
+    let block = ExtendedBlock::new(1, 0, StorageType::Ssd, FileType::File);
     LocatedBlock::new(block, vec![TEST_SERVER.0.clone(), second_addr])
+}
+
+#[tokio::test]
+async fn committed_reopen_failure_does_not_cancel_opened_replicas() {
+    let context = create_test_context();
+
+    let mut ready = false;
+    for _ in 0..50 {
+        if context.block_client(&TEST_SERVER.0).await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "test server failed to start within 5 seconds");
+
+    // A committed reopen (len > 0, e.g. append/overwrite through
+    // `FsWriterBase::get_writer`) must NOT cancel the replicas opened before
+    // a later failure: the first replica may already hold committed data and
+    // a cancel commit would abort it on the worker (Copilot review on
+    // PR #1918).
+    let committed = ExtendedBlock::new(1, 64, StorageType::Ssd, FileType::File);
+    let unreachable = WorkerAddress {
+        worker_id: 2,
+        hostname: "127.0.0.1".to_string(),
+        ip_addr: "127.0.0.1".to_string(),
+        rpc_port: 1,
+        web_port: 1,
+    };
+    let lb = LocatedBlock::new(committed, vec![TEST_SERVER.0.clone(), unreachable]);
+
+    let result = BlockWriter::new(context, lb, 0, 64).await;
+    assert!(
+        result.is_err(),
+        "second replica open must fail for a committed reopen too"
+    );
+
+    let observed = OBSERVED_REQUESTS.lock().unwrap().clone();
+    let cancels = observed
+        .iter()
+        .filter(|(_, status)| *status == RequestStatus::Cancel)
+        .count();
+    assert_eq!(
+        cancels, 0,
+        "committed reopen must not send cancel commits, observed: {:?}",
+        observed
+    );
 }
 
 #[tokio::test]
