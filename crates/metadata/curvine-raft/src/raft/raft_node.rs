@@ -48,6 +48,7 @@ struct ProposeApply {
 struct PendingReady {
     ready: Ready,
     soft_state: Option<SoftState>,
+    demoted: bool,
 }
 
 type PendingPromises = HashMap<i64, Callback>;
@@ -390,8 +391,9 @@ where
             .pending_ready
             .take()
             .ok_or_else(|| RaftError::other("snapshot completed without a pending Ready".into()))?;
-        self.finish_ready(pending.ready, pending.soft_state, promise)
-            .await
+        self.finish_ready(pending.ready, pending.soft_state, promise, pending.demoted)
+            .await?;
+        Ok(())
     }
 
     fn handle_available(&mut self, env: Envelope, promise: &mut PendingPromises) -> RaftResult<()> {
@@ -624,15 +626,24 @@ where
         });
 
         if *ready.snapshot() != Snapshot::default() {
+            let demoted =
+                !self.recovery.active && self.role_monitor.is_leader() && !self.is_leader();
+            if demoted {
+                self.role_monitor.step_down();
+            }
             let snapshot_done = self
                 .storage
                 .gen_apply_snapshot_job(ready.snapshot().clone())?;
-            self.pending_ready = Some(PendingReady { ready, soft_state });
+            self.pending_ready = Some(PendingReady {
+                ready,
+                soft_state,
+                demoted,
+            });
             self.snapshot_done = Some(snapshot_done);
             return Ok(());
         }
 
-        self.finish_ready(ready, soft_state, promise).await
+        self.finish_ready(ready, soft_state, promise, false).await
     }
 
     async fn finish_ready(
@@ -640,7 +651,13 @@ where
         mut ready: Ready,
         soft_state: Option<SoftState>,
         promise: &mut PendingPromises,
+        demoted: bool,
     ) -> RaftResult<()> {
+        let to_follower = (demoted || self.role_monitor.is_leader()) && !self.is_leader();
+        if to_follower && !self.recovery.active {
+            self.role_monitor.step_down();
+        }
+
         // Persist entries before the HardState that may commit them. A crash may
         // leave extra uncommitted entries, but must never leave commit past tail.
         if !ready.entries().is_empty() {
@@ -692,7 +709,6 @@ where
             );
 
             self.storage.role_change(ss.raft_state).await?;
-            let to_follower = self.role_monitor.is_leader() && !self.is_leader();
             if to_follower {
                 Self::fail_pending_promises(promise, "raft leader stepped down");
                 Self::install_snapshot(&self.storage, self.group.voters()).await?;
