@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::file_gen::FileGen;
 use curvine_error::{FsError, FsResult};
 use curvine_runtime::common::Utils;
 use num_enum::{FromPrimitive, IntoPrimitive};
@@ -19,10 +20,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const TRANSFER_TEMP_PATH_MARKER: &str = ".curvine-transfer-tmp-";
-
-pub fn is_transfer_temp_path(path: &str) -> bool {
-    path.contains(TRANSFER_TEMP_PATH_MARKER)
-}
 
 #[derive(
     Clone,
@@ -153,11 +150,54 @@ pub struct TransferCommand {
     pub submitter: String,
     pub tenant: String,
     pub options: BTreeMap<String, String>,
+    /// fs_mode export batch: one job carrying several independent single-file
+    /// exports. Each entry is planned as its own task so a stale entry fails
+    /// alone instead of taking the whole job down.
+    ///
+    /// `serde(default)` keeps older `command_json` payloads readable.
+    #[serde(default)]
+    pub fs_mode_files: Vec<FsModeFile>,
+}
+
+/// One file inside an fs_mode export batch.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsModeFile {
+    /// Path the export reads from, in Curvine.
+    pub source: String,
+    /// Path the object is written to, in UFS.
+    pub target: String,
+    /// Version the submitter read when it enqueued the export. The planner and
+    /// the worker both re-check it, so an object always holds the version the
+    /// submitter claimed.
+    pub gen: FileGen,
 }
 
 impl TransferCommand {
     pub const OVERWRITE_OPTION: &'static str = "overwrite";
     pub const REPLICAS_OPTION: &'static str = "replicas";
+    /// Upper bound on files in one fs_mode export batch. Keeps `command_json`
+    /// and the submit RPC bounded.
+    pub const FS_MODE_BATCH_MAX_FILES: usize = 256;
+    /// Submitter prefix reserved for fs_mode exports. Only commands carrying
+    /// `fs_mode_files` may use it (enforced at submit).
+    pub const FS_MODE_SUBMITTER_PREFIX: &'static str = "fs-mode:";
+
+    /// Submitter used by a cluster's fs_mode exports.
+    pub fn fs_mode_submitter(cluster_id: &str) -> String {
+        format!("{}{}", Self::FS_MODE_SUBMITTER_PREFIX, cluster_id)
+    }
+
+    /// True when this command carries an fs_mode export batch.
+    pub fn is_fs_mode_batch(&self) -> bool {
+        !self.fs_mode_files.is_empty()
+    }
+
+    /// fs_mode jobs are exempt from target-overlap scheduling: every entry is an
+    /// independent single-file copy guarded by its generation, so ordering does
+    /// not depend on scheduler serialization.
+    pub fn is_fs_mode_submitter(submitter: &str) -> bool {
+        submitter.starts_with(Self::FS_MODE_SUBMITTER_PREFIX)
+    }
 
     pub fn job_key(&self) -> String {
         format!("{:?}:{}:{}", self.kind, self.source_path, self.target_path)

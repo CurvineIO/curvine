@@ -25,9 +25,10 @@ use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FreeResult, LeaderSnapshotInfo, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts,
-    TrashEntry, TtlAction, TtlType, WorkerAddress, INTERNAL_CTIME_XATTR, INTERNAL_TTL_TYPE_XATTR,
+    BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileGen, FileLock,
+    FileStatus, FreeResult, LeaderSnapshotInfo, ListOptions, MkdirOpts, MountInfo, RenameFlags,
+    SetAttrOpts, StorageState, TrashEntry, TtlAction, TtlType, WorkerAddress, INTERNAL_CTIME_XATTR,
+    INTERNAL_TTL_TYPE_XATTR,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::AtomicCounter;
@@ -1163,6 +1164,52 @@ impl FsDir {
         Ok(free_res)
     }
 
+    /// Release one fs_mode file whose UFS object was verified out of lock.
+    ///
+    /// Re-resolves the inode by id and releases it only if it still carries the
+    /// verified version, is still `Both` and still records `ufs_mtime`, so a
+    /// rewrite, a newer mark or a rename onto the path between verification and
+    /// release cannot release an unverified file. Logs a non-recursive `Free`,
+    /// so followers release exactly this file. `None` when nothing was released.
+    pub fn free_verified(
+        &mut self,
+        inode_id: i64,
+        expected_path: &str,
+        gen: FileGen,
+        ufs_mtime: i64,
+    ) -> FsResult<Option<FreeResult>> {
+        let path = match self.get_inode_path(inode_id) {
+            Ok(path) => path,
+            Err(FsError::FileNotFound(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        if path != expected_path {
+            return Ok(None);
+        }
+        let inp = InodePath::resolve(self.root_ptr(), &path, &self.store)?;
+        let Some(inode) = inp.get_last_inode() else {
+            return Ok(None);
+        };
+        let still_verified = match inode.as_ref() {
+            File(f) => {
+                f.id == inode_id
+                    && f.gen() == gen
+                    && f.storage_policy.state == StorageState::Both
+                    && f.storage_policy.ufs_mtime == ufs_mtime
+            }
+            _ => false,
+        };
+        if !still_verified {
+            return Ok(None);
+        }
+
+        let op_ms = LocalTime::mills() as i64;
+        let free_res = self.unprotected_free(inode, op_ms, false)?;
+        self.journal_writer
+            .log_free(self, inp.path(), op_ms, false)?;
+        Ok(Some(free_res))
+    }
+
     pub(crate) fn unprotected_free(
         &mut self,
         inode: InodePtr,
@@ -2142,9 +2189,52 @@ impl FsDir {
         // The TTL-type marker is likewise master-owned (create/mount path); user
         // SetAttr requests must not flip a file between atime and mtime TTL.
         Self::normalize_internal_x_attrs(&mut opts);
+
+        // Conditional UFS mark: an fs_mode export names the version it copied,
+        // and the mark only lands while the inode still carries it. A miss is a
+        // safe no-op (the file stays `Cv`, Free reconciliation re-exports it).
+        // `take()` keeps the guard out of the journal so replay is unconditional.
+        // Reports without a guard keep the original behaviour.
+        if let Some(expected) = opts.expect_gen.take() {
+            if opts.ufs_mtime.is_some() && !Self::ufs_mark_applicable(inode.as_ref(), expected) {
+                return Ok(inode.to_file_status(inp.path())?);
+            }
+        }
+
         self.unprotected_set_attr(inode.clone(), opts.clone())?;
         self.journal_writer.log_set_attr(self, &inp, opts)?;
         Ok(inode.to_file_status(inp.path())?)
+    }
+
+    /// Whether `inode` may still claim that `expected` is the version sitting on
+    /// UFS. Failing any condition means the export raced with a newer version, a
+    /// delete, or a free: marking `Both` then would let TTL Free drop Curvine
+    /// data that UFS does not actually hold.
+    fn ufs_mark_applicable(inode: &InodeView, expected: FileGen) -> bool {
+        Self::ufs_mark_candidate(inode).is_some_and(|file| file.gen() == expected)
+    }
+
+    /// Only a complete, quiescent file that still owns a Curvine copy may
+    /// receive a UFS mark.
+    fn ufs_mark_candidate(inode: &InodeView) -> Option<&InodeFile> {
+        let File(file) = inode else {
+            return None;
+        };
+
+        if !file.is_complete() || file.is_writing() {
+            return None;
+        }
+
+        // `Ufs` means the Curvine copy was already released: `save_ufs` would
+        // flip it back to `Both` with no data behind the claim.
+        if !matches!(
+            file.storage_policy.state,
+            StorageState::Cv | StorageState::Both
+        ) {
+            return None;
+        }
+
+        Some(file)
     }
 
     /// Master-owned xattrs (ctime, trash markers) are never client-writable.

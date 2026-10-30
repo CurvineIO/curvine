@@ -390,6 +390,23 @@ macro_rules! impl_filesystem_for_enum {
                 }
             }
 
+            async fn create_with_metadata(
+                &self,
+                path: &::curvine_fs_api::Path,
+                overwrite: bool,
+                metadata: &::std::collections::HashMap<String, String>,
+            ) -> ::curvine_error::FsResult<$crate::UnifiedWriter> {
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => {
+                            let writer = inner.create_with_metadata(path, overwrite, metadata).await?;
+                            Ok($crate::UnifiedWriter::$variant(writer))
+                        }
+                    )+
+                }
+            }
+
             async fn append(
                 &self,
                 path: &::curvine_fs_api::Path,

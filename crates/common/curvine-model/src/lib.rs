@@ -105,6 +105,9 @@ pub use self::posix_permission::*;
 mod opts;
 pub use self::opts::*;
 
+mod file_gen;
+pub use self::file_gen::{FileGen, CV_GEN_METADATA_KEY};
+
 mod job;
 pub use self::job::*;
 

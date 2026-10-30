@@ -19,6 +19,7 @@ use crate::utils::ProtoUtils;
 use crate::FsResult;
 use curvine_core_error::err_box;
 use prost::bytes::BytesMut;
+use std::collections::HashMap;
 use std::future::Future;
 
 pub trait FileSystem<Writer, Reader> {
@@ -27,6 +28,21 @@ pub trait FileSystem<Writer, Reader> {
     fn mkdir(&self, path: &Path, create_parent: bool) -> impl Future<Output = FsResult<bool>>;
 
     fn create(&self, path: &Path, overwrite: bool) -> impl Future<Output = FsResult<Writer>>;
+
+    /// Create with object-storage user metadata attached to the object.
+    ///
+    /// Backends without user metadata ignore `metadata` and behave exactly like
+    /// [`Self::create`]. Callers must therefore treat the metadata as best
+    /// effort and keep an independent verification path for those backends.
+    fn create_with_metadata(
+        &self,
+        path: &Path,
+        overwrite: bool,
+        metadata: &HashMap<String, String>,
+    ) -> impl Future<Output = FsResult<Writer>> {
+        let _ = metadata;
+        self.create(path, overwrite)
+    }
 
     fn append(&self, path: &Path) -> impl Future<Output = FsResult<Writer>>;
 

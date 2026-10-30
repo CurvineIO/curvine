@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use crate::cmds::fs::{
     blocks::BlocksCommand, cat::CatCommand, chmod::ChmodCommand, chown::ChownCommand,
     count::CountCommand, df::DfCommand, du::DuCommand, free::FreeCommand, get::GetCommand,
-    ls::LsCommand, mkdir::MkdirCommand, mv::MvCommand, put::PutCommand, rm::RmCommand,
-    stat::StatCommand, touch::TouchCommand, trash::TrashCommand,
+    ls::LsCommand, mkdir::MkdirCommand, mv::MvCommand, put::PutCommand,
+    reconcile::ReconcileCommand, rm::RmCommand, stat::StatCommand, touch::TouchCommand,
+    trash::TrashCommand,
 };
 
 #[derive(Parser, Debug)]
@@ -241,6 +242,14 @@ pub enum FsSubCommand {
         #[clap(short, long, help = "Recursively free all files under the directory")]
         recursive: bool,
     },
+
+    /// Enqueue CV->UFS exports for fs_mode files that were never exported.
+    ///
+    /// Only enqueues; it never releases Curvine data and never waits for a copy.
+    Reconcile {
+        #[clap(help = "Root of the subtree to reconcile")]
+        path: String,
+    },
 }
 
 impl FsCommand {
@@ -418,6 +427,11 @@ impl FsCommand {
                     recursive: *recursive,
                 };
                 free_cmd.execute(client).await
+            }
+
+            FsSubCommand::Reconcile { path } => {
+                let cmd = ReconcileCommand { path: path.clone() };
+                cmd.execute(client).await
             }
         }
     }

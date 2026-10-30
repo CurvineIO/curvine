@@ -15,16 +15,17 @@
 use crate::master::journal::{
     CompleteFileEntry, DeleteEntry, JournalEntry, MkdirEntry, RenameEntry,
 };
-use crate::master::{JobManager, SyncFsDir};
+use crate::master::meta::inode::InodeView;
+use crate::master::{FsModeExport, JobManager, SyncFsDir};
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
-use curvine_model::{JobSourceType, JobTaskState, LoadJobCommand};
+use curvine_model::{JobSourceType, JobTaskState, LoadJobCommand, StorageState};
 use curvine_runtime::common::DurationUnit;
-use curvine_unified_fs::MountValue;
-use log::{info, warn};
+use curvine_unified_fs::{MountValue, UfsFileSystem};
+use log::{debug, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -179,7 +180,85 @@ impl UfsLoader {
         }
     }
 
+    /// True when exports go through the Transfer service: the replayer then
+    /// only submits and never waits for a copy.
+    pub fn transfer_enabled(&self) -> bool {
+        self.job_manager.transfer_enabled()
+    }
+
+    /// Whether replaying `entry` needs a live Curvine worker. Transfer mode never
+    /// does: the replayer only enqueues, and Transfer schedules the copy.
+    pub fn needs_worker(&self, entry: &JournalEntry) -> bool {
+        !self.transfer_enabled() && entry.needs_worker_for_ufs()
+    }
+
+    /// Export described by a replayed `CompleteFile`, in transfer mode.
+    ///
+    /// The inode is re-read by id: the journal path can be stale after a rename,
+    /// and a file that changed since (rewritten, deleted, already marked) has a
+    /// newer `CompleteFile` or needs nothing. The copy then targets the file's
+    /// current path and carries the generation the journal recorded.
+    pub fn fs_mode_export(&self, e: &CompleteFileEntry) -> FsResult<Option<FsModeExport>> {
+        if !e.file.is_complete() || e.file.ufs_only() {
+            return Ok(None);
+        }
+        let gen = e.file.gen();
+        let path = {
+            let fs_dir = self.fs_dir.read();
+            let Some(InodeView::File(file)) = fs_dir.store.get_inode(e.file.id, None)? else {
+                return Ok(None);
+            };
+            if file.gen() != gen
+                || file.storage_policy.state != StorageState::Cv
+                || !file.is_complete()
+                || file.is_writing()
+            {
+                return Ok(None);
+            }
+            match fs_dir.get_inode_path(e.file.id) {
+                Ok(path) => path,
+                Err(FsError::FileNotFound(_)) => return Ok(None),
+                Err(err) => return Err(err),
+            }
+        };
+        let source = Path::from_str(path)?;
+        let Some((target, mnt)) = self.get_mnt(&source)? else {
+            return Ok(None);
+        };
+        Ok(Some(FsModeExport {
+            mount_id: mnt.info.mount_id,
+            source,
+            target,
+            gen,
+        }))
+    }
+
+    /// Submit `exports` without waiting for the copies. A failure leaves the
+    /// files `Cv`; Free reconciliation re-exports them, so it never blocks the
+    /// replay cursor (which also gates log compaction).
+    pub async fn submit_fs_mode_exports(&self, exports: Vec<FsModeExport>) {
+        if exports.is_empty() {
+            return;
+        }
+        match self.job_manager.fs_mode_exporter() {
+            Some(exporter) => {
+                exporter.submit(exports).await;
+            }
+            None => warn!(
+                "{} fs_mode export(s) skipped: no Transfer client",
+                exports.len()
+            ),
+        }
+    }
+
     pub async fn complete_file(&self, e: &CompleteFileEntry) -> CommonResult<()> {
+        if self.transfer_enabled() {
+            if let Some(export) = self.fs_mode_export(e)? {
+                self.submit_fs_mode_exports(vec![export]).await;
+            }
+            return Ok(());
+        }
+
         if !e.file.is_complete() || e.file.ufs_only() {
             return Ok(());
         }
@@ -212,6 +291,13 @@ impl UfsLoader {
         if let Some((src_ufs_path, mnt)) = self.get_mnt(&src)? {
             let ufs = mnt.ufs()?;
             if !ufs.exists(&src_ufs_path).await? {
+                if self.transfer_enabled() {
+                    // Nothing to move. An unexported file is exported under its
+                    // current path by its own CompleteFile or by Free
+                    // reconciliation.
+                    debug!("rename: src {} not on UFS, nothing to move", src_ufs_path);
+                    return Ok(());
+                }
                 warn!(
                     "rename: src file not exists: {}, exporting dst {}",
                     src_ufs_path,
@@ -238,6 +324,13 @@ impl UfsLoader {
                     Err(e) => return Err(e.into()),
                 }
                 Ok(())
+            } else if self.transfer_enabled() {
+                // Move the objects themselves (server-side copy + delete). The
+                // legacy delete-then-export would destroy the only copy of a
+                // released file and re-upload everything else.
+                self.move_objects(&ufs, &src_ufs_path, &src_dst_path)
+                    .await?;
+                Ok(())
             } else {
                 ufs.delete(&src_ufs_path, true).await?;
                 self.submit_export_task(&dst, &mnt).await?;
@@ -245,6 +338,36 @@ impl UfsLoader {
             }
         } else {
             Ok(())
+        }
+    }
+
+    /// Move `src` to `dst` on a UFS without native rename. Files move one by one
+    /// (OpenDAL copies then deletes), so a rerun after a crash continues with
+    /// whatever is still under `src`.
+    async fn move_objects(&self, ufs: &UfsFileSystem, src: &Path, dst: &Path) -> FsResult<()> {
+        if !ufs.get_status(src).await?.is_dir {
+            ufs.rename(src, dst).await?;
+            return Ok(());
+        }
+        let mut pending = vec![(src.clone(), dst.clone())];
+        while let Some((from, to)) = pending.pop() {
+            for child in ufs.list_status(&from).await? {
+                let child_src = Path::from_str(&child.path)?;
+                let child_dst = Path::from_str(format!(
+                    "{}/{}",
+                    to.full_path().trim_end_matches('/'),
+                    child.name
+                ))?;
+                if child.is_dir {
+                    pending.push((child_src, child_dst));
+                } else {
+                    ufs.rename(&child_src, &child_dst).await?;
+                }
+            }
+        }
+        match ufs.delete(src, true).await {
+            Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
+            Err(err) => Err(err),
         }
     }
 

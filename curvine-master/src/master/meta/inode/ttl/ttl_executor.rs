@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::{DeleteMode, MasterFilesystem};
+use crate::master::fs::{DeleteMode, FreeOutcome, MasterFilesystem};
 use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::trash;
 use curvine_core_error::err_ext;
@@ -164,9 +164,19 @@ impl InodeTtlExecutor {
                     InodeView::File(f) => f.len.max(0),
                     _ => 0,
                 };
-                self.filesystem.free(&path, true)?;
-                debug!("ttl free {} {:?}", path, inode);
-                Ok((true, inode, reclaimed))
+
+                match self.filesystem.free_or_defer(&path, true)? {
+                    FreeOutcome::Freed(_) => {
+                        debug!("ttl free {} {:?}", path, inode);
+                        Ok((true, inode, reclaimed))
+                    }
+                    // Nothing left holding Curvine data: reconciliation has
+                    // released everything, so the TTL is done.
+                    FreeOutcome::Deferred { pending: 0 } => Ok((true, inode, 0)),
+                    // Reconciliation releases files once verified. "Not handled"
+                    // keeps the inode in its TTL bucket for another round.
+                    FreeOutcome::Deferred { .. } => Ok((false, inode, 0)),
+                }
             }
 
             _ => Ok((true, inode, 0)),

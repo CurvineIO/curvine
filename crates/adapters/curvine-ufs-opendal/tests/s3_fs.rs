@@ -18,7 +18,7 @@ mod s3_tests {
 
     use curvine_core_error::CommonResult;
     use curvine_fs_api::{FileSystem, Path, Reader, Writer};
-    use curvine_model::FileStatus;
+    use curvine_model::{FileStatus, CV_GEN_METADATA_KEY};
     use curvine_runtime::common::{FileUtils, Utils};
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use curvine_ufs_opendal::OpendalFileSystem;
@@ -138,5 +138,95 @@ mod s3_tests {
         }
 
         Ok(checksum)
+    }
+
+    /// The `cv-gen` user metadata is how the fs_mode export path proves which
+    /// file version an object holds. It must survive the write and the
+    /// server-side copy that backs a rename, because Free reconciliation reads
+    /// it back through `stat` on the final path.
+    #[test]
+    fn cv_gen_user_metadata_survives_write_and_copy() -> CommonResult<()> {
+        let fs = match get_fs() {
+            Some(fs) => fs,
+            None => {
+                println!("Not found s3 conf, skip s3 test");
+                return Ok(());
+            }
+        };
+
+        let rt = AsyncRuntime::single();
+        if !rt.block_on(async { check_s3_available(&fs).await }) {
+            println!("S3 service is not available, skip s3 test");
+            return Ok(());
+        }
+
+        rt.block_on(async move {
+            let suffix = Utils::rand_str(8);
+            let src = Path::new(format!("s3://curvine-test/cv-gen-{suffix}.log"))?;
+            let dst = Path::new(format!("s3://curvine-test/cv-gen-{suffix}.moved"))?;
+            let gen = "9001:4096:1000:77";
+            let metadata = HashMap::from([(CV_GEN_METADATA_KEY.to_string(), gen.to_string())]);
+
+            let mut writer = fs.create_with_metadata(&src, true, &metadata).await?;
+            writer.write(b"payload").await?;
+            writer.complete().await?;
+
+            let written = fs.get_status(&src).await?;
+            assert_eq!(gen_of(&written), Some(gen.to_string()), "stat after write");
+
+            fs.rename(&src, &dst).await?;
+            let moved = fs.get_status(&dst).await?;
+            assert_eq!(
+                gen_of(&moved),
+                Some(gen.to_string()),
+                "stat after server-side copy"
+            );
+            assert_eq!(moved.len, 7, "content survived the move");
+
+            fs.delete(&dst, false).await?;
+            Ok(())
+        })
+    }
+
+    /// A plain `create` must not invent a generation, otherwise Free
+    /// reconciliation would trust an object whose version was never recorded.
+    #[test]
+    fn create_without_metadata_leaves_the_generation_absent() -> CommonResult<()> {
+        let fs = match get_fs() {
+            Some(fs) => fs,
+            None => {
+                println!("Not found s3 conf, skip s3 test");
+                return Ok(());
+            }
+        };
+
+        let rt = AsyncRuntime::single();
+        if !rt.block_on(async { check_s3_available(&fs).await }) {
+            println!("S3 service is not available, skip s3 test");
+            return Ok(());
+        }
+
+        rt.block_on(async move {
+            let path = Path::new(format!(
+                "s3://curvine-test/cv-nogen-{}.log",
+                Utils::rand_str(8)
+            ))?;
+
+            let mut writer = fs.create(&path, true).await?;
+            writer.write(b"payload").await?;
+            writer.complete().await?;
+
+            assert_eq!(gen_of(&fs.get_status(&path).await?), None);
+
+            fs.delete(&path, false).await?;
+            Ok(())
+        })
+    }
+
+    fn gen_of(status: &FileStatus) -> Option<String> {
+        status
+            .x_attr
+            .get(CV_GEN_METADATA_KEY)
+            .map(|value| String::from_utf8_lossy(value).into_owned())
     }
 }

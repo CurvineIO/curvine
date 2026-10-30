@@ -106,6 +106,14 @@ mod service_test;
 #[path = "tests/planning_lease_test.rs"]
 mod planning_lease_test;
 
+#[cfg(test)]
+#[path = "tests/fs_mode_command_test.rs"]
+mod fs_mode_command_test;
+
+#[cfg(test)]
+#[path = "tests/fs_mode_store_test.rs"]
+mod fs_mode_store_test;
+
 pub use self::dispatch::TransferScheduler;
 
 // Running jobs only need scheduler attention for task state changes or lease renewal.

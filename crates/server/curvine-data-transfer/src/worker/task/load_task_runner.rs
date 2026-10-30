@@ -32,9 +32,11 @@ use curvine_model::{
     SegmentGroupPlan, SegmentPlan, SetAttrOptsBuilder, StorageType, TaskBlockLocation,
     TransferPlanKind, TRANSFER_TEMP_PATH_MARKER,
 };
+use curvine_model::{FileGen, JobSourceType, LoadTaskInfo, CV_GEN_METADATA_KEY};
 use curvine_runtime::common::{LocalTime, TimeSpent, Utils};
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{debug, error, info, warn};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,6 +81,10 @@ pub struct LoadTaskRunner {
     progress_reporter: Option<TaskProgressReporter>,
     progress_interval_ms: u64,
     task_timeout_ms: u64,
+    /// Version an fs_mode export copies, taken from the task's read plan: the
+    /// planner accepted that plan only after it matched the submitted
+    /// generation. `None` for every other task.
+    fs_mode_gen: Option<FileGen>,
 }
 
 struct CopyStream {
@@ -130,6 +136,7 @@ impl LoadTaskRunner {
         task_timeout_ms: u64,
     ) -> Self {
         let master_client = JobMasterClient::new(fs.fs_client());
+        let fs_mode_gen = Self::plan_gen(&task.info);
         Self {
             task,
             fs,
@@ -138,7 +145,20 @@ impl LoadTaskRunner {
             progress_reporter,
             progress_interval_ms,
             task_timeout_ms,
+            fs_mode_gen,
         }
+    }
+
+    fn plan_gen(info: &LoadTaskInfo) -> Option<FileGen> {
+        if info.job.source_type != JobSourceType::FsModeAuto
+            || info.source_read_plan_json.is_empty()
+            || !Path::from_str(&info.source_path).is_ok_and(|p| p.is_cv())
+        {
+            return None;
+        }
+        serde_json::from_str::<FileBlocks>(&info.source_read_plan_json)
+            .ok()
+            .map(|blocks| FileGen::of_blocks(&blocks))
     }
 
     pub fn get_ufs(&self) -> FsResult<UfsFileSystem> {
@@ -411,6 +431,7 @@ impl LoadTaskRunner {
         }
         let copied_bytes = stream.writer.pos();
         let reader_len = stream.reader.len();
+        self.check_fs_mode_source(stream).await?;
         self.commit_output(stream).await?;
         Ok(Some((
             copied_bytes,
@@ -1527,6 +1548,29 @@ impl LoadTaskRunner {
         Some(attr_builder.build())
     }
 
+    /// fs_mode only: refuse to publish an object for a version that is no longer
+    /// current. Runs right before the temporary object becomes visible at its
+    /// final path, so a source deleted, renamed away or rewritten during the
+    /// copy leaves nothing behind at the final path.
+    async fn check_fs_mode_source(&self, stream: &CopyStream) -> FsResult<()> {
+        let Some(gen) = self.fs_mode_gen else {
+            return Ok(());
+        };
+        let current = match self.fs.get_block_locations(stream.reader.path()).await {
+            Ok(blocks) => Some(FileGen::of_blocks(&blocks)),
+            Err(FsError::FileNotFound(_)) => None,
+            Err(err) => return Err(err),
+        };
+        if current == Some(gen) {
+            return Ok(());
+        }
+        err_box!(
+            "fs_mode export superseded: {} no longer carries version {}",
+            stream.reader.path().full_path(),
+            gen
+        )
+    }
+
     /// Return the committed output UFS mtime. UFS->CV completed it atomically
     /// with the writer; CV->UFS retains its legacy source-side metadata update.
     async fn mark_committed_output(&self, stream: &CopyStream) -> FsResult<i64> {
@@ -1538,9 +1582,26 @@ impl LoadTaskRunner {
         }
         let ufs_status = self.get_ufs()?.get_status(&stream.final_path).await?;
         let ufs_mtime = ufs_status.mtime;
-        let attr_opts = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build();
-        self.fs.set_attr(stream.reader.path(), attr_opts).await?;
-        Ok(ufs_mtime)
+
+        // fs_mode exports carry the version they read, so the master refuses a
+        // mark that no longer matches; otherwise a late completion would tag a
+        // newer version as persisted and Free could release live data.
+        let Some(gen) = self.fs_mode_gen else {
+            let attr_opts = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build();
+            self.fs.set_attr(stream.reader.path(), attr_opts).await?;
+            return Ok(ufs_mtime);
+        };
+        let opts = SetAttrOptsBuilder::new()
+            .ufs_mtime(ufs_mtime)
+            .expect_gen(gen)
+            .build();
+        match self.fs.set_attr(stream.reader.path(), opts).await {
+            Ok(_) => Ok(ufs_mtime),
+            // Moved or deleted after the copy: the object is valid for its
+            // version but unmarked, so Free reconciliation re-verifies it.
+            Err(FsError::FileNotFound(_)) => Ok(ufs_mtime),
+            Err(err) => Err(err),
+        }
     }
 
     async fn commit_output(&self, stream: &CopyStream) -> FsResult<()> {
@@ -1801,11 +1862,27 @@ impl LoadTaskRunner {
                 return err_box!("File exists and overwrite=false");
             }
 
-            match ufs.create(path, overwrite).await {
+            // Stamp the exported generation onto the object when the backend
+            // supports user metadata. Free reconciliation reads it back through
+            // `stat` and can then prove which version an object holds instead of
+            // comparing a second-resolution mtime.
+            let gen_metadata = self
+                .fs_mode_gen
+                .map(|gen| HashMap::from([(CV_GEN_METADATA_KEY.to_string(), gen.to_string())]));
+
+            let created = match &gen_metadata {
+                Some(metadata) => ufs.create_with_metadata(path, overwrite, metadata).await,
+                None => ufs.create(path, overwrite).await,
+            };
+
+            match created {
                 Ok(writer) => Ok(writer),
                 Err(FsError::FileNotFound(_)) => {
                     ensure_ufs_parent(&ufs, path).await?;
-                    ufs.create(path, overwrite).await
+                    match &gen_metadata {
+                        Some(metadata) => ufs.create_with_metadata(path, overwrite, metadata).await,
+                        None => ufs.create(path, overwrite).await,
+                    }
                 }
                 Err(e) => Err(e),
             }

@@ -409,6 +409,16 @@ message GetFilesystemInfoResponse {
     optional ServerCompatibilityInfoProto compatibility = 1000;
 }
 
+// Immutable identity of one Curvine file version. Used as a conditional guard
+// so an asynchronous UFS export can only mark the version it actually read.
+message FileGenProto {
+    required int64 inode_id = 1;
+    required int64 len = 2;
+    required int64 mtime = 3;
+    // Id of the last block; 0 for an empty file.
+    required int64 last_block_id = 4;
+}
+
 message SetAttrOptsProto {
     required bool recursive = 1;
     optional int32 replicas = 2;
@@ -422,6 +432,9 @@ message SetAttrOptsProto {
     map<string, bytes> add_x_attr = 10;
     repeated string remove_x_attr = 11;
     optional int64 ufs_mtime = 12;
+    // When present, ufs_mtime is applied only if the inode still carries this
+    // generation. Resolved by the leader, never persisted into the journal.
+    optional FileGenProto expect_gen = 13;
 }
 
 message SetAttrRequest {

@@ -42,6 +42,9 @@ const TRANSFER_PROTOCOL_VERSION: u32 = 1;
 /// Fallback topology refresh: even without ack piggyback the router re-fetches
 /// at this cadence so a missed bump self-heals.
 const ROUTER_FALLBACK_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+/// Sent only for fs_mode export batches, so an older server rejects them
+/// instead of running them as plain directory exports.
+const FS_MODE_TRANSFER_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone)]
 pub struct TransferClient {
@@ -164,7 +167,11 @@ impl TransferClient {
             submitter: command.submitter.clone(),
             tenant: command.tenant.clone(),
             command: serde_json::to_vec(&command).map_err(|e| FsError::common(e.to_string()))?,
-            protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
+            protocol_version: Some(if command.is_fs_mode_batch() {
+                FS_MODE_TRANSFER_PROTOCOL_VERSION
+            } else {
+                TRANSFER_PROTOCOL_VERSION
+            }),
         };
         self.connector
             .proto_rpc::<_, SubmitTransferResponse, FsError>(RpcCode::SubmitTransfer, req)

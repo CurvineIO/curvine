@@ -17,11 +17,11 @@ use std::collections::{HashMap, HashSet};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferCountFilter,
-    TransferJobRecord, TransferLease, TransferListFilter, TransferProgress, TransferState,
-    TransferStateCounts, TransferStateUpdate, TransferTaskCounts, TransferTaskRecord,
-    TransferTaskReport, TransferTaskState, TransferTaskStatus, TransferTenantSummary,
-    WorkerInflight,
+    summarize_transfer_tasks, StaleTaskAttempt, TaskAttemptStart, TransferCommand,
+    TransferCountFilter, TransferJobRecord, TransferLease, TransferListFilter, TransferProgress,
+    TransferState, TransferStateCounts, TransferStateUpdate, TransferTaskCounts,
+    TransferTaskRecord, TransferTaskReport, TransferTaskState, TransferTaskStatus,
+    TransferTenantSummary, WorkerInflight,
 };
 use parking_lot::Mutex;
 
@@ -170,6 +170,12 @@ impl TransferStore for MemoryTransferStore {
         submitter: &str,
         client_request_id: &str,
     ) -> FsResult<Option<TransferJobRecord>> {
+        // fs_mode jobs target one file per entry and order themselves by
+        // generation checks; an overlapping target from someone else is not a
+        // conflict for them.
+        if TransferCommand::is_fs_mode_submitter(submitter) {
+            return Ok(None);
+        }
         Ok(self
             .inner
             .lock()
@@ -177,6 +183,7 @@ impl TransferStore for MemoryTransferStore {
             .values()
             .find(|job| {
                 job.state.is_executing()
+                    && !TransferCommand::is_fs_mode_submitter(&job.submitter)
                     && !(job.submitter == submitter && job.client_request_id == client_request_id)
                     && target_paths_conflict(target_path, &job.target_path)
             })
@@ -587,15 +594,21 @@ impl TransferStore for MemoryTransferStore {
                     }) {
                         return None;
                     }
-                    let executing_targets = inner
+                    let executing = inner
                         .jobs
                         .values()
                         .filter(|job| job.state.is_executing())
-                        .map(|job| job.target_path.as_str())
                         .collect::<Vec<_>>();
-                    if executing_targets.len() as u64 >= max_executing_transfers {
+                    // Every executing job takes a slot; fs_mode jobs only skip
+                    // the target-overlap check, like in the SQL stores.
+                    if executing.len() as u64 >= max_executing_transfers {
                         return None;
                     }
+                    let executing_targets = executing
+                        .iter()
+                        .filter(|job| !TransferCommand::is_fs_mode_submitter(&job.submitter))
+                        .map(|job| job.target_path.as_str())
+                        .collect::<Vec<_>>();
                     let executing_tenants = inner
                         .jobs
                         .values()
@@ -608,9 +621,10 @@ impl TransferStore for MemoryTransferStore {
                         .filter(|job| {
                             job.state == TransferState::Pending
                                 && job.lease_expire_at <= now_ms
-                                && !executing_targets.iter().any(|target_path| {
-                                    target_paths_conflict(&job.target_path, target_path)
-                                })
+                                && (TransferCommand::is_fs_mode_submitter(&job.submitter)
+                                    || !executing_targets.iter().any(|target_path| {
+                                        target_paths_conflict(&job.target_path, target_path)
+                                    }))
                         })
                         .min_by_key(|job| {
                             let tenant_pressure =
@@ -628,12 +642,16 @@ impl TransferStore for MemoryTransferStore {
             .get(&candidate_id)
             .filter(|candidate| candidate.state != TransferState::Pending)
             .and_then(|candidate| {
+                if TransferCommand::is_fs_mode_submitter(&candidate.submitter) {
+                    return None;
+                }
                 inner
                     .jobs
                     .values()
                     .find(|existing| {
                         existing.job_id != candidate.job_id
                             && existing.state.is_executing()
+                            && !TransferCommand::is_fs_mode_submitter(&existing.submitter)
                             && target_paths_conflict(&candidate.target_path, &existing.target_path)
                     })
                     .cloned()

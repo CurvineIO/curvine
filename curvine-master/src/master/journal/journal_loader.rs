@@ -149,6 +149,14 @@ impl JournalLoader {
         recovery: RecoveryGate,
         testing: bool,
     ) -> CommonResult<Self> {
+        // Install the fs_mode release gate before anything can serve a release:
+        // with transfer enabled the replayer no longer waits for exports, so an
+        // unverified Free would drop Curvine data UFS never received.
+        if job_manager.transfer_enabled() {
+            let releaser = crate::master::journal::FreeReconciler::start(job_manager.clone());
+            job_manager.master_fs().set_fs_mode_releaser(releaser);
+        }
+
         let ufs_loader = UfsLoader::new(job_manager, fs_dir.clone(), conf);
         let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
         let worker_notify = worker_manager.read().registered_notify();
@@ -827,7 +835,7 @@ impl JournalLoader {
         for op in batch.batch {
             applied.op_id = op.op_id();
             applied.rpc_id = op.rpc_id();
-            if op.needs_worker_for_ufs() {
+            if self.ufs_loader.needs_worker(&op) {
                 needs_worker = true;
             }
             if op.affects_ufs() {
@@ -838,11 +846,32 @@ impl JournalLoader {
             self.recovery.set_pending(target.saturating_sub(cursor));
             return UfsDrive::WaitWorkers;
         }
+        // Transfer mode merges the entry's consecutive CompleteFile exports into
+        // one submit, flushed before the next namespace op so copies are
+        // enqueued in journal order.
+        let mut exports = Vec::new();
         for op in &ufs_ops {
             if generation != self.recovery.generation() || !self.is_leader.load(Ordering::Acquire) {
                 return UfsDrive::Stopped;
             }
-            if let Err(e) = self.ufs_loader.apply_entry(op).await {
+            let result = match op {
+                JournalEntry::CompleteFile(e) if self.ufs_loader.transfer_enabled() => {
+                    match self.ufs_loader.fs_mode_export(e) {
+                        Ok(export) => {
+                            exports.extend(export);
+                            Ok(())
+                        }
+                        Err(err) => Err(err.into()),
+                    }
+                }
+                _ => {
+                    self.ufs_loader
+                        .submit_fs_mode_exports(mem::take(&mut exports))
+                        .await;
+                    self.ufs_loader.apply_entry(op).await
+                }
+            };
+            if let Err(e) = result {
                 let message = e.to_string();
                 if classify_apply_error(&message) == ApplyDisposition::EnterSafeMode {
                     self.recovery.enter_safe_mode(&message);
@@ -852,6 +881,7 @@ impl JournalLoader {
                 return UfsDrive::Retry(message);
             }
         }
+        self.ufs_loader.submit_fs_mode_exports(exports).await;
         self.finish_ufs_entry(&entry, generation, applied, !ufs_ops.is_empty())
     }
 
@@ -980,7 +1010,7 @@ impl JournalLoader {
                 return UfsDrive::Stopped;
             }
         };
-        if ops.iter().any(|op| op.needs_worker_for_ufs()) && self.live_worker_count() == 0 {
+        if ops.iter().any(|op| self.ufs_loader.needs_worker(op)) && self.live_worker_count() == 0 {
             self.recovery.set_pending(1);
             return UfsDrive::WaitWorkers;
         }

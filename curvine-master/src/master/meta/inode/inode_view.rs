@@ -23,8 +23,8 @@ use crate::master::MetadataCodec;
 use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{
-    FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction, TtlType, INTERNAL_CTIME_XATTR,
-    INTERNAL_TTL_TYPE_XATTR,
+    FileGen, FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction, TtlType,
+    INTERNAL_CTIME_XATTR, INTERNAL_TTL_TYPE_XATTR,
 };
 use curvine_runtime::common::{LocalTime, Utils};
 use serde::{Deserialize, Serialize};
@@ -201,6 +201,15 @@ impl InodeView {
 
     pub fn is_file(&self) -> bool {
         !self.is_dir()
+    }
+
+    /// Version identity for files; `None` for directories and unresolved
+    /// entries. See [`FileGen`].
+    pub fn gen(&self) -> Option<FileGen> {
+        match self {
+            File(f) => Some(f.gen()),
+            _ => None,
+        }
     }
 
     pub fn is_file_entry(&self) -> bool {

@@ -2685,6 +2685,7 @@ dependencies = [
  "curvine-error",
  "curvine-fault",
  "curvine-fs-api",
+ "curvine-job-client",
  "curvine-metrics",
  "curvine-model",
  "curvine-net",

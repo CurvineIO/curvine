@@ -14,7 +14,7 @@
 
 use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
-use crate::master::{JobContext, JobStore, LoadJobRunner, MountManager};
+use crate::master::{FsModeExporter, JobContext, JobStore, LoadJobRunner, MountManager};
 use core::time::Duration;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext, CommonResult};
@@ -30,7 +30,7 @@ use curvine_runtime::runtime::ScheduledExecutor;
 use curvine_runtime::runtime::{LoopTask, RpcRuntime, Runtime};
 use curvine_runtime::sync::AtomicCounter;
 use curvine_unified_fs::MountValue;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use std::cmp::Reverse;
 use std::sync::Arc;
@@ -72,6 +72,9 @@ pub struct JobManager {
     factory: Arc<UfsFactory>,
     mount_manager: Arc<MountManager>,
     transfer_enabled: bool,
+    /// Transfer-mode export path; `None` when transfer is off or the client
+    /// could not be built (files then stay `Cv` and are never released).
+    fs_mode_exporter: Option<Arc<FsModeExporter>>,
     job_life_ttl: Duration,
     job_cleanup_ttl: Duration,
     terminal_retention: Duration,
@@ -88,6 +91,20 @@ impl JobManager {
         conf: &ClusterConf,
     ) -> Self {
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
+        let fs_mode_exporter = if conf.transfer.enabled {
+            match FsModeExporter::new(conf, rt.clone()) {
+                Ok(exporter) => Some(Arc::new(exporter)),
+                Err(err) => {
+                    error!(
+                        "fs_mode export is disabled: cannot build the Transfer client: {}",
+                        err
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Self {
             rt,
@@ -96,6 +113,7 @@ impl JobManager {
             factory,
             mount_manager,
             transfer_enabled: conf.transfer.enabled,
+            fs_mode_exporter,
             job_life_ttl: conf.job.job_life_ttl,
             job_cleanup_ttl: conf.job.job_cleanup_ttl,
             terminal_retention: conf.job.terminal_retention,
@@ -443,6 +461,24 @@ impl JobManager {
     pub fn record_submitted(&self) {
         LOAD_JOB_METRICS.submitted.inc();
         self.refresh_running_metrics();
+    }
+
+    /// True when exports are handed to the Transfer service.
+    pub fn transfer_enabled(&self) -> bool {
+        self.transfer_enabled
+    }
+
+    pub fn fs_mode_exporter(&self) -> Option<&Arc<FsModeExporter>> {
+        self.fs_mode_exporter.as_ref()
+    }
+
+    pub fn mount_manager(&self) -> &Arc<MountManager> {
+        &self.mount_manager
+    }
+
+    /// Metadata side of the filesystem, for Free reconciliation.
+    pub fn master_fs(&self) -> &MasterFilesystem {
+        &self.master_fs
     }
 
     pub async fn submit_export_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {

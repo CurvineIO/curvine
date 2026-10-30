@@ -19,7 +19,10 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
 use curvine_io::DataSlice;
-use curvine_model::{DeleteResult, FileStatus, FileType, ListOptions, SetAttrOpts, StoragePolicy};
+use curvine_model::{
+    DeleteResult, FileStatus, FileType, ListOptions, SetAttrOpts, StoragePolicy,
+    CV_GEN_METADATA_KEY,
+};
 use curvine_ufs_api::OpendalConf;
 #[cfg(feature = "opendal-oss")]
 use curvine_ufs_api::OssHdfsConf;
@@ -282,6 +285,9 @@ pub struct OpendalWriter {
     chunk: BytesMut,
     chunk_size: usize,
     writer: Option<opendal::Writer>,
+    /// Object metadata attached when the object is created; empty for ordinary
+    /// writes. S3-compatible backends persist it, and `stat` returns it back.
+    metadata: HashMap<String, String>,
 }
 
 impl Writer for OpendalWriter {
@@ -311,9 +317,14 @@ impl Writer for OpendalWriter {
 
     async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
         if self.writer.is_none() {
+            let pending = self.operator.writer_with(&self.object_path);
+            let pending = if self.metadata.is_empty() {
+                pending
+            } else {
+                pending.user_metadata(self.metadata.clone())
+            };
             self.writer = Some(
-                self.operator
-                    .writer(&self.object_path)
+                pending
                     .await
                     .map_err(|e| opendal_error("Failed to create writer", &self.object_path, e))?,
             );
@@ -830,6 +841,14 @@ impl OpendalFileSystem {
             .map(|t| t.into_inner().as_millisecond())
             .unwrap_or(0);
         let len = metadata.content_length() as i64;
+        // Only the generation key is surfaced: everything else on the object is
+        // the user's business, and flattening arbitrary keys into `x_attr` would
+        // let UFS state leak into Curvine metadata.
+        let x_attr = metadata
+            .user_metadata()
+            .and_then(|user| user.get(CV_GEN_METADATA_KEY))
+            .map(|gen| HashMap::from([(CV_GEN_METADATA_KEY.to_string(), gen.as_bytes().to_vec())]))
+            .unwrap_or_default();
 
         FileStatus {
             path: path.full_path().to_owned(),
@@ -846,9 +865,60 @@ impl OpendalFileSystem {
             replicas: 1,
             block_size: 4 * 1024 * 1024,
             mode: 0o777,
+            x_attr,
             storage_policy: StoragePolicy::new_ufs(),
             ..Default::default()
         }
+    }
+
+    /// Shared body of `create` and `create_with_metadata`.
+    ///
+    /// `metadata` is attached both to the placeholder empty object and to the
+    /// writer that later replaces it: an object that is created and never
+    /// written must still carry it, otherwise the reader would see an object
+    /// with no generation and treat it as unverified.
+    async fn create_inner(
+        &self,
+        path: &Path,
+        overwrite: bool,
+        metadata: HashMap<String, String>,
+    ) -> FsResult<OpendalWriter> {
+        let object_path = self.get_object_path(path)?;
+
+        let exist = self.get_object_status(&object_path).await?.is_some();
+
+        if exist && !overwrite {
+            return err_ext!(FsError::file_exists(path.full_path()));
+        }
+
+        if !exist {
+            // If no data is written to OpenDal, no file will be created.
+            // This does not conform to POSIX semantics, so an empty file is created.
+            let pending = self
+                .operator
+                .write_with(&object_path, opendal::Buffer::new());
+            let pending = if metadata.is_empty() {
+                pending
+            } else {
+                pending.user_metadata(metadata.clone())
+            };
+            pending
+                .await
+                .map_err(|e| opendal_error("Failed to create empty file", path.full_path(), e))?;
+        }
+
+        let status = Self::write_status(path);
+        Ok(OpendalWriter {
+            operator: self.operator.clone(),
+            path: path.clone(),
+            object_path,
+            status,
+            pos: 0,
+            chunk: BytesMut::with_capacity(8 * 1024 * 1024),
+            chunk_size: 8 * 1024 * 1024,
+            writer: None,
+            metadata,
+        })
     }
 
     async fn get_object_status(&self, object_path: &str) -> FsResult<Option<Metadata>> {
@@ -953,34 +1023,20 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     /// Create a new file or open for overwrite. When overwrite is false and the path exists, returns file_exists.
     /// Empty file is written only when the path does not exist (POSIX-like); when overwrite is true we defer to the first write.
     async fn create(&self, path: &Path, overwrite: bool) -> FsResult<OpendalWriter> {
-        let object_path = self.get_object_path(path)?;
+        self.create_inner(path, overwrite, HashMap::new()).await
+    }
 
-        let exist = self.get_object_status(&object_path).await?.is_some();
-
-        if exist && !overwrite {
-            return err_ext!(FsError::file_exists(path.full_path()));
-        }
-
-        if !exist {
-            // If no data is written to OpenDal, no file will be created.
-            // This does not conform to POSIX semantics, so an empty file is created.
-            self.operator
-                .write(&object_path, opendal::Buffer::new())
-                .await
-                .map_err(|e| opendal_error("Failed to create empty file", path.full_path(), e))?;
-        }
-
-        let status = Self::write_status(path);
-        Ok(OpendalWriter {
-            operator: self.operator.clone(),
-            path: path.clone(),
-            object_path,
-            status,
-            pos: 0,
-            chunk: BytesMut::with_capacity(8 * 1024 * 1024),
-            chunk_size: 8 * 1024 * 1024,
-            writer: None,
-        })
+    /// Same as [`Self::create`], attaching `metadata` to the object.
+    ///
+    /// S3-compatible backends keep it across a server-side copy, which is what
+    /// lets the fs_mode export path prove which file version an object holds.
+    async fn create_with_metadata(
+        &self,
+        path: &Path,
+        overwrite: bool,
+        metadata: &HashMap<String, String>,
+    ) -> FsResult<OpendalWriter> {
+        self.create_inner(path, overwrite, metadata.clone()).await
     }
 
     async fn append(&self, path: &Path) -> FsResult<OpendalWriter> {
@@ -1010,6 +1066,9 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                         chunk: BytesMut::from(chunk.to_vec().as_slice()),
                         chunk_size: 8 * 1024 * 1024,
                         writer: None,
+                        // Append never carries an export generation: fs_mode
+                        // exports always create a fresh object.
+                        metadata: HashMap::new(),
                     });
                 }
                 err_ext!(FsError::unsupported(format!(

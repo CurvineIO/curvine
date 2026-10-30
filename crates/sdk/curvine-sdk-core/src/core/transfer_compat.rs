@@ -240,6 +240,7 @@ fn build_transfer_command(
         submitter: SUBMITTER.to_string(),
         tenant: String::new(),
         options: Default::default(),
+        fs_mode_files: Vec::new(),
     };
     command.set_overwrite(overwrite);
     if let Some(replicas) = replicas {

@@ -2030,11 +2030,17 @@ fn select_conflicting_active_transfer(
     submitter: &str,
     client_request_id: &str,
 ) -> FsResult<Option<TransferJobRecord>> {
+    // fs_mode jobs neither conflict nor are conflicted with (see
+    // `TransferCommand::is_fs_mode_submitter`).
+    if TransferCommand::is_fs_mode_submitter(submitter) {
+        return Ok(None);
+    }
     let child_prefix = sqlite_like_prefix(target_path);
     let exact_or_child = conn
         .query_row(
             job_select_sql(
                 "where state in (2, 3, 4, 5)
+               and submitter not like 'fs-mode:%'
                and not (submitter = ?2 and client_request_id = ?3)
                and (
                    target_path = ?1
@@ -2057,6 +2063,7 @@ fn select_conflicting_active_transfer(
             .query_row(
                 job_select_sql(
                     "where state in (2, 3, 4, 5)
+                       and submitter not like 'fs-mode:%'
                        and not (submitter = ?2 and client_request_id = ?3)
                        and target_path = ?1
                      limit 1",
@@ -2076,7 +2083,10 @@ fn select_conflicting_active_transfer(
 
 fn select_executing_targets(conn: &Connection) -> FsResult<Vec<(String, String)>> {
     let mut stmt = conn
-        .prepare("select target_path, tenant from transfer_jobs where state in (2, 3, 4, 5)")
+        .prepare(
+            "select target_path, tenant from transfer_jobs
+             where state in (2, 3, 4, 5) and submitter not like 'fs-mode:%'",
+        )
         .map_err(sqlite_err)?;
     let rows = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -2103,11 +2113,15 @@ fn select_pending_transfer(
     let mut values = vec![SqliteValue::Integer(now_ms)];
     let mut exclusions = Vec::with_capacity(active_targets.len());
     let mut active_tenants = BTreeSet::new();
+    // An executing job on "/" overlaps every path. Only fs_mode jobs, which are
+    // exempt from overlap, may still start.
+    let mut root_active = false;
 
     for (target_path, tenant) in active_targets {
         let target_path = normalize_target_path(target_path);
         if target_path == "/" {
-            return Ok(None);
+            root_active = true;
+            continue;
         }
         active_tenants.insert(tenant.as_str());
 
@@ -2132,14 +2146,21 @@ fn select_pending_transfer(
         }
         exclusions.push(format!("not ({})", conflicts.join(" or ")));
     }
+    if root_active {
+        // Exclusion parameters are unused when only fs_mode jobs may start.
+        values.truncate(1);
+    }
 
     let mut sql = "select job_id, run_id, lease_epoch, state
                    from transfer_jobs
                    where state = 1 and lease_expire_at <= ?"
         .to_string();
-    if !exclusions.is_empty() {
-        sql.push_str(" and ");
+    if root_active {
+        sql.push_str(" and submitter like 'fs-mode:%'");
+    } else if !exclusions.is_empty() {
+        sql.push_str(" and (submitter like 'fs-mode:%' or (");
         sql.push_str(&exclusions.join(" and "));
+        sql.push_str("))");
     }
     if active_tenants.is_empty() {
         sql.push_str(" order by updated_at asc, job_id asc limit 1");

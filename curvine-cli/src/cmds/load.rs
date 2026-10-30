@@ -142,6 +142,7 @@ impl LoadCommand {
             submitter: "curvine-cli".to_string(),
             tenant: String::new(),
             options: Default::default(),
+            fs_mode_files: Vec::new(),
         };
         command.set_overwrite(self.overwrite);
         let mut rep = handle_rpc_result(transfer_client.submit(command)).await;

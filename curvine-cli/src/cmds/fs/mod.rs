@@ -13,6 +13,7 @@ mod ls;
 mod mkdir;
 mod mv;
 mod put;
+mod reconcile;
 mod rm;
 mod stat;
 mod touch;

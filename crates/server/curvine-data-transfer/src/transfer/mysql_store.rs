@@ -16,10 +16,11 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     summarize_transfer_tasks, transfer_task_summary_from_aggregate, StaleTaskAttempt,
-    TaskAttemptStart, TransferCountFilter, TransferJobRecord, TransferKind, TransferLease,
-    TransferListFilter, TransferProgress, TransferState, TransferStateCounts, TransferStateUpdate,
-    TransferTaskCounts, TransferTaskRecord, TransferTaskReport, TransferTaskState,
-    TransferTaskStatus, TransferTaskSummary, TransferTenantSummary, WorkerInflight,
+    TaskAttemptStart, TransferCommand, TransferCountFilter, TransferJobRecord, TransferKind,
+    TransferLease, TransferListFilter, TransferProgress, TransferState, TransferStateCounts,
+    TransferStateUpdate, TransferTaskCounts, TransferTaskRecord, TransferTaskReport,
+    TransferTaskState, TransferTaskStatus, TransferTaskSummary, TransferTenantSummary,
+    WorkerInflight,
 };
 use mysql::prelude::*;
 use mysql::{params, IsolationLevel, Params, Pool, PooledConn, TxOpts};
@@ -2057,11 +2058,17 @@ fn select_conflicting_active_transfer(
     submitter: &str,
     client_request_id: &str,
 ) -> FsResult<Option<TransferJobRecord>> {
+    // fs_mode jobs neither conflict nor are conflicted with (see
+    // `TransferCommand::is_fs_mode_submitter`).
+    if TransferCommand::is_fs_mode_submitter(submitter) {
+        return Ok(None);
+    }
     // `record_json` remains the source of truth for historical jobs. Do not
     // backfill target_path merely to make this lookup indexable.
     let conflict = select_jobs(
         conn,
-        "select record_json from transfer_jobs where state in (2, 3, 4, 5)",
+        "select record_json from transfer_jobs
+         where state in (2, 3, 4, 5) and submitter not like 'fs-mode:%'",
         Params::Empty,
     )?
     .into_iter()
@@ -2075,7 +2082,8 @@ fn select_conflicting_active_transfer(
 fn select_executing_targets(conn: &mut impl Queryable) -> FsResult<Vec<(String, String)>> {
     Ok(select_jobs(
         conn,
-        "select record_json from transfer_jobs where state in (2, 3, 4, 5)",
+        "select record_json from transfer_jobs
+         where state in (2, 3, 4, 5) and submitter not like 'fs-mode:%'",
         Params::Empty,
     )?
     .into_iter()
@@ -2109,9 +2117,10 @@ fn select_pending_transfer(
          where state = 1 and lease_expire_at <= :now_ms",
         params! { "now_ms" => now_ms },
     )? {
-        if active_targets
-            .iter()
-            .any(|(target_path, _)| target_paths_conflict(&job.target_path, target_path))
+        if !TransferCommand::is_fs_mode_submitter(&job.submitter)
+            && active_targets
+                .iter()
+                .any(|(target_path, _)| target_paths_conflict(&job.target_path, target_path))
         {
             continue;
         }

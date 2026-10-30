@@ -975,3 +975,103 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
     js.shutdown();
     Ok(())
 }
+
+/// Same environment as [`new_ufs_loader_complete_env`], with transfer mode on.
+///
+/// Kept separate so the legacy tests keep exercising the waiting path: with
+/// transfer enabled the replayer must submit and move on, which is a different
+/// contract.
+fn new_ufs_loader_transfer_env(
+    name: &str,
+) -> CommonResult<(
+    ClusterConf,
+    JournalSystem,
+    MasterFilesystem,
+    std::path::PathBuf,
+)> {
+    Master::init_test_metrics();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.transfer.enabled = true;
+    conf.journal.ufs_copy_timeout = "2s".to_string();
+    conf.change_test_meta_dir(format!(
+        "ufs-loader-transfer-{}-{}",
+        name,
+        curvine_runtime::common::LocalTime::mills()
+    ));
+
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    fs.add_test_worker(WorkerInfo::default());
+
+    let ufs_dir = std::env::temp_dir().join(format!(
+        "curvine-ufs-loader-transfer-{}-{}-{}",
+        name,
+        std::process::id(),
+        curvine_runtime::common::LocalTime::mills()
+    ));
+    let _ = std::fs::remove_dir_all(&ufs_dir);
+    std::fs::create_dir_all(&ufs_dir)?;
+
+    let mount_opts = MountOptions::builder()
+        .write_type(WriteType::FsMode)
+        .build();
+    journal_system.mount_manager().mount(
+        None,
+        "/mnt",
+        format!("file://{}/", ufs_dir.display()).as_ref(),
+        &mount_opts,
+    )?;
+
+    Ok((conf, journal_system, fs, ufs_dir))
+}
+
+/// The core promise of async export: a failed or slow submit must never stall
+/// the replay cursor, because `ufs_applied` also gates log compaction.
+///
+/// No Transfer service is running here, so the submit is guaranteed to fail.
+/// The replayer must still return success, leaving the file `Cv` for Free
+/// reconciliation.
+#[test]
+fn test_ufs_loader_transfer_mode_does_not_block_on_export() -> CommonResult<()> {
+    let (conf, journal_system, fs, ufs_dir) = new_ufs_loader_transfer_env("no-block")?;
+
+    fs.create("/mnt/block.log", true)?;
+    journal_system.fs().fs_dir.read().take_entries();
+    fs.complete_file("/mnt/block.log", None, 0, vec![], "", false, None)?;
+    let entry = take_complete_file_entry(&journal_system)?;
+
+    let loader = UfsLoader::new(
+        journal_system.job_manager(),
+        journal_system.fs().fs_dir.clone(),
+        &conf.journal,
+    );
+    let rt = AsyncRuntime::single();
+
+    let started = std::time::Instant::now();
+    rt.block_on(async { loader.complete_file(&entry).await })?;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "replay must not wait for a data copy, took {:?}",
+        elapsed
+    );
+
+    // Nothing was exported (no Transfer service), so the file must still be `Cv`
+    // and therefore ineligible for a later verified release without an export.
+    let status = fs.file_status("/mnt/block.log")?;
+    assert_eq!(
+        status.storage_policy.state,
+        curvine_model::StorageState::Cv,
+        "an unexported file must not be marked Both"
+    );
+
+    drop(fs);
+    journal_system.shutdown();
+    let _ = std::fs::remove_dir_all(&ufs_dir);
+    Ok(())
+}

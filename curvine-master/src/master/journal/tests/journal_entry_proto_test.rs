@@ -16,8 +16,9 @@ use super::*;
 use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use crate::master::meta::BlockMeta;
 use curvine_model::{
-    AccessMode, BlockLocation, CommitBlock, FileLock, LockFlags, LockType, MountInfo, Provider,
-    SetAttrOpts, StorageType, TtlAction, TtlType, WriteType,
+    AccessMode, BlockLocation, CommitBlock, FileGen, FileLock, LockFlags, LockType, MountInfo,
+    ProtoUtils, Provider, SetAttrOpts, SetAttrOptsBuilder, StorageType, TtlAction, TtlType,
+    WriteType,
 };
 use std::collections::HashMap;
 
@@ -59,6 +60,7 @@ fn set_attr_opts() -> SetAttrOpts {
         add_x_attr: HashMap::from([("user.tag".to_string(), b"v".to_vec())]),
         remove_x_attr: vec!["user.old".to_string()],
         ufs_mtime: Some(1_300),
+        expect_gen: None,
     }
 }
 
@@ -255,6 +257,23 @@ fn protobuf_batch_round_trips_all_entry_variants() {
     // Re-encoding must reproduce the same bytes, so every field (including
     // the codec-backed inode/block payloads) survives the round trip.
     assert_eq!(bytes, decoded.encode().unwrap());
+}
+
+#[test]
+fn set_attr_proto_round_trips_the_generation_guard() {
+    // The guard travels on the RPC but is stripped by the leader before the
+    // journal entry is built (`fs_dir::set_attr` calls `take()`), so replay
+    // stays unconditional. This pins the field mapping itself.
+    let gen = FileGen::new(9_001, 2_147_483_648, 1_000, 77);
+    let opts = SetAttrOptsBuilder::new()
+        .ufs_mtime(1_300)
+        .expect_gen(gen)
+        .build();
+
+    let back = ProtoUtils::set_attr_opts_from_pb(ProtoUtils::set_attr_opts_to_pb(opts));
+
+    assert_eq!(back.ufs_mtime, Some(1_300));
+    assert_eq!(back.expect_gen, Some(gen));
 }
 
 #[test]

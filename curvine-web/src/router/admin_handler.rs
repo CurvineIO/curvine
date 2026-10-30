@@ -4654,6 +4654,7 @@ async fn submit_transfer_v1(
         submitter: submitter.clone(),
         tenant: String::new(),
         options: Default::default(),
+        fs_mode_files: Vec::new(),
     };
     command.set_overwrite(overwrite);
     let client = instance.transfer_client()?;

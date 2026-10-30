@@ -21,7 +21,7 @@ use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_model::{
     is_special_file_type, BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts,
-    FileType, StoragePolicy, INTERNAL_CTIME_XATTR, INTERNAL_TTL_TYPE_XATTR,
+    FileGen, FileType, StoragePolicy, INTERNAL_CTIME_XATTR, INTERNAL_TTL_TYPE_XATTR,
 };
 use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};
@@ -165,6 +165,19 @@ impl InodeFile {
 
     pub fn is_complete(&self) -> bool {
         self.features.file_write.is_none()
+    }
+
+    /// Immutable identity of the current version, used by the asynchronous UFS
+    /// export path as a conditional guard. `rename` leaves it untouched;
+    /// `overwrite` allocates a new block id, while `append`, `truncate` and
+    /// `resize` change `len`.
+    pub fn gen(&self) -> FileGen {
+        FileGen::new(
+            self.id,
+            self.len,
+            self.mtime,
+            self.blocks.last().map(|b| b.id).unwrap_or(0),
+        )
     }
 
     pub fn is_writing(&self) -> bool {

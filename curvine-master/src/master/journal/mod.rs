@@ -33,6 +33,13 @@ pub use self::sender_task::SenderTask;
 mod ufs_loader;
 pub use self::ufs_loader::UfsLoader;
 
+mod free_reconcile;
+pub use self::free_reconcile::{FreeReconciler, FsModeReleaser};
+
+#[cfg(test)]
+#[path = "tests/free_reconcile_test.rs"]
+mod free_reconcile_test;
+
 #[cfg(test)]
 #[path = "tests/journal_entry_proto_test.rs"]
 mod journal_entry_proto_test;

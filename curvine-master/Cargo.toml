@@ -30,6 +30,7 @@ curvine-rocksdb = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-codec = { workspace = true }
 curvine-data-transfer = { workspace = true, features = ["opendal-s3"] }
+curvine-job-client = { workspace = true }
 curvine-unified-fs = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true }

@@ -47,7 +47,16 @@ const PROGRESS_REPORT_COALESCE_BATCH: usize = 256;
 const MAX_BATCH_TASK_REPORTS: usize = PROGRESS_REPORT_COALESCE_BATCH;
 const JOB_SUMMARY_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
-const TRANSFER_PROTOCOL_VERSION: u32 = 1;
+/// Highest protocol version this server understands. Version 2 adds fs_mode
+/// export batches (`fs_mode_files`); an older server rejects them instead of
+/// silently running them as unguarded exports.
+const TRANSFER_PROTOCOL_VERSION: u32 = 2;
+/// Oldest accepted. Version 1 clients never send fs_mode options, so serving
+/// them is safe.
+const MIN_TRANSFER_PROTOCOL_VERSION: u32 = 1;
+/// First version that understands `fs_mode_files`.
+const FS_MODE_PROTOCOL_VERSION: u32 = 2;
+pub(super) const FS_MODE_BATCH_MAX_FILES: usize = TransferCommand::FS_MODE_BATCH_MAX_FILES;
 const DEFAULT_LIST_PAGE_SIZE: usize = 20;
 const MAX_LIST_PAGE_SIZE: usize = 1000;
 /// Minimum interval between auto-repair retries for the same load job_key.
@@ -219,6 +228,7 @@ where
             submitter: req.submitter.clone(),
             tenant: req.tenant.clone(),
             options: Default::default(),
+            fs_mode_files: Vec::new(),
         };
         if !req.command.is_empty() {
             command = decode_transfer_command(&req.command)?;
@@ -247,6 +257,17 @@ where
             }
         }
         validate_transfer_options(&command)?;
+        if command.is_fs_mode_batch()
+            && req
+                .protocol_version
+                .unwrap_or(MIN_TRANSFER_PROTOCOL_VERSION)
+                < FS_MODE_PROTOCOL_VERSION
+        {
+            return Err(FsError::common(format!(
+                "fs_mode_files requires transfer protocol version {}",
+                FS_MODE_PROTOCOL_VERSION
+            )));
+        }
         validate_transfer_paths(command.kind, &command.source_path, &command.target_path)?;
         command.target_path = normalized_transfer_path(&Path::from_str(&command.target_path)?);
         let now_ms = now_ms();
@@ -554,7 +575,11 @@ where
                 submitter: command.submitter.clone(),
                 tenant: command.tenant.clone(),
                 command: encode_transfer_command(&command)?,
-                protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
+                protocol_version: Some(if command.is_fs_mode_batch() {
+                    FS_MODE_PROTOCOL_VERSION
+                } else {
+                    TRANSFER_PROTOCOL_VERSION
+                }),
             },
             false,
         )
@@ -1472,11 +1497,11 @@ fn observe_task_phases_static(
 }
 
 fn validate_protocol_version(protocol_version: Option<u32>) -> FsResult<()> {
-    let protocol_version = protocol_version.unwrap_or(TRANSFER_PROTOCOL_VERSION);
-    if protocol_version != TRANSFER_PROTOCOL_VERSION {
+    let protocol_version = protocol_version.unwrap_or(MIN_TRANSFER_PROTOCOL_VERSION);
+    if !(MIN_TRANSFER_PROTOCOL_VERSION..=TRANSFER_PROTOCOL_VERSION).contains(&protocol_version) {
         return Err(FsError::common(format!(
-            "Unsupported transfer protocol version {}, supported {}",
-            protocol_version, TRANSFER_PROTOCOL_VERSION
+            "Unsupported transfer protocol version {}, supported {}..={}",
+            protocol_version, MIN_TRANSFER_PROTOCOL_VERSION, TRANSFER_PROTOCOL_VERSION
         )));
     }
     Ok(())
@@ -1509,22 +1534,77 @@ fn transfer_kind(kind: i32) -> FsResult<TransferKind> {
     }
 }
 
-fn validate_transfer_options(command: &TransferCommand) -> FsResult<()> {
-    let Some(value) = command.options.get(TransferCommand::REPLICAS_OPTION) else {
-        return Ok(());
-    };
-    if command.kind != TransferKind::Load {
+pub(super) fn validate_transfer_options(command: &TransferCommand) -> FsResult<()> {
+    if let Some(value) = command.options.get(TransferCommand::REPLICAS_OPTION) {
+        if command.kind != TransferKind::Load {
+            return Err(FsError::common(
+                "replicas is supported only for load transfers",
+            ));
+        }
+        let replicas = value
+            .parse::<i32>()
+            .map_err(|_| FsError::common("transfer replicas must be a positive integer"))?;
+        if replicas <= 0 {
+            return Err(FsError::common(
+                "transfer replicas must be a positive integer",
+            ));
+        }
+    }
+
+    validate_fs_mode_options(command)
+}
+
+/// Validates the fs_mode export shape.
+///
+/// The `fs-mode:` submitter and `fs_mode_files` must appear together: the
+/// submitter exempts a job from target-overlap scheduling, which is only safe
+/// for generation-guarded single-file copies. A malformed batch is rejected,
+/// never repaired, because guessing would export the wrong data.
+fn validate_fs_mode_options(command: &TransferCommand) -> FsResult<()> {
+    let fs_mode_submitter = TransferCommand::is_fs_mode_submitter(&command.submitter);
+    if fs_mode_submitter != command.is_fs_mode_batch() {
         return Err(FsError::common(
-            "replicas is supported only for load transfers",
+            "the fs-mode submitter and fs_mode_files must be used together",
         ));
     }
-    let replicas = value
-        .parse::<i32>()
-        .map_err(|_| FsError::common("transfer replicas must be a positive integer"))?;
-    if replicas <= 0 {
+    if !command.is_fs_mode_batch() {
+        return Ok(());
+    }
+    if command.kind != TransferKind::Export {
         return Err(FsError::common(
-            "transfer replicas must be a positive integer",
+            "fs_mode_files is supported only for export transfers",
         ));
+    }
+    if command.fs_mode_files.len() > FS_MODE_BATCH_MAX_FILES {
+        return Err(FsError::common(format!(
+            "fs_mode batch has {} files, limit is {}",
+            command.fs_mode_files.len(),
+            FS_MODE_BATCH_MAX_FILES
+        )));
+    }
+    for file in &command.fs_mode_files {
+        ensure_direction(&file.source, &file.target)?;
+    }
+    Ok(())
+}
+
+/// fs_mode exports always copy from Curvine into UFS.
+fn ensure_direction(source: &str, target: &str) -> FsResult<()> {
+    let source = Path::from_str(source)
+        .map_err(|e| FsError::common(format!("invalid fs_mode source {}: {}", source, e)))?;
+    let target = Path::from_str(target)
+        .map_err(|e| FsError::common(format!("invalid fs_mode target {}: {}", target, e)))?;
+    if !source.is_cv() {
+        return Err(FsError::common(format!(
+            "fs_mode source {} must be a Curvine path",
+            source.full_path()
+        )));
+    }
+    if target.is_cv() {
+        return Err(FsError::common(format!(
+            "fs_mode target {} must be a UFS path",
+            target.full_path()
+        )));
     }
     Ok(())
 }

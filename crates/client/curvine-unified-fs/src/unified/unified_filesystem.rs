@@ -33,6 +33,7 @@ use curvine_model::{
     RuntimeConfigEntry, RuntimeConfigResetResult, RuntimeConfigUpdateResult, SetAttrOpts,
     TransferCommand, TransferKind, TransferState, TrashEntry,
 };
+use curvine_model::{FileGen, FsModeFile, StorageState};
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
@@ -736,6 +737,69 @@ impl UnifiedFileSystem {
         Ok(("SubmitJob".to_string(), result.job_id, result.target_path))
     }
 
+    /// Enqueue an fs_mode export of `path`'s current version and return the
+    /// Transfer job id, or `None` when the file needs none (not in an fs_mode
+    /// mount, incomplete, or already persisted).
+    ///
+    /// Used by `cv fs reconcile` to backfill files whose export never landed.
+    /// The version-derived request id deduplicates repeated reconciliation.
+    /// Terminal jobs are reported rather than mistaken for a new enqueue.
+    pub async fn export_fs_mode_file(&self, path: &Path) -> FsResult<Option<String>> {
+        if !path.is_cv() {
+            return err_box!("{} is not a Curvine path", path.full_path());
+        }
+        let Some(mount) = self.mount_cache.get_mount(self, path).await? else {
+            return Ok(None);
+        };
+        if !mount.info.is_fs_mode() {
+            return Ok(None);
+        }
+
+        let blocks = self.cv.get_block_locations(path).await?;
+        if blocks.status.is_dir
+            || !blocks.status.is_complete
+            || blocks.status.storage_policy.state != StorageState::Cv
+        {
+            return Ok(None);
+        }
+        let gen = FileGen::of_blocks(&blocks);
+        let target = mount.get_ufs_path(path)?;
+        let cluster_id = &self.cv.conf().cluster_id;
+
+        let mut command = TransferCommand {
+            kind: TransferKind::Export,
+            source_path: path.clone_uri(),
+            target_path: target.clone_uri(),
+            client_request_id: format!("fsm-reconcile:{}:{}", gen, Utils::md5(target.full_path())),
+            submitter: TransferCommand::fs_mode_submitter(cluster_id),
+            tenant: String::new(),
+            options: Default::default(),
+            fs_mode_files: vec![FsModeFile {
+                source: path.clone_uri(),
+                target: target.clone_uri(),
+                gen,
+            }],
+        };
+        command.set_overwrite(true);
+
+        let client = TransferClient::with_context(self.fs_context())?;
+        let rep = submit_transfer_with_backoff(&client, command).await?;
+        if [
+            TransferState::Completed as i32,
+            TransferState::Failed as i32,
+            TransferState::Canceled as i32,
+            TransferState::PartialSuccess as i32,
+        ]
+        .contains(&rep.state)
+        {
+            return err_box!(
+                "reconciliation job {} is already terminal; retry the transfer job",
+                rep.job_id
+            );
+        }
+        Ok(Some(rep.job_id))
+    }
+
     async fn cache_transfer_command(&self, requested_path: &Path) -> FsResult<TransferCommand> {
         let mount = self
             .mount_cache
@@ -761,6 +825,7 @@ impl UnifiedFileSystem {
             submitter: "curvine-client".to_string(),
             tenant: String::new(),
             options: Default::default(),
+            fs_mode_files: Vec::new(),
         })
     }
 

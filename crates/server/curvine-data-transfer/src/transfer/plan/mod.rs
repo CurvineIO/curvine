@@ -21,12 +21,13 @@ use curvine_config::{ClientConf, TransferConf};
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_fs_api::{FileSystem, Path};
+use curvine_fs_api::{FileSystem, Path, GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS};
 use curvine_model::ListOptions;
 use curvine_model::{
-    segment_group_json, BatchManifest, BatchManifestEntry, FileStatus, LoadJobInfo, LocatedBlock,
-    MountInfo, SegmentGroupPlan, SegmentPlan, TransferCommand, TransferJobRecord, TransferKind,
-    TransferProgress, TransferTaskRecord, TransferTaskState, WorkerInfo,
+    segment_group_json, BatchManifest, BatchManifestEntry, FileBlocks, FileGen, FileStatus,
+    JobSourceType, LoadJobInfo, LocatedBlock, MountInfo, SegmentGroupPlan, SegmentPlan,
+    TransferCommand, TransferJobRecord, TransferKind, TransferProgress, TransferTaskRecord,
+    TransferTaskState, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
 use parking_lot::Mutex;
@@ -37,6 +38,32 @@ use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const CV_LIST_PAGE_SIZE: usize = 1_000;
+
+pub(crate) fn validate_fs_mode_mapping(
+    mount: &MountInfo,
+    mounts: &[MountInfo],
+    source: &Path,
+    target: &Path,
+) -> FsResult<()> {
+    let actual = mounts
+        .iter()
+        .filter(|candidate| Path::has_prefix(source.path(), &candidate.cv_path))
+        .max_by_key(|candidate| candidate.cv_path.len());
+    if !source.is_cv()
+        || !mount.is_fs_mode()
+        || actual.is_none_or(|candidate| candidate.mount_id != mount.mount_id)
+        || mount.get_ufs_path(source)? != *target
+    {
+        return err_box!(
+            "fs_mode source {} does not map to target {} in mount {}",
+            source.full_path(),
+            target.full_path(),
+            mount.cv_path
+        );
+    }
+    Ok(())
+}
+
 pub struct PlannedTransfer {
     pub job_info: LoadJobInfo,
     pub tasks: Vec<TransferTaskRecord>,
@@ -579,6 +606,13 @@ impl TransferPlanner {
         job: &TransferJobRecord,
         mount: MountInfo,
     ) -> FsResult<PlannedTransfer> {
+        // fs_mode export batches bypass the directory walk entirely: each entry
+        // is an independent single-file copy with its own generation.
+        let command = transfer_command(job)?;
+        if command.is_fs_mode_batch() {
+            return self.plan_fs_mode_batch(job, &command, &mount).await;
+        }
+
         let source = Path::from_str(&job.source_path)?;
         let target = Path::from_str(&job.target_path)?;
         let job_info = self.load_job_info(job, &mount).await?;
@@ -963,6 +997,152 @@ impl TransferPlanner {
         )
     }
 
+    /// Plans one fs_mode export batch: one single-file task per entry.
+    ///
+    /// The block lookup that produces a task's read plan is also the version
+    /// check: the plan is used only when its status and last block match the
+    /// generation the submitter recorded. The worker derives the generation from
+    /// that same plan, so the version it stamps and marks is exactly the one
+    /// checked here. A stale entry is skipped alone. Segment splitting is never
+    /// used: a segment writes the shared target directly, so a failure would
+    /// leave a partial object at the final path.
+    async fn plan_fs_mode_batch(
+        &self,
+        job: &TransferJobRecord,
+        command: &TransferCommand,
+        mount: &MountInfo,
+    ) -> FsResult<PlannedTransfer> {
+        let job_info = self.load_job_info(job, mount).await?;
+        let mounts = self.cache.snapshot().mounts;
+        let mut tasks = Vec::new();
+        let mut total_size = 0i64;
+        let mut superseded = 0usize;
+
+        for file in &command.fs_mode_files {
+            let source = Path::from_str(&file.source)?;
+            let target = Path::from_str(&file.target)?;
+            validate_fs_mode_mapping(mount, &mounts, &source, &target)?;
+        }
+
+        for chunk in command
+            .fs_mode_files
+            .chunks(GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS)
+        {
+            let mut sources = Vec::with_capacity(chunk.len());
+            for file in chunk {
+                sources.push(Path::from_str(&file.source)?);
+            }
+            let lookups = self.fs_mode_block_locations(&sources).await?;
+
+            for ((file, source), lookup) in chunk.iter().zip(&sources).zip(lookups) {
+                let blocks = match lookup {
+                    Ok(blocks) => blocks,
+                    Err(FsError::FileNotFound(_)) => {
+                        superseded += 1;
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+                if blocks.status.is_dir || FileGen::of_blocks(&blocks) != file.gen {
+                    superseded += 1;
+                    continue;
+                }
+
+                let target = Path::from_str(&file.target)?;
+                let plan = serde_json::to_string(&blocks).map_err(|_| {
+                    FsError::common(format!(
+                        "Unable to prepare the CV read plan for {}",
+                        source.full_path()
+                    ))
+                })?;
+                total_size = total_size.saturating_add(blocks.status.len);
+                self.push_planned_task(job, source, &target, &blocks.status, plan, &mut tasks)?;
+            }
+        }
+
+        if superseded > 0 {
+            log::info!(
+                "fs_mode batch {}: {} of {} entries superseded at planning",
+                job.job_id,
+                superseded,
+                command.fs_mode_files.len()
+            );
+        }
+
+        Ok(PlannedTransfer {
+            job_info,
+            tasks,
+            total_size,
+            skipped_files: superseded,
+            skipped_size: 0,
+            cv_metadata_epoch: None,
+        })
+    }
+
+    /// Block layouts for `paths`, one bounded RPC per call when the master
+    /// supports it, otherwise one lookup per path.
+    async fn fs_mode_block_locations(&self, paths: &[Path]) -> FsResult<Vec<FsResult<FileBlocks>>> {
+        let start = Instant::now();
+        let batch = self.master_fs.get_block_locations_batch(paths).await;
+        record_metadata_operation("cv", "get_block_locations_batch", batch.is_ok(), start);
+        if let Some(results) = batch? {
+            return Ok(results);
+        }
+        let mut results = Vec::with_capacity(paths.len());
+        for path in paths {
+            let start = Instant::now();
+            let blocks = self.master_fs.get_block_locations(path).await;
+            record_metadata_operation("cv", "get_block_locations", blocks.is_ok(), start);
+            results.push(blocks);
+        }
+        Ok(results)
+    }
+
+    /// Push one file with an already prepared read plan.
+    fn push_planned_task(
+        &self,
+        job: &TransferJobRecord,
+        path: &Path,
+        task_target: &Path,
+        status: &FileStatus,
+        source_read_plan_json: String,
+        tasks: &mut Vec<TransferTaskRecord>,
+    ) -> FsResult<()> {
+        let task_id = format!("{}_task_{}", job.job_id, tasks.len());
+        tasks.push(TransferTaskRecord {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            task_id,
+            attempt_id: 0,
+            source_path: path.clone_uri(),
+            target_path: task_target.clone_uri(),
+            worker_id: 0,
+            worker_session_id: String::new(),
+            source_read_plan_json,
+            report_target_json: String::new(),
+            state: TransferTaskState::Pending,
+            progress: TransferProgress {
+                total_size: status.len,
+                ..Default::default()
+            },
+            estimated_size: status.len,
+            retry_count: 0,
+            attempt_started_at: 0,
+            accepted_at_ms: 0,
+            first_byte_at_ms: 0,
+            last_report_at: 0,
+            stale_deadline_at: 0,
+            updated_at: LocalTime::mills() as i64,
+            replace_target: false,
+            block_locations: Vec::new(),
+        });
+        let max_tasks = self.max_tasks();
+        if tasks.len() > max_tasks {
+            return err_box!("Transfer {} files exceeds {}", job.job_id, max_tasks);
+        }
+        Ok(())
+    }
+
     /// Push one file as its own task (non-batching path, or a large file that
     /// exceeds the batch target but is below the segment threshold; design
     /// §7.1 keeps such files single-task).
@@ -1319,6 +1499,7 @@ pub(crate) fn load_job_info(
         .replicas
         .or(mount_dir_replicas)
         .unwrap_or(client_conf.replicas);
+    let mut source_type = JobSourceType::default();
     let (replicas, overwrite) = match transfer_command(job) {
         Ok(command) => {
             let replicas = command
@@ -1326,6 +1507,11 @@ pub(crate) fn load_job_info(
                 .ok()
                 .flatten()
                 .unwrap_or(default_replicas);
+            // Tells the worker to derive the generation from the task's read
+            // plan, stamp it on the object and mark conditionally.
+            if command.is_fs_mode_batch() {
+                source_type = JobSourceType::FsModeAuto;
+            }
             (replicas, command.overwrite())
         }
         // Keep the pre-options behavior for old/corrupt records: they used the
@@ -1344,7 +1530,7 @@ pub(crate) fn load_job_info(
         mount_info: mount.clone(),
         create_time: job.created_at,
         overwrite: Some(overwrite),
-        source_type: Default::default(),
+        source_type,
         // The transfer job this planned load task belongs to.
         transfer_job_id: Some(job.job_id.clone()),
     })

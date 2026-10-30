@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::content_summary::{ContentSummary, ContentSummarySnapshot, ContentSummarySource};
+use crate::file_gen::FileGen;
 use crate::proto::*;
 use crate::state::*;
 use crate::worker_info::TransferWorkerCapabilities;
@@ -672,6 +673,7 @@ impl ProtoUtils {
             add_x_attr: opts.add_x_attr,
             remove_x_attr: opts.remove_x_attr,
             ufs_mtime: opts.ufs_mtime,
+            expect_gen: opts.expect_gen.map(Self::file_gen_to_pb),
         }
     }
 
@@ -689,7 +691,21 @@ impl ProtoUtils {
             add_x_attr: opts.add_x_attr,
             remove_x_attr: opts.remove_x_attr,
             ufs_mtime: opts.ufs_mtime,
+            expect_gen: opts.expect_gen.map(Self::file_gen_from_pb),
         }
+    }
+
+    pub fn file_gen_to_pb(gen: FileGen) -> FileGenProto {
+        FileGenProto {
+            inode_id: gen.inode_id,
+            len: gen.len,
+            mtime: gen.mtime,
+            last_block_id: gen.last_block_id,
+        }
+    }
+
+    pub fn file_gen_from_pb(gen: FileGenProto) -> FileGen {
+        FileGen::new(gen.inode_id, gen.len, gen.mtime, gen.last_block_id)
     }
 
     pub fn create_opts_to_pb(

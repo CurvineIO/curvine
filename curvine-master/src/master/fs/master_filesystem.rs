@@ -15,7 +15,7 @@
 use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::full_block_report::{FullReportProgress, FullReportTracker};
 use crate::master::fs::policy::ChooseContext;
-use crate::master::journal::JournalSystem;
+use crate::master::journal::{FsModeReleaser, JournalSystem};
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
 use crate::master::meta::{
     trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
@@ -36,6 +36,7 @@ use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
+use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -89,6 +90,29 @@ pub struct MasterFilesystem {
     /// never reclaim the same entry and the blocking caller always reports the
     /// totals it actually reclaimed.
     pending_drain: Arc<Mutex<()>>,
+    /// Routes fs_mode releases through reconciliation (transfer mode). Unset
+    /// keeps the direct release path, which is correct only while the replayer
+    /// waits for each export. Shared by every clone so none bypasses the gate.
+    fs_mode_releaser: Arc<OnceCell<Arc<dyn FsModeReleaser>>>,
+}
+
+/// Result of [`MasterFilesystem::free_or_defer`].
+pub enum FreeOutcome {
+    Freed(FreeResult),
+    /// Handed to fs_mode reconciliation; `pending` files still hold data.
+    Deferred {
+        pending: usize,
+    },
+}
+
+/// One fs_mode file as Free reconciliation sees it.
+pub struct FsModeSnapshot {
+    pub path: String,
+    pub gen: FileGen,
+    pub state: StorageState,
+    pub ufs_mtime: i64,
+    /// Complete and not being written.
+    pub quiescent: bool,
 }
 
 pub struct BlockReportResult {
@@ -191,7 +215,19 @@ impl MasterFilesystem {
                     .collect(),
             ),
             pending_drain: Default::default(),
+            fs_mode_releaser: Default::default(),
         }
+    }
+
+    /// Install the fs_mode release gate. Called once at startup when transfer is
+    /// enabled; leaving it unset keeps the legacy direct release path.
+    pub fn set_fs_mode_releaser(&self, releaser: Arc<dyn FsModeReleaser>) {
+        // First writer wins: a second install would only mean two gates.
+        let _ = self.fs_mode_releaser.set(releaser);
+    }
+
+    pub fn fs_mode_releaser(&self) -> Option<&Arc<dyn FsModeReleaser>> {
+        self.fs_mode_releaser.get()
     }
 
     pub fn with_js(conf: &ClusterConf, js: &JournalSystem) -> Self {
@@ -213,6 +249,7 @@ impl MasterFilesystem {
                     .collect(),
             ),
             pending_drain: Default::default(),
+            fs_mode_releaser: Default::default(),
         }
     }
 
@@ -597,13 +634,52 @@ impl MasterFilesystem {
     }
 
     pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
+        match self.free_or_defer(path.as_ref(), recursive)? {
+            FreeOutcome::Freed(res) => Ok(res),
+            // Reconciliation releases each file once its UFS object is verified.
+            FreeOutcome::Deferred { .. } => Ok(FreeResult::default()),
+        }
+    }
+
+    /// Free `path`, or hand its fs_mode files to reconciliation (transfer mode).
+    ///
+    /// fs_mode reads a released file from UFS by its current path, so under
+    /// transfer mode no fs_mode file is released before its UFS object is
+    /// verified. A recursive free of a directory that contains an fs_mode
+    /// mount point but is not itself in one is refused: freeing it directly
+    /// would release those files unverified.
+    pub fn free_or_defer(&self, path: &str, recursive: bool) -> FsResult<FreeOutcome> {
+        if let Some(releaser) = self.fs_mode_releaser() {
+            if releaser.is_fs_mode(path) {
+                let (pending, cleanup) = self.fs_mode_release_candidates(path, recursive)?;
+                let count = pending.len();
+                if cleanup {
+                    releaser.defer_cleanup(path)?;
+                }
+                for inode_id in pending {
+                    releaser.defer_release(inode_id);
+                }
+                return Ok(FreeOutcome::Deferred { pending: count });
+            }
+            if recursive && releaser.contains_fs_mode_mount(path) {
+                return err_box!(
+                    "free {} would release fs_mode files without UFS verification; free each fs_mode mount separately",
+                    path
+                );
+            }
+        }
+
         let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let inp = Self::resolve_path(&fs_dir, path)?;
         Self::check_not_reserved_path(inp.path())?;
 
         let mut free_res = fs_dir.free(&inp, recursive)?;
         drop(fs_dir);
+        self.remove_freed_blocks(&mut free_res);
+        Ok(FreeOutcome::Freed(free_res))
+    }
 
+    fn remove_freed_blocks(&self, free_res: &mut FreeResult) {
         let mut worker_manager = self.worker_manager.write();
         worker_manager.remove_blocks(&DeleteResult {
             inodes: 0,
@@ -612,8 +688,95 @@ impl MasterFilesystem {
             trashed: false,
             purge_pending: false,
         });
+    }
 
-        Ok(free_res)
+    /// State Free reconciliation needs for one file, read under one lock.
+    pub fn fs_mode_snapshot(&self, inode_id: i64) -> FsResult<Option<FsModeSnapshot>> {
+        let fs_dir = self.fs_dir.read();
+        let path = match fs_dir.get_inode_path(inode_id) {
+            Ok(path) => path,
+            Err(FsError::FileNotFound(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let inp = Self::resolve_path(&fs_dir, &path)?;
+        let Some(inode) = inp.get_last_inode() else {
+            return Ok(None);
+        };
+        let InodeView::File(file) = inode.as_ref() else {
+            return Ok(None);
+        };
+        if file.id != inode_id {
+            return Ok(None);
+        }
+        Ok(Some(FsModeSnapshot {
+            path,
+            gen: file.gen(),
+            state: file.storage_policy.state,
+            ufs_mtime: file.storage_policy.ufs_mtime,
+            quiescent: file.is_complete() && !file.is_writing(),
+        }))
+    }
+
+    /// Release one fs_mode file after its UFS object was verified. True when
+    /// released; false when the file changed since verification.
+    pub fn release_verified(
+        &self,
+        inode_id: i64,
+        path: &str,
+        gen: FileGen,
+        ufs_mtime: i64,
+    ) -> FsResult<bool> {
+        let mut fs_dir = self.fs_dir.write();
+        let Some(mut free_res) = fs_dir.free_verified(inode_id, path, gen, ufs_mtime)? else {
+            return Ok(false);
+        };
+        drop(fs_dir);
+        self.remove_freed_blocks(&mut free_res);
+        Ok(true)
+    }
+
+    /// Files under `path` that still hold Curvine data and must be routed
+    /// through reconciliation. `Ufs` files are already released. Directories
+    /// carry no data of their own, and `recursive=false` inside a directory
+    /// frees nothing (same rule as `FsDir::unprotected_free`).
+    fn fs_mode_release_candidates(
+        &self,
+        path: &str,
+        recursive: bool,
+    ) -> FsResult<(Vec<i64>, bool)> {
+        let fs_dir = self.fs_dir.read();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+        Self::check_not_reserved_path(inp.path())?;
+        if inp.is_root() {
+            return err_box!("The root is not allowed to be free");
+        }
+        let root = inp
+            .get_last_inode()
+            .ok_or_else(|| FsError::file_not_found(inp.path()))?;
+
+        let cleanup = recursive && matches!(root.as_ref(), InodeView::Dir(_));
+        let mut ids = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            match node.as_ref() {
+                InodeView::File(file) if file.storage_policy.state != StorageState::Ufs => {
+                    ids.push(file.id)
+                }
+                // Directory children are lazily materialised as FileEntry; they
+                // must be resolved through the store before they can be treated
+                // as files.
+                InodeView::FileEntry(entry) => {
+                    if let Some(stored) = fs_dir.store.get_inode(entry.id, Some(&entry.name))? {
+                        stack.push(InodePtr::from_owned(stored));
+                    }
+                }
+                InodeView::Dir(dir) if recursive => {
+                    stack.extend(dir.children_iter());
+                }
+                _ => {}
+            }
+        }
+        Ok((ids, cleanup))
     }
 
     pub fn rename<T: AsRef<str>>(&self, src: T, dst: T, flags: RenameFlags) -> FsResult<bool> {
@@ -3365,6 +3528,10 @@ mod tests {
         );
     }
 
+    #[path = "expect_gen_test.rs"]
+    mod expect_gen_test;
+    #[path = "fs_mode_release_gate_test.rs"]
+    mod fs_mode_release_gate_test;
     #[path = "get_block_locations_batch_test.rs"]
     mod get_block_locations_batch_test;
     #[path = "worker_recovery_test.rs"]

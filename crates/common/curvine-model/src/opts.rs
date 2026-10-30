@@ -384,6 +384,11 @@ pub struct SetAttrOpts {
     pub add_x_attr: HashMap<String, Vec<u8>>,
     pub remove_x_attr: Vec<String>,
     pub ufs_mtime: Option<i64>,
+    /// Conditional guard for `ufs_mtime`: the mark is applied only when the
+    /// inode still carries exactly this version. Never persisted into the
+    /// journal: the leader resolves it before logging, so replay stays
+    /// unconditional.
+    pub expect_gen: Option<FileGen>,
 }
 
 impl SetAttrOpts {
@@ -407,6 +412,7 @@ impl SetAttrOpts {
             add_x_attr,
             remove_x_attr: vec![],
             ufs_mtime: None,
+            expect_gen: None,
         }
     }
 }
@@ -424,6 +430,7 @@ pub struct SetAttrOptsBuilder {
     add_x_attr: HashMap<String, Vec<u8>>,
     remove_x_attr: Vec<String>,
     ufs_mtime: Option<i64>,
+    expect_gen: Option<FileGen>,
 }
 
 impl Default for SetAttrOptsBuilder {
@@ -447,6 +454,7 @@ impl SetAttrOptsBuilder {
             add_x_attr: HashMap::new(),
             remove_x_attr: vec![],
             ufs_mtime: None,
+            expect_gen: None,
         }
     }
 
@@ -510,6 +518,12 @@ impl SetAttrOptsBuilder {
         self
     }
 
+    /// Require the inode to still carry `gen` before `ufs_mtime` is applied.
+    pub fn expect_gen(mut self, gen: FileGen) -> Self {
+        let _ = self.expect_gen.insert(gen);
+        self
+    }
+
     pub fn build(self) -> SetAttrOpts {
         SetAttrOpts {
             recursive: self.recursive,
@@ -524,6 +538,7 @@ impl SetAttrOptsBuilder {
             add_x_attr: self.add_x_attr,
             remove_x_attr: self.remove_x_attr,
             ufs_mtime: self.ufs_mtime,
+            expect_gen: self.expect_gen,
         }
     }
 }
