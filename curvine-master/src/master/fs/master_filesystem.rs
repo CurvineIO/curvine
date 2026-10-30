@@ -228,7 +228,9 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
             pending_drain: Default::default(),
-            purging_inflight: Default::default(),
+            // Shared like `session_map`: every handle must agree on which
+            // `.purging` entries a synchronous delete still owns.
+            purging_inflight: js.fs().purging_inflight.clone(),
         }
     }
 
@@ -4011,7 +4013,7 @@ mod tests {
         assert_eq!(rename.dst, staged);
 
         let purger = PendingTrashPurger::new(fs.clone(), fs.master_monitor.clone());
-        assert_eq!(purger.drain_pending().unwrap().unwrap().0, 0);
+        assert_eq!(purger.drain_purging().unwrap().unwrap().0, 0);
         assert_eq!(
             fs.scan_purging_trash(16, None).unwrap().paths,
             vec![staged.clone()]
@@ -4023,5 +4025,106 @@ mod tests {
         assert!(!res.purge_pending);
         assert!(!fs.is_purge_inflight(&staged));
         assert!(fs.scan_purging_trash(16, None).unwrap().paths.is_empty());
+    }
+
+    // #1864 review: `.purging` adoption runs outside the `pending_drain` guard,
+    // so a blocking empty-trash neither waits on nor skips a leftover staged
+    // delete, and the `.pending` drain still yields to it.
+    #[test]
+    fn purging_drain_does_not_take_the_empty_trash_guard() {
+        use crate::master::fs::PendingTrashPurger;
+
+        let fs = {
+            Master::init_test_metrics();
+            let mut conf = ClusterConf::format();
+            conf.testing = true;
+            conf.journal.enable = false;
+            conf.master.trash_enabled = true;
+            conf.master.delete_stage_min_children = 2;
+            conf.master.meta_dir = Utils::test_sub_dir(format!(
+                "master-fs-purging-unguarded/meta-{}",
+                Utils::rand_str(6)
+            ));
+            conf.journal.journal_dir = Utils::test_sub_dir(format!(
+                "master-fs-purging-unguarded/journal-{}",
+                Utils::rand_str(6)
+            ));
+            JournalSystem::fs_only_for_test(&conf).unwrap()
+        };
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        fs.create("/victim/a", true).unwrap();
+        fs.create("/victim/b", true).unwrap();
+        fs.create("/owned.log", true).unwrap();
+        fs.delete_with_mode("/owned.log", false, DeleteMode::Default)
+            .unwrap();
+
+        // A staged delete whose caller is gone: staged, then released without
+        // purging, as after lost leadership.
+        let (_, staged) = {
+            let mut fs_dir = fs.fs_dir.write();
+            fs.delete_locked(&mut fs_dir, "/victim", true, DeleteMode::SkipTrash)
+                .unwrap()
+        };
+        let staged = staged.expect("staged");
+        fs.purging_inflight.lock().remove(&staged);
+
+        let guard = fs.lock_pending_drain();
+        assert_eq!(fs.stage_trash_for_purge().unwrap(), 1);
+        let purger = PendingTrashPurger::new(fs.clone(), fs.master_monitor.clone());
+
+        assert_eq!(purger.drain_pending().unwrap(), Some((0, 0, 0)));
+        assert_eq!(purger.drain_purging().unwrap(), Some((1, 2, 0)));
+        assert!(fs.scan_purging_trash(16, None).unwrap().paths.is_empty());
+        assert_eq!(fs.scan_pending_trash(16, None).unwrap().paths.len(), 1);
+        drop(guard);
+    }
+
+    // #1864 review: every handle over one journal system must agree on which
+    // `.purging` entries a synchronous delete owns, or a purger on one handle
+    // could adopt an entry a delete on another handle is still reclaiming.
+    #[test]
+    fn with_js_shares_the_purging_inflight_set() {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.master.delete_stage_min_children = 2;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-fs-inflight/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-fs-inflight/journal-{}", Utils::rand_str(6)));
+        let js = JournalSystem::from_conf(&conf).unwrap();
+        let staging = MasterFilesystem::with_js(&conf, &js);
+        let observer = MasterFilesystem::with_js(&conf, &js);
+        staging
+            .master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        staging.create("/victim/a", true).unwrap();
+        staging.create("/victim/b", true).unwrap();
+
+        let (_, staged) = {
+            let mut fs_dir = staging.fs_dir.write();
+            staging
+                .delete_locked(&mut fs_dir, "/victim", true, DeleteMode::SkipTrash)
+                .unwrap()
+        };
+        let staged = staged.expect("a directory at the cutoff is staged");
+
+        assert!(observer.is_purge_inflight(&staged));
+        assert!(js.fs().is_purge_inflight(&staged));
+        let purger = crate::master::fs::PendingTrashPurger::new(
+            observer.clone(),
+            observer.master_monitor.clone(),
+        );
+        assert_eq!(purger.drain_purging().unwrap().unwrap().0, 0);
+
+        let mut res = DeleteResult::new();
+        staging.finish_staged_delete(&staged, &mut res);
+        assert_eq!(res.inodes, 2);
+        assert!(!observer.is_purge_inflight(&staged));
+
+        drop(staging);
+        drop(observer);
+        js.shutdown();
     }
 }

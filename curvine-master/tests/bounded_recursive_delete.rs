@@ -352,7 +352,7 @@ fn lost_leadership_leaves_the_entry_for_the_purger() {
     // The next active master adopts the leftover entry.
     fs.master_monitor.set_role_for_test(RoleState::Leader);
     let drained = PendingTrashPurger::new(fs.clone(), fs.master_monitor.clone())
-        .drain_pending()
+        .drain_purging()
         .unwrap()
         .unwrap();
     assert_eq!(drained.0, 1);

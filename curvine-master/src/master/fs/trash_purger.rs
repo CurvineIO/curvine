@@ -312,7 +312,8 @@ impl TrashPurger {
 // Bound on how many pending entries one drain cycle dequeues per scan page.
 const PENDING_SCAN_BATCH: usize = 64;
 
-/// Drains `/.Trash/.pending`, the staging directory written by `async_delete`.
+/// Drains `/.Trash/.pending`, the staging directory written by `async_delete`,
+/// and adopts entries a synchronous delete left in `/.Trash/.purging` (#1864).
 ///
 /// This runs regardless of `trash_enabled` and of `trash_retention`: an async
 /// delete promises reclamation without a retention window, so its entries are
@@ -344,8 +345,9 @@ impl PendingTrashPurger {
         self
     }
 
-    /// Purges every currently staged entry, page by page. Returns the number of
-    /// entries reclaimed, or `None` when the master was demoted mid-cycle.
+    /// Purges every entry staged in `/.Trash/.pending`, page by page. Returns
+    /// `(entries, inodes, bytes)` reclaimed, or `None` when the master was
+    /// demoted mid-cycle.
     ///
     /// The drain is skipped when a blocking empty-trash call owns the pending
     /// directory: both walk the same entries, and only the blocking caller has
@@ -374,9 +376,27 @@ impl PendingTrashPurger {
             return Ok(None);
         }
 
-        // `.purging` holds staged synchronous deletes (#1864). The deleting
-        // caller purges its own entry; only entries it left behind (lost
-        // leadership, a failed batch, a restart) are adopted here.
+        Ok(Some(totals))
+    }
+
+    /// Adopts entries left in `/.Trash/.purging` by a synchronous delete that
+    /// stopped early (lost leadership, a failed batch, a restart), page by page.
+    /// Returns `(entries, inodes, bytes)` reclaimed, or `None` when the master
+    /// was demoted mid-cycle.
+    ///
+    /// Runs outside the `pending_drain` guard: `EmptyTrash` never touches
+    /// `.purging`, and an entry a delete still owns is skipped through the
+    /// in-flight set, so a large leftover never blocks an empty-trash call.
+    pub fn drain_purging(&self) -> FsResult<Option<(u64, u64, u64)>> {
+        let mut totals = (0u64, 0u64, 0u64);
+
+        // Sampled like the pending probe: one bounded page per cycle.
+        if let Ok(probe) = self.fs.scan_purging_trash(self.scan_batch, None) {
+            if let Ok(metrics) = Master::get_metrics() {
+                metrics.trash_purging_entries.set(probe.paths.len() as i64);
+            }
+        }
+
         let purging = |limit: usize, after: Option<&str>| self.fs.scan_purging_trash(limit, after);
         if !self.drain_dir(purging, &mut totals)? {
             return Ok(None);
@@ -437,6 +457,15 @@ impl LoopTask for PendingTrashPurger {
             if entries > 0 {
                 info!(
                     "trash purger reclaimed {} async-deleted entries ({} inodes, {} bytes)",
+                    entries, inodes, bytes
+                );
+            }
+        }
+
+        if let Some((entries, inodes, bytes)) = self.drain_purging()? {
+            if entries > 0 {
+                info!(
+                    "trash purger adopted {} abandoned staged deletes ({} inodes, {} bytes)",
                     entries, inodes, bytes
                 );
             }
