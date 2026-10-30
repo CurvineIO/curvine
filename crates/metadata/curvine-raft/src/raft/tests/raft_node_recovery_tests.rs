@@ -867,6 +867,54 @@ fn pending_snapshot_publishes_the_step_down_before_parking_the_ready() {
     );
 }
 
+// `on_ready` already published the step-down before parking the Ready, so when
+// the snapshot completes the monitor no longer reports leader and only the
+// recorded transition keeps the follower-mode reinstall alive.
+#[test]
+fn pending_snapshot_completion_keeps_the_follower_mode_reinstall() {
+    let rt = Arc::new(Runtime::new("test-pending-step-down-role", 2, 2));
+    let monitor = RoleMonitor::new();
+    let app = RoleRecordingAppStorage::new(HashAppStorage::new(), monitor.read_ctl());
+    let mut conf = JournalConf::with_test();
+    let mut node = test_rocks_node_with_app(rt.clone(), 1, &mut conf, app.clone(), monitor);
+    let journal_dir = conf.journal_dir.clone();
+
+    seed_applied_state(&node, 100);
+    hold_current_ready(&mut node);
+    let mut pending = node.pending_ready.take().unwrap();
+    pending.soft_state = Some(SoftState {
+        leader_id: 2,
+        raft_state: StateRole::Follower,
+    });
+    pending.demoted = true;
+
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: 1,
+        raft_state: StateRole::Leader,
+    });
+    assert!(node.role_monitor.is_leader());
+    node.role_monitor.step_down();
+    assert!(!node.role_monitor.is_leader());
+    node.pending_ready = Some(pending);
+
+    let mut promise = HashMap::new();
+    rt.block_on(node.complete_pending_snapshot(Ok(()), &mut promise))
+        .unwrap();
+
+    let replayed = app.replayed_as_leader();
+    assert!(
+        !replayed.is_empty(),
+        "resuming a parked snapshot must still reinstall it and replay the tail"
+    );
+    assert!(
+        !replayed.iter().any(|leader| *leader),
+        "the reinstall must replay as a follower"
+    );
+
+    drop(node);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
 #[test]
 fn follower_snapshot_is_throttled_by_min_interval() {
     let rt = JournalConf::with_test().create_runtime();
