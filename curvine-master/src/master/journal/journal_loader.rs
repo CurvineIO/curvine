@@ -757,6 +757,25 @@ impl JournalLoader {
             }
         };
         let Some(entry) = list.into_iter().next() else {
+            // A snapshot can advance past this cursor, deleting the entries the
+            // replay still needs. Waiting forever blocks every later checkpoint
+            // and grows the journal without bound, so the cluster never recovers
+            // on its own. Skip the range that is already gone and record the new
+            // watermark so followers apply the same position.
+            let first = match raft::Storage::first_index(&self.log_store) {
+                Ok(first) => first,
+                Err(e) => return UfsDrive::Retry(e.to_string()),
+            };
+            if cursor + 1 < first {
+                error!(
+                    "UFS replay skips entries {}..{} already discarded by a snapshot",
+                    cursor + 1,
+                    first
+                );
+                let mut applied = state.ufs_applied.clone();
+                applied.index = first - 1;
+                return self.finish_ufs_entry(&Entry::default(), generation, applied, true);
+            }
             return UfsDrive::Retry(format!("ufs replay waiting for log entry {}", cursor + 1));
         };
         if entry.index > target {
