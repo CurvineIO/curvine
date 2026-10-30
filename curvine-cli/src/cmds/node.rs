@@ -16,7 +16,7 @@ use crate::util::*;
 use clap::Parser;
 use curvine_client_core::file::FsClient;
 use curvine_config::ClusterConf;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_model::WorkerInfo;
 use curvine_runtime::common::ByteUnit;
 use std::collections::BTreeMap;
@@ -25,69 +25,159 @@ use std::sync::Arc;
 #[derive(Parser, Debug)]
 #[command(arg_required_else_help = true)]
 pub struct NodeCommand {
-    /// list all nodes
-    #[arg(long, short = 'l')]
+    #[command(subcommand)]
+    command: Option<NodeSubCommand>,
+
+    /// Alias for `node list`, kept so existing scripts keep working.
+    #[arg(long, short = 'l', hide = true)]
     list: bool,
 
-    /// show version distribution across all workers
-    #[arg(long)]
+    /// Alias for `node versions`, kept so existing scripts keep working.
+    #[arg(long, hide = true)]
     versions: bool,
 
-    /// add decommission node
-    #[arg(long, visible_alias = "add-dcm")]
+    /// Alias for `node decommission --add/--remove`.
+    #[arg(long, visible_alias = "add-dcm", hide = true)]
     add_decommission: bool,
 
-    /// remove decommission node
-    #[arg(long, visible_alias = "remove-dcm")]
+    #[arg(long, visible_alias = "remove-dcm", hide = true)]
     remove_decommission: bool,
 
-    /// node list (hostname, ip, or host:port). Repeat the argument or separate with commas.
-    #[arg(
-        required_if_eq("add_decommission", "true"),
-        required_if_eq("remove_decommission", "true")
-    )]
+    /// Alias for `node decommission --add/--remove`.
+    #[arg(hide = true)]
     nodes: Vec<String>,
 }
 
-impl NodeCommand {
-    fn print_worker(worker: &WorkerInfo) {
-        let address = format!("{}:{}", worker.address.hostname, worker.address.rpc_port);
-        println!(
-            "{:<25} {:<15} {:<15} {:<15}",
-            address,
-            format!("{:?}", worker.status),
-            ByteUnit::byte_to_string(worker.capacity as u64),
-            ByteUnit::byte_to_string(worker.available as u64)
-        );
-    }
+#[derive(clap::Subcommand, Debug)]
+pub enum NodeSubCommand {
+    /// List nodes with their health state
+    List {
+        /// healthy: every directory usable; unhealthy: at least one is not.
+        #[arg(long, value_enum, default_value_t = HealthFilter::All)]
+        health: HealthFilter,
 
-    // Handle listing all worker nodes
-    async fn handle_list(&self, client: Arc<FsClient>) -> CommonResult<()> {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show the release version distribution
+    Versions,
+
+    /// Check node health: every unhealthy node, or one node in detail
+    Check {
+        /// hostname, ip, or host:port. Omit to survey the whole cluster.
+        node: Option<String>,
+
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Manage the decommission list
+    Decommission {
+        #[arg(long, visible_alias = "add-dcm")]
+        add: bool,
+
+        #[arg(long, visible_alias = "remove-dcm")]
+        remove: bool,
+
+        /// node list (hostname, ip, or host:port). Repeat or separate with commas.
+        #[arg(required = true)]
+        nodes: Vec<String>,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HealthFilter {
+    All,
+    Healthy,
+    Unhealthy,
+}
+
+impl NodeCommand {
+    async fn handle_list(
+        &self,
+        client: Arc<FsClient>,
+        health: HealthFilter,
+        json: bool,
+    ) -> CommonResult<()> {
         let info = handle_rpc_result(client.get_filesystem_info()).await;
 
-        println!("Worker Nodes:");
-        println!(
-            "{:<25} {:<15} {:<15} {:<15}",
-            "Address", "Status", "Capacity", "Available"
-        );
-        println!("{}", "-".repeat(70));
-
-        for worker in info
+        let mut workers: Vec<(String, &WorkerInfo)> = info
             .live_workers
             .iter()
             .chain(info.blacklist_workers.iter())
             .chain(info.decommission_workers.iter())
             .chain(info.lost_workers.iter())
-        {
-            Self::print_worker(worker);
+            .map(|worker| (format!("{:?}", worker.status), worker))
+            .collect();
+
+        // Unhealthy nodes first: the list exists to surface problems.
+        workers.sort_by_key(|(_, worker)| {
+            (!Self::unhealthy_dirs(worker).is_empty(), worker.rpc_addr())
+        });
+
+        if json {
+            let payload = serde_json::json!({
+                "workers": workers
+                    .iter()
+                    .map(|(status, worker)| serde_json::json!({
+                        "worker_id": worker.worker_id(),
+                        "address": worker.rpc_addr(),
+                        "status": status,
+                        "health": Self::health_label(worker),
+                        "accepting_allocations": worker.accepting_allocations(),
+                        "schedulable": worker.schedulable(),
+                        "capacity": worker.capacity,
+                        "available": worker.available,
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_default()
+            );
+            return Ok(());
         }
 
+        println!(
+            "{:<25} {:<15} {:<12} {:<12} {:<12} Fault",
+            "Address", "Status", "Health", "Capacity", "Available"
+        );
+        println!("{}", "-".repeat(96));
+        for (status, worker) in workers {
+            if !Self::keep(worker, health) {
+                continue;
+            }
+            let fault = Self::unhealthy_dirs(worker)
+                .first()
+                .map(|dir| format!("{}({})", dir.fault_kind, dir.dir_path))
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "{:<25} {:<15} {:<12} {:<12} {:<12} {}",
+                worker.rpc_addr(),
+                status,
+                Self::health_label(worker),
+                ByteUnit::byte_to_string(worker.capacity.max(0) as u64),
+                ByteUnit::byte_to_string(worker.available.max(0) as u64),
+                fault,
+            );
+        }
         Ok(())
     }
 
+    fn keep(worker: &WorkerInfo, health: HealthFilter) -> bool {
+        match health {
+            HealthFilter::All => true,
+            HealthFilter::Healthy => worker.accepting_allocations(),
+            HealthFilter::Unhealthy => !worker.accepting_allocations(),
+        }
+    }
+
     /// Selectors from repeated arguments and comma-separated values.
-    fn node_selectors(&self) -> Vec<String> {
-        self.nodes
+    fn node_selectors(nodes: &[String]) -> Vec<String> {
+        nodes
             .iter()
             .flat_map(|node| node.split(','))
             .map(|node| node.trim().to_string())
@@ -123,10 +213,11 @@ impl NodeCommand {
         client: Arc<FsClient>,
         status: &str,
         operation_type: &str,
+        selectors: Vec<String>,
     ) -> CommonResult<()> {
         let mut successful = Vec::new();
         let mut failed = Vec::new();
-        for node in self.node_selectors() {
+        for node in Self::node_selectors(&selectors) {
             match client.set_worker_status(&node, status).await {
                 Ok((worker, _)) => successful.push(format!(
                     "{}:{}",
@@ -137,16 +228,6 @@ impl NodeCommand {
         }
         Self::print_decommission_results(&successful, &failed, operation_type);
         Ok(())
-    }
-
-    async fn handle_add_decommission(&self, client: Arc<FsClient>) -> CommonResult<()> {
-        self.set_decommission_status(client, "decommission", "added to")
-            .await
-    }
-
-    async fn handle_remove_decommission(&self, client: Arc<FsClient>) -> CommonResult<()> {
-        self.set_decommission_status(client, "remove_decommission", "removed from")
-            .await
     }
 
     // Handle showing version distribution across workers
@@ -222,23 +303,181 @@ impl NodeCommand {
     }
 
     pub async fn execute(&self, client: Arc<FsClient>, _conf: ClusterConf) -> CommonResult<()> {
+        // Legacy flags: `cv node -l`, `cv node --versions`, `cv node --add-dcm ...`.
+        if self.add_decommission || self.remove_decommission {
+            return self.handle_decommission_alias(client).await;
+        }
+        if self.list {
+            return self.handle_list(client, HealthFilter::All, false).await;
+        }
         if self.versions {
             return self.handle_versions(client).await;
         }
 
-        if self.list {
-            return self.handle_list(client).await;
+        match &self.command {
+            None | Some(NodeSubCommand::List { .. }) => {
+                let (health, json) = match &self.command {
+                    Some(NodeSubCommand::List { health, json }) => (*health, *json),
+                    _ => (HealthFilter::All, false),
+                };
+                self.handle_list(client, health, json).await
+            }
+            Some(NodeSubCommand::Versions) => self.handle_versions(client).await,
+            Some(NodeSubCommand::Check { node, json }) => {
+                self.handle_check(client, node.as_deref(), *json).await
+            }
+            Some(NodeSubCommand::Decommission { add, remove, nodes }) => {
+                let status = match (add, remove) {
+                    (true, false) => ("decommission", "added to"),
+                    (false, true) => ("remove_decommission", "removed from"),
+                    _ => return err_box!("Specify either --add or --remove"),
+                };
+                self.set_decommission_status(client, status.0, status.1, nodes.clone())
+                    .await
+            }
+        }
+    }
+
+    async fn handle_decommission_alias(&self, client: Arc<FsClient>) -> CommonResult<()> {
+        let (status, operation) = if self.add_decommission {
+            ("decommission", "added to")
+        } else {
+            ("remove_decommission", "removed from")
+        };
+        self.set_decommission_status(client, status, operation, self.nodes.clone())
+            .await
+    }
+
+    /// `cv node check`: survey unhealthy nodes, or explain one node in detail.
+    async fn handle_check(
+        &self,
+        client: Arc<FsClient>,
+        selector: Option<&str>,
+        json: bool,
+    ) -> CommonResult<()> {
+        let info = handle_rpc_result(client.get_filesystem_info()).await;
+        let workers = Self::all_workers(&info);
+
+        let selected: Vec<&WorkerInfo> = match selector {
+            Some(node) => {
+                let node = node.trim();
+                let found = workers
+                    .iter()
+                    .find(|worker| Self::matches(worker, node))
+                    .ok_or_else(|| curvine_core_error::err_msg!("worker not found: {}", node))?;
+                vec![found]
+            }
+            None => workers
+                .iter()
+                .copied()
+                .filter(|worker| !worker.accepting_allocations())
+                .collect(),
+        };
+
+        if json {
+            let payload = serde_json::json!({
+                "workers": selected
+                    .iter()
+                    .map(|worker| serde_json::json!({
+                        "worker_id": worker.worker_id(),
+                        "address": worker.rpc_addr(),
+                        "status": format!("{:?}", worker.status),
+                        "accepting_allocations": worker.accepting_allocations(),
+                        "schedulable": worker.schedulable(),
+                        "storage": Self::unhealthy_dirs(worker)
+                            .iter()
+                            .map(|dir| serde_json::json!({
+                                "dir_id": dir.dir_id,
+                                "path": dir.dir_path,
+                                "state": dir.health_state.as_str_name(),
+                                "fault": dir.fault_kind.as_str_name(),
+                                "since_ms": dir.unhealthy_since_ms,
+                            }))
+                            .collect::<Vec<_>>(),
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_default()
+            );
+            return Ok(());
         }
 
-        if self.add_decommission {
-            return self.handle_add_decommission(client).await;
+        if selected.is_empty() {
+            println!("All workers are healthy.");
+            return Ok(());
         }
 
-        if self.remove_decommission {
-            return self.handle_remove_decommission(client).await;
+        for worker in selected {
+            println!(
+                "{}  {}  worker_id={}  health={}  accepting={}  schedulable={}",
+                worker.address.hostname,
+                worker.rpc_addr(),
+                worker.worker_id(),
+                Self::health_label(worker),
+                worker.accepting_allocations(),
+                worker.schedulable(),
+            );
+            for dir in Self::unhealthy_dirs(worker) {
+                println!(
+                    "  dir {} {} state={} fault={} unhealthy_for={}",
+                    dir.dir_id,
+                    dir.dir_path,
+                    dir.health_state.as_str_name(),
+                    dir.fault_kind.as_str_name(),
+                    Self::elapsed(dir.unhealthy_since_ms),
+                );
+            }
         }
-
         Ok(())
+    }
+
+    fn all_workers(info: &curvine_model::FilesystemInfo) -> Vec<&WorkerInfo> {
+        info.live_workers
+            .iter()
+            .chain(info.blacklist_workers.iter())
+            .chain(info.decommission_workers.iter())
+            .chain(info.lost_workers.iter())
+            .collect()
+    }
+
+    fn unhealthy_dirs(worker: &WorkerInfo) -> Vec<&curvine_model::StorageInfo> {
+        worker
+            .storage_map
+            .values()
+            .filter(|dir| !dir.is_usable())
+            .collect()
+    }
+
+    /// `unhealthy` means the node cannot take new writes for at least one
+    /// directory; it is a fact, not a routing decision.
+    fn health_label(worker: &WorkerInfo) -> &'static str {
+        if worker.accepting_allocations() {
+            "healthy"
+        } else {
+            "unhealthy"
+        }
+    }
+
+    fn matches(worker: &WorkerInfo, selector: &str) -> bool {
+        worker.address.hostname == selector
+            || worker.address.ip_addr == selector
+            || worker.rpc_addr() == selector
+            || worker.worker_id().to_string() == selector
+    }
+
+    fn elapsed(since_ms: i64) -> String {
+        if since_ms <= 0 {
+            return "-".to_string();
+        }
+        let now = curvine_runtime::common::LocalTime::mills() as i64;
+        let secs = ((now - since_ms) / 1000).max(0);
+        match secs {
+            s if s < 60 => format!("{}s", s),
+            s if s < 3600 => format!("{}m", s / 60),
+            s => format!("{}h", s / 3600),
+        }
     }
 }
 
@@ -360,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn add_decommission_accepts_node_without_double_dash() {
+    fn legacy_decommission_flags_still_parse() {
         let cmd =
             NodeCommand::try_parse_from(["node", "--add-decommission", "10.144.228.84"]).unwrap();
         assert!(cmd.add_decommission);
@@ -369,20 +608,50 @@ mod tests {
 
     #[test]
     fn node_selectors_split_commas_and_repeated_args() {
-        let cmd = NodeCommand::try_parse_from([
-            "node",
-            "--add-decommission",
-            "10.144.228.84,10.144.228.85",
-            "host-a",
-        ])
-        .unwrap();
+        let nodes = vec![
+            "10.144.228.84,10.144.228.85".to_string(),
+            "host-a".to_string(),
+        ];
         assert_eq!(
-            cmd.node_selectors(),
+            NodeCommand::node_selectors(&nodes),
             vec![
                 "10.144.228.84".to_string(),
                 "10.144.228.85".to_string(),
                 "host-a".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn check_subcommand_parses_with_and_without_a_node() {
+        let all = NodeCommand::try_parse_from(["node", "check"]).unwrap();
+        match all.command {
+            Some(NodeSubCommand::Check { node, json }) => {
+                assert!(node.is_none());
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+
+        let one = NodeCommand::try_parse_from(["node", "check", "h135:8997", "--json"]).unwrap();
+        match one.command {
+            Some(NodeSubCommand::Check { node, json }) => {
+                assert_eq!(node.as_deref(), Some("h135:8997"));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn list_subcommand_parses_health_filter() {
+        let cmd = NodeCommand::try_parse_from(["node", "list", "--health", "unhealthy"]).unwrap();
+        match cmd.command {
+            Some(NodeSubCommand::List { health, json }) => {
+                assert_eq!(health, HealthFilter::Unhealthy);
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
     }
 }

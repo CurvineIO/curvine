@@ -339,9 +339,19 @@ fn worker_matches(worker: &WorkerInfo, selector: &str) -> bool {
 
 fn worker_json(worker: WorkerInfo) -> Value {
     let display_ip = resolve_display_ip(&worker.address.hostname, &worker.address.ip_addr);
+    // Derived views for consoles and scripts: the worker fact (can it take
+    // writes) and the master decision (do we route to it). Keeping both lets an
+    // operator tell "node cannot write" from "we do not want to use it".
+    let accepting_allocations = worker.accepting_allocations();
+    let schedulable = worker.schedulable();
     let mut value = json!(worker);
     if let Some(object) = value.as_object_mut() {
         object.insert("display_ip".to_string(), json!(display_ip));
+        object.insert(
+            "accepting_allocations".to_string(),
+            json!(accepting_allocations),
+        );
+        object.insert("schedulable".to_string(), json!(schedulable));
     }
     value
 }
