@@ -280,9 +280,8 @@ impl BlockLayout for FileLayout {
         let committed_len = meta.len.min(logical_len);
         if device.len() < committed_len {
             return err_box!(
-                "Block {} file {} is truncated: committed length {}, file length {}",
+                "Block {} is truncated: committed length {}, file length {}",
                 meta.id,
-                file,
                 committed_len,
                 device.len()
             );

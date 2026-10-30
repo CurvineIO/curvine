@@ -73,7 +73,7 @@ impl ReadHandler {
         let mut context = ReadContext::from_req(msg)?;
         let conf = Worker::get_conf()?;
         let max_block_size = conf.master.max_block_size;
-        self.store.get_block(context.block_id).map_err(|e| {
+        let stored = self.store.get_block(context.block_id).map_err(|e| {
             FsError::block_not_found(context.block_id)
                 .ctx(format!("worker block store lookup failed: {}", e))
         })?;
@@ -136,9 +136,12 @@ impl ReadHandler {
         let (meta, is_short_circuit, path, file) = if let Some((meta, path, _)) = sc_path {
             (meta, true, path, None)
         } else {
-            let (meta, file) =
-                self.store
-                    .open_reader_by_id(context.block_id, context.off, logical_len)?;
+            // Opening validates the block file (e.g. truncation); record the
+            // failure on the worker before returning it to the client.
+            let (meta, file) = self
+                .store
+                .open_reader_by_id(context.block_id, context.off, logical_len)
+                .inspect_err(|e| Self::record_read_error(self.metrics, stored.dir_id(), e))?;
             let path = file.path().to_string();
             (meta, false, path, Some(file))
         };

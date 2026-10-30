@@ -1390,9 +1390,12 @@ mod test {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("is truncated"), "unexpected error: {err}");
+        // The message reaches the client; it must not expose worker paths.
+        let path_str = path.to_string_lossy();
+        assert!(!err.contains(path_str.as_ref()), "error leaks path: {err}");
 
-        // A read bounded below the surviving bytes is also rejected: the block
-        // as a whole can no longer be trusted.
+        // A read bounded below the committed length but beyond the surviving
+        // bytes is also rejected.
         let dir = ds.find_dir(finalized.dir_id())?;
         assert!(FileLayout.open_reader(dir, &finalized, 0, 30).is_err());
 
