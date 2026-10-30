@@ -630,6 +630,36 @@ impl FsDir {
         })
     }
 
+    /// Moves a subtree being permanently deleted to
+    /// `/.Trash/.purging/<name>` in one journaled rename and returns the staged
+    /// path (#1864).
+    ///
+    /// The caller purges the staged entry in bounded batches after releasing
+    /// the namespace lock, so a large recursive delete no longer removes the
+    /// whole subtree under one lock hold and one store batch. The path vanishes
+    /// from the namespace at once, exactly like a direct delete. Hard links and
+    /// unresolved entries are not staged; the caller deletes them directly.
+    pub fn stage_for_purge(&mut self, inp: &InodePath) -> FsResult<String> {
+        let op_ms = LocalTime::mills() as i64;
+        let inode = match inp.get_last_inode() {
+            Some(v) if !inp.is_root() => v,
+            _ => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        self.ensure_trash_root()?;
+        self.ensure_trash_dir(trash::TRASH_PURGING_ROOT)?;
+
+        let entry_name = self.unique_trash_entry_name(op_ms, inode.id())?;
+        let dst_path = trash::purging_entry_path(&entry_name);
+        let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+
+        // No TRASH flag: the entry gets no origin or delete-time markers, so it
+        // can never be listed, restored or swept by the retention pass.
+        self.rename_with_mtime(inp, &dst_inp, RenameFlags::NO_REPLACE, op_ms)?;
+        debug!("staged {} for bounded purge as {}", inp.path(), dst_path);
+        Ok(dst_path)
+    }
+
     /// Claims a retention-expired trash entry for reclamation by moving it from
     /// `/.Trash/<name>` to `/.Trash/.pending/<name>` in one journaled rename.
     ///
@@ -700,9 +730,10 @@ impl FsDir {
                 format!("{}-{}", base, seq)
             };
             let mut candidates = vec![trash::trash_entry_path(&name)];
-            // Pending entries share the trash-root name space by name only, not
-            // by directory, so both locations must be free to reuse a name.
+            // Staged entries share the trash-root name space by name only, not
+            // by directory, so every location must be free to reuse a name.
             candidates.push(trash::pending_entry_path(&name));
+            candidates.push(trash::purging_entry_path(&name));
             if candidates.iter().all(|path| {
                 InodePath::resolve(self.root_ptr(), path, &self.store)
                     .map(|inp| inp.get_last_inode().is_none())
@@ -934,15 +965,34 @@ impl FsDir {
         limit: usize,
         start_after: Option<&str>,
     ) -> FsResult<TrashScanPage> {
+        self.scan_staging_dir(trash::TRASH_PENDING_ROOT, limit, start_after)
+    }
+
+    /// Returns one bounded page of `/.Trash/.purging` entry paths. The caller
+    /// must skip entries a synchronous delete is still purging.
+    pub fn scan_purging_trash(
+        &self,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> FsResult<TrashScanPage> {
+        self.scan_staging_dir(trash::TRASH_PURGING_ROOT, limit, start_after)
+    }
+
+    fn scan_staging_dir(
+        &self,
+        root: &str,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> FsResult<TrashScanPage> {
         let limit = limit.max(1);
-        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_PENDING_ROOT, &self.store)?;
+        let inp = InodePath::resolve(self.root_ptr(), root, &self.store)?;
         let Some(inode) = inp.get_last_inode() else {
             return Ok(TrashScanPage::default());
         };
         let Dir(dir) = inode.as_ref() else {
             return err_ext!(FsError::invalid_argument(format!(
                 "{} exists and is not a directory",
-                trash::TRASH_PENDING_ROOT
+                root
             )));
         };
 
@@ -960,7 +1010,7 @@ impl FsDir {
 
         let paths = children
             .into_iter()
-            .map(|child| trash::pending_entry_path(child.name()))
+            .map(|child| format!("{}{}{}", root, PATH_SEPARATOR, child.name()))
             .collect();
 
         Ok(TrashScanPage { paths, next_after })

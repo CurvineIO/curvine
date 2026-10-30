@@ -359,10 +359,7 @@ impl PendingTrashPurger {
             return Ok(Some((0, 0, 0)));
         };
 
-        let mut entries = 0u64;
-        let mut inodes = 0u64;
-        let mut bytes = 0u64;
-        let mut start_after = None;
+        let mut totals = (0u64, 0u64, 0u64);
 
         // Sample the queue depth once per cycle. The probe is one bounded page,
         // so a backlog larger than the page reports the page size.
@@ -372,37 +369,59 @@ impl PendingTrashPurger {
             }
         }
 
+        let pending = |limit: usize, after: Option<&str>| self.fs.scan_pending_trash(limit, after);
+        if !self.drain_dir(pending, &mut totals)? {
+            return Ok(None);
+        }
+
+        // `.purging` holds staged synchronous deletes (#1864). The deleting
+        // caller purges its own entry; only entries it left behind (lost
+        // leadership, a failed batch, a restart) are adopted here.
+        let purging = |limit: usize, after: Option<&str>| self.fs.scan_purging_trash(limit, after);
+        if !self.drain_dir(purging, &mut totals)? {
+            return Ok(None);
+        }
+
+        Ok(Some(totals))
+    }
+
+    /// Purges one staging directory page by page, adding to `totals`. Returns
+    /// `false` when the master was demoted mid-drain.
+    fn drain_dir<F>(&self, scan: F, totals: &mut (u64, u64, u64)) -> FsResult<bool>
+    where
+        F: Fn(usize, Option<&str>) -> FsResult<crate::master::meta::TrashScanPage>,
+    {
+        let mut start_after = None;
         loop {
             if !self.monitor.is_active() {
-                return Ok(None);
+                return Ok(false);
             }
 
-            let page = self
-                .fs
-                .scan_pending_trash(self.scan_batch, start_after.as_deref())?;
+            let page = scan(self.scan_batch, start_after.as_deref())?;
             for path in page.paths {
+                if self.fs.is_purge_inflight(&path) {
+                    continue;
+                }
                 // An entry staged after this page was scanned is picked up by the
                 // next cycle; a restored or already purged one resolves to a
                 // no-op inside the purger.
                 match self.purger.purge_entry(&path) {
                     Ok(Some(outcome)) => {
-                        entries += 1;
-                        inodes += outcome.inodes;
-                        bytes += outcome.bytes;
+                        totals.0 += 1;
+                        totals.1 += outcome.inodes;
+                        totals.2 += outcome.bytes;
                     }
-                    Ok(None) => return Ok(None),
+                    Ok(None) => return Ok(false),
                     Err(FsError::FileNotFound(_)) => {}
-                    Err(e) => warn!("failed to purge pending trash entry {}: {}", path, e),
+                    Err(e) => warn!("failed to purge staged trash entry {}: {}", path, e),
                 }
             }
 
             match page.next_after {
                 Some(next) => start_after = Some(next),
-                None => break,
+                None => return Ok(true),
             }
         }
-
-        Ok(Some((entries, inodes, bytes)))
     }
 }
 
