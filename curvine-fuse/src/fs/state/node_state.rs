@@ -719,6 +719,18 @@ impl NodeState {
         self.dir_write().clear_mark_delete(ino)
     }
 
+    /// Record the unlink-time Curvine path for a pending deferred delete.
+    /// See `DirTree::set_deferred_delete_path`.
+    pub fn set_deferred_delete_path(&self, ino: u64, path: &Path) {
+        self.dir_write()
+            .set_deferred_delete_path(ino, path.full_path().to_owned());
+    }
+
+    /// The recorded unlink-time path of a pending deferred delete, if any.
+    pub fn deferred_delete_path(&self, ino: u64) -> Option<String> {
+        self.dir_read().deferred_delete_path(ino)
+    }
+
     /// Clear inode `mark_delete` and the `deleted_children` entry for a specific
     /// hardlink name under `parent` (not the inode's primary parent/name).
     pub fn clear_unlink_state(&self, ino: u64, parent: u64, name: &str) -> FuseResult<()> {
@@ -811,6 +823,7 @@ impl NodeState {
 
         if has_handles {
             debug!("unlink ino={}, path={}: open handles, deferring", ino, path);
+            self.set_deferred_delete_path(ino, &path);
             return Ok(());
         }
 
@@ -820,6 +833,7 @@ impl NodeState {
                 "unlink ino={}, path={}: handle appeared, deferring",
                 ino, path
             );
+            self.set_deferred_delete_path(ino, &path);
             return Ok(());
         }
 

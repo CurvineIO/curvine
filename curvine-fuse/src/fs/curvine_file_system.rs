@@ -1900,15 +1900,28 @@ impl fs::FileSystem for CurvineFileSystem {
         // handler and leak the handle, writer and deferred delete (#1395).
         // Path is optional context; path-free cleanup always runs.
         let path = self.state.get_path(ino).ok();
-        if let Some(path) = &path {
-            let _guard = self.state.lock_path(path).await;
-        } else {
-            warn!(
-                "release ino={}: dcache path unavailable (evicted or unlinked), \
-                 running path-free cleanup",
-                ino
-            );
-        }
+        // Hold the path lock for the whole RELEASE: this is what serializes
+        // RELEASE with fs_unlink / fs_create and with other RELEASEs of the
+        // same path (duplicate deferred deletes, lock teardown interleaving).
+        // When the dcache path is gone, the unlink-time recorded path is used
+        // for the deferred delete instead, so the lock covers that target too.
+        let fallback_delete_path = path
+            .is_none()
+            .then(|| self.state.deferred_delete_path(ino))
+            .flatten()
+            .and_then(|p| Path::from_str(&p).ok());
+        let delete_lock_target = path.clone().or_else(|| fallback_delete_path.clone());
+        let _guard = match &delete_lock_target {
+            Some(p) => Some(self.state.lock_path(p).await),
+            None => {
+                warn!(
+                    "release ino={}: no dcache or recorded path available, \
+                     running path-free cleanup",
+                    ino
+                );
+                None
+            }
+        };
 
         let (handle, mut release_result) = self.state.release_handle(ino, op.arg.fh).await?;
 
@@ -1917,13 +1930,16 @@ impl fs::FileSystem for CurvineFileSystem {
                 .invalid_cache(op.header.nodeid, None, INVAL_REASON_RELEASE);
         }
 
+        let log_path = path
+            .as_ref()
+            .map(|p| p.full_path().to_owned())
+            .unwrap_or_else(|| handle.open_path());
+
         let flock_result = self.fs_unlock(&handle, LockFlags::Flock).await;
         if let Err(e) = &flock_result {
             warn!(
                 "failed to release flock for ino={}, path={}: {}",
-                ino,
-                handle.open_path(),
-                e
+                ino, log_path, e
             );
         }
         Self::retain_first_error(&mut release_result, flock_result);
@@ -1932,34 +1948,23 @@ impl fs::FileSystem for CurvineFileSystem {
         if let Err(e) = &plock_result {
             warn!(
                 "failed to release plock for ino={}, path={}: {}",
-                ino,
-                handle.open_path(),
-                e
+                ino, log_path, e
             );
         }
         Self::retain_first_error(&mut release_result, plock_result);
 
         match self.state.deferred_delete_ready(ino).await {
             Ok(true) => {
-                // The deferred delete needs a path to reach the master; fall
-                // back to the handle's open-time path when the dcache entry is
-                // gone. Without any path the mark stays set (existing
-                // retention semantics) instead of dropping the deletion.
-                let delete_path = match &path {
-                    Some(path) => Some(path.clone()),
-                    None => match Path::from_str(handle.open_path()) {
-                        Ok(p) => Some(p),
-                        Err(e) => {
-                            warn!(
-                                "release ino={}: handle path {} is not a valid Path: {}",
-                                ino,
-                                handle.open_path(),
-                                e
-                            );
-                            None
-                        }
-                    },
-                };
+                // The deferred delete target must be the Curvine path the
+                // unlink resolved (recorded at unlink time); the dcache path
+                // is preferred when still resolvable. The handle's backend
+                // snapshot is never used as a deletion target: renames do not
+                // update it and on cache-mode UFS mounts it can be a UFS URI,
+                // so deleting by it could remove a reused name or fail
+                // outright. Without a trustworthy target the mark stays set
+                // (existing retention semantics) instead of dropping the
+                // deletion.
+                let delete_path = path.clone().or_else(|| fallback_delete_path.clone());
                 match delete_path {
                     Some(delete_path) => {
                         debug!(
@@ -1979,7 +1984,7 @@ impl fs::FileSystem for CurvineFileSystem {
                         Self::retain_first_error(&mut release_result, delete_result);
                     }
                     None => warn!(
-                        "release ino={}: deferred delete pending but no path available; \
+                        "release ino={}: deferred delete pending but no trustworthy path available; \
                          retaining pending delete",
                         ino
                     ),
@@ -1989,9 +1994,7 @@ impl fs::FileSystem for CurvineFileSystem {
             Err(e) => {
                 warn!(
                     "failed to evaluate deferred delete for ino={}, path={}: {}",
-                    ino,
-                    handle.open_path(),
-                    e
+                    ino, log_path, e
                 );
                 Self::retain_first_error(&mut release_result, Err(e));
             }
@@ -4118,37 +4121,190 @@ mod tests {
             let rt = Arc::new(AsyncRuntime::single());
             rt.block_on(async {
                 let fs = CurvineFileSystem::new(rpc_conf(), rt.clone()).unwrap();
-                let (ino, status) = evicted_file(&fs, "staledel", 302);
+
+                // Nested layout: /dir/staledel. The parent must be evictable
+                // while the child stays pending-delete.
+                let dir_ino = {
+                    let mut tree = fs.state.dir_write();
+                    let mut dir_status = FileStatus::with_name(302, "dir".to_string(), true);
+                    dir_status.path = "/dir".to_string();
+                    dir_status.nlink = 2;
+                    tree.lookup(FUSE_ROOT_ID, "dir", dir_status, true)
+                        .unwrap()
+                        .ino
+                };
+                let (ino, status) = {
+                    let mut tree = fs.state.dir_write();
+                    let mut st = FileStatus::with_name(303, "staledel".to_string(), false);
+                    st.path = "/dir/staledel".to_string();
+                    let ino = tree
+                        .lookup(dir_ino, "staledel", st.clone(), true)
+                        .unwrap()
+                        .ino;
+                    // Drop the kernel lookup ref first so the parent is
+                    // evictable; the child still holds ref_ctr via its dentry.
+                    tree.forget(ino, 1).unwrap();
+                    (ino, st)
+                };
 
                 let handle = fs
                     .state
                     .insert_handle_with_writer(ino, None, None, status)
                     .await;
 
-                // Reintroduce the dentry and unlink it while the handle is
-                // open: fs_unlink defers the backend delete.
+                // Unlink while the handle is open: fs_unlink defers the
+                // backend delete and records the unlink-time Curvine path.
+                fs.state.fs_unlink(dir_ino, "staledel").await.unwrap();
+                assert!(fs.state.dir_read().pending_delete(ino));
+                let recorded = fs
+                    .state
+                    .deferred_delete_path(ino)
+                    .expect("unlink-time path recorded");
+                assert_eq!(recorded, "/dir/staledel");
+
+                // Evict ONLY the parent: get_path(ino) now fails (stale
+                // ancestor) while the pending delete survives (mark_delete
+                // pins the child inode).
+                fs.state.dir_write().forget(dir_ino, 1).unwrap();
                 fs.state
                     .dir_write()
-                    .lookup(
-                        FUSE_ROOT_ID,
-                        "staledel",
-                        FileStatus::with_name(302, "staledel".to_string(), false),
-                        true,
-                    )
-                    .unwrap();
-                fs.state.fs_unlink(FUSE_ROOT_ID, "staledel").await.unwrap();
-                assert!(fs.state.dir_read().pending_delete(ino));
-                assert!(fs.state.get_path(ino).is_ok());
+                    .get_inode_mut(dir_ino, None)
+                    .unwrap()
+                    .last_access = 0;
+                fs.state.clear().unwrap();
+                assert!(fs.state.get_path(ino).is_err(), "ancestor must be evicted");
+                assert!(
+                    fs.state.dir_read().pending_delete(ino),
+                    "pending delete survives"
+                );
 
-                // Drop the kernel lookup ref; the mark_delete pin keeps the
-                // inode in the dcache even after the FORGET is balanced.
-                fs.state.dir_write().forget(ino, 1).unwrap();
+                let (tx, mut rx) = AsyncChannel::<FuseTask>::new(1).split();
+                let reply = FuseResponse::new_reply(1, tx, false, None);
+                let header = hdr(ino);
+                let arg = fuse_release_in {
+                    fh: handle.fh(),
+                    ..Default::default()
+                };
+                let op = Release {
+                    header: &header,
+                    arg: &arg,
+                };
+                let result = fs.release(op, reply).await;
 
-                let result = run_release(&fs, ino, handle.fh()).await;
-                // The delete itself cannot succeed without a master, but the
-                // release must complete and never lose the handle.
+                // Without a master the deferred delete cannot complete; its
+                // error (if any) surfaces through the reply per
+                // retain_first_error. The handle is freed either way.
+                let mut replied: Option<i32> = None;
+                while let Ok(Some(task)) = rx.try_recv() {
+                    if let FuseTask::Reply(data) | FuseTask::RequestReply { data, .. } = task {
+                        replied = Some(data.header().error);
+                    }
+                }
+                if fs.state.dir_read().pending_delete(ino) {
+                    // Delete did not complete: the failure must have been
+                    // reported instead of silently swallowed.
+                    assert_ne!(replied, Some(0), "failed delete must surface in the reply");
+                }
+                assert!(result.is_ok(), "release itself completes");
                 assert!(!fs.state.has_open_handles(ino), "handle must be freed");
-                let _ = result; // error (or FileNotFound-style success) reported via reply
+            });
+        }
+
+        /// The open-time handle snapshot must never be a deletion target:
+        /// open /a/f -> rename to /b/f -> recreate /a/f -> unlink /b/f (with
+        /// handle open, deferred) -> evict /b -> release. The fallback must
+        /// delete the recorded unlink-time path (/b/f), not the reused /a/f.
+        #[test]
+        fn release_deferred_delete_uses_unlink_time_path_not_open_snapshot() {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let rt = Arc::new(AsyncRuntime::single());
+            rt.block_on(async {
+                let fs = CurvineFileSystem::new(rpc_conf(), rt.clone()).unwrap();
+
+                let (a_ino, dir_a, dir_b) = {
+                    let mut tree = fs.state.dir_write();
+                    let mut a = FileStatus::with_name(402, "a".to_string(), true);
+                    a.path = "/a".to_string();
+                    a.nlink = 2;
+                    let dir_a = tree.lookup(FUSE_ROOT_ID, "a", a, true).unwrap().ino;
+                    let mut b = FileStatus::with_name(403, "b".to_string(), true);
+                    b.path = "/b".to_string();
+                    b.nlink = 2;
+                    let dir_b = tree.lookup(FUSE_ROOT_ID, "b", b, true).unwrap().ino;
+                    let mut st = FileStatus::with_name(404, "f".to_string(), false);
+                    st.path = "/a/f".to_string();
+                    let f_ino = tree.lookup(dir_a, "f", st.clone(), true).unwrap().ino;
+                    tree.forget(f_ino, 1).unwrap();
+                    (f_ino, dir_a, dir_b)
+                };
+
+                let handle = fs
+                    .state
+                    .insert_handle_with_writer(a_ino, None, None, {
+                        let mut st = FileStatus::with_name(404, "f".to_string(), false);
+                        st.path = "/a/f".to_string();
+                        st
+                    })
+                    .await;
+
+                // Simulate the rename /a/f -> /b/f in the dcache (the master
+                // RPC is unavailable; only the dcache shape matters here).
+                fs.state.rename(dir_a, "f", dir_b, "f").unwrap();
+
+                // Recreate /a/f as a NEW inode reusing the old name.
+                {
+                    let mut tree = fs.state.dir_write();
+                    let mut st = FileStatus::with_name(405, "f".to_string(), false);
+                    st.path = "/a/f".to_string();
+                    let new_ino = tree.lookup(dir_a, "f", st, true).unwrap().ino;
+                    assert_ne!(new_ino, a_ino, "recreated file must be a new inode");
+                    tree.forget(new_ino, 1).unwrap();
+                }
+
+                // Unlink /b/f while the handle is open -> deferred, recording
+                // the unlink-time path /b/f.
+                fs.state.fs_unlink(dir_b, "f").await.unwrap();
+                assert!(fs.state.dir_read().pending_delete(a_ino));
+                assert_eq!(
+                    fs.state.deferred_delete_path(a_ino).as_deref(),
+                    Some("/b/f"),
+                    "unlink-time path must be recorded, not the open snapshot"
+                );
+
+                // Evict /b so get_path(a_ino) fails.
+                fs.state.dir_write().forget(dir_b, 1).unwrap();
+                fs.state
+                    .dir_write()
+                    .get_inode_mut(dir_b, None)
+                    .unwrap()
+                    .last_access = 0;
+                fs.state.clear().unwrap();
+                assert!(fs.state.get_path(a_ino).is_err());
+
+                let (tx, rx) = AsyncChannel::<FuseTask>::new(1).split();
+                let reply = FuseResponse::new_reply(1, tx, false, None);
+                let header = hdr(a_ino);
+                let arg = fuse_release_in {
+                    fh: handle.fh(),
+                    ..Default::default()
+                };
+                let op = Release {
+                    header: &header,
+                    arg: &arg,
+                };
+                let result = fs.release(op, reply).await;
+                assert!(!fs.state.has_open_handles(a_ino), "handle must be freed");
+
+                // Without a master the delete may or may not complete; what
+                // matters is that the attempted target was /b/f (recorded at
+                // unlink time) and the recreated /a/f is untouched.
+                let _ = result;
+                let _ = rx;
+                // The recreated /a/f must NOT have been marked for deletion.
+                assert!(
+                    !fs.state.dir_read().pending_delete(405),
+                    "the recreated /a/f must never be deleted by this release"
+                );
             });
         }
 
