@@ -164,6 +164,9 @@ impl FilesystemConf {
             return err_box!("master_addrs can not be empty");
         }
         let log = LogConf::default();
+        // Derive the retry policy from the shared ClientConf defaults so a default
+        // change cannot leave this constructor on stale literals.
+        let rpc_defaults = ClientConf::default();
         Ok(Self {
             master_addrs: master_addrs.join(","),
             io_threads: 16,
@@ -172,9 +175,12 @@ impl FilesystemConf {
             conn_timeout_ms: 30_000,
             rpc_timeout_ms: 120_000,
             data_timeout_ms: 120_000,
-            rpc_retry_max_duration_ms: 120_000,
-            rpc_retry_min_sleep_ms: 100,
-            rpc_retry_max_sleep_ms: 3_000,
+            conn_retry_max_duration_ms: rpc_defaults.conn_retry_max_duration_ms,
+            conn_retry_min_sleep_ms: rpc_defaults.conn_retry_min_sleep_ms,
+            conn_retry_max_sleep_ms: rpc_defaults.conn_retry_max_sleep_ms,
+            rpc_retry_max_duration_ms: rpc_defaults.rpc_retry_max_duration_ms,
+            rpc_retry_min_sleep_ms: rpc_defaults.rpc_retry_min_sleep_ms,
+            rpc_retry_max_sleep_ms: rpc_defaults.rpc_retry_max_sleep_ms,
             block_size: "128MB".to_string(),
             write_chunk_size: "128KB".to_string(),
             read_chunk_size: "128KB".to_string(),
@@ -332,6 +338,7 @@ impl FilesystemConf {
 #[cfg(test)]
 mod tests {
     use super::{FilesystemConf, TransferClientConf};
+    use curvine_config::ClientConf;
 
     #[test]
     fn default_master_conn_pool_size_is_one() {
@@ -347,9 +354,32 @@ mod tests {
         let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
         let cluster = conf.into_cluster_conf().unwrap();
 
-        assert_eq!(cluster.client.rpc_retry_min_sleep_ms, 100);
-        assert_eq!(cluster.client.rpc_retry_max_sleep_ms, 3_000);
-        assert_eq!(cluster.client.rpc_retry_max_duration_ms, 120_000);
+        let defaults = ClientConf::default();
+
+        assert_eq!(
+            cluster.client.conn_retry_max_duration_ms,
+            defaults.conn_retry_max_duration_ms
+        );
+        assert_eq!(
+            cluster.client.conn_retry_min_sleep_ms,
+            defaults.conn_retry_min_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.conn_retry_max_sleep_ms,
+            defaults.conn_retry_max_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.rpc_retry_min_sleep_ms,
+            defaults.rpc_retry_min_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.rpc_retry_max_sleep_ms,
+            defaults.rpc_retry_max_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.rpc_retry_max_duration_ms,
+            defaults.rpc_retry_max_duration_ms
+        );
     }
 
     #[test]
