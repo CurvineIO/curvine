@@ -13,11 +13,14 @@
 // limitations under the License.
 
 use super::*;
-use crate::raft::storage::{HashAppStorage, MemLogStorage, RocksLogStorage};
+use crate::raft::storage::{ApplyMsg, HashAppStorage, MemLogStorage, RocksLogStorage};
 use curvine_config::RaftPeer;
 use curvine_net::net::NetUtils;
-use raft::eraftpb::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2, HardState};
-use raft::Storage;
+use curvine_runtime::sync::StateCtl;
+use raft::eraftpb::{
+    ConfChangeSingle, ConfChangeTransition, ConfChangeV2, HardState, Message, Snapshot,
+};
+use raft::{StateRole, Storage};
 use std::time::Instant;
 
 fn test_node(rt: Arc<Runtime>, id: u64) -> RaftNode<MemLogStorage, HashAppStorage<String, String>> {
@@ -27,8 +30,18 @@ fn test_node(rt: Arc<Runtime>, id: u64) -> RaftNode<MemLogStorage, HashAppStorag
 fn test_node_with_voters(
     rt: Arc<Runtime>,
     id: u64,
-    mut peer_ids: Vec<u64>,
+    peer_ids: Vec<u64>,
 ) -> RaftNode<MemLogStorage, HashAppStorage<String, String>> {
+    test_node_with_app(rt, id, peer_ids, HashAppStorage::new(), RoleMonitor::new())
+}
+
+fn test_node_with_app<B: AppStorage>(
+    rt: Arc<Runtime>,
+    id: u64,
+    mut peer_ids: Vec<u64>,
+    app_store: B,
+    role_monitor: RoleMonitor,
+) -> RaftNode<MemLogStorage, B> {
     let mut conf = JournalConf::with_test();
     conf.rpc_retry_max_duration_ms = 0;
     conf.conn_retry_max_duration_ms = 0;
@@ -62,7 +75,7 @@ fn test_node_with_voters(
         rt.clone(),
         node_id,
         log_store,
-        HashAppStorage::new(),
+        app_store,
         client.clone(),
         &conf,
     );
@@ -91,7 +104,7 @@ fn test_node_with_voters(
         receiver,
         sender,
         group,
-        role_monitor: RoleMonitor::new(),
+        role_monitor,
         tick_interval: Duration::from_millis(conf.raft_tick_interval_ms),
         max_batch_size: conf.raft_batch_size.max(1),
         snapshot_interval_ms: 0,
@@ -99,6 +112,57 @@ fn test_node_with_voters(
         snapshot_entries: conf.snapshot_entries,
         last_snapshot_ms: 0,
         last_snapshot_op_id: 0,
+    }
+}
+
+#[derive(Clone)]
+struct RoleRecordingAppStorage {
+    inner: HashAppStorage<String, String>,
+    ctl: StateCtl,
+    replayed_as_leader: Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+impl RoleRecordingAppStorage {
+    fn new(inner: HashAppStorage<String, String>, ctl: StateCtl) -> Self {
+        Self {
+            inner,
+            ctl,
+            replayed_as_leader: Arc::new(std::sync::Mutex::new(vec![])),
+        }
+    }
+
+    fn replayed_as_leader(&self) -> Vec<bool> {
+        self.replayed_as_leader.lock().unwrap().clone()
+    }
+}
+
+impl AppStorage for RoleRecordingAppStorage {
+    async fn apply(&self, wait: bool, msg: ApplyMsg) -> RaftResult<()> {
+        if matches!(msg, ApplyMsg::Scan(_)) {
+            let leader = self.ctl.state::<RoleState>() == RoleState::Leader;
+            self.replayed_as_leader.lock().unwrap().push(leader);
+        }
+        self.inner.apply(wait, msg).await
+    }
+
+    fn get_fsm_state(&self) -> FsmState {
+        self.inner.get_fsm_state()
+    }
+
+    async fn role_change(&self, role: StateRole) -> RaftResult<()> {
+        self.inner.role_change(role).await
+    }
+
+    async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
+        self.inner.create_snapshot().await
+    }
+
+    async fn apply_snapshot(&self, snapshot: SnapshotData) -> RaftResult<()> {
+        self.inner.apply_snapshot(snapshot).await
+    }
+
+    fn snapshot_dir(&self, snapshot_id: u64) -> RaftResult<String> {
+        self.inner.snapshot_dir(snapshot_id)
     }
 }
 
@@ -119,6 +183,16 @@ fn test_rocks_node_with_conf(
     id: u64,
     conf: &mut JournalConf,
 ) -> RaftNode<RocksLogStorage, HashAppStorage<String, String>> {
+    test_rocks_node_with_app(rt, id, conf, HashAppStorage::new(), RoleMonitor::new())
+}
+
+fn test_rocks_node_with_app<B: AppStorage>(
+    rt: Arc<Runtime>,
+    id: u64,
+    conf: &mut JournalConf,
+    app_store: B,
+    role_monitor: RoleMonitor,
+) -> RaftNode<RocksLogStorage, B> {
     conf.rpc_retry_max_duration_ms = 0;
     conf.conn_retry_max_duration_ms = 0;
     let root = std::env::temp_dir().join(format!(
@@ -162,7 +236,7 @@ fn test_rocks_node_with_conf(
         rt.clone(),
         node_id,
         log_store,
-        HashAppStorage::new(),
+        app_store,
         client.clone(),
         conf,
     );
@@ -191,7 +265,7 @@ fn test_rocks_node_with_conf(
         receiver,
         sender,
         group,
-        role_monitor: RoleMonitor::new(),
+        role_monitor,
         tick_interval: Duration::from_millis(conf.raft_tick_interval_ms),
         max_batch_size: conf.raft_batch_size.max(1),
         snapshot_interval_ms: 0,
@@ -299,6 +373,7 @@ fn hold_current_ready<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>) {
     node.pending_ready = Some(PendingReady {
         ready,
         soft_state: None,
+        demoted: false,
     });
 }
 
@@ -684,14 +759,157 @@ fn leader_step_down_reinstalls_the_local_snapshot_and_reanchors_the_markers() {
             raft_state: raft::StateRole::Follower,
         }),
         &mut promise,
+        false,
     ))
     .unwrap();
+
+    assert!(
+        !node.role_monitor.is_leader(),
+        "the step-down must be published before the local snapshot is reinstalled"
+    );
 
     assert_eq!(
         node.last_snapshot_op_id, 100,
         "the local snapshot reinstall must re-anchor the entry counter"
     );
     assert!(node.last_snapshot_ms > 0);
+
+    drop(node);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+// The reinstall is the only follower-mode replay of the committed tail, so the
+// step-down has to be visible from inside it. A post-completion role check
+// would also pass with the old ordering.
+#[test]
+fn finish_ready_publishes_the_step_down_before_the_snapshot_reinstall() {
+    let rt = Arc::new(Runtime::new("test-step-down-role", 2, 2));
+    let monitor = RoleMonitor::new();
+    let app = RoleRecordingAppStorage::new(HashAppStorage::new(), monitor.read_ctl());
+    let mut conf = JournalConf::with_test();
+    let mut node = test_rocks_node_with_app(rt.clone(), 1, &mut conf, app.clone(), monitor);
+    let journal_dir = conf.journal_dir.clone();
+
+    seed_applied_state(&node, 100);
+    node.last_snapshot_op_id = 0;
+    node.last_snapshot_ms = 0;
+    hold_current_ready(&mut node);
+    let pending = node.pending_ready.take().unwrap();
+
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: 1,
+        raft_state: StateRole::Leader,
+    });
+    assert!(node.role_monitor.is_leader());
+    assert!(!node.is_leader());
+
+    let mut promise = HashMap::new();
+    rt.block_on(node.finish_ready(
+        pending.ready,
+        Some(SoftState {
+            leader_id: 2,
+            raft_state: StateRole::Follower,
+        }),
+        &mut promise,
+        false,
+    ))
+    .unwrap();
+
+    let replayed = app.replayed_as_leader();
+    assert!(!replayed.is_empty(), "the reinstall must replay the tail");
+    assert!(
+        !replayed.iter().any(|leader| *leader),
+        "the follower-mode replay must observe the published Follower role"
+    );
+
+    drop(node);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+// `on_ready` parks a snapshot-bearing Ready; the business role must already be
+// follower while the snapshot is still pending.
+#[test]
+fn pending_snapshot_publishes_the_step_down_before_parking_the_ready() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone(), 1);
+    node.recovery.active = false;
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: 1,
+        raft_state: StateRole::Leader,
+    });
+    assert!(node.role_monitor.is_leader());
+
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 5;
+    snapshot.mut_metadata().term = 3;
+    snapshot.mut_metadata().mut_conf_state().voters = vec![1, 2, 3];
+
+    let mut message = Message::default();
+    message.set_msg_type(MessageType::MsgSnapshot);
+    message.from = 2;
+    message.to = 1;
+    message.term = 3;
+    message.set_snapshot(snapshot);
+
+    node.raw.step(message).unwrap();
+    assert!(node.raw.has_ready());
+
+    let mut promise = HashMap::new();
+    rt.block_on(node.on_ready(&mut promise)).unwrap();
+
+    assert!(
+        node.pending_ready.is_some(),
+        "the snapshot Ready must be parked"
+    );
+    assert!(
+        !node.role_monitor.is_leader(),
+        "on_ready must publish the step-down while the snapshot is pending"
+    );
+}
+
+// `on_ready` already published the step-down before parking the Ready, so when
+// the snapshot completes the monitor no longer reports leader and only the
+// recorded transition keeps the follower-mode reinstall alive.
+#[test]
+fn pending_snapshot_completion_keeps_the_follower_mode_reinstall() {
+    let rt = Arc::new(Runtime::new("test-pending-step-down-role", 2, 2));
+    let monitor = RoleMonitor::new();
+    let app = RoleRecordingAppStorage::new(HashAppStorage::new(), monitor.read_ctl());
+    let mut conf = JournalConf::with_test();
+    let mut node = test_rocks_node_with_app(rt.clone(), 1, &mut conf, app.clone(), monitor);
+    let journal_dir = conf.journal_dir.clone();
+
+    seed_applied_state(&node, 100);
+    hold_current_ready(&mut node);
+    let mut pending = node.pending_ready.take().unwrap();
+    pending.soft_state = Some(SoftState {
+        leader_id: 2,
+        raft_state: StateRole::Follower,
+    });
+    pending.demoted = true;
+
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: 1,
+        raft_state: StateRole::Leader,
+    });
+    assert!(node.role_monitor.is_leader());
+    node.role_monitor.step_down();
+    assert!(!node.role_monitor.is_leader());
+    node.pending_ready = Some(pending);
+
+    let mut promise = HashMap::new();
+    rt.block_on(node.complete_pending_snapshot(Ok(()), &mut promise))
+        .unwrap();
+
+    let replayed = app.replayed_as_leader();
+    assert!(
+        !replayed.is_empty(),
+        "resuming a parked snapshot must still reinstall it and replay the tail"
+    );
+    assert!(
+        !replayed.iter().any(|leader| *leader),
+        "the reinstall must replay as a follower"
+    );
 
     drop(node);
     let _ = std::fs::remove_dir_all(&journal_dir);
