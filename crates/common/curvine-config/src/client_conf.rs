@@ -421,7 +421,12 @@ impl Default for ClientConf {
             conn_retry_min_sleep_ms: 100,
             conn_retry_max_sleep_ms: 2 * 1000,
 
-            rpc_retry_max_duration_ms: 120 * 1000,
+            // Foreground metadata RPCs (stat, list, create, ...) block a FUSE
+            // request, so the retry budget is also their response deadline.
+            // 60s is long enough for a raft failover and short enough that a
+            // client does not wait two minutes on a dead control plane.
+            // `ClusterConnector::rpc` honours this as a hard deadline.
+            rpc_retry_max_duration_ms: 60 * 1000,
             rpc_retry_min_sleep_ms: 100,
             rpc_retry_max_sleep_ms: 10 * 1000,
 
@@ -492,6 +497,14 @@ impl Default for ClientConf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_rpc_budget_defaults_to_one_minute() {
+        // The retry budget is also the response deadline of a foreground
+        // metadata RPC (#1815), so keep it at 60s unless a deployment opts out.
+        let conf = ClientConf::default();
+        assert_eq!(conf.rpc_retry_max_duration_ms, 60 * 1000);
+    }
 
     #[test]
     fn test_seek_absorb_window_default_off() {
