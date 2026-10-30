@@ -724,10 +724,12 @@ impl Default for FuseConf {
 
             path_lock_stripes: 1024,
 
-            // Dedicated file name so a fuse process never shares the client/sdk
-            // log ("curvine.log") when both run on the same host. Configs that
-            // omit `[fuse] log` inherit this instead of falling back to the
-            // empty name, which Logger turns into "curvine".
+            // Dedicated file name so a fuse process does not share the
+            // client/sdk log ("curvine.log") by default. Only configs that omit
+            // `[fuse] log` inherit this: a partial table such as
+            // `log = { level = "debug" }` still takes `file_name` from LogConf's
+            // own serde default (empty), which Logger turns into "curvine", as
+            // master/worker/transfer do today.
             log: LogConf {
                 file_name: "fuse.log".to_string(),
                 ..Default::default()
