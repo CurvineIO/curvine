@@ -504,7 +504,6 @@ mod tests {
         // metadata RPC (#1815), so keep it at 60s unless a deployment opts out.
         let conf = ClientConf::default();
         assert_eq!(conf.rpc_retry_max_duration_ms, 60 * 1000);
-        assert!(conf.rpc_retry_max_duration_ms <= 60 * 1000);
     }
 
     #[test]

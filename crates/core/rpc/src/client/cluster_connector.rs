@@ -25,7 +25,7 @@ use log::{debug, warn};
 use prost::Message as PMessage;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Cluster connection manager
 // 1. Request the master, automatically obtain the active master node, handle retries and master switching
@@ -167,8 +167,9 @@ impl ClusterConnector {
         self.timeout_rpc_within(id, msg, self.rpc_timeout).await
     }
 
-    /// RPC to one node, with connection establishment and the request both
-    /// bounded by `timeout`.
+    /// RPC to one node, with connection establishment and the request sharing
+    /// one `timeout` deadline: a slow connect leaves only the rest of the
+    /// timeout for the request, so one call never takes longer than `timeout`.
     ///
     /// `msg` is consumed by the request, so it is only moved in after the
     /// connection is up; a connection timeout therefore leaves no half-used
@@ -182,6 +183,7 @@ impl ClusterConnector {
     where
         E: ErrorExt + From<IOError> + From<CommonError>,
     {
+        let deadline = Instant::now() + timeout;
         let client = match tokio::time::timeout(timeout, self.get_client_with_id(id)).await {
             Ok(Ok(client)) => client,
             Ok(Err(e)) => return Err((true, e.into())),
@@ -197,7 +199,8 @@ impl ClusterConnector {
             }
         };
 
-        match client.timeout_rpc(timeout, msg).await {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match client.timeout_rpc(remaining, msg).await {
             Ok(v) => match v.check_error_ext::<E>() {
                 Err(e) => Err((e.should_retry(), e)),
                 Ok(_) => Ok(v),
@@ -263,7 +266,13 @@ impl ClusterConnector {
 
         // Send a request to the current leader node.
         if let Some(id) = self.leader_id() {
-            let leader_timeout = self.rpc_timeout.min(policy.remaining());
+            // With other members to fail over to, the probe may use at most half
+            // of the budget; otherwise a stalled leader would consume the whole
+            // budget and the call would fail without trying any other node.
+            let mut leader_timeout = self.rpc_timeout.min(policy.remaining());
+            if self.group.len() > 1 {
+                leader_timeout = leader_timeout.min(policy.remaining() / 2);
+            }
             match self
                 .timeout_rpc_within(id, msg.clone(), leader_timeout)
                 .await

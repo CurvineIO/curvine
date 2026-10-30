@@ -21,10 +21,13 @@
 //! connection and never answers, which is what an unreachable control plane
 //! looks like once the connection is up but the service does not respond.
 
-use curvine_io::IOError;
-use curvine_net::net::NodeAddr;
+use curvine_core_error::{CommonErrorExt, CommonResultExt};
+use curvine_io::{DataSlice, IOError};
+use curvine_net::net::{ConnState, NetUtils, NodeAddr};
 use curvine_rpc::client::{ClientConf, ClusterConnector};
-use curvine_rpc::message::{Builder, MessageBuilder};
+use curvine_rpc::handler::{HandlerService, MessageHandler};
+use curvine_rpc::message::{Builder, Message, MessageBuilder};
+use curvine_rpc::server::{RpcServer, ServerConf};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -101,6 +104,68 @@ fn rpc_retry_budget_is_a_deadline() {
         assert!(
             elapsed >= Duration::from_millis(BUDGET_MS),
             "rpc() gave up before spending its budget: {:?}",
+            elapsed
+        );
+    });
+}
+
+struct EchoHandler;
+
+impl MessageHandler for EchoHandler {
+    type Error = CommonErrorExt;
+
+    fn handle(&self, msg: &Message) -> CommonResultExt<Message> {
+        Ok(msg.success_with_data(None, DataSlice::Empty))
+    }
+}
+
+struct EchoService;
+
+impl HandlerService for EchoService {
+    type Item = EchoHandler;
+
+    fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
+        EchoHandler
+    }
+}
+
+/// A stalled cached leader must not consume the whole budget: with a healthy
+/// member available, `rpc()` must still fail over to it within the budget.
+#[test]
+fn stalled_leader_still_fails_over_within_budget() {
+    let conf = ServerConf::with_hostname("127.0.0.1", NetUtils::hold_available_port());
+    let server = RpcServer::new(conf, EchoService);
+    let healthy_port = server.bind_addr().port;
+    let server_rt = server.clone_rt();
+    let mut listener = server.start();
+    server_rt
+        .block_on(listener.wait_startup())
+        .expect("healthy master must reach the Running state");
+
+    // The per-node timeout is longer than the budget, so an unclamped leader
+    // probe would spend the whole budget on the stalled leader.
+    let connector = connector(stalled_endpoint(), BUDGET_MS, 3_000);
+    connector
+        .add_node(NodeAddr::new(2, "127.0.0.1", healthy_port))
+        .unwrap();
+    let rt = connector.clone_runtime();
+
+    rt.block_on(async move {
+        let msg = MessageBuilder::new_rpc(1i8).build();
+        let start = Instant::now();
+        let res = connector.rpc::<IOError>(msg).await;
+        let elapsed = start.elapsed();
+
+        res.unwrap_or_else(|e| panic!("rpc() did not fail over after {elapsed:?}: {e}"));
+        assert_eq!(
+            connector.leader_id(),
+            Some(2),
+            "the healthy member must become the cached leader"
+        );
+        assert!(
+            elapsed < Duration::from_millis(BUDGET_MS),
+            "failover must finish within the {} ms budget: {:?}",
+            BUDGET_MS,
             elapsed
         );
     });
