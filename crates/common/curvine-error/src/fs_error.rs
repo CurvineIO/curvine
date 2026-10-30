@@ -853,6 +853,20 @@ mod tests {
     use curvine_core_error::{ErrorExt, ErrorImpl};
 
     #[test]
+    fn unknown_error_kind_from_a_newer_peer_degrades_to_common() {
+        // A new worker reports StorageUnavailable (kind 40). An older client
+        // does not know it: decoding must keep the message instead of failing.
+        let error: FsError = FsError::storage_unavailable("storage_unavailable kind=io_error");
+        let bytes = error.encode();
+        // Simulate an older binary by decoding with a kind it cannot name.
+        let mut raw = bytes.clone();
+        raw[..4].copy_from_slice(&9999_i32.to_be_bytes());
+        let decoded: FsError = FsError::decode(raw);
+        assert!(matches!(decoded, FsError::Common(_)));
+        assert!(decoded.to_string().contains("storage_unavailable"));
+    }
+
+    #[test]
     pub fn error_test() {
         let error: FsError = FsError::DiskOutOfSpace(ErrorImpl::with_source("disk full".into()));
         println!("error {:?}", error);

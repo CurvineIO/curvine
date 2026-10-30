@@ -135,8 +135,62 @@ pub struct StorageInfo {
 }
 
 impl StorageInfo {
+    /// Whether this directory may take new writes.
+    ///
+    /// `failed` is checked as well as `health_state`: an older worker only
+    /// reports the boolean, and a mixed-version cluster must not treat its
+    /// failed directory as healthy just because the newer fields are absent.
     pub fn is_usable(&self) -> bool {
-        self.health_state.is_usable()
+        !self.failed && self.health_state.is_usable()
+    }
+}
+
+#[cfg(test)]
+mod health_compat_test {
+    use super::*;
+    use crate::ProtoUtils;
+    use curvine_proto::StorageInfoProto;
+
+    fn proto(failed: bool, health_state: Option<u32>) -> StorageInfoProto {
+        StorageInfoProto {
+            dir_id: 1,
+            storage_id: "d1".to_string(),
+            failed,
+            capacity: 100,
+            available: 100,
+            fs_used: 0,
+            non_fs_used: 0,
+            reserved_bytes: 0,
+            storage_type: StorageType::Disk.into(),
+            block_num: 0,
+            dir_path: "/data".to_string(),
+            health_state,
+            fault_kind: None,
+            unhealthy_since_ms: None,
+        }
+    }
+
+    #[test]
+    fn older_worker_failed_flag_still_means_unusable() {
+        // An older worker sends only `failed`; the newer fields are absent.
+        let info = ProtoUtils::storage_info_from_pb(proto(true, None));
+        assert_eq!(info.health_state, HealthState::Healthy);
+        assert!(!info.is_usable(), "legacy failed dir must stay unusable");
+    }
+
+    #[test]
+    fn newer_worker_health_state_is_used() {
+        let info = ProtoUtils::storage_info_from_pb(proto(
+            false,
+            Some(u8::from(HealthState::Unusable) as u32),
+        ));
+        assert!(!info.is_usable());
+    }
+
+    #[test]
+    fn healthy_directory_is_usable() {
+        let info = ProtoUtils::storage_info_from_pb(proto(false, Some(0)));
+        assert!(info.is_usable());
     }
 }
 
