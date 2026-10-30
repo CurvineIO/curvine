@@ -262,12 +262,10 @@ impl BlockLayout for FileLayout {
         logical_len: i64,
     ) -> IOResult<BlockReadContext> {
         let file = Self::block_file(dir, meta)?;
-        // Block metadata can briefly retain the pre-resize length while a new
-        // active generation is already published. The opened file is the
-        // source of truth for bytes that can be read physically.
+        // The opened file is the source of truth for bytes that can be read
+        // physically, bounded by the logical length below.
         let inner = OpenOptions::new().read(true).open(&file)?;
         let device = LocalFile::from_file(&file, inner)?;
-        let physical_len = device.len().min(logical_len);
         if off < 0 || off > logical_len {
             return err_box!(
                 "Invalid block offset: {}, block length: {}",
@@ -275,6 +273,20 @@ impl BlockLayout for FileLayout {
                 logical_len
             );
         }
+        // Only the logical range beyond the committed worker length may be a
+        // sparse tail (master-side truncate up). Bytes the worker committed
+        // must be present; a shorter file means the block was truncated or
+        // damaged, and zero-filling it would return corrupted data as success.
+        let committed_len = meta.len.min(logical_len);
+        if device.len() < committed_len {
+            return err_box!(
+                "Block {} is truncated: committed length {}, file length {}",
+                meta.id,
+                committed_len,
+                device.len()
+            );
+        }
+        let physical_len = device.len().min(logical_len);
         BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)
     }
 

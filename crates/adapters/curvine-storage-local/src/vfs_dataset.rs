@@ -1345,18 +1345,18 @@ mod test {
     }
 
     #[test]
-    fn file_reader_uses_open_file_length_when_metadata_is_stale() -> CommonResult<()> {
-        let mut ds = create_data_set(true, "reader-stale-physical-len");
+    fn file_reader_zero_fills_logical_tail_beyond_committed_len() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "reader-sparse-logical-tail");
         let mut block = ExtendedBlock::with_mem(1, "50B")?;
         let writing = ds.open_block(&block)?;
         ds.write_test_data(&writing, "20B")?;
         block.len = 20;
         let finalized = ds.finalize_block(&block)?;
 
-        let mut stale = finalized.clone();
-        stale.len = 50;
-        let dir = ds.find_dir(stale.dir_id())?;
-        let mut reader = FileLayout.open_reader(dir, &stale, 0, 50)?;
+        // Master-side truncate up: logical length 50 exceeds the 20 committed
+        // worker bytes, so the tail is a legitimate sparse hole.
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 50)?;
         let region = reader.read_region(false, 50)?;
         let bytes = match region {
             DataSlice::Buffer(bytes) => bytes,
@@ -1365,6 +1365,51 @@ mod test {
 
         assert_eq!(&bytes[..20], b"A".repeat(20).as_slice());
         assert!(bytes[20..].iter().all(|byte| *byte == 0));
+        Ok(())
+    }
+
+    #[test]
+    fn file_reader_rejects_file_shorter_than_committed_len() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "reader-truncated-block");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let writing = ds.open_block(&block)?;
+        ds.write_test_data(&writing, "50B")?;
+        block.len = 50;
+        let finalized = ds.finalize_block(&block)?;
+
+        // Truncate the committed block file behind the worker's back (#1812).
+        let path = FileLayout::block_path(ds.find_dir(finalized.dir_id())?, &finalized)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_len(20)?;
+
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let err = match FileLayout.open_reader(dir, &finalized, 0, 50) {
+            Ok(_) => panic!("truncated block must not be served as a sparse tail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("is truncated"), "unexpected error: {err}");
+        // The message reaches the client; it must not expose worker paths.
+        let path_str = path.to_string_lossy();
+        assert!(!err.contains(path_str.as_ref()), "error leaks path: {err}");
+
+        // A read bounded below the committed length but beyond the surviving
+        // bytes is also rejected.
+        let dir = ds.find_dir(finalized.dir_id())?;
+        assert!(FileLayout.open_reader(dir, &finalized, 0, 30).is_err());
+
+        // Master-side truncate down to the surviving bytes stays readable:
+        // only min(meta.len, logical_len) bytes must be present.
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 20)?;
+        let region = reader.read_region(false, 50)?;
+        let bytes = match region {
+            DataSlice::Buffer(bytes) => bytes,
+            other => panic!("expected bounded buffered read, got {other:?}"),
+        };
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(&bytes[..], b"A".repeat(20).as_slice());
         Ok(())
     }
 
