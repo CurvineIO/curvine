@@ -65,6 +65,15 @@ pub struct VfsDataset {
     num_blocks_to_delete: AtomicUsize,
 }
 
+/// Health view of one data directory, for metrics.
+#[derive(Debug, Clone)]
+pub struct DirHealth {
+    pub dir_id: u32,
+    pub dir_path: String,
+    pub storage_type: StorageType,
+    pub state: curvine_model::HealthState,
+}
+
 pub struct RemovedBlockState {
     pub meta: BlockMeta,
     committed: Option<BlockMeta>,
@@ -268,6 +277,19 @@ impl VfsDataset {
 
     pub fn dir_iter(&self) -> Values<'_, u32, Arc<VfsDir>> {
         self.dir_list.dir_iter()
+    }
+
+    /// Per-directory health for the `dir_health_state` metric.
+    pub fn dir_health(&self) -> Vec<DirHealth> {
+        self.dir_list
+            .dir_iter()
+            .map(|dir| DirHealth {
+                dir_id: dir.id(),
+                dir_path: dir.path_str().to_string(),
+                storage_type: dir.storage_type(),
+                state: dir.health_state(),
+            })
+            .collect()
     }
 
     /// Directories plus the health policy, so callers can probe without

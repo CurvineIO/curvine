@@ -51,6 +51,27 @@ pub struct WorkerMetrics {
     pub(crate) disk_free_ratio: GaugeVec,
     /// Writes rejected because storage admission reported insufficient capacity.
     pub(crate) disk_full_rejected_writes: Counter,
+
+    /// Health state per directory: 0=healthy, 1=suspect, 2=unusable.
+    /// Label by dir so "which disks are degraded" is one query.
+    pub(crate) dir_health_state: GaugeVec,
+    /// Faults observed per directory, labelled by fault kind so unhealthy
+    /// disks can be filtered and stacked by error type.
+    pub(crate) dir_fault_total: CounterVec,
+    /// State machine transitions, labelled by fault kind: flapping and
+    /// per-error-type churn are visible without parsing logs.
+    pub(crate) health_transition_total: CounterVec,
+    /// Probe results per directory (ok/error), i.e. how often self-check runs.
+    pub(crate) health_check_total: CounterVec,
+    /// Probe latency; a rising tail means a hung or slow mount.
+    pub(crate) health_check_duration_seconds: HistogramVec,
+    /// Worker-declared fact: may this node take new writes? 0/1.
+    pub(crate) accepting_allocations: Gauge,
+    /// Directories currently unusable, for alerting without labels.
+    pub(crate) unhealthy_dirs: Gauge,
+    /// Admission rejections labelled by reason, so "broken disk" and "full
+    /// disk" can be told apart in dashboards and alerts.
+    pub(crate) admission_reject_total: CounterVec,
 }
 
 impl WorkerMetrics {
@@ -136,9 +157,85 @@ impl WorkerMetrics {
                 "disk_full_rejected_writes",
                 "Writes rejected because the storage layer reported insufficient capacity",
             )?,
+            dir_health_state: m::new_gauge_vec(
+                "dir_health_state",
+                "Per-disk health state: 0=healthy, 1=suspect, 2=unusable",
+                &["dir_id", "dir_path", "storage_type"],
+            )?,
+            dir_fault_total: m::new_counter_vec(
+                "dir_fault_total",
+                "Probe faults per disk, labelled by fault kind",
+                &["dir_id", "dir_path", "kind"],
+            )?,
+            health_transition_total: m::new_counter_vec(
+                "health_transition_total",
+                "Health state transitions, labelled by from/to/kind",
+                &["from", "to", "kind"],
+            )?,
+            health_check_total: m::new_counter_vec(
+                "health_check_total",
+                "Health probe results per disk",
+                &["dir_id", "outcome"],
+            )?,
+            health_check_duration_seconds: m::new_histogram_vec_with_buckets(
+                "health_check_duration_seconds",
+                "Health probe latency in seconds",
+                &["probe"],
+                &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
+            )?,
+            accepting_allocations: m::new_gauge(
+                "worker_accepting_allocations",
+                "1 when the worker accepts new writes, 0 when every disk is unusable",
+            )?,
+            unhealthy_dirs: m::new_gauge("worker_unhealthy_dirs", "Data dirs currently unusable")?,
+            admission_reject_total: m::new_counter_vec(
+                "admission_reject_total",
+                "Write admissions rejected, labelled by reason",
+                &["reason"],
+            )?,
         };
 
         Ok(wm)
+    }
+
+    /// Record one storage probe round.
+    pub fn record_probe(&self, report: &curvine_storage_local::ProbeReport) {
+        let dir_id = report.dir_id.to_string();
+        self.health_check_total
+            .with_label_values(&[&dir_id, if report.ok { "ok" } else { "error" }])
+            .inc();
+        self.health_check_duration_seconds
+            .with_label_values(&["storage"])
+            .observe(report.elapsed.as_secs_f64());
+        self.dir_health_state
+            .with_label_values(&[&dir_id, &report.dir_path, report.storage_type.as_str_name()])
+            .set(health_state_code(report.state));
+
+        let Some(transition) = report.transition.as_ref() else {
+            return;
+        };
+        let kind = transition.fault.as_str_name();
+        self.health_transition_total
+            .with_label_values(&[
+                transition.from.as_str_name(),
+                transition.to.as_str_name(),
+                kind,
+            ])
+            .inc();
+        if !transition.is_recovery() {
+            self.dir_fault_total
+                .with_label_values(&[&dir_id, &report.dir_path, kind])
+                .inc();
+        }
+    }
+
+    /// Record a rejected write admission. `reason` is a stable machine token
+    /// (`storage_unavailable`, `disk_out_of_space`), not a message.
+    pub fn record_admission_reject(&self, reason: &str) {
+        self.disk_full_rejected_writes.inc();
+        self.admission_reject_total
+            .with_label_values(&[reason])
+            .inc();
     }
 
     pub fn text_output(&self) -> CommonResult<String> {
@@ -154,6 +251,21 @@ impl WorkerMetrics {
         self.storage_failed.set(state.failed_storage_count() as i64);
 
         self.store_total_disks.set(state.storage_count() as i64);
+
+        for dir in state.dir_health() {
+            self.dir_health_state
+                .with_label_values(&[
+                    &dir.dir_id.to_string(),
+                    &dir.dir_path,
+                    dir.storage_type.as_str_name(),
+                ])
+                .set(health_state_code(dir.state));
+        }
+
+        self.unhealthy_dirs.set(state.failed_storage_count() as i64);
+        self.accepting_allocations.set(i64::from(
+            state.storage_count() == 0 || state.failed_storage_count() < state.storage_count(),
+        ));
 
         for d in state.dir_free_ratios() {
             let dir_id = d.dir_id.to_string();
@@ -175,5 +287,38 @@ impl WorkerMetrics {
 impl Debug for WorkerMetrics {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "WorkerMetrics")
+    }
+}
+
+/// Metric encoding of a health state. Kept explicit (not `as i64`) so the
+/// dashboard contract cannot drift with enum ordering.
+pub(crate) fn health_state_code(state: curvine_model::HealthState) -> i64 {
+    match state {
+        curvine_model::HealthState::Healthy => 0,
+        curvine_model::HealthState::Suspect => 1,
+        curvine_model::HealthState::Unusable => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::health_state_code;
+    use curvine_model::HealthState;
+
+    #[test]
+    fn health_state_metric_codes_are_stable() {
+        assert_eq!(health_state_code(HealthState::Healthy), 0);
+        assert_eq!(health_state_code(HealthState::Suspect), 1);
+        assert_eq!(health_state_code(HealthState::Unusable), 2);
+    }
+
+    #[test]
+    fn fault_kind_label_names_are_stable() {
+        // Dashboards and saved queries key off these strings.
+        use curvine_model::FaultKind;
+        assert_eq!(FaultKind::IoError.as_str_name(), "io_error");
+        assert_eq!(FaultKind::PathMissing.as_str_name(), "path_missing");
+        assert_eq!(FaultKind::ReadOnly.as_str_name(), "read_only");
+        assert_eq!(FaultKind::SpaceOut.as_str_name(), "space_out");
     }
 }

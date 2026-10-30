@@ -201,9 +201,9 @@ impl DirList {
     /// failures and recovers automatically after `successes_to_recover`
     /// consecutive successes, so a transient error no longer disables a disk
     /// until the worker restarts. Each transition is logged once.
-    pub fn probe_all(&self) {
+    pub fn probe_all(&self) -> Vec<ProbeReport> {
         let dirs: Vec<Arc<VfsDir>> = self.dir_iter().cloned().collect();
-        probe_dirs(&dirs, &self.health_policy);
+        probe_dirs(&dirs, &self.health_policy)
     }
 
     /// Per-directory state from the last probe. Pure memory: the heartbeat uses
@@ -279,18 +279,44 @@ impl DirList {
     }
 }
 
+/// Outcome of probing one directory, for metrics and reporting.
+#[derive(Debug, Clone)]
+pub struct ProbeReport {
+    pub dir_id: u32,
+    pub dir_path: String,
+    pub storage_type: StorageType,
+    pub state: HealthState,
+    pub ok: bool,
+    pub elapsed: std::time::Duration,
+    pub transition: Option<HealthTransition>,
+}
+
 /// Probe the given directories and advance their health state machines.
 ///
 /// Free function so callers can collect the directories under a lock and run
 /// the syscalls *without* holding it: a hung mount must never stall writers.
-pub fn probe_dirs(dirs: &[Arc<VfsDir>], policy: &HealthPolicy) {
+pub fn probe_dirs(dirs: &[Arc<VfsDir>], policy: &HealthPolicy) -> Vec<ProbeReport> {
     let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
-    for dir in dirs {
-        let outcome = dir.probe();
-        if let Some(transition) = dir.observe_health(&outcome, policy, now_ms) {
-            log_health_transition(dir, &transition);
-        }
-    }
+    dirs.iter()
+        .map(|dir| {
+            let started = std::time::Instant::now();
+            let outcome = dir.probe();
+            let elapsed = started.elapsed();
+            let transition = dir.observe_health(&outcome, policy, now_ms);
+            if let Some(t) = transition.as_ref() {
+                log_health_transition(dir, t);
+            }
+            ProbeReport {
+                dir_id: dir.id(),
+                dir_path: dir.path_str().to_string(),
+                storage_type: dir.storage_type(),
+                state: dir.health_state(),
+                ok: outcome.is_ok(),
+                elapsed,
+                transition,
+            }
+        })
+        .collect()
 }
 
 fn log_health_transition(dir: &VfsDir, transition: &HealthTransition) {

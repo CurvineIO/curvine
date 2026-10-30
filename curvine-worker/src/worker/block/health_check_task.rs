@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::BlockStore;
+use crate::worker::Worker;
 use curvine_error::FsResult;
 use curvine_rpc::server::ServerState;
 use curvine_runtime::runtime::{LoopTask, ScheduledExecutor};
@@ -41,8 +42,15 @@ impl LoopTask for HealthCheckTask {
     type Error = curvine_error::FsError;
 
     fn run(&self) -> FsResult<()> {
-        if let Err(e) = self.store.probe_storages() {
-            error!("storage health probe failed: {}", e);
+        match self.store.probe_storages() {
+            Ok(reports) => {
+                if let Ok(metrics) = Worker::get_metrics() {
+                    for report in &reports {
+                        metrics.record_probe(report);
+                    }
+                }
+            }
+            Err(e) => error!("storage health probe failed: {}", e),
         }
         Ok(())
     }

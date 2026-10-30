@@ -529,13 +529,12 @@ impl BlockStore {
     /// Runs on the health-check loop, never on the heartbeat path. The
     /// directories are cloned out of the lock first so a hung mount cannot
     /// block writers for the duration of the probe.
-    pub fn probe_storages(&self) -> CommonResult<()> {
+    pub fn probe_storages(&self) -> CommonResult<Vec<curvine_storage_local::ProbeReport>> {
         let (dirs, policy) = {
             let state = self.read()?;
             state.dir_snapshot()
         };
-        curvine_storage_local::probe_dirs(&dirs, &policy);
-        Ok(())
+        Ok(curvine_storage_local::probe_dirs(&dirs, &policy))
     }
 }
 

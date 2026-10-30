@@ -70,8 +70,12 @@ fn broken_data_dir_is_reported_and_recovers() -> FsResult<()> {
             conf.worker.health.consecutive_successes = 2;
         })
         .build()?;
-    testing.start_cluster()?;
-
+    let cluster = testing.start_cluster()?;
+    let worker_web_ports: Vec<u16> = cluster
+        .worker_conf
+        .iter()
+        .map(|conf| conf.worker.web_port)
+        .collect();
     let conf = testing.get_active_cluster_conf()?;
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = Ctx {
@@ -99,10 +103,32 @@ fn broken_data_dir_is_reported_and_recovers() -> FsResult<()> {
         "master must stop routing to an unhealthy node"
     );
 
-    // 2) The cluster stays writable: the healthy node absorbs the writes.
+    // 2) The fault is queryable by state and by error type: this is what the
+    // dashboards and `cv node check` consumers filter on.
+    let metrics = wait_for_metrics(&worker_web_ports, "kind=\"path_missing\"")?;
+    assert_eq!(
+        gauge_value(&metrics, "worker_unhealthy_dirs"),
+        Some(1.0),
+        "unhealthy dir count must be exported"
+    );
+    assert_eq!(
+        gauge_value(&metrics, "worker_accepting_allocations"),
+        Some(0.0),
+        "the worker must advertise that it takes no writes"
+    );
+    assert!(
+        metrics.contains("health_transition_total{"),
+        "state transitions must be countable"
+    );
+    assert!(
+        metrics.contains("dir_health_state{"),
+        "per-disk health state must be exported"
+    );
+
+    // 3) The cluster stays writable: the healthy node absorbs the writes.
     write_until_success(&ctx, "/health-e2e-during.log")?;
 
-    // 3) Restoring the directory brings the node back without a restart.
+    // 4) Restoring the directory brings the node back without a restart.
     std::fs::rename(&park, &dir)?;
     let worker = wait_for_worker(&ctx, &broken_worker, |w| w.accepting_allocations())?;
     assert!(
@@ -171,6 +197,45 @@ fn wait_for_worker(
     Err(curvine_error::FsError::common(format!(
         "worker {worker_id} did not reach the expected health state in time: {last}"
     )))
+}
+
+/// Scrape each worker's `/metrics` until one reports `needle`.
+fn wait_for_metrics(ports: &[u16], needle: &str) -> FsResult<String> {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        for port in ports {
+            if let Some(text) = scrape(*port) {
+                if text.contains(needle) {
+                    return Ok(text);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(curvine_error::FsError::common(format!(
+                "no worker exported {needle} within the timeout"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Value of a (possibly labelled) gauge sample, e.g. `worker_unhealthy_dirs{...} 1`.
+fn gauge_value(text: &str, name: &str) -> Option<f64> {
+    text.lines()
+        .filter(|line| line.starts_with(name))
+        .find_map(|line| line.split_whitespace().last()?.parse().ok())
+}
+
+fn scrape(port: u16) -> Option<String> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream
+        .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .ok()?;
+    let mut body = String::new();
+    stream.read_to_string(&mut body).ok()?;
+    Some(body)
 }
 
 fn unhealthy_dir(worker: &WorkerInfo) -> Option<&StorageInfo> {

@@ -25,13 +25,14 @@ use curvine_runtime::common::{ByteUnit, TimeSpent};
 use log::{info, warn};
 use std::mem;
 
-/// True when the storage layer rejected the write because no directory can
-/// take it (broken or full). Typed, not string matching.
-pub(crate) fn is_storage_rejection(e: &FsError) -> bool {
-    matches!(
-        e,
-        FsError::StorageUnavailable(_) | FsError::DiskOutOfSpace(_)
-    )
+/// Stable metric label when the storage layer rejected the write, so a broken
+/// disk and a full disk are separable in dashboards. Typed, not string matching.
+pub(crate) fn reject_reason(e: &FsError) -> Option<&'static str> {
+    match e {
+        FsError::StorageUnavailable(_) => Some("storage_unavailable"),
+        FsError::DiskOutOfSpace(_) => Some("disk_out_of_space"),
+        _ => None,
+    }
 }
 
 pub struct WriteHandler {
@@ -135,8 +136,8 @@ impl WriteHandler {
                 // `From<CommonError> for FsError` keeps a boxed FsError typed,
                 // so the retry class survives to the client.
                 let error = FsError::from(e);
-                if is_storage_rejection(&error) {
-                    self.metrics.disk_full_rejected_writes.inc();
+                if let Some(reason) = reject_reason(&error) {
+                    self.metrics.record_admission_reject(reason);
                 }
                 return Err(error);
             }
@@ -404,7 +405,7 @@ impl WriteHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_storage_rejection, WriteHandler};
+    use super::{reject_reason, WriteHandler};
     use crate::worker::block::BlockStore;
     use crate::worker::handler::WriteContext;
     use crate::worker::storage::BlockWriteContext;
@@ -418,14 +419,19 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn only_capacity_and_health_rejections_count_as_storage_rejections() {
-        assert!(is_storage_rejection(&FsError::storage_unavailable(
-            "io_error"
-        )));
-        assert!(is_storage_rejection(&FsError::disk_out_of_space("full")));
-        assert!(!is_storage_rejection(&FsError::common(
-            "failed to open staging file"
-        )));
+    fn rejection_reasons_are_stable_machine_tokens() {
+        assert_eq!(
+            reject_reason(&FsError::storage_unavailable("io_error")),
+            Some("storage_unavailable")
+        );
+        assert_eq!(
+            reject_reason(&FsError::disk_out_of_space("full")),
+            Some("disk_out_of_space")
+        );
+        assert_eq!(
+            reject_reason(&FsError::common("failed to open staging file")),
+            None
+        );
     }
 
     #[test]

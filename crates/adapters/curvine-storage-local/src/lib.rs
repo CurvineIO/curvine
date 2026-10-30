@@ -25,7 +25,7 @@ mod policy;
 pub use self::policy::*;
 
 mod dir_list;
-pub use self::dir_list::{probe_dirs, DirList, StorageRequest};
+pub use self::dir_list::{probe_dirs, DirList, ProbeReport, StorageRequest};
 
 mod version;
 pub use self::version::*;
@@ -46,6 +46,6 @@ mod block_io_context;
 pub use self::block_io_context::{BlockReadContext, BlockWriteContext};
 
 mod vfs_dataset;
-pub use self::vfs_dataset::VfsDataset;
+pub use self::vfs_dataset::{DirHealth, VfsDataset};
 
 pub type BlockDataset = VfsDataset;
