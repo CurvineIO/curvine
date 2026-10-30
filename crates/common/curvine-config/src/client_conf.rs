@@ -423,7 +423,7 @@ impl Default for ClientConf {
 
             rpc_retry_max_duration_ms: 120 * 1000,
             rpc_retry_min_sleep_ms: 100,
-            rpc_retry_max_sleep_ms: 10 * 1000,
+            rpc_retry_max_sleep_ms: 3 * 1000,
 
             rpc_close_idle: true,
             conn_timeout_ms: 30 * 1000,
