@@ -517,12 +517,25 @@ impl BlockStore {
         Ok(Some(removed.meta))
     }
 
-    // Get all storage information and check whether the storage directory is normal.
-    // If the directory is not normal, the storage will be marked as failed.
-    // This method is called by the heartbeat thread and returns all storage information, including failed storage.
+    /// Storage information from the last probe. Called by the heartbeat thread
+    /// and by registration; pure memory, so a hung mount cannot stall it.
     pub fn get_and_check_storages(&self) -> CommonResult<Vec<StorageInfo>> {
         let state = self.read()?;
         Ok(state.get_and_check_storages())
+    }
+
+    /// Probe every data directory and refresh the health state.
+    ///
+    /// Runs on the health-check loop, never on the heartbeat path. The
+    /// directories are cloned out of the lock first so a hung mount cannot
+    /// block writers for the duration of the probe.
+    pub fn probe_storages(&self) -> CommonResult<()> {
+        let (dirs, policy) = {
+            let state = self.read()?;
+            state.dir_snapshot()
+        };
+        curvine_storage_local::probe_dirs(&dirs, &policy);
+        Ok(())
     }
 }
 

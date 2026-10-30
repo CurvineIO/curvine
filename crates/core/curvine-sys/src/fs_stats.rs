@@ -104,7 +104,7 @@ impl FsStats {
         self.check_device()
     }
 
-    fn check_device(&self) -> SysResult<()> {
+    pub fn check_device(&self) -> SysResult<()> {
         let current = sys::get_device_id(self.path());
         if current == 0 {
             let baseline = self.device_id.get();

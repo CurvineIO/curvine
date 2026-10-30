@@ -109,6 +109,32 @@ impl WorkerDataDir {
     }
 }
 
+/// Storage/node health thresholds. See docs/design/storage-health-architecture.md.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkerHealthConf {
+    /// How often data directories are probed. This runs off the heartbeat path,
+    /// so a hung mount cannot delay heartbeats.
+    pub check_interval: String,
+
+    /// Consecutive probe failures required before a directory stops taking writes.
+    pub consecutive_failures: u32,
+
+    /// Consecutive probe successes required before a quarantined directory
+    /// returns to service.
+    pub consecutive_successes: u32,
+}
+
+impl Default for WorkerHealthConf {
+    fn default() -> Self {
+        Self {
+            check_interval: "5s".to_string(),
+            consecutive_failures: 3,
+            consecutive_successes: 5,
+        }
+    }
+}
+
 // Worker configuration file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -148,6 +174,12 @@ pub struct WorkerConf {
     pub free_ratio: f64,
 
     pub data_dir: Vec<String>,
+
+    /// Health thresholds for storage/node checks. A directory is quarantined
+    /// only after `consecutive_failures` consecutive probe failures and comes
+    /// back automatically after `consecutive_successes` consecutive successes,
+    /// so a transient error no longer disables a disk until the worker restarts.
+    pub health: WorkerHealthConf,
 
     pub io_slow_threshold: String,
 
@@ -199,6 +231,13 @@ pub struct WorkerConf {
 }
 
 impl WorkerConf {
+    pub fn health_check_interval_ms(&self) -> u64 {
+        DurationUnit::from_str(&self.health.check_interval)
+            .map(|d| d.as_millis())
+            .unwrap_or(5_000)
+            .max(1)
+    }
+
     pub fn io_slow_us(&self) -> u64 {
         let dur = DurationUnit::from_str(&self.io_slow_threshold).unwrap();
         dur.as_millis() * 1000
@@ -220,6 +259,7 @@ impl Default for WorkerConf {
             dir_reserved: "0".to_string(),
             free_ratio: 0.0,
             data_dir: vec![],
+            health: WorkerHealthConf::default(),
             io_slow_threshold: "100ms".to_string(),
             io_threads: 32,
             worker_threads: Utils::worker_threads(32),

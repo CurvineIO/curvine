@@ -156,6 +156,10 @@ message StorageInfoProto {
     required StorageTypeProto storage_type = 9 [default = STORAGE_TYPE_PROTO_DISK];
     required int64 block_num = 10;
     required string dir_path = 11 [default = ""];
+    // Health view of this directory (see curvine_model::HealthState / FaultKind).
+    optional uint32 health_state = 12 [default = 0];
+    optional uint32 fault_kind = 13 [default = 0];
+    optional int64 unhealthy_since_ms = 14 [default = 0];
 }
 
 // Represents a customer service address.

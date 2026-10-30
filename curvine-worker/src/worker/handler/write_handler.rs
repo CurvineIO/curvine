@@ -25,25 +25,13 @@ use curvine_runtime::common::{ByteUnit, TimeSpent};
 use log::{info, warn};
 use std::mem;
 
-/// Returns true if `e` is a "no storage space" admission rejection from the
-/// worker storage layer. `CommonError` is a type-erased `Box<dyn Error>` whose
-/// payload is a formatted string (see `curvine_core_error::err_box!`), so we
-/// match on the stable substrings emitted by `VfsDataset`/`DirList`/
-/// `RobinChoosingPolicy`:
-///   - "Not enough space in storage dir ..." (VfsDataset / DirList)
-///   - "Not enough {:?} storage capacity for ... bytes" (RobinChoosingPolicy)
-pub(crate) fn is_no_storage_space(e: &curvine_core_error::CommonError) -> bool {
-    let msg = e.to_string();
-    msg.contains("Not enough space")
-        || (msg.contains("Not enough") && msg.contains("storage capacity"))
-}
-
-fn map_storage_open_error(e: curvine_core_error::CommonError) -> FsError {
-    if is_no_storage_space(&e) {
-        FsError::disk_out_of_space(e.to_string())
-    } else {
-        e.into()
-    }
+/// True when the storage layer rejected the write because no directory can
+/// take it (broken or full). Typed, not string matching.
+pub(crate) fn is_storage_rejection(e: &FsError) -> bool {
+    matches!(
+        e,
+        FsError::StorageUnavailable(_) | FsError::DiskOutOfSpace(_)
+    )
 }
 
 pub struct WriteHandler {
@@ -144,13 +132,13 @@ impl WriteHandler {
         let meta = match self.store.open_block(&open_block) {
             Ok(m) => m,
             Err(e) => {
-                // `CommonError` is a type-erased string error (see
-                // curvine_core_error::err_box!), so match on the stable
-                // rejection messages emitted by the storage layer.
-                if is_no_storage_space(&e) {
+                // `From<CommonError> for FsError` keeps a boxed FsError typed,
+                // so the retry class survives to the client.
+                let error = FsError::from(e);
+                if is_storage_rejection(&error) {
                     self.metrics.disk_full_rejected_writes.inc();
                 }
-                return Err(map_storage_open_error(e));
+                return Err(error);
             }
         };
         context.dir_id = meta.dir_id();
@@ -416,7 +404,7 @@ impl WriteHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_storage_open_error, WriteHandler};
+    use super::{is_storage_rejection, WriteHandler};
     use crate::worker::block::BlockStore;
     use crate::worker::handler::WriteContext;
     use crate::worker::storage::BlockWriteContext;
@@ -430,25 +418,28 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn storage_capacity_rejection_maps_to_disk_out_of_space() {
-        let error = curvine_core_error::err_msg!(
-            "Not enough space in storage dir 1 for block 2 rewrite: need 20, available 10"
-        );
-
-        assert!(matches!(
-            map_storage_open_error(error.into()),
-            FsError::DiskOutOfSpace(_)
-        ));
+    fn only_capacity_and_health_rejections_count_as_storage_rejections() {
+        assert!(is_storage_rejection(&FsError::storage_unavailable(
+            "io_error"
+        )));
+        assert!(is_storage_rejection(&FsError::disk_out_of_space("full")));
+        assert!(!is_storage_rejection(&FsError::common(
+            "failed to open staging file"
+        )));
     }
 
     #[test]
-    fn unrelated_storage_error_remains_common() {
-        let error = curvine_core_error::err_msg!("failed to open staging file");
+    fn typed_error_survives_the_common_error_boundary() {
+        let typed = FsError::storage_unavailable("io_error dir=1");
+        let boxed: curvine_core_error::CommonError = Box::new(typed);
 
-        assert!(matches!(
-            map_storage_open_error(error.into()),
-            FsError::Common(_)
-        ));
+        // The storage layer returns CommonResult; classification must survive.
+        let restored = FsError::from(boxed);
+        assert!(matches!(restored, FsError::StorageUnavailable(_)));
+        assert_eq!(
+            restored.retry_class(),
+            curvine_error::RetryClass::RetryElsewhere
+        );
     }
 
     // Same construction pattern already used by

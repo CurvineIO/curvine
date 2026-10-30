@@ -179,8 +179,25 @@ impl WorkerInfo {
         self.available.saturating_sub(self.scheduled_bytes)
     }
 
+    /// Worker-declared fact: can this node take new writes at all?
+    ///
+    /// `P0` only has storage checkers, so it is derived from per-directory
+    /// health. When a non-storage checker can fence the worker this becomes an
+    /// explicitly reported field.
+    pub fn accepting_allocations(&self) -> bool {
+        if self.storage_map.is_empty() {
+            return self.is_live();
+        }
+        self.storage_map.values().any(|storage| storage.is_usable())
+    }
+
+    /// Master policy on top of the worker fact: blacklist/decommission/weight.
+    pub fn schedulable(&self) -> bool {
+        self.is_live() && self.weight > 0 && self.accepting_allocations()
+    }
+
     pub fn can_allocate(&self, block_size: i64) -> bool {
-        if !self.is_live() {
+        if !self.is_live() || !self.accepting_allocations() {
             return false;
         }
         // 0 is a valid size: no capacity constraint, pick any live worker.

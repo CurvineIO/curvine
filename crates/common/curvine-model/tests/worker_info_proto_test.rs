@@ -38,6 +38,7 @@ fn sample_worker() -> WorkerInfo {
             storage_type: StorageType::Disk,
             block_num: 42,
             dir_path: "/data".to_string(),
+            ..Default::default()
         },
     );
     worker

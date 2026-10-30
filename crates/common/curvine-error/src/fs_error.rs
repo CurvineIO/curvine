@@ -33,6 +33,51 @@ use thiserror::Error;
 use tokio::task::JoinError;
 use tokio::time::error::Elapsed;
 
+/// What a caller should do with a failure.
+///
+/// This is the single source of truth for retry decisions: the client, the
+/// transfer scheduler and the master all call `FsError::retry_class()` instead
+/// of matching on message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryClass {
+    /// Retrying cannot help: the request is wrong or a human must fix the target.
+    Permanent,
+
+    /// Another location (worker, replica) will likely succeed.
+    RetryElsewhere,
+
+    /// Same location, after a short wait (backpressure, leader switch, lease).
+    RetryAfter,
+
+    /// The request must go to the current master/leader.
+    RetryMaster,
+
+    /// Data may be corrupt: stop and protect the block, never reuse this copy.
+    Abort,
+}
+
+impl RetryClass {
+    /// Stable machine marker for paths that only carry text (transfer task
+    /// reports). The decision still comes from the typed error, not from the
+    /// message body.
+    pub fn token(&self) -> &'static str {
+        match self {
+            RetryClass::Permanent => "retry:never",
+            RetryClass::RetryElsewhere => "retry:elsewhere",
+            RetryClass::RetryAfter => "retry:later",
+            RetryClass::RetryMaster => "retry:master",
+            RetryClass::Abort => "retry:abort",
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            RetryClass::RetryElsewhere | RetryClass::RetryAfter | RetryClass::RetryMaster
+        )
+    }
+}
+
 // Uniformly defined file system error codes.
 #[repr(i32)]
 #[derive(Debug, Copy, Clone, IntoPrimitive, FromPrimitive)]
@@ -76,6 +121,9 @@ pub enum ErrorKind {
     SnapshotNotReady = 37,
     Encode = 38,
     Decode = 39,
+    /// A worker cannot take new writes (unhealthy storage / fenced node).
+    /// Distinct from `DiskOutOfSpace`: the fix is to move, not to add capacity.
+    StorageUnavailable = 40,
 
     #[num_enum(default)]
     Common = 10000,
@@ -188,6 +236,10 @@ pub enum FsError {
     // Read-only file system or mount
     #[error("{0}")]
     ReadOnly(ErrorImpl<StringError>),
+
+    /// The target cannot serve new writes; retrying elsewhere is the fix.
+    #[error("{0}")]
+    StorageUnavailable(ErrorImpl<StringError>),
 
     // Pipeline replication error with failed worker info
     #[error("{0}")]
@@ -304,6 +356,10 @@ impl FsError {
     pub fn unsupported_ufs_read(path: impl AsRef<str>) -> Self {
         let msg = format!("File {} unsupported ufs read", path.as_ref());
         Self::UnsupportedUfsRead(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn storage_unavailable(msg: impl Into<String>) -> Self {
+        Self::StorageUnavailable(ErrorImpl::with_source(msg.into().into()))
     }
 
     pub fn read_only(path: impl AsRef<str>) -> Self {
@@ -447,6 +503,33 @@ impl FsError {
         matches!(self, FsError::NotLeaderMaster(_))
     }
 
+    /// Classify the failure for every consumer (client, transfer, master).
+    pub fn retry_class(&self) -> RetryClass {
+        match self {
+            FsError::StorageUnavailable(_)
+            | FsError::DiskOutOfSpace(_)
+            | FsError::NoAvailableWorker(_)
+            | FsError::NoLocalPath(_)
+            | FsError::Pipeline(_)
+            | FsError::MinReplicasNotMet(_)
+            | FsError::ReadOnly(_) => RetryClass::RetryElsewhere,
+
+            FsError::Timeout(_)
+            | FsError::InProgress(_)
+            | FsError::Lease(_)
+            | FsError::Expired(_)
+            | FsError::TransferOverloaded(_) => RetryClass::RetryAfter,
+
+            FsError::NotLeaderMaster(_) | FsError::Raft(_) | FsError::SnapshotNotReady(_) => {
+                RetryClass::RetryMaster
+            }
+
+            FsError::AbnormalData(_) => RetryClass::Abort,
+
+            _ => RetryClass::Permanent,
+        }
+    }
+
     pub fn with_opt_msg(error: Option<Self>, msg: impl Into<String>) -> Self {
         match error {
             None => Self::common("No errors found"),
@@ -483,6 +566,7 @@ impl FsError {
             FsError::Expired(_) => ErrorKind::Expired,
             FsError::UnsupportedUfsRead(_) => ErrorKind::UnsupportedUfsRead,
             FsError::ReadOnly(_) => ErrorKind::ReadOnly,
+            FsError::StorageUnavailable(_) => ErrorKind::StorageUnavailable,
             FsError::Pipeline(_) => ErrorKind::Pipeline,
             FsError::MinReplicasNotMet(_) => ErrorKind::MinReplicasNotMet,
             FsError::NoAvailableWorker(_) => ErrorKind::NoAvailableWorker,
@@ -512,7 +596,13 @@ impl From<String> for FsError {
 
 impl From<CommonError> for FsError {
     fn from(value: CommonError) -> Self {
-        FsError::Common(ErrorImpl::with_source(value.into()))
+        // Keep a typed error typed: the storage layer returns `CommonResult`,
+        // but a boxed `FsError` must not degrade into `Common` (that would drop
+        // the retry classification on the way to the client).
+        match value.downcast::<FsError>() {
+            Ok(e) => *e,
+            Err(e) => FsError::Common(ErrorImpl::with_source(e.into())),
+        }
     }
 }
 
@@ -634,6 +724,7 @@ impl ErrorExt for FsError {
             FsError::Expired(e) => FsError::Expired(e.ctx(ctx)),
             FsError::UnsupportedUfsRead(e) => FsError::UnsupportedUfsRead(e.ctx(ctx)),
             FsError::ReadOnly(e) => FsError::ReadOnly(e.ctx(ctx)),
+            FsError::StorageUnavailable(e) => FsError::StorageUnavailable(e.ctx(ctx)),
             FsError::Pipeline(e) => FsError::Pipeline(e.ctx(ctx)),
             FsError::MinReplicasNotMet(e) => FsError::MinReplicasNotMet(e.ctx(ctx)),
             FsError::NoAvailableWorker(e) => FsError::NoAvailableWorker(e.ctx(ctx)),
@@ -679,6 +770,7 @@ impl ErrorExt for FsError {
             FsError::Expired(e) => e.encode(ErrorKind::Expired),
             FsError::UnsupportedUfsRead(e) => e.encode(ErrorKind::UnsupportedUfsRead),
             FsError::ReadOnly(e) => e.encode(ErrorKind::ReadOnly),
+            FsError::StorageUnavailable(e) => e.encode(ErrorKind::StorageUnavailable),
             FsError::Pipeline(e) => e.encode(ErrorKind::Pipeline),
             FsError::MinReplicasNotMet(e) => e.encode(ErrorKind::MinReplicasNotMet),
             FsError::NoAvailableWorker(e) => e.encode(ErrorKind::NoAvailableWorker),
@@ -727,6 +819,7 @@ impl ErrorExt for FsError {
             ErrorKind::Expired => FsError::Expired(de.into_string()),
             ErrorKind::UnsupportedUfsRead => FsError::UnsupportedUfsRead(de.into_string()),
             ErrorKind::ReadOnly => FsError::ReadOnly(de.into_string()),
+            ErrorKind::StorageUnavailable => FsError::StorageUnavailable(de.into_string()),
             ErrorKind::Pipeline => FsError::Pipeline(de.into_string()),
             ErrorKind::MinReplicasNotMet => FsError::MinReplicasNotMet(de.into_string()),
             ErrorKind::NoAvailableWorker => FsError::NoAvailableWorker(de.into_string()),
@@ -746,7 +839,10 @@ impl ErrorExt for FsError {
     }
 
     fn should_retry(&self) -> bool {
-        self.retry_master()
+        matches!(
+            self.retry_class(),
+            RetryClass::RetryElsewhere | RetryClass::RetryAfter | RetryClass::RetryMaster
+        )
     }
 }
 

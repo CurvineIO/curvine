@@ -23,7 +23,9 @@ pub use self::master_client::{MasterClient, MasterRegistration};
 mod block_actor;
 pub use self::block_actor::BlockActor;
 
+mod health_check_task;
 mod heartbeat_task;
+pub use self::health_check_task::HealthCheckTask;
 pub use self::heartbeat_task::HeartbeatTask;
 
 #[cfg(test)]

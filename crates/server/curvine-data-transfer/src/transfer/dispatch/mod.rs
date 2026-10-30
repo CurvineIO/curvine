@@ -2596,10 +2596,15 @@ fn choose_worker_admitted(
 /// (positional segment writes, batch commit markers, temp+rename singles)
 /// and bounded by task_max_retries with stale-style backoff.
 fn is_task_retryable(task: &TransferTaskRecord) -> bool {
-    // Terminal failure messages are strings (no structured kind survives
-    // the report path), so match narrow transient markers. Allowlist is
-    // intentionally narrow (see doc above).
+    // Storage/health failures carry the retry class the worker computed; the
+    // token keeps that decision intact across the text-only report path.
     let msg = task.progress.message.as_str();
+    if msg.contains(curvine_error::RetryClass::RetryElsewhere.token())
+        || msg.contains(curvine_error::RetryClass::RetryAfter.token())
+        || msg.contains(curvine_error::RetryClass::RetryMaster.token())
+    {
+        return true;
+    }
     msg.contains("RateLimited")
         || msg.contains("TooManyRequests")
         || msg.contains("too many requests")
@@ -2984,6 +2989,8 @@ mod tests {
             "Transfer task report timed out after 5000 ms: job=..",
             "WorkerSessionGone: worker restarted",
             "stale worker session rotated",
+            // Storage health failures: the worker said "try elsewhere".
+            "Load (UFS -> Curvine) failed during execution: source=oss://b/k; target=/t; cause=retry:elsewhere storage_unavailable no usable Disk data dir",
         ] {
             assert!(is_task_retryable(&failed_task(message)), "{}", message);
         }

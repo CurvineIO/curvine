@@ -194,6 +194,9 @@ impl LoadTaskRunner {
                 } else {
                     "copy_error"
                 };
+                // The retry decision comes from the typed error; the token only
+                // carries it across the text-only task report.
+                let retry_token = e.retry_class().token();
                 let progress = self.task.set_failed(transfer_failure_message(
                     match Path::from_str(&self.task.info.source_path) {
                         Ok(source) if source.is_cv() => curvine_model::TransferKind::Export,
@@ -202,7 +205,7 @@ impl LoadTaskRunner {
                     "execution",
                     &self.task.info.source_path,
                     &self.task.info.target_path,
-                    &e,
+                    &FsError::common(format!("{} {}", retry_token, e)),
                 ));
                 let res = self.report_progress(progress).await;
                 match res {

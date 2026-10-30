@@ -16,7 +16,10 @@ use crate::{DirState, StorageVersion, DEFAULT_BLOCK_ALIGN};
 use curvine_config::WorkerDataDir;
 use curvine_core_error::CommonResult;
 use curvine_io::LocalFile;
-use curvine_model::StorageType;
+use curvine_model::{
+    FaultKind, HealthPolicy, HealthState, HealthTracker, HealthTransition, ProbeOutcome,
+    StorageType,
+};
 use curvine_runtime::common::{ByteUnit, FileUtils};
 use curvine_runtime::sync::AtomicLong;
 #[cfg(feature = "spdk")]
@@ -26,7 +29,6 @@ use log::*;
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 /// A physical worker storage directory.
 ///
@@ -45,7 +47,49 @@ pub struct VfsDir {
     pub(crate) final_bytes: AtomicLong,
     pub(crate) tmp_bytes: AtomicLong,
     pub(crate) state: Arc<DirState>,
-    pub(crate) check_failed: Arc<AtomicBool>,
+    /// Health state machine for this directory. Driven by the worker probe
+    /// loop, read by admission and the heartbeat snapshot.
+    pub(crate) health: Arc<HealthTracker>,
+    /// Capacity numbers sampled by the last probe. The heartbeat reports these
+    /// so it never issues a filesystem syscall on a possibly hung mount.
+    pub(crate) sample: Arc<SampleCache>,
+}
+
+/// Last sampled capacity of one directory (see `VfsDir::probe`).
+pub struct SampleCache {
+    capacity: AtomicLong,
+    available: AtomicLong,
+    fs_used: AtomicLong,
+    non_fs_used: AtomicLong,
+}
+
+impl std::fmt::Debug for SampleCache {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SampleCache")
+            .field("capacity", &self.capacity.get())
+            .field("available", &self.available.get())
+            .finish()
+    }
+}
+
+impl Default for SampleCache {
+    fn default() -> Self {
+        Self {
+            capacity: AtomicLong::new(0),
+            available: AtomicLong::new(0),
+            fs_used: AtomicLong::new(0),
+            non_fs_used: AtomicLong::new(0),
+        }
+    }
+}
+
+/// One directory's capacity snapshot, safe to read from any thread.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DirSample {
+    pub capacity: i64,
+    pub available: i64,
+    pub fs_used: i64,
+    pub non_fs_used: i64,
 }
 
 impl VfsDir {
@@ -133,7 +177,8 @@ impl VfsDir {
             final_bytes: AtomicLong::new(0),
             tmp_bytes: AtomicLong::new(0),
             state: Arc::new(state),
-            check_failed: Arc::new(AtomicBool::new(false)),
+            health: Arc::new(HealthTracker::new()),
+            sample: Arc::new(SampleCache::default()),
         };
 
         Ok(dir)
@@ -372,12 +417,106 @@ impl VfsDir {
                 .is_some_and(|required| self.available() >= required)
     }
 
+    /// Whether this directory may take new writes.
     pub fn is_failed(&self) -> bool {
-        self.check_failed.load(Ordering::SeqCst)
+        !self.health.state().is_usable()
     }
 
-    pub fn set_failed(&self) {
-        self.check_failed.store(true, Ordering::SeqCst);
+    pub fn health_state(&self) -> HealthState {
+        self.health.state()
+    }
+
+    /// Feed one probe result into the state machine and return the transition,
+    /// if the health state changed. The caller owns logging and reporting.
+    pub fn observe_health(
+        &self,
+        outcome: &ProbeOutcome,
+        policy: &HealthPolicy,
+        now_ms: i64,
+    ) -> Option<HealthTransition> {
+        self.health.observe(outcome, policy, now_ms)
+    }
+
+    /// Capacity numbers from the last probe (no syscall).
+    pub fn sample(&self) -> DirSample {
+        DirSample {
+            capacity: self.sample.capacity.get(),
+            available: self.sample.available.get(),
+            fs_used: self.sample.fs_used.get(),
+            non_fs_used: self.sample.non_fs_used.get(),
+        }
+    }
+
+    pub fn fault_kind(&self) -> curvine_model::FaultKind {
+        self.health.fault()
+    }
+
+    pub fn unhealthy_since_ms(&self) -> i64 {
+        self.health.since_ms()
+    }
+
+    /// Refresh the cached capacity sample. Called by the probe loop only.
+    fn refresh_sample(&self) {
+        self.sample.capacity.set(self.capacity());
+        self.sample.available.set(self.available());
+        self.sample.fs_used.set(self.fs_used());
+        self.sample.non_fs_used.set(self.non_fs_used());
+    }
+
+    /// Run the storage health probe: identity (path/type/mode/device) plus a
+    /// mount sanity check. Does not write to the directory.
+    ///
+    /// Returns a structured outcome so callers never have to match on message
+    /// text: "disk wrong" and "disk full" stay distinguishable.
+    pub fn probe(&self) -> ProbeOutcome {
+        // SPDK raw devices have no filesystem to inspect.
+        if self.storage_type == StorageType::SpdkDisk {
+            self.refresh_sample();
+            return ProbeOutcome::Ok;
+        }
+
+        let path = self.stats.path();
+        let meta = match path.metadata() {
+            Ok(meta) => meta,
+            Err(e) => {
+                return ProbeOutcome::failed(
+                    FaultKind::from_io_error(&e),
+                    format!("metadata {}: {}", path.display(), e),
+                )
+            }
+        };
+
+        if !meta.is_dir() {
+            return ProbeOutcome::failed(
+                FaultKind::NotDir,
+                format!("{} is not a directory", path.display()),
+            );
+        }
+
+        if meta.permissions().readonly() {
+            return ProbeOutcome::failed(
+                FaultKind::ReadOnly,
+                format!("{} is read only", path.display()),
+            );
+        }
+
+        if let Err(e) = self.stats.check_device() {
+            return ProbeOutcome::failed(
+                FaultKind::DeviceChanged,
+                format!("{}: {}", path.display(), e),
+            );
+        }
+
+        // A dead mount reports zero total space instead of failing stat().
+        if self.stats.total_space() == 0 {
+            return ProbeOutcome::failed(
+                FaultKind::DeviceGone,
+                format!("statvfs {} returned 0 total space", path.display()),
+            );
+        }
+
+        self.refresh_sample();
+        ProbeOutcome::Ok
     }
 }
 
@@ -441,7 +580,8 @@ mod test {
             final_bytes: AtomicLong::new(0),
             tmp_bytes: AtomicLong::new(0),
             state: st,
-            check_failed: Arc::new(AtomicBool::new(false)),
+            health: Arc::new(HealthTracker::new()),
+            sample: Arc::new(SampleCache::default()),
         }
     }
 
@@ -464,7 +604,8 @@ mod test {
             final_bytes: AtomicLong::new(0),
             tmp_bytes: AtomicLong::new(0),
             state: st,
-            check_failed: Arc::new(AtomicBool::new(false)),
+            health: Arc::new(HealthTracker::new()),
+            sample: Arc::new(SampleCache::default()),
         }
     }
 

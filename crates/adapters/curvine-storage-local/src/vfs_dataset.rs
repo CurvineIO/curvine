@@ -149,7 +149,11 @@ impl VfsDataset {
     }
 
     pub fn from_conf(cluster_id: &str, conf: &ClusterConf) -> CommonResult<Self> {
-        let mut dir_list = DirList::new(vec![])?;
+        let health_policy = curvine_model::HealthPolicy::new(
+            conf.worker.health.consecutive_failures,
+            conf.worker.health.consecutive_successes,
+        );
+        let mut dir_list = DirList::new(vec![])?.with_health_policy(health_policy);
         let dir_reserved = ByteUnit::from_str(&conf.worker.dir_reserved)?.as_byte();
         let free_ratio = normalize_free_ratio(conf.worker.free_ratio);
 
@@ -232,6 +236,9 @@ impl VfsDataset {
                 self.meta.put(block);
             }
         }
+        // Seed the capacity samples and health state so the very first
+        // heartbeat reports real numbers.
+        self.dir_list.probe_all();
         info!(
             "Dataset initialize, used {} ms, total block {}",
             spent.used_ms(),
@@ -261,6 +268,15 @@ impl VfsDataset {
 
     pub fn dir_iter(&self) -> Values<'_, u32, Arc<VfsDir>> {
         self.dir_list.dir_iter()
+    }
+
+    /// Directories plus the health policy, so callers can probe without
+    /// holding the dataset lock.
+    pub fn dir_snapshot(&self) -> (Vec<Arc<VfsDir>>, curvine_model::HealthPolicy) {
+        (
+            self.dir_list.dir_iter().cloned().collect(),
+            *self.dir_list.health_policy(),
+        )
     }
 
     pub fn all_blocks(&self) -> Vec<BlockMeta> {
@@ -783,7 +799,7 @@ mod test {
     use curvine_runtime::sync::AtomicLong;
     use curvine_sys::FsStats;
     use std::io::Write;
-    use std::sync::atomic::AtomicBool;
+
     use std::sync::Arc;
 
     fn create_data_set(format: bool, dir: &str) -> VfsDataset {
@@ -851,7 +867,8 @@ mod test {
             final_bytes: AtomicLong::new(0),
             tmp_bytes: AtomicLong::new(0),
             state,
-            check_failed: Arc::new(AtomicBool::new(false)),
+            health: Arc::new(curvine_model::HealthTracker::new()),
+            sample: Arc::new(crate::vfs_dir::SampleCache::default()),
         }
     }
 
@@ -880,7 +897,8 @@ mod test {
             final_bytes: AtomicLong::new(used_bytes),
             tmp_bytes: AtomicLong::new(0),
             state,
-            check_failed: Arc::new(AtomicBool::new(false)),
+            health: Arc::new(curvine_model::HealthTracker::new()),
+            sample: Arc::new(crate::vfs_dir::SampleCache::default()),
         }
     }
 

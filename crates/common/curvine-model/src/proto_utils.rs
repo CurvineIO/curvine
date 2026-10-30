@@ -40,6 +40,9 @@ impl ProtoUtils {
             storage_type: item.storage_type.into(),
             block_num: item.block_num,
             dir_path: item.dir_path,
+            health_state: Some(u8::from(item.health_state) as u32),
+            fault_kind: Some(u8::from(item.fault_kind) as u32),
+            unhealthy_since_ms: Some(item.unhealthy_since_ms),
         }
     }
 
@@ -56,6 +59,9 @@ impl ProtoUtils {
             storage_type: StorageType::from(item.storage_type),
             block_num: item.block_num,
             dir_path: item.dir_path,
+            health_state: crate::HealthState::from(item.health_state.unwrap_or(0) as u8),
+            fault_kind: crate::FaultKind::from(item.fault_kind.unwrap_or(0) as u8),
+            unhealthy_since_ms: item.unhealthy_since_ms.unwrap_or(0),
         }
     }
 

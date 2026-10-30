@@ -247,6 +247,13 @@ data_dir = [
 log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 enable_s3_gateway = false
 
+# Storage health thresholds. A data dir is quarantined only after N consecutive
+# probe failures and returns to service after M consecutive successes, so a
+# transient EIO no longer disables a disk until the worker restarts.
+[worker.health]
+consecutive_failures = 3
+consecutive_successes = 5
+
 # SPDK over NVMe-oF/RDMA configuration  
 [worker.spdk_disk]  
 enabled = false  

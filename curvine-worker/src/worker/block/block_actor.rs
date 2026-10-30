@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::{
-    BlockMeta, BlockStore, HeartbeatTask, MasterClient, MasterRegistration,
+    BlockMeta, BlockStore, HealthCheckTask, HeartbeatTask, MasterClient, MasterRegistration,
 };
 use curvine_client_core::file::FsContext;
 use curvine_config::ClusterConf;
@@ -124,6 +124,7 @@ pub struct BlockActor {
     store: BlockStore,
     executor: Arc<GroupExecutor>,
     heartbeat_interval_ms: u64,
+    health_check_interval_ms: u64,
     worker_ctl: StateCtl,
     block_report_limit: usize,
 
@@ -169,12 +170,14 @@ impl BlockActor {
             conf.worker.executor_channel_size,
         );
         let heartbeat_interval_ms = conf.master.heartbeat_interval_ms();
+        let health_check_interval_ms = conf.worker.health_check_interval_ms();
         let block_report_limit = conf.master.block_report_limit;
         Ok(Self {
             client,
             store,
             executor: Arc::new(executor),
             heartbeat_interval_ms,
+            health_check_interval_ms,
             worker_ctl,
             block_report_limit,
             report_blocks: Arc::new(DashMap::new()),
@@ -202,6 +205,12 @@ impl BlockActor {
             total_len,
             spend.used_ms()
         );
+
+        HealthCheckTask::start(
+            self.worker_ctl.clone(),
+            self.store.clone(),
+            self.health_check_interval_ms,
+        )?;
 
         Self::start_heartbeat(
             self.executor.clone(),

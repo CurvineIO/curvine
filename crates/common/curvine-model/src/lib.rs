@@ -40,6 +40,9 @@ pub trait CurvinePath: Sized + std::fmt::Display {
 mod storage_info;
 pub use self::storage_info::*;
 
+mod health;
+pub use self::health::*;
+
 mod worker_address;
 pub use self::worker_address::WorkerAddress;
 

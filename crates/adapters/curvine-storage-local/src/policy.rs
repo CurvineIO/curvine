@@ -14,6 +14,7 @@
 
 use crate::VfsDir;
 use curvine_core_error::{err_box, CommonResult};
+use curvine_model::FsError;
 use curvine_model::StorageType;
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -68,15 +69,25 @@ impl RobinChoosingPolicy {
             res = self.get_next_dir(dirs, StorageType::Disk, required_bytes)
         }
 
-        if let Some(v) = res {
-            Ok(v)
-        } else {
-            err_box!(
-                "Not enough {:?} storage capacity for {} bytes",
+        match res {
+            Some(v) => Ok(v),
+            // Typed on purpose: a broken disk and a full disk must not collapse
+            // into the same "not enough capacity" message, and the client needs
+            // a retry class it can trust.
+            None => Err(Box::new(FsError::storage_unavailable(format!(
+                "storage_unavailable no usable {:?} data dir: need={} bytes, dirs=[{}]",
                 storage_type,
-                required_bytes
-            )
+                required_bytes,
+                Self::describe(dirs)
+            )))),
         }
+    }
+
+    fn describe(dirs: &IndexMap<u32, Arc<VfsDir>>) -> String {
+        dirs.values()
+            .map(|dir| format!("{}:{}/{}", dir.id(), dir.health_state(), dir.fault_kind()))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     fn get_next_dir<'a>(

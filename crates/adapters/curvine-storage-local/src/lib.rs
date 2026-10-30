@@ -25,7 +25,7 @@ mod policy;
 pub use self::policy::*;
 
 mod dir_list;
-pub use self::dir_list::{DirList, StorageRequest};
+pub use self::dir_list::{probe_dirs, DirList, StorageRequest};
 
 mod version;
 pub use self::version::*;

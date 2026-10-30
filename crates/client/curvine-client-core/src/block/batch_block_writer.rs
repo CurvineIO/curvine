@@ -236,6 +236,10 @@ impl BatchBlockWriter {
             {
                 Ok(writer) => writer,
                 Err(error) => {
+                    // A worker that cannot even open a block must not be picked
+                    // again for this write; without this the same broken worker
+                    // keeps getting every following AddBlock.
+                    fs_context.add_failed_worker(&group.worker);
                     for opened_group in &mut groups {
                         if let Err(cancel_error) = opened_group.writer.cancel().await {
                             log::warn!(

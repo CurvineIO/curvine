@@ -14,7 +14,7 @@
 
 use crate::{ChoosingPolicy, RobinChoosingPolicy, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
-use curvine_model::{StorageInfo, StorageType};
+use curvine_model::{HealthPolicy, HealthState, HealthTransition, StorageInfo, StorageType};
 use curvine_runtime::common::ByteUnit;
 use indexmap::map::Values;
 use indexmap::IndexMap;
@@ -45,6 +45,7 @@ impl StorageRequest {
 pub struct DirList {
     dirs: IndexMap<u32, Arc<VfsDir>>,
     chooser: ChoosingPolicy,
+    health_policy: HealthPolicy,
 }
 
 impl DirList {
@@ -60,6 +61,7 @@ impl DirList {
         Ok(Self {
             dirs,
             chooser: ChoosingPolicy::Robin(RobinChoosingPolicy::new()),
+            health_policy: HealthPolicy::default(),
         })
     }
 
@@ -181,32 +183,51 @@ impl DirList {
         Ok(())
     }
 
-    /// Collect per-directory heartbeat state and update physical health.
+    /// Thresholds that decide when a directory becomes unusable and when it
+    /// comes back. Shared by every checker.
+    pub fn health_policy(&self) -> &HealthPolicy {
+        &self.health_policy
+    }
+
+    pub fn with_health_policy(mut self, policy: HealthPolicy) -> Self {
+        self.health_policy = policy;
+        self
+    }
+
+    /// Probe every directory and advance its health state machine.
+    ///
+    /// Runs on the worker health-check loop, never on the heartbeat path: a
+    /// directory is quarantined after `failures_to_unusable` consecutive
+    /// failures and recovers automatically after `successes_to_recover`
+    /// consecutive successes, so a transient error no longer disables a disk
+    /// until the worker restarts. Each transition is logged once.
+    pub fn probe_all(&self) {
+        let dirs: Vec<Arc<VfsDir>> = self.dir_iter().cloned().collect();
+        probe_dirs(&dirs, &self.health_policy);
+    }
+
+    /// Per-directory state from the last probe. Pure memory: the heartbeat uses
+    /// this so a hung mount cannot stall it.
     pub fn get_and_check_storages(&self, block_num: i64) -> Vec<StorageInfo> {
         self.dir_iter()
             .map(|dir| {
-                let failed = match dir.check_dir() {
-                    Ok(_) => dir.is_failed(),
-                    Err(e) => {
-                        if !dir.is_failed() {
-                            error!("check_dir {}: {}", dir.id(), e);
-                        }
-                        dir.set_failed();
-                        true
-                    }
-                };
+                let sample = dir.sample();
+                let failed = dir.is_failed();
                 StorageInfo {
                     dir_id: dir.id(),
                     storage_id: dir.version().storage_id.to_string(),
                     failed,
-                    capacity: dir.capacity(),
-                    fs_used: dir.fs_used(),
-                    non_fs_used: dir.non_fs_used(),
-                    available: dir.available(),
+                    capacity: sample.capacity,
+                    fs_used: sample.fs_used,
+                    non_fs_used: sample.non_fs_used,
+                    available: sample.available,
                     reserved_bytes: dir.reserved_bytes(),
                     storage_type: dir.storage_type(),
                     block_num,
                     dir_path: dir.path_str().to_string(),
+                    health_state: dir.health_state(),
+                    fault_kind: dir.fault_kind(),
+                    unhealthy_since_ms: dir.unhealthy_since_ms(),
                 }
             })
             .collect()
@@ -258,6 +279,42 @@ impl DirList {
     }
 }
 
+/// Probe the given directories and advance their health state machines.
+///
+/// Free function so callers can collect the directories under a lock and run
+/// the syscalls *without* holding it: a hung mount must never stall writers.
+pub fn probe_dirs(dirs: &[Arc<VfsDir>], policy: &HealthPolicy) {
+    let now_ms = curvine_runtime::common::LocalTime::mills() as i64;
+    for dir in dirs {
+        let outcome = dir.probe();
+        if let Some(transition) = dir.observe_health(&outcome, policy, now_ms) {
+            log_health_transition(dir, &transition);
+        }
+    }
+}
+
+fn log_health_transition(dir: &VfsDir, transition: &HealthTransition) {
+    if transition.to == HealthState::Unusable {
+        error!(
+            "storage_health_transition dir_id={} path={} from={} to={} kind={} detail={}",
+            dir.id(),
+            dir.path_str(),
+            transition.from,
+            transition.to,
+            transition.fault,
+            transition.detail,
+        );
+    } else {
+        info!(
+            "storage_health_transition dir_id={} path={} from={} to={}",
+            dir.id(),
+            dir.path_str(),
+            transition.from,
+            transition.to,
+        );
+    }
+}
+
 impl Index<usize> for DirList {
     type Output = Arc<VfsDir>;
 
@@ -272,6 +329,7 @@ mod tests {
     use curvine_config::WorkerDataDir;
     use curvine_core_error::CommonResult;
     use curvine_model::StorageType;
+    use curvine_model::{HealthPolicy, HealthState};
     use curvine_runtime::common::{ByteUnit, FileUtils};
 
     #[test]
@@ -340,30 +398,65 @@ mod tests {
     }
 
     #[test]
-    fn failed_dir_stays_failed_and_stops_allocation() -> CommonResult<()> {
-        FileUtils::delete_path("../testing/dir-failed-sticky", true)?;
+    fn failing_dir_is_quarantined_and_recovers_automatically() -> CommonResult<()> {
+        use curvine_model::ProbeOutcome;
+
+        FileUtils::delete_path("../testing/dir-health-recovery", true)?;
         let dir = VfsDir::from_dir(
             "",
-            WorkerDataDir::from_str("[SSD:100MB]../testing/dir-failed-sticky")?,
+            WorkerDataDir::from_str("[SSD:100MB]../testing/dir-health-recovery")?,
         )?;
         let dir_id = dir.id();
-        let mut group = DirList::new(vec![dir])?;
+        let mut group = DirList::new(vec![dir])?.with_health_policy(HealthPolicy::new(2, 2));
+        let dir = group.get_dir(dir_id).unwrap().clone();
         assert_eq!(group.failed_count(), 0);
 
-        group.get_dir(dir_id).unwrap().set_failed();
+        let broken = ProbeOutcome::failed(curvine_model::FaultKind::IoError, "EIO");
+
+        // First failure only marks the directory suspect: still allocatable.
+        dir.observe_health(&broken, group.health_policy(), 1);
+        assert_eq!(dir.health_state(), HealthState::Suspect);
+        assert_eq!(group.failed_count(), 0);
+        assert!(group
+            .choose_dir(StorageRequest::new(StorageType::Ssd, 1)?)
+            .is_ok());
+
+        // Reaching the threshold quarantines it and stops allocation.
+        dir.observe_health(&broken, group.health_policy(), 1);
         assert_eq!(group.failed_count(), 1);
-
-        // A passing directory check must not resurrect a failed directory.
-        let storages = group.get_and_check_storages(0);
-        assert_eq!(storages.len(), 1);
-        assert!(
-            storages[0].failed,
-            "sticky failure must survive a healthy check"
-        );
-
         assert!(group
             .choose_dir(StorageRequest::new(StorageType::Ssd, 1)?)
             .is_err());
+
+        // Recovery needs consecutive successes, then allocation resumes
+        // without restarting the worker.
+        let ok = ProbeOutcome::Ok;
+        dir.observe_health(&ok, group.health_policy(), 2);
+        assert_eq!(group.failed_count(), 1);
+        dir.observe_health(&ok, group.health_policy(), 2);
+        assert_eq!(dir.health_state(), HealthState::Healthy);
+        assert_eq!(group.failed_count(), 0);
+        assert!(group
+            .choose_dir(StorageRequest::new(StorageType::Ssd, 1)?)
+            .is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn probe_reports_missing_directory_as_typed_fault() -> CommonResult<()> {
+        use curvine_model::FaultKind;
+
+        FileUtils::delete_path("../testing/dir-probe-missing", true)?;
+        let dir = VfsDir::from_dir(
+            "",
+            WorkerDataDir::from_str("[SSD:100MB]../testing/dir-probe-missing")?,
+        )?;
+        assert!(dir.probe().is_ok());
+
+        FileUtils::delete_path("../testing/dir-probe-missing", true)?;
+        let probe = dir.probe();
+        let (kind, _) = probe.fault().expect("missing dir must be reported");
+        assert_eq!(kind, FaultKind::PathMissing);
         Ok(())
     }
 

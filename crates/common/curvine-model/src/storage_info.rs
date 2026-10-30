@@ -14,6 +14,7 @@
 
 #![allow(clippy::derivable_impls)]
 
+use crate::{FaultKind, HealthState};
 use clap::ValueEnum;
 use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{err_box, CommonError};
@@ -123,6 +124,20 @@ pub struct StorageInfo {
     pub storage_type: StorageType,
     pub block_num: i64,
     pub dir_path: String,
+
+    /// Health state reported by the worker. `failed` stays for older peers.
+    pub health_state: HealthState,
+
+    pub fault_kind: FaultKind,
+
+    /// When the directory became unhealthy (ms since epoch, 0 while healthy).
+    pub unhealthy_since_ms: i64,
+}
+
+impl StorageInfo {
+    pub fn is_usable(&self) -> bool {
+        self.health_state.is_usable()
+    }
 }
 
 #[cfg(test)]
