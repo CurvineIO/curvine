@@ -654,8 +654,14 @@ impl FsDir {
         let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
 
         // No TRASH flag: the entry gets no origin or delete-time markers, so it
-        // can never be listed, restored or swept by the retention pass.
-        self.rename_with_mtime(inp, &dst_inp, RenameFlags::NO_REPLACE, op_ms)?;
+        // can never be listed, restored or swept by the retention pass. PURGE
+        // keeps an expired source parent's mtime, matching a direct delete.
+        self.rename_with_mtime(
+            inp,
+            &dst_inp,
+            RenameFlags::NO_REPLACE | RenameFlags::PURGE,
+            op_ms,
+        )?;
         debug!("staged {} for bounded purge as {}", inp.path(), dst_path);
         Ok(dst_path)
     }
@@ -1350,8 +1356,15 @@ impl FsDir {
             }
         }
 
-        // Update the parent directory for the last modification time.
-        src_parent.update_mtime(mtime);
+        // Update the parent directory for the last modification time. A purge
+        // staging rename is a permanent delete of the source, so it follows
+        // `unprotected_delete`: an already-expired source parent keeps its
+        // mtime. Expiry is evaluated at the journaled `mtime`, so replay agrees.
+        let src_parent_expired = flags.purge()
+            && matches!(src_parent.as_ref().expiration_ms(), Ok(Some(exp)) if mtime > exp);
+        if !src_parent_expired {
+            src_parent.update_mtime(mtime);
+        }
         dst_parent.update_mtime(mtime);
 
         // A directory is a link from each parent; cross-parent moves must

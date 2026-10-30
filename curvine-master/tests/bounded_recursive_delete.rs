@@ -19,7 +19,10 @@ use curvine_config::ClusterConf;
 use curvine_master::master::fs::{DeleteMode, MasterFilesystem, PendingTrashPurger};
 use curvine_master::master::journal::{JournalEntry, JournalSystem};
 use curvine_master::Master;
-use curvine_model::{ClientAddress, CommitBlock, CreateFileOpts, OpenFlags, WorkerInfo};
+use curvine_model::{
+    ClientAddress, CommitBlock, CreateFileOpts, OpenFlags, SetAttrOptsBuilder, TtlAction,
+    WorkerInfo,
+};
 use curvine_raft::raft::RoleState;
 use curvine_runtime::common::Utils;
 
@@ -206,6 +209,61 @@ fn follower_replay_reaches_the_leader_namespace() {
     follower.restore_from_rocksdb().unwrap();
     assert_eq!(names(&follower, "/"), names(&leader, "/"));
     assert!(purging_entries(&follower).is_empty());
+
+    drop(loader);
+    drop(follower);
+    follower_js.shutdown();
+}
+
+#[test]
+fn staged_delete_keeps_an_expired_parent_mtime_like_a_direct_delete() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let leader = filesystem("expired-leader", 4, true);
+    let follower_js = JournalSystem::from_conf(&conf("expired-follower", 4, true)).unwrap();
+    let follower = follower_js.fs();
+    let loader = follower_js.journal_loader();
+
+    // Below the cutoff: deleted directly. Above it: staged by a rename.
+    for dir in 0..3 {
+        leader.create(format!("/ttl/small/d{dir}/f"), true).unwrap();
+    }
+    wide_tree(&leader, "/ttl/large");
+    leader
+        .set_attr(
+            "/ttl",
+            SetAttrOptsBuilder::new()
+                .ttl_ms(1)
+                .ttl_action(TtlAction::Delete)
+                .build(),
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let expired_mtime = leader.file_status("/ttl").unwrap().mtime;
+
+    let dir = leader.fs_dir();
+    for entry in dir.read().take_entries() {
+        loader.apply_entry(entry).unwrap();
+    }
+
+    leader.delete("/ttl/small", true).unwrap();
+    assert_eq!(leader.file_status("/ttl").unwrap().mtime, expired_mtime);
+
+    leader.delete("/ttl/large", true).unwrap();
+    let entries = dir.read().take_entries();
+    assert!(
+        entries.iter().any(|e| matches!(e, JournalEntry::Rename(_))),
+        "/ttl/large must be staged"
+    );
+    assert_eq!(leader.file_status("/ttl").unwrap().mtime, expired_mtime);
+
+    // Replay evaluates expiry at the journaled timestamp and agrees.
+    for entry in entries {
+        loader.apply_entry(entry).unwrap();
+    }
+    assert_eq!(follower.file_status("/ttl").unwrap().mtime, expired_mtime);
+    assert!(follower.list_status("/ttl").unwrap().is_empty());
+    follower.restore_from_rocksdb().unwrap();
+    assert_eq!(follower.file_status("/ttl").unwrap().mtime, expired_mtime);
 
     drop(loader);
     drop(follower);
