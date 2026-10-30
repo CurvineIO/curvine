@@ -466,7 +466,13 @@ impl ClusterConnector {
         // Send a request to the current leader node.
         if let Some(id) = self.leader_id() {
             if let Ok(peer) = self.get_addr(id) {
-                let leader_timeout = self.rpc_timeout.min(policy.remaining());
+                // With other members to fail over to, the probe may use at most half
+                // of the budget; otherwise a stalled leader would consume the whole
+                // budget and the call would fail without trying any other node.
+                let mut leader_timeout = self.rpc_timeout.min(policy.remaining());
+                if self.peer_snapshot().len() > 1 {
+                    leader_timeout = leader_timeout.min(policy.remaining() / 2);
+                }
                 match self
                     .timeout_rpc_to_peer_with_timeout::<E>(&peer, msg.clone(), leader_timeout)
                     .await
