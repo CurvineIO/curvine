@@ -36,6 +36,24 @@ type WorkerRow = WorkerInfo & { rowStatus: string }
 const FILTERS = ['all', 'live', 'blacklist', 'decommission', 'lost'] as const
 type StatusFilter = (typeof FILTERS)[number]
 
+/** Unhealthy directories, i.e. the worker cannot take new writes for them. */
+function unhealthyDirs(worker: WorkerInfo) {
+  return Object.values(worker.storage_map || {}).filter(
+    (dir) => String(dir.health_state ?? '').toLowerCase() === 'unusable'
+  )
+}
+
+/** Worker fact (can it write), not the master's routing decision. */
+function isHealthy(worker: WorkerInfo): boolean {
+  if (typeof worker.accepting_allocations === 'boolean') return worker.accepting_allocations
+  return unhealthyDirs(worker).length === 0
+}
+
+function healthTone(worker: WorkerInfo): 'positive' | 'negative' | 'neutral' {
+  if (!isHealthy(worker)) return 'negative'
+  return 'positive'
+}
+
 function ipAddress(worker: WorkerInfo): string {
   return worker.display_ip || worker.address?.ip_addr || worker.ip_addr || '-'
 }
@@ -86,15 +104,18 @@ export function WorkersPage() {
 
   const filtered = useMemo(() => {
     const needle = query.toLowerCase()
-    return allWorkers.filter(
-      (worker) =>
-        (statusFilter === 'all' || worker.rowStatus === statusFilter) &&
-        `${workerHostname(worker)} ${workerId(worker)} ${workerAddress(worker)} ${ipAddress(worker)} ${workerShortVersion(
-          worker
-        )}`
-          .toLowerCase()
-          .includes(needle)
-    )
+    return allWorkers
+      .filter(
+        (worker) =>
+          (statusFilter === 'all' || worker.rowStatus === statusFilter) &&
+          `${workerHostname(worker)} ${workerId(worker)} ${workerAddress(worker)} ${ipAddress(worker)} ${workerShortVersion(
+            worker
+          )}`
+            .toLowerCase()
+            .includes(needle)
+      )
+      // Surface problems first: this list exists to show what needs attention.
+      .sort((a, b) => Number(isHealthy(b)) - Number(isHealthy(a)))
   }, [allWorkers, statusFilter, query])
 
   const activeWorkers = useMemo(
@@ -137,7 +158,7 @@ export function WorkersPage() {
 
       {error && <ErrorAlert message={error} />}
 
-      <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
         <MetricCard
           label={t('workers.metrics.liveWorkers')}
           value={groups.live.length}
@@ -158,6 +179,13 @@ export function WorkersPage() {
           meta={t('workers.metrics.activeWorkers')}
           delta={t('workers.metrics.usedPercent', { percent: clusterUsage })}
           tone="neutral"
+        />
+        <MetricCard
+          label={t('workers.metrics.unhealthy')}
+          value={activeWorkers.filter((worker) => !isHealthy(worker)).length}
+          meta={t('workers.metrics.unhealthyMeta')}
+          delta={delta(activeWorkers.some((worker) => !isHealthy(worker)) ? 'check' : 'none')}
+          tone={activeWorkers.some((worker) => !isHealthy(worker)) ? 'bad' : 'good'}
         />
         <MetricCard
           label={t('workers.metrics.lostWorkers')}
@@ -215,10 +243,11 @@ export function WorkersPage() {
           loading={loading}
           error={null}
           emptyTitle={t('workers.list.empty')}
-          columnWidths={['20%', '8%', '21%', '15%', '5%', '11%', '20%']}
+          columnWidths={['19%', '7%', '8%', '19%', '14%', '5%', '10%', '18%']}
           columns={[
             t('workers.list.headerWorker'),
             t('workers.list.headerStatus'),
+            t('workers.list.headerHealth'),
             t('workers.list.headerVersion'),
             t('workers.list.headerUsage'),
             t('workers.list.headerBlocks'),
@@ -261,6 +290,13 @@ export function WorkersPage() {
                   />
                 </TableCell>
                 <TableCell>
+                  <StatusBadge
+                    value={isHealthy(worker) ? t('workers.health.healthy') : t('workers.health.unhealthy')}
+                    tone={healthTone(worker)}
+                    data-testid={`worker-health-${selector}`}
+                  />
+                </TableCell>
+                <TableCell>
                   {/* Its own column: the reported version carries the build
                       commit and branch, so it needs more room than a subtitle —
                       and it is proportional, like the detail page's copy, because
@@ -277,6 +313,16 @@ export function WorkersPage() {
                   {/* One line: `used` is derived from capacity - available, so
                       showing used/capacity keeps every figure recoverable. */}
                   <div className="flex w-full items-center gap-2">
+                    {!isHealthy(worker) && (
+                      <span
+                        className="shrink-0 rounded bg-destructive/10 px-1.5 py-0.5 text-[10px] font-medium text-destructive"
+                        title={unhealthyDirs(worker)
+                          .map((dir) => `${dir.dir_path || dir.storage_id}: ${dir.fault_kind || 'unusable'}`)
+                          .join('\n')}
+                      >
+                        {t('workers.health.notAllocatable')}
+                      </span>
+                    )}
                     <strong className="shrink-0 text-xs tabular-nums">{usage}%</strong>
                     <Meter
                       percent={usage}

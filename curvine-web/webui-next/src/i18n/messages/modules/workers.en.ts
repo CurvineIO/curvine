@@ -9,7 +9,9 @@ export default {
       blacklistDecommission: 'blacklist / decommission',
       activeWorkers: 'active workers',
       usedPercent: '{percent}% used',
-      requiresAttention: 'requires attention'
+      requiresAttention: 'requires attention',
+      unhealthy: 'Unhealthy Workers',
+      unhealthyMeta: 'cannot accept writes'
     },
     list: {
       title: 'Worker Nodes',
@@ -17,6 +19,7 @@ export default {
       searchPlaceholder: 'Search hostname or ip',
       headerWorker: 'Worker',
       headerStatus: 'Status',
+      headerHealth: 'Health',
       headerVersion: 'Version',
       headerUsage: 'Usage',
       headerBlocks: 'Blocks',
@@ -31,6 +34,17 @@ export default {
       blacklist: 'Blacklist',
       decommission: 'Decommission',
       lost: 'Lost'
+    },
+    health: {
+      healthy: 'Healthy',
+      suspect: 'Suspect',
+      unusable: 'Unusable',
+      unhealthy: 'Unhealthy',
+      notAllocatable: 'No writes',
+      reason: 'Reason',
+      since: 'Unhealthy for',
+      fault: 'Fault',
+      state: 'State'
     },
     actions: {
       detail: 'Detail',

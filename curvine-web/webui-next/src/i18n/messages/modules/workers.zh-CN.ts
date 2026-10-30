@@ -9,7 +9,9 @@ export default {
       blacklistDecommission: '黑名单 / 下线',
       activeWorkers: '活跃 Worker',
       usedPercent: '已用 {percent}%',
-      requiresAttention: '需要关注'
+      requiresAttention: '需要关注',
+      unhealthy: '不健康节点',
+      unhealthyMeta: '无法接受写入'
     },
     list: {
       title: 'Worker 节点',
@@ -17,6 +19,7 @@ export default {
       searchPlaceholder: '搜索主机名或 IP',
       headerWorker: 'Worker',
       headerStatus: '状态',
+      headerHealth: '健康',
       headerVersion: '版本',
       headerUsage: '使用率',
       headerBlocks: '块',
@@ -31,6 +34,17 @@ export default {
       blacklist: '黑名单',
       decommission: '下线',
       lost: '丢失'
+    },
+    health: {
+      healthy: '健康',
+      suspect: '可疑',
+      unusable: '不可用',
+      unhealthy: '不健康',
+      notAllocatable: '不可分配',
+      reason: '原因',
+      since: '持续',
+      fault: '故障',
+      state: '状态'
     },
     actions: {
       detail: '详情',

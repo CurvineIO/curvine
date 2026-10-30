@@ -49,6 +49,23 @@ const STORAGE_TYPE_ICONS: Record<string, LucideIcon> = {
   spdkdisk: ServerIcon
 }
 
+/** How long a target has been unhealthy, e.g. "12m". */
+function elapsed(sinceMs?: number | null): string {
+  if (!sinceMs || sinceMs <= 0) return '-'
+  const secs = Math.max(0, Math.floor((Date.now() - sinceMs) / 1000))
+  if (secs < 60) return `${secs}s`
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`
+  return `${Math.floor(secs / 3600)}h`
+}
+
+/** Oldest `unhealthy_since_ms` across the node's directories (0 = none). */
+function earliestUnhealthySince(items: WorkerStorageInfo[]): number {
+  const since = items
+    .map((item) => Number(item.unhealthy_since_ms || 0))
+    .filter((value) => value > 0)
+  return since.length ? Math.min(...since) : 0
+}
+
 function storageTypeIcon(value: unknown): LucideIcon {
   return STORAGE_TYPE_ICONS[String(value ?? '').trim().toLowerCase()] ?? HardDriveIcon
 }
@@ -248,6 +265,36 @@ export function WorkerDetailSheet({
         
                 <Card size="sm">
                   <CardHeader>
+                    <CardTitle>{t('workers.health.state')}</CardTitle>
+                    <p className="text-xs text-muted-foreground">
+                      {t('workers.metrics.unhealthyMeta')}
+                    </p>
+                  </CardHeader>
+                  <CardContent>
+                    <DetailList>
+                      <DetailRow label={t('workers.health.state')}>
+                        <StatusBadge
+                          value={
+                            worker.accepting_allocations === false
+                              ? t('workers.health.unhealthy')
+                              : t('workers.health.healthy')
+                          }
+                          tone={worker.accepting_allocations === false ? 'negative' : 'positive'}
+                        />
+                      </DetailRow>
+                      <DetailRow label="allocatable">
+                        {String(worker.accepting_allocations ?? '-')}
+                      </DetailRow>
+                      <DetailRow label="schedulable">{String(worker.schedulable ?? '-')}</DetailRow>
+                      <DetailRow label={t('workers.health.since')}>
+                        {elapsed(earliestUnhealthySince(storageItems))}
+                      </DetailRow>
+                    </DetailList>
+                  </CardContent>
+                </Card>
+
+                <Card size="sm">
+                  <CardHeader>
                     <CardTitle>{t('workers.detail.storage.title')}</CardTitle>
                     <p className="text-xs text-muted-foreground">{t('workers.detail.storage.subtitle')}</p>
                   </CardHeader>
@@ -284,19 +331,28 @@ export function WorkerDetailSheet({
                   loading={loading}
                   error={null}
                   emptyTitle={t('workers.detail.storage.empty')}
-                  columnWidths={['36%', '12%', '26%', '9%', '17%']}
+                  columnWidths={['28%', '10%', '10%', '12%', '22%', '8%', '10%']}
                   columns={[
                     t('workers.detail.storage.directoriesTitle'),
                     t('workers.detail.storage.type'),
+                    t('workers.health.state'),
+                    t('workers.health.fault'),
                     t('workers.list.headerUsage'),
                     t('workers.list.headerBlocks'),
-                    t('workers.list.headerStatus')
+                    t('workers.health.since')
                   ]}
                   rows={storageItems.map((item) => {
                     const itemUsage = usagePercent(item.capacity, item.available)
                     const StorageIcon = storageTypeIcon(item.storage_type)
                     return (
-                      <TableRow key={item.storage_id}>
+                      <TableRow
+                        key={item.storage_id}
+                        className={
+                          String(item.health_state ?? '').toLowerCase() === 'unusable'
+                            ? 'bg-destructive/5'
+                            : undefined
+                        }
+                      >
                         <TableCell>
                           <div className="flex w-full min-w-0 flex-col gap-0.5">
                             <strong className="truncate font-medium">{item.dir_path}</strong>
@@ -310,6 +366,19 @@ export function WorkerDetailSheet({
                             <StorageIcon className="size-3.5 shrink-0" aria-hidden />
                             {item.storage_type || '-'}
                           </span>
+                        </TableCell>
+                        <TableCell>
+                          <StatusBadge
+                            value={item.health_state || '-'}
+                            tone={
+                              String(item.health_state ?? '').toLowerCase() === 'unusable'
+                                ? 'negative'
+                                : 'positive'
+                            }
+                          />
+                        </TableCell>
+                        <TableCell className="text-xs text-muted-foreground">
+                          {item.fault_kind || '-'}
                         </TableCell>
                         <TableCell>
                           <div className="flex w-full flex-col gap-1">
@@ -328,11 +397,8 @@ export function WorkerDetailSheet({
                           </div>
                         </TableCell>
                         <TableCell className="tabular-nums">{item.block_num || 0}</TableCell>
-                        <TableCell>
-                          <StatusBadge
-                            value={translateStatus(t, item.failed ? 'failed' : 'healthy')}
-                            tone={item.failed ? 'negative' : 'positive'}
-                          />
+                        <TableCell className="text-xs text-muted-foreground">
+                          {elapsed(item.unhealthy_since_ms)}
                         </TableCell>
                       </TableRow>
                     )

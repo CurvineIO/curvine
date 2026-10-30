@@ -86,6 +86,10 @@ export interface WorkerStorageInfo {
   available?: number | null
   block_num?: number | null
   failed?: boolean
+  /** Health view reported by the worker. `failed` stays for older peers. */
+  health_state?: 'Healthy' | 'Suspect' | 'Unusable' | string | null
+  fault_kind?: string | null
+  unhealthy_since_ms?: number | null
 }
 
 export interface WorkerInfo {
@@ -106,6 +110,10 @@ export interface WorkerInfo {
   version?: string | null
   storage_map?: Record<string, WorkerStorageInfo> | null
   status?: string | null
+  /** Worker fact: can it take new writes at all? */
+  accepting_allocations?: boolean | null
+  /** Master decision: does the scheduler route new blocks here? */
+  schedulable?: boolean | null
   [key: string]: unknown
 }
 
