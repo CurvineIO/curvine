@@ -25,7 +25,12 @@ use curvine_runtime::sync::channel::{
 };
 use curvine_runtime::sync::ErrorMonitor;
 use log::{debug, error};
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio::time;
 
 // Control task type
 enum WriterTask {
@@ -57,9 +62,18 @@ async fn recv_task(
 }
 
 struct BufferChannel {
+    path: String,
     chunk_sender: AsyncSender<DataSlice>,
     task_sender: AsyncSender<WriterTask>,
     err_monitor: Arc<ErrorMonitor<FsError>>,
+    /// Resolves when the background writer task exits (normally or with an
+    /// error), so pending handshakes can wake up instead of waiting for their
+    /// full timeout.
+    exited: watch::Receiver<bool>,
+    /// Upper bound for one request/response handshake with the background
+    /// task. Without it a wedged-but-alive task would leave callers pending
+    /// forever (see https://github.com/CurvineIO/curvine/issues/1908).
+    timeout: Duration,
 }
 
 impl BufferChannel {
@@ -67,11 +81,53 @@ impl BufferChannel {
         self.err_monitor.take_error().unwrap_or(e.into())
     }
 
+    /// Run one request/response handshake with a deadline, so a background
+    /// task that is alive but no longer responding cannot block the caller
+    /// forever. When the background task has already exited, the call fails
+    /// immediately instead of waiting for the deadline.
+    async fn guard<F, T, E>(&self, fut: F) -> FsResult<T>
+    where
+        F: Future<Output = Result<T, E>>,
+        E: Into<FsError>,
+    {
+        let mut exited = self.exited.clone();
+        // Failed fast when the task already exited before this call.
+        if *exited.borrow_and_update() {
+            return Err(self.task_exited_error());
+        }
+
+        let res = time::timeout(self.timeout, async {
+            tokio::select! {
+                biased;
+                _ = exited.changed() => Err(self.task_exited_error()),
+                res = fut => res.map_err(|e| e.into()),
+            }
+        })
+        .await;
+
+        match res {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(e)) => Err(self.check_error(e)),
+            Err(_) => {
+                let e = FsError::common(format!(
+                    "write buffer task not responding after {:?}, path={}",
+                    self.timeout, self.path
+                ));
+                error!("{}", e);
+                Err(self.check_error(e))
+            }
+        }
+    }
+
+    fn task_exited_error(&self) -> FsError {
+        FsError::common(format!(
+            "write buffer background task has exited, path={}",
+            self.path
+        ))
+    }
+
     async fn write(&mut self, data: DataSlice) -> FsResult<()> {
-        self.chunk_sender
-            .send(data)
-            .await
-            .map_err(|e| self.check_error(e))
+        self.guard(self.chunk_sender.send(data)).await
     }
 
     async fn complete(&mut self) -> FsResult<()> {
@@ -87,7 +143,7 @@ impl BufferChannel {
             rx.receive().await?;
             Ok::<(), IOError>(())
         };
-        fun.await.map_err(|e| self.check_error(e))
+        self.guard(fun).await
     }
 
     async fn flush(&mut self) -> FsResult<()> {
@@ -97,7 +153,7 @@ impl BufferChannel {
             rx.receive().await?;
             Ok::<(), IOError>(())
         };
-        fun.await.map_err(|e| self.check_error(e))
+        self.guard(fun).await
     }
 
     async fn cancel(&mut self) -> FsResult<()> {
@@ -107,7 +163,7 @@ impl BufferChannel {
             rx.receive().await??;
             Ok::<(), FsError>(())
         };
-        fun.await.map_err(|e| self.check_error(e))
+        self.guard(fun).await
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
@@ -117,7 +173,7 @@ impl BufferChannel {
             rx.receive().await?;
             Ok::<(), IOError>(())
         };
-        fun.await.map_err(|e| self.check_error(e))
+        self.guard(fun).await
     }
 
     async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<FileBlocks> {
@@ -129,7 +185,7 @@ impl BufferChannel {
             let file_blocks = rx.receive().await?;
             Ok::<FileBlocks, IOError>(file_blocks)
         };
-        fun.await.map_err(|e| self.check_error(e))
+        self.guard(fun).await
     }
 }
 
@@ -147,13 +203,17 @@ impl FsWriterBuffer {
         let path = writer.path().clone();
         let file_blocks = writer.file_blocks();
         let pos = writer.pos();
+        let timeout =
+            Duration::from_millis(writer.fs_context().conf.client.write_buffer_timeout_ms);
 
         let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
         let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+        let (exited_tx, exited_rx) = watch::channel(false);
+        let exited_tx2 = exited_tx.clone();
         let monitor = err_monitor.clone();
 
         let rt = writer.fs_context().clone_runtime();
-        rt.spawn(async move {
+        let handle: JoinHandle<()> = rt.spawn(async move {
             let res = Self::write_future(chunk_receiver, task_receiver, writer).await;
             match res {
                 Ok(_) => {}
@@ -167,12 +227,37 @@ impl FsWriterBuffer {
                     monitor.set_error(e);
                 }
             }
+            // Wake up every in-flight handshake so callers fail fast instead
+            // of waiting for their timeout.
+            let _ = exited_tx2.send(true);
+        });
+
+        // The background task must survive the writer being polled; keeping
+        // the handle here (instead of dropping it) also lets a watchdog turn
+        // an unexpected task panic into a visible error for pending callers.
+        let watchdog_path = path.path().to_string();
+        let watchdog_monitor = err_monitor.clone();
+        rt.spawn(async move {
+            if let Err(e) = handle.await {
+                if e.is_panic() {
+                    let err = FsError::common(format!(
+                        "write buffer background task panicked, path={}: {}",
+                        watchdog_path, e
+                    ));
+                    error!("{}", err);
+                    watchdog_monitor.set_error(err);
+                }
+            }
+            let _ = exited_tx.send(true);
         });
 
         let writer = BufferChannel {
+            path: path.path().to_string(),
             chunk_sender,
             task_sender,
             err_monitor,
+            exited: exited_rx,
+            timeout,
         };
 
         Self {
@@ -324,11 +409,16 @@ impl FsWriterBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{recv_task, SelectTask, WriterTask};
+    use super::{recv_task, BufferChannel, SelectTask, WriterTask};
     use bytes::Bytes;
     use curvine_error::FsResult;
     use curvine_io::DataSlice;
     use curvine_runtime::sync::channel::{AsyncChannel, CallChannel};
+    use curvine_runtime::sync::ErrorMonitor;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::watch;
+    use tokio::time;
 
     #[tokio::test]
     async fn cancel_control_preempts_queued_data() {
@@ -345,5 +435,104 @@ mod tests {
             recv_task(&mut chunk_rx, &mut task_rx).await,
             Some(SelectTask::Control(WriterTask::Cancel(_)))
         ));
+    }
+
+    // Build a BufferChannel whose background side is fully controlled by the
+    // test: nothing answers the handshakes unless the test does.
+    fn test_channel(timeout_ms: u64) -> (BufferChannel, watch::Sender<bool>) {
+        let (chunk_sender, chunk_receiver) = AsyncChannel::new(2).split();
+        let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+        let (exited_tx, exited_rx) = watch::channel(false);
+        std::mem::forget((chunk_receiver, task_receiver));
+
+        let channel = BufferChannel {
+            path: "/gh-1908-test".to_string(),
+            chunk_sender,
+            task_sender,
+            err_monitor: Arc::new(ErrorMonitor::new()),
+            exited: exited_rx,
+            timeout: Duration::from_millis(timeout_ms),
+        };
+        (channel, exited_tx)
+    }
+
+    // Regression test for #1908: the background task is alive but stops
+    // polling, so the handshake can never complete. flush()/complete() must
+    // return an error within the configured deadline instead of hanging.
+    #[tokio::test]
+    async fn handshakes_time_out_when_background_task_stops_responding() {
+        let (mut channel, _exited_tx) = test_channel(200);
+
+        let res = time::timeout(Duration::from_secs(5), channel.flush()).await;
+        assert!(res.is_ok(), "flush() hung instead of returning an error");
+        let err = res.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("not responding"),
+            "unexpected error: {}",
+            err
+        );
+
+        let (mut channel, _exited_tx) = test_channel(200);
+        let res = time::timeout(Duration::from_secs(5), channel.complete()).await;
+        assert!(res.is_ok(), "complete() hung instead of returning an error");
+        let err = res.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("not responding"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    // When the background task exits, an in-flight request must be woken up
+    // immediately with an error, without waiting for its timeout.
+    #[tokio::test]
+    async fn exited_background_task_wakes_pending_requests() {
+        let (mut channel, exited_tx) = test_channel(60 * 1000);
+
+        let handle = tokio::spawn(async move { channel.flush().await });
+        time::sleep(Duration::from_millis(100)).await;
+        // Simulate the watchdog noticing that the background task exited.
+        let _ = exited_tx.send(true);
+
+        let res = time::timeout(Duration::from_secs(5), handle).await;
+        assert!(res.is_ok(), "pending flush() was not woken up on task exit");
+        let err = res.unwrap().unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("exited"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    // A handshake issued after the background task already exited must fail
+    // fast instead of waiting for the deadline.
+    #[tokio::test]
+    async fn handshake_fails_fast_when_task_already_exited() {
+        let (mut channel, exited_tx) = test_channel(60 * 1000);
+        let _ = exited_tx.send(true);
+
+        let res = time::timeout(Duration::from_secs(5), channel.flush()).await;
+        assert!(res.is_ok(), "flush() hung on an already-exited task");
+        let err = res.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("exited"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    // After a timeout has been observed, the error is recorded and later
+    // calls keep seeing it via check_error() semantics.
+    #[tokio::test]
+    async fn timeout_error_is_visible_to_later_calls() {
+        let (mut channel, _exited_tx) = test_channel(200);
+
+        let err = channel.flush().await.unwrap_err();
+        assert!(err.to_string().contains("not responding"));
+
+        // The next call fails fast: the channel is unusable now.
+        let res = time::timeout(Duration::from_secs(5), channel.flush()).await;
+        assert!(res.is_ok());
+        assert!(res.unwrap().is_err());
     }
 }

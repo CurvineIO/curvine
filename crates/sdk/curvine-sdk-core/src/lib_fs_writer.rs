@@ -22,7 +22,11 @@ use curvine_io::DataSlice;
 use curvine_model::FileStatus;
 use curvine_rpc::handler::FrameBuf;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use log::warn;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time;
 
 pub struct LibFsWriter {
     pub(crate) rt: Arc<Runtime>,
@@ -30,6 +34,7 @@ pub struct LibFsWriter {
     pub(crate) buf: FrameBuf,
     pub(crate) chunk_size: usize,
     pub(crate) cur_chunk: Option<BytesMut>,
+    pub(crate) timeout_secs: u64,
 }
 
 impl LibFsWriter {
@@ -40,6 +45,7 @@ impl LibFsWriter {
             buf: FrameBuf::new(conf.client.write_chunk_size * conf.client.write_chunk_num),
             chunk_size: conf.client.write_chunk_size,
             cur_chunk: None,
+            timeout_secs: conf.client.close_timeout_secs,
         }
     }
 
@@ -78,13 +84,39 @@ impl LibFsWriter {
         self.alloc_chunk()
     }
 
+    /// Upper bound for a blocking flush/complete from the JNI layer: without
+    /// it, a wedged write-buffer background task blocks the caller (e.g. Java
+    /// SDK closeWriter) forever (see https://github.com/CurvineIO/curvine/issues/1908).
+    /// Uses close_timeout_secs so the blocking wait is capped at roughly the
+    /// same budget as the rest of the close path.
+    fn block_on_with_deadline<F, T>(rt: &Runtime, timeout_secs: u64, task: F) -> FsResult<T>
+    where
+        F: Future<Output = FsResult<T>>,
+    {
+        let timeout = Duration::from_secs(timeout_secs);
+        match rt.block_on(time::timeout(timeout, task)) {
+            Ok(res) => res,
+            Err(_) => {
+                let msg = format!(
+                    "writer flush/complete timed out after {:?}; \
+                     the write buffer background task may be stuck",
+                    timeout
+                );
+                warn!("{}", msg);
+                err_box!(msg)
+            }
+        }
+    }
+
     pub fn flush(&mut self) -> FsResult<()> {
-        self.rt.block_on(self.inner.flush())
+        let task = self.inner.flush();
+        Self::block_on_with_deadline(&self.rt, self.timeout_secs, task)
     }
 
     pub fn complete(&mut self) -> FsResult<()> {
         let _ = self.cur_chunk.take();
-        self.rt.block_on(self.inner.complete())
+        let task = self.inner.complete();
+        Self::block_on_with_deadline(&self.rt, self.timeout_secs, task)
     }
 
     pub fn pos(&self) -> i64 {
