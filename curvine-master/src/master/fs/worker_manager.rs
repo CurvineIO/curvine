@@ -19,8 +19,9 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_model::{
-    BlockLocation, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo, StorageType,
-    TransferWorkerCapabilities, WorkerAddress, WorkerCommand, WorkerInfo, WorkerStatus,
+    BlockLocation, CommitBlock, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo,
+    StorageType, TransferWorkerCapabilities, WorkerAddress, WorkerCommand, WorkerInfo,
+    WorkerStatus,
 };
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::{ByteUnit, LocalTime};
@@ -35,6 +36,9 @@ pub struct WorkerManager {
     pub(crate) cluster_id: String,
     pub(crate) conf: ClusterConf,
 }
+
+/// A committed replica to settle: `(block_id, block_len, worker_id)`.
+pub(crate) type SettleEntry = (i64, i64, u32);
 
 impl WorkerManager {
     pub fn new(conf: &ClusterConf) -> FsResult<Self> {
@@ -132,6 +136,65 @@ impl WorkerManager {
 
     pub(crate) fn unschedule_chosen_workers(&mut self, workers: &[WorkerAddress], block_size: i64) {
         self.adjust_chosen_workers(workers, block_size, false);
+    }
+
+    /// Binds the reservation taken by `choose_worker` to the allocated block
+    /// so commit-time settlement releases at most this block's own credit.
+    pub(crate) fn bind_scheduled_blocks(
+        &mut self,
+        workers: &[WorkerAddress],
+        block_id: i64,
+        block_size: i64,
+    ) {
+        if block_size <= 0 {
+            return;
+        }
+        for addr in workers {
+            if let Some(worker) = self.worker_map.workers.get_mut(&addr.worker_id) {
+                worker.bind_scheduled_block(block_id, block_size);
+            }
+        }
+    }
+
+    /// Settles reservations for committed blocks.
+    ///
+    /// Allocation reserves a full `block_size` per replica and binds that
+    /// credit to the block id (`bind_scheduled_blocks`). The remainder would
+    /// otherwise stay reserved until the heartbeat reclaim (which only
+    /// reclaims bytes actually written) or the lost-interval expiry, so a
+    /// burst of small files could reserve the whole cluster and starve new
+    /// allocations. Commit therefore releases the credit the block still owns
+    /// above its final length. Credit a heartbeat already reclaimed, or
+    /// absent because the commit never re-reserved (`FsWriterBase` reopening
+    /// an existing block, repeated flushes), settles nothing, so other
+    /// blocks' reservations stay intact.
+    pub(crate) fn settle_committed_blocks(&mut self, settles: &[SettleEntry]) {
+        for &(block_id, block_len, worker_id) in settles {
+            if let Some(worker) = self.worker_map.workers.get_mut(&worker_id) {
+                worker.settle_scheduled_block(block_id, block_len);
+            }
+        }
+    }
+
+    /// Builds the settlement snapshot for committed blocks: one flat
+    /// allocation regardless of block count, so callers can snapshot under
+    /// the namespace write lock before `commit_blocks` is moved into the
+    /// journal. SPDK replicas are filtered out here and keep their credit:
+    /// the bdev extent stays fully allocated regardless of `block_len`
+    /// (`BlockMeta::with_final_spdk`), so the reservation is left for the
+    /// heartbeat to reclaim once the worker reports the reduced available
+    /// space.
+    pub(crate) fn settle_snapshot(commit_blocks: &[CommitBlock]) -> Vec<SettleEntry> {
+        commit_blocks
+            .iter()
+            .flat_map(|commit| {
+                commit
+                    .locations
+                    .iter()
+                    .filter(|loc| loc.storage_type != StorageType::SpdkDisk)
+                    .map(move |loc| (commit.block_id, commit.block_len, loc.worker_id))
+            })
+            .collect()
     }
 
     fn expire_scheduled_bytes(&mut self) {
@@ -552,6 +615,169 @@ mod tests {
             manager.get_worker(1).unwrap().scheduled_bytes,
             8 * block_size
         );
+    }
+
+    #[test]
+    fn settle_committed_blocks_releases_unused_reservation() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        manager.add_test_worker(worker_with_available(1, 1 << 40));
+
+        // A small file reserves a full block but only writes 4 KiB.
+        let chosen = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&chosen, 1, block_size);
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+
+        let commit = CommitBlock {
+            block_id: 1,
+            block_len: 4096,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 4096);
+    }
+
+    #[test]
+    fn settle_committed_blocks_keeps_full_block_reservation() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        manager.add_test_worker(worker_with_available(1, 1 << 40));
+
+        let chosen = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&chosen, 1, block_size);
+
+        // A fully written block settles nothing; the heartbeat reclaims it.
+        let commit = CommitBlock {
+            block_id: 1,
+            block_len: block_size,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+    }
+
+    #[test]
+    fn settle_without_bound_credit_is_noop() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        manager.add_test_worker(worker_with_available(1, 1 << 40));
+
+        // Block 1 holds the only reservation.
+        let chosen = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&chosen, 1, block_size);
+
+        // An existing-block rewrite commits block 2 without a new AddBlock
+        // reservation; it must not consume block 1's credit. Unknown workers
+        // are ignored.
+        let commit = CommitBlock {
+            block_id: 2,
+            block_len: 0,
+            locations: vec![BlockLocation::with_id(1), BlockLocation::with_id(99)],
+        };
+        manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+    }
+
+    #[test]
+    fn settle_after_heartbeat_reclaim_keeps_other_reservation() {
+        let mut manager = robin_manager();
+        let available = 1 << 30;
+        let block_size = 128 << 20;
+        let mut worker = worker_with_available(1, available);
+        worker.capacity = available;
+        let addr = worker.address.clone();
+        manager.add_test_worker(worker);
+
+        // Block 1 reserves, then a heartbeat observes the worker-side
+        // temporary reservation and reclaims the whole credit before commit.
+        let chosen = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&chosen, 1, block_size);
+
+        let cluster_id = manager.cluster_id.clone();
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                String::new(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![storage(available, available - block_size)],
+                None,
+            )
+            .unwrap();
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 0);
+
+        // Block 2 reserves afterwards; block 1's late small commit must not
+        // consume block 2's credit.
+        let chosen = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&chosen, 2, block_size);
+
+        let commit = CommitBlock {
+            block_id: 1,
+            block_len: 4096,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+    }
+
+    #[test]
+    fn settle_repeated_flush_releases_credit_once() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        manager.add_test_worker(worker_with_available(1, 1 << 40));
+
+        let chosen = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&chosen, 1, block_size);
+
+        // Each flush commits the same growing block; the credit converges to
+        // the committed length instead of releasing `block_size - len` again.
+        for block_len in [4096, 4096, 8192] {
+            let commit = CommitBlock {
+                block_id: 1,
+                block_len,
+                locations: vec![BlockLocation::with_id(1)],
+            };
+            manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
+        }
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 4096);
+    }
+
+    #[test]
+    fn settle_skips_spdk_locations() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        manager.add_test_worker(worker_with_available(1, 1 << 40));
+
+        let chosen = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&chosen, 1, block_size);
+
+        // An SPDK extent stays fully allocated after a small commit, so the
+        // reservation must be left for the heartbeat to reclaim.
+        let commit = CommitBlock {
+            block_id: 1,
+            block_len: 4096,
+            locations: vec![BlockLocation::new(1, StorageType::SpdkDisk)],
+        };
+        manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
     }
 
     #[test]

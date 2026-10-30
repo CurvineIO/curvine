@@ -125,13 +125,13 @@ impl WorkerMap {
             info.add_storage(item);
         }
 
-        let previous = self.workers.get(&worker_id).map(|worker| {
-            (
-                worker.available,
-                worker.scheduled_bytes,
-                worker.scheduled_since_ms,
-            )
-        });
+        let previous = match self.workers.get_mut(&worker_id) {
+            Some(worker) => {
+                info.carry_scheduled_from(worker);
+                Some(worker.available)
+            }
+            None => None,
+        };
 
         // Decommission is operator-managed and survives timeouts, eviction and restarts.
         // Blacklist is heartbeat-timeout based; a new heartbeat clears it.
@@ -141,9 +141,7 @@ impl WorkerMap {
             WorkerStatus::Live
         };
 
-        if let Some((previous_available, previous_scheduled, previous_since)) = previous {
-            info.scheduled_bytes = previous_scheduled;
-            info.scheduled_since_ms = previous_since;
+        if let Some(previous_available) = previous {
             info.reclaim_scheduled_from_heartbeat(previous_available);
         }
 
