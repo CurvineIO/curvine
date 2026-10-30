@@ -35,6 +35,7 @@ use log::{debug, error, info, warn};
 use raft::eraftpb::{Entry, EntryType};
 use raft::StateRole;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use std::{fs, mem};
@@ -58,6 +59,9 @@ pub struct JournalLoader {
     retry_interval: Duration,
     metrics: &'static MasterMetrics,
     has_apply_worker: bool,
+    /// Shared raft-term handle, so the session lease epoch follows election
+    /// instead of process start (#1883 review).
+    term: Arc<AtomicU64>,
 }
 
 impl JournalLoader {
@@ -80,6 +84,7 @@ impl JournalLoader {
             log_store,
             journal_writer,
             true,
+            Arc::new(AtomicU64::new(0)),
         )
     }
 
@@ -92,6 +97,7 @@ impl JournalLoader {
         job_manager: Arc<JobManager>,
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
+        term: Arc<AtomicU64>,
     ) -> CommonResult<Self> {
         Self::build(
             rt,
@@ -102,6 +108,7 @@ impl JournalLoader {
             log_store,
             journal_writer,
             false,
+            term,
         )
     }
 
@@ -115,6 +122,7 @@ impl JournalLoader {
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
         testing: bool,
+        term: Arc<AtomicU64>,
     ) -> CommonResult<Self> {
         let ufs_loader = UfsLoader::new(job_manager, fs_dir.clone(), conf);
         let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
@@ -135,6 +143,7 @@ impl JournalLoader {
             retry_interval: Duration::from_secs(conf.retry_interval_secs),
             metrics: Master::get_metrics()?,
             has_apply_worker: !testing,
+            term,
         };
 
         loader.refresh_metrics()?;
@@ -1043,6 +1052,9 @@ impl AppStorage for JournalLoader {
     fn hard_state_changed(&self, state: &raft::eraftpb::HardState) {
         self.metrics.journal_committed.set(state.commit as i64);
         self.metrics.journal_term.set(state.term as i64);
+        // Every persisted term moves the lease epoch forward; a promotion always
+        // carries a higher term than the leadership it replaces.
+        self.term.store(state.term, Ordering::Release);
     }
 
     async fn role_change(&self, role: StateRole) -> RaftResult<()> {

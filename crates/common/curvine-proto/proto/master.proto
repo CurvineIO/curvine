@@ -418,6 +418,25 @@ message MetricsReportResponse {
 
 }
 
+// Client session lease heartbeat. The first heartbeat registers the session
+// keyed by client.client_name; later heartbeats renew it. Sessions are advisory
+// liveness only and are not an authentication boundary.
+message ClientHeartbeatRequest {
+    required ClientAddressProto client = 1;
+    // Client-side heartbeat interval, informational for the master.
+    required uint64 heartbeat_interval_ms = 2;
+    optional uint32 pid = 3;
+    optional string mount_point = 4;
+    optional string client_version = 5;
+}
+
+message ClientHeartbeatResponse {
+    // A session not renewed within this window is considered expired.
+    required uint64 session_timeout_ms = 1;
+    // True when this heartbeat registered a new session on the current leader.
+    required bool new_session = 2;
+}
+
 message FileResizeRequest {
     required string path = 1;
     required FileAllocOptsProto opts = 2;

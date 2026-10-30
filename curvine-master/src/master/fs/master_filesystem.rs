@@ -21,10 +21,11 @@ use crate::master::meta::{
     trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
 };
 
+use crate::master::fs::state::{SessionHeartbeat, SessionMap};
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
-use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
+use crate::master::{Master, MasterMonitor, SyncFsDir, SyncSessionMap, SyncWorkerManager};
 use curvine_config::{ClusterConf, MasterConf};
 use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
 use curvine_error::FsError;
@@ -76,6 +77,8 @@ pub struct MasterFilesystem {
     pub fs_dir: SyncFsDir,
     pub worker_manager: SyncWorkerManager,
     pub master_monitor: MasterMonitor,
+    /// Leader-local client session leases (not journaled).
+    pub session_map: SyncSessionMap,
     pub conf: Arc<MasterConf>,
     full_report_tracker: FullReportTracker,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
@@ -173,6 +176,7 @@ impl MasterFilesystem {
             fs_dir,
             worker_manager,
             master_monitor,
+            session_map: ArcRwLock::new(SessionMap::new(conf.master.client_session_timeout_ms())),
             conf: Arc::new(conf.master.clone()),
             full_report_tracker: Default::default(),
             full_block_reconciles: Default::default(),
@@ -190,6 +194,9 @@ impl MasterFilesystem {
             fs_dir: js.fs().fs_dir.clone(),
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
+            // Share the journal system's registry: every handle on the same
+            // master must see one set of client sessions.
+            session_map: js.fs().session_map.clone(),
             conf: Arc::new(conf.master.clone()),
             full_report_tracker: Default::default(),
             full_block_reconciles: Default::default(),
@@ -200,6 +207,36 @@ impl MasterFilesystem {
             )),
             pending_drain: Default::default(),
         }
+    }
+
+    /// Adopt the client-session lease epoch for the raft term this master is
+    /// serving (#1883 review).
+    ///
+    /// `SessionMap::created_at` is seeded when the process starts, but the grace
+    /// window it feeds (`#1879` lock validity, `#1884` reaper) must be measured
+    /// from election: a standby promoted hours later would otherwise find the
+    /// window already expired and could release a healthy client's locks. The term
+    /// is published by the journal loader, so no standby hook is needed - a
+    /// promotion always observes a higher term than the leadership it replaces.
+    ///
+    /// Every leader-side consumer of `created_at` must call this before reading
+    /// it. Callers that also write a session should use [`MasterFilesystem::heartbeat_in_epoch`]
+    /// so adoption and the write share one lock.
+    pub fn adopt_session_epoch(&self, now: u64) {
+        self.session_map
+            .write()
+            .adopt(self.master_monitor.term(), now);
+    }
+
+    /// Adopt the current term and register or renew `hb` under one lock.
+    ///
+    /// Returns `(new_session, session_timeout_ms)`, so a caller needs exactly one
+    /// session-map guard for both the epoch and the write.
+    pub(crate) fn heartbeat_in_epoch(&self, hb: SessionHeartbeat, now: u64) -> (bool, u64) {
+        let term = self.master_monitor.term();
+        let mut sessions = self.session_map.write();
+        let new_session = sessions.heartbeat_in_epoch(hb, term, now);
+        (new_session, sessions.session_timeout_ms())
     }
 
     pub fn check_parent(path: &InodePath) -> FsResult<()> {

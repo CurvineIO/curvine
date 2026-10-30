@@ -27,11 +27,12 @@ use curvine_model::{
 };
 use curvine_model::{ListOptions, OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
-    BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
-    CreateFileRequest, CreateLeaderSnapshotRequest, CreateLeaderSnapshotResponse, DeleteRequest,
-    EmptyTrashRequest, EmptyTrashResponse, GetFilesystemInfoRequest, ListTrashRequest,
-    ListTrashResponse, MkdirOptsProto, MkdirRequest, MountRequest, RenameRequest,
-    RestoreTrashRequest, RestoreTrashResponse, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
+    BlockReportInfoProto, BlockReportListRequest, ClientAddressProto, ClientHeartbeatRequest,
+    ClientHeartbeatResponse, CompleteFileRequest, CompleteFileResponse, CreateFileRequest,
+    CreateLeaderSnapshotRequest, CreateLeaderSnapshotResponse, DeleteRequest, EmptyTrashRequest,
+    EmptyTrashResponse, GetFilesystemInfoRequest, ListTrashRequest, ListTrashResponse,
+    MkdirOptsProto, MkdirRequest, MountRequest, RenameRequest, RestoreTrashRequest,
+    RestoreTrashResponse, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -39,12 +40,13 @@ use curvine_raft::raft::RoleState;
 use curvine_rpc::handler::MessageHandler;
 #[cfg(feature = "fault-injection")]
 use curvine_rpc::message::ResponseStatus;
-use curvine_rpc::message::{Builder, MAX_DATE_SIZE};
+use curvine_rpc::message::{Builder, Message, MAX_DATE_SIZE};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use curvine_runtime::sync::StateCtl;
+use curvine_server::master::fs::state::SessionHeartbeat;
 use curvine_server::master::fs::{DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
@@ -370,15 +372,19 @@ fn control_plane_requests_use_the_async_handler() {
     let mkdir = Builder::new_rpc(RpcCode::Mkdir).build();
     assert!(handler.is_sync(&mkdir));
 
-    // Pin the actor-runtime routing: only heartbeat and block report must
-    // use actor_rt; GetFilesystemInfo (statfs) must run on the main pool so
-    // that statfs bursts cannot delay heartbeats.
+    // Pin the actor-runtime routing: worker heartbeats, block reports and client
+    // session heartbeats must use actor_rt; GetFilesystemInfo (statfs) must run on
+    // the main pool so that statfs bursts cannot delay heartbeats.
     let fs_info_msg = Builder::new_rpc(RpcCode::GetFilesystemInfo).build();
     assert!(
         handler.get_rt(&fs_info_msg).is_none(),
         "GetFilesystemInfo must NOT be routed to actor_rt"
     );
-    for code in [RpcCode::WorkerHeartbeat, RpcCode::WorkerBlockReport] {
+    for code in [
+        RpcCode::WorkerHeartbeat,
+        RpcCode::WorkerBlockReport,
+        RpcCode::ClientHeartbeat,
+    ] {
         let msg = Builder::new_rpc(code).build();
         assert!(
             handler.get_rt(&msg).is_some(),
@@ -400,6 +406,104 @@ fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     assert!(!response.is_success());
     let err = response.check_error_ext::<FsError>().unwrap_err();
     assert!(matches!(err, FsError::NotLeaderMaster(_)));
+    Ok(())
+}
+
+fn client_heartbeat_msg(client_name: &str) -> Message {
+    Builder::new_rpc(RpcCode::ClientHeartbeat)
+        .proto_header(ClientHeartbeatRequest {
+            client: ClientAddressProto {
+                client_name: client_name.to_string(),
+                hostname: "client-host".to_string(),
+                ip_addr: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            heartbeat_interval_ms: 12_000,
+            pid: Some(1),
+            mount_point: None,
+            client_version: None,
+        })
+        .build()
+}
+
+#[test]
+fn client_heartbeat_rpc_registers_session_on_leader() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_active_master("client-heartbeat", |_| {});
+    let msg = client_heartbeat_msg("client-heartbeat-1");
+    assert!(
+        handler.is_sync(&msg),
+        "ClientHeartbeat must use the sync handler"
+    );
+
+    let first: ClientHeartbeatResponse = handler.handle(&msg)?.parse_header()?;
+    assert!(first.new_session);
+    assert!(first.session_timeout_ms > 0);
+
+    let second: ClientHeartbeatResponse = handler.handle(&msg)?.parse_header()?;
+    assert!(!second.new_session);
+
+    let fs = handler.clone_fs();
+    let sessions = fs.session_map.read();
+    assert_eq!(sessions.len(), 1);
+    assert!(sessions.get("client-heartbeat-1").is_some());
+    Ok(())
+}
+
+#[test]
+fn with_js_handles_share_one_session_map() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let mut conf = ClusterConf::format();
+    conf.journal.enable = false;
+    conf.change_test_meta_dir(format!("session-map-shared-{}", Utils::rand_str(8)));
+    let js = JournalSystem::from_conf(&conf)?;
+
+    // Two independently built handles on the same master, plus the journal
+    // system's own handle, must observe one set of client sessions.
+    let a = MasterFilesystem::with_js(&conf, &js);
+    let b = MasterFilesystem::with_js(&conf, &js);
+    let hb = |client: &str| SessionHeartbeat {
+        address: ClientAddress {
+            client_name: client.to_string(),
+            ..Default::default()
+        },
+        heartbeat_interval_ms: 12_000,
+        pid: None,
+        mount_point: None,
+        client_version: None,
+    };
+    let term = a.master_monitor.term();
+    assert!(a
+        .session_map
+        .write()
+        .heartbeat_in_epoch(hb("via-a"), term, 0));
+    assert!(js
+        .fs()
+        .session_map
+        .write()
+        .heartbeat_in_epoch(hb("via-js"), term, 0));
+
+    let sessions = b.session_map.read();
+    assert!(sessions.get("via-a").is_some(), "b must see a's session");
+    assert!(
+        sessions.get("via-js").is_some(),
+        "b must see js.fs()'s session"
+    );
+    assert_eq!(sessions.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn client_heartbeat_rpc_to_standby_is_rejected() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler();
+
+    let response = handler.handle(&client_heartbeat_msg("client-heartbeat-standby"))?;
+
+    assert!(!response.is_success());
+    let err = response.check_error_ext::<FsError>().unwrap_err();
+    assert!(matches!(err, FsError::NotLeaderMaster(_)));
+    assert!(handler.clone_fs().session_map.read().is_empty());
     Ok(())
 }
 

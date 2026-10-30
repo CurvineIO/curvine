@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::master::fs::state::{monotonic_ms, SessionHeartbeat};
 use crate::master::fs::{DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
 use crate::master::meta::trash::TrashCursor;
@@ -22,6 +23,8 @@ use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext};
+#[cfg(test)]
+use curvine_error::ErrorKind;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
@@ -1008,6 +1011,82 @@ impl MasterHandler {
         ctx.response(SymlinkResponse::default())
     }
 
+    fn client_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: ClientHeartbeatRequest = ctx.parse_header()?;
+        let rep_header = Self::process_client_heartbeat(&self.fs, header, monotonic_ms())?;
+        ctx.response(rep_header)
+    }
+
+    pub(crate) fn process_client_heartbeat(
+        fs: &MasterFilesystem,
+        header: ClientHeartbeatRequest,
+        now: u64,
+    ) -> FsResult<ClientHeartbeatResponse> {
+        let address = ProtoUtils::client_address_from_pb(header.client);
+        if address.client_name.is_empty() {
+            return Err(FsError::invalid_argument(
+                "client heartbeat requires a non-empty client_name",
+            ));
+        }
+
+        let hb = SessionHeartbeat {
+            address,
+            heartbeat_interval_ms: header.heartbeat_interval_ms,
+            pid: header.pid,
+            mount_point: header.mount_point,
+            client_version: header.client_version,
+        };
+
+        let client_name = hb.address.client_name.clone();
+        let hostname = hb.address.hostname.clone();
+        let mount_point = hb.mount_point.clone();
+        let interval_ms = hb.heartbeat_interval_ms;
+
+        // A demoted master must not own sessions: the lease epoch only advances
+        // on the leader, and a standby heartbeat would write a session into an
+        // epoch it never adopted (#1883 review).
+        if !fs.master_monitor.is_active() {
+            return Err(FsError::not_leader(
+                "client heartbeat requires the active master",
+            ));
+        }
+
+        // Adopt the term's lease epoch and write the session under one lock, so a
+        // heartbeat can never land in an epoch it did not adopt first.
+        let (new_session, session_timeout_ms) = fs.heartbeat_in_epoch(hb, now);
+
+        if new_session {
+            // The lease window is the master's, not the client's: a client (or a
+            // modified SDK) reporting a slower interval than the lease allows would
+            // flap between alive and expired, and the reaper could release its locks
+            // while it is still working. Tell the operator once, on first contact.
+            if interval_ms > 0 && interval_ms.saturating_mul(5) > session_timeout_ms {
+                log::warn!(
+                    "client {} reports a {}ms heartbeat interval, which is outside the \
+                     {}ms session lease (expected about {}ms); the master enforces its own \
+                     window, so this session may expire between heartbeats",
+                    client_name,
+                    interval_ms,
+                    session_timeout_ms,
+                    session_timeout_ms / 5
+                );
+            } else {
+                log::info!(
+                    "register client session {} from {} (mount point {:?}, lease {}ms)",
+                    client_name,
+                    hostname,
+                    mount_point,
+                    session_timeout_ms
+                );
+            }
+        }
+
+        Ok(ClientHeartbeatResponse {
+            session_timeout_ms,
+            new_session,
+        })
+    }
+
     fn metrics_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: MetricsReportRequest = ctx.parse_header()?;
 
@@ -1139,7 +1218,10 @@ impl MasterHandler {
     }
 
     fn uses_actor_rt(code: RpcCode) -> bool {
-        matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport)
+        matches!(
+            code,
+            RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport | RpcCode::ClientHeartbeat
+        )
     }
 
     fn record_rpc_queue_duration(&self, ctx: &RpcContext<'_>) {
@@ -1321,6 +1403,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::GetMountInfo => self.get_mount_info(ctx),
 
                 RpcCode::MetricsReport => self.metrics_report(ctx),
+                RpcCode::ClientHeartbeat => self.client_heartbeat(ctx),
                 RpcCode::CreateLeaderSnapshot => self.create_leader_snapshot(ctx),
 
                 // Worker related requests
@@ -1390,10 +1473,12 @@ impl MessageHandler for MasterHandler {
         }
     }
 
-    // Only WorkerHeartbeat and WorkerBlockReport are routed to actor_rt;
-    // GetFilesystemInfo (statfs) deliberately runs on the main RPC blocking pool
-    // so that FUSE/kubelet statfs bursts cannot delay heartbeats and cause workers
-    // to be marked lost.
+    // Worker heartbeats, worker block reports and client heartbeats are routed to
+    // actor_rt; GetFilesystemInfo (statfs) deliberately runs on the main RPC
+    // blocking pool so that FUSE/kubelet statfs bursts cannot delay heartbeats.
+    // Client heartbeats belong there for the same reason: a main-pool burst longer
+    // than `master.client_session_timeout` would expire every client session, and
+    // once lock validity is session-aware that becomes a mass lock release.
     fn get_rt(&self, msg: &Message) -> Option<&Runtime> {
         let code = RpcCode::from(msg.code());
         if Self::uses_actor_rt(code) {
@@ -1464,6 +1549,159 @@ mod tests {
         // Structured version metadata survives heartbeat -> WorkerInfo ->
         // WorkerInfoProto (filesystem_info) -> WorkerInfo round trip.
         assert_eq!(worker.component_info, Some(component_info));
+    }
+
+    fn client_heartbeat_req(client_name: &str) -> ClientHeartbeatRequest {
+        ClientHeartbeatRequest {
+            client: ClientAddressProto {
+                client_name: client_name.to_string(),
+                hostname: "client-host".to_string(),
+                ip_addr: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            heartbeat_interval_ms: 12_000,
+            pid: Some(4242),
+            mount_point: Some("/mnt/curvine".to_string()),
+            client_version: Some("0.1.0-test".to_string()),
+        }
+    }
+
+    fn client_heartbeat_fs(test_name: &str) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-handler-test/meta-{}", test_name));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-handler-test/journal-{}", test_name));
+        conf.master.client_session_timeout = "30s".to_string();
+        conf.master.init().unwrap();
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        // `process_client_heartbeat` only serves the active master, so stand in
+        // for raft leader election (the tests that exercise a standby set the
+        // role themselves).
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        fs
+    }
+
+    #[test]
+    fn process_client_heartbeat_registers_then_renews_session() {
+        let fs = client_heartbeat_fs(&Utils::rand_str(6));
+
+        let first =
+            MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 1_000)
+                .unwrap();
+        assert!(first.new_session);
+        assert_eq!(first.session_timeout_ms, 30_000);
+
+        let second =
+            MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 13_000)
+                .unwrap();
+        assert!(!second.new_session);
+
+        // Clones of MasterFilesystem share the same session map.
+        let shared = fs.clone();
+        let sessions = shared.session_map.read();
+        let s = sessions.get("c-1").unwrap();
+        assert_eq!(s.started_at, 1_000);
+        assert_eq!(s.last_heartbeat, 13_000);
+        assert_eq!(s.expire_at, 43_000);
+        assert_eq!(s.pid, Some(4242));
+        assert_eq!(s.mount_point.as_deref(), Some("/mnt/curvine"));
+        assert_eq!(s.address.hostname, "client-host");
+        assert!(sessions.is_live("c-1", 43_000));
+        assert!(!sessions.is_live("c-1", 43_001));
+    }
+
+    #[test]
+    fn client_heartbeat_starts_a_new_lease_epoch_after_demotion() {
+        use curvine_raft::raft::RoleState;
+
+        let fs = client_heartbeat_fs(&Utils::rand_str(6));
+
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        fs.master_monitor.set_term_for_test(1);
+        MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 1_000).unwrap();
+        MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-2"), 1_000).unwrap();
+        assert_eq!(fs.session_map.read().created_at(), 1_000);
+        assert_eq!(fs.session_map.read().len(), 2);
+
+        // A demoted master must reject the heartbeat and leave the map untouched,
+        // so it cannot own a lease in an epoch it never adopted.
+        fs.master_monitor.set_role_for_test(RoleState::Follower);
+        let err = MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 2_000)
+            .expect_err("a standby must not renew a client session");
+        assert!(
+            matches!(err.kind(), ErrorKind::NotLeaderMaster),
+            "a standby must answer NotLeaderMaster, got {:?}",
+            err.kind()
+        );
+        assert_eq!(fs.session_map.read().created_at(), 1_000);
+        assert_eq!(
+            fs.session_map.read().get("c-1").unwrap().last_heartbeat,
+            1_000,
+            "the standby heartbeat must not renew the lease"
+        );
+
+        // Promotion carries a higher term: the previous term's sessions are gone
+        // and the grace window restarts at promotion, not at process start.
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        fs.master_monitor.set_term_for_test(2);
+        let rep = MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req("c-1"), 30_000)
+            .unwrap();
+        assert!(
+            rep.new_session,
+            "the new term must not inherit the old session"
+        );
+
+        let sessions = fs.session_map.read();
+        assert_eq!(
+            sessions.created_at(),
+            30_000,
+            "the lease epoch must restart when a new term is adopted"
+        );
+        assert_eq!(sessions.len(), 1);
+        assert!(
+            sessions.get("c-2").is_none(),
+            "sessions from before the demotion must not survive the new term"
+        );
+    }
+
+    #[test]
+    fn process_client_heartbeat_lease_comes_from_the_master_timeout() {
+        let fs = client_heartbeat_fs(&Utils::rand_str(6));
+
+        // The client asks for a lease far longer than the master allows; the
+        // enforced window must stay the master's `client_session_timeout`.
+        let mut header = client_heartbeat_req("greedy-client");
+        header.heartbeat_interval_ms = 3_600_000;
+
+        let first = MasterHandler::process_client_heartbeat(&fs, header, 1_000).unwrap();
+        assert_eq!(first.session_timeout_ms, 30_000);
+
+        let sessions = fs.session_map.read();
+        let s = sessions.get("greedy-client").unwrap();
+        assert_eq!(
+            s.expire_at - s.last_heartbeat,
+            30_000,
+            "a client-reported interval must never widen the enforced lease"
+        );
+        assert_eq!(
+            s.heartbeat_interval_ms, 3_600_000,
+            "the reported interval is still recorded for diagnostics"
+        );
+    }
+
+    #[test]
+    fn process_client_heartbeat_rejects_empty_client_name() {
+        let fs = client_heartbeat_fs(&Utils::rand_str(6));
+
+        let err = MasterHandler::process_client_heartbeat(&fs, client_heartbeat_req(""), 0)
+            .expect_err("empty client_name must be rejected");
+        assert!(err.to_string().contains("non-empty client_name"));
+        assert!(fs.session_map.read().is_empty());
     }
 
     #[test]
