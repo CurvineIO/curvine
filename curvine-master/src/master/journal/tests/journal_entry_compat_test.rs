@@ -351,3 +351,130 @@ fn legacy_set_locks_batch_replays_as_not_session_owned() {
         "a lock from before #1878 must not claim a session lease"
     );
 }
+
+/// The layout right before #1878: every entry as today, except `SetLocks`.
+#[derive(Serialize)]
+#[allow(dead_code)]
+enum PreSessionJournalEntry {
+    Mkdir(MkdirEntry),
+    CreateFile(CreateFileEntry),
+    ReopenFile(ReopenFileEntry),
+    OverWriteFile(OverWriteFileEntry),
+    AddBlock(AddBlockEntry),
+    CompleteFile(CompleteFileEntry),
+    Rename(RenameEntry),
+    Delete(DeleteEntry),
+    Mount(MountEntry),
+    UnMount(UnMountEntry),
+    SetAttr(SetAttrEntry),
+    Symlink(SymlinkEntry),
+    Link(LinkEntry),
+    SetLocks(LegacySetLocksEntry),
+    Free(FreeEntry),
+    UfsApplied(UfsAppliedEntry),
+    Snapshot(SnapshotEntry),
+    CacheInvalidation(CacheInvalidationEntry),
+    TrashPurge(TrashPurgeEntry),
+}
+
+#[derive(Serialize)]
+struct PreSessionJournalBatch {
+    seq_id: u64,
+    batch: Vec<PreSessionJournalEntry>,
+}
+
+fn legacy_lock(client_id: &str, owner_id: u64) -> LegacyFileLock {
+    LegacyFileLock {
+        client_id: client_id.to_string(),
+        owner_id,
+        pid: 55,
+        acquire_time: 66,
+        lock_type: LockType::WriteLock,
+        lock_flags: LockFlags::Plock,
+        start: 0,
+        end: 100,
+    }
+}
+
+/// A batch written by the release right before #1878 mixes an old-layout
+/// `SetLocks` with entries in their current layouts (`Free { recursive }`,
+/// `Rename` with exchange inode ids) and variants appended after the oldest
+/// legacy mirror (`CacheInvalidation`, `TrashPurge`). Neither the current nor
+/// the oldest legacy schema can decode it; replay after an upgrade must not fail.
+#[test]
+fn pre_session_mixed_batch_replays_every_entry() {
+    let pre_session = PreSessionJournalBatch {
+        seq_id: 8,
+        batch: vec![
+            PreSessionJournalEntry::SetLocks(LegacySetLocksEntry {
+                op_id: 1,
+                rpc_id: 2,
+                ino: 33,
+                locks: vec![legacy_lock("client-a", 1), legacy_lock("client-b", 2)],
+            }),
+            PreSessionJournalEntry::Free(FreeEntry {
+                op_id: 3,
+                rpc_id: 4,
+                path: "/free".to_string(),
+                mtime: 5,
+                recursive: true,
+            }),
+            PreSessionJournalEntry::Rename(RenameEntry {
+                op_id: 6,
+                rpc_id: 7,
+                src: "/src".to_string(),
+                dst: "/dst".to_string(),
+                mtime: 8,
+                flags: 2,
+                src_inode_id: 100,
+                dst_inode_id: 200,
+            }),
+            PreSessionJournalEntry::CacheInvalidation(CacheInvalidationEntry {
+                op_id: 9,
+                rpc_id: 10,
+                inodes: vec![],
+            }),
+            PreSessionJournalEntry::TrashPurge(TrashPurgeEntry {
+                op_id: 11,
+                rpc_id: 0,
+                entry: "/.Trash/1-2".to_string(),
+                mtime: 12,
+                paths: vec!["/.Trash/1-2/a".to_string()],
+            }),
+        ],
+    };
+    let bytes = SerdeUtils::serialize(&pre_session).unwrap();
+
+    assert!(SerdeUtils::deserialize::<JournalBatch>(&bytes).is_err());
+
+    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    assert_eq!(batch.seq_id, 8);
+    assert_eq!(batch.batch.len(), 5);
+
+    let JournalEntry::SetLocks(entry) = &batch.batch[0] else {
+        panic!("expected set-locks journal entry");
+    };
+    assert_eq!(entry.ino, 33);
+    let owners: Vec<_> = entry.locks.iter().map(|l| l.client_id.as_str()).collect();
+    assert_eq!(owners, ["client-a", "client-b"]);
+    assert!(entry.locks.iter().all(|l| !l.session_owned));
+
+    let JournalEntry::Free(entry) = &batch.batch[1] else {
+        panic!("expected free journal entry");
+    };
+    assert!(
+        entry.recursive,
+        "the current Free layout must not be downgraded"
+    );
+
+    let JournalEntry::Rename(entry) = &batch.batch[2] else {
+        panic!("expected rename journal entry");
+    };
+    assert_eq!((entry.src_inode_id, entry.dst_inode_id), (100, 200));
+
+    assert!(matches!(batch.batch[3], JournalEntry::CacheInvalidation(_)));
+    let JournalEntry::TrashPurge(entry) = &batch.batch[4] else {
+        panic!("expected trash purge journal entry");
+    };
+    assert_eq!(entry.paths, vec!["/.Trash/1-2/a".to_string()]);
+}
