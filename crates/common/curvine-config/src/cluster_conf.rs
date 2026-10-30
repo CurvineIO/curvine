@@ -810,8 +810,10 @@ mod tests {
 
     #[test]
     fn normalize_whitespace_trims_cluster_name() {
-        let mut conf = ClusterConf::default();
-        conf.cluster_name = " curvine-prod ".to_string();
+        let mut conf = ClusterConf {
+            cluster_name: " curvine-prod ".to_string(),
+            ..Default::default()
+        };
         conf.normalize_whitespace();
         assert_eq!(conf.cluster_name, "curvine-prod");
     }
