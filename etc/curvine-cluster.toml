@@ -76,6 +76,11 @@ meta_dir = "testing/meta"
 # trash_purge_batch_inodes = 4096
 # trash_purge_yield_ms = 5
 # trash_purge_interval = "1s"
+# delete_max_sync_inodes: largest subtree (in inodes) a client recursive delete
+#   removes in place while holding the namespace lock. Larger subtrees are
+#   moved to /.Trash/.pending and reclaimed in bounded batches, so a huge
+#   delete cannot stall metadata requests or raft apply. 0 disables the limit.
+# delete_max_sync_inodes = 100000
 # Log rotation applies when log_dir is a directory; stdout and stderr are not rotated.
 # max_file_size_mb: rotate when the file reaches this size in MB (default 100, 0 = no size limit).
 # time_rotation: "daily" or "hourly" (default none). Combined with max_file_size_mb, whichever

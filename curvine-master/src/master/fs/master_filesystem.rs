@@ -284,7 +284,29 @@ impl MasterFilesystem {
     ) -> FsResult<DeleteResult> {
         let mut delete_res = {
             let mut fs_dir = self.fs_dir.write();
-            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)?
+            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode, 0)?
+        };
+        self.release_deleted_blocks(&mut delete_res);
+
+        Ok(delete_res)
+    }
+
+    /// Client-facing delete. A permanent recursive delete whose subtree holds
+    /// more than `max_sync_inodes` inodes is not walked under the namespace
+    /// lock: it is staged under `/.Trash/.pending` (an O(1) rename) and the
+    /// bounded purger reclaims it, so the lock hold time and the journal
+    /// replay cost stay independent of the subtree size. `0` disables the
+    /// limit.
+    pub fn delete_bounded<T: AsRef<str>>(
+        &self,
+        path: T,
+        recursive: bool,
+        mode: DeleteMode,
+        max_sync_inodes: usize,
+    ) -> FsResult<DeleteResult> {
+        let mut delete_res = {
+            let mut fs_dir = self.fs_dir.write();
+            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode, max_sync_inodes)?
         };
         self.release_deleted_blocks(&mut delete_res);
 
@@ -306,7 +328,7 @@ impl MasterFilesystem {
             if !self.master_monitor.is_active() {
                 return Ok(None);
             }
-            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)?
+            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode, 0)?
         };
         self.release_deleted_blocks(&mut delete_res);
 
@@ -319,6 +341,7 @@ impl MasterFilesystem {
         path: &str,
         recursive: bool,
         mode: DeleteMode,
+        max_sync_inodes: usize,
     ) -> FsResult<DeleteResult> {
         let inp = Self::resolve_path(fs_dir, path)?;
 
@@ -339,6 +362,16 @@ impl MasterFilesystem {
             DeleteMode::Default => self.conf.trash_enabled && !in_trash,
         };
 
+        // A permanent recursive delete walks the whole subtree under the write
+        // lock. Above the budget, hand the subtree to the bounded purger instead.
+        let oversized = !soft_delete
+            && recursive
+            && max_sync_inodes > 0
+            && FsDir::subtree_exceeds(&inp, max_sync_inodes);
+        if oversized {
+            return Self::stage_oversized_delete(fs_dir, &inp, max_sync_inodes);
+        }
+
         // The callee reports how the delete was actually served: a shared inode
         // or an unresolved entry falls back to a permanent unlink even when the
         // trash is enabled, and must not claim to be recoverable or staged.
@@ -348,6 +381,45 @@ impl MasterFilesystem {
             _ => fs_dir.delete(&inp, recursive)?,
         };
         Ok(delete_res)
+    }
+
+    fn stage_oversized_delete(
+        fs_dir: &mut FsDir,
+        inp: &InodePath,
+        max_sync_inodes: usize,
+    ) -> FsResult<DeleteResult> {
+        let path = inp.path();
+        if !trash::is_trash_path(path) {
+            info!(
+                "delete of {} exceeds {} inodes, staging it for background purge",
+                path, max_sync_inodes
+            );
+            return fs_dir.trash_pending(inp, true);
+        }
+
+        // A whole recycle-bin entry can be claimed by the purger with one
+        // rename, like an expired entry. Pending paths never reach this point:
+        // `resolve_path` hides them.
+        if trash::is_trash_entry_path(path) {
+            info!(
+                "delete of trash entry {} exceeds {} inodes, claiming it for background purge",
+                path, max_sync_inodes
+            );
+            fs_dir.claim_trash_entry_for_purge(path)?;
+            return Ok(DeleteResult {
+                trashed: true,
+                purge_pending: true,
+                ..DeleteResult::new()
+            });
+        }
+
+        // A subtree inside a trash entry has no O(1) staging target that keeps
+        // the entry intact.
+        err_ext!(FsError::invalid_argument(format!(
+            "{} holds more than {} inodes and cannot be deleted synchronously; \
+             delete its recycle-bin entry instead",
+            path, max_sync_inodes
+        )))
     }
 
     pub(crate) fn release_deleted_blocks(&self, delete_res: &mut DeleteResult) {

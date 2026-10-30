@@ -147,6 +147,12 @@ pub struct MasterConf {
     #[serde(skip)]
     pub trash_purge_interval_unit: DurationUnit,
 
+    // Largest subtree (in inodes) a client recursive delete removes in place
+    // under the namespace lock. Larger subtrees are staged under
+    // /.Trash/.pending and reclaimed by the bounded purger, so lock hold time
+    // stays independent of the subtree size. 0 disables the limit.
+    pub delete_max_sync_inodes: usize,
+
     // Eviction configuration
     pub enable_quota_eviction: bool,
     pub quota_eviction_mode: String,
@@ -431,6 +437,8 @@ impl Default for MasterConf {
 
             trash_purge_interval: "1s".to_string(),
             trash_purge_interval_unit: Default::default(),
+
+            delete_max_sync_inodes: 100_000,
 
             // Eviction configuration defaults
             enable_quota_eviction: false,

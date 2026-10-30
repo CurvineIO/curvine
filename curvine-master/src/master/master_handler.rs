@@ -262,9 +262,16 @@ impl MasterHandler {
         } else {
             DeleteMode::Default
         };
+        // Mounted deletes stay synchronous: staging would rename a path whose
+        // UFS object the client already removed.
+        let max_sync_inodes = if mount_info.is_some() {
+            0
+        } else {
+            self.fs.conf.delete_max_sync_inodes
+        };
         let res = self
             .fs
-            .delete_with_mode(&header.path, header.recursive, mode);
+            .delete_bounded(&header.path, header.recursive, mode, max_sync_inodes);
         self.set_req_cache(req_id, res)
     }
 

@@ -524,6 +524,33 @@ impl FsDir {
         Ok(total)
     }
 
+    /// Returns whether the subtree rooted at `inp` holds more than `limit`
+    /// inodes, counting the root itself. The walk stops as soon as the limit is
+    /// exceeded, so its cost is bounded by `limit` rather than the subtree.
+    pub fn subtree_exceeds(inp: &InodePath, limit: usize) -> bool {
+        let Some(root) = inp.get_last_inode() else {
+            return false;
+        };
+
+        let mut count = 0usize;
+        let mut stack: Vec<&InodeView> = vec![root.as_ref()];
+        while let Some(inode) = stack.pop() {
+            count += 1;
+            if count > limit {
+                return true;
+            }
+            if let Dir(dir) = inode {
+                for child in dir.children_iter() {
+                    if count + stack.len() >= limit {
+                        return true;
+                    }
+                    stack.push(child);
+                }
+            }
+        }
+        false
+    }
+
     // Move an entry into /.Trash instead of removing it. Blocks stay on the
     // workers so the entry can be restored until retention expires.
     pub fn trash(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
