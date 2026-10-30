@@ -959,6 +959,16 @@ impl FsClient {
     }
 
     pub async fn set_lock(&self, path: &Path, lock: FileLock) -> FsResult<Option<FileLock>> {
+        // Stamp session ownership at the RPC boundary: FUSE and SDK callers do not
+        // know whether a lease is confirmed, and the master needs the flag to
+        // decide between session-expiry and `lock_expire_time` reclamation. Only
+        // this context's own client id under a confirmed lease qualifies; a
+        // caller's explicit `true` for any other owner is cleared as well.
+        // `get_lock` deliberately does not stamp anything: it is a query, and the
+        // master judges the locks that already exist.
+        let mut lock = lock;
+        lock.session_owned = self.context.is_session_owner(&lock.client_id);
+
         let req = SetLockRequest {
             path: path.encode(),
             lock: ProtoUtils::file_lock_to_pb(lock),

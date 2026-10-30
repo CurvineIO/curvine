@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
-use crate::master::meta::BlockMeta;
+use crate::master::meta::{BlockMeta, LegacyFileLock};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
 use curvine_runtime::common::SerdeUtils;
@@ -306,20 +306,35 @@ impl JournalBatch {
     pub(crate) fn deserialize_compat(bytes: &[u8]) -> CommonResult<Self> {
         match SerdeUtils::deserialize(bytes) {
             Ok(batch) => Ok(batch),
-            Err(current_err) => match deserialize_legacy_batch(bytes) {
-                Ok(batch) => {
-                    debug!(
-                        "replaying legacy journal batch with pre-extension entry schemas, seq_id={}",
-                        batch.seq_id
-                    );
-                    Ok(batch.into())
+            Err(current_err) => {
+                // The immediately preceding layout: every entry as today except a
+                // `SetLocks` without `session_owned` (#1878).
+                let pre_session_err = match deserialize_pre_session_batch(bytes) {
+                    Ok(batch) => {
+                        debug!(
+                            "replaying journal batch with pre-session SetLocks schema, seq_id={}",
+                            batch.seq_id
+                        );
+                        return Ok(batch.into());
+                    }
+                    Err(e) => e,
+                };
+                match deserialize_legacy_batch(bytes) {
+                    Ok(batch) => {
+                        debug!(
+                            "replaying legacy journal batch with pre-extension entry schemas, seq_id={}",
+                            batch.seq_id
+                        );
+                        Ok(batch.into())
+                    }
+                    Err(legacy_err) => err_box!(
+                        "failed to deserialize journal batch with current, pre-session or legacy schemas: current={}, pre_session={}, legacy={}",
+                        current_err,
+                        pre_session_err,
+                        legacy_err
+                    ),
                 }
-                Err(legacy_err) => err_box!(
-                    "failed to deserialize journal batch with current or legacy schemas: current={}, legacy={}",
-                    current_err,
-                    legacy_err
-                ),
-            },
+            }
         }
     }
 
@@ -387,10 +402,113 @@ enum LegacyJournalEntry {
     SetAttr(SetAttrEntry),
     Symlink(SymlinkEntry),
     Link(LinkEntry),
-    SetLocks(SetLocksEntry),
+    SetLocks(LegacySetLocksEntry),
     Free(LegacyFreeEntry),
     UfsApplied(UfsAppliedEntry),
     Snapshot(SnapshotEntry),
+}
+
+/// `SetLocks` as written before session ownership (#1878): the lock payload has
+/// no trailing `session_owned` flag. Batches carrying it decode through this
+/// mirror, through [`PreSessionJournalEntry`] or [`LegacyJournalEntry`].
+#[derive(Deserialize)]
+struct LegacySetLocksEntry {
+    op_id: u64,
+    rpc_id: i64,
+    ino: i64,
+    locks: Vec<LegacyFileLock>,
+}
+
+impl From<LegacySetLocksEntry> for SetLocksEntry {
+    fn from(entry: LegacySetLocksEntry) -> Self {
+        Self {
+            op_id: entry.op_id,
+            rpc_id: entry.rpc_id,
+            ino: entry.ino,
+            locks: entry.locks.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Journal entries as written right before session ownership (#1878): identical
+/// to [`JournalEntry`] in variant order and in every payload layout, except
+/// that `SetLocks` carries locks without the trailing `session_owned` flag.
+///
+/// [`LegacyJournalEntry`] cannot stand in for it: that mirror also keeps the
+/// pre-#721 `Free`/`Rename` layouts and lacks the variants appended since, so a
+/// pre-#1878 batch with an old `SetLocks` next to `Free { recursive }`,
+/// `CacheInvalidation` or `TrashPurge` would fail every decoder.
+#[derive(Deserialize)]
+enum PreSessionJournalEntry {
+    Mkdir(MkdirEntry),
+    CreateFile(CreateFileEntry),
+    ReopenFile(ReopenFileEntry),
+    OverWriteFile(OverWriteFileEntry),
+    AddBlock(AddBlockEntry),
+    CompleteFile(CompleteFileEntry),
+    Rename(RenameEntry),
+    Delete(DeleteEntry),
+    Mount(MountEntry),
+    UnMount(UnMountEntry),
+    SetAttr(SetAttrEntry),
+    Symlink(SymlinkEntry),
+    Link(LinkEntry),
+    SetLocks(LegacySetLocksEntry),
+    Free(FreeEntry),
+    UfsApplied(UfsAppliedEntry),
+    Snapshot(SnapshotEntry),
+    CacheInvalidation(CacheInvalidationEntry),
+    TrashPurge(TrashPurgeEntry),
+}
+
+#[derive(Deserialize)]
+struct PreSessionJournalBatch {
+    seq_id: u64,
+    batch: Vec<PreSessionJournalEntry>,
+}
+
+fn deserialize_pre_session_batch(bytes: &[u8]) -> CommonResult<PreSessionJournalBatch> {
+    let mut reader = Cursor::new(bytes);
+    let batch = SerdeUtils::deserialize_from(&mut reader)?;
+    if reader.position() != bytes.len() as u64 {
+        return err_box!("pre-session journal batch has trailing bytes");
+    }
+    Ok(batch)
+}
+
+impl From<PreSessionJournalBatch> for JournalBatch {
+    fn from(batch: PreSessionJournalBatch) -> Self {
+        Self {
+            seq_id: batch.seq_id,
+            batch: batch.batch.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<PreSessionJournalEntry> for JournalEntry {
+    fn from(entry: PreSessionJournalEntry) -> Self {
+        match entry {
+            PreSessionJournalEntry::Mkdir(entry) => Self::Mkdir(entry),
+            PreSessionJournalEntry::CreateFile(entry) => Self::CreateFile(entry),
+            PreSessionJournalEntry::ReopenFile(entry) => Self::ReopenFile(entry),
+            PreSessionJournalEntry::OverWriteFile(entry) => Self::OverWriteFile(entry),
+            PreSessionJournalEntry::AddBlock(entry) => Self::AddBlock(entry),
+            PreSessionJournalEntry::CompleteFile(entry) => Self::CompleteFile(entry),
+            PreSessionJournalEntry::Rename(entry) => Self::Rename(entry),
+            PreSessionJournalEntry::Delete(entry) => Self::Delete(entry),
+            PreSessionJournalEntry::Mount(entry) => Self::Mount(entry),
+            PreSessionJournalEntry::UnMount(entry) => Self::UnMount(entry),
+            PreSessionJournalEntry::SetAttr(entry) => Self::SetAttr(entry),
+            PreSessionJournalEntry::Symlink(entry) => Self::Symlink(entry),
+            PreSessionJournalEntry::Link(entry) => Self::Link(entry),
+            PreSessionJournalEntry::SetLocks(entry) => Self::SetLocks(entry.into()),
+            PreSessionJournalEntry::Free(entry) => Self::Free(entry),
+            PreSessionJournalEntry::UfsApplied(entry) => Self::UfsApplied(entry),
+            PreSessionJournalEntry::Snapshot(entry) => Self::Snapshot(entry),
+            PreSessionJournalEntry::CacheInvalidation(entry) => Self::CacheInvalidation(entry),
+            PreSessionJournalEntry::TrashPurge(entry) => Self::TrashPurge(entry),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -442,7 +560,7 @@ impl From<LegacyJournalEntry> for JournalEntry {
             LegacyJournalEntry::SetAttr(entry) => Self::SetAttr(entry),
             LegacyJournalEntry::Symlink(entry) => Self::Symlink(entry),
             LegacyJournalEntry::Link(entry) => Self::Link(entry),
-            LegacyJournalEntry::SetLocks(entry) => Self::SetLocks(entry),
+            LegacyJournalEntry::SetLocks(entry) => Self::SetLocks(entry.into()),
             LegacyJournalEntry::Free(entry) => Self::Free(FreeEntry {
                 op_id: entry.op_id,
                 rpc_id: entry.rpc_id,

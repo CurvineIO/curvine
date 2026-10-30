@@ -14,7 +14,7 @@
 
 use crate::state::{StorageType, TtlAction};
 use curvine_common_macros::ClientCliArgs;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_net::net::InetAddr;
 use curvine_rpc::client::ClientConf as RpcConf;
 use curvine_runtime::common::{ByteUnit, DurationUnit, Utils};
@@ -204,6 +204,20 @@ pub struct ClientConf {
     #[client_cli]
     pub clean_task_interval_ms: u64,
 
+    // Client session lease heartbeat interval, in milliseconds.
+    //
+    // Every client sends a `ClientHeartbeat` on this cadence so the master can
+    // tell a live client from a crashed one and reclaim what it owns (file locks,
+    // writer markers). Keep `master.client_session_timeout` at about 5x this
+    // value; the master enforces its own window and warns on a mismatch.
+    //
+    // 0 disables the heartbeat: this client then keeps the legacy
+    // `lock_expire_time` behaviour for its locks and nothing it owns is reclaimed
+    // when it crashes.
+    #[serde(alias = "heartbeat_interval")]
+    #[client_cli]
+    pub heartbeat_interval_ms: u64,
+
     #[client_cli]
     pub close_timeout_secs: u64,
 
@@ -289,6 +303,14 @@ impl ClientConf {
 
     pub const DEFAULT_CLEAN_TASK_INTERVAL_MS: u64 = 60 * 1000;
 
+    /// Default client session heartbeat cadence: `master.client_session_timeout`
+    /// defaults to 60s, i.e. 5 missed heartbeats before a session expires.
+    pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 12 * 1000;
+
+    /// Lowest accepted heartbeat cadence; 0 means "disabled" rather than "as fast
+    /// as possible".
+    pub const MIN_HEARTBEAT_INTERVAL_MS: u64 = 100;
+
     pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
 
     pub const DEFAULT_READ_PARALLEL: i64 = 1;
@@ -344,6 +366,18 @@ impl ClientConf {
 
         // Process smart prefetch configuration
         self.large_file_size = ByteUnit::from_str(&self.large_file_size_str)?.as_byte() as i64;
+
+        // Keep 0 as the explicit "disabled" value instead of clamping it, but
+        // refuse a cadence that can only hammer the master.
+        if self.heartbeat_interval_ms > 0
+            && self.heartbeat_interval_ms < Self::MIN_HEARTBEAT_INTERVAL_MS
+        {
+            return err_box!(
+                "client.heartbeat_interval_ms must be 0 (disabled) or at least {}, got {}",
+                Self::MIN_HEARTBEAT_INTERVAL_MS,
+                self.heartbeat_interval_ms
+            );
+        }
 
         Ok(())
     }
@@ -453,6 +487,8 @@ impl Default for ClientConf {
 
             clean_task_interval_ms: Self::DEFAULT_CLEAN_TASK_INTERVAL_MS,
 
+            heartbeat_interval_ms: Self::DEFAULT_HEARTBEAT_INTERVAL_MS,
+
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
 
             metadata_operation_buckets: vec![
@@ -492,6 +528,41 @@ impl Default for ClientConf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_interval_defaults_to_five_missed_beats_per_minute() {
+        let conf = ClientConf::default();
+        assert_eq!(conf.heartbeat_interval_ms, 12_000);
+        // Five heartbeats must fit in the default master window (60s), otherwise
+        // every default client would flap between alive and expired.
+        assert_eq!(conf.heartbeat_interval_ms * 5, 60_000);
+    }
+
+    #[test]
+    fn heartbeat_interval_zero_disables_the_lease() {
+        let conf = ClientConf {
+            heartbeat_interval_ms: 0,
+            ..Default::default()
+        };
+        conf.clone().init().unwrap();
+        assert_eq!(
+            conf.heartbeat_interval_ms, 0,
+            "0 must stay 0 (disabled), never be clamped into a live heartbeat"
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_rejects_a_hot_loop() {
+        let mut conf = ClientConf {
+            heartbeat_interval_ms: 1,
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("a sub-100ms cadence can only hammer the master");
+        assert!(error.to_string().contains("heartbeat_interval_ms"));
+    }
 
     #[test]
     fn test_seek_absorb_window_default_off() {

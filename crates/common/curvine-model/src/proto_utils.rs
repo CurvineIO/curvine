@@ -864,6 +864,7 @@ impl ProtoUtils {
             lock_flags: lock.lock_flags as i32,
             start: lock.start,
             end: lock.end,
+            session_owned: Some(lock.session_owned),
         }
     }
 
@@ -877,6 +878,7 @@ impl ProtoUtils {
             lock_flags: LockFlags::from(lock.lock_flags as u8),
             start: lock.start,
             end: lock.end,
+            session_owned: lock.session_owned.unwrap_or(false),
         }
     }
 
