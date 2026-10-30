@@ -52,7 +52,7 @@ public class FilesystemConf {
     // rpc requests retry policy.
     public long rpc_retry_max_duration_ms = 120 * 1000;
     public long rpc_retry_min_sleep_ms = 100;
-    public long rpc_retry_max_sleep_ms = 10 * 1000;
+    public long rpc_retry_max_sleep_ms = 3 * 1000;
 
     // Whether to close the idle rpc connection.
     public boolean rpc_close_idle = true;

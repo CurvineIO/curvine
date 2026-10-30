@@ -337,8 +337,8 @@ impl Default for JournalConf {
 
             rpc_close_idle: false,
             rpc_retry_max_duration_ms: 60 * 1000,
-            rpc_retry_min_sleep_ms: 20 * 1000,
-            rpc_retry_max_sleep_ms: 20 * 1000,
+            rpc_retry_min_sleep_ms: 100,
+            rpc_retry_max_sleep_ms: 3 * 1000,
 
             conn_timeout_ms: 30 * 1000,
             io_timeout_ms: 60 * 1000,

@@ -172,6 +172,9 @@ impl FilesystemConf {
             conn_timeout_ms: 30_000,
             rpc_timeout_ms: 120_000,
             data_timeout_ms: 120_000,
+            rpc_retry_max_duration_ms: 120_000,
+            rpc_retry_min_sleep_ms: 100,
+            rpc_retry_max_sleep_ms: 3_000,
             block_size: "128MB".to_string(),
             write_chunk_size: "128KB".to_string(),
             read_chunk_size: "128KB".to_string(),
@@ -337,6 +340,30 @@ mod tests {
 
         let cluster = conf.into_cluster_conf().unwrap();
         assert_eq!(cluster.client.master_conn_pool_size, 1);
+    }
+
+    #[test]
+    fn with_master_addrs_sets_default_retry_policy() {
+        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        assert_eq!(cluster.client.rpc_retry_min_sleep_ms, 100);
+        assert_eq!(cluster.client.rpc_retry_max_sleep_ms, 3_000);
+        assert_eq!(cluster.client.rpc_retry_max_duration_ms, 120_000);
+    }
+
+    #[test]
+    fn explicit_retry_policy_is_not_replaced() {
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.rpc_retry_min_sleep_ms = 200;
+        conf.rpc_retry_max_sleep_ms = 1_500;
+        conf.rpc_retry_max_duration_ms = 30_000;
+
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        assert_eq!(cluster.client.rpc_retry_min_sleep_ms, 200);
+        assert_eq!(cluster.client.rpc_retry_max_sleep_ms, 1_500);
+        assert_eq!(cluster.client.rpc_retry_max_duration_ms, 30_000);
     }
 
     #[test]
