@@ -81,6 +81,10 @@ pub struct FsContext {
     // caches the master's compatibility contract — not only FUSE mount.
     handshake_lock: tokio::sync::Mutex<()>,
     handshake_started: AtomicBool,
+    // Whether the master acknowledged the most recent `ClientHeartbeat`. Starts
+    // false and is cleared on any failure, so a lock is only stamped
+    // session-owned while a lease is actually confirmed (#1878).
+    session_active: AtomicBool,
 }
 
 impl FsContext {
@@ -140,6 +144,7 @@ impl FsContext {
             handshake_reported: AtomicBool::new(false),
             handshake_lock: tokio::sync::Mutex::new(()),
             handshake_started: AtomicBool::new(false),
+            session_active: AtomicBool::new(false),
         };
         Ok(context)
     }
@@ -354,12 +359,34 @@ impl FsContext {
         self.conf.client.heartbeat_interval_ms
     }
 
-    /// Whether this client keeps a master session alive.
+    /// Whether this client is configured to keep a master session alive.
     ///
-    /// Locks acquired by a session-owning client are reclaimed by session expiry
-    /// instead of `lock_expire_time`, so this is stamped onto every `SetLock`.
+    /// This is a config predicate only; use [`Self::session_active`] to learn
+    /// whether a lease is actually confirmed.
     pub fn heartbeat_enabled(&self) -> bool {
         self.heartbeat_interval_ms() > 0
+    }
+
+    /// Whether the master acknowledged this client's most recent heartbeat.
+    ///
+    /// False before the first heartbeat completes, after any failed renewal, and
+    /// against a master that does not support `ClientHeartbeat`.
+    pub fn session_active(&self) -> bool {
+        self.heartbeat_enabled() && self.session_active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_session_active(&self, active: bool) {
+        self.session_active.store(active, Ordering::Release);
+    }
+
+    /// Whether a lock owned by `lock_client_id` can be reclaimed by session expiry.
+    ///
+    /// Only locks owned by this context's registered client id qualify, and only
+    /// while the lease is confirmed. Every other lock (a synthetic owner such as
+    /// `curvine-lancedb:<pid>`, or one taken before registration or after a
+    /// failed renewal) keeps the legacy `lock_expire_time` path.
+    pub fn is_session_owner(&self, lock_client_id: &str) -> bool {
+        self.session_active() && lock_client_id == self.client_addr.client_name
     }
 
     /// Start the client session heartbeat task (T2 of #1867).
@@ -389,8 +416,9 @@ impl FsContext {
     }
 
     async fn run_heartbeat_task(context: Weak<FsContext>, interval: Duration) {
-        // The first tick fires immediately, so a session exists before the client
-        // can take its first lock.
+        // The first tick fires immediately, but nothing orders it before the
+        // caller's first lock: until the master acknowledges a heartbeat,
+        // `session_active` stays false and locks keep the legacy TTL path.
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -399,7 +427,9 @@ impl FsContext {
             let Some(context) = context.upgrade() else {
                 return;
             };
-            if let Err(e) = Self::client_heartbeat(&context).await {
+            let result = Self::client_heartbeat(&context).await;
+            context.set_session_active(result.is_ok());
+            if let Err(e) = result {
                 // A demoted master answers NotLeader while the client is already
                 // discovering the new leader: expected during failover, so it must
                 // not look like an error in the log.
@@ -475,5 +505,57 @@ impl FsContext {
     async fn metrics_report(context: &Arc<FsContext>) -> FsResult<()> {
         let metrics = ClientMetrics::encode()?;
         FsClient::new(context.clone()).metrics_report(metrics).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(heartbeat_interval_ms: u64) -> FsContext {
+        let mut conf = ClusterConf::default();
+        conf.client.heartbeat_interval_ms = heartbeat_interval_ms;
+        FsContext::new(conf).unwrap()
+    }
+
+    #[test]
+    fn lock_taken_before_the_first_heartbeat_is_not_session_owned() {
+        // No polling for registration: right after construction no lease is
+        // confirmed, so even this context's own locks stay on the legacy path.
+        let ctx = context(12_000);
+        let own = ctx.clone_client_name();
+        assert!(!ctx.session_active());
+        assert!(!ctx.is_session_owner(&own));
+    }
+
+    #[test]
+    fn confirmed_lease_stamps_only_the_registered_client_id() {
+        let ctx = context(12_000);
+        let own = ctx.clone_client_name();
+        ctx.set_session_active(true);
+
+        assert!(ctx.is_session_owner(&own));
+        // A synthetic owner (e.g. `curvine-lancedb:<pid>`) never registered a
+        // session, so it must keep `lock_expire_time` reclamation.
+        assert!(!ctx.is_session_owner("curvine-lancedb:42"));
+    }
+
+    #[test]
+    fn failed_or_unsupported_renewal_reverts_to_the_legacy_path() {
+        // The heartbeat task clears the flag on any error, including an old
+        // master that does not know `ClientHeartbeat`.
+        let ctx = context(12_000);
+        let own = ctx.clone_client_name();
+        ctx.set_session_active(true);
+        ctx.set_session_active(false);
+        assert!(!ctx.is_session_owner(&own));
+    }
+
+    #[test]
+    fn disabled_heartbeat_never_claims_session_ownership() {
+        let ctx = context(0);
+        let own = ctx.clone_client_name();
+        ctx.set_session_active(true);
+        assert!(!ctx.is_session_owner(&own));
     }
 }

@@ -19,8 +19,8 @@
 use curvine_client::file::CurvineFileSystem;
 use curvine_fs_api::{Path, Writer};
 use curvine_model::{FileLock, LockFlags, LockType};
-use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::RpcRuntime;
+use curvine_server::master::fs::state::monotonic_ms;
 use curvine_server::test::MiniCluster;
 use curvine_tests::Testing;
 use std::sync::Arc;
@@ -76,7 +76,7 @@ fn session_of(
 fn session_is_live(cluster: &MiniCluster, client_id: &str) -> bool {
     let master = cluster.get_active_master_fs();
     let sessions = master.session_map.read();
-    sessions.is_live(client_id, LocalTime::mills())
+    sessions.is_live(client_id, monotonic_ms())
 }
 
 fn create_file(fs: &CurvineFileSystem, path: &Path) {
@@ -198,11 +198,14 @@ fn heartbeat_client_stamps_session_ownership_on_its_locks() {
     let fs = client_fs(&testing);
     let client_id = fs.fs_context_ref().clone_client_name();
 
+    // The client stamps only after it has seen the master's acknowledgement,
+    // which lands just after the master-side registration.
     wait_until(
-        "the client session to register",
+        "the client to confirm its session lease",
         Duration::from_secs(15),
-        || session_of(&cluster, &client_id).is_some(),
+        || fs.fs_context_ref().session_active(),
     );
+    assert!(session_of(&cluster, &client_id).is_some());
 
     let path = Path::from_str(format!("/session-owned-{}", std::process::id())).unwrap();
     create_file(&fs, &path);
@@ -221,5 +224,40 @@ fn heartbeat_client_stamps_session_ownership_on_its_locks() {
         stored.session_owned,
         "a heartbeat client's locks must be marked session-owned so #1879 can \
          judge them by session liveness"
+    );
+}
+
+#[test]
+fn foreign_owner_lock_keeps_the_legacy_path_under_a_live_session() {
+    // curvine-lancedb takes locks as `curvine-lancedb:<pid>` through a context
+    // whose session is registered under the context UUID. Such a lock has no
+    // session that could ever renew it, so it must stay on `lock_expire_time`
+    // even when the caller asks for session ownership.
+    let (testing, cluster) = start_cluster(HEARTBEAT_MS);
+    let fs = client_fs(&testing);
+    wait_until(
+        "the client to confirm its session lease",
+        Duration::from_secs(15),
+        || fs.fs_context_ref().session_active(),
+    );
+
+    let path = Path::from_str(format!("/session-foreign-{}", std::process::id())).unwrap();
+    create_file(&fs, &path);
+    let foreign = format!("curvine-lancedb:{}", std::process::id());
+    let mut lock = write_lock(foreign.clone(), 13);
+    lock.session_owned = true;
+    fs.clone_runtime()
+        .block_on(async { fs.set_lock(&path, lock).await })
+        .unwrap();
+
+    let stored = cluster
+        .get_active_master_fs()
+        .get_lock(path.full_path(), probe_lock())
+        .unwrap()
+        .expect("the probe must see the foreign owner's conflicting lock");
+    assert_eq!(stored.client_id, foreign);
+    assert!(
+        !stored.session_owned,
+        "a lock whose client_id is not the registered session must keep the legacy TTL path"
     );
 }
