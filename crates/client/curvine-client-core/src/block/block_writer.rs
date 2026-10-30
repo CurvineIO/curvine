@@ -25,6 +25,7 @@ use curvine_io::DataSlice;
 use curvine_model::{BlockLocation, CommitBlock, LocatedBlock, StorageType, WorkerAddress};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use futures::future::{join_all, try_join_all};
+use log::warn;
 use std::sync::Arc;
 
 async fn finish_all_cancellations<I, F>(futures: I) -> FsResult<()>
@@ -45,6 +46,73 @@ where
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+// An adapter that was opened against one replica and can be cancelled again.
+trait OpenedAdapter {
+    fn worker_address(&self) -> &WorkerAddress;
+    async fn cancel(&mut self) -> FsResult<()>;
+}
+
+impl OpenedAdapter for WriterAdapter {
+    fn worker_address(&self) -> &WorkerAddress {
+        WriterAdapter::worker_address(self)
+    }
+
+    async fn cancel(&mut self) -> FsResult<()> {
+        WriterAdapter::cancel(self).await
+    }
+}
+
+// Best-effort cancellation of the adapters already opened in this round.
+// Every adapter is attempted; the first cancellation error is preserved,
+// but it never masks the primary error from the caller.
+async fn cancel_opened<T>(inners: &mut [T]) -> FsResult<()>
+where
+    T: OpenedAdapter,
+{
+    let futures = inners.iter_mut().map(|writer| {
+        let worker_addr = writer.worker_address().clone();
+        async move {
+            writer
+                .cancel()
+                .await
+                .map_err(|e| e.ctx(format!("failed to cancel block on {}", worker_addr)))
+        }
+    });
+    finish_all_cancellations(futures).await
+}
+
+// Opens one replica at a time. If a later replica fails to open, the
+// adapters already opened in this round are cancelled best-effort and the
+// original open error is returned. `open` is injectable for tests.
+async fn open_all<T, F, Fut>(num_replicas: usize, mut open: F) -> FsResult<Vec<T>>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = FsResult<T>>,
+    T: OpenedAdapter,
+{
+    let mut inners = Vec::with_capacity(num_replicas);
+    for idx in 0..num_replicas {
+        match open(idx).await {
+            Ok(adapter) => inners.push(adapter),
+            Err(e) => {
+                // Partial open failure: best-effort cancel the replicas opened
+                // in this round so worker-side write state is reclaimed.
+                // Cancellation errors are logged only; the original open
+                // error remains the primary error returned to the caller.
+                if let Err(cancel_err) = cancel_opened(&mut inners).await {
+                    warn!(
+                        "failed to cancel {} replicas opened before open failure: {}",
+                        inners.len(),
+                        cancel_err
+                    );
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(inners)
 }
 
 enum WriterAdapter {
@@ -205,12 +273,16 @@ impl BlockWriter {
             return err_box!("There is no available worker");
         }
 
-        let mut inners = Vec::with_capacity(locate.locs.len());
-        for addr in &locate.locs {
-            let adapter =
-                WriterAdapter::new(fs_context.clone(), &locate, addr, pos, block_size).await?;
-            inners.push(adapter);
-        }
+        let inners = open_all(locate.locs.len(), |idx| {
+            WriterAdapter::new(
+                fs_context.clone(),
+                &locate,
+                &locate.locs[idx],
+                pos,
+                block_size,
+            )
+        })
+        .await?;
 
         let writer = Self {
             inners,
@@ -271,16 +343,7 @@ impl BlockWriter {
     }
 
     pub async fn cancel(&mut self) -> FsResult<()> {
-        let futures = self.inners.iter_mut().map(|writer| {
-            let worker_addr = writer.worker_address().clone();
-            async move {
-                writer
-                    .cancel()
-                    .await
-                    .map_err(|e| e.ctx(format!("failed to cancel block on {}", worker_addr)))
-            }
-        });
-        finish_all_cancellations(futures).await
+        cancel_opened(&mut self.inners).await
     }
 
     pub fn remaining(&self) -> i64 {
@@ -349,8 +412,9 @@ impl BlockWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::finish_all_cancellations;
-    use curvine_error::FsError;
+    use super::{cancel_opened, finish_all_cancellations, open_all, OpenedAdapter};
+    use curvine_error::{FsError, FsResult};
+    use curvine_model::WorkerAddress;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -374,6 +438,147 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             3,
             "one failure must not prevent the remaining cancellations"
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct ScriptedWriter {
+        calls: Arc<AtomicUsize>,
+        fail_cancel: bool,
+        worker_id: u32,
+    }
+
+    impl ScriptedWriter {
+        fn new(calls: Arc<AtomicUsize>, fail_cancel: bool, worker_id: u32) -> Self {
+            Self {
+                calls,
+                fail_cancel,
+                worker_id,
+            }
+        }
+    }
+
+    impl OpenedAdapter for ScriptedWriter {
+        fn worker_address(&self) -> &WorkerAddress {
+            // Return a stable address so the ctx wrapping in cancel_opened works.
+            static ADDR: std::sync::OnceLock<WorkerAddress> = std::sync::OnceLock::new();
+            ADDR.get_or_init(WorkerAddress::default)
+        }
+
+        async fn cancel(&mut self) -> FsResult<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_cancel {
+                Err(FsError::common("injected cancellation failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_replica_open_cancels_adapters_opened_before_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Replica 0 opens fine, replica 1 fails to open: the adapter opened
+        // for replica 0 must be cancelled exactly once and the original open
+        // error of replica 1 must be returned.
+        let script = vec![(false, false), (true, false)]; // (fail_open, fail_cancel)
+
+        let err = open_all(2, |idx| {
+            let script = script.clone();
+            let calls = calls.clone();
+            async move {
+                let (fail_open, fail_cancel) = script[idx];
+                if fail_open {
+                    Err(FsError::common("injected open failure"))
+                } else {
+                    Ok(ScriptedWriter::new(calls, fail_cancel, idx as u32))
+                }
+            }
+        })
+        .await;
+
+        assert!(err.is_err());
+        let err_msg = err.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("injected open failure"),
+            "primary error must be the original open error, got: {err_msg}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the adapter opened before the failure must be cancelled exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_replica_open_with_failing_cancel_still_returns_open_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Replica 0 opens fine and its cancellation fails; replica 1 fails to
+        // open. The caller must still get the original open error of replica 1.
+        let script = vec![(false, true), (true, false)];
+
+        let err = open_all(2, |idx| {
+            let script = script.clone();
+            let calls = calls.clone();
+            async move {
+                let (fail_open, fail_cancel) = script[idx];
+                if fail_open {
+                    Err(FsError::common("injected open failure"))
+                } else {
+                    Ok(ScriptedWriter::new(calls, fail_cancel, idx as u32))
+                }
+            }
+        })
+        .await;
+
+        assert!(err.is_err());
+        let err_msg = err.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("injected open failure"),
+            "primary error must be the original open error, got: {err_msg}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "cancel must still be attempted even when the original error wins"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_open_never_cancels_any_adapter() {
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let inners = open_all(3, |idx| {
+            let calls = calls.clone();
+            async move { Ok(ScriptedWriter::new(calls, false, idx as u32)) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(inners.len(), 3);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no cancellation when all replicas open successfully"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_opened_attempts_all_adapters_and_preserves_first_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut inners = vec![
+            ScriptedWriter::new(calls.clone(), false, 0),
+            ScriptedWriter::new(calls.clone(), true, 1),
+            ScriptedWriter::new(calls.clone(), false, 2),
+        ];
+
+        let result = cancel_opened(&mut inners).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "one failing cancel must not prevent the remaining cancellations"
         );
     }
 }
