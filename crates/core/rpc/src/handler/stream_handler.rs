@@ -71,29 +71,7 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
     }
 
     pub async fn call(&mut self, request: Message) -> IOResult<()> {
-        let response = if self.handler.is_sync(&request) {
-            let rt = self.handler.get_rt(&request).unwrap_or(&self.rt);
-
-            let handler = self.handler.clone();
-            rt.spawn_blocking(move || match handler.handle(&request) {
-                Err(e) => {
-                    debug!("handler request {} error: {}", request.req_id(), e);
-                    request.error_ext(&e)
-                }
-
-                Ok(v) => v,
-            })
-            .await?
-        } else {
-            let protocol = request.protocol;
-            match self.handler.async_handle(request).await {
-                Ok(v) => v,
-                Err(e) => {
-                    debug!("handler request {} error: {}", protocol.req_id, e);
-                    Builder::protocol(protocol).build().error_ext(&e)
-                }
-            }
-        };
+        let response = dispatch(&self.rt, &self.handler, request).await?;
 
         if response.not_empty() {
             self.frame.send(response).await
@@ -105,4 +83,41 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
     pub fn frame_mut(&mut self) -> &mut F {
         &mut self.frame
     }
+}
+
+/// Runs one request through `handler` and returns the response message.
+///
+/// Sync requests run on the blocking pool of `handler.get_rt()` (or `rt`);
+/// async requests run inline on the caller's task. Handler errors become
+/// error responses; only a failed blocking task (panic/cancel) is an `Err`.
+pub(crate) async fn dispatch<M: MessageHandler>(
+    rt: &Arc<Runtime>,
+    handler: &Arc<M>,
+    request: Message,
+) -> IOResult<Message> {
+    let response = if handler.is_sync(&request) {
+        let rt = handler.get_rt(&request).unwrap_or(rt);
+
+        let handler = handler.clone();
+        rt.spawn_blocking(move || match handler.handle(&request) {
+            Err(e) => {
+                debug!("handler request {} error: {}", request.req_id(), e);
+                request.error_ext(&e)
+            }
+
+            Ok(v) => v,
+        })
+        .await?
+    } else {
+        let protocol = request.protocol;
+        match handler.async_handle(request).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("handler request {} error: {}", protocol.req_id, e);
+                Builder::protocol(protocol).build().error_ext(&e)
+            }
+        }
+    };
+
+    Ok(response)
 }

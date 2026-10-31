@@ -27,6 +27,9 @@ pub use self::rpc_codec::RpcCodec;
 mod stream_handler;
 pub use self::stream_handler::StreamHandler;
 
+mod buffer_handler;
+pub use self::buffer_handler::BufferHandler;
+
 mod write_frame;
 pub use self::write_frame::WriteFrame;
 
