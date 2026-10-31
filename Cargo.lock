@@ -2346,6 +2346,7 @@ dependencies = [
  "curvine-runtime",
  "futures",
  "hyper 1.7.0",
+ "libc",
  "num_enum",
  "once_cell",
  "prost 0.11.9",
