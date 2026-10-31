@@ -16,13 +16,16 @@ use crate::handler::stream_handler::dispatch;
 use crate::handler::{LimitConf, MessageHandler, ReadFrame, WriteFrame};
 use crate::message::Message;
 use crate::ServerConf;
-use curvine_io::IOResult;
+use curvine_io::{IOError, IOResult};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use log::warn;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
+
+/// A finished request and the connection permit it holds until written.
+type Reply = (IOResult<Message>, OwnedSemaphorePermit);
 
 /// Connection handler that processes requests of one connection concurrently.
 ///
@@ -31,8 +34,10 @@ use tokio::time::timeout;
 /// connection. `BufferHandler` instead:
 ///
 /// 1. reads requests in a loop and spawns one task per request;
-/// 2. bounds in-flight requests by `LimitConf::conn_limit` per connection and by
-///    the shared `LimitConf::global_limit` semaphore across all connections;
+/// 2. bounds work with two semaphores: `LimitConf::conn_limit` per connection
+///    covers a request from dispatch until its reply is written, and the shared
+///    `LimitConf::global_limit` covers execution only, so a peer that stops
+///    reading holds just its own connection's permits;
 /// 3. sends responses from a single writer task as soon as they are ready, so
 ///    responses can be out of order. Clients must match responses by `req_id`
 ///    (as `BufferClient` does).
@@ -94,7 +99,7 @@ impl<M: MessageHandler> BufferHandler<M> {
         read_res.and(write_res)
     }
 
-    async fn read_loop(&mut self, tx: mpsc::Sender<IOResult<Message>>) -> IOResult<()> {
+    async fn read_loop(&mut self, tx: mpsc::Sender<Reply>) -> IOResult<()> {
         loop {
             let res = tokio::select! {
                 // The writer stopped (write error or failed request task):
@@ -124,25 +129,42 @@ impl<M: MessageHandler> BufferHandler<M> {
                 v = self.global_limit.clone().acquire_owned() => v,
             };
             // The semaphores are never closed.
-            let permits = (conn_permit.unwrap(), global_permit.unwrap());
+            let (conn_permit, global_permit) = (conn_permit.unwrap(), global_permit.unwrap());
 
             let rt = self.rt.clone();
             let handler = self.handler.clone();
             let tx = tx.clone();
             self.rt.spawn(async move {
-                let response = dispatch(&rt, &handler, request).await;
-                // Fails only when the writer already stopped.
-                let _ = tx.send(response).await;
-                drop(permits);
+                // Run dispatch in its own task so a panic anywhere in the
+                // handler (is_sync, get_rt, handle, async_handle) becomes an
+                // `Err` that closes the connection, instead of leaving the
+                // caller waiting for a reply that never comes.
+                let task_rt = rt.clone();
+                let response = rt
+                    .spawn(async move { dispatch(&task_rt, &handler, request).await })
+                    .await
+                    .map_err(IOError::from)
+                    .and_then(|v| v);
+
+                // Execution is done: free the global slot before queueing, so
+                // a peer that stops reading cannot hold slots other
+                // connections need.
+                drop(global_permit);
+
+                // The connection permit travels with the reply and is released
+                // after it is written (or dropped). That bounds queued plus
+                // writing replies per connection to `conn_limit`.
+                // `send` fails only when the writer already stopped.
+                let _ = tx.send((response, conn_permit)).await;
             });
         }
     }
 
     async fn write_loop(
         mut write_frame: WriteFrame,
-        mut rx: mpsc::Receiver<IOResult<Message>>,
+        mut rx: mpsc::Receiver<Reply>,
     ) -> IOResult<()> {
-        while let Some(response) = rx.recv().await {
+        while let Some((response, _conn_permit)) = rx.recv().await {
             let response = match response {
                 Ok(v) => v,
                 Err(e) => {

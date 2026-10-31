@@ -45,6 +45,15 @@ struct ProbeHandler {
 impl MessageHandler for ProbeHandler {
     type Error = CommonErrorExt;
 
+    // "async-panic" requests take the async path and panic there.
+    fn is_sync(&self, msg: &Message) -> bool {
+        msg.data_bytes() != Some(b"async-panic".as_slice())
+    }
+
+    async fn async_handle(&self, _msg: Message) -> CommonResultExt<Message> {
+        panic!("probe async handler panic")
+    }
+
     fn handle(&self, msg: &Message) -> CommonResultExt<Message> {
         let data = String::from_utf8_lossy(msg.data_bytes().unwrap_or_default()).to_string();
         if data == "panic" {
@@ -232,19 +241,34 @@ fn buffer_handler_releases_global_permits_after_requests_finish() {
     assert_eq!(server.probe.active.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn buffer_handler_closes_connection_when_handler_panics() {
+/// Sends `payload` (which makes the probe panic) and requires the call to fail
+/// quickly because the server closed the connection. `client.rpc` has no
+/// deadline of its own, so the outer timeout separates "connection closed"
+/// from "call hung".
+fn assert_panic_closes_connection(payload: &'static str) {
     let server = start_server(false, 8, 4096);
     server.rt.block_on(async {
         let client = connect(&server).await;
         let msg = Builder::new_rpc(1i8)
-            .data(DataSlice::from_str("panic"))
+            .data(DataSlice::from_str(payload))
             .build();
-        let res = client.timeout_rpc(Duration::from_secs(10), msg).await;
-        assert!(res.is_err(), "panicking request must fail, not hang");
+        let res = tokio::time::timeout(Duration::from_secs(2), client.rpc(msg))
+            .await
+            .expect("panicking request must fail fast, not hang");
+        assert!(res.is_err(), "panicking request must return an error");
 
         // A new connection is served normally.
         let client = connect(&server).await;
         send_all(&client, &[10; 2]).await;
     });
+}
+
+#[test]
+fn buffer_handler_closes_connection_when_handler_panics() {
+    assert_panic_closes_connection("panic");
+}
+
+#[test]
+fn buffer_handler_closes_connection_when_async_handler_panics() {
+    assert_panic_closes_connection("async-panic");
 }
