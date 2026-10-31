@@ -360,3 +360,42 @@ fn lost_leadership_leaves_the_entry_for_the_purger() {
     assert!(purging_entries(&fs).is_empty());
     assert_eq!(fs.get_file_counts().1, 0);
 }
+
+#[test]
+fn restart_keeps_a_staged_entry_for_the_purger() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fs = filesystem("restart", 4, false);
+    let keep = fs.create("/keep", false).unwrap();
+    wide_tree(&fs, "/victim");
+
+    // Staged and journaled, but no purge batch commits: the purge stops at its
+    // first fenced batch, which is the state a restart right after the rename
+    // leaves behind.
+    fs.master_monitor.set_role_for_test(RoleState::Follower);
+    let res = fs.delete("/victim", true).unwrap();
+    assert!(res.purge_pending);
+    let staged = purging_entries(&fs);
+    assert_eq!(staged.len(), 1);
+
+    // Only durable state survives: the in-flight set is process memory, so the
+    // restored entry must still be listed and adoptable by the purger.
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(purging_entries(&fs), staged);
+    assert!(!fs.exists("/victim").unwrap());
+    assert_eq!(fs.file_status("/keep").unwrap().id, keep.id);
+
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
+    let drained = PendingTrashPurger::new(fs.clone(), fs.master_monitor.clone())
+        .drain_purging()
+        .unwrap()
+        .unwrap();
+    assert_eq!(drained, (1, 120, 120 * BLOCK as u64));
+    assert!(purging_entries(&fs).is_empty());
+    // (dirs, files): same as a direct delete, only /keep is left.
+    assert_eq!(fs.get_file_counts().1, 1);
+
+    let counts = fs.get_file_counts();
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.get_file_counts(), counts);
+    assert!(purging_entries(&fs).is_empty());
+}
