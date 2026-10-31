@@ -103,6 +103,15 @@ struct TestServer {
 }
 
 fn start_server(stream: bool, conn_limit: usize, global_limit: usize) -> TestServer {
+    start_server_with(stream, conn_limit, global_limit, |_| {})
+}
+
+fn start_server_with(
+    stream: bool,
+    conn_limit: usize,
+    global_limit: usize,
+    configure: impl FnOnce(&mut ServerConf),
+) -> TestServer {
     let probe = Arc::new(Probe::default());
     let service = ProbeService {
         probe: probe.clone(),
@@ -113,6 +122,7 @@ fn start_server(stream: bool, conn_limit: usize, global_limit: usize) -> TestSer
     let mut conf = ServerConf::with_hostname("127.0.0.1", NetUtils::hold_available_port());
     // Enough blocking threads that the pool is never the limiting factor.
     conf.worker_threads = 32;
+    configure(&mut conf);
     let server = RpcServer::new(conf, service);
     let addr = server.bind_addr().clone();
     let rt = server.clone_rt();
@@ -271,4 +281,61 @@ fn buffer_handler_closes_connection_when_handler_panics() {
 #[test]
 fn buffer_handler_closes_connection_when_async_handler_panics() {
     assert_panic_closes_connection("async-panic");
+}
+
+fn sleep_request(sleep_ms: u64) -> Message {
+    Builder::new_rpc(1i8)
+        .data(DataSlice::from_str(sleep_ms.to_string()))
+        .build()
+}
+
+#[test]
+fn buffer_handler_releases_permits_when_client_disconnects_mid_request() {
+    // One global permit. The first client disconnects while its request is
+    // still executing; the reply then has no reader. The second client can
+    // run only if that path releases both permits.
+    let server = start_server(false, 8, 1);
+    server.rt.block_on(async {
+        let c1 = connect(&server).await;
+        let call = tokio::spawn(async move { c1.rpc(sleep_request(500)).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        call.abort();
+        let _ = call.await;
+
+        let c2 = connect(&server).await;
+        tokio::time::timeout(Duration::from_secs(5), send_all(&c2, &[10; 2]))
+            .await
+            .expect("second connection must get the released permit");
+    });
+
+    assert_eq!(server.probe.peak.load(Ordering::SeqCst), 1);
+    assert_eq!(server.probe.active.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn buffer_handler_closes_connection_when_permit_wait_times_out() {
+    // One global permit held by a slow request on c1. A request on c2 waits
+    // for that permit; after the server timeout (300ms) c2's connection must
+    // close, well before the slow request finishes. Idle close is off so only
+    // the permit deadline can close it.
+    let server = start_server_with(false, 8, 1, |conf| {
+        conf.timeout_ms = 300;
+        conf.close_idle = false;
+    });
+    server.rt.block_on(async {
+        let c1 = connect(&server).await;
+        let slow = tokio::spawn(async move { c1.rpc(sleep_request(1500)).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let c2 = connect(&server).await;
+        let res = tokio::time::timeout(Duration::from_millis(1000), c2.rpc(sleep_request(0)))
+            .await
+            .expect("waiting for a permit must not hang past the server timeout");
+        assert!(res.is_err(), "undispatched request must fail");
+
+        // The slow request on the other connection is unaffected.
+        slow.await
+            .unwrap()
+            .expect("slow request must still complete");
+    });
 }

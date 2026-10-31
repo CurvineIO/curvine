@@ -22,7 +22,7 @@ use log::warn;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
-use tokio::time::timeout;
+use tokio::time::{sleep_until, timeout, Instant};
 
 /// A finished request and the connection permit it holds until written.
 type Reply = (IOResult<Message>, OwnedSemaphorePermit);
@@ -99,6 +99,14 @@ impl<M: MessageHandler> BufferHandler<M> {
         read_res.and(write_res)
     }
 
+    fn permit_timeout(&self, kind: &str) -> IOResult<()> {
+        warn!(
+            "no {} permit within {:?}, closing connection",
+            kind, self.timeout
+        );
+        Ok(())
+    }
+
     async fn read_loop(&mut self, tx: mpsc::Sender<Reply>) -> IOResult<()> {
         loop {
             let res = tokio::select! {
@@ -120,12 +128,21 @@ impl<M: MessageHandler> BufferHandler<M> {
 
             // Acquire the connection permit first so one busy connection waits
             // on its own limit instead of holding global permits.
+            //
+            // While waiting, this loop does not read the socket, so it cannot
+            // see the peer close the connection. Bound the wait: when it
+            // expires, stop reading and close the connection. In-flight
+            // requests still write their replies first; the caller fails the
+            // undispatched request and can retry on a new connection.
+            let deadline = Instant::now() + self.timeout;
             let conn_permit = tokio::select! {
                 _ = tx.closed() => return Ok(()),
+                _ = sleep_until(deadline) => return self.permit_timeout("connection"),
                 v = self.conn_limit.clone().acquire_owned() => v,
             };
             let global_permit = tokio::select! {
                 _ = tx.closed() => return Ok(()),
+                _ = sleep_until(deadline) => return self.permit_timeout("global"),
                 v = self.global_limit.clone().acquire_owned() => v,
             };
             // The semaphores are never closed.
