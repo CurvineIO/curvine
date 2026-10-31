@@ -40,6 +40,7 @@ struct CompleteFileOptions {
     only_flush: bool,
     set_attr_opts: Option<SetAttrOpts>,
     return_file_blocks: bool,
+    release_block_id: Option<i64>,
 }
 
 /// RAII guard for a claimed one-time handshake report. Resets the claim when
@@ -113,6 +114,7 @@ impl FsClient {
                 path,
                 opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
                 flags: flags.value(),
+                first_block_client: None,
             })
             .collect();
 
@@ -134,6 +136,31 @@ impl FsClient {
         opts: CreateFileOpts,
         overwrite: bool,
     ) -> FsResult<FileStatus> {
+        let (status, _) = self.create_file0(path, opts, overwrite, false).await?;
+        Ok(status)
+    }
+
+    /// Like `create_with_opts`, but also asks the master for the first block
+    /// when `client.alloc_first_block_on_create` is enabled. The returned block
+    /// is owned by the caller: write it or pass it to `release_block_id` of the
+    /// final CompleteFile.
+    pub async fn create_for_write(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        overwrite: bool,
+    ) -> FsResult<(FileStatus, Option<LocatedBlock>)> {
+        let alloc = self.conf().client.alloc_first_block_on_create;
+        self.create_file0(path, opts, overwrite, alloc).await
+    }
+
+    async fn create_file0(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        overwrite: bool,
+        alloc_first_block: bool,
+    ) -> FsResult<(FileStatus, Option<LocatedBlock>)> {
         let flags = OpenFlags::new_write_only()
             .set_create(true)
             .set_overwrite(overwrite);
@@ -141,11 +168,15 @@ impl FsClient {
             path: path.encode(),
             opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
             flags: flags.value(),
+            first_block_client: alloc_first_block.then(|| self.context.client_addr_pb()),
         };
 
         let rep_header: CreateFileResponse = self.rpc(RpcCode::CreateFile, header).await?;
         let status = ProtoUtils::file_status_from_pb(rep_header.file_status);
-        Ok(status)
+        let first_block = rep_header
+            .first_block
+            .map(ProtoUtils::located_block_from_pb);
+        Ok((status, first_block))
     }
 
     pub async fn open_with_opts(
@@ -154,14 +185,43 @@ impl FsClient {
         opts: CreateFileOpts,
         flags: OpenFlags,
     ) -> FsResult<FileBlocks> {
+        let (file_blocks, _) = self.open_file0(path, opts, flags, false).await?;
+        Ok(file_blocks)
+    }
+
+    /// Write-open counterpart of `create_for_write`. The master only returns a
+    /// first block when the open leaves the file empty (O_CREAT or O_TRUNC).
+    pub async fn open_for_write(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> FsResult<(FileBlocks, Option<LocatedBlock>)> {
+        let alloc = self.conf().client.alloc_first_block_on_create
+            && !flags.read_only()
+            && (flags.create() || flags.truncate());
+        self.open_file0(path, opts, flags, alloc).await
+    }
+
+    async fn open_file0(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+        alloc_first_block: bool,
+    ) -> FsResult<(FileBlocks, Option<LocatedBlock>)> {
         let header = OpenFileRequest {
             path: path.encode(),
             opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
             flags: flags.value(),
+            first_block_client: alloc_first_block.then(|| self.context.client_addr_pb()),
         };
         let rep_header: OpenFileResponse = self.rpc(RpcCode::OpenFile, header).await?;
-        let status = ProtoUtils::file_blocks_from_pb(rep_header.file_blocks);
-        Ok(status)
+        let file_blocks = ProtoUtils::file_blocks_from_pb(rep_header.file_blocks);
+        let first_block = rep_header
+            .first_block
+            .map(ProtoUtils::located_block_from_pb);
+        Ok((file_blocks, first_block))
     }
 
     pub async fn file_status(&self, path: &Path) -> FsResult<FileStatus> {
@@ -509,6 +569,7 @@ impl FsClient {
                 only_flush,
                 set_attr_opts,
                 return_file_blocks: true,
+                release_block_id: None,
             },
         )
         .await
@@ -523,6 +584,31 @@ impl FsClient {
         only_flush: bool,
         set_attr_opts: Option<SetAttrOpts>,
     ) -> FsResult<Option<FileBlocks>> {
+        self.complete_file_release(
+            path,
+            inode_id,
+            len,
+            commit_blocks,
+            only_flush,
+            set_attr_opts,
+            None,
+        )
+        .await
+    }
+
+    /// `complete_file_by_id` that also drops `release_block_id`, a block that
+    /// was pre-allocated at create time and never written.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_file_release(
+        &self,
+        path: &Path,
+        inode_id: i64,
+        len: i64,
+        commit_blocks: impl IntoIterator<Item = CommitBlock>,
+        only_flush: bool,
+        set_attr_opts: Option<SetAttrOpts>,
+        release_block_id: Option<i64>,
+    ) -> FsResult<Option<FileBlocks>> {
         self.complete_file0(
             path,
             Some(inode_id),
@@ -532,6 +618,7 @@ impl FsClient {
                 only_flush,
                 set_attr_opts,
                 return_file_blocks: true,
+                release_block_id,
             },
         )
         .await
@@ -543,6 +630,7 @@ impl FsClient {
         inode_id: i64,
         len: i64,
         commit_blocks: impl IntoIterator<Item = CommitBlock>,
+        release_block_id: Option<i64>,
     ) -> FsResult<()> {
         self.complete_file0(
             path,
@@ -553,6 +641,7 @@ impl FsClient {
                 only_flush: true,
                 set_attr_opts: None,
                 return_file_blocks: false,
+                release_block_id,
             },
         )
         .await
@@ -582,6 +671,7 @@ impl FsClient {
             inode_id,
             set_attr_opts: options.set_attr_opts.map(ProtoUtils::set_attr_opts_to_pb),
             return_file_blocks: Some(options.return_file_blocks),
+            release_block_id: options.release_block_id,
         };
 
         let operation = if options.only_flush {
@@ -615,6 +705,7 @@ impl FsClient {
                     inode_id: None,
                     set_attr_opts: None,
                     return_file_blocks: Some(false),
+                    release_block_id: None,
                 }
             })
             .collect();
@@ -883,6 +974,7 @@ impl FsClient {
             path: path.encode(),
             opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
             flags: flags.value(),
+            first_block_client: None,
         };
 
         let rep_header: CreateFileResponse = self.rpc(RpcCode::CreateFile, header).await?;

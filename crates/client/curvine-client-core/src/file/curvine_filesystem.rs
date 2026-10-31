@@ -114,12 +114,18 @@ impl CurvineFileSystem {
         opts: CreateFileOpts,
         overwrite: bool,
     ) -> FsResult<FsWriter> {
-        let status = self
+        let (status, first_block) = self
             .fs_client
-            .create_with_opts(path, opts, overwrite)
+            .create_for_write(path, opts, overwrite)
             .await?;
         let file_blocks = FileBlocks::new(status, vec![]);
-        let writer = FsWriter::create(self.fs_context.clone(), path.clone(), file_blocks);
+        let writer = FsWriter::with_first_block(
+            self.fs_context.clone(),
+            path.clone(),
+            file_blocks,
+            false,
+            first_block,
+        );
         Ok(writer)
     }
 
@@ -164,12 +170,13 @@ impl CurvineFileSystem {
         opts: CreateFileOpts,
         flags: OpenFlags,
     ) -> FsResult<FsWriter> {
-        let file_block = self.fs_client.open_with_opts(path, opts, flags).await?;
-        let writer = FsWriter::new(
+        let (file_block, first_block) = self.fs_client.open_for_write(path, opts, flags).await?;
+        let writer = FsWriter::with_first_block(
             self.fs_context.clone(),
             path.clone(),
             file_block,
             flags.append(),
+            first_block,
         );
         Ok(writer)
     }

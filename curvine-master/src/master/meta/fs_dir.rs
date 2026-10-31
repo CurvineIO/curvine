@@ -1621,10 +1621,14 @@ impl FsDir {
         client_name: impl AsRef<str>,
         only_flush: bool,
         set_attr_opts: Option<SetAttrOpts>,
-    ) -> FsResult<bool> {
+        release_block_id: Option<i64>,
+    ) -> FsResult<Option<BlockMeta>> {
         let file = inode.as_file_mut()?;
         let id = file.id();
         file.complete(len, &commit_block, client_name, only_flush)?;
+        // After `complete` validated the length, so a rejected request keeps
+        // the block. The journaled CompleteFile entry carries the shrunk list.
+        let released = release_block_id.and_then(|v| file.release_unwritten_block(v));
 
         // Only apply set_attr_opts on real complete/close, not on flush.
         // Flush semantics should remain narrow (durability only).
@@ -1645,7 +1649,7 @@ impl FsDir {
         self.journal_writer
             .log_complete_file(self, path, inode.as_file_ref()?, commit_block)?;
 
-        Ok(true)
+        Ok(released)
     }
 
     pub fn get_file_locations(

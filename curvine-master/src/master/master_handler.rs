@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::master::fs::state::{monotonic_ms, SessionHeartbeat};
-use crate::master::fs::{DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus};
+use crate::master::fs::{
+    CompleteFileOptions, DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus,
+};
 use crate::master::job::JobHandler;
 use crate::master::meta::trash::TrashCursor;
 use crate::master::meta::TrashListing;
@@ -175,10 +177,20 @@ impl MasterHandler {
 
         let opts = ProtoUtils::create_opts_from_pb(header.opts);
         let flags = OpenFlags::new(header.flags);
-        let status = self.create_file0(ctx.msg.req_id(), header.path, opts, flags)?;
+        let path = header.path;
+        let status = self.create_file0(ctx.msg.req_id(), path.clone(), opts, flags)?;
+        let first_block = match header.first_block_client {
+            Some(client) if status.len == 0 => self.fs.alloc_first_block(
+                &path,
+                status.id,
+                ProtoUtils::client_address_from_pb(client),
+            ),
+            _ => None,
+        };
 
         let rep_header = CreateFileResponse {
             file_status: ProtoUtils::file_status_to_pb(status),
+            first_block: first_block.map(ProtoUtils::located_block_to_pb),
         };
         ctx.response(rep_header)
     }
@@ -191,10 +203,25 @@ impl MasterHandler {
         let audit_path = format!("{}:{}", flags.access_mark(), header.path);
         ctx.set_audit(Some(audit_path), None);
 
-        let file_blocks = self.open_file0(ctx.msg.req_id(), header.path, opts, flags)?;
+        let path = header.path;
+        let file_blocks = self.open_file0(ctx.msg.req_id(), path.clone(), opts, flags)?;
+        // Only an open that leaves the file empty is about to write block 0.
+        let wants_first_block = !flags.read_only()
+            && (flags.create() || flags.truncate())
+            && file_blocks.status.len == 0
+            && file_blocks.block_locs.is_empty();
+        let first_block = match header.first_block_client {
+            Some(client) if wants_first_block => self.fs.alloc_first_block(
+                &path,
+                file_blocks.status.id,
+                ProtoUtils::client_address_from_pb(client),
+            ),
+            _ => None,
+        };
 
         let rep_header = OpenFileResponse {
             file_blocks: ProtoUtils::file_blocks_to_pb(file_blocks),
+            first_block: first_block.map(ProtoUtils::located_block_to_pb),
         };
         ctx.response(rep_header)
     }
@@ -514,26 +541,25 @@ impl MasterHandler {
             .into_iter()
             .map(ProtoUtils::commit_block_from_pb)
             .collect();
-        if req.only_flush && !return_file_blocks {
-            self.fs.flush_file(
-                req.path,
-                req.inode_id,
-                req.len,
-                commit_blocks,
-                req.client_name,
-            )?;
-            Ok(None)
+        // `return_file_blocks` only matters for flush; a close never returns them.
+        let set_attr_opts = if req.only_flush && !return_file_blocks {
+            None
         } else {
-            self.fs.complete_file(
-                req.path,
-                req.inode_id,
-                req.len,
-                commit_blocks,
-                req.client_name,
-                req.only_flush,
-                req.set_attr_opts.map(ProtoUtils::set_attr_opts_from_pb),
-            )
-        }
+            req.set_attr_opts.map(ProtoUtils::set_attr_opts_from_pb)
+        };
+        self.fs.complete_file_with_opts(
+            req.path,
+            req.inode_id,
+            req.len,
+            commit_blocks,
+            req.client_name,
+            CompleteFileOptions {
+                only_flush: req.only_flush,
+                return_file_blocks,
+                set_attr_opts,
+                release_block_id: req.release_block_id,
+            },
+        )
     }
 
     pub fn create_files_batch(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {

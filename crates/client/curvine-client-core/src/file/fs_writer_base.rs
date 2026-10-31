@@ -14,13 +14,13 @@
 
 use crate::block::BlockWriter;
 use crate::file::{FsClient, FsContext};
-use curvine_core_error::{err_box, try_option_mut};
+use curvine_core_error::{err_box, try_option, try_option_mut};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_io::DataSlice;
 use curvine_model::{
-    CommitBlock, FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts, WriteFileBlocks,
+    CommitBlock, FileAllocOpts, FileBlocks, FileStatus, LocatedBlock, SetAttrOpts, WriteFileBlocks,
 };
 use curvine_runtime::common::FastHashSet;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
@@ -48,6 +48,10 @@ pub struct FsWriterBase {
     /// opened, blocks published by a successful flush, and blocks finalized on
     /// workers but still waiting for their commit metadata to reach the master.
     durable_blocks: FastHashSet<i64>,
+    /// Block 0 allocated by the master together with CreateFile/OpenFile.
+    /// Consumed by the first `get_writer` at offset 0 instead of AddBlock;
+    /// if it is never written, the next CompleteFile releases it.
+    first_block: Option<LocatedBlock>,
 }
 
 fn needs_append_block(file_blocks: &WriteFileBlocks, file_len: i64, pos: i64) -> bool {
@@ -84,7 +88,17 @@ impl FsWriterBase {
             cache_limit,
             cache_writers,
             durable_blocks,
+            first_block: None,
         }
+    }
+
+    /// Attaches a block pre-allocated by the master for an empty file.
+    pub fn with_first_block(mut self, first_block: Option<LocatedBlock>) -> Self {
+        // Only usable as block 0 of a file this writer sees as empty.
+        if self.file_blocks.block_locs.is_empty() && self.len == 0 {
+            self.first_block = first_block;
+        }
+        self
     }
 
     pub fn pos(&self) -> i64 {
@@ -183,6 +197,17 @@ impl FsWriterBase {
         self.cur_writer.is_some()
             || !self.cache_writers.is_empty()
             || self.file_blocks.has_commit_blocks()
+            || self.first_block.is_some()
+    }
+
+    /// Hands the unused pre-allocated block to the next CompleteFile.
+    ///
+    /// Taken before the request is sent: if the response is lost the block
+    /// may already be gone on the master, so it must not be written later.
+    /// The block is then left as an empty pending block, which is the same
+    /// state as a writer that called AddBlock and never wrote.
+    fn take_release_block(&mut self) -> Option<i64> {
+        self.first_block.take().map(|v| v.block.id)
     }
 
     // Write is completed, perform the following operations
@@ -274,7 +299,8 @@ impl FsWriterBase {
         }
 
         let commit_blocks = self.file_blocks.take_commit_blocks();
-        if !commit_blocks.is_empty() {
+        let release_block_id = self.take_release_block();
+        if !commit_blocks.is_empty() || release_block_id.is_some() {
             let committed_len = self.committed_len();
             let result = self
                 .fs_client
@@ -283,6 +309,7 @@ impl FsWriterBase {
                     self.file_blocks.status.id,
                     committed_len,
                     commit_blocks.clone(),
+                    release_block_id,
                 )
                 .await;
             if let Err(e) = result {
@@ -337,15 +364,17 @@ impl FsWriterBase {
             self.durable_blocks.insert(commit.block_id);
         }
 
+        let release_block_id = self.take_release_block();
         let result = self
             .fs_client
-            .complete_file_by_id(
+            .complete_file_release(
                 &self.path,
                 self.file_blocks.status.id,
                 self.len,
                 commit_blocks.clone(),
                 only_flush,
                 set_attr_opts,
+                release_block_id,
             )
             .await;
         match result {
@@ -408,6 +437,22 @@ impl FsWriterBase {
                         };
 
                         self.update_writer(Some(writer), true).await?;
+                    }
+
+                    None if self.pos == 0 && self.first_block.is_some() => {
+                        // Empty file: write block 0 that came back with
+                        // CreateFile/OpenFile, skipping the AddBlock RPC.
+                        let lb = try_option!(self.first_block.take());
+                        self.file_blocks.add_block(lb.clone())?;
+                        let writer = BlockWriter::new(
+                            self.fs_context.clone(),
+                            lb,
+                            0,
+                            self.file_blocks.status.block_size,
+                        )
+                        .await?;
+
+                        self.cur_writer.replace(writer);
                     }
 
                     None => {

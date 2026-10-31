@@ -19,7 +19,7 @@ use curvine_error::FsResult;
 use curvine_fs_api::{Path, Writer};
 use curvine_io::DataSlice;
 use curvine_metrics::MetricTimer;
-use curvine_model::{FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts};
+use curvine_model::{FileAllocOpts, FileBlocks, FileStatus, LocatedBlock, SetAttrOpts};
 use curvine_runtime::common::ByteUnit;
 use log::debug;
 use std::sync::Arc;
@@ -36,6 +36,17 @@ pub struct FsWriter {
 
 impl FsWriter {
     pub fn new(fs_context: Arc<FsContext>, path: Path, status: FileBlocks, append: bool) -> Self {
+        Self::with_first_block(fs_context, path, status, append, None)
+    }
+
+    /// `new` plus the block the master pre-allocated in CreateFile/OpenFile.
+    pub fn with_first_block(
+        fs_context: Arc<FsContext>,
+        path: Path,
+        status: FileBlocks,
+        append: bool,
+        first_block: Option<LocatedBlock>,
+    ) -> Self {
         let chunk_size = fs_context.write_chunk_size();
         let chunk_num = fs_context.write_chunk_num();
         let pos = ternary!(append, status.len, 0);
@@ -51,7 +62,7 @@ impl FsWriter {
             status.replicas
         );
 
-        let writer = FsWriterBase::new(fs_context, path, status, pos);
+        let writer = FsWriterBase::new(fs_context, path, status, pos).with_first_block(first_block);
         let inner = FsWriterBuffer::new(writer, chunk_num);
 
         Self {

@@ -134,6 +134,18 @@ impl WorkerManager {
         self.adjust_chosen_workers(workers, block_size, false);
     }
 
+    /// Same as `unschedule_chosen_workers`, keyed by worker id.
+    pub(crate) fn unschedule_worker_ids(&mut self, worker_ids: &[u32], block_size: i64) {
+        if block_size <= 0 {
+            return;
+        }
+        for id in worker_ids {
+            if let Some(worker) = self.worker_map.workers.get_mut(id) {
+                worker.unschedule_bytes(block_size);
+            }
+        }
+    }
+
     fn expire_scheduled_bytes(&mut self) {
         let timeout_ms = self.conf.master.worker_lost_interval_ms();
         if timeout_ms == 0 {
