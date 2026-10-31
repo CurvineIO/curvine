@@ -21,11 +21,11 @@ use curvine_core_error::CommonResult;
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
 use curvine_io::DataSlice;
-use curvine_model::ProtoUtils;
+use curvine_model::{ExtendedBlock, ProtoUtils};
 use curvine_proto::{
     BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
-    BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto, FilesBatchWriteRequest,
-    FilesBatchWriteResponse,
+    BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto, ExtendedBlockProto,
+    FilesBatchWriteRequest, FilesBatchWriteResponse,
 };
 use curvine_rpc::message::{Builder, Message, RequestStatus};
 
@@ -68,6 +68,42 @@ impl BatchWriteHandler {
             );
         }
         Ok(())
+    }
+
+    /// Rolls back every block opened by this batch after a fatal
+    /// `complete_batch` failure: triggered block and all siblings. Each abort
+    /// is best-effort — a failure is logged and never replaces the original
+    /// error that caused the batch to fail.
+    ///
+    /// A block finalized before the failure is committed state, not batch
+    /// staging: aborting it would delete a good replica, so final blocks are
+    /// skipped. Missing blocks were already aborted and are fine too.
+    ///
+    /// State is reset (`context` / `file` / `leases` cleared, `is_commit =
+    /// true`) so a stale batch cannot be replayed on this handler and the
+    /// next `open_batch` starts clean instead of hitting "previous batch
+    /// write is still active".
+    fn rollback_batch(&mut self) {
+        if let Some(contexts) = self.context.take() {
+            for context in &contexts {
+                match self.store.get_block(context.block.id) {
+                    Ok(meta) if !meta.is_final() => {
+                        if let Err(e) = self.store.abort_block(&context.block) {
+                            log::warn!(
+                                "failed to abort batch block {} after batch failure: {}",
+                                context.block.id,
+                                e
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        }
+        self.file.take();
+        self.leases.clear();
+        self.is_commit = true;
     }
 
     fn abort_open_contexts(store: &BlockStore, contexts: &[WriteContext]) {
@@ -167,43 +203,32 @@ impl BatchWriteHandler {
         Ok(Builder::success(msg).proto_header(batch_response).build())
     }
 
-    pub fn complete_batch(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
-        // Parse the flattened batch request
-        let header: BlocksBatchCommitRequest = msg.parse_header()?;
-        let mut results = Vec::new();
-
-        if self.is_commit {
-            return if !msg.data.is_empty() {
-                err_box!("The block has been committed and data cannot be written anymore.")
-            } else {
-                Ok(msg.success())
-            };
-        }
-
-        let Some(contexts) = self.context.as_ref() else {
-            return err_box!("batch commit without open context");
-        };
-        let Some(files) = self.file.as_mut() else {
-            return err_box!("batch commit without open files");
-        };
-        if contexts.len() != header.blocks.len() || files.len() != header.blocks.len() {
+    /// Validates the commit request against the batch's open contexts.
+    /// Returns the blocks to commit/abort in batch order.
+    fn validate_commit_blocks(
+        contexts: &[WriteContext],
+        blocks: &[ExtendedBlockProto],
+        files_len: usize,
+        req_id: i64,
+    ) -> FsResult<Vec<ExtendedBlock>> {
+        if contexts.len() != blocks.len() || files_len != blocks.len() {
             return err_box!(
                 "batch commit block count mismatch: blocks={}, contexts={}, files={}",
-                header.blocks.len(),
+                blocks.len(),
                 contexts.len(),
-                files.len()
+                files_len
             );
         }
 
-        let mut commit_blocks = Vec::with_capacity(header.blocks.len());
-        for (i, block_proto) in header.blocks.into_iter().enumerate() {
+        let mut commit_blocks = Vec::with_capacity(blocks.len());
+        for (i, block_proto) in blocks.iter().enumerate() {
             let Some(context) = contexts.get(i) else {
                 return err_box!("missing batch write context at index {}", i);
             };
-            let expected_req_id = msg.req_id() + i as i64;
+            let expected_req_id = req_id + i as i64;
             Self::check_context(context, expected_req_id)?;
 
-            let block = ProtoUtils::extend_block_from_pb(block_proto);
+            let block = ProtoUtils::extend_block_from_pb(block_proto.clone());
             if block.id != context.block.id
                 || block.storage_type != context.block.storage_type
                 || block.file_type != context.block.file_type
@@ -224,30 +249,62 @@ impl BatchWriteHandler {
             }
             commit_blocks.push(block);
         }
+        Ok(commit_blocks)
+    }
 
-        for (i, file) in files.iter_mut().enumerate() {
-            if let Some(file) = file.as_mut() {
-                if let Err(e) = file.flush() {
-                    if let Some(context) = contexts.get(i) {
-                        WriteHandler::record_write_error(
-                            self.write_handler.metrics,
-                            context.dir_id,
-                            &e,
-                        );
-                    }
-                    return Err(e.into());
+    pub fn complete_batch(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
+        // Parse the flattened batch request
+        let header: BlocksBatchCommitRequest = msg.parse_header()?;
+        let mut results = Vec::new();
+
+        if self.is_commit {
+            return if !msg.data.is_empty() {
+                err_box!("The block has been committed and data cannot be written anymore.")
+            } else {
+                Ok(msg.success())
+            };
+        }
+
+        let Some(contexts) = self.context.as_ref() else {
+            return err_box!("batch commit without open context");
+        };
+        let Some(files) = self.file.as_mut() else {
+            return err_box!("batch commit without open files");
+        };
+        let commit_blocks =
+            match Self::validate_commit_blocks(contexts, &header.blocks, files.len(), msg.req_id())
+            {
+                Ok(blocks) => blocks,
+                Err(e) => {
+                    self.rollback_batch();
+                    return Err(e);
                 }
+            };
+
+        let flush_error = files.iter_mut().enumerate().find_map(|(i, file)| {
+            let file = file.as_mut()?;
+            file.flush().err().map(|e| (i, e))
+        });
+        if let Some((i, e)) = flush_error {
+            if let Some(context) = self.context.as_ref().and_then(|c| c.get(i)) {
+                WriteHandler::record_write_error(self.write_handler.metrics, context.dir_id, &e);
             }
+            self.rollback_batch();
+            return Err(e.into());
         }
         for file in files.iter_mut() {
             file.take();
         }
 
         for block in commit_blocks {
-            if commit {
-                self.store.finalize_block(&block)?;
+            let result = if commit {
+                self.store.finalize_block(&block).map(|_| ())
             } else {
-                self.store.abort_block(&block)?;
+                self.store.abort_block(&block)
+            };
+            if let Err(e) = result {
+                self.rollback_batch();
+                return Err(e.into());
             }
             results.push(true);
         }
@@ -403,5 +460,174 @@ impl BatchWriteHandler {
             RequestStatus::Cancel => self.complete_batch(msg, false),
             _ => err_box!("Unsupported request type"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::Worker;
+    use curvine_config::{ClusterConf, WorkerConf};
+    use curvine_core_error::CommonResult;
+    use curvine_fs_api::RpcCode;
+    use curvine_model::{FileType, StorageType};
+    use curvine_runtime::common::Utils;
+
+    fn store() -> CommonResult<BlockStore> {
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                dir_reserved: "0".into(),
+                data_dir: vec![format!(
+                    "[MEM:4MB]../testing/batch-rollback-{}",
+                    Utils::uuid()
+                )],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        // The handler shares Worker metrics/config but does not start any listeners.
+        let _worker = Worker::with_conf(conf.clone())?;
+        BlockStore::new("test", &conf)
+    }
+
+    fn open_batch(handler: &mut BatchWriteHandler) -> FsResult<()> {
+        let blocks: Vec<_> = (1..=3)
+            .map(|id| {
+                ProtoUtils::extend_block_to_pb(ExtendedBlock::new(
+                    id,
+                    4,
+                    StorageType::Mem,
+                    FileType::File,
+                ))
+            })
+            .collect();
+        let open = Builder::new()
+            .code(RpcCode::WriteBlocksBatch)
+            .request(RequestStatus::Open)
+            .req_id(7)
+            .proto_header(BlocksBatchWriteRequest {
+                blocks,
+                off: 0,
+                block_size: 4,
+                req_id: 7,
+                seq_id: 0,
+                chunk_size: 4,
+                short_circuit: false,
+                client_name: "test".into(),
+                component_info: None,
+            })
+            .build();
+        handler.open_batch(&open)?;
+        Ok(())
+    }
+
+    fn commit_msg(block_ids: &[i64], req_id: i64) -> Message {
+        // No data was written, so the committed length is 0 (<= block_size 4).
+        let blocks = block_ids
+            .iter()
+            .map(|id| {
+                ProtoUtils::extend_block_to_pb(ExtendedBlock::new(
+                    *id,
+                    0,
+                    StorageType::Mem,
+                    FileType::File,
+                ))
+            })
+            .collect();
+        Builder::new()
+            .code(RpcCode::WriteBlocksBatch)
+            .request(RequestStatus::Complete)
+            .req_id(req_id)
+            .proto_header(BlocksBatchCommitRequest {
+                blocks,
+                off: 0,
+                block_size: 4,
+                req_id,
+                seq_id: 0,
+                cancel: false,
+                component_info: None,
+            })
+            .build()
+    }
+
+    #[test]
+    fn complete_failure_aborts_all_uncommitted_siblings() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+        assert!(store.get_block(1).is_ok());
+        assert!(store.get_block(2).is_ok());
+        assert!(store.get_block(3).is_ok());
+        assert!(!handler.is_commit);
+
+        // The commit request omits block 3: the count-mismatch guard fails and
+        // the whole batch must be rolled back.
+        let msg = commit_msg(&[1, 2], 9);
+        assert!(handler.complete_batch(&msg, true).is_err());
+        assert!(handler.is_commit);
+        assert!(handler.context.is_none());
+        assert!(handler.leases.is_empty());
+        for id in 1..=3 {
+            assert!(store.get_block(id).is_err(), "block {} must be aborted", id);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn req_id_mismatch_failure_aborts_all_uncommitted_siblings() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+
+        // Wrong req_id: per-block validation fails, triggering a full rollback.
+        let msg = commit_msg(&[1, 2, 3], 42);
+        assert!(handler.complete_batch(&msg, true).is_err());
+        assert!(handler.is_commit);
+        assert!(handler.context.is_none());
+        for id in 1..=3 {
+            assert!(store.get_block(id).is_err(), "block {} must be aborted", id);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn flushed_successor_committed_before_late_failure_is_not_aborted() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+
+        // A hypothetical failure on the last finalize must not roll the
+        // already-finalized siblings back to nothing: abort_batch skips final
+        // blocks. Force the condition by pre-finalizing block 1 through the
+        // store, then failing the batch via a req_id mismatch.
+        let block = ExtendedBlock::new(1, 0, StorageType::Mem, FileType::File);
+        store.finalize_block(&block)?;
+        assert!(store.get_block(1)?.is_final());
+
+        let msg = commit_msg(&[1, 2, 3], 42);
+        assert!(handler.complete_batch(&msg, true).is_err());
+        assert!(store.get_block(1)?.is_final(), "final block must survive");
+        for id in 2..=3 {
+            assert!(store.get_block(id).is_err(), "block {} must be aborted", id);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn successful_commit_still_works_after_fix() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+
+        let msg = commit_msg(&[1, 2, 3], 7);
+        handler.complete_batch(&msg, true)?;
+        assert!(handler.is_commit);
+        for id in 1..=3 {
+            assert!(store.get_block(id)?.is_final());
+        }
+        // Repeated commit is idempotent.
+        handler.complete_batch(&commit_msg(&[1, 2, 3], 7), true)?;
+        Ok(())
     }
 }
