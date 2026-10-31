@@ -72,6 +72,15 @@ pub struct PurgeOutcome {
     pub bytes: u64,
 }
 
+/// Why a purge stopped before reaching the end of its entry.
+#[derive(Debug)]
+pub enum PurgeStop {
+    /// This node is no longer the active master.
+    Demoted,
+    /// A walk or batch failed; nothing of that batch was applied.
+    Failed(FsError),
+}
+
 /// Reclaims trashed entries in bounded batches.
 ///
 /// Each batch removes at most `trash_purge_batch_inodes` inodes and carries at
@@ -117,15 +126,31 @@ impl TrashPurger {
     /// Purges `entry` completely. Returns `None` when this node lost leadership
     /// mid-purge; the entry then stays in the trash for the next active master.
     pub fn purge_entry(&self, entry: &str) -> FsResult<Option<PurgeOutcome>> {
+        match self.purge_entry_partial(entry) {
+            (outcome, None) => Ok(Some(outcome)),
+            (_, Some(PurgeStop::Demoted)) => Ok(None),
+            (_, Some(PurgeStop::Failed(e))) => Err(e),
+        }
+    }
+
+    /// Like [`Self::purge_entry`], but also reports what was reclaimed when the
+    /// purge stops early. Batches that applied before the stop are committed and
+    /// journaled, so their counts are real even though the entry is unfinished.
+    pub fn purge_entry_partial(&self, entry: &str) -> (PurgeOutcome, Option<PurgeStop>) {
+        let mut outcome = PurgeOutcome::default();
+        let stop = self.purge_entry_into(entry, &mut outcome).err();
+        (outcome, stop)
+    }
+
+    fn purge_entry_into(&self, entry: &str, outcome: &mut PurgeOutcome) -> Result<(), PurgeStop> {
         let mut frames = vec![Frame {
             path: entry.to_string(),
             after: None,
         }];
-        let mut outcome = PurgeOutcome::default();
 
         loop {
             if !self.monitor.is_active() {
-                return Ok(None);
+                return Err(PurgeStop::Demoted);
             }
 
             // The walk only reads metadata, and the batch it produces is bounded,
@@ -133,10 +158,11 @@ impl TrashPurger {
             let batch = {
                 let fs_dir = self.fs.fs_dir();
                 let fs_dir = fs_dir.read();
-                Self::next_batch(&fs_dir, &mut frames, self.batch_inodes, self.batch_bytes)?
+                Self::next_batch(&fs_dir, &mut frames, self.batch_inodes, self.batch_bytes)
+                    .map_err(PurgeStop::Failed)?
             };
             if batch.is_empty() {
-                return Ok(Some(outcome));
+                return Ok(());
             }
 
             let started = Instant::now();
@@ -149,10 +175,10 @@ impl TrashPurger {
                     applied
                 }
                 // A demotion is not a purge failure: this node simply stopped.
-                Ok(None) => return Ok(None),
+                Ok(None) => return Err(PurgeStop::Demoted),
                 Err(e) => {
                     Self::record_batch(elapsed_ms, 0, false);
-                    return Err(e);
+                    return Err(PurgeStop::Failed(e));
                 }
             };
             outcome.batches += 1;
@@ -425,15 +451,18 @@ impl PendingTrashPurger {
                 // An entry staged after this page was scanned is picked up by the
                 // next cycle; a restored or already purged one resolves to a
                 // no-op inside the purger.
-                match self.purger.purge_entry(&path) {
-                    Ok(Some(outcome)) => {
-                        totals.0 += 1;
-                        totals.1 += outcome.inodes;
-                        totals.2 += outcome.bytes;
+                // Batches applied before a stop are committed, so their counts
+                // are reported; only a finished entry counts as an entry.
+                let (outcome, stop) = self.purger.purge_entry_partial(&path);
+                totals.1 += outcome.inodes;
+                totals.2 += outcome.bytes;
+                match stop {
+                    None => totals.0 += 1,
+                    Some(PurgeStop::Demoted) => return Ok(false),
+                    Some(PurgeStop::Failed(FsError::FileNotFound(_))) => {}
+                    Some(PurgeStop::Failed(e)) => {
+                        warn!("failed to purge staged trash entry {}: {}", path, e)
                     }
-                    Ok(None) => return Ok(false),
-                    Err(FsError::FileNotFound(_)) => {}
-                    Err(e) => warn!("failed to purge staged trash entry {}: {}", path, e),
                 }
             }
 

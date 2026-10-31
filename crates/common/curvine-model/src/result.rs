@@ -39,8 +39,10 @@ pub struct DeleteResult {
     pub blocks: HashMap<i64, Vec<BlockLocation>>,
     // True when the entry was moved into /.Trash instead of being purged.
     pub trashed: bool,
-    // True when the entry was staged under /.Trash/.pending and will be
-    // reclaimed asynchronously, so the counts above are zero.
+    // True when part or all of the entry is left for the background purger:
+    // either an async delete staged it under /.Trash/.pending (counts are
+    // zero), or a large recursive delete staged it under /.Trash/.purging and
+    // its purge stopped early (counts cover only the batches already applied).
     pub purge_pending: bool,
 }
 

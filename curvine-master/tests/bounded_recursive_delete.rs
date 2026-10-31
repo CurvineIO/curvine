@@ -399,3 +399,70 @@ fn restart_keeps_a_staged_entry_for_the_purger() {
     assert_eq!(fs.get_file_counts(), counts);
     assert!(purging_entries(&fs).is_empty());
 }
+
+#[test]
+fn a_purge_that_stops_partway_reports_what_it_reclaimed() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut conf = conf("partial", 4, true);
+    // A long yield gives the test a wide window to demote between batches.
+    conf.master.trash_purge_yield_ms = 50;
+    let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
+    let mut worker = WorkerInfo {
+        capacity: 1 << 40,
+        available: 1 << 40,
+        ..Default::default()
+    };
+    worker.address.worker_id = 11;
+    fs.add_test_worker(worker);
+    wide_tree(&fs, "/victim");
+    let dir = fs.fs_dir();
+    dir.read().take_entries();
+
+    let deleter = {
+        let fs = fs.clone();
+        std::thread::spawn(move || fs.delete("/victim", true).unwrap())
+    };
+    // Demote once at least one batch has been applied and journaled.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let applied = dir
+            .read()
+            .take_entries()
+            .iter()
+            .any(|e| matches!(e, JournalEntry::TrashPurge(_)));
+        if applied {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no purge batch applied"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    fs.master_monitor.set_role_for_test(RoleState::Follower);
+    let res = deleter.join().unwrap();
+
+    assert!(res.purge_pending);
+    assert!(
+        res.inodes > 0 && res.inodes < 120,
+        "partial inodes: {}",
+        res.inodes
+    );
+    assert_eq!(res.bytes, res.inodes * BLOCK as u64);
+    assert_eq!(purging_entries(&fs).len(), 1);
+
+    // A restart after some batches committed resumes from the durable state,
+    // and the two halves add up to a full delete.
+    fs.restore_from_rocksdb().unwrap();
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
+    let drained = PendingTrashPurger::new(fs.clone(), fs.master_monitor.clone())
+        .drain_purging()
+        .unwrap()
+        .unwrap();
+    assert_eq!(drained.0, 1);
+    assert_eq!(res.inodes + drained.1, 120);
+    assert_eq!(res.bytes + drained.2, 120 * BLOCK as u64);
+    assert!(purging_entries(&fs).is_empty());
+    assert_eq!(fs.get_file_counts().1, 0);
+}

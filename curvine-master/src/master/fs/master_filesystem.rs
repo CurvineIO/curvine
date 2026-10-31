@@ -22,7 +22,7 @@ use crate::master::meta::{
 };
 
 use crate::master::fs::state::{SessionHeartbeat, SessionMap};
-use crate::master::fs::DeleteResult;
+use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncSessionMap, SyncWorkerManager};
@@ -454,26 +454,29 @@ impl MasterFilesystem {
     /// The namespace change is already committed and journaled, so the delete
     /// itself has succeeded. If the purge stops early (lost leadership or a
     /// failed batch) the entry stays in `/.Trash/.purging`, the result reports
-    /// `purge_pending`, and the background purger finishes it.
+    /// `purge_pending` with the counts reclaimed so far, and the background
+    /// purger finishes it.
     fn finish_staged_delete(&self, staged: &str, delete_res: &mut DeleteResult) {
         let _guard = PurgingGuard {
             set: &self.purging_inflight,
             path: staged,
         };
         let purger = crate::master::fs::TrashPurger::new(self.clone(), self.master_monitor.clone());
-        match purger.purge_entry(staged) {
-            Ok(Some(outcome)) => {
-                delete_res.inodes += outcome.inodes;
-                delete_res.bytes += outcome.bytes;
-            }
-            Ok(None) => {
+        // Batches applied before an early stop are already reclaimed, so they
+        // are reported even when the rest is left for the purger.
+        let (outcome, stop) = purger.purge_entry_partial(staged);
+        delete_res.inodes += outcome.inodes;
+        delete_res.bytes += outcome.bytes;
+        match stop {
+            None => {}
+            Some(PurgeStop::Demoted) => {
                 info!(
                     "lost leadership while purging {}; left for the purger",
                     staged
                 );
                 delete_res.purge_pending = true;
             }
-            Err(e) => {
+            Some(PurgeStop::Failed(e)) => {
                 warn!(
                     "purge of staged delete {} failed, left for the purger: {}",
                     staged, e
