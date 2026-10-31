@@ -28,6 +28,18 @@ use futures::future::{join_all, try_join_all};
 use log::warn;
 use std::sync::Arc;
 
+// Whether a partial open failure may cancel the replicas already opened in
+// this round. Reopening a committed block (the master reports len > 0, or the
+// write offset is non-zero) must not be rolled back: a cancel commit would
+// abort the already committed replicas on the workers. SPDK rewrites reuse
+// the extent without preserving the committed state (BdevLayout::prepare_write),
+// so aborting such a rewrite would free an extent the master still references.
+// Newly allocated blocks (len == 0 and pos == 0) have no committed state and
+// are cancelled best-effort.
+fn rollback_on_failure(locate: &LocatedBlock, pos: i64) -> bool {
+    locate.block.len == 0 && pos == 0
+}
+
 async fn finish_all_cancellations<I, F>(futures: I) -> FsResult<()>
 where
     I: IntoIterator<Item = F>,
@@ -280,25 +292,19 @@ impl BlockWriter {
             return err_box!("There is no available worker");
         }
 
-        // Reopening a committed block (the master reports len > 0, or the
-        // write offset is non-zero): a cancel commit would abort the already
-        // committed replicas on the workers. SPDK rewrites reuse the extent
-        // without preserving the committed state (BdevLayout::prepare_write),
-        // so aborting such a rewrite would free an extent the master still
-        // references. Skip rollback cancellation for those and keep the
-        // pre-existing drop-only behavior; newly allocated blocks (len == 0
-        // and pos == 0) are still cancelled best-effort.
-        let committed_reopen = locate.block.len > 0 || pos > 0;
-
-        let inners = open_all(locate.locs.len(), !committed_reopen, |idx| {
-            WriterAdapter::new(
-                fs_context.clone(),
-                &locate,
-                &locate.locs[idx],
-                pos,
-                block_size,
-            )
-        })
+        let inners = open_all(
+            locate.locs.len(),
+            rollback_on_failure(&locate, pos),
+            |idx| {
+                WriterAdapter::new(
+                    fs_context.clone(),
+                    &locate,
+                    &locate.locs[idx],
+                    pos,
+                    block_size,
+                )
+            },
+        )
         .await?;
 
         let writer = Self {
@@ -429,7 +435,9 @@ impl BlockWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{cancel_opened, finish_all_cancellations, open_all, OpenedAdapter};
+    use super::{
+        cancel_opened, finish_all_cancellations, open_all, rollback_on_failure, OpenedAdapter,
+    };
     use curvine_error::{FsError, FsResult};
     use curvine_model::{ExtendedBlock, FileType, LocatedBlock, StorageType, WorkerAddress};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -599,37 +607,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn committed_reopen_failure_does_not_cancel_opened_replicas() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        // Reopening a committed block (len > 0): rollback must not cancel the
-        // replicas opened in this round, otherwise an already committed
-        // replica would be aborted on the workers (see the Copilot review on
-        // PR #1918).
-        let block = ExtendedBlock::new(1, 64, StorageType::Ssd, FileType::File);
-        let block = ExtendedBlock { len: 64, ..block };
-        let lb = LocatedBlock::new(block, vec![]);
-        assert_eq!(lb.block.len, 64);
-
-        // Drive open_all with cancel_on_failure = false directly: the
-        // BlockWriter::new gate maps committed reopens to this flag.
-        let err = open_all(2, false, |idx| {
-            let calls = calls.clone();
-            async move {
-                if idx == 1 {
-                    Err(FsError::common("injected open failure"))
-                } else {
-                    Ok(ScriptedWriter::new(calls, false, idx as u32))
-                }
-            }
-        })
-        .await;
-
-        assert!(err.is_err());
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "committed reopen must not cancel opened replicas"
+    #[test]
+    fn rollback_on_failure_gates_on_freshly_allocated_blocks() {
+        let new_block = LocatedBlock::new(
+            ExtendedBlock::new(1, 0, StorageType::Ssd, FileType::File),
+            vec![],
         );
+        assert!(rollback_on_failure(&new_block, 0));
+        // A non-zero write offset means the caller seeks into existing data.
+        assert!(!rollback_on_failure(&new_block, 64));
+
+        // The master reports committed blocks with len > 0 (see
+        // acquire_new_block: newly allocated blocks always carry len 0).
+        let committed = LocatedBlock::new(
+            ExtendedBlock::new(1, 64, StorageType::Ssd, FileType::File),
+            vec![],
+        );
+        assert!(!rollback_on_failure(&committed, 0));
+        assert!(!rollback_on_failure(&committed, 64));
     }
 }

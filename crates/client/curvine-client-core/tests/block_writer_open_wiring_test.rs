@@ -14,12 +14,13 @@
 
 //! Integration wiring test for `BlockWriter::new` (issue #1648).
 //!
-//! A custom in-process RPC handler accepts the `WriteBlock` Open of the first
-//! replica and records every `WriteBlock` request status afterwards. The
-//! second replica points at an unreachable address so its open fails after
-//! the first replica opened fully. The test pins the real call site: if
-//! `BlockWriter::new` reverted to the old `?` loop, no cancel commit would
-//! reach the first worker and the assertion below would fail.
+//! Each test owns an isolated RPC server whose handler accepts the
+//! `WriteBlock` Open of the first replica and records every `WriteBlock`
+//! request status afterwards. The second replica points at an unreachable
+//! address so its open fails after the first replica opened fully. One test
+//! pins that a fresh-block open failure sends exactly one cancel commit;
+//! the other pins that a committed-block reopen failure sends none (the
+//! rollback gate in `BlockWriter::new`).
 
 use curvine_client_core::block::BlockWriter;
 use curvine_client_core::file::FsContext;
@@ -30,33 +31,37 @@ use curvine_model::{ExtendedBlock, FileType, LocatedBlock, StorageType, WorkerAd
 use curvine_net::net::ConnState;
 use curvine_proto::BlockWriteResponse;
 use curvine_rpc::handler::{HandlerService, MessageHandler};
-use curvine_rpc::message::RequestStatus;
+use curvine_rpc::message::{Message, RequestStatus};
 use curvine_rpc::server::{RpcServer, ServerConf};
-use curvine_runtime::runtime::Runtime;
-use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-// WriteBlock requests observed by the test handler, as (req_id, status).
-static OBSERVED_REQUESTS: Lazy<Mutex<Vec<(i64, RequestStatus)>>> =
-    Lazy::new(|| Mutex::new(Vec::new()));
+struct RecordingService {
+    observed: Arc<Mutex<Vec<(i64, RequestStatus)>>>,
+}
 
-struct RecordingHandler;
+impl HandlerService for RecordingService {
+    type Item = RecordingHandler;
+
+    fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
+        RecordingHandler {
+            observed: self.observed.clone(),
+        }
+    }
+}
+
+struct RecordingHandler {
+    observed: Arc<Mutex<Vec<(i64, RequestStatus)>>>,
+}
 
 impl MessageHandler for RecordingHandler {
     type Error = curvine_core_error::CommonErrorExt;
 
-    fn handle(
-        &self,
-        msg: &curvine_rpc::message::Message,
-    ) -> Result<curvine_rpc::message::Message, Self::Error> {
+    fn handle(&self, msg: &Message) -> Result<Message, Self::Error> {
         let code = RpcCode::from(msg.code());
         let status = msg.request_status();
         if code == RpcCode::WriteBlock {
-            OBSERVED_REQUESTS
-                .lock()
-                .unwrap()
-                .push((msg.req_id(), status));
+            self.observed.lock().unwrap().push((msg.req_id(), status));
         }
 
         if code == RpcCode::WriteBlock && status == RequestStatus::Open {
@@ -79,134 +84,100 @@ impl MessageHandler for RecordingHandler {
     }
 }
 
-struct RecordingService;
-
-impl HandlerService for RecordingService {
-    type Item = RecordingHandler;
-
-    fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
-        RecordingHandler
-    }
+/// One test = one server + one observation buffer, so parallel tests never
+/// observe each other's requests.
+struct TestEnv {
+    context: Arc<FsContext>,
+    worker: WorkerAddress,
+    observed: Arc<Mutex<Vec<(i64, RequestStatus)>>>,
 }
 
-static TEST_SERVER: Lazy<(WorkerAddress, Arc<Runtime>)> = Lazy::new(|| {
-    let port = curvine_net::net::NetUtils::hold_available_port();
-    let conf = ServerConf::with_hostname("127.0.0.1", port);
-    let server = RpcServer::new(conf, RecordingService);
-    let rt = server.clone_rt();
-    let addr_port = server.bind_addr().port;
-    std::thread::spawn(move || {
-        server.block_on_start();
-    });
-    (
-        WorkerAddress {
+impl TestEnv {
+    fn new() -> Self {
+        let observed: Arc<Mutex<Vec<(i64, RequestStatus)>>> = Arc::new(Mutex::new(Vec::new()));
+        let port = curvine_net::net::NetUtils::hold_available_port();
+        let conf = ServerConf::with_hostname("127.0.0.1", port);
+        let service = RecordingService {
+            observed: observed.clone(),
+        };
+        let server = RpcServer::new(conf, service);
+        let rt = server.clone_rt();
+        let port = server.bind_addr().port;
+        std::thread::spawn(move || {
+            server.block_on_start();
+        });
+        let worker = WorkerAddress {
             worker_id: 1,
             hostname: "127.0.0.1".to_string(),
             ip_addr: "127.0.0.1".to_string(),
-            rpc_port: addr_port as u32,
+            rpc_port: port as u32,
             web_port: 8000,
-        },
-        rt,
-    )
-});
+        };
 
-fn create_test_context() -> Arc<FsContext> {
-    let mut conf = ClusterConf::default();
-    conf.client.short_circuit = false;
-    // Fail fast on the unreachable second replica instead of retrying for
-    // the default 2 minutes.
-    conf.client.conn_retry_max_duration_ms = 500;
-    conf.client.conn_retry_min_sleep_ms = 50;
-    conf.client.conn_retry_max_sleep_ms = 100;
-    conf.client.conn_timeout_ms = 500;
-    conf.client.rpc_retry_max_duration_ms = 500;
-    conf.client.rpc_retry_min_sleep_ms = 50;
-    conf.client.rpc_retry_max_sleep_ms = 100;
-    conf.client.rpc_timeout_ms = 500;
-    Arc::new(FsContext::with_rt(conf, TEST_SERVER.1.clone()).unwrap())
+        let mut client_conf = ClusterConf::default();
+        client_conf.client.short_circuit = false;
+        // Fail fast on the unreachable second replica instead of retrying
+        // for the default 2 minutes.
+        client_conf.client.conn_retry_max_duration_ms = 500;
+        client_conf.client.conn_retry_min_sleep_ms = 50;
+        client_conf.client.conn_retry_max_sleep_ms = 100;
+        client_conf.client.conn_timeout_ms = 500;
+        client_conf.client.rpc_retry_max_duration_ms = 500;
+        client_conf.client.rpc_retry_min_sleep_ms = 50;
+        client_conf.client.rpc_retry_max_sleep_ms = 100;
+        client_conf.client.rpc_timeout_ms = 500;
+        let context = Arc::new(FsContext::with_rt(client_conf, rt).unwrap());
+
+        Self {
+            context,
+            worker,
+            observed,
+        }
+    }
+
+    fn unreachable_second_replica(&self) -> WorkerAddress {
+        WorkerAddress {
+            worker_id: 2,
+            hostname: "127.0.0.1".to_string(),
+            ip_addr: "127.0.0.1".to_string(),
+            rpc_port: 1, // nothing listens here
+            web_port: 1,
+        }
+    }
+
+    fn located_block(&self, block: ExtendedBlock) -> LocatedBlock {
+        LocatedBlock::new(
+            block,
+            vec![self.worker.clone(), self.unreachable_second_replica()],
+        )
+    }
+
+    async fn wait_ready(&self) {
+        for _ in 0..50 {
+            if self.context.block_client(&self.worker).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("test server failed to start within 5 seconds");
+    }
+
+    fn observed(&self) -> Vec<(i64, RequestStatus)> {
+        self.observed.lock().unwrap().clone()
+    }
 }
 
-fn located_block(second_addr: WorkerAddress) -> LocatedBlock {
+#[tokio::test]
+async fn new_block_failure_cancels_opened_replicas_exactly_once() {
+    let env = TestEnv::new();
+    env.wait_ready().await;
+
     // len = 0: a freshly allocated block, exactly what the new-block path of
-    // `FsWriterBase::get_writer` hands to `BlockWriter::new`. Only this case
-    // must roll back with cancel commits on partial open failure.
+    // `FsWriterBase::get_writer` hands to `BlockWriter::new`. Its open
+    // failure must roll back the already opened replicas with cancel commits.
     let block = ExtendedBlock::new(1, 0, StorageType::Ssd, FileType::File);
-    LocatedBlock::new(block, vec![TEST_SERVER.0.clone(), second_addr])
-}
 
-#[tokio::test]
-async fn committed_reopen_failure_does_not_cancel_opened_replicas() {
-    let context = create_test_context();
-
-    let mut ready = false;
-    for _ in 0..50 {
-        if context.block_client(&TEST_SERVER.0).await.is_ok() {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(ready, "test server failed to start within 5 seconds");
-
-    // A committed reopen (len > 0, e.g. append/overwrite through
-    // `FsWriterBase::get_writer`) must NOT cancel the replicas opened before
-    // a later failure: the first replica may already hold committed data and
-    // a cancel commit would abort it on the worker (Copilot review on
-    // PR #1918).
-    let committed = ExtendedBlock::new(1, 64, StorageType::Ssd, FileType::File);
-    let unreachable = WorkerAddress {
-        worker_id: 2,
-        hostname: "127.0.0.1".to_string(),
-        ip_addr: "127.0.0.1".to_string(),
-        rpc_port: 1,
-        web_port: 1,
-    };
-    let lb = LocatedBlock::new(committed, vec![TEST_SERVER.0.clone(), unreachable]);
-
-    let result = BlockWriter::new(context, lb, 0, 64).await;
-    assert!(
-        result.is_err(),
-        "second replica open must fail for a committed reopen too"
-    );
-
-    let observed = OBSERVED_REQUESTS.lock().unwrap().clone();
-    let cancels = observed
-        .iter()
-        .filter(|(_, status)| *status == RequestStatus::Cancel)
-        .count();
-    assert_eq!(
-        cancels, 0,
-        "committed reopen must not send cancel commits, observed: {:?}",
-        observed
-    );
-}
-
-#[tokio::test]
-async fn new_cancels_opened_replicas_when_a_later_replica_fails_to_open() {
-    let context = create_test_context();
-
-    // Wait until the test server accepts connections.
-    let mut ready = false;
-    for _ in 0..50 {
-        if context.block_client(&TEST_SERVER.0).await.is_ok() {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(ready, "test server failed to start within 5 seconds");
-
-    // The first replica is the reachable test server; the second one is an
-    // unreachable address so its open fails after the first opened fully.
-    let unreachable = WorkerAddress {
-        worker_id: 2,
-        hostname: "127.0.0.1".to_string(),
-        ip_addr: "127.0.0.1".to_string(),
-        rpc_port: 1, // nothing listens here
-        web_port: 1,
-    };
-
-    let result = BlockWriter::new(context, located_block(unreachable), 0, 64).await;
+    let result = BlockWriter::new(env.context.clone(), env.located_block(block), 0, 64).await;
     let err = match result {
         Ok(_) => panic!("second replica open must fail"),
         Err(e) => e,
@@ -220,17 +191,45 @@ async fn new_cancels_opened_replicas_when_a_later_replica_fails_to_open() {
         "primary error must be the original open error, got: {err_msg}"
     );
 
-    // The first replica opened fully against the test server; its writer must
-    // have received a cancel commit before `BlockWriter::new` returned.
-    let observed = OBSERVED_REQUESTS.lock().unwrap().clone();
-    let cancels: Vec<_> = observed
-        .iter()
+    let cancels = env
+        .observed()
+        .into_iter()
         .filter(|(_, status)| *status == RequestStatus::Cancel)
-        .collect();
+        .count();
     assert_eq!(
-        cancels.len(),
+        cancels,
         1,
         "the opened replica must receive exactly one cancel commit, observed: {:?}",
-        observed
+        env.observed()
+    );
+}
+
+#[tokio::test]
+async fn committed_reopen_failure_does_not_cancel_opened_replicas() {
+    let env = TestEnv::new();
+    env.wait_ready().await;
+
+    // A committed block (len > 0) reopened for append/overwrite through
+    // `FsWriterBase::get_writer` must NOT be rolled back with cancel commits
+    // on a later open failure: the already opened replica may hold committed
+    // data and a cancel would abort it on the worker.
+    let block = ExtendedBlock::new(1, 64, StorageType::Ssd, FileType::File);
+
+    let result = BlockWriter::new(env.context.clone(), env.located_block(block), 0, 64).await;
+    assert!(
+        result.is_err(),
+        "second replica open must fail for a committed reopen too"
+    );
+
+    let cancels = env
+        .observed()
+        .into_iter()
+        .filter(|(_, status)| *status == RequestStatus::Cancel)
+        .count();
+    assert_eq!(
+        cancels,
+        0,
+        "committed reopen must not send cancel commits, observed: {:?}",
+        env.observed()
     );
 }
