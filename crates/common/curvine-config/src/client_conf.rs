@@ -221,6 +221,15 @@ pub struct ClientConf {
     #[client_cli]
     pub close_timeout_secs: u64,
 
+    // Maximum time to wait for one request/response handshake with the write
+    // buffer background task (data enqueue, flush, complete, cancel, seek,
+    // resize), in milliseconds. Bounds how long a writer (and e.g. the Java
+    // SDK closeWriter) can block when the background task stops responding.
+    // Keep it above the slowest expected single data write.
+    #[serde(alias = "write_buffer_timeout")]
+    #[client_cli]
+    pub write_buffer_timeout_ms: u64,
+
     #[client_cli(skip)]
     pub metadata_operation_buckets: Vec<f64>,
 
@@ -313,6 +322,11 @@ impl ClientConf {
 
     pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
 
+    // Aligned with the default data_timeout_ms: a write-buffer handshake wraps
+    // at most the drain of queued chunks plus one RPC, so this comfortably
+    // exceeds normal latency while still bounding the hang reported in #1908.
+    pub const DEFAULT_WRITE_BUFFER_TIMEOUT_MS: u64 = 120 * 1000;
+
     pub const DEFAULT_READ_PARALLEL: i64 = 1;
 
     pub const DEFAULT_MAX_READ_PARALLEL: i64 = 8;
@@ -357,6 +371,12 @@ impl ClientConf {
 
         self.seek_absorb_window =
             ByteUnit::from_str(&self.seek_absorb_window_str)?.as_byte() as i64;
+
+        // 0 means "unset" (e.g. the SDK FilesystemConf omits it): fall back
+        // to the default abandonment deadline.
+        if self.write_buffer_timeout_ms == 0 {
+            self.write_buffer_timeout_ms = Self::DEFAULT_WRITE_BUFFER_TIMEOUT_MS;
+        }
 
         self.small_file_size = ByteUnit::from_str(&self.small_file_size_str)?.as_byte() as i64;
 
@@ -490,6 +510,8 @@ impl Default for ClientConf {
             heartbeat_interval_ms: Self::DEFAULT_HEARTBEAT_INTERVAL_MS,
 
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
+
+            write_buffer_timeout_ms: Self::DEFAULT_WRITE_BUFFER_TIMEOUT_MS,
 
             metadata_operation_buckets: vec![
                 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,

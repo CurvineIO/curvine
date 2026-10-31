@@ -67,6 +67,11 @@ pub struct FilesystemConf {
     pub rpc_timeout_ms: u64,
     pub data_timeout_ms: u64,
 
+    /// Maximum time to wait for one write-buffer request/response handshake
+    /// (data enqueue, flush, complete, cancel, seek, resize), in
+    /// milliseconds. 0 means "use the ClientConf default" (120s).
+    pub write_buffer_timeout_ms: u64,
+
     // Number of fs master connections.
     // Pool size 3 reaches the highest QPS. Pool size 1 supports the most clients, so the default is 1.
     pub master_conn_pool_size: usize,
@@ -257,6 +262,8 @@ impl FilesystemConf {
             conn_timeout_ms: self.conn_timeout_ms,
             rpc_timeout_ms: self.rpc_timeout_ms,
             data_timeout_ms: self.data_timeout_ms,
+            // 0 (unset) falls back to the ClientConf default in init().
+            write_buffer_timeout_ms: self.write_buffer_timeout_ms,
             master_conn_pool_size: self.master_conn_pool_size,
             rpc_close_idle: self.rpc_close_idle,
 
@@ -455,6 +462,47 @@ mod tests {
             msg.contains("invalid digit found in string"),
             "parse error should be included: {msg}"
         );
+    }
+
+    #[test]
+    fn maps_write_buffer_timeout_into_client_conf() {
+        // An explicit value flows through to ClientConf unchanged.
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.write_buffer_timeout_ms = 45_000;
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.write_buffer_timeout_ms, 45_000);
+
+        // Unset (0) keeps the ClientConf default.
+        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(
+            cluster.client.write_buffer_timeout_ms,
+            ClientConf::DEFAULT_WRITE_BUFFER_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn parses_write_buffer_timeout_from_java_toml() {
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                read_chunk_size = "128KB"
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+                write_buffer_timeout_ms = 45000
+            "#,
+        )
+        .unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.write_buffer_timeout_ms, 45_000);
     }
 
     #[test]

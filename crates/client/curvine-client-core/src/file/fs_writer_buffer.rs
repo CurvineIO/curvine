@@ -25,7 +25,11 @@ use curvine_runtime::sync::channel::{
 };
 use curvine_runtime::sync::ErrorMonitor;
 use log::{debug, error};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time;
 
 // Control task type
 enum WriterTask {
@@ -57,9 +61,23 @@ async fn recv_task(
 }
 
 struct BufferChannel {
+    path: String,
     chunk_sender: AsyncSender<DataSlice>,
     task_sender: AsyncSender<WriterTask>,
     err_monitor: Arc<ErrorMonitor<FsError>>,
+    /// Set once a handshake has timed out: the background task is not
+    /// responding, so every later call fails immediately instead of queuing
+    /// another request and waiting out a fresh timeout. The writer is
+    /// considered abandoned at that point (see
+    /// https://github.com/CurvineIO/curvine/issues/1908).
+    abandoned: AtomicBool,
+    /// Upper bound for one request/response handshake with the background
+    /// task. Without it a wedged-but-alive task would leave callers pending
+    /// forever (see https://github.com/CurvineIO/curvine/issues/1908). Task
+    /// exit does not need special handling: when the task returns or panics,
+    /// the channel receivers and `CallChannel` senders are dropped, so any
+    /// pending `send`/`receive` fails right away.
+    timeout: Duration,
 }
 
 impl BufferChannel {
@@ -67,11 +85,48 @@ impl BufferChannel {
         self.err_monitor.take_error().unwrap_or(e.into())
     }
 
+    /// Run one request/response handshake with a deadline, so a background
+    /// task that is alive but no longer responding cannot block the caller
+    /// forever. The first timeout latches the channel as abandoned (and
+    /// records the error in `err_monitor`), so later calls fail immediately
+    /// instead of waiting another full timeout.
+    async fn guard<F, T, E>(&self, fut: F) -> FsResult<T>
+    where
+        F: Future<Output = Result<T, E>>,
+        E: Into<FsError>,
+    {
+        if self.abandoned.load(Ordering::Acquire) {
+            return Err(self.check_error(FsError::common(format!(
+                "write buffer task not responding, writer abandoned, path={}",
+                self.path
+            ))));
+        }
+
+        match time::timeout(self.timeout, fut).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(e)) => Err(self.check_error(e)),
+            Err(_) => {
+                let e = FsError::common(format!(
+                    "write buffer task not responding after {:?}, path={}",
+                    self.timeout, self.path
+                ));
+                error!("{}", e);
+                // Latch: this writer is unusable now, fail every later call
+                // immediately instead of waiting out another timeout. The
+                // latched error also flows through err_monitor/check_error()
+                // so later callers observe the original timeout cause.
+                self.abandoned.store(true, Ordering::Release);
+                self.err_monitor.set_error(e);
+                Err(FsError::common(format!(
+                    "write buffer task not responding after {:?}, path={}",
+                    self.timeout, self.path
+                )))
+            }
+        }
+    }
+
     async fn write(&mut self, data: DataSlice) -> FsResult<()> {
-        self.chunk_sender
-            .send(data)
-            .await
-            .map_err(|e| self.check_error(e))
+        self.guard(self.chunk_sender.send(data)).await
     }
 
     async fn complete(&mut self) -> FsResult<()> {
@@ -87,7 +142,7 @@ impl BufferChannel {
             rx.receive().await?;
             Ok::<(), IOError>(())
         };
-        fun.await.map_err(|e| self.check_error(e))
+        self.guard(fun).await
     }
 
     async fn flush(&mut self) -> FsResult<()> {
@@ -97,7 +152,7 @@ impl BufferChannel {
             rx.receive().await?;
             Ok::<(), IOError>(())
         };
-        fun.await.map_err(|e| self.check_error(e))
+        self.guard(fun).await
     }
 
     async fn cancel(&mut self) -> FsResult<()> {
@@ -107,7 +162,7 @@ impl BufferChannel {
             rx.receive().await??;
             Ok::<(), FsError>(())
         };
-        fun.await.map_err(|e| self.check_error(e))
+        self.guard(fun).await
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
@@ -117,7 +172,7 @@ impl BufferChannel {
             rx.receive().await?;
             Ok::<(), IOError>(())
         };
-        fun.await.map_err(|e| self.check_error(e))
+        self.guard(fun).await
     }
 
     async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<FileBlocks> {
@@ -129,7 +184,7 @@ impl BufferChannel {
             let file_blocks = rx.receive().await?;
             Ok::<FileBlocks, IOError>(file_blocks)
         };
-        fun.await.map_err(|e| self.check_error(e))
+        self.guard(fun).await
     }
 }
 
@@ -147,6 +202,8 @@ impl FsWriterBuffer {
         let path = writer.path().clone();
         let file_blocks = writer.file_blocks();
         let pos = writer.pos();
+        let timeout =
+            Duration::from_millis(writer.fs_context().conf.client.write_buffer_timeout_ms);
 
         let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
         let (task_sender, task_receiver) = AsyncChannel::new(2).split();
@@ -170,9 +227,12 @@ impl FsWriterBuffer {
         });
 
         let writer = BufferChannel {
+            path: path.path().to_string(),
             chunk_sender,
             task_sender,
             err_monitor,
+            abandoned: AtomicBool::new(false),
+            timeout,
         };
 
         Self {
@@ -324,11 +384,15 @@ impl FsWriterBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{recv_task, SelectTask, WriterTask};
+    use super::{recv_task, BufferChannel, SelectTask, WriterTask};
     use bytes::Bytes;
     use curvine_error::FsResult;
     use curvine_io::DataSlice;
     use curvine_runtime::sync::channel::{AsyncChannel, CallChannel};
+    use curvine_runtime::sync::ErrorMonitor;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::time;
 
     #[tokio::test]
     async fn cancel_control_preempts_queued_data() {
@@ -346,4 +410,163 @@ mod tests {
             Some(SelectTask::Control(WriterTask::Cancel(_)))
         ));
     }
+
+    // Build a BufferChannel whose background side is fully controlled by the
+    // test: nothing answers the handshakes unless the test does.
+    fn test_channel(timeout_ms: u64) -> BufferChannel {
+        let (chunk_sender, chunk_receiver) = AsyncChannel::new(2).split();
+        let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+        // Keep the receivers alive without owning them: this mirrors a
+        // background task that stays alive but stops polling.
+        std::mem::forget((chunk_receiver, task_receiver));
+
+        BufferChannel {
+            path: "/gh-1908-test".to_string(),
+            chunk_sender,
+            task_sender,
+            err_monitor: Arc::new(ErrorMonitor::new()),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
+            timeout: Duration::from_millis(timeout_ms),
+        }
+    }
+
+    // Regression test for #1908: the background task is alive but stops
+    // polling, so the handshake can never complete. flush()/complete() must
+    // return an error within the configured deadline instead of hanging.
+    #[tokio::test]
+    async fn handshakes_time_out_when_background_task_stops_responding() {
+        let mut channel = test_channel(200);
+
+        let start = Instant::now();
+        let res = time::timeout(Duration::from_secs(5), channel.flush()).await;
+        assert!(res.is_ok(), "flush() hung instead of returning an error");
+        let err = res.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("not responding"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "flush() waited {:?}, expected to stop at the 200ms deadline",
+            start.elapsed()
+        );
+
+        let mut channel = test_channel(200);
+        let res = time::timeout(Duration::from_secs(5), channel.complete()).await;
+        assert!(res.is_ok(), "complete() hung instead of returning an error");
+        let err = res.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("not responding"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    // A responder that mirrors the real Complete arm: it replies, then exits
+    // right away. The reply must win: a successful complete must not be
+    // misread as "task exited" or time out.
+    #[tokio::test]
+    async fn complete_succeeds_when_responder_replies_then_exits() {
+        let (chunk_sender, chunk_receiver) = AsyncChannel::new(2).split();
+        let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+
+        // Responder: drain tasks, answer each one, exit after the first.
+        tokio::spawn(async move {
+            // Hold the chunk receiver so the channels stay open.
+            let mut _chunk_receiver = chunk_receiver;
+            let mut task_receiver = task_receiver;
+            if let Some(task) = task_receiver.recv().await {
+                match task {
+                    WriterTask::Flush(tx) => {
+                        let _ = tx.send(1);
+                    }
+                    WriterTask::Complete((_, _, tx)) => {
+                        let _ = tx.send(1);
+                    }
+                    _ => {}
+                }
+            }
+            // Drop everything immediately after the reply: the task exits.
+        });
+
+        let mut channel = BufferChannel {
+            path: "/gh-1908-reply-then-exit".to_string(),
+            chunk_sender,
+            task_sender,
+            err_monitor: Arc::new(ErrorMonitor::new()),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
+            timeout: Duration::from_secs(10),
+        };
+
+        let res = time::timeout(Duration::from_secs(5), channel.flush()).await;
+        assert!(res.is_ok(), "flush() hung");
+        res.unwrap()
+            .expect("flush() must succeed when the responder replies then exits");
+    }
+
+    // The background task exits (receivers dropped) while a flush is in
+    // flight: the pending receive must fail right away via the dropped
+    // CallChannel sender, without waiting for the timeout.
+    #[tokio::test]
+    async fn pending_flush_fails_when_responder_exits_without_replying() {
+        let (chunk_sender, chunk_receiver) = AsyncChannel::new(2).split();
+        let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+
+        // Responder exits immediately without answering anything.
+        drop((chunk_receiver, task_receiver));
+
+        let mut channel = BufferChannel {
+            path: "/gh-1908-exit-no-reply".to_string(),
+            chunk_sender,
+            task_sender,
+            err_monitor: Arc::new(ErrorMonitor::new()),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
+            timeout: Duration::from_secs(60),
+        };
+
+        let start = Instant::now();
+        let res = time::timeout(Duration::from_secs(5), channel.flush()).await;
+        assert!(res.is_ok(), "flush() hung after responder exit");
+        assert!(
+            res.unwrap().is_err(),
+            "flush() must fail when the responder exited without replying"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "flush() waited {:?}, expected a fast failure on dropped channels",
+            start.elapsed()
+        );
+    }
+
+    // After the first timeout the channel is latched as abandoned: later
+    // calls fail immediately instead of waiting another full timeout.
+    #[tokio::test]
+    async fn timeout_latches_abandoned_and_later_calls_fail_fast() {
+        let mut channel = test_channel(200);
+
+        let err = channel.flush().await.unwrap_err();
+        assert!(err.to_string().contains("not responding"));
+
+        let start = Instant::now();
+        let res = time::timeout(Duration::from_secs(5), channel.flush()).await;
+        assert!(res.is_ok(), "latched flush() hung");
+        let err = res.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("not responding"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "latched flush() waited {:?}, expected an immediate failure",
+            start.elapsed()
+        );
+    }
+
+    // End-to-end note: a full FsWriterBase-backed complete requires a live
+    // master/worker (the task's complete RPC enters the 60/120s connection
+    // retry path without one), so the reply-wins-over-exit regression is
+    // covered by the controlled in-process responder above instead of an
+    // environment-dependent server test.
 }
