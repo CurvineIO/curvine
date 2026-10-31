@@ -80,6 +80,16 @@ pub struct Inode {
     pub dir: Option<Box<DirEntry>>,
 
     pub mark_delete: bool,
+
+    /// Curvine-namespace path recorded at unlink time for a deferred delete.
+    ///
+    /// When unlink defers the backend delete to last-close (release), the
+    /// dcache ancestors may be evicted by then, so the plain-name path cannot
+    /// be reconstructed. Recording the exact path taken at unlink (which is
+    /// protected by `lock_path`) gives release a stable, correct deletion
+    /// target even after renames or evictions (#1395).
+    #[serde(default)]
+    pub deferred_delete_path: Option<String>,
 }
 
 impl Inode {

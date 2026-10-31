@@ -227,6 +227,25 @@ impl BackendHandle {
         self.status.read().unwrap().clone()
     }
 
+    /// Best-effort backend path for logging only.
+    ///
+    /// Returns the status snapshot's path when non-empty and parseable;
+    /// otherwise falls back to the backend writer's path. This is NEVER a
+    /// deletion target: renames do not update the snapshot and on cache-mode
+    /// UFS mounts the writer path can be a UFS URI (`file:///backing/f`) that
+    /// the Curvine master would reject. Close-time deferred deletes use the
+    /// unlink-time recorded Curvine path instead (#1395).
+    pub fn open_path(&self) -> String {
+        let status_path = self.status.read().unwrap().path.clone();
+        if !status_path.is_empty() && Path::from_str(&status_path).is_ok() {
+            return status_path;
+        }
+        if let Some(writer) = &self.writer {
+            return writer.path().full_path().to_owned();
+        }
+        status_path
+    }
+
     /// Replace the open-time status snapshot after a dirty-read reopen.
     fn refresh_status(&self, status: FileStatus) {
         *self.status.write().unwrap() = status;

@@ -611,6 +611,7 @@ impl DirTree {
                 return Ok(());
             };
             inode.mark_delete = false;
+            inode.deferred_delete_path = None;
             (inode.parent, inode.name.clone())
         };
         let dir = self.get_dir_mut_check(parent)?;
@@ -642,6 +643,24 @@ impl DirTree {
             None => false,
             Some(inode) => inode.is_deleted(),
         }
+    }
+
+    /// Record the unlink-time Curvine path for a pending deferred delete.
+    ///
+    /// `fs_unlink` calls this right after `unlink(.., true)` under `lock_path`,
+    /// so the stored path is exactly what the unlink resolved and the correct
+    /// backend deletion target for the release-time fallback (#1395).
+    pub fn set_deferred_delete_path(&mut self, ino: u64, path: String) {
+        if let Some(inode) = self.inodes.get_mut(&ino) {
+            inode.deferred_delete_path = Some(path);
+        }
+    }
+
+    /// The recorded unlink-time path of a pending deferred delete, if any.
+    pub fn deferred_delete_path(&self, ino: u64) -> Option<String> {
+        self.get_inode(ino, None)
+            .filter(|inode| inode.is_deleted())
+            .and_then(|inode| inode.deferred_delete_path.clone())
     }
 
     pub fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
