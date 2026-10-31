@@ -515,6 +515,7 @@ fn committed_leader_noop_advances_app_storage_applied_index() -> CommonResult<()
 struct PopulatedRefuseEmptySnapshotAppStorage {
     fsm_state: Arc<Mutex<FsmState>>,
     apply_snapshot_calls: Arc<Mutex<u32>>,
+    snapshot_root: Option<String>,
 }
 
 impl PopulatedRefuseEmptySnapshotAppStorage {
@@ -524,7 +525,15 @@ impl PopulatedRefuseEmptySnapshotAppStorage {
         Self {
             fsm_state: Arc::new(Mutex::new(fsm)),
             apply_snapshot_calls: Arc::new(Mutex::new(0)),
+            snapshot_root: None,
         }
+    }
+
+    // A store that owns a snapshot directory can receive a private copy of a
+    // snapshot another member created; without one it can only download.
+    fn with_snapshot_root(mut self, root: impl Into<String>) -> Self {
+        self.snapshot_root = Some(root.into());
+        self
     }
 }
 
@@ -555,8 +564,11 @@ impl AppStorage for PopulatedRefuseEmptySnapshotAppStorage {
         ))
     }
 
-    fn snapshot_dir(&self, _: u64) -> RaftResult<String> {
-        Ok(String::new())
+    fn snapshot_dir(&self, snapshot_id: u64) -> RaftResult<String> {
+        Ok(match &self.snapshot_root {
+            Some(root) => format!("{root}/ck-{snapshot_id}"),
+            None => String::new(),
+        })
     }
 }
 
@@ -937,38 +949,91 @@ fn snapshot_fetcher_builds_download_for_remote_snapshot() {
     );
 }
 
-/// A complete local copy wins over a remote owner: manual meta+journal copies
-/// must not trigger a full re-download.
+/// A complete local copy of another member's snapshot is copied into this
+/// member's own snapshot directory: a recovering member must install a snapshot
+/// it owns, and must not re-download files that are already readable here.
 #[test]
-fn snapshot_fetcher_uses_complete_local_copy_of_remote_snapshot() -> CommonResult<()> {
+fn snapshot_fetcher_owns_a_local_copy_of_remote_snapshot() -> CommonResult<()> {
     let conf = JournalConf::with_test();
     let rt = conf.create_runtime();
-    let dir = Utils::test_sub_dir(format!("snapshot-local-copy-{}", Utils::rand_id()));
-    FileUtils::delete_path(&dir, true)?;
-    FileUtils::create_dir(&dir, true)?;
-    std::fs::write(Path::new(&dir).join("checkpoint.db"), vec![0u8; 16])?;
+    let source = Utils::test_sub_dir(format!("snapshot-local-copy-{}", Utils::rand_id()));
+    let root = Utils::test_sub_dir(format!("snapshot-own-root-{}", Utils::rand_id()));
+    FileUtils::delete_path(&source, true)?;
+    FileUtils::create_dir(&source, true)?;
+    FileUtils::delete_path(&root, true)?;
+    FileUtils::create_dir(&root, true)?;
+    std::fs::write(Path::new(&source).join("checkpoint.db"), vec![7u8; 16])?;
 
-    let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0);
+    let app =
+        PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0).with_snapshot_root(&root);
     let mut data = reported_snapshot(5, 7);
-    data.files_data = Some(files_in_dir(&dir));
+    data.files_data = Some(files_in_dir(&source));
 
     let fetcher =
         SnapshotFetcher::new(9, &app, &conf, test_client(&conf, rt.clone()), data).unwrap();
 
-    match fetcher {
-        SnapshotFetcher::Local(data) => {
-            let files = data
-                .files_data
-                .expect("local snapshot must keep its file manifest");
-            assert_eq!(
-                files.dir, dir,
-                "a reused local copy must keep its manifest dir"
-            );
+    let dir = match &fetcher {
+        SnapshotFetcher::OwnedCopy(_, dir) => dir.clone(),
+        SnapshotFetcher::Local(_) => {
+            panic!("a snapshot owned by another member must not be treated as local")
         }
-        SnapshotFetcher::Remote(..) => panic!("complete local copy must not be downloaded"),
-    }
+        SnapshotFetcher::Remote(..) => {
+            panic!("a complete local copy must not be downloaded")
+        }
+    };
+    assert_ne!(
+        dir, source,
+        "the directory of another member must not be adopted"
+    );
+    assert!(
+        dir.starts_with(&root),
+        "the copy must live in this member's own storage: {dir}"
+    );
 
-    FileUtils::delete_path(&dir, true)?;
+    let fetched = rt.block_on(fetcher.fetch())?;
+    let files = fetched
+        .files_data
+        .expect("a copied snapshot must keep its file manifest");
+    assert_eq!(
+        files.dir, dir,
+        "the installed snapshot must name the copy this member owns"
+    );
+    assert_eq!(
+        std::fs::read(Path::new(&files.dir).join("checkpoint.db"))?,
+        vec![7u8; 16],
+        "the copied file must carry the manifest content"
+    );
+
+    FileUtils::delete_path(&source, true)?;
+    FileUtils::delete_path(&root, true)?;
+    Ok(())
+}
+
+/// A store that cannot name a private snapshot directory cannot own a copy, so
+/// the readable files stay in place; only stores that manage a directory get the
+/// ownership copy.
+#[test]
+fn snapshot_fetcher_reads_in_place_without_a_private_snapshot_dir() -> CommonResult<()> {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let source = Utils::test_sub_dir(format!("snapshot-no-own-root-{}", Utils::rand_id()));
+    FileUtils::delete_path(&source, true)?;
+    FileUtils::create_dir(&source, true)?;
+    std::fs::write(Path::new(&source).join("checkpoint.db"), vec![0u8; 16])?;
+
+    let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0);
+    let mut data = reported_snapshot(5, 7);
+    data.files_data = Some(files_in_dir(&source));
+
+    let fetcher =
+        SnapshotFetcher::new(9, &app, &conf, test_client(&conf, rt.clone()), data).unwrap();
+
+    assert!(
+        matches!(fetcher, SnapshotFetcher::Local(_)),
+        "without a store-managed snapshot directory the readable files stay in place"
+    );
+
+    FileUtils::delete_path(&source, true)?;
     Ok(())
 }
 
