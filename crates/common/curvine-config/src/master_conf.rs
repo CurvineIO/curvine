@@ -141,6 +141,12 @@ pub struct MasterConf {
     // operations can take the namespace lock.
     pub trash_purge_yield_ms: u64,
 
+    // A permanent recursive delete of a directory with at least this many direct
+    // children is staged under /.Trash/.purging and purged in bounded batches
+    // before the call returns, instead of removing the whole subtree under one
+    // namespace lock hold (#1864). 0 disables staging.
+    pub delete_stage_min_children: usize,
+
     // How often the master drains /.Trash/.pending, i.e. the entries staged by
     // async deletes. Runs regardless of trash_enabled.
     pub trash_purge_interval: String,
@@ -444,6 +450,7 @@ impl Default for MasterConf {
 
             trash_purge_batch_inodes: 4096,
             trash_purge_yield_ms: 5,
+            delete_stage_min_children: 4096,
 
             trash_purge_interval: "1s".to_string(),
             trash_purge_interval_unit: Default::default(),

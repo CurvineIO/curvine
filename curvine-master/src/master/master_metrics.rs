@@ -168,9 +168,12 @@ pub struct MasterMetrics {
     pub(crate) eviction_bytes_freed: Counter,
 
     // Trash purge progress. `trash_pending_entries` is the number of entries
-    // waiting in `/.Trash/.pending`; the counters let operators derive average
-    // batch cost and purge throughput without a per-entry histogram.
+    // waiting in `/.Trash/.pending`; `trash_purging_entries` counts staged
+    // synchronous deletes left in `/.Trash/.purging` for the purger (#1864).
+    // The counters let operators derive average batch cost and purge
+    // throughput without a per-entry histogram.
     pub(crate) trash_pending_entries: Gauge,
+    pub(crate) trash_purging_entries: Gauge,
     pub(crate) trash_purge_batches: Counter,
     pub(crate) trash_purge_batch_duration_ms: Counter,
     pub(crate) trash_purge_inodes: Counter,
@@ -335,6 +338,10 @@ impl MasterMetrics {
             trash_pending_entries: m::new_gauge(
                 "trash_pending_entries",
                 "Trash entries staged for the async purger in /.Trash/.pending",
+            )?,
+            trash_purging_entries: m::new_gauge(
+                "trash_purging_entries",
+                "Staged synchronous deletes left in /.Trash/.purging for the purger",
             )?,
             trash_purge_batches: m::new_counter(
                 "trash_purge_batches",

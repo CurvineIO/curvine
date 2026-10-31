@@ -70,12 +70,17 @@ meta_dir = "testing/meta"
 #   foreground metadata operations are not starved (default 5).
 # trash_purge_interval: how often the master drains /.Trash/.pending, i.e. the
 #   entries staged by async deletes; runs even while trash_enabled is false.
+# delete_stage_min_children: a permanent recursive delete of a directory with at
+#   least this many direct children is moved to /.Trash/.purging and purged in
+#   trash_purge_batch_inodes batches before the call returns, so one delete never
+#   holds the namespace lock for the whole subtree (default 4096; 0 disables).
 # trash_enabled = false
 # trash_retention = "7d"
 # trash_check_interval = "1h"
 # trash_purge_batch_inodes = 4096
 # trash_purge_yield_ms = 5
 # trash_purge_interval = "1s"
+# delete_stage_min_children = 4096
 
 # Client session lease. Every client (FUSE, SDK, CLI) registers a session with
 # ClientHeartbeat; a session whose lease lapses is reaped together with the locks

@@ -22,7 +22,7 @@ use crate::master::meta::{
 };
 
 use crate::master::fs::state::{SessionHeartbeat, SessionMap};
-use crate::master::fs::DeleteResult;
+use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncSessionMap, SyncWorkerManager};
@@ -53,6 +53,10 @@ pub enum DeleteMode {
     /// the background, regardless of `master.trash_enabled`. Falls back to a
     /// permanent delete for paths already inside the trash namespace.
     AsyncPurge,
+    /// Permanent delete of a mounted path. The client already removed the UFS
+    /// object, so the entry is never trashed or staged: a staging rename would
+    /// be replayed as a UFS rename.
+    Mounted,
 }
 
 pub struct CvMetadataSnapshotEntry {
@@ -89,6 +93,23 @@ pub struct MasterFilesystem {
     /// never reclaim the same entry and the blocking caller always reports the
     /// totals it actually reclaimed.
     pending_drain: Arc<Mutex<()>>,
+    /// `/.Trash/.purging` entries a synchronous delete is still purging. Entries
+    /// are registered under the namespace write lock that stages them, so the
+    /// background purger, which scans under the read lock, never adopts an entry
+    /// whose caller is still reclaiming it.
+    purging_inflight: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Unregisters an in-flight `.purging` entry, also on early return or panic.
+struct PurgingGuard<'a> {
+    set: &'a Mutex<HashSet<String>>,
+    path: &'a str,
+}
+
+impl Drop for PurgingGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().remove(self.path);
+    }
 }
 
 pub struct BlockReportResult {
@@ -186,6 +207,7 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
             pending_drain: Default::default(),
+            purging_inflight: Default::default(),
         }
     }
 
@@ -206,6 +228,9 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
             pending_drain: Default::default(),
+            // Shared like `session_map`: every handle must agree on which
+            // `.purging` entries a synchronous delete still owns.
+            purging_inflight: js.fs().purging_inflight.clone(),
         }
     }
 
@@ -319,11 +344,14 @@ impl MasterFilesystem {
         recursive: bool,
         mode: DeleteMode,
     ) -> FsResult<DeleteResult> {
-        let mut delete_res = {
+        let (mut delete_res, staged) = {
             let mut fs_dir = self.fs_dir.write();
             self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)?
         };
         self.release_deleted_blocks(&mut delete_res);
+        if let Some(staged) = staged {
+            self.finish_staged_delete(&staged, &mut delete_res);
+        }
 
         Ok(delete_res)
     }
@@ -338,7 +366,7 @@ impl MasterFilesystem {
         recursive: bool,
         mode: DeleteMode,
     ) -> FsResult<Option<DeleteResult>> {
-        let mut delete_res = {
+        let (mut delete_res, staged) = {
             let mut fs_dir = self.fs_dir.write();
             if !self.master_monitor.is_active() {
                 return Ok(None);
@@ -346,17 +374,23 @@ impl MasterFilesystem {
             self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)?
         };
         self.release_deleted_blocks(&mut delete_res);
+        if let Some(staged) = staged {
+            self.finish_staged_delete(&staged, &mut delete_res);
+        }
 
         Ok(Some(delete_res))
     }
 
+    /// Returns the delete result and, when the subtree was staged for a bounded
+    /// purge, the `/.Trash/.purging` path the caller must purge after releasing
+    /// the namespace lock.
     fn delete_locked(
         &self,
         fs_dir: &mut FsDir,
         path: &str,
         recursive: bool,
         mode: DeleteMode,
-    ) -> FsResult<DeleteResult> {
+    ) -> FsResult<(DeleteResult, Option<String>)> {
         let inp = Self::resolve_path(fs_dir, path)?;
 
         // Removing the root would orphan every trashed entry. Entries below it
@@ -371,10 +405,18 @@ impl MasterFilesystem {
         // bin cannot be used to hide data from a purge.
         let in_trash = trash::is_trash_path(inp.path());
         let soft_delete = match mode {
-            DeleteMode::SkipTrash => false,
+            DeleteMode::SkipTrash | DeleteMode::Mounted => false,
             DeleteMode::AsyncPurge => !in_trash,
             DeleteMode::Default => self.conf.trash_enabled && !in_trash,
         };
+
+        if !soft_delete && recursive && self.should_stage_delete(&inp, mode) {
+            let staged = fs_dir.stage_for_purge(&inp)?;
+            // Registered before the write lock is released; see
+            // `purging_inflight`.
+            self.purging_inflight.lock().insert(staged.clone());
+            return Ok((DeleteResult::new(), Some(staged)));
+        }
 
         // The callee reports how the delete was actually served: a shared inode
         // or an unresolved entry falls back to a permanent unlink even when the
@@ -384,7 +426,69 @@ impl MasterFilesystem {
             _ if soft_delete => fs_dir.trash(&inp, recursive)?,
             _ => fs_dir.delete(&inp, recursive)?,
         };
-        Ok(delete_res)
+        Ok((delete_res, None))
+    }
+
+    /// A permanent recursive delete is staged when the target is a directory
+    /// with at least `delete_stage_min_children` direct children (#1864).
+    /// Mounted paths and anything already inside a staging area are deleted
+    /// directly.
+    fn should_stage_delete(&self, inp: &InodePath, mode: DeleteMode) -> bool {
+        let min_children = self.conf.delete_stage_min_children;
+        if min_children == 0
+            || matches!(mode, DeleteMode::Mounted)
+            || inp.is_root()
+            || trash::is_staging_path(inp.path())
+        {
+            return false;
+        }
+        match inp.get_last_inode() {
+            Some(inode) => inode.is_dir() && inode.child_len() >= min_children,
+            None => false,
+        }
+    }
+
+    /// Purges a staged delete in bounded batches, releasing the namespace lock
+    /// between batches, and folds the reclaimed counts into `delete_res`.
+    ///
+    /// The namespace change is already committed and journaled, so the delete
+    /// itself has succeeded. If the purge stops early (lost leadership or a
+    /// failed batch) the entry stays in `/.Trash/.purging`, the result reports
+    /// `purge_pending` with the counts reclaimed so far, and the background
+    /// purger finishes it.
+    fn finish_staged_delete(&self, staged: &str, delete_res: &mut DeleteResult) {
+        let _guard = PurgingGuard {
+            set: &self.purging_inflight,
+            path: staged,
+        };
+        let purger = crate::master::fs::TrashPurger::new(self.clone(), self.master_monitor.clone());
+        // Batches applied before an early stop are already reclaimed, so they
+        // are reported even when the rest is left for the purger.
+        let (outcome, stop) = purger.purge_entry_partial(staged);
+        delete_res.inodes += outcome.inodes;
+        delete_res.bytes += outcome.bytes;
+        match stop {
+            None => {}
+            Some(PurgeStop::Demoted) => {
+                info!(
+                    "lost leadership while purging {}; left for the purger",
+                    staged
+                );
+                delete_res.purge_pending = true;
+            }
+            Some(PurgeStop::Failed(e)) => {
+                warn!(
+                    "purge of staged delete {} failed, left for the purger: {}",
+                    staged, e
+                );
+                delete_res.purge_pending = true;
+            }
+        }
+    }
+
+    /// True while a synchronous delete is still purging the `.purging` entry.
+    pub(crate) fn is_purge_inflight(&self, path: &str) -> bool {
+        self.purging_inflight.lock().contains(path)
     }
 
     pub(crate) fn release_deleted_blocks(&self, delete_res: &mut DeleteResult) {
@@ -494,6 +598,17 @@ impl MasterFilesystem {
     ) -> FsResult<TrashScanPage> {
         let fs_dir = self.fs_dir.read();
         fs_dir.scan_pending_trash(limit, start_after)
+    }
+
+    /// One bounded page of `/.Trash/.purging` entries, including the ones a
+    /// synchronous delete is still purging (see `is_purge_inflight`).
+    pub fn scan_purging_trash(
+        &self,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> FsResult<TrashScanPage> {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.scan_purging_trash(limit, start_after)
     }
 
     pub fn restore_trash<T: AsRef<str>>(
@@ -851,7 +966,7 @@ impl MasterFilesystem {
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
         let fs_dir = self.fs_dir.read();
         let inp = Self::resolve_path_raw(&fs_dir, path.as_ref())?;
-        if trash::is_pending_path(inp.path()) {
+        if trash::is_staging_path(inp.path()) {
             return Ok(false);
         }
         Ok(inp.get_last_inode().is_some())
@@ -864,7 +979,7 @@ impl MasterFilesystem {
             let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;
             let mut all_statuses = Vec::new();
             for path in &paths {
-                if trash::is_pending_path(path.path()) {
+                if trash::is_staging_path(path.path()) {
                     continue;
                 }
                 let statuses = fs_dir.list_status(path)?;
@@ -895,13 +1010,14 @@ impl MasterFilesystem {
         }
     }
 
-    /// Resolves a client-supplied path. `/.Trash/.pending` is master-owned
-    /// staging for async deletes and reclamation, so it resolves as missing:
-    /// clients can neither stat, list, open, rename nor synchronously delete it.
+    /// Resolves a client-supplied path. `/.Trash/.pending` and
+    /// `/.Trash/.purging` are master-owned staging for deletes and reclamation,
+    /// so they resolve as missing: clients can neither stat, list, open, rename
+    /// nor synchronously delete them.
     /// Internal reclamation goes through `FsDir` directly and is not affected.
     fn resolve_path(fs_dir: &FsDir, path: &str) -> FsResult<InodePath> {
         let inp = Self::resolve_path_raw(fs_dir, path)?;
-        Self::check_not_pending_path(inp.path())?;
+        Self::check_not_staging_path(inp.path())?;
         Ok(inp)
     }
 
@@ -909,17 +1025,19 @@ impl MasterFilesystem {
         InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
     }
 
-    fn check_not_pending_path(path: &str) -> FsResult<()> {
-        if trash::is_pending_path(path) {
+    fn check_not_staging_path(path: &str) -> FsResult<()> {
+        if trash::is_staging_path(path) {
             return err_ext!(FsError::file_not_found(path));
         }
         Ok(())
     }
 
-    /// Drops the `.pending` staging directory from a listing of `/.Trash`.
+    /// Drops the staging directories from a listing of `/.Trash`.
     fn hide_pending(dir_path: &str, mut statuses: Vec<FileStatus>) -> Vec<FileStatus> {
         if dir_path == trash::TRASH_ROOT {
-            statuses.retain(|status| status.name != trash::TRASH_PENDING_NAME);
+            statuses.retain(|status| {
+                status.name != trash::TRASH_PENDING_NAME && status.name != trash::TRASH_PURGING_NAME
+            });
         }
         statuses
     }
@@ -3852,5 +3970,164 @@ mod tests {
         fs.master_monitor
             .set_role_for_test(curvine_raft::raft::RoleState::Leader);
         assert_eq!(fs.drain_pending_trash().unwrap().unwrap().inodes, 1);
+    }
+
+    // #1864: the staging rename targets `.purging`, and the background purger
+    // leaves an entry alone while the synchronous delete still owns it.
+    #[test]
+    fn purging_entry_is_staged_by_rename_and_skipped_while_in_flight() {
+        use crate::master::fs::PendingTrashPurger;
+        use crate::master::journal::JournalEntry;
+
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.master.delete_stage_min_children = 2;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-fs-purging/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-fs-purging/journal-{}", Utils::rand_str(6)));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        fs.create("/victim/a", true).unwrap();
+        fs.create("/victim/b", true).unwrap();
+        fs.fs_dir.read().take_entries();
+
+        // Stage without purging, as `delete_with_mode` does under its lock.
+        let (_, staged) = {
+            let mut fs_dir = fs.fs_dir.write();
+            fs.delete_locked(&mut fs_dir, "/victim", true, DeleteMode::SkipTrash)
+                .unwrap()
+        };
+        let staged = staged.expect("a directory at the cutoff is staged");
+        assert!(trash::is_purging_entry_path(&staged), "got {}", staged);
+        assert!(fs.is_purge_inflight(&staged));
+
+        let entries = fs.fs_dir.read().take_entries();
+        let rename = entries
+            .iter()
+            .find_map(|e| match e {
+                JournalEntry::Rename(r) => Some(r),
+                _ => None,
+            })
+            .expect("staging is journaled as a rename");
+        assert_eq!(rename.src, "/victim");
+        assert_eq!(rename.dst, staged);
+
+        let purger = PendingTrashPurger::new(fs.clone(), fs.master_monitor.clone());
+        assert_eq!(purger.drain_purging().unwrap().unwrap().0, 0);
+        assert_eq!(
+            fs.scan_purging_trash(16, None).unwrap().paths,
+            vec![staged.clone()]
+        );
+
+        let mut res = DeleteResult::new();
+        fs.finish_staged_delete(&staged, &mut res);
+        assert_eq!(res.inodes, 2);
+        assert!(!res.purge_pending);
+        assert!(!fs.is_purge_inflight(&staged));
+        assert!(fs.scan_purging_trash(16, None).unwrap().paths.is_empty());
+    }
+
+    // #1864 review: `.purging` adoption runs outside the `pending_drain` guard,
+    // so a blocking empty-trash neither waits on nor skips a leftover staged
+    // delete, and the `.pending` drain still yields to it.
+    #[test]
+    fn purging_drain_does_not_take_the_empty_trash_guard() {
+        use crate::master::fs::PendingTrashPurger;
+
+        let fs = {
+            Master::init_test_metrics();
+            let mut conf = ClusterConf::format();
+            conf.testing = true;
+            conf.journal.enable = false;
+            conf.master.trash_enabled = true;
+            conf.master.delete_stage_min_children = 2;
+            conf.master.meta_dir = Utils::test_sub_dir(format!(
+                "master-fs-purging-unguarded/meta-{}",
+                Utils::rand_str(6)
+            ));
+            conf.journal.journal_dir = Utils::test_sub_dir(format!(
+                "master-fs-purging-unguarded/journal-{}",
+                Utils::rand_str(6)
+            ));
+            JournalSystem::fs_only_for_test(&conf).unwrap()
+        };
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        fs.create("/victim/a", true).unwrap();
+        fs.create("/victim/b", true).unwrap();
+        fs.create("/owned.log", true).unwrap();
+        fs.delete_with_mode("/owned.log", false, DeleteMode::Default)
+            .unwrap();
+
+        // A staged delete whose caller is gone: staged, then released without
+        // purging, as after lost leadership.
+        let (_, staged) = {
+            let mut fs_dir = fs.fs_dir.write();
+            fs.delete_locked(&mut fs_dir, "/victim", true, DeleteMode::SkipTrash)
+                .unwrap()
+        };
+        let staged = staged.expect("staged");
+        fs.purging_inflight.lock().remove(&staged);
+
+        let guard = fs.lock_pending_drain();
+        assert_eq!(fs.stage_trash_for_purge().unwrap(), 1);
+        let purger = PendingTrashPurger::new(fs.clone(), fs.master_monitor.clone());
+
+        assert_eq!(purger.drain_pending().unwrap(), Some((0, 0, 0)));
+        assert_eq!(purger.drain_purging().unwrap(), Some((1, 2, 0)));
+        assert!(fs.scan_purging_trash(16, None).unwrap().paths.is_empty());
+        assert_eq!(fs.scan_pending_trash(16, None).unwrap().paths.len(), 1);
+        drop(guard);
+    }
+
+    // #1864 review: every handle over one journal system must agree on which
+    // `.purging` entries a synchronous delete owns, or a purger on one handle
+    // could adopt an entry a delete on another handle is still reclaiming.
+    #[test]
+    fn with_js_shares_the_purging_inflight_set() {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.master.delete_stage_min_children = 2;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-fs-inflight/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-fs-inflight/journal-{}", Utils::rand_str(6)));
+        let js = JournalSystem::from_conf(&conf).unwrap();
+        let staging = MasterFilesystem::with_js(&conf, &js);
+        let observer = MasterFilesystem::with_js(&conf, &js);
+        staging
+            .master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        staging.create("/victim/a", true).unwrap();
+        staging.create("/victim/b", true).unwrap();
+
+        let (_, staged) = {
+            let mut fs_dir = staging.fs_dir.write();
+            staging
+                .delete_locked(&mut fs_dir, "/victim", true, DeleteMode::SkipTrash)
+                .unwrap()
+        };
+        let staged = staged.expect("a directory at the cutoff is staged");
+
+        assert!(observer.is_purge_inflight(&staged));
+        assert!(js.fs().is_purge_inflight(&staged));
+        let purger = crate::master::fs::PendingTrashPurger::new(
+            observer.clone(),
+            observer.master_monitor.clone(),
+        );
+        assert_eq!(purger.drain_purging().unwrap().unwrap().0, 0);
+
+        let mut res = DeleteResult::new();
+        staging.finish_staged_delete(&staged, &mut res);
+        assert_eq!(res.inodes, 2);
+        assert!(!observer.is_purge_inflight(&staged));
+
+        drop(staging);
+        drop(observer);
+        js.shutdown();
     }
 }
