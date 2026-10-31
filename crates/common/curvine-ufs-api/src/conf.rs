@@ -114,6 +114,15 @@ pub struct OpendalConf {
     /// Number of concurrent Range requests issued for sequential reads.
     /// Configured by [`Self::READ_CONCURRENT`].
     pub read_concurrent: usize,
+    /// Hard upper bound for a single UFS operation as seen by Curvine.
+    ///
+    /// The per-attempt limits (`connect_timeout`, `read_timeout`) and
+    /// `retry_times` are enforced *inside* the retry loop, so the worst case of
+    /// one call is `(retry_times + 1)` attempts plus backoff. This bound wraps
+    /// the whole call instead, so a blackholed object-store path fails with a
+    /// `Timeout` (ETIMEDOUT) instead of staying started indefinitely.
+    /// Configured by [`Self::OPERATION_TIMEOUT`].
+    pub operation_timeout: Duration,
 }
 
 impl S3Conf {
@@ -255,6 +264,7 @@ impl OpendalConf {
     pub const RETRY_MAX_DELAY_MS: &'static str = "opendal.retry_max_delay_ms";
     pub const READ_CHUNK_SIZE: &'static str = "opendal.read_chunk_size";
     pub const READ_CONCURRENT: &'static str = "opendal.read_concurrent";
+    pub const OPERATION_TIMEOUT: &'static str = "opendal.operation_timeout";
 
     // Default values - using S3Conf defaults for consistency
     pub const DEFAULT_RETRY_TIMES: u32 = S3Conf::DEFAULT_RETRY_TIMES; // 3
@@ -264,6 +274,10 @@ impl OpendalConf {
     pub const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 10000; // 10 seconds
     pub const DEFAULT_READ_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
     pub const DEFAULT_READ_CONCURRENT: usize = 4; // 4 parallel range requests per object
+                                                  // 30s keeps a foreground metadata call (HEAD/stat) inside a 60s response
+                                                  // budget even after the retry loop, and still allows ~2.2 Mbps for one 8 MiB
+                                                  // write chunk. Mounts on very slow links can raise it per mount.
+    pub const DEFAULT_OPERATION_TIMEOUT: &'static str = "30s";
 
     /// Create OpendalConf from configuration map
     pub fn from_map(properties: &HashMap<String, String>) -> CommonResult<Self> {
@@ -306,6 +320,14 @@ impl OpendalConf {
             return err_box!("{} must be greater than 0", Self::READ_CONCURRENT);
         }
 
+        let operation_timeout_str = map
+            .get_string(Self::OPERATION_TIMEOUT)
+            .unwrap_or(Self::DEFAULT_OPERATION_TIMEOUT.to_string());
+        let operation_timeout = DurationUnit::from_str(&operation_timeout_str)?.as_duration();
+        if operation_timeout.is_zero() {
+            return err_box!("{} must be greater than 0", Self::OPERATION_TIMEOUT);
+        }
+
         Ok(Self {
             retry_times,
             connect_timeout,
@@ -314,6 +336,7 @@ impl OpendalConf {
             retry_max_delay_ms,
             read_chunk_size,
             read_concurrent,
+            operation_timeout,
         })
     }
 
@@ -412,7 +435,9 @@ impl Deref for OssHdfsConf {
 #[cfg(test)]
 mod opendal_conf_tests {
     use super::OpendalConf;
+    use curvine_runtime::common::DurationUnit;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     #[test]
     fn defaults_when_unset() {
@@ -421,6 +446,38 @@ mod opendal_conf_tests {
         assert_eq!(conf.read_concurrent, OpendalConf::DEFAULT_READ_CONCURRENT);
         assert_eq!(conf.read_chunk_size, 1024 * 1024);
         assert_eq!(conf.read_concurrent, 4);
+        assert_eq!(
+            conf.operation_timeout,
+            DurationUnit::from_str(OpendalConf::DEFAULT_OPERATION_TIMEOUT)
+                .unwrap()
+                .as_duration()
+        );
+        assert_eq!(conf.operation_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn operation_timeout_is_user_overridable() {
+        let props = HashMap::from([(OpendalConf::OPERATION_TIMEOUT.to_string(), "5s".to_string())]);
+        let conf = OpendalConf::from_map(&props).unwrap();
+        assert_eq!(conf.operation_timeout, Duration::from_secs(5));
+        assert_ne!(
+            conf.operation_timeout,
+            conf.connect_timeout + conf.read_timeout
+        );
+    }
+
+    #[test]
+    fn operation_timeout_rejects_zero_and_invalid_values() {
+        for value in ["0", "0s", "not-a-duration"] {
+            let props = HashMap::from([(
+                OpendalConf::OPERATION_TIMEOUT.to_string(),
+                value.to_string(),
+            )]);
+            assert!(
+                OpendalConf::from_map(&props).is_err(),
+                "{value} should be rejected"
+            );
+        }
     }
 
     #[test]
