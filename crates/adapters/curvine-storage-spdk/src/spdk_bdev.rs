@@ -1433,6 +1433,8 @@ mod test {
     #[test]
     fn spdk_write_forced_eio_marks_uncertain() {
         let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+        // No timeout: force_complete() must be the only path to uncertain.
+        bdev.io_timeout_ms = 0;
 
         let responder = std::thread::spawn(move || {
             let req = rx.recv().expect("write should submit exactly once");
@@ -1459,7 +1461,9 @@ mod test {
     /// Same as above but for flush: a forced completion must be uncertain.
     #[test]
     fn spdk_flush_forced_eio_marks_uncertain() {
-        let (bdev, rx) = test_bdev_with_fake_channel(true);
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+        // No timeout: force_complete() must be the only path to uncertain.
+        bdev.io_timeout_ms = 0;
 
         let responder = std::thread::spawn(move || {
             let req = rx.recv().expect("flush should submit exactly once");
@@ -1521,6 +1525,8 @@ mod test {
     #[test]
     fn spdk_write_forced_eshutdown_marks_uncertain() {
         let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+        // No timeout: force_complete() must be the only path to uncertain.
+        bdev.io_timeout_ms = 0;
 
         let responder = std::thread::spawn(move || {
             let req = rx.recv().expect("write should submit exactly once");
