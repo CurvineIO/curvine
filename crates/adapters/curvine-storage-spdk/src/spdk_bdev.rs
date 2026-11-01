@@ -1575,4 +1575,29 @@ mod test {
 
         std::mem::forget(bdev);
     }
+
+    /// Every blocklist code must be uncertain; codes outside it must not.
+    #[test]
+    fn is_uncertain_abort_status_covers_full_blocklist() {
+        // All 7 blocklist codes (SCT=0 Generic) must be uncertain.
+        for sc in [0x05i32, 0x07, 0x08, 0x09, 0x0a, 0x1b, 0x71] {
+            let rc = -sc;
+            assert!(
+                SpdkBdev::is_uncertain_abort_status(rc),
+                "SC=0x{sc:02x} must be classified uncertain"
+            );
+        }
+
+        // Codes not in the blocklist must be accepted (not uncertain).
+        for (sct, sc) in [(0u32, 0x02u32), (0, 0x80), (0, 0x00), (2, 0x08)] {
+            let rc = -((sct * 256 + sc) as i32);
+            assert!(
+                !SpdkBdev::is_uncertain_abort_status(rc),
+                "SCT=0x{sct:x}/SC=0x{sc:02x} must not be classified uncertain"
+            );
+        }
+
+        // rc >= 0 (success / no error) must never be uncertain.
+        assert!(!SpdkBdev::is_uncertain_abort_status(0));
+    }
 }
