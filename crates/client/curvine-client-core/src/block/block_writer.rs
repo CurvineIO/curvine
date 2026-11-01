@@ -22,22 +22,24 @@ use curvine_core_error::ErrorExt;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_io::DataSlice;
-use curvine_model::{BlockLocation, CommitBlock, LocatedBlock, StorageType, WorkerAddress};
+use curvine_model::{
+    BlockLocation, CommitBlock, ExtendedBlock, LocatedBlock, StorageType, WorkerAddress,
+};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use futures::future::{join_all, try_join_all};
 use log::warn;
 use std::sync::Arc;
 
-// Whether a partial open failure may cancel the replicas already opened in
-// this round. Reopening a committed block (the master reports len > 0, or the
-// write offset is non-zero) must not be rolled back: a cancel commit would
-// abort the already committed replicas on the workers. SPDK rewrites reuse
-// the extent without preserving the committed state (BdevLayout::prepare_write),
-// so aborting such a rewrite would free an extent the master still references.
-// Newly allocated blocks (len == 0 and pos == 0) have no committed state and
-// are cancelled best-effort.
-fn rollback_on_failure(locate: &LocatedBlock, pos: i64) -> bool {
-    locate.block.len == 0 && pos == 0
+// Whether a partial open failure may cancel/abort a block that already has
+// worker-side write state. Reopening a committed block (the master reports
+// len > 0, or the write offset is non-zero) must not be rolled back: a cancel
+// commit would abort the already committed replicas on the workers. SPDK
+// rewrites reuse the extent without preserving the committed state
+// (BdevLayout::prepare_write), so aborting such a rewrite would free an
+// extent the master still references. Newly allocated blocks (len == 0 and
+// pos == 0) have no committed state and are cancelled best-effort.
+pub(crate) fn rollback_on_failure(block: &ExtendedBlock, pos: i64) -> bool {
+    block.len == 0 && pos == 0
 }
 
 async fn finish_all_cancellations<I, F>(futures: I) -> FsResult<()>
@@ -294,7 +296,7 @@ impl BlockWriter {
 
         let inners = open_all(
             locate.locs.len(),
-            rollback_on_failure(&locate, pos),
+            rollback_on_failure(&locate.block, pos),
             |idx| {
                 WriterAdapter::new(
                     fs_context.clone(),

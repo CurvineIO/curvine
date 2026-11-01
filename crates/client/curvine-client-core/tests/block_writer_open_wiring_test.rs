@@ -38,20 +38,35 @@ use std::time::Duration;
 
 struct RecordingService {
     observed: Arc<Mutex<Vec<(i64, RequestStatus)>>>,
+    echo_mismatched_block_size: bool,
 }
 
 impl HandlerService for RecordingService {
     type Item = RecordingHandler;
 
     fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
-        RecordingHandler {
-            observed: self.observed.clone(),
-        }
+        RecordingHandler::new(self.observed.clone(), self.echo_mismatched_block_size)
     }
 }
 
 struct RecordingHandler {
     observed: Arc<Mutex<Vec<(i64, RequestStatus)>>>,
+    // When set, the Open reply echoes a block_size different from the one
+    // the client requested, driving the constructor's block-size mismatch
+    // branch (and its gated abort) under test.
+    echo_mismatched_block_size: bool,
+}
+
+impl RecordingHandler {
+    fn new(
+        observed: Arc<Mutex<Vec<(i64, RequestStatus)>>>,
+        echo_mismatched_block_size: bool,
+    ) -> Self {
+        Self {
+            observed,
+            echo_mismatched_block_size,
+        }
+    }
 }
 
 impl MessageHandler for RecordingHandler {
@@ -66,12 +81,21 @@ impl MessageHandler for RecordingHandler {
 
         if code == RpcCode::WriteBlock && status == RequestStatus::Open {
             // Respond with a writable block context so the first replica
-            // opens fully.
+            // opens fully. The echoed block_size is off by one so the
+            // constructor's block-size mismatch branch fires: `BlockWriter::new`
+            // calls with block_size = 65, the mismatch triggers the abort
+            // path under test in the block-size-mismatch tests below. For
+            // the other tests (block_size = 64) the echo matches and the
+            // open succeeds cleanly.
             let rep = BlockWriteResponse {
                 id: 1,
                 path: Some("/tmp/curvine-test-block".to_string()),
                 off: 0,
-                block_size: 64,
+                block_size: if self.echo_mismatched_block_size {
+                    64
+                } else {
+                    65
+                },
                 storage_type: StorageType::Disk.into(),
                 pipeline_status: None,
             };
@@ -94,11 +118,19 @@ struct TestEnv {
 
 impl TestEnv {
     fn new() -> Self {
+        Self::with_echo_mismatch(false)
+    }
+
+    /// `echo_mismatched_block_size` makes the handler's Open reply report a
+    /// block_size differing from the client's request, which drives the
+    /// constructor block-size-mismatch branch (and its gated abort).
+    fn with_echo_mismatch(echo_mismatched_block_size: bool) -> Self {
         let observed: Arc<Mutex<Vec<(i64, RequestStatus)>>> = Arc::new(Mutex::new(Vec::new()));
         let port = curvine_net::net::NetUtils::hold_available_port();
         let conf = ServerConf::with_hostname("127.0.0.1", port);
         let service = RecordingService {
             observed: observed.clone(),
+            echo_mismatched_block_size,
         };
         let server = RpcServer::new(conf, service);
         let rt = server.clone_rt();
@@ -230,6 +262,65 @@ async fn committed_reopen_failure_does_not_cancel_opened_replicas() {
         cancels,
         0,
         "committed reopen must not send cancel commits, observed: {:?}",
+        env.observed()
+    );
+}
+
+#[tokio::test]
+async fn remote_constructor_mismatch_aborts_fresh_block() {
+    // The handler's Open reply reports a block_size differing from the
+    // request, so `BlockWriterRemote::new` fails in its block-size mismatch
+    // branch after `write_block` succeeded. For a freshly allocated block
+    // (len == 0 && pos == 0) the constructor must send the abort commit.
+    let env = TestEnv::with_echo_mismatch(true);
+    env.wait_ready().await;
+
+    let block = ExtendedBlock::new(1, 0, StorageType::Ssd, FileType::File);
+
+    let result = BlockWriter::new(env.context.clone(), env.located_block(block), 0, 65).await;
+    assert!(
+        result.is_err(),
+        "block-size mismatch must fail the open on the first replica"
+    );
+
+    let cancels = env
+        .observed()
+        .into_iter()
+        .filter(|(_, status)| *status == RequestStatus::Cancel)
+        .count();
+    assert_eq!(
+        cancels,
+        1,
+        "the mismatch abort must fire exactly once for a fresh block, observed: {:?}",
+        env.observed()
+    );
+}
+
+#[tokio::test]
+async fn remote_constructor_mismatch_spares_committed_block() {
+    // Same mismatch, but the block is a committed reopen (len == 64): the
+    // gate must suppress the abort so the committed SPDK extent is not
+    // freed on the worker.
+    let env = TestEnv::with_echo_mismatch(true);
+    env.wait_ready().await;
+
+    let block = ExtendedBlock::new(1, 64, StorageType::Ssd, FileType::File);
+
+    let result = BlockWriter::new(env.context.clone(), env.located_block(block), 0, 65).await;
+    assert!(
+        result.is_err(),
+        "block-size mismatch must fail the open on the first replica"
+    );
+
+    let cancels = env
+        .observed()
+        .into_iter()
+        .filter(|(_, status)| *status == RequestStatus::Cancel)
+        .count();
+    assert_eq!(
+        cancels,
+        0,
+        "the mismatch abort must not fire for a committed reopen, observed: {:?}",
         env.observed()
     );
 }
