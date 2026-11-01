@@ -1427,6 +1427,38 @@ mod test {
     }
 
     #[test]
+    fn file_reader_serves_written_bytes_of_unfinalized_block() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "reader-unfinalized-block");
+        let block = ExtendedBlock::with_mem(1, "50B")?;
+        let writing = ds.open_block(&block)?;
+        // Only 20 of the 50 reserved bytes have been written and flushed.
+        ds.write_test_data(&writing, "20B")?;
+
+        // While the block is being written or finalized, its len is the reserved
+        // block size, not a committed length (#1938).
+        let readable = ds.get_readable_block(1).cloned().expect("readable block");
+        assert_eq!(readable.state(), &BlockState::Writing);
+        let _reservation = ds.reserve_file_finalize(&block)?;
+        let finalizing = ds.get_readable_block(1).cloned().expect("readable block");
+        assert_eq!(finalizing.state(), &BlockState::Finalizing);
+
+        for meta in [readable, finalizing] {
+            assert_eq!(meta.len(), 50);
+            assert_eq!(meta.committed_len(), None);
+            let dir = ds.find_dir(meta.dir_id())?;
+            let mut reader = FileLayout.open_reader(dir, &meta, 0, 50)?;
+            let region = reader.read_region(false, 50)?;
+            let bytes = match region {
+                DataSlice::Buffer(bytes) => bytes,
+                other => panic!("expected buffered read, got {other:?}"),
+            };
+            assert_eq!(&bytes[..20], b"A".repeat(20).as_slice());
+            assert!(bytes[20..].iter().all(|byte| *byte == 0));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn file_reader_clamps_physical_file_to_logical_length() -> CommonResult<()> {
         let mut ds = create_data_set(true, "reader-logical-length-boundary");
         let mut block = ExtendedBlock::with_mem(1, "50B")?;

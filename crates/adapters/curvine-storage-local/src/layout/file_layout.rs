@@ -424,14 +424,19 @@ impl BlockLayout for FileLayout {
         // sparse tail (master-side truncate up). Bytes the worker committed
         // must be present; a shorter file means the block was truncated or
         // damaged, and zero-filling it would return corrupted data as success.
-        let committed_len = meta.len.min(logical_len);
-        if device.len() < committed_len {
-            return err_box!(
-                "Block {} is truncated: committed length {}, file length {}",
-                meta.id,
-                committed_len,
-                device.len()
-            );
+        // A block that is still being written has no committed length yet:
+        // its file holds the bytes written so far, which may be fewer than
+        // the reserved block size.
+        if let Some(committed_len) = meta.committed_len() {
+            let committed_len = committed_len.min(logical_len);
+            if device.len() < committed_len {
+                return err_box!(
+                    "Block {} is truncated: committed length {}, file length {}",
+                    meta.id,
+                    committed_len,
+                    device.len()
+                );
+            }
         }
         let physical_len = device.len().min(logical_len);
         BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)
