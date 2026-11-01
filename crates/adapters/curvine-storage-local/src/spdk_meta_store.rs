@@ -1,14 +1,14 @@
 //! RocksDB-backed SPDK block metadata.
 use crate::meta_store::BlockMetaStore;
 use crate::BlockMeta;
-/// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) = 29B.
+/// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) | quarantined(1B) = 30B.
 /// O(1) per block
 use byteorder::{BigEndian, ByteOrder};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_rocksdb::{DBConf, DBEngine};
 use log::{info, warn};
 const CF_SPDK_BLOCKS: &str = "spdk_blocks";
-const VALUE_SIZE: usize = 29;
+const VALUE_SIZE: usize = 30;
 pub struct SpdkMetaStore {
     db: DBEngine,
 }
@@ -20,6 +20,8 @@ pub struct SpdkBlockRecord {
     pub size: i64,
     pub len: i64,
     pub finalized: bool,
+    /// Extent must stay reserved on restart when true.
+    pub quarantined: bool,
 }
 impl SpdkMetaStore {
     pub fn open(dir: &str, format: bool) -> CommonResult<Self> {
@@ -28,6 +30,7 @@ impl SpdkMetaStore {
         info!("SpdkMetaStore opened at {}", dir);
         Ok(Self { db })
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn put(
         &self,
         block_id: i64,
@@ -36,9 +39,10 @@ impl SpdkMetaStore {
         size: i64,
         len: i64,
         finalized: bool,
+        quarantined: bool,
     ) -> CommonResult<()> {
         let key = Self::encode_key(block_id);
-        let value = Self::encode_value(dir_id, offset, size, len, finalized);
+        let value = Self::encode_value(dir_id, offset, size, len, finalized, quarantined);
         self.db.put_cf(CF_SPDK_BLOCKS, key, value)
     }
     pub fn delete(&self, block_id: i64) -> CommonResult<()> {
@@ -96,6 +100,7 @@ impl SpdkMetaStore {
         size: i64,
         len: i64,
         finalized: bool,
+        quarantined: bool,
     ) -> [u8; VALUE_SIZE] {
         let mut buf = [0u8; VALUE_SIZE];
         BigEndian::write_u32(&mut buf[0..4], dir_id);
@@ -103,6 +108,7 @@ impl SpdkMetaStore {
         BigEndian::write_i64(&mut buf[12..20], size);
         BigEndian::write_i64(&mut buf[20..28], len);
         buf[28] = if finalized { 1 } else { 0 };
+        buf[29] = if quarantined { 1 } else { 0 };
         buf
     }
     #[inline]
@@ -122,6 +128,7 @@ impl SpdkMetaStore {
             size: BigEndian::read_i64(&bytes[12..20]),
             len: BigEndian::read_i64(&bytes[20..28]),
             finalized: bytes[28] != 0,
+            quarantined: bytes[29] != 0,
         })
     }
 }
@@ -135,6 +142,7 @@ impl BlockMetaStore for SpdkMetaStore {
             meta.actual_len,
             meta.len(),
             meta.is_final(),
+            meta.is_quarantined(),
         )
     }
 
@@ -153,20 +161,29 @@ mod test {
     #[test]
     fn put_get_delete() {
         let store = SpdkMetaStore::open(&test_dir("pgd"), true).unwrap();
-        store.put(1, 1, 0, 4096, 4096, true).unwrap();
-        store.put(2, 1, 4096, 8192, 6000, false).unwrap();
+        store.put(1, 1, 0, 4096, 4096, true, false).unwrap();
+        store.put(2, 1, 4096, 8192, 6000, false, false).unwrap();
         let r = store.get(1).unwrap().unwrap();
         assert_eq!(r.offset, 0);
         assert!(r.finalized);
+        assert!(!r.quarantined);
         store.delete(1).unwrap();
         assert!(store.get(1).unwrap().is_none());
+    }
+    #[test]
+    fn put_persists_quarantined() {
+        let store = SpdkMetaStore::open(&test_dir("quarantined"), true).unwrap();
+        store.put(1, 1, 0, 4096, 4096, false, true).unwrap();
+        let r = store.get(1).unwrap().unwrap();
+        assert!(!r.finalized);
+        assert!(r.quarantined);
     }
     #[test]
     fn scan_all() {
         let store = SpdkMetaStore::open(&test_dir("scan"), true).unwrap();
         for i in 0..100 {
             store
-                .put(i, (i % 3) as u32, i * 4096, 4096, 4096, i % 2 == 0)
+                .put(i, (i % 3) as u32, i * 4096, 4096, 4096, i % 2 == 0, false)
                 .unwrap();
         }
         assert_eq!(store.scan_all().unwrap().len(), 100);
@@ -174,8 +191,8 @@ mod test {
     #[test]
     fn dir_id_preserved() {
         let store = SpdkMetaStore::open(&test_dir("dir"), true).unwrap();
-        store.put(1, 10, 0, 4096, 4096, true).unwrap();
-        store.put(2, 20, 4096, 4096, 4096, false).unwrap();
+        store.put(1, 10, 0, 4096, 4096, true, false).unwrap();
+        store.put(2, 20, 4096, 4096, 4096, false, false).unwrap();
         let records = store.scan_all().unwrap();
         assert_eq!(records.iter().filter(|r| r.dir_id == 10).count(), 1);
         assert_eq!(records.iter().filter(|r| r.dir_id == 20).count(), 1);
@@ -183,8 +200,8 @@ mod test {
     #[test]
     fn update_key() {
         let store = SpdkMetaStore::open(&test_dir("upd"), true).unwrap();
-        store.put(1, 1, 0, 4096, 4096, false).unwrap();
-        store.put(1, 1, 0, 4096, 2048, true).unwrap();
+        store.put(1, 1, 0, 4096, 4096, false, false).unwrap();
+        store.put(1, 1, 0, 4096, 2048, true, false).unwrap();
         assert_eq!(store.get(1).unwrap().unwrap().len, 2048);
     }
     #[test]
@@ -192,7 +209,7 @@ mod test {
         let dir = test_dir("reopen");
         {
             let s = SpdkMetaStore::open(&dir, true).unwrap();
-            s.put(1, 5, 0, 4096, 4096, true).unwrap();
+            s.put(1, 5, 0, 4096, 4096, true, false).unwrap();
         }
         let s = SpdkMetaStore::open(&dir, false).unwrap();
         assert_eq!(s.scan_all().unwrap().len(), 1);

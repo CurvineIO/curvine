@@ -84,6 +84,22 @@ impl BlockStore {
         Ok(block_store)
     }
 
+    /// Wraps a pre-built dataset, bypassing `ClusterConf` (for synthetic
+    /// SPDK test datasets, which have no config-string form).
+    #[cfg(test)]
+    pub fn from_dataset_for_test(dataset: BlockDataset) -> Self {
+        BlockStore {
+            state: Arc::new(RwLock::new(dataset)),
+            uses: Arc::new(
+                (0..BLOCK_LOCK_STRIPES)
+                    .map(|_| Mutex::new(HashMap::new()))
+                    .collect(),
+            ),
+            replication_owner: None,
+            block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
+        }
+    }
+
     fn block_uses(&self, block_id: i64) -> &Mutex<HashMap<i64, BlockUse>> {
         &self.uses[block_id as u64 as usize % self.uses.len()]
     }
@@ -363,6 +379,15 @@ impl BlockStore {
         let _block_lock = self.block_lock(block.id, "abort");
         self.check_replication_owner(block.id)?;
         self.with_dataset_write("abort", |state| state.abort_block(block))
+    }
+
+    /// Abort with an uncertain (timed-out) write/flush outcome; see `Dataset::abort_block_uncertain`.
+    pub fn abort_block_uncertain(&self, block: &ExtendedBlock) -> CommonResult<()> {
+        let _block_lock = self.block_lock(block.id, "abort_uncertain");
+        self.check_replication_owner(block.id)?;
+        self.with_dataset_write("abort_uncertain", |state| {
+            state.abort_block_uncertain(block)
+        })
     }
 
     pub(crate) fn abort_replication_write(&self, block_id: i64) -> CommonResult<()> {
