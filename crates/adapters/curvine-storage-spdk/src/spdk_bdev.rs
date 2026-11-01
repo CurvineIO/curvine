@@ -1362,6 +1362,38 @@ mod test {
         std::mem::forget(bdev);
     }
 
+    /// Control: a pre-submission rejection (not EIO/ETIMEDOUT, not forced)
+    /// must not mark uncertain, and must not mark the qpair dead either.
+    #[test]
+    fn spdk_write_pre_submission_rejection_does_not_mark_uncertain() {
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+        bdev.io_timeout_ms = 0;
+
+        let responder = std::thread::spawn(move || {
+            let req = rx.recv().expect("write should submit exactly once");
+            assert!(req.completion.complete(-libc::ENOMEM));
+            rx
+        });
+
+        let err = bdev
+            .spdk_write(0, &[0u8; 512])
+            .expect_err("write should fail with a pre-submission rejection");
+        assert!(err.to_string().contains("NVMe write failed"), "{}", err);
+        assert!(
+            !bdev.io_channel.qpair_dead.load(Ordering::Acquire),
+            "pre-submission rejection must not mark qpair dead"
+        );
+        assert!(
+            !bdev.has_uncertain_writes(),
+            "pre-submission rejection is not uncertain"
+        );
+
+        let rx = responder.join().expect("responder thread must not panic");
+        assert!(rx.try_recv().is_err(), "only one submit expected");
+
+        std::mem::forget(bdev);
+    }
+
     /// Forced completion (as force_complete_qpair does on qpair failure)
     /// reports -EIO but keeps the context alive for a late real callback.
     /// It must be treated as uncertain, not a confirmed failure.
