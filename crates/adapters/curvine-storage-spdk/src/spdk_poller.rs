@@ -113,6 +113,8 @@ pub struct IoCompletion {
 struct IoCompletionInner {
     done: bool,
     status: i32,
+    /// True if synthesized by the poller, not a genuine terminal completion.
+    forced: bool,
 }
 
 impl IoCompletion {
@@ -121,22 +123,41 @@ impl IoCompletion {
             inner: Mutex::new(IoCompletionInner {
                 done: false,
                 status: 0,
+                forced: false,
             }),
             cond: Condvar::new(),
         })
     }
 
-    /// Called by C callback on completion.
+    /// Called on a genuine, terminal completion (SPDK callback or
+    /// pre-submission rejection).
     /// Returns true if this call actually completed the I/O (first call wins).
     pub fn complete(&self, status: i32) -> bool {
+        self.complete_inner(status, false)
+    }
+
+    /// Like `complete`, but for a poller-synthesized status (e.g.
+    /// force_complete_qpair, handle_unregister); not confirmed terminal.
+    pub fn force_complete(&self, status: i32) -> bool {
+        self.complete_inner(status, true)
+    }
+
+    fn complete_inner(&self, status: i32, forced: bool) -> bool {
         let mut inner = self.inner.lock().unwrap();
         if inner.done {
             return false;
         }
         inner.done = true;
         inner.status = status;
+        inner.forced = forced;
         self.cond.notify_one();
         true
+    }
+
+    /// True if the completion was synthesized by the poller, not confirmed
+    /// terminal. Meaningful only after `wait()` returns done.
+    pub fn was_forced(&self) -> bool {
+        self.inner.lock().unwrap().forced
     }
 
     /// Block until complete or timeout. Returns NVMe status.
@@ -765,7 +786,7 @@ impl SpdkPoller {
                 qs.dead.store(true, Ordering::Release);
                 for &ptr in &qs.pending {
                     unsafe {
-                        (*ptr).completion.complete(-libc::ESHUTDOWN);
+                        (*ptr).completion.force_complete(-libc::ESHUTDOWN);
                     }
                 }
                 let pending = std::mem::take(&mut qs.pending);
@@ -947,7 +968,7 @@ impl SpdkPoller {
                 // Signal but DON'T free - keep alive for late callbacks.
                 let ctx = *cb_ptr;
                 unsafe {
-                    (*ctx).completion.complete(-libc::EIO);
+                    (*ctx).completion.force_complete(-libc::EIO);
                 }
             }
             // Move to stale so reclaim_stale can free them later.
@@ -1285,6 +1306,9 @@ mod test {
         // Assert: DEAD entries completed with -EIO.
         assert_eq!(completion_1.wait(0), -libc::EIO);
         assert_eq!(completion_2.wait(0), -libc::EIO);
+        // Assert: provenance marks these as forced/nonterminal, not confirmed.
+        assert!(completion_1.was_forced());
+        assert!(completion_2.was_forced());
 
         // Assert: LIVE entry NOT completed (timeout with 1ms).
         assert_eq!(completion_3.wait(1000), -libc::ETIMEDOUT);
@@ -1390,6 +1414,29 @@ mod test {
 
         assert!(!completion.complete(99));
         assert_eq!(completion.wait(0), 42);
+    }
+
+    #[test]
+    fn complete_is_not_forced_but_force_complete_is() {
+        let completion = IoCompletion::new();
+        assert!(completion.complete(-libc::EIO));
+        assert_eq!(completion.wait(0), -libc::EIO);
+        assert!(
+            !completion.was_forced(),
+            "genuine completion must not be marked forced"
+        );
+
+        let forced = IoCompletion::new();
+        assert!(forced.force_complete(-libc::EIO));
+        assert_eq!(forced.wait(0), -libc::EIO);
+        assert!(
+            forced.was_forced(),
+            "force_complete must mark the completion as forced"
+        );
+
+        // First-call-wins applies across complete/force_complete too.
+        assert!(!forced.complete(0));
+        assert!(forced.was_forced(), "second caller must not clear forced");
     }
 
     #[test]

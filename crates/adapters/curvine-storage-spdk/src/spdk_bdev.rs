@@ -589,8 +589,9 @@ impl SpdkBdev {
                 if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                     self.io_channel.qpair_dead.store(true, Ordering::Release);
                 }
-                if rc == -libc::ETIMEDOUT {
-                    // Write may still complete later; not a confirmed failure.
+                if rc == -libc::ETIMEDOUT || completion.was_forced() {
+                    // Wait timed out, or the poller synthesized this
+                    // status (e.g. force_complete_qpair); not confirmed.
                     self.uncertain_writes.store(true, Ordering::Release);
                 }
                 return err_box!(
@@ -630,8 +631,9 @@ impl SpdkBdev {
             if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                 self.io_channel.qpair_dead.store(true, Ordering::Release);
             }
-            if rc == -libc::ETIMEDOUT {
-                // Flush may still complete later; not a confirmed failure.
+            if rc == -libc::ETIMEDOUT || completion.was_forced() {
+                // Wait timed out, or the poller synthesized this
+                // status (e.g. force_complete_qpair); not confirmed.
                 self.uncertain_writes.store(true, Ordering::Release);
             }
             return err_box!(
@@ -1350,6 +1352,62 @@ mod test {
         assert!(
             !bdev.has_uncertain_writes(),
             "confirmed EIO is not uncertain"
+        );
+
+        let rx = responder.join().expect("responder thread must not panic");
+        assert!(rx.try_recv().is_err(), "only one submit expected");
+
+        std::mem::forget(bdev);
+    }
+
+    /// Forced completion (as force_complete_qpair does on qpair failure)
+    /// reports -EIO but keeps the context alive for a late real callback.
+    /// It must be treated as uncertain, not a confirmed failure.
+    #[test]
+    fn spdk_write_forced_eio_marks_uncertain() {
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+
+        let responder = std::thread::spawn(move || {
+            let req = rx.recv().expect("write should submit exactly once");
+            assert!(req.completion.force_complete(-libc::EIO));
+            rx
+        });
+
+        let err = bdev
+            .spdk_write(0, &[0u8; 512])
+            .expect_err("write should fail with a forced, nonterminal EIO");
+        assert!(err.to_string().contains("NVMe write failed"), "{}", err);
+        assert!(bdev.io_channel.qpair_dead.load(Ordering::Acquire));
+        assert!(
+            bdev.has_uncertain_writes(),
+            "forced, nonterminal EIO must be uncertain"
+        );
+
+        let rx = responder.join().expect("responder thread must not panic");
+        assert!(rx.try_recv().is_err(), "only one submit expected");
+
+        std::mem::forget(bdev);
+    }
+
+    /// Same as above but for flush: a forced completion must be uncertain.
+    #[test]
+    fn spdk_flush_forced_eio_marks_uncertain() {
+        let (bdev, rx) = test_bdev_with_fake_channel(true);
+
+        let responder = std::thread::spawn(move || {
+            let req = rx.recv().expect("flush should submit exactly once");
+            assert!(req.completion.force_complete(-libc::EIO));
+            rx
+        });
+
+        let err = bdev
+            .spdk_flush()
+            .expect_err("flush should fail with a forced, nonterminal EIO");
+        assert!(err.to_string().contains("NVMe flush failed"), "{}", err);
+        assert!(bdev.io_channel.qpair_dead.load(Ordering::Acquire));
+        assert!(
+            bdev.has_uncertain_writes(),
+            "forced, nonterminal EIO must be uncertain"
         );
 
         let rx = responder.join().expect("responder thread must not panic");
