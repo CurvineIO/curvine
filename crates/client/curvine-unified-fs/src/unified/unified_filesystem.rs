@@ -752,24 +752,27 @@ impl UnifiedFileSystem {
         self.open_with_opts(path, opts, flags).await
     }
 
-    pub async fn open_with_opts(
-        &self,
-        path: &Path,
+    // The open path is boxed: in debug builds every nested async layer keeps
+    // its own copy of the inner future on the stack, and FUSE request tasks
+    // run on 2 MiB worker stacks.
+    pub fn open_with_opts<'a>(
+        &'a self,
+        path: &'a Path,
         opts: CreateFileOpts,
         flags: OpenFlags,
-    ) -> FsResult<UnifiedWriter> {
-        self.open_with_opts0(path, opts, flags, true).await
+    ) -> impl Future<Output = FsResult<UnifiedWriter>> + 'a {
+        Box::pin(self.open_with_opts0(path, opts, flags, true))
     }
 
     /// `open_with_opts` without first-block pre-allocation on the Curvine
     /// side, for a caller that completes the file without writing.
-    pub async fn open_without_first_block(
-        &self,
-        path: &Path,
+    pub fn open_without_first_block<'a>(
+        &'a self,
+        path: &'a Path,
         opts: CreateFileOpts,
         flags: OpenFlags,
-    ) -> FsResult<UnifiedWriter> {
-        self.open_with_opts0(path, opts, flags, false).await
+    ) -> impl Future<Output = FsResult<UnifiedWriter>> + 'a {
+        Box::pin(self.open_with_opts0(path, opts, flags, false))
     }
 
     async fn open_cv_writer(

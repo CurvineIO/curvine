@@ -34,6 +34,7 @@ use curvine_rpc::client::ClientConf;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use log::info;
 use log::warn;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -164,24 +165,27 @@ impl CurvineFileSystem {
         self.open_with_opts(path, create_opts, flags).await
     }
 
-    pub async fn open_with_opts(
-        &self,
-        path: &Path,
+    // The two public entry points return the inner future instead of being
+    // `async fn`s: another async layer here grows the stack of every caller
+    // (FUSE request tasks run on 2 MiB worker stacks).
+    pub fn open_with_opts<'a>(
+        &'a self,
+        path: &'a Path,
         opts: CreateFileOpts,
         flags: OpenFlags,
-    ) -> FsResult<FsWriter> {
-        self.open_with_opts0(path, opts, flags, true).await
+    ) -> impl Future<Output = FsResult<FsWriter>> + 'a {
+        self.open_with_opts0(path, opts, flags, true)
     }
 
     /// `open_with_opts` without first-block pre-allocation, for a caller that
     /// completes the file without writing (e.g. FUSE `O_CREAT|O_RDONLY`).
-    pub async fn open_without_first_block(
-        &self,
-        path: &Path,
+    pub fn open_without_first_block<'a>(
+        &'a self,
+        path: &'a Path,
         opts: CreateFileOpts,
         flags: OpenFlags,
-    ) -> FsResult<FsWriter> {
-        self.open_with_opts0(path, opts, flags, false).await
+    ) -> impl Future<Output = FsResult<FsWriter>> + 'a {
+        self.open_with_opts0(path, opts, flags, false)
     }
 
     async fn open_with_opts0(
