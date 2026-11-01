@@ -14,6 +14,8 @@ const CF_SPDK_BLOCKS: &str = "spdk_blocks";
 const VALUE_SIZE: usize = 30;
 /// Pre-quarantine record size (no quarantined byte); must stay decodable.
 const LEGACY_VALUE_SIZE: usize = 29;
+/// Byte offset of the quarantined flag (30B format).
+const QUARANTINED_BYTE: usize = 29;
 pub struct SpdkMetaStore {
     db: DBEngine,
     /// Test-only: forces the next put() to fail.
@@ -128,7 +130,7 @@ impl SpdkMetaStore {
         BigEndian::write_i64(&mut buf[12..20], size);
         BigEndian::write_i64(&mut buf[20..28], len);
         buf[28] = if finalized { 1 } else { 0 };
-        buf[29] = if quarantined { 1 } else { 0 };
+        buf[QUARANTINED_BYTE] = if quarantined { 1 } else { 0 };
         buf
     }
     #[inline]
@@ -142,7 +144,7 @@ impl SpdkMetaStore {
             );
         }
         // Missing in legacy 29B records -> defaults to not quarantined.
-        let quarantined = bytes.get(VALUE_SIZE - 1).is_some_and(|b| *b != 0);
+        let quarantined = bytes.get(QUARANTINED_BYTE).is_some_and(|b| *b != 0);
         Ok(SpdkBlockRecord {
             block_id,
             dir_id: BigEndian::read_u32(&bytes[0..4]),
