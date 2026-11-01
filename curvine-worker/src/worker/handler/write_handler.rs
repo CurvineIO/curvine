@@ -401,9 +401,17 @@ impl WriteHandler {
                 commit,
                 commit_err
             );
-            // Same re-entrancy guard as the branches above, so a re-entrant completion call can't reach commit_block() again.
-            self.is_commit = true;
-            self.lease.take();
+            // A transient finalize failure rolls the block back to Writing
+            // (retryable), so only latch is_commit if it's actually terminal:
+            // removed, quarantined, or already finalized.
+            let terminal = match self.store.get_block(context.block.id) {
+                Ok(meta) => meta.is_quarantined() || meta.is_final(),
+                Err(_) => true,
+            };
+            if terminal {
+                self.is_commit = true;
+                self.lease.take();
+            }
             return Err(commit_err);
         }
         self.is_commit = true;
@@ -1237,6 +1245,119 @@ mod tests {
             second.is_ok(),
             "re-entrant call after a commit_block() failure should be treated as an \
              idempotent no-op by the is_commit guard: {second:?}"
+        );
+
+        Ok(())
+    }
+
+    // Transient finalize failure: not terminal, handler must stay open.
+    #[test]
+    fn complete_keeps_handler_open_after_transient_finalize_failure() -> FsResult<()> {
+        // 0 len: RecordingBlockIO writes no real bytes, so the file stays
+        // empty - avoids a real length mismatch masking the injected one.
+        let block_size = 0_i64;
+        let block = ExtendedBlock::new(43, block_size, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("complete-transient-finalize-failure")?;
+        store.open_block(&block).map_err(FsError::from)?;
+
+        let file = BlockWriteContext::new(
+            RecordingBlockIO {
+                operations: Arc::new(Mutex::new(Vec::new())),
+            },
+            0,
+            block_size,
+            0,
+        )?;
+        let context = WriteContext {
+            block: block.clone(),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+            dir_id: 0,
+            dir_metrics: None,
+        };
+
+        let lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(context),
+            file: Some(file),
+            lease,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        store.set_force_transient_finalize_failure_for_test(true);
+        let err = handler.complete(&msg, true).unwrap_err();
+        store.set_force_transient_finalize_failure_for_test(false);
+        assert!(
+            err.to_string()
+                .contains("injected transient finalize failure"),
+            "unexpected error: {err}"
+        );
+
+        // Must NOT be latched: the block rolled back to Writing, not terminal.
+        assert!(
+            !handler.is_commit,
+            "is_commit must stay false after a transient (retryable) finalize failure"
+        );
+        assert!(
+            handler.lease.is_some(),
+            "the write lease must stay held after a transient finalize failure"
+        );
+        let meta = store.get_block(block.id).map_err(FsError::from)?;
+        assert_eq!(
+            meta.state(),
+            &curvine_storage_local::BlockState::Writing,
+            "block must be rolled back to Writing, not left in some other state"
+        );
+
+        // A retried Complete on the same handler must reach commit_block()
+        // again (not report false success), and now succeed since the fault
+        // injection is disabled.
+        let retried = handler.complete(&msg, true);
+        assert!(
+            retried.is_ok(),
+            "retried completion must actually finalize the block: {retried:?}"
+        );
+        assert!(
+            handler.is_commit,
+            "is_commit must be set once the retry actually finalizes the block"
+        );
+        assert!(
+            handler.lease.is_none(),
+            "the write lease must be released once the block is actually finalized"
+        );
+        let meta = store.get_block(block.id).map_err(FsError::from)?;
+        assert!(
+            meta.is_final(),
+            "block must be finalized after the successful retry"
         );
 
         Ok(())

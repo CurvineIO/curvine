@@ -65,6 +65,9 @@ pub struct BlockStore {
     block_locks: Arc<Vec<Mutex<()>>>,
     uses: Arc<Vec<Mutex<HashMap<i64, BlockUse>>>>,
     replication_owner: Option<String>,
+    /// Test-only: forces the next finalize prepare to fail transiently.
+    #[cfg(test)]
+    force_transient_finalize_failure: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BlockStore {
@@ -79,6 +82,8 @@ impl BlockStore {
             ),
             replication_owner: None,
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
+            #[cfg(test)]
+            force_transient_finalize_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         Ok(block_store)
@@ -97,7 +102,14 @@ impl BlockStore {
             ),
             replication_owner: None,
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
+            force_transient_finalize_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_force_transient_finalize_failure_for_test(&self, enabled: bool) {
+        self.force_transient_finalize_failure
+            .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
     fn block_uses(&self, block_id: i64) -> &Mutex<HashMap<i64, BlockUse>> {
@@ -313,6 +325,15 @@ impl BlockStore {
 
         let started = Instant::now();
         let plan = reservation.prepare(block.len);
+        #[cfg(test)]
+        let plan = if self
+            .force_transient_finalize_failure
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            curvine_core_error::err_box!("injected transient finalize failure for test")
+        } else {
+            plan
+        };
         self.observe_file_layout_operation("finalize", started.elapsed());
         let plan = match plan {
             Ok(plan) => plan,
