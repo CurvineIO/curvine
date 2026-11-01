@@ -68,6 +68,9 @@ pub struct BlockStore {
     /// Test-only: forces the next finalize prepare to fail transiently.
     #[cfg(test)]
     force_transient_finalize_failure: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only: forces the next abort to fail transiently.
+    #[cfg(test)]
+    force_transient_abort_failure: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BlockStore {
@@ -84,6 +87,8 @@ impl BlockStore {
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
             #[cfg(test)]
             force_transient_finalize_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            force_transient_abort_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         Ok(block_store)
@@ -103,12 +108,19 @@ impl BlockStore {
             replication_owner: None,
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
             force_transient_finalize_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            force_transient_abort_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn set_force_transient_finalize_failure_for_test(&self, enabled: bool) {
         self.force_transient_finalize_failure
+            .store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_force_transient_abort_failure_for_test(&self, enabled: bool) {
+        self.force_transient_abort_failure
             .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
@@ -399,6 +411,13 @@ impl BlockStore {
     pub fn abort_block(&self, block: &ExtendedBlock) -> CommonResult<()> {
         let _block_lock = self.block_lock(block.id, "abort");
         self.check_replication_owner(block.id)?;
+        #[cfg(test)]
+        if self
+            .force_transient_abort_failure
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return curvine_core_error::err_box!("injected transient abort failure for test");
+        }
         self.with_dataset_write("abort", |state| state.abort_block(block))
     }
 
@@ -406,6 +425,13 @@ impl BlockStore {
     pub fn abort_block_uncertain(&self, block: &ExtendedBlock) -> CommonResult<()> {
         let _block_lock = self.block_lock(block.id, "abort_uncertain");
         self.check_replication_owner(block.id)?;
+        #[cfg(test)]
+        if self
+            .force_transient_abort_failure
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return curvine_core_error::err_box!("injected transient abort failure for test");
+        }
         self.with_dataset_write("abort_uncertain", |state| {
             state.abort_block_uncertain(block)
         })

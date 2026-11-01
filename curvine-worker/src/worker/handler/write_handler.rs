@@ -332,6 +332,16 @@ impl WriteHandler {
         Ok(())
     }
 
+    /// True if safe to latch is_commit (removed/quarantined/finalized);
+    /// false if still Writing or unreadable (stay retryable).
+    fn block_is_terminal(&self, block_id: i64) -> bool {
+        match self.store.get_raw_block_opt(block_id) {
+            Ok(Some(meta)) => meta.is_quarantined() || meta.is_final(),
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    }
+
     pub fn complete(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
         if self.is_commit {
             return if !msg.data.is_empty() {
@@ -368,9 +378,11 @@ impl WriteHandler {
                         abort_err
                     );
                 }
-                // Guard against a re-entrant completion call bypassing the quarantine.
-                self.is_commit = true;
-                self.lease.take();
+                // Latch only if terminal; stay retryable otherwise.
+                if self.block_is_terminal(context.block.id) {
+                    self.is_commit = true;
+                    self.lease.take();
+                }
                 return Err(flush_err.into());
             }
             drop(file);
@@ -384,9 +396,11 @@ impl WriteHandler {
                     abort_err
                 );
             }
-            // Same re-entrancy guard as above, for consistency.
-            self.is_commit = true;
-            self.lease.take();
+            // Same as above.
+            if self.block_is_terminal(context.block.id) {
+                self.is_commit = true;
+                self.lease.take();
+            }
             return err_box!(
                 "Invalid block length: {}, block size: {}",
                 context.block.len,
@@ -404,12 +418,7 @@ impl WriteHandler {
             // Only latch is_commit if truly terminal; stay retryable
             // otherwise. Use the raw pending meta, not get_block_opt():
             // during a rewrite it can mask a transient rollback.
-            let terminal = match self.store.get_raw_block_opt(context.block.id) {
-                Ok(Some(meta)) => meta.is_quarantined() || meta.is_final(),
-                Ok(None) => true,
-                Err(_) => false,
-            };
-            if terminal {
+            if self.block_is_terminal(context.block.id) {
                 self.is_commit = true;
                 self.lease.take();
             }
@@ -1535,6 +1544,240 @@ mod tests {
         assert!(
             handler.lease.is_none(),
             "the write lease must be released once the rewrite is actually finalized"
+        );
+
+        Ok(())
+    }
+
+    /// A transient abort failure must not latch is_commit; stay retryable.
+    #[test]
+    fn complete_keeps_handler_open_after_transient_abort_failure_on_flush_error() -> FsResult<()> {
+        let block_size = 1024_i64;
+        let block = ExtendedBlock::new(45, block_size, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("complete-transient-abort-failure-flush")?;
+        store.open_block(&block).map_err(FsError::from)?;
+
+        let file = BlockWriteContext::new(FailingFlushBlockIO, 0, block_size, 0)?;
+        let context = WriteContext {
+            block: block.clone(),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+            dir_id: 0,
+            dir_metrics: None,
+        };
+        let lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(context),
+            file: Some(file),
+            lease,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        store.set_force_transient_abort_failure_for_test(true);
+        let err = handler.complete(&msg, true).unwrap_err();
+        store.set_force_transient_abort_failure_for_test(false);
+        assert!(
+            err.to_string().contains("flush failed"),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            !handler.is_commit,
+            "is_commit must stay false after a transient abort failure"
+        );
+        assert!(
+            handler.lease.is_some(),
+            "the write lease must stay held after a transient abort failure"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Writing),
+            "block must remain Writing, not left in some other state"
+        );
+
+        // Cancel-on-failure cleanup, fault injection now disabled.
+        let cancel_msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(2)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+        let second = handler.complete(&cancel_msg, false);
+        assert!(
+            second.is_ok(),
+            "retried cancel must actually abort the block: {second:?}"
+        );
+        assert!(
+            handler.is_commit,
+            "is_commit must be set once the retry actually aborts the block"
+        );
+        assert!(
+            handler.lease.is_none(),
+            "the write lease must be released once the block is actually aborted"
+        );
+        assert!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .is_none(),
+            "block must be fully removed after a successful abort"
+        );
+
+        Ok(())
+    }
+
+    /// Same scenario, but on the length-mismatch abort path.
+    #[test]
+    fn complete_keeps_handler_open_after_transient_abort_failure_on_length_mismatch() -> FsResult<()>
+    {
+        let block_size = 1024_i64;
+        let block = ExtendedBlock::new(46, block_size, StorageType::Disk, FileType::File);
+        // Oversized: triggers the length-check branch, not commit_block().
+        let oversized_block = ExtendedBlock {
+            len: block_size + 1,
+            ..block.clone()
+        };
+
+        let store = create_test_store("complete-transient-abort-failure-length")?;
+        store.open_block(&block).map_err(FsError::from)?;
+
+        let file = BlockWriteContext::new(
+            RecordingBlockIO {
+                operations: Arc::new(Mutex::new(Vec::new())),
+            },
+            0,
+            block_size,
+            0,
+        )?;
+        let context = WriteContext {
+            block: oversized_block.clone(),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+            dir_id: 0,
+            dir_metrics: None,
+        };
+        let lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(context),
+            file: Some(file),
+            lease,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(oversized_block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        store.set_force_transient_abort_failure_for_test(true);
+        let err = handler.complete(&msg, true).unwrap_err();
+        store.set_force_transient_abort_failure_for_test(false);
+        assert!(
+            err.to_string().contains("Invalid block length"),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            !handler.is_commit,
+            "is_commit must stay false after a transient abort failure"
+        );
+        assert!(
+            handler.lease.is_some(),
+            "the write lease must stay held after a transient abort failure"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Writing),
+            "block must remain Writing, not left in some other state"
+        );
+
+        // Retry: abort now succeeds, same error but terminal this time.
+        let retried = handler.complete(&msg, true);
+        assert!(
+            retried.is_err(),
+            "the length-mismatch error is reported on every attempt"
+        );
+        assert!(
+            handler.is_commit,
+            "is_commit must be set once the retry actually aborts the block"
+        );
+        assert!(
+            handler.lease.is_none(),
+            "the write lease must be released once the block is actually aborted"
+        );
+        assert!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .is_none(),
+            "block must be fully removed after a successful abort"
         );
 
         Ok(())
