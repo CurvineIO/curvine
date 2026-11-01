@@ -1187,9 +1187,13 @@ impl NodeState {
         let _guard = self.lock_path(&path).await;
 
         let handle = if flags.read_only() {
+            // The file is completed right away, so a pre-allocated first
+            // block would only be journaled, reserved and released again.
             let writer = self
-                .new_writer(&path, flags.set_write_only(), opts.clone())
+                .fs
+                .open_without_first_block(&path, opts.clone(), flags.set_write_only())
                 .await?;
+            let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer);
             let mut status = writer.status().clone();
             writer.complete(None).await?;
 

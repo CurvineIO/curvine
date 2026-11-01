@@ -29,10 +29,11 @@ use curvine_model::{ListOptions, OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, ClientAddressProto, ClientHeartbeatRequest,
     ClientHeartbeatResponse, CompleteFileRequest, CompleteFileResponse, CreateFileRequest,
-    CreateLeaderSnapshotRequest, CreateLeaderSnapshotResponse, DeleteRequest, EmptyTrashRequest,
-    EmptyTrashResponse, GetFilesystemInfoRequest, ListTrashRequest, ListTrashResponse,
-    MkdirOptsProto, MkdirRequest, MountRequest, RenameRequest, RestoreTrashRequest,
-    RestoreTrashResponse, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
+    CreateFileResponse, CreateLeaderSnapshotRequest, CreateLeaderSnapshotResponse, DeleteRequest,
+    EmptyTrashRequest, EmptyTrashResponse, GetFilesystemInfoRequest, ListTrashRequest,
+    ListTrashResponse, MkdirOptsProto, MkdirRequest, MountRequest, OpenFileRequest,
+    OpenFileResponse, RenameRequest, RestoreTrashRequest, RestoreTrashResponse,
+    WorkerHeartbeatRequest, WorkerHeartbeatResponse,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -47,7 +48,9 @@ use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use curvine_runtime::sync::StateCtl;
 use curvine_server::master::fs::state::SessionHeartbeat;
-use curvine_server::master::fs::{DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus};
+use curvine_server::master::fs::{
+    CompleteFileOptions, DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus,
+};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
 use curvine_server::master::meta::trash;
@@ -3560,6 +3563,7 @@ fn handler_only_flush_without_snapshot_persists_block() -> CommonResult<()> {
         inode_id: None,
         set_attr_opts: None,
         return_file_blocks: Some(false),
+        release_block_id: None,
     };
     let msg = Builder::new_rpc(RpcCode::CompleteFile)
         .proto_header(req)
@@ -4423,5 +4427,204 @@ fn rename_rejects_master_internal_flags() -> CommonResult<()> {
     )?;
     assert!(fs.exists("/internal-flag-moved.log")?);
 
+    Ok(())
+}
+
+fn first_block_client() -> Option<ClientAddressProto> {
+    Some(ProtoUtils::client_address_to_pb(ClientAddress::default()))
+}
+
+fn rpc_create(
+    handler: &MasterHandler,
+    path: &str,
+    first_block_client: Option<ClientAddressProto>,
+) -> CommonResult<CreateFileResponse> {
+    let req = CreateFileRequest {
+        path: path.to_string(),
+        flags: OpenFlags::new_create().value(),
+        first_block_client,
+        ..Default::default()
+    };
+    let msg = Builder::new_rpc(RpcCode::CreateFile)
+        .req_id(Utils::req_id())
+        .proto_header(req)
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    handler.retry_check_create_file(&mut ctx)?.parse_header()
+}
+
+fn rpc_open(
+    handler: &MasterHandler,
+    path: &str,
+    flags: OpenFlags,
+    first_block_client: Option<ClientAddressProto>,
+) -> CommonResult<OpenFileResponse> {
+    let req = OpenFileRequest {
+        path: path.to_string(),
+        flags: flags.value(),
+        first_block_client,
+        ..Default::default()
+    };
+    let msg = Builder::new_rpc(RpcCode::OpenFile)
+        .req_id(Utils::req_id())
+        .proto_header(req)
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    handler.retry_check_open_file(&mut ctx)?.parse_header()
+}
+
+fn rpc_close(
+    handler: &MasterHandler,
+    path: &str,
+    len: i64,
+    commit_blocks: Vec<CommitBlock>,
+    release_block_id: Option<i64>,
+) -> CommonResult<()> {
+    let req = CompleteFileRequest {
+        path: path.to_string(),
+        len,
+        commit_blocks: commit_blocks
+            .into_iter()
+            .map(ProtoUtils::commit_block_to_pb)
+            .collect(),
+        release_block_id,
+        ..Default::default()
+    };
+    let msg = Builder::new_rpc(RpcCode::CompleteFile)
+        .req_id(Utils::req_id())
+        .proto_header(req)
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    handler.complete_file(&mut ctx)?;
+    Ok(())
+}
+
+// Issue #433: a small file needs CreateFile + CompleteFile only.
+#[test]
+fn create_returns_first_block_and_close_commits_it() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_for_test("first-block-create");
+    let fs = handler.clone_fs();
+    let path = "/first_block_a.log";
+
+    let rep = rpc_create(&handler, path, first_block_client())?;
+    let block = ProtoUtils::located_block_from_pb(rep.first_block.expect("first block"));
+    assert_eq!(block.block.len, 0);
+    assert!(!block.locs.is_empty());
+
+    // Written: a plain close commits block 0 without any AddBlock.
+    rpc_close(&handler, path, 10, vec![full_commit(&block, 10)], None)?;
+    let blocks = fs.get_block_locations(path)?;
+    assert_eq!(blocks.status.len, 10);
+    assert_eq!(blocks.block_locs.len(), 1);
+    assert_eq!(blocks.block_locs[0].block.id, block.block.id);
+    Ok(())
+}
+
+#[test]
+fn empty_file_close_releases_the_first_block() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_for_test("first-block-empty");
+    let fs = handler.clone_fs();
+    let path = "/first_block_empty.log";
+
+    let rep = rpc_create(&handler, path, first_block_client())?;
+    let block = ProtoUtils::located_block_from_pb(rep.first_block.unwrap());
+    rpc_close(&handler, path, 0, vec![], Some(block.block.id))?;
+
+    // Without the release, the empty block 0 stays in the block list.
+    let blocks = fs.get_block_locations(path)?;
+    assert_eq!(blocks.status.len, 0);
+    assert!(blocks.block_locs.is_empty());
+    Ok(())
+}
+
+#[test]
+fn requests_without_first_block_client_keep_the_old_contract() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_for_test("first-block-legacy");
+    let fs = handler.clone_fs();
+
+    let rep = rpc_create(&handler, "/first_block_old.log", None)?;
+    assert!(rep.first_block.is_none());
+    assert!(fs
+        .get_block_locations("/first_block_old.log")?
+        .block_locs
+        .is_empty());
+
+    let rep = rpc_open(
+        &handler,
+        "/first_block_old2.log",
+        OpenFlags::new_create(),
+        None,
+    )?;
+    assert!(rep.first_block.is_none());
+    Ok(())
+}
+
+#[test]
+fn open_allocates_first_block_only_when_the_file_ends_up_empty() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_for_test("first-block-open");
+    let path = "/first_block_open.log";
+
+    // O_CREAT on a missing file.
+    let rep = rpc_open(
+        &handler,
+        path,
+        OpenFlags::new_create(),
+        first_block_client(),
+    )?;
+    let block = ProtoUtils::located_block_from_pb(rep.first_block.expect("first block"));
+    rpc_close(&handler, path, 10, vec![full_commit(&block, 10)], None)?;
+
+    // Reopen for append: the file has data, so the old AddBlock path stays.
+    let append = OpenFlags::new_write_only().set_append(true);
+    let rep = rpc_open(&handler, path, append, first_block_client())?;
+    assert!(rep.first_block.is_none());
+    rpc_close(&handler, path, 10, vec![], None)?;
+
+    // O_TRUNC empties the file, so block 0 comes back again.
+    let trunc = OpenFlags::new_write_only().set_truncate(true);
+    let rep = rpc_open(&handler, path, trunc, first_block_client())?;
+    let block = ProtoUtils::located_block_from_pb(rep.first_block.expect("first block"));
+    rpc_close(&handler, path, 4, vec![full_commit(&block, 4)], None)?;
+    assert_eq!(handler.clone_fs().get_block_locations(path)?.status.len, 4);
+
+    // Read-only open never allocates.
+    let rep = rpc_open(
+        &handler,
+        path,
+        OpenFlags::new_read_only(),
+        first_block_client(),
+    )?;
+    assert!(rep.first_block.is_none());
+    Ok(())
+}
+
+#[test]
+fn released_first_block_replays_to_the_same_tree() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, loader, _js2, fs2) = setup_pair("first-block-release");
+    let path = "/first_block_replay.log";
+    let status = fs.create(path, true)?;
+    let block = fs
+        .alloc_first_block(path, status.id, ClientAddress::default())
+        .expect("first block");
+    fs.complete_file_with_opts(
+        path,
+        Some(status.id),
+        0,
+        vec![],
+        "",
+        CompleteFileOptions {
+            release_block_id: Some(block.block.id),
+            ..Default::default()
+        },
+    )?;
+
+    replay_all_then_duplicate_last(&js, &loader)?;
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
+    assert!(fs2.get_block_locations(path)?.block_locs.is_empty());
     Ok(())
 }

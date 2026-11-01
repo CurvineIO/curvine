@@ -70,10 +70,13 @@ pub struct CvMetadataSnapshotPage {
     pub epoch: u64,
 }
 
-struct CompleteFileOptions {
-    only_flush: bool,
-    return_file_blocks: bool,
-    set_attr_opts: Option<SetAttrOpts>,
+#[derive(Default)]
+pub struct CompleteFileOptions {
+    pub only_flush: bool,
+    pub return_file_blocks: bool,
+    pub set_attr_opts: Option<SetAttrOpts>,
+    /// Pre-allocated block the client never wrote; see `alloc_first_block`.
+    pub release_block_id: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -93,6 +96,13 @@ pub struct MasterFilesystem {
     /// never reclaim the same entry and the blocking caller always reports the
     /// totals it actually reclaimed.
     pending_drain: Arc<Mutex<()>>,
+    /// Leader-local registry of blocks handed out by `alloc_first_block` that
+    /// only their creator may still release (not journaled). An entry is
+    /// dropped as soon as the block is committed or handed to any other
+    /// caller (OpenFile for write, AddBlock reuse, AssignWorker), so a stale
+    /// release can never remove a block another writer is using. Lock order:
+    /// always taken after `fs_dir`, never held while taking another lock.
+    pre_alloc: Arc<Mutex<HashMap<i64, PreAllocBlock>>>,
     /// `/.Trash/.purging` entries a synchronous delete is still purging. Entries
     /// are registered under the namespace write lock that stages them, so the
     /// background purger, which scans under the read lock, never adopts an entry
@@ -111,6 +121,19 @@ impl Drop for PurgingGuard<'_> {
         self.set.lock().remove(self.path);
     }
 }
+
+/// Reservation taken for a pre-allocated first block.
+struct PreAllocBlock {
+    block_size: i64,
+    /// `(worker_id, scheduled_since_ms)` right after the reservation.
+    stamps: Vec<(u32, u64)>,
+    alloc_ms: u64,
+}
+
+/// Above this many unreleased pre-allocations, entries older than the
+/// reservation timeout are pruned. Pruning only turns a later release into a
+/// no-op, which leaves the same empty block an unwritten AddBlock leaves.
+const PRE_ALLOC_PRUNE_THRESHOLD: usize = 65536;
 
 pub struct BlockReportResult {
     pub delete_blocks: Vec<i64>,
@@ -207,6 +230,7 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
             pending_drain: Default::default(),
+            pre_alloc: Default::default(),
             purging_inflight: Default::default(),
         }
     }
@@ -228,6 +252,9 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
             pending_drain: Default::default(),
+            // Shared like `session_map`: CreateFile and CompleteFile may be
+            // served by different handles on the same master.
+            pre_alloc: js.fs().pre_alloc.clone(),
             // Shared like `session_map`: every handle must agree on which
             // `.purging` entries a synchronous delete still owns.
             purging_inflight: js.fs().purging_inflight.clone(),
@@ -934,6 +961,10 @@ impl MasterFilesystem {
         let status = fs_dir.reopen_file(&inp, opts.client_name)?;
         let file = inode.as_file_ref()?;
         let blocks = if !file.blocks.is_empty() {
+            // The opener may write any returned block, including one still
+            // pre-allocated by its creator, so that creator may no longer
+            // release it.
+            self.forget_pre_alloc(file.blocks.iter().map(|v| v.id));
             self.get_block_locs(path, &fs_dir, file)?
         } else {
             vec![]
@@ -1163,6 +1194,87 @@ impl MasterFilesystem {
         }
     }
 
+    /// Allocates the first block of a file that is still empty, so a writer
+    /// can skip the AddBlock round trip after CreateFile/OpenFile.
+    ///
+    /// Best effort: returns `None` when the file already has blocks (another
+    /// writer, or a retried create) or no worker can take the block. The
+    /// client then falls back to a normal AddBlock, which is the old path.
+    ///
+    /// The emptiness check and the allocation run under one `fs_dir` write
+    /// lock, so two concurrent creates of one path cannot both get a block.
+    /// The returned block is registered in `pre_alloc`; only that registration
+    /// makes a later `release_block_id` effective.
+    pub fn alloc_first_block(
+        &self,
+        path: &str,
+        inode_id: i64,
+        client_addr: ClientAddress,
+    ) -> Option<LocatedBlock> {
+        let res = (|| -> FsResult<Option<LocatedBlock>> {
+            let mut fs_dir = self.fs_dir.write();
+            let inode = Self::resolve_file_inode(&fs_dir, path, Some(inode_id))?;
+            let file = inode.as_file_ref()?;
+            if !file.blocks.is_empty() || file.len != 0 {
+                return Ok(None);
+            }
+            let block_size = file.block_size as i64;
+            let block =
+                self.allocate_block(&mut fs_dir, path, inode, client_addr, vec![], vec![], 0)?;
+            let stamps = self.worker_manager.read().schedule_stamps(&block.locs);
+            self.register_pre_alloc(
+                block.block.id,
+                PreAllocBlock {
+                    block_size,
+                    stamps,
+                    alloc_ms: LocalTime::mills(),
+                },
+            );
+            Ok(Some(block))
+        })();
+        match res {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "alloc_first_block {} (inode {}) skipped: {}",
+                    path, inode_id, e
+                );
+                None
+            }
+        }
+    }
+
+    fn register_pre_alloc(&self, block_id: i64, entry: PreAllocBlock) {
+        let mut map = self.pre_alloc.lock();
+        if map.len() >= PRE_ALLOC_PRUNE_THRESHOLD {
+            let ttl = self.conf.worker_lost_interval_ms();
+            let now = LocalTime::mills();
+            map.retain(|_, v| now.saturating_sub(v.alloc_ms) < ttl);
+        }
+        map.insert(block_id, entry);
+    }
+
+    /// Drops the release right of pre-allocated blocks that were committed or
+    /// handed to another caller.
+    fn forget_pre_alloc(&self, block_ids: impl IntoIterator<Item = i64>) {
+        let mut ids = block_ids.into_iter().peekable();
+        if ids.peek().is_none() {
+            return;
+        }
+        let mut map = self.pre_alloc.lock();
+        if map.is_empty() {
+            return;
+        }
+        for id in ids {
+            map.remove(&id);
+        }
+    }
+
+    #[cfg(test)]
+    fn has_pre_alloc(&self, block_id: i64) -> bool {
+        self.pre_alloc.lock().contains_key(&block_id)
+    }
+
     /// Document application to allocate a new block.
     #[allow(clippy::too_many_arguments)]
     pub fn add_block<T: AsRef<str>>(
@@ -1179,12 +1291,15 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
+        self.forget_pre_alloc(commit_blocks.iter().map(|v| v.block_id));
 
         // File allows concurrent writes, 'previous' is the previous block,
         // need to check if the next block has already been allocated。
         // If it has been allocated, return that block
         if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
-            let locs = fs_dir.get_block_locations(next.id)?;
+            // A pending block keeps its assigned workers in `meta.locs`; the
+            // location store only knows committed replicas.
+            let locs = fs_dir.get_locations(next)?;
             let extend_block = ExtendedBlock {
                 id: next.id,
                 len: next.len(),
@@ -1192,10 +1307,37 @@ impl MasterFilesystem {
                 file_type: file.file_type,
                 alloc_opts: next.alloc_opts.clone(),
             };
+            // The block now has a second writer: its creator may no longer
+            // release it.
+            self.forget_pre_alloc([next.id]);
 
             return self.create_locate_block(path, extend_block, &locs);
         }
 
+        self.allocate_block(
+            &mut fs_dir,
+            path,
+            inode,
+            client_addr,
+            commit_blocks,
+            exclude_workers,
+            file_len,
+        )
+    }
+
+    /// Chooses workers and appends a new block; the caller holds `fs_dir`.
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_block(
+        &self,
+        fs_dir: &mut FsDir,
+        path: &str,
+        inode: InodePtr,
+        client_addr: ClientAddress,
+        commit_blocks: Vec<CommitBlock>,
+        exclude_workers: Vec<u32>,
+        file_len: i64,
+    ) -> FsResult<LocatedBlock> {
+        let file = inode.as_file_ref()?;
         let block_size = file.block_size as i64;
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
         let has_spdk = {
@@ -1242,6 +1384,7 @@ impl MasterFilesystem {
                 only_flush,
                 return_file_blocks: true,
                 set_attr_opts,
+                release_block_id: None,
             },
         )
     }
@@ -1265,9 +1408,22 @@ impl MasterFilesystem {
                 only_flush: true,
                 return_file_blocks: false,
                 set_attr_opts: None,
+                release_block_id: None,
             },
         )
         .map(|_| ())
+    }
+
+    pub fn complete_file_with_opts<T: AsRef<str>>(
+        &self,
+        path: T,
+        inode_id: Option<i64>,
+        len: i64,
+        commit_blocks: Vec<CommitBlock>,
+        client_name: T,
+        options: CompleteFileOptions,
+    ) -> FsResult<Option<FileBlocks>> {
+        self.complete_file0(path, inode_id, len, commit_blocks, client_name, options)
     }
 
     fn complete_file0<T: AsRef<str>>(
@@ -1282,7 +1438,14 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
-        fs_dir.complete_file(
+        let committed: Vec<i64> = commit_blocks.iter().map(|v| v.block_id).collect();
+        // Only the creator of a still-registered pre-allocation may release
+        // it. Checked under `fs_dir`, which also serialises the hand-offs in
+        // AddBlock/AssignWorker that remove the registration.
+        let release_block_id = options
+            .release_block_id
+            .filter(|id| self.pre_alloc.lock().contains_key(id));
+        let released = fs_dir.complete_file(
             path,
             &mut inode,
             len,
@@ -1290,16 +1453,32 @@ impl MasterFilesystem {
             client_name,
             options.only_flush,
             options.set_attr_opts,
+            release_block_id,
         )?;
+        let released_entry = released.and_then(|b| self.pre_alloc.lock().remove(&b.id));
+        self.forget_pre_alloc(committed);
 
-        if options.only_flush && options.return_file_blocks {
-            let file = inode.as_file_ref()?;
-            let locs = self.get_block_locs(path, &fs_dir, file)?;
-            let status = inode.to_file_status(path)?;
-            return Ok(Some(FileBlocks::new(status, locs)));
+        let res = if options.only_flush && options.return_file_blocks {
+            (|| {
+                let file = inode.as_file_ref()?;
+                let locs = self.get_block_locs(path, &fs_dir, file)?;
+                let status = inode.to_file_status(path)?;
+                Ok(Some(FileBlocks::new(status, locs)))
+            })()
+        } else {
+            Ok(None)
+        };
+        drop(fs_dir);
+
+        // Return the capacity reserved when the block was chosen, after the
+        // namespace lock is gone (same order as delete/free).
+        if let Some(entry) = released_entry {
+            self.worker_manager
+                .write()
+                .unschedule_stamped(&entry.stamps, entry.block_size);
         }
 
-        Ok(None)
+        res
     }
 
     pub fn get_file_blocks(
@@ -2213,6 +2392,9 @@ impl MasterFilesystem {
         };
         let block = match fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers) {
             Ok((block, assigned)) => {
+                // Another writer is now writing this block: a pending release
+                // from its creator must not drop it.
+                self.forget_pre_alloc([block.id]);
                 if !assigned {
                     self.worker_manager
                         .write()
@@ -3970,6 +4152,349 @@ mod tests {
         fs.master_monitor
             .set_role_for_test(curvine_raft::raft::RoleState::Leader);
         assert_eq!(fs.drain_pending_trash().unwrap().unwrap().inodes, 1);
+    }
+
+    fn first_block_fs(name: &str) -> MasterFilesystem {
+        let fs = test_fs(name);
+        let capacity = 1 << 30;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+        fs
+    }
+
+    fn scheduled_bytes(fs: &MasterFilesystem) -> i64 {
+        fs.worker_manager
+            .read()
+            .get_worker(1)
+            .unwrap()
+            .scheduled_bytes
+    }
+
+    fn close_opts(release_block_id: Option<i64>) -> CompleteFileOptions {
+        CompleteFileOptions {
+            release_block_id,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unwritten_first_block_is_released_on_close() {
+        let fs = first_block_fs("first-block-release");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+
+        let block = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .expect("empty file gets a first block");
+        assert_eq!(block.block.len, 0);
+        assert_eq!(block.locs.len(), 1);
+        assert_eq!(scheduled_bytes(&fs), status.block_size);
+        // The file already has block 0, so a retried create gets nothing new.
+        assert!(fs.alloc_first_block("/a.log", status.id, client).is_none());
+
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(block.block.id)),
+        )
+        .unwrap();
+
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert!(blocks.block_locs.is_empty());
+        assert_eq!(blocks.status.len, 0);
+        assert!(blocks.status.is_complete);
+        assert_eq!(scheduled_bytes(&fs), 0, "reservation must be returned");
+    }
+
+    #[test]
+    fn written_first_block_survives_a_release_request() {
+        let fs = first_block_fs("first-block-written");
+        let status = fs.create("/a.log", true).unwrap();
+        let block = fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .unwrap();
+        let commit = CommitBlock {
+            block_id: block.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+
+        // The commit in the same request makes the block non-empty, so a
+        // stale release id must not drop it.
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            10,
+            vec![commit],
+            "",
+            close_opts(Some(block.block.id)),
+        )
+        .unwrap();
+
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert_eq!(blocks.status.len, 10);
+        assert_eq!(blocks.block_locs.len(), 1);
+        assert_eq!(blocks.block_locs[0].block.id, block.block.id);
+    }
+
+    #[test]
+    fn rejected_close_keeps_the_first_block() {
+        let fs = first_block_fs("first-block-rejected");
+        let status = fs.create("/a.log", true).unwrap();
+        let block = fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .unwrap();
+
+        // len 5 with no committed data fails the length check.
+        let err = fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            5,
+            vec![],
+            "",
+            close_opts(Some(block.block.id)),
+        );
+        assert!(err.is_err());
+
+        let fs_dir = fs.fs_dir.read();
+        let inode = MasterFilesystem::resolve_file_inode(&fs_dir, "/a.log", None).unwrap();
+        let file = inode.as_file_ref().unwrap();
+        assert_eq!(file.block_ids(), vec![block.block.id]);
+        drop(fs_dir);
+        assert_eq!(scheduled_bytes(&fs), status.block_size);
+    }
+
+    #[test]
+    fn first_block_is_not_allocated_for_a_file_with_data() {
+        let fs = first_block_fs("first-block-non-empty");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let block = fs
+            .add_block("/a.log", None, client.clone(), vec![], vec![], 0, None)
+            .unwrap();
+        let commit = CommitBlock {
+            block_id: block.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        fs.complete_file("/a.log", None, 10, vec![commit], "", false, None)
+            .unwrap();
+
+        assert!(fs.alloc_first_block("/a.log", status.id, client).is_none());
+    }
+
+    #[test]
+    fn first_block_without_workers_falls_back() {
+        let fs = test_fs("first-block-no-worker");
+        let status = fs.create("/a.log", true).unwrap();
+        assert!(fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .is_none());
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert!(blocks.block_locs.is_empty());
+    }
+
+    // A retried CreateFile (or a second creator) gets no first block and falls
+    // back to AddBlock; the reused pending block must carry its workers.
+    #[test]
+    fn add_block_after_pre_allocation_returns_pending_workers() {
+        let fs = first_block_fs("first-block-retry");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .unwrap();
+        assert!(fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .is_none());
+
+        let reused = fs
+            .add_block("/a.log", Some(status.id), client, vec![], vec![], 0, None)
+            .unwrap();
+        assert_eq!(reused.block.id, first.block.id);
+        assert_eq!(reused.locs.len(), 1, "pending block must keep its workers");
+        assert_eq!(reused.locs[0].worker_id, 1);
+        // Two writers now share the block, so the creator lost its release.
+        assert!(!fs.has_pre_alloc(first.block.id));
+    }
+
+    // Writer A pre-allocates and never writes; writer B reopens the file and
+    // takes block 0 through AssignWorker. A's close must not drop B's block.
+    #[test]
+    fn release_after_assign_worker_hand_off_keeps_the_block() {
+        let fs = first_block_fs("first-block-assign-hand-off");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .unwrap();
+
+        // B sees block 0 without committed locations and assigns workers.
+        fs.assign_worker_by_id(
+            "/a.log",
+            Some(status.id),
+            first.block.clone(),
+            client,
+            vec![],
+        )
+        .unwrap();
+        assert!(!fs.has_pre_alloc(first.block.id));
+
+        // A closes with its release id.
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(first.block.id)),
+        )
+        .unwrap();
+
+        // B commits its data into the same block.
+        let commit = CommitBlock {
+            block_id: first.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        fs.complete_file("/a.log", Some(status.id), 10, vec![commit], "", false, None)
+            .unwrap();
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert_eq!(blocks.status.len, 10);
+        assert_eq!(blocks.block_locs[0].block.id, first.block.id);
+    }
+
+    #[test]
+    fn release_after_add_block_hand_off_keeps_the_block() {
+        let fs = first_block_fs("first-block-add-hand-off");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .unwrap();
+        fs.add_block("/a.log", Some(status.id), client, vec![], vec![], 0, None)
+            .unwrap();
+
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(first.block.id)),
+        )
+        .unwrap();
+        let fs_dir = fs.fs_dir.read();
+        let inode = MasterFilesystem::resolve_file_inode(&fs_dir, "/a.log", None).unwrap();
+        assert_eq!(
+            inode.as_file_ref().unwrap().block_ids(),
+            vec![first.block.id]
+        );
+    }
+
+    // Block A's reservation expires, block B is reserved on the same worker,
+    // then A is released: B's reservation must stay.
+    #[test]
+    fn stale_release_does_not_subtract_a_newer_reservation() {
+        let fs = first_block_fs("first-block-expired-release");
+        let client = ClientAddress::default();
+        let a = fs.create("/a.log", true).unwrap();
+        let block_a = fs
+            .alloc_first_block("/a.log", a.id, client.clone())
+            .unwrap();
+
+        // Expiry (or a full heartbeat reclaim) clears the window.
+        {
+            let mut wm = fs.worker_manager.write();
+            let worker = wm.worker_map.workers.get_mut(&1).unwrap();
+            worker.scheduled_bytes = 0;
+            worker.scheduled_since_ms = 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let b = fs.create("/b.log", true).unwrap();
+        fs.alloc_first_block("/b.log", b.id, client).unwrap();
+        assert_eq!(scheduled_bytes(&fs), b.block_size);
+
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(a.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(block_a.block.id)),
+        )
+        .unwrap();
+        // A's metadata is still dropped, but B keeps its reservation.
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert!(blocks.block_locs.is_empty());
+        assert_eq!(scheduled_bytes(&fs), b.block_size);
+    }
+
+    // Writer B's OpenFile returns block 0 before B asks for its workers; A's
+    // release in between must not drop the block B already holds.
+    #[test]
+    fn release_after_open_file_hand_off_keeps_the_block() {
+        let fs = first_block_fs("first-block-open-hand-off");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .unwrap();
+        let opened = fs
+            .open_file(
+                "/a.log",
+                CreateFileOpts::with_create(false),
+                OpenFlags::new_write_only(),
+            )
+            .unwrap();
+        assert_eq!(opened.block_locs[0].block.id, first.block.id);
+        assert!(!fs.has_pre_alloc(first.block.id));
+
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(first.block.id)),
+        )
+        .unwrap();
+        let assigned = fs
+            .assign_worker_by_id(
+                "/a.log",
+                Some(status.id),
+                first.block.clone(),
+                client,
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(assigned.block.id, first.block.id);
+        assert_eq!(assigned.locs[0].worker_id, 1);
+    }
+
+    #[test]
+    fn commit_drops_the_release_registration() {
+        let fs = first_block_fs("first-block-commit-forget");
+        let status = fs.create("/a.log", true).unwrap();
+        let block = fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .unwrap();
+        let commit = CommitBlock {
+            block_id: block.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        fs.complete_file("/a.log", Some(status.id), 10, vec![commit], "", true, None)
+            .unwrap();
+        assert!(!fs.has_pre_alloc(block.block.id));
     }
 
     // #1864: the staging rename targets `.purging`, and the background purger

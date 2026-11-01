@@ -34,6 +34,7 @@ use curvine_rpc::client::ClientConf;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use log::info;
 use log::warn;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -114,12 +115,18 @@ impl CurvineFileSystem {
         opts: CreateFileOpts,
         overwrite: bool,
     ) -> FsResult<FsWriter> {
-        let status = self
+        let (status, first_block) = self
             .fs_client
-            .create_with_opts(path, opts, overwrite)
+            .create_for_write(path, opts, overwrite)
             .await?;
         let file_blocks = FileBlocks::new(status, vec![]);
-        let writer = FsWriter::create(self.fs_context.clone(), path.clone(), file_blocks);
+        let writer = FsWriter::with_first_block(
+            self.fs_context.clone(),
+            path.clone(),
+            file_blocks,
+            false,
+            first_block,
+        );
         Ok(writer)
     }
 
@@ -158,18 +165,46 @@ impl CurvineFileSystem {
         self.open_with_opts(path, create_opts, flags).await
     }
 
-    pub async fn open_with_opts(
+    // The two public entry points return the inner future instead of being
+    // `async fn`s: another async layer here grows the stack of every caller
+    // (FUSE request tasks run on 2 MiB worker stacks).
+    pub fn open_with_opts<'a>(
+        &'a self,
+        path: &'a Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> impl Future<Output = FsResult<FsWriter>> + 'a {
+        self.open_with_opts0(path, opts, flags, true)
+    }
+
+    /// `open_with_opts` without first-block pre-allocation, for a caller that
+    /// completes the file without writing (e.g. FUSE `O_CREAT|O_RDONLY`).
+    pub fn open_without_first_block<'a>(
+        &'a self,
+        path: &'a Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> impl Future<Output = FsResult<FsWriter>> + 'a {
+        self.open_with_opts0(path, opts, flags, false)
+    }
+
+    async fn open_with_opts0(
         &self,
         path: &Path,
         opts: CreateFileOpts,
         flags: OpenFlags,
+        alloc_first_block: bool,
     ) -> FsResult<FsWriter> {
-        let file_block = self.fs_client.open_with_opts(path, opts, flags).await?;
-        let writer = FsWriter::new(
+        let (file_block, first_block) = self
+            .fs_client
+            .open_for_write(path, opts, flags, alloc_first_block)
+            .await?;
+        let writer = FsWriter::with_first_block(
             self.fs_context.clone(),
             path.clone(),
             file_block,
             flags.append(),
+            first_block,
         );
         Ok(writer)
     }

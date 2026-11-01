@@ -134,6 +134,37 @@ impl WorkerManager {
         self.adjust_chosen_workers(workers, block_size, false);
     }
 
+    /// Snapshots the reservation window of each chosen worker, so a later
+    /// `unschedule_stamped` can tell whether that window is still the one the
+    /// reservation was added to.
+    pub(crate) fn schedule_stamps(&self, workers: &[WorkerAddress]) -> Vec<(u32, u64)> {
+        workers
+            .iter()
+            .filter_map(|addr| {
+                let worker = self.worker_map.workers.get(&addr.worker_id)?;
+                Some((addr.worker_id, worker.scheduled_since_ms))
+            })
+            .collect()
+    }
+
+    /// Returns a reservation taken by `choose_worker`, but only on workers
+    /// whose reservation window is unchanged. Expiry, a full reclaim or a
+    /// worker restart resets `scheduled_since_ms`, and the bytes then belong
+    /// to newer reservations, so subtracting them would overbook the worker.
+    pub(crate) fn unschedule_stamped(&mut self, stamps: &[(u32, u64)], block_size: i64) {
+        self.expire_scheduled_bytes();
+        if block_size <= 0 {
+            return;
+        }
+        for (id, since_ms) in stamps {
+            if let Some(worker) = self.worker_map.workers.get_mut(id) {
+                if *since_ms != 0 && worker.scheduled_since_ms == *since_ms {
+                    worker.unschedule_bytes(block_size);
+                }
+            }
+        }
+    }
+
     fn expire_scheduled_bytes(&mut self) {
         let timeout_ms = self.conf.master.worker_lost_interval_ms();
         if timeout_ms == 0 {

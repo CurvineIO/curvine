@@ -85,6 +85,11 @@ pub struct ClientConf {
     #[client_cli]
     pub short_circuit: bool,
 
+    // Ask the master to allocate the first block in CreateFile/OpenFile, so a
+    // small file needs one RPC fewer. Masters without support ignore it.
+    #[client_cli]
+    pub alloc_first_block_on_create: bool,
+
     #[serde(skip)]
     pub storage_type: StorageType,
     #[serde(alias = "storage_type")]
@@ -439,6 +444,7 @@ impl Default for ClientConf {
             max_cache_block_handles: 10,
 
             short_circuit: true,
+            alloc_first_block_on_create: true,
 
             storage_type: StorageType::Disk,
             storage_type_str: "disk".to_string(),
