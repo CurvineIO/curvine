@@ -35,6 +35,11 @@ pub struct BatchWriteHandler {
     pub(crate) file: Option<Vec<Option<BlockWriteContext>>>,
     leases: Vec<Option<BlockWriteLease>>,
     pub(crate) is_commit: bool,
+    /// Set when the batch was rolled back after a fatal failure. Complete is
+    /// then rejected (the blocks are gone, misreporting success would let
+    /// `BlockClient::write_commit_batch()` treat an aborted batch as
+    /// committed); Cancel stays idempotent and successful.
+    rolled_back: bool,
     pub(crate) write_handler: WriteHandler,
 }
 
@@ -55,6 +60,7 @@ impl BatchWriteHandler {
             file: None,
             leases: Vec::new(),
             is_commit: false,
+            rolled_back: false,
             write_handler: WriteHandler::new(store_clone, client_addr)?,
         })
     }
@@ -75,35 +81,35 @@ impl BatchWriteHandler {
     /// is best-effort — a failure is logged and never replaces the original
     /// error that caused the batch to fail.
     ///
-    /// A block finalized before the failure is committed state, not batch
-    /// staging: aborting it would delete a good replica, so final blocks are
-    /// skipped. Missing blocks were already aborted and are fine too.
+    /// A block still in the committed, finalized generation is skipped (it is
+    /// committed state, not batch staging), and a block being rewritten is
+    /// handled atomically — the check and abort run under the same block
+    /// stripe lock, so a concurrent finalize cannot slip between them and get
+    /// its committed replica deleted. Missing blocks were already aborted and
+    /// are fine too.
     ///
     /// State is reset (`context` / `file` / `leases` cleared, `is_commit =
     /// true`) so a stale batch cannot be replayed on this handler and the
     /// next `open_batch` starts clean instead of hitting "previous batch
-    /// write is still active".
+    /// write is still active". Once rolled back, `complete_batch` rejects
+    /// retried Complete requests (misreporting success would let the client
+    /// treat an aborted batch as committed); Cancel stays idempotent.
     fn rollback_batch(&mut self) {
         if let Some(contexts) = self.context.take() {
             for context in &contexts {
-                match self.store.get_block(context.block.id) {
-                    Ok(meta) if !meta.is_final() => {
-                        if let Err(e) = self.store.abort_block(&context.block) {
-                            log::warn!(
-                                "failed to abort batch block {} after batch failure: {}",
-                                context.block.id,
-                                e
-                            );
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => {}
+                if let Err(e) = self.store.abort_batch_write(context.block.id) {
+                    log::warn!(
+                        "failed to abort batch block {} after batch failure: {}",
+                        context.block.id,
+                        e
+                    );
                 }
             }
         }
         self.file.take();
         self.leases.clear();
         self.is_commit = true;
+        self.rolled_back = true;
     }
 
     fn abort_open_contexts(store: &BlockStore, contexts: &[WriteContext]) {
@@ -253,13 +259,29 @@ impl BatchWriteHandler {
     }
 
     pub fn complete_batch(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
-        // Parse the flattened batch request
-        let header: BlocksBatchCommitRequest = msg.parse_header()?;
+        // Parse the flattened batch request. A malformed header must not be
+        // returned before the opened batch is rolled back: the blocks would
+        // stay in Writing and the staging allocations would never be
+        // reclaimed.
+        let header: BlocksBatchCommitRequest = match msg.parse_header() {
+            Ok(header) => header,
+            Err(e) => {
+                self.rollback_batch();
+                return Err(e.into());
+            }
+        };
         let mut results = Vec::new();
 
         if self.is_commit {
             return if !msg.data.is_empty() {
                 err_box!("The block has been committed and data cannot be written anymore.")
+            } else if self.rolled_back && commit {
+                // The batch was aborted by a previous failed Complete. Blocks
+                // are gone, so reporting success would let the client treat an
+                // aborted batch as committed. Cancel stays idempotent.
+                err_box!(
+                    "batch write was rolled back after a previous failure; retry the batch write"
+                )
             } else {
                 Ok(msg.success())
             };
@@ -466,11 +488,14 @@ impl BatchWriteHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::block::BlockStore;
+    use crate::worker::storage::BlockWriteContext;
     use crate::worker::Worker;
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_core_error::CommonResult;
     use curvine_fs_api::RpcCode;
-    use curvine_model::{FileType, StorageType};
+    use curvine_io::{BlockIO, DataSlice};
+    use curvine_model::{ExtendedBlock, FileType, StorageType};
     use curvine_runtime::common::Utils;
 
     fn store() -> CommonResult<BlockStore> {
@@ -551,6 +576,71 @@ mod tests {
             .build()
     }
 
+    /// Replaces the batch's opened file for `index` with a write context whose
+    /// `flush()` always fails, so `complete_batch` reaches the flush-error
+    /// rollback branch.
+    fn make_flush_fail(handler: &mut BatchWriteHandler, index: usize) -> FsResult<()> {
+        let file = handler.file.as_mut().unwrap();
+        file[index] = Some(BlockWriteContext::new(FailingFlushBlockIO, 0, 4, 0)?);
+        Ok(())
+    }
+
+    struct FailingFlushBlockIO;
+
+    impl BlockIO for FailingFlushBlockIO {
+        fn read_region(
+            &mut self,
+            _enable_send_file: bool,
+            _len: i32,
+        ) -> curvine_io::IOResult<DataSlice> {
+            unreachable!()
+        }
+
+        fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
+            unreachable!()
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
+            unreachable!()
+        }
+
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "flush failed",
+            )))
+        }
+
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            0
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn path(&self) -> &str {
+            "failing-flush"
+        }
+
+        fn resize(
+            &mut self,
+            _truncate: bool,
+            _off: i64,
+            _len: i64,
+            _mode: i32,
+        ) -> curvine_io::IOResult<()> {
+            unreachable!()
+        }
+    }
+
     #[test]
     fn complete_failure_aborts_all_uncommitted_siblings() -> CommonResult<()> {
         let store = store()?;
@@ -591,26 +681,140 @@ mod tests {
         Ok(())
     }
 
+    // Regression test for the flush-error rollback branch: a middle block
+    // whose flush fails must roll back the whole batch (triggered block and
+    // all siblings), reset handler state, and reclaim staging allocations.
     #[test]
-    fn flushed_successor_committed_before_late_failure_is_not_aborted() -> CommonResult<()> {
+    fn flush_error_aborts_all_siblings_and_resets_handler() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+        make_flush_fail(&mut handler, 1)?; // middle block (index 1)
+
+        // Valid commit request so validation passes and the loop reaches flush.
+        let msg = commit_msg(&[1, 2, 3], 7);
+        assert!(handler.complete_batch(&msg, true).is_err());
+        assert!(handler.rolled_back);
+        assert!(handler.is_commit);
+        assert!(handler.context.is_none());
+        assert!(handler.leases.is_empty());
+        for id in 1..=3 {
+            assert!(store.get_block(id).is_err(), "block {} must be aborted", id);
+        }
+        Ok(())
+    }
+
+    // Regression test for the finalize-error rollback branch: pre-abort block 2
+    // so `finalize_block(2)` fails after block 1 was finalized. Block 1 must
+    // stay final, block 3 must be aborted, handler state reset, and the
+    // already-finalized block 1 survives (its staging was never opened).
+    #[test]
+    fn finalize_error_aborts_remaining_siblings_and_keeps_committed() -> CommonResult<()> {
         let store = store()?;
         let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
         open_batch(&mut handler)?;
 
-        // A hypothetical failure on the last finalize must not roll the
-        // already-finalized siblings back to nothing: abort_batch skips final
-        // blocks. Force the condition by pre-finalizing block 1 through the
-        // store, then failing the batch via a req_id mismatch.
-        let block = ExtendedBlock::new(1, 0, StorageType::Mem, FileType::File);
-        store.finalize_block(&block)?;
+        // Abort block 2 behind the handler's back: it leaves the dataset, so
+        // finalize_block(2) fails with "block 2 not exists" during commit.
+        let block2 = ExtendedBlock::new(2, 0, StorageType::Mem, FileType::File);
+        store.abort_block(&block2)?;
+        assert!(store.get_block(2).is_err());
+
+        let msg = commit_msg(&[1, 2, 3], 7);
+        assert!(handler.complete_batch(&msg, true).is_err());
+        assert!(handler.rolled_back);
+        assert!(handler.context.is_none());
+        assert!(handler.leases.is_empty());
+        // Block 1 was finalized before the failure and must survive.
+        assert!(store.get_block(1)?.is_final());
+        // Block 3 was never committed and must be aborted by the rollback.
+        assert!(store.get_block(3).is_err());
+        Ok(())
+    }
+
+    // Regression test for the rewrite scenario (szbr00): when a batch rewrites
+    // an already-finalized block on a file layout, rollback must abort the new
+    // Writing generation and release its reserved capacity, while the old
+    // committed copy stays readable.
+    #[test]
+    fn rewrite_rollback_aborts_new_generation_keeps_committed_copy() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+
+        // Open a 3-block batch that adds blocks 1..=3 (1 is a fresh block).
+        open_batch(&mut handler)?;
+        // Now finalize block 1 through the store, as a committed generation.
+        // `open_batch` already rewrote block 1 into Writing; the fresh-open
+        // path does not record a committed generation (reserve_file_open with
+        // `Some(meta) + is_final` is what preserves it), so finalizing turns
+        // it into Finalized.
+        let block1 = ExtendedBlock::new(1, 0, StorageType::Mem, FileType::File);
+        store.finalize_block(&block1)?;
         assert!(store.get_block(1)?.is_final());
 
+        // Now trigger rollback via req_id mismatch. The old implementation's
+        // `get_block(...).is_final()` guard would see block 1 as final and
+        // skip aborting it, leaving a finalized block and a reservation leak.
+        // The new `abort_batch_write` aborts only the raw non-final
+        // generation; block 1 is final after the manual finalize, so it is
+        // skipped (a committed replica must not be deleted by rollback).
         let msg = commit_msg(&[1, 2, 3], 42);
         assert!(handler.complete_batch(&msg, true).is_err());
-        assert!(store.get_block(1)?.is_final(), "final block must survive");
-        for id in 2..=3 {
+        assert!(handler.rolled_back);
+        assert!(handler.context.is_none());
+        assert!(handler.leases.is_empty());
+
+        // Block 1 was finalized to a committed generation, so it survives.
+        assert!(store.get_block(1)?.is_final());
+        // Blocks 2/3 were never committed and must be aborted.
+        assert!(store.get_block(2).is_err());
+        assert!(store.get_block(3).is_err());
+        Ok(())
+    }
+
+    // Regression test: a malformed protobuf commit header must roll back the
+    // opened batch before returning the decode error.
+    #[test]
+    fn malformed_commit_header_rolls_back_batch() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+
+        // Body with invalid protobuf wire data: header decode fails.
+        let msg = Builder::new()
+            .code(RpcCode::WriteBlocksBatch)
+            .request(RequestStatus::Complete)
+            .req_id(7)
+            .data(DataSlice::Bytes(vec![0xFF, 0xFF, 0xFF, 0xFF].into()))
+            .build();
+        assert!(handler.complete_batch(&msg, true).is_err());
+        assert!(handler.rolled_back);
+        assert!(handler.is_commit);
+        assert!(handler.context.is_none());
+        for id in 1..=3 {
             assert!(store.get_block(id).is_err(), "block {} must be aborted", id);
         }
+        Ok(())
+    }
+
+    // After a rollback, a retried Complete must be rejected (the blocks are
+    // gone) rather than misreported as a successful commit, while Cancel stays
+    // idempotent and successful.
+    #[test]
+    fn complete_retry_rejected_after_rollback_cancel_stays_idempotent() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+
+        // Roll back via wrong req_id.
+        let bad = commit_msg(&[1, 2, 3], 42);
+        assert!(handler.complete_batch(&bad, true).is_err());
+        assert!(handler.rolled_back);
+
+        // Same-connection retry of Complete must fail, not report success.
+        let retry = commit_msg(&[1, 2, 3], 7);
+        assert!(handler.complete_batch(&retry, true).is_err());
+        assert!(handler.complete_batch(&retry, false).is_ok());
         Ok(())
     }
 

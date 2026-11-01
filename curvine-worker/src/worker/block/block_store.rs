@@ -359,6 +359,33 @@ impl BlockStore {
         })
     }
 
+    /// Aborts a batch-opened block unless it is still in the committed,
+    /// finalized generation. Unlike [`BlockStore::abort_block`], this does
+    /// NOT go through the readable view: during a file-backed rewrite the
+    /// dataset keeps the previous committed meta in `committed_rewrites`, so
+    /// `get_block`/`get_readable_block` would return that old meta and report
+    /// `is_final() == true`, leaking the new Writing generation's staging
+    /// file and reserved capacity. The raw `state.get_block(id)` reflects the
+    /// current Writing (or later) generation, and the check plus abort run
+    /// under the same block stripe lock inside one `with_dataset_write`,
+    /// mirroring `abort_replication_write`, so a concurrent finalize cannot
+    /// slip between them and get its committed replica deleted.
+    ///
+    /// Missing blocks (already aborted) are fine and return `Ok(())`.
+    pub(crate) fn abort_batch_write(&self, block_id: i64) -> CommonResult<()> {
+        let _lock = self.block_lock(block_id, "abort_batch");
+        self.check_replication_owner(block_id)?;
+        self.with_dataset_write("abort_batch", |state| {
+            if state
+                .get_block(block_id)
+                .is_some_and(|meta| !meta.is_final())
+            {
+                state.abort_block(&ExtendedBlock::with_id(block_id))?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn get_block(&self, id: i64) -> CommonResult<BlockMeta> {
         let state = self.read()?;
         let b = state
