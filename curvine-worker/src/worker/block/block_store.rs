@@ -65,10 +65,10 @@ pub struct BlockStore {
     block_locks: Arc<Vec<Mutex<()>>>,
     uses: Arc<Vec<Mutex<HashMap<i64, BlockUse>>>>,
     replication_owner: Option<String>,
-    /// Test-only: forces the next finalize prepare to fail transiently.
+    /// Test-only: forces the next finalize prepare to fail (one-shot).
     #[cfg(test)]
     force_transient_finalize_failure: Arc<std::sync::atomic::AtomicBool>,
-    /// Test-only: forces the next abort to fail transiently.
+    /// Test-only: forces the next abort to fail (one-shot).
     #[cfg(test)]
     force_transient_abort_failure: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -340,7 +340,7 @@ impl BlockStore {
         #[cfg(test)]
         let plan = if self
             .force_transient_finalize_failure
-            .load(std::sync::atomic::Ordering::Acquire)
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
             curvine_core_error::err_box!("injected transient finalize failure for test")
         } else {
@@ -414,7 +414,7 @@ impl BlockStore {
         #[cfg(test)]
         if self
             .force_transient_abort_failure
-            .load(std::sync::atomic::Ordering::Acquire)
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
             return curvine_core_error::err_box!("injected transient abort failure for test");
         }
@@ -428,7 +428,7 @@ impl BlockStore {
         #[cfg(test)]
         if self
             .force_transient_abort_failure
-            .load(std::sync::atomic::Ordering::Acquire)
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
             return curvine_core_error::err_box!("injected transient abort failure for test");
         }
