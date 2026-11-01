@@ -258,7 +258,11 @@ impl MasterHandler {
         // already gone when this runs and a trash entry could never be restored.
         // Keep mounted deletes permanent until trash supports UFS routing; an
         // explicit client request to skip the trash is honoured either way.
-        let mode = if mount_info.is_some() || header.skip_trash() {
+        // Mounted deletes are also never staged for a bounded purge, because the
+        // staging rename would be replayed against the UFS.
+        let mode = if mount_info.is_some() {
+            DeleteMode::Mounted
+        } else if header.skip_trash() {
             DeleteMode::SkipTrash
         } else if header.async_delete() {
             DeleteMode::AsyncPurge

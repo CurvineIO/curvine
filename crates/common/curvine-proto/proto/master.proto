@@ -101,8 +101,10 @@ message DeleteResponse {
     optional FreeResultProto res = 1;
     // True when the master moved the entry into /.Trash instead of purging it.
     optional bool trashed = 2 [default = false];
-    // True when the entry was staged for asynchronous reclamation, so the
-    // returned counts are zero and the space is freed after the purge runs.
+    // True when part or all of the entry is left for asynchronous reclamation,
+    // and the remaining space is freed after the purge runs. The returned
+    // counts are zero for an async delete, and cover only what was already
+    // reclaimed when a staged recursive delete stopped early.
     optional bool purge_pending = 3 [default = false];
 }
 
