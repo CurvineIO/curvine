@@ -170,7 +170,31 @@ impl CurvineFileSystem {
         opts: CreateFileOpts,
         flags: OpenFlags,
     ) -> FsResult<FsWriter> {
-        let (file_block, first_block) = self.fs_client.open_for_write(path, opts, flags).await?;
+        self.open_with_opts0(path, opts, flags, true).await
+    }
+
+    /// `open_with_opts` without first-block pre-allocation, for a caller that
+    /// completes the file without writing (e.g. FUSE `O_CREAT|O_RDONLY`).
+    pub async fn open_without_first_block(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> FsResult<FsWriter> {
+        self.open_with_opts0(path, opts, flags, false).await
+    }
+
+    async fn open_with_opts0(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+        alloc_first_block: bool,
+    ) -> FsResult<FsWriter> {
+        let (file_block, first_block) = self
+            .fs_client
+            .open_for_write(path, opts, flags, alloc_first_block)
+            .await?;
         let writer = FsWriter::with_first_block(
             self.fs_context.clone(),
             path.clone(),

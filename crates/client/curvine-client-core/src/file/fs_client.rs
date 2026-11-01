@@ -150,8 +150,15 @@ impl FsClient {
         opts: CreateFileOpts,
         overwrite: bool,
     ) -> FsResult<(FileStatus, Option<LocatedBlock>)> {
-        let alloc = self.conf().client.alloc_first_block_on_create;
+        let alloc = self.can_alloc_first_block();
         self.create_file0(path, opts, overwrite, alloc).await
+    }
+
+    /// Pre-allocation is skipped while workers are excluded: the master picks
+    /// the first block without the exclusion list that AddBlock carries, so it
+    /// could hand back a worker this client just failed to write to.
+    fn can_alloc_first_block(&self) -> bool {
+        self.conf().client.alloc_first_block_on_create && self.context.exclude_workers().is_empty()
     }
 
     async fn create_file0(
@@ -175,7 +182,8 @@ impl FsClient {
         let status = ProtoUtils::file_status_from_pb(rep_header.file_status);
         let first_block = rep_header
             .first_block
-            .map(ProtoUtils::located_block_from_pb);
+            .map(ProtoUtils::located_block_from_pb)
+            .filter(|v| !v.should_assign());
         Ok((status, first_block))
     }
 
@@ -191,13 +199,17 @@ impl FsClient {
 
     /// Write-open counterpart of `create_for_write`. The master only returns a
     /// first block when the open leaves the file empty (O_CREAT or O_TRUNC).
+    /// `alloc_first_block = false` is for callers that will not write, such
+    /// as a FUSE `O_CREAT|O_RDONLY` create that completes the file at once.
     pub async fn open_for_write(
         &self,
         path: &Path,
         opts: CreateFileOpts,
         flags: OpenFlags,
+        alloc_first_block: bool,
     ) -> FsResult<(FileBlocks, Option<LocatedBlock>)> {
-        let alloc = self.conf().client.alloc_first_block_on_create
+        let alloc = alloc_first_block
+            && self.can_alloc_first_block()
             && !flags.read_only()
             && (flags.create() || flags.truncate());
         self.open_file0(path, opts, flags, alloc).await
@@ -218,9 +230,12 @@ impl FsClient {
         };
         let rep_header: OpenFileResponse = self.rpc(RpcCode::OpenFile, header).await?;
         let file_blocks = ProtoUtils::file_blocks_from_pb(rep_header.file_blocks);
+        // A block without workers cannot be written directly; leave it to the
+        // AddBlock/AssignWorker path.
         let first_block = rep_header
             .first_block
-            .map(ProtoUtils::located_block_from_pb);
+            .map(ProtoUtils::located_block_from_pb)
+            .filter(|v| !v.should_assign());
         Ok((file_blocks, first_block))
     }
 

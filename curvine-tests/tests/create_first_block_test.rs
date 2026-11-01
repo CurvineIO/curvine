@@ -120,6 +120,31 @@ fn small_files_use_the_block_returned_by_create() -> CommonResult<()> {
         let mut expect = vec![0u8; 10];
         expect.push(b'x');
         assert_eq!(read_all(&fs, &path).await?, expect);
+
+        // Two writers: A pre-allocates and closes empty, B writes block 0
+        // through the AddBlock reuse path. A's close must keep B's block.
+        let path = Path::from_str("/first_block/two_writers.data")?;
+        let mut a = fs.create(&path, true).await?;
+        let first = master_block_ids(&master, path.path())?;
+        let opts = fs.create_opts_builder().build();
+        let mut b = fs
+            .open_with_opts(&path, opts, OpenFlags::new_write_only())
+            .await?;
+        b.write(b"from b").await?;
+        a.complete().await?;
+        b.complete().await?;
+        assert_eq!(master_block_ids(&master, path.path())?, first);
+        assert_eq!(read_all(&fs, &path).await?, b"from b");
+
+        // A writer opened without pre-allocation leaves block 0 to AddBlock.
+        let path = Path::from_str("/first_block/no_prealloc.data")?;
+        let opts = fs.create_opts_builder().build();
+        let flags = OpenFlags::new_write_only().set_create(true);
+        let mut writer = fs.open_without_first_block(&path, opts, flags).await?;
+        assert!(master_block_ids(&master, path.path())?.is_empty());
+        writer.write(b"late block").await?;
+        writer.complete().await?;
+        assert_eq!(read_all(&fs, &path).await?, b"late block");
         Ok(())
     })
 }
