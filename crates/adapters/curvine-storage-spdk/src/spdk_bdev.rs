@@ -216,7 +216,9 @@ pub struct SpdkBdev {
     io_timeout_ms: u64,
     inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     retired_dma: Arc<RetiredDmaRegistry>,
-    /// Set on write/flush `ETIMEDOUT` (unconfirmed completion); sticky like `qpair_dead`.
+    /// Set when a submitted write/flush's terminal outcome was not
+    /// confirmed (timeout or synthesized completion); sticky like
+    /// `qpair_dead`.
     uncertain_writes: AtomicBool,
 }
 
