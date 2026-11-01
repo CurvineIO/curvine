@@ -1953,6 +1953,43 @@ mod test {
         Ok(())
     }
 
+    /// Regression: a legacy 29B record must restore its BlockMeta and keep
+    /// its extent occupied after an upgrade/reload (not free-listed).
+    #[test]
+    fn legacy_record_survives_upgrade_and_restart() -> CommonResult<()> {
+        let path = "../testing/spdk_legacy_upgrade_reload";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let available = dir.available();
+        // Pre-upgrade worker's on-disk record: no quarantined byte.
+        store.put_legacy_for_test(1, 1, 0, 4096, 4096, true)?;
+        drop(dir);
+
+        // Reopen as the upgraded binary.
+        let dir2 = spdk_dir(1, spdk_state());
+        let ds = VfsDataset::new("t", DirList::new(vec![dir2])?, Some(store.clone()))?;
+        let meta = ds.get_block(1).expect("legacy block must be restored");
+        assert_eq!(meta.state(), &BlockState::Finalized);
+        assert_eq!(
+            ds.available(),
+            available - 4096,
+            "legacy block's extent must be reserved, not free"
+        );
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "legacy block's extent must not be free-listed after upgrade"
+        );
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
     #[test]
     fn abort_block_uncertain_falls_back_for_file_storage() -> CommonResult<()> {
         let mut ds = create_data_set(true, "abort-uncertain-file-fallback");

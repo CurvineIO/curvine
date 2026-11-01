@@ -2,6 +2,7 @@
 use crate::meta_store::BlockMetaStore;
 use crate::BlockMeta;
 /// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) | quarantined(1B) = 30B.
+/// Legacy 29B records (no quarantined byte) decode with quarantined=false.
 /// O(1) per block
 use byteorder::{BigEndian, ByteOrder};
 use curvine_core_error::{err_box, CommonResult};
@@ -9,6 +10,8 @@ use curvine_rocksdb::{DBConf, DBEngine};
 use log::{info, warn};
 const CF_SPDK_BLOCKS: &str = "spdk_blocks";
 const VALUE_SIZE: usize = 30;
+/// Pre-quarantine record size (no quarantined byte); must stay decodable.
+const LEGACY_VALUE_SIZE: usize = 29;
 pub struct SpdkMetaStore {
     db: DBEngine,
 }
@@ -113,14 +116,16 @@ impl SpdkMetaStore {
     }
     #[inline]
     fn decode_value(block_id: i64, bytes: &[u8]) -> CommonResult<SpdkBlockRecord> {
-        if bytes.len() < VALUE_SIZE {
+        if bytes.len() < LEGACY_VALUE_SIZE {
             return err_box!(
                 "SpdkMetaStore: value too short for block {} ({} < {})",
                 block_id,
                 bytes.len(),
-                VALUE_SIZE
+                LEGACY_VALUE_SIZE
             );
         }
+        // Missing in legacy 29B records -> defaults to not quarantined.
+        let quarantined = bytes.get(VALUE_SIZE - 1).is_some_and(|b| *b != 0);
         Ok(SpdkBlockRecord {
             block_id,
             dir_id: BigEndian::read_u32(&bytes[0..4]),
@@ -128,8 +133,30 @@ impl SpdkMetaStore {
             size: BigEndian::read_i64(&bytes[12..20]),
             len: BigEndian::read_i64(&bytes[20..28]),
             finalized: bytes[28] != 0,
-            quarantined: bytes[29] != 0,
+            quarantined,
         })
+    }
+
+    /// Test-only: write a raw legacy 29B record (bypasses encode_value,
+    /// which always emits 30B), for backward-compat decode tests.
+    #[cfg(test)]
+    pub(crate) fn put_legacy_for_test(
+        &self,
+        block_id: i64,
+        dir_id: u32,
+        offset: i64,
+        size: i64,
+        len: i64,
+        finalized: bool,
+    ) -> CommonResult<()> {
+        let mut buf = [0u8; LEGACY_VALUE_SIZE];
+        BigEndian::write_u32(&mut buf[0..4], dir_id);
+        BigEndian::write_i64(&mut buf[4..12], offset);
+        BigEndian::write_i64(&mut buf[12..20], size);
+        BigEndian::write_i64(&mut buf[20..28], len);
+        buf[28] = if finalized { 1 } else { 0 };
+        let key = Self::encode_key(block_id);
+        self.db.put_cf(CF_SPDK_BLOCKS, key, buf)
     }
 }
 
@@ -177,6 +204,32 @@ mod test {
         let r = store.get(1).unwrap().unwrap();
         assert!(!r.finalized);
         assert!(r.quarantined);
+    }
+    /// Regression: a legacy 29B record must still decode and show up in
+    /// scan_all(), defaulting quarantined=false.
+    #[test]
+    fn decode_legacy_29_byte_record_defaults_quarantined_false() {
+        let store = SpdkMetaStore::open(&test_dir("legacy29"), true).unwrap();
+        store
+            .put_legacy_for_test(42, 7, 4096, 8192, 8192, true)
+            .unwrap();
+
+        let rec = store.get(42).unwrap().expect("legacy record must decode");
+        assert_eq!(rec.dir_id, 7);
+        assert_eq!(rec.offset, 4096);
+        assert_eq!(rec.size, 8192);
+        assert_eq!(rec.len, 8192);
+        assert!(rec.finalized);
+        assert!(
+            !rec.quarantined,
+            "legacy record must default quarantined=false"
+        );
+
+        // scan_all() is the actual restart/upgrade path: it must not skip
+        // the legacy record either.
+        let all = store.scan_all().unwrap();
+        assert_eq!(all.len(), 1, "scan_all() must not skip legacy records");
+        assert!(!all[0].quarantined);
     }
     #[test]
     fn scan_all() {
