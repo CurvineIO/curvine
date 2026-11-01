@@ -402,8 +402,9 @@ impl WriteHandler {
                 commit_err
             );
             // Only latch is_commit if truly terminal; stay retryable
-            // otherwise (transient rollback or an unreadable state).
-            let terminal = match self.store.get_block_opt(context.block.id) {
+            // otherwise. Use the raw pending meta, not get_block_opt():
+            // during a rewrite it can mask a transient rollback.
+            let terminal = match self.store.get_raw_block_opt(context.block.id) {
                 Ok(Some(meta)) => meta.is_quarantined() || meta.is_final(),
                 Ok(None) => true,
                 Err(_) => false,
@@ -1358,6 +1359,182 @@ mod tests {
         assert!(
             meta.is_final(),
             "block must be finalized after the successful retry"
+        );
+
+        Ok(())
+    }
+
+    /// Same scenario, but on a rewrite of an already-finalized block: the
+    /// terminal check must use the raw pending meta, not the readable
+    /// (committed_rewrites) one, or a transient failure looks terminal.
+    #[test]
+    fn complete_keeps_handler_open_after_transient_finalize_failure_on_rewrite() -> FsResult<()> {
+        let block_size = 0_i64;
+        let block = ExtendedBlock::new(44, block_size, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("complete-transient-finalize-failure-rewrite")?;
+        store.open_block(&block).map_err(FsError::from)?;
+
+        // First write: finalize so the block has a committed generation.
+        let first_lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        let mut first_handler = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                RecordingBlockIO {
+                    operations: Arc::new(Mutex::new(Vec::new())),
+                },
+                0,
+                block_size,
+                0,
+            )?),
+            lease: first_lease,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+        let first_msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+        first_handler.complete(&first_msg, true)?;
+        assert!(
+            store.get_block(block.id).map_err(FsError::from)?.is_final(),
+            "setup: first write must be finalized"
+        );
+
+        // Reopen for a rewrite: old copy moves to committed_rewrites.
+        store.open_block(&block).map_err(FsError::from)?;
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Writing),
+            "setup: rewrite pending copy must be Writing"
+        );
+        assert!(
+            store.get_block(block.id).map_err(FsError::from)?.is_final(),
+            "setup: readable copy must still be the old Finalized generation"
+        );
+
+        let lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 2,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                RecordingBlockIO {
+                    operations: Arc::new(Mutex::new(Vec::new())),
+                },
+                0,
+                block_size,
+                0,
+            )?),
+            lease,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(2)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        store.set_force_transient_finalize_failure_for_test(true);
+        let err = handler.complete(&msg, true).unwrap_err();
+        store.set_force_transient_finalize_failure_for_test(false);
+        assert!(
+            err.to_string()
+                .contains("injected transient finalize failure"),
+            "unexpected error: {err}"
+        );
+
+        // The fix: get_raw_block_opt() sees Writing, not the stale
+        // Finalized entry get_block_opt() would resolve via committed_rewrites.
+        assert!(
+            !handler.is_commit,
+            "is_commit must stay false after a transient finalize failure on a rewrite"
+        );
+        assert!(
+            handler.lease.is_some(),
+            "the write lease must stay held after a transient finalize failure on a rewrite"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Writing),
+            "pending copy must be rolled back to Writing, not left in some other state"
+        );
+        assert!(
+            store.get_block(block.id).map_err(FsError::from)?.is_final(),
+            "the readable copy stays the old Finalized generation while the rewrite is pending"
+        );
+
+        // Retry must actually finalize the rewrite now.
+        let retried = handler.complete(&msg, true);
+        assert!(
+            retried.is_ok(),
+            "retried completion must actually finalize the rewrite: {retried:?}"
+        );
+        assert!(
+            handler.is_commit,
+            "is_commit must be set once the retry actually finalizes the rewrite"
+        );
+        assert!(
+            handler.lease.is_none(),
+            "the write lease must be released once the rewrite is actually finalized"
         );
 
         Ok(())

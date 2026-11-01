@@ -441,6 +441,14 @@ impl BlockStore {
         Ok(state.get_readable_block(id).cloned())
     }
 
+    /// The raw pending meta, unlike get_block_opt() which can return a
+    /// stale committed_rewrites entry during a rewrite. Use this to check
+    /// if a pending write/finalize is terminal.
+    pub fn get_raw_block_opt(&self, id: i64) -> CommonResult<Option<BlockMeta>> {
+        let state = self.read()?;
+        Ok(state.get_block(id).cloned())
+    }
+
     pub fn open_writer(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockWriteContext> {
         let (layout, dir) = {
             let state = self.read()?;
