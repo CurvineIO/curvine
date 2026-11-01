@@ -58,11 +58,11 @@ impl FileHandle {
         }
     }
 
-    /// Best-effort backend path recorded at open time.
+    /// Best-effort backend path recorded at open time, for logging only.
     ///
-    /// The dcache may have dropped the inode's ancestors by RELEASE time
-    /// (unlink, TTL eviction); this snapshot keeps the master-side object
-    /// reachable for close-time cleanup (#1395).
+    /// This snapshot is NOT a deletion target: renames do not update it and on
+    /// cache-mode UFS mounts it can be a UFS URI. Close-time deferred deletes
+    /// use the unlink-time recorded Curvine path instead (#1395).
     pub fn open_path(&self) -> String {
         match self {
             FileHandle::Backend(h) => h.open_path(),

@@ -719,8 +719,8 @@ impl NodeState {
         self.dir_write().clear_mark_delete(ino)
     }
 
-    /// Record the unlink-time Curvine path for a pending deferred delete.
-    /// See `DirTree::set_deferred_delete_path`.
+    /// Record the unlink-time Curvine path and master file id for a pending
+    /// deferred delete. See `DirTree::set_deferred_delete_path`.
     pub fn set_deferred_delete_path(&self, ino: u64, path: &Path) {
         self.dir_write()
             .set_deferred_delete_path(ino, path.full_path().to_owned());
@@ -729,6 +729,11 @@ impl NodeState {
     /// The recorded unlink-time path of a pending deferred delete, if any.
     pub fn deferred_delete_path(&self, ino: u64) -> Option<String> {
         self.dir_read().deferred_delete_path(ino)
+    }
+
+    /// The recorded master file id of a pending deferred delete, if any.
+    pub fn deferred_delete_master_id(&self, ino: u64) -> Option<i64> {
+        self.dir_read().deferred_delete_master_id(ino)
     }
 
     /// Clear inode `mark_delete` and the `deleted_children` entry for a specific
@@ -1157,6 +1162,13 @@ impl NodeState {
         self.cache_resolved_status(ino, name, &status);
 
         Ok(status)
+    }
+
+    /// Backend `get_status` for an explicit path, without touching the dcache.
+    /// Used by the release-time deferred-delete identity check, which must not
+    /// repopulate cache state for a path that may have been reused (#1395).
+    pub async fn fs_stat_by_path(&self, path: &Path) -> FuseResult<FileStatus> {
+        Ok(self.fs.get_status(path).await?)
     }
 
     pub async fn fs_stat_guarded(&self, ino: u64) -> FuseResult<FileStatus> {
