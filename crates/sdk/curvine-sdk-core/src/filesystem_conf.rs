@@ -472,12 +472,17 @@ mod tests {
         let cluster = conf.into_cluster_conf().unwrap();
         assert_eq!(cluster.client.write_buffer_timeout_ms, 45_000);
 
-        // Unset (0) keeps the ClientConf default.
+        // Unset (0) derives the default from the wrapped RPC budgets:
+        // rpc_timeout_ms + rpc_retry_max_duration_ms + margin.
         let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
         let cluster = conf.into_cluster_conf().unwrap();
-        assert_eq!(
-            cluster.client.write_buffer_timeout_ms,
-            ClientConf::DEFAULT_WRITE_BUFFER_TIMEOUT_MS
+        let expected = cluster.client.rpc_timeout_ms
+            + cluster.client.rpc_retry_max_duration_ms
+            + ClientConf::DEFAULT_WRITE_BUFFER_TIMEOUT_MARGIN_MS;
+        assert_eq!(cluster.client.write_buffer_timeout_ms, expected);
+        assert!(
+            cluster.client.write_buffer_timeout_ms > cluster.client.rpc_timeout_ms,
+            "default deadline must exceed a single master RPC budget"
         );
     }
 

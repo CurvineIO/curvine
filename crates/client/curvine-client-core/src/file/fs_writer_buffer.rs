@@ -71,6 +71,13 @@ struct BufferChannel {
     /// considered abandoned at that point (see
     /// https://github.com/CurvineIO/curvine/issues/1908).
     abandoned: AtomicBool,
+    /// Handle for the background write task. Kept so the latch can abort the
+    /// task when it fires: a task parked with no timer never wakes to see the
+    /// closed channels, and an abandoned writer would otherwise hold its
+    /// `FsWriterBase` (worker connections, block lease) and queued chunks for
+    /// the process lifetime. The master lease reclaims the unfinished file as
+    /// it does after a client crash.
+    task_handle: tokio::task::JoinHandle<()>,
     /// Upper bound for one request/response handshake with the background
     /// task. Without it a wedged-but-alive task would leave callers pending
     /// forever (see https://github.com/CurvineIO/curvine/issues/1908). Task
@@ -106,8 +113,13 @@ impl BufferChannel {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(e)) => Err(self.check_error(e)),
             Err(_) => {
+                // The deadline fired while the handshake was in flight, so
+                // the task may still be working on the queued request: the
+                // file's final state is unknown from the caller's side. The
+                // error says so instead of claiming the write failed.
                 let e = FsError::common(format!(
-                    "write buffer task not responding after {:?}, path={}",
+                    "write buffer task not responding after {:?}, path={}: \
+                     the write may still complete in the background, outcome unknown",
                     self.timeout, self.path
                 ));
                 error!("{}", e);
@@ -115,12 +127,16 @@ impl BufferChannel {
                 // immediately instead of waiting out another timeout. The
                 // latched error also flows through err_monitor/check_error()
                 // so later callers observe the original timeout cause.
+                let latch = e.to_string();
                 self.abandoned.store(true, Ordering::Release);
                 self.err_monitor.set_error(e);
-                Err(FsError::common(format!(
-                    "write buffer task not responding after {:?}, path={}",
-                    self.timeout, self.path
-                )))
+                // Stop the background task: a parked task never wakes to see
+                // the closed channels, so aborting releases its `FsWriterBase`
+                // (worker connections, block lease) and queued chunks instead
+                // of leaking them for the process lifetime. The master lease
+                // reclaims the unfinished file as it does after a client crash.
+                self.task_handle.abort();
+                Err(FsError::common(latch))
             }
         }
     }
@@ -210,7 +226,7 @@ impl FsWriterBuffer {
         let monitor = err_monitor.clone();
 
         let rt = writer.fs_context().clone_runtime();
-        rt.spawn(async move {
+        let task_handle: tokio::task::JoinHandle<()> = rt.spawn(async move {
             let res = Self::write_future(chunk_receiver, task_receiver, writer).await;
             match res {
                 Ok(_) => {}
@@ -232,6 +248,7 @@ impl FsWriterBuffer {
             task_sender,
             err_monitor,
             abandoned: AtomicBool::new(false),
+            task_handle,
             timeout,
         };
 
@@ -426,6 +443,7 @@ mod tests {
             task_sender,
             err_monitor: Arc::new(ErrorMonitor::new()),
             abandoned: std::sync::atomic::AtomicBool::new(false),
+            task_handle: tokio::spawn(async {}),
             timeout: Duration::from_millis(timeout_ms),
         }
     }
@@ -496,6 +514,7 @@ mod tests {
             task_sender,
             err_monitor: Arc::new(ErrorMonitor::new()),
             abandoned: std::sync::atomic::AtomicBool::new(false),
+            task_handle: tokio::spawn(async {}),
             timeout: Duration::from_secs(10),
         };
 
@@ -522,6 +541,7 @@ mod tests {
             task_sender,
             err_monitor: Arc::new(ErrorMonitor::new()),
             abandoned: std::sync::atomic::AtomicBool::new(false),
+            task_handle: tokio::spawn(async {}),
             timeout: Duration::from_secs(60),
         };
 
@@ -536,6 +556,84 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "flush() waited {:?}, expected a fast failure on dropped channels",
             start.elapsed()
+        );
+    }
+
+    // When the deadline fires before the reply, the error must say the
+    // outcome is unknown: the queued handshake is already handed to the task
+    // and can still succeed in the background, so the caller must not read
+    // the error as "the write failed".
+    #[tokio::test]
+    async fn timeout_error_reports_unknown_outcome_when_reply_is_late() {
+        let (chunk_sender, chunk_receiver) = AsyncChannel::new(2).split();
+        let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+
+        // Responder: wait for the flush, then reply well after the deadline.
+        tokio::spawn(async move {
+            let mut _chunk_receiver = chunk_receiver;
+            let mut task_receiver = task_receiver;
+            if let Some(WriterTask::Flush(tx)) = task_receiver.recv().await {
+                time::sleep(Duration::from_millis(400)).await;
+                let _ = tx.send(1);
+            }
+        });
+
+        let mut channel = BufferChannel {
+            path: "/gh-1908-late-reply".to_string(),
+            chunk_sender,
+            task_sender,
+            err_monitor: Arc::new(ErrorMonitor::new()),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
+            task_handle: tokio::spawn(async {}),
+            timeout: Duration::from_millis(200),
+        };
+
+        let err = channel.flush().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("outcome unknown"),
+            "error must state the outcome is unknown: {}",
+            msg
+        );
+    }
+
+    // When the latch fires, the background task must be aborted so an
+    // abandoned writer does not hold its FsWriterBase and queued chunks for
+    // the process lifetime.
+    #[tokio::test]
+    async fn latch_aborts_the_background_task() {
+        let (chunk_sender, chunk_receiver) = AsyncChannel::new(2).split();
+        let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+
+        // Responder: a parked task with no timer - the #1908 shape. It never
+        // polls and never notices the channels closing.
+        let handle = tokio::spawn(async move {
+            let _chunk_receiver = chunk_receiver;
+            let _task_receiver = task_receiver;
+            loop {
+                time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        let mut channel = BufferChannel {
+            path: "/gh-1908-abort".to_string(),
+            chunk_sender,
+            task_sender,
+            err_monitor: Arc::new(ErrorMonitor::new()),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
+            task_handle: handle,
+            timeout: Duration::from_millis(200),
+        };
+
+        let err = channel.flush().await.unwrap_err();
+        assert!(err.to_string().contains("not responding"));
+
+        // The latch aborted the parked task: it finishes (cancelled) shortly.
+        let res = time::timeout(Duration::from_secs(5), channel.task_handle).await;
+        assert!(res.is_ok(), "aborted task did not finish");
+        assert!(
+            res.unwrap().is_err(),
+            "task should have been cancelled by the latch abort"
         );
     }
 
