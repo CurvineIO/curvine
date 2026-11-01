@@ -64,6 +64,11 @@ pub struct BlockChecksum {
 
 impl BlockChecksum {
     /// Compute checksums for `data` split into `chunk_size` chunks.
+    ///
+    /// This walks the whole buffer in a separate pass. Use it to re-derive a
+    /// checksum from bytes already on disk or in memory (sidecar rebuild,
+    /// tests). On the write path, feed data through [`ChecksumBuilder`] as it
+    /// is written instead.
     pub fn compute(chunk_size: u32, data: &[u8]) -> IOResult<Self> {
         let mut builder = ChecksumBuilder::new(chunk_size)?;
         builder.update(data);
@@ -108,7 +113,7 @@ impl BlockChecksum {
     }
 
     /// Byte range `[start, end)` covered by chunk `index`, or `None` when out
-    /// of range.
+    /// of range. The last chunk may be shorter than `chunk_size`.
     pub fn chunk_range(&self, index: u64) -> Option<Range<u64>> {
         if index >= self.chunk_count() {
             return None;
@@ -121,6 +126,11 @@ impl BlockChecksum {
     /// Indexes of chunks overlapping the byte range `[offset, offset + len)`.
     /// The range is clamped to `data_len`; an empty or out-of-range request
     /// yields an empty range.
+    ///
+    /// The result includes the first and last chunks even when the request
+    /// covers them only partly. A CRC covers a whole chunk, so verifying a
+    /// read that starts or ends inside a chunk requires reading that full
+    /// chunk (see [`Self::chunk_range`]) before calling [`Self::verify_chunk`].
     pub fn chunks_for_range(&self, offset: u64, len: u64) -> Range<u64> {
         let end = offset.saturating_add(len).min(self.data_len);
         if offset >= end {
@@ -224,6 +234,10 @@ impl BlockChecksum {
 
 /// Incremental per-chunk CRC32C computation for data written sequentially
 /// from block offset 0. Input slices may cross chunk boundaries arbitrarily.
+///
+/// This is the intended write-path API: calling [`Self::update`] from the
+/// write loop computes CRCs while the bytes are already being touched, with no
+/// second pass over the data as [`BlockChecksum::compute`] would need.
 #[derive(Debug, Clone)]
 pub struct ChecksumBuilder {
     chunk_size: u32,

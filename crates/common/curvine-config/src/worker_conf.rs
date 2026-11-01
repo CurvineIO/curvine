@@ -173,9 +173,13 @@ pub struct WorkerConf {
     pub enable_splice: bool,
     pub enable_send_file: bool,
 
-    /// Compute per-chunk CRC32C checksums for block data on write and verify
-    /// them on read (#1921). Off by default. While enabled, reads go through
-    /// the worker, so sendfile and short-circuit reads are not used.
+    /// Reserved switch for block data checksums (#1921). Off by default.
+    ///
+    /// Currently inactive: setting it has no runtime effect and provides no
+    /// integrity protection. Planned follow-up work will compute per-chunk
+    /// CRC32C checksums on write and verify them on read; once that lands,
+    /// enabling it will route reads through the worker, so sendfile and
+    /// short-circuit reads will not be used.
     pub block_checksum: bool,
 
     // Pipe size
