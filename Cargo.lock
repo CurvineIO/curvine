@@ -2825,6 +2825,7 @@ version = "0.2.2"
 dependencies = [
  "byteorder",
  "bytes",
+ "crc32c",
  "curvine-config",
  "curvine-core-error",
  "curvine-io",

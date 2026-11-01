@@ -173,6 +173,15 @@ pub struct WorkerConf {
     pub enable_splice: bool,
     pub enable_send_file: bool,
 
+    /// Reserved switch for block data checksums (#1921). Off by default.
+    ///
+    /// Currently inactive: setting it has no runtime effect and provides no
+    /// integrity protection. Planned follow-up work will compute per-chunk
+    /// CRC32C checksums on write and verify them on read; once that lands,
+    /// enabling it will route reads through the worker, so sendfile and
+    /// short-circuit reads will not be used.
+    pub block_checksum: bool,
+
     // Pipe size
     pub pipe_buf_size: usize,
     // Number of cores of pipeline resource pool
@@ -234,6 +243,7 @@ impl Default for WorkerConf {
 
             enable_splice: false,
             enable_send_file: true,
+            block_checksum: false,
 
             pipe_buf_size: 64 * 1024,
             pipe_pool_init_cap: 0,
@@ -268,6 +278,19 @@ mod tests {
         // 128KB write chunk at 100ms is ~1.25MB/s: clearly abnormal on any local
         // disk, while 300ms would only fire on an almost hung device.
         assert_eq!(WorkerConf::default().io_slow_us(), 100_000);
+    }
+
+    #[test]
+    fn block_checksum_defaults_to_off() {
+        assert!(!WorkerConf::default().block_checksum);
+        let conf: WorkerConf = toml::from_str(r#"data_dir = ["/data/data1"]"#).unwrap();
+        assert!(!conf.block_checksum);
+    }
+
+    #[test]
+    fn block_checksum_parses_from_toml() {
+        let conf: WorkerConf = toml::from_str("block_checksum = true").unwrap();
+        assert!(conf.block_checksum);
     }
 
     #[test]

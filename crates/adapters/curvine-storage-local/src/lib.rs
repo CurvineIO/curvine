@@ -42,6 +42,12 @@ pub use self::meta_store::*;
 mod layout;
 pub use self::layout::*;
 
+mod block_checksum;
+pub use self::block_checksum::{
+    checksum_path, BlockChecksum, ChecksumBuilder, CHECKSUM_FILE_SUFFIX,
+    DEFAULT_CHECKSUM_CHUNK_SIZE,
+};
+
 mod block_io_context;
 pub use self::block_io_context::{BlockReadContext, BlockWriteContext};
 
