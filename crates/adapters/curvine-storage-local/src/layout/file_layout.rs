@@ -87,9 +87,9 @@ impl FileLayout {
     fn block_dir(dir: &VfsDir, meta: &BlockMeta) -> CommonResult<PathBuf> {
         let path = match meta.state() {
             BlockState::Finalized => {
-                let uid = meta.id() as u64;
-                let d1 = (uid >> 48) & 0x1F;
-                let d2 = (uid >> 32) & 0x1F;
+                let block_id = meta.id() as u64;
+                let d1 = (block_id >> 48) & 0x1F;
+                let d2 = (block_id >> 32) & 0x1F;
                 Self::active_dir(dir)
                     .join(format!("b{}", d1))
                     .join(format!("b{}", d2))
