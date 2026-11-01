@@ -104,6 +104,7 @@ impl BlockLayout for BdevLayout {
         _dir: &VfsDir,
         meta: &BlockMeta,
         committed_len: i64,
+        _checksum: bool,
     ) -> CommonResult<BlockMeta> {
         Ok(BlockMeta::with_final_spdk(meta, committed_len))
     }

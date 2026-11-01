@@ -97,6 +97,12 @@ pub struct FileFinalizeReservation {
 }
 
 impl FileFinalizeReservation {
+    /// Publish this block without a checksum sidecar, e.g. when another
+    /// writer may still change the bytes after the checksum pass.
+    pub fn skip_checksum(&mut self) {
+        self.checksum = false;
+    }
+
     pub fn prepare(&self, committed_len: i64) -> CommonResult<FileFinalizePlan> {
         FileLayout::prepare_finalize(&self.dir, &self.pending, committed_len, self.checksum)
     }
@@ -717,7 +723,7 @@ impl Dataset for VfsDataset {
             let dir = self.find_dir(meta.dir_id())?;
             let layout = self.layouts.get(meta.storage_type());
             let reserved_bytes = meta.physical_bytes();
-            let final_meta = layout.finalize(dir, meta, block.len)?;
+            let final_meta = layout.finalize(dir, meta, block.len, self.block_checksum)?;
             if block.len != final_meta.len() {
                 return err_box!(
                     "Block {} length mismatch, expected: {}, actual: {}",
@@ -1627,6 +1633,48 @@ mod test {
         assert!(ds.publish_file_finalize(&reservation, plan).is_err());
         assert!(!FileLayout::checksum_path_of(&staging_path).exists());
         assert!(staging_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn checksum_path_appends_suffix() {
+        assert_eq!(
+            FileLayout::checksum_path_of(std::path::Path::new("/data/blk_1")),
+            std::path::PathBuf::from("/data/blk_1.crc")
+        );
+    }
+
+    #[test]
+    fn dataset_finalize_block_honors_checksum_switch() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-dataset-finalize");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let writing = ds.open_block(&block)?;
+        std::fs::write(block_file(&ds, &writing)?, [6u8; 40])?;
+        block.len = 40;
+        let finalized = ds.finalize_block(&block)?;
+
+        assert_checksum_matches(&block_file(&ds, &finalized)?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn recreated_block_with_checksum_off_drops_leftover_sidecar() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-recreate-off");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let first = write_and_finalize(&mut ds, &mut block, &[1u8; 40])?;
+        let active_path = block_file(&ds, &first)?;
+        let checksum_path = FileLayout::checksum_path_of(&active_path);
+        let leftover = std::fs::read(&checksum_path)?;
+
+        // Simulate a deallocate that removed the block but not its sidecar.
+        ds.remove_block(&block)?;
+        std::fs::write(&checksum_path, leftover)?;
+
+        ds.block_checksum = false;
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        write_and_finalize(&mut ds, &mut block, &[2u8; 40])?;
+        assert!(active_path.exists());
+        assert!(!checksum_path.exists());
         Ok(())
     }
 

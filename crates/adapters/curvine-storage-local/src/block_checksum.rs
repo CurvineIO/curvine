@@ -327,11 +327,6 @@ pub fn chunk_count(data_len: u64, chunk_size: u32) -> u64 {
     data_len.div_ceil(chunk_size as u64)
 }
 
-/// Sidecar checksum path for a block file path.
-pub fn checksum_path(block_path: &str) -> String {
-    format!("{}{}", block_path, CHECKSUM_FILE_SUFFIX)
-}
-
 fn check_chunk_size(chunk_size: u32) -> IOResult<()> {
     if chunk_size == 0 {
         return err_box!("checksum chunk size must be > 0");
@@ -534,10 +529,5 @@ mod tests {
         let mut ragged = body;
         ragged.push(0);
         assert!(BlockChecksum::decode(&reseal(ragged)).is_err());
-    }
-
-    #[test]
-    fn checksum_path_appends_suffix() {
-        assert_eq!(checksum_path("/data/blk_1"), "/data/blk_1.crc");
     }
 }

@@ -46,7 +46,6 @@ pub struct FileFinalizePlan {
     staging_path: PathBuf,
     active_path: PathBuf,
     staging_checksum: Option<PathBuf>,
-    is_rewrite: bool,
 }
 
 impl FileFinalizePlan {
@@ -125,10 +124,20 @@ impl FileLayout {
         file.ends_with(CHECKSUM_FILE_SUFFIX)
     }
 
-    fn remove_if_exists(path: &Path) -> std::io::Result<()> {
+    /// Returns whether a file was removed.
+    fn remove_if_exists(path: &Path) -> std::io::Result<bool> {
         match fs::remove_file(path) {
-            Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Persist directory entry changes (unlink, rename) made in `path`'s parent.
+    fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+        match path.parent() {
+            Some(parent) => File::open(parent)?.sync_all(),
+            None => Ok(()),
         }
     }
 
@@ -206,28 +215,38 @@ impl FileLayout {
             staging_path,
             active_path,
             staging_checksum,
-            is_rewrite,
         })
     }
 
     /// Publish order keeps a block from ever pairing with another generation's
-    /// sidecar: drop the old active sidecar, rename the block, then rename the
-    /// new sidecar. A crash in between leaves a block without a sidecar.
+    /// sidecar, in memory and after a crash:
+    ///
+    /// 1. Remove any active sidecar and, if one existed, sync the directory.
+    ///    Always done, because a sidecar left by an earlier generation of this
+    ///    block id (rewrite, or a failed sidecar delete) is stale either way.
+    /// 2. Rename the block. With a new sidecar, sync the directory so the block
+    ///    rename is durable before the sidecar can become visible.
+    /// 3. Rename the new sidecar.
+    ///
+    /// Outcomes on failure: if step 1 fails, publish fails before the rename
+    /// and rollback keeps the committed block and its sidecar. If step 2's
+    /// rename fails, rollback keeps the committed block, but its sidecar is
+    /// already gone and T5 handles the missing sidecar. If the sync in step 2
+    /// or step 3 fails, the new block stays published without a sidecar.
     pub(crate) fn publish_finalize(mut plan: FileFinalizePlan) -> CommonResult<BlockMeta> {
         let active_checksum = Self::checksum_path_of(&plan.active_path);
-        // A rewrite replaces the committed block; its sidecar is stale even
-        // when checksums are now off. Fail before the rename so rollback keeps
-        // the committed block with its matching sidecar.
-        if plan.is_rewrite || plan.staging_checksum.is_some() {
-            Self::remove_if_exists(&active_checksum)?;
+        if Self::remove_if_exists(&active_checksum)? {
+            Self::sync_parent_dir(&active_checksum)?;
         }
         FileUtils::rename(&plan.staging_path, &plan.active_path)?;
         if let Some(staging_checksum) = plan.staging_checksum.take() {
-            if let Err(e) = fs::rename(&staging_checksum, &active_checksum) {
+            let published = Self::sync_parent_dir(&plan.active_path)
+                .and_then(|_| fs::rename(&staging_checksum, &active_checksum));
+            if let Err(e) = published {
                 // The block is already visible; keep it and publish without a
-                // sidecar rather than failing a durable rename.
+                // sidecar rather than failing a completed rename.
                 log::warn!(
-                    "block {} published without checksum, sidecar rename failed: {}",
+                    "block {} published without checksum, sidecar publish failed: {}",
                     plan.final_meta.id(),
                     e
                 );
@@ -306,8 +325,9 @@ impl BlockLayout for FileLayout {
         dir: &VfsDir,
         meta: &BlockMeta,
         committed_len: i64,
+        checksum: bool,
     ) -> CommonResult<BlockMeta> {
-        let plan = Self::prepare_finalize(dir, meta, committed_len, false)?;
+        let plan = Self::prepare_finalize(dir, meta, committed_len, checksum)?;
         Self::publish_finalize(plan)
     }
 
