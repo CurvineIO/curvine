@@ -8,12 +8,17 @@ use byteorder::{BigEndian, ByteOrder};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_rocksdb::{DBConf, DBEngine};
 use log::{info, warn};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 const CF_SPDK_BLOCKS: &str = "spdk_blocks";
 const VALUE_SIZE: usize = 30;
 /// Pre-quarantine record size (no quarantined byte); must stay decodable.
 const LEGACY_VALUE_SIZE: usize = 29;
 pub struct SpdkMetaStore {
     db: DBEngine,
+    /// Test-only: forces the next put() to fail.
+    #[cfg(test)]
+    force_put_failure: AtomicBool,
 }
 #[derive(Debug, Clone)]
 pub struct SpdkBlockRecord {
@@ -31,7 +36,15 @@ impl SpdkMetaStore {
         let conf = DBConf::new(dir).add_cf(CF_SPDK_BLOCKS);
         let db = DBEngine::new(conf, format)?;
         info!("SpdkMetaStore opened at {}", dir);
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            #[cfg(test)]
+            force_put_failure: AtomicBool::new(false),
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn set_force_put_failure_for_test(&self, enabled: bool) {
+        self.force_put_failure.store(enabled, Ordering::Release);
     }
     #[allow(clippy::too_many_arguments)]
     pub fn put(
@@ -44,6 +57,10 @@ impl SpdkMetaStore {
         finalized: bool,
         quarantined: bool,
     ) -> CommonResult<()> {
+        #[cfg(test)]
+        if self.force_put_failure.load(Ordering::Acquire) {
+            return err_box!("SpdkMetaStore: injected put failure for block {}", block_id);
+        }
         let key = Self::encode_key(block_id);
         let value = Self::encode_value(dir_id, offset, size, len, finalized, quarantined);
         self.db.put_cf(CF_SPDK_BLOCKS, key, value)

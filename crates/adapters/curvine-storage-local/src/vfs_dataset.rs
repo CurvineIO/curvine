@@ -818,7 +818,7 @@ impl Dataset for VfsDataset {
         // Keep the extent reserved; only flip state, don't deallocate/release.
         let mut quarantined = meta;
         quarantined.state = BlockState::Quarantined;
-        self.meta.put(quarantined);
+        self.meta.put_checked(quarantined)?;
         Ok(())
     }
 
@@ -2020,6 +2020,42 @@ mod test {
         );
 
         drop(ds2);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// A failed persist of the quarantine transition must propagate, not
+    /// be swallowed; the in-memory quarantine must still hold.
+    #[test]
+    fn abort_block_uncertain_propagates_persist_failure_but_keeps_in_memory_quarantine(
+    ) -> CommonResult<()> {
+        let path = "../testing/spdk_quarantine_persist_failure";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let mut ds = VfsDataset::new("t", DirList::new(vec![dir])?, Some(store.clone()))?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+
+        store.set_force_put_failure_for_test(true);
+        let result = ds.abort_block_uncertain(&block);
+        store.set_force_put_failure_for_test(false);
+
+        assert!(result.is_err(), "persistence failure must propagate");
+
+        // Must still be Quarantined despite the persist failure.
+        let meta = ds.get_block(1).expect("block must still exist in memory");
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "extent must stay reserved even when persistence failed"
+        );
+
+        drop(ds);
         drop(store);
         let _ = std::fs::remove_dir_all(path);
         Ok(())
