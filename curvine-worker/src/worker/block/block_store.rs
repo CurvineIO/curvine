@@ -403,12 +403,13 @@ impl BlockStore {
         off: i64,
         logical_len: i64,
     ) -> CommonResult<BlockReadContext> {
-        let (layout, dir) = {
+        let (layout, dir, verify) = {
             let state = self.read()?;
-            state.layout_for(meta)?
+            let (layout, dir) = state.layout_for(meta)?;
+            (layout, dir, state.checksum_verify())
         };
         layout
-            .open_reader(&dir, meta, off, logical_len)
+            .open_reader(&dir, meta, off, logical_len, verify)
             .map_err(Into::into)
     }
 
@@ -448,15 +449,20 @@ impl BlockStore {
             .clone();
         let logical_len = logical_len.unwrap_or_else(|| meta.len());
         let (layout, dir) = state.layout_for(&meta)?;
-        let reader = layout.open_reader(&dir, &meta, off, logical_len)?;
+        let reader = layout.open_reader(&dir, &meta, off, logical_len, state.checksum_verify())?;
         Ok((meta, reader))
     }
 
     /// Returns a local path only while no finalize publication is in progress.
     /// A finalizing file can be atomically renamed before a co-located client
     /// opens the returned path, so callers must use `open_reader_by_id` then.
+    /// Also `None` while checksum verification is on: a client reading the
+    /// file directly would bypass the check.
     pub fn short_circuit_by_id(&self, id: i64) -> CommonResult<Option<(BlockMeta, String, i64)>> {
         let state = self.read()?;
+        if state.checksum_verify().is_enabled() {
+            return Ok(None);
+        }
         if matches!(
             state.get_block(id).map(BlockMeta::state),
             Some(BlockState::Finalizing)
@@ -886,17 +892,92 @@ mod tests {
     }
 
     fn create_checksum_store(name: &str) -> CommonResult<BlockStore> {
+        create_checksum_store_with(name, true, false)
+    }
+
+    fn create_checksum_store_with(
+        name: &str,
+        write: bool,
+        verify: bool,
+    ) -> CommonResult<BlockStore> {
         let conf = ClusterConf {
             format_worker: true,
             worker: WorkerConf {
                 dir_reserved: "0".to_string(),
                 data_dir: vec![format!("[MEM:16MB]../testing/block-store-{name}")],
-                block_checksum: true,
+                block_checksum: write,
+                block_checksum_verify: verify,
                 ..WorkerConf::default()
             },
             ..ClusterConf::default()
         };
         BlockStore::new("test", &conf)
+    }
+
+    /// Write `data` through a worker writer and finalize it.
+    fn finalize_with_data(store: &BlockStore, id: i64, data: &[u8]) -> CommonResult<BlockMeta> {
+        let mut block = ExtendedBlock::with_mem(id, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let mut writer = store.open_writer(&meta, 0)?;
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(data)))?;
+        writer.flush()?;
+        drop(writer);
+        block.len = data.len() as i64;
+        store.finalize_block(&block)
+    }
+
+    #[test]
+    fn verified_reads_detect_corruption_and_disable_short_circuit() -> CommonResult<()> {
+        let store = create_checksum_store_with("checksum-verify-read", true, true)?;
+        // Three 64 KiB chunks with a partial tail.
+        let len = 150 * 1024 + 17;
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let finalized = finalize_with_data(&store, 1, &data)?;
+        assert!(store.short_circuit_by_id(finalized.id)?.is_none());
+
+        let (_, mut reader) = store.open_reader_by_id(finalized.id, 100 * 1024, len as i64)?;
+        assert!(!reader.supports_send_file());
+        assert_eq!(
+            read_bytes(&mut reader, 1024)?,
+            &data[100 * 1024..101 * 1024]
+        );
+
+        // Flip one byte in chunk 1 [64 KiB, 128 KiB).
+        let path = store.short_circuit(&finalized)?.unwrap();
+        let mut corrupted = data.clone();
+        corrupted[90 * 1024] ^= 0xff;
+        std::fs::write(&path, &corrupted)?;
+
+        let (_, mut reader) = store.open_reader_by_id(finalized.id, 0, len as i64)?;
+        assert_eq!(read_bytes(&mut reader, 64 * 1024)?, &data[..64 * 1024]);
+        let err = reader.read_region(false, 1).unwrap_err().to_string();
+        assert!(err.contains("checksum mismatch at chunk 1"), "{err}");
+
+        // Replication reads the source at its stored length with send_file.
+        let (_, mut reader) = store.open_reader_by_id_at_stored_len(finalized.id, 64 * 1024)?;
+        assert!(reader.read_region(true, 64 * 1024).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn verify_off_keeps_short_circuit_and_send_file() -> CommonResult<()> {
+        let store = create_checksum_store_with("checksum-verify-off", true, false)?;
+        let finalized = finalize_with_data(&store, 1, &[7u8; 4096])?;
+        assert!(store.short_circuit_by_id(finalized.id)?.is_some());
+        let (_, reader) = store.open_reader_by_id(finalized.id, 0, 4096)?;
+        assert!(!reader.is_verified());
+        Ok(())
+    }
+
+    #[test]
+    fn verify_without_write_reads_blocks_without_sidecar() -> CommonResult<()> {
+        // Default policy allows blocks that have no sidecar.
+        let store = create_checksum_store_with("checksum-verify-only", false, true)?;
+        let finalized = finalize_with_data(&store, 1, &[5u8; 4096])?;
+        let (_, mut reader) = store.open_reader_by_id(finalized.id, 0, 4096)?;
+        assert!(!reader.is_verified());
+        assert_eq!(read_bytes(&mut reader, 4096)?, vec![5u8; 4096]);
+        Ok(())
     }
 
     fn assert_sidecar_matches(path: &str) -> CommonResult<()> {

@@ -14,7 +14,8 @@
 
 use crate::layout::{validate_open_offset, BlockLayout};
 use crate::{
-    BlockChecksum, BlockMeta, BlockState, CHECKSUM_FILE_SUFFIX, DEFAULT_CHECKSUM_CHUNK_SIZE,
+    BlockChecksum, BlockMeta, BlockState, ChecksumVerify, CHECKSUM_FILE_SUFFIX,
+    DEFAULT_CHECKSUM_CHUNK_SIZE,
 };
 use crate::{BlockReadContext, BlockWriteContext, VfsDir};
 use curvine_core_error::{err_box, try_err, CommonResult};
@@ -118,6 +119,26 @@ impl FileLayout {
         let mut name = OsString::from(block_path.as_os_str());
         name.push(CHECKSUM_FILE_SUFFIX);
         PathBuf::from(name)
+    }
+
+    /// Load the sidecar of `block_path`, `Ok(None)` when it does not exist.
+    /// Called right after opening the block file under the dataset read lock,
+    /// so both belong to the same published generation.
+    fn read_checksum(block_path: &Path) -> IOResult<Option<BlockChecksum>> {
+        let checksum_path = Self::checksum_path_of(block_path);
+        let buf = match fs::read(&checksum_path) {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        match BlockChecksum::decode(&buf) {
+            Ok(checksum) => Ok(Some(checksum)),
+            Err(e) => err_box!(
+                "invalid checksum sidecar {}: {}",
+                checksum_path.display(),
+                e
+            ),
+        }
     }
 
     fn is_checksum_file(file: &str) -> bool {
@@ -407,6 +428,7 @@ impl BlockLayout for FileLayout {
         meta: &BlockMeta,
         off: i64,
         logical_len: i64,
+        verify: ChecksumVerify,
     ) -> IOResult<BlockReadContext> {
         let file = Self::block_file(dir, meta)?;
         // The opened file is the source of truth for bytes that can be read
@@ -434,7 +456,27 @@ impl BlockLayout for FileLayout {
             );
         }
         let physical_len = device.len().min(logical_len);
-        BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)
+        let file_len = device.len();
+        let reader = BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)?;
+        if !verify.is_enabled() {
+            return Ok(reader);
+        }
+
+        match Self::read_checksum(Path::new(&file))? {
+            // Finalize materializes the file to the checksummed length, so a
+            // different file length means the block changed afterwards.
+            Some(checksum) if checksum.data_len() as i64 != file_len => err_box!(
+                "Block {} checksum length mismatch: checksum covers {}, file length {}",
+                meta.id,
+                checksum.data_len(),
+                file_len
+            ),
+            Some(checksum) => reader.with_checksum(checksum),
+            None if verify == ChecksumVerify::RequireSidecar => {
+                err_box!("Block {} has no checksum sidecar", meta.id)
+            }
+            None => Ok(reader),
+        }
     }
 
     fn short_circuit(&self, dir: &VfsDir, meta: &BlockMeta) -> CommonResult<Option<String>> {

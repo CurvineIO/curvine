@@ -44,7 +44,8 @@ pub use self::layout::*;
 
 mod block_checksum;
 pub use self::block_checksum::{
-    BlockChecksum, ChecksumBuilder, CHECKSUM_FILE_SUFFIX, DEFAULT_CHECKSUM_CHUNK_SIZE,
+    BlockChecksum, ChecksumBuilder, ChecksumVerify, CHECKSUM_FILE_SUFFIX,
+    DEFAULT_CHECKSUM_CHUNK_SIZE,
 };
 
 mod block_io_context;

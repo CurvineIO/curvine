@@ -52,6 +52,32 @@ const CRC_LEN: usize = 4;
 /// Read buffer for [`BlockChecksum::from_reader`].
 const READ_BUF_LEN: usize = 1024 * 1024;
 
+/// Read-side checksum verification mode for a block reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChecksumVerify {
+    /// Read without verification.
+    #[default]
+    Off,
+    /// Verify when a sidecar exists; read a block without one unverified.
+    AllowMissing,
+    /// Verify, and reject a block without a sidecar.
+    RequireSidecar,
+}
+
+impl ChecksumVerify {
+    pub fn from_conf(verify: bool, allow_missing: bool) -> Self {
+        match (verify, allow_missing) {
+            (false, _) => Self::Off,
+            (true, true) => Self::AllowMissing,
+            (true, false) => Self::RequireSidecar,
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+}
+
 /// CRC32C of `data`.
 pub fn crc32c(data: &[u8]) -> u32 {
     crc32c::crc32c(data)
