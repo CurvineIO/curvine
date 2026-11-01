@@ -207,6 +207,7 @@ uuid = { version = "1.11.0", features = ["v4", "fast-rng"] }
 rand = '0.8.5'
 murmur3 = "0.5.2"
 crc32fast = "1.4.2"
+crc32c = "0.6.8"
 socket2 = "0.5.8"
 chrono = { version = "0.4.31", default-features = false, features = ["clock"] }
 prometheus = { version = "0.13.4", features = ["process"] }
