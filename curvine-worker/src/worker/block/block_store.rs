@@ -134,6 +134,17 @@ impl BlockStore {
         ))
     }
 
+    /// True when more ordinary writers than the finalizing one hold a lease.
+    /// Leases are acquired under the block stripe lock, so a caller holding
+    /// that lock sees a stable count. A finalize without a lease (tests,
+    /// replication) counts as one writer.
+    fn has_other_ordinary_writers(&self, block_id: i64) -> bool {
+        self.block_uses(block_id)
+            .lock()
+            .get(&block_id)
+            .is_some_and(|entry| entry.ordinary_writers > 1)
+    }
+
     // Called under the block stripe lock, so acquisition cannot race admission/removal.
     fn check_replication_owner(&self, block_id: i64) -> CommonResult<()> {
         let uses = self.block_uses(block_id).lock();
@@ -269,9 +280,20 @@ impl BlockStore {
         let reservation =
             self.with_dataset_write("finalize", |state| state.reserve_file_finalize(block))?;
 
-        let Some(reservation) = reservation else {
+        let Some(mut reservation) = reservation else {
             return self.with_dataset_write("finalize", |state| state.finalize_block(block));
         };
+        if self.has_other_ordinary_writers(block.id) {
+            // Another session holds an open handle on the same staging inode
+            // and may write after the checksum pass, including after publish;
+            // its own finalize then short-circuits on the already finalized
+            // block. A missing sidecar is safe, a stale one reads as corruption.
+            log::warn!(
+                "block {} finalized with concurrent writers, skipping checksum",
+                block.id
+            );
+            reservation.skip_checksum();
+        }
 
         let started = Instant::now();
         let plan = reservation.prepare(block.len);
@@ -860,6 +882,120 @@ mod tests {
 
         let (_, mut published_reader) = store.open_reader_by_id_at_stored_len(block.id, 0)?;
         assert_eq!(read_bytes(&mut published_reader, 4)?, b"new!");
+        Ok(())
+    }
+
+    fn create_checksum_store(name: &str) -> CommonResult<BlockStore> {
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                dir_reserved: "0".to_string(),
+                data_dir: vec![format!("[MEM:16MB]../testing/block-store-{name}")],
+                block_checksum: true,
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        BlockStore::new("test", &conf)
+    }
+
+    fn assert_sidecar_matches(path: &str) -> CommonResult<()> {
+        use crate::worker::storage::{BlockChecksum, DEFAULT_CHECKSUM_CHUNK_SIZE};
+        let data = std::fs::read(path)?;
+        let sidecar = std::fs::read(FileLayout::checksum_path_of(std::path::Path::new(path)))?;
+        let expected = BlockChecksum::compute(DEFAULT_CHECKSUM_CHUNK_SIZE, &data)?;
+        assert_eq!(BlockChecksum::decode(&sidecar)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_checksums_worker_and_short_circuit_writes() -> CommonResult<()> {
+        let store = create_checksum_store("checksum-write-paths")?;
+        // More than two 64 KiB chunks with a partial tail.
+        let len = 150 * 1024 + 17;
+
+        // Worker write path with a seek back over already written bytes.
+        let mut block = ExtendedBlock::with_mem(1, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let mut writer = store.open_writer(&meta, 0)?;
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(
+            &vec![1u8; len][..],
+        )))?;
+        writer.seek_to(70 * 1024)?;
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&[9u8; 100][..])))?;
+        writer.flush()?;
+        drop(writer);
+        block.len = len as i64;
+        let finalized = store.finalize_block(&block)?;
+        let path = store.short_circuit(&finalized)?.unwrap();
+        assert_eq!(std::fs::read(&path)?[70 * 1024], 9);
+        assert_sidecar_matches(&path)?;
+
+        // Short-circuit path: the client writes the staging file directly.
+        let mut block = ExtendedBlock::with_mem(2, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let staging = store.short_circuit(&meta)?.unwrap();
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&staging, &data)?;
+        block.len = len as i64;
+        let finalized = store.finalize_block(&block)?;
+        let path = store.short_circuit(&finalized)?.unwrap();
+        assert_sidecar_matches(&path)?;
+
+        // Removing the block removes its sidecar.
+        store.remove_block(2)?;
+        assert!(!FileLayout::checksum_path_of(std::path::Path::new(&path)).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_writers_finalize_without_checksum() -> CommonResult<()> {
+        let store = create_checksum_store("checksum-concurrent-writers")?;
+        let mut block = ExtendedBlock::with_mem(1, "1MB")?;
+        let first = store.ordinary_write_lease(block.id)?;
+        let second = store.ordinary_write_lease(block.id)?;
+        let meta = store.open_block(&block)?;
+        let staging = store.short_circuit(&meta)?.unwrap();
+        std::fs::write(&staging, [1u8; 100])?;
+
+        // The second session still holds the staging inode open and may write
+        // after the checksum pass, so the first finalize must not publish one.
+        let mut late = std::fs::OpenOptions::new().write(true).open(&staging)?;
+        block.len = 100;
+        let finalized = store.finalize_block(&block)?;
+        let path = store.short_circuit(&finalized)?.unwrap();
+        let sidecar = FileLayout::checksum_path_of(std::path::Path::new(&path));
+        assert!(!sidecar.exists());
+        drop(first);
+
+        late.write_all(&[2u8; 100])?;
+        drop(late);
+        assert_eq!(store.finalize_block(&block)?.len(), 100);
+        assert!(!sidecar.exists());
+        drop(second);
+
+        // A single remaining writer gets a sidecar again on rewrite.
+        let _only = store.ordinary_write_lease(block.id)?;
+        let rewrite = store.open_block(&block)?;
+        std::fs::write(store.short_circuit(&rewrite)?.unwrap(), [3u8; 100])?;
+        store.finalize_block(&block)?;
+        assert_sidecar_matches(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn length_mismatch_abort_leaves_no_checksum_sidecar() -> CommonResult<()> {
+        let store = create_checksum_store("checksum-length-mismatch")?;
+        let mut block = ExtendedBlock::with_mem(1, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let staging = store.short_circuit(&meta)?.unwrap();
+        std::fs::write(&staging, [4u8; 100])?;
+
+        block.len = 101;
+        assert!(store.finalize_block(&block).is_err());
+        assert!(store.get_block(1).is_err());
+        assert!(!std::path::Path::new(&staging).exists());
+        assert!(!FileLayout::checksum_path_of(std::path::Path::new(&staging)).exists());
         Ok(())
     }
 

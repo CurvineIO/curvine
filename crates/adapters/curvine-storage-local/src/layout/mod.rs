@@ -48,11 +48,14 @@ pub trait BlockLayout {
         block: &ExtendedBlock,
     ) -> CommonResult<BlockMeta>;
 
+    /// Finalize in one step under the dataset lock. `checksum` asks layouts
+    /// that support checksum sidecars to write one; others ignore it.
     fn finalize(
         &self,
         dir: &VfsDir,
         meta: &BlockMeta,
         committed_len: i64,
+        checksum: bool,
     ) -> CommonResult<BlockMeta>;
 
     fn scan(&self, dir: &VfsDir) -> CommonResult<Vec<BlockMeta>>;
@@ -149,10 +152,11 @@ impl BlockLayout for BlockLayoutKind {
         dir: &VfsDir,
         meta: &BlockMeta,
         committed_len: i64,
+        checksum: bool,
     ) -> CommonResult<BlockMeta> {
         match self {
-            Self::File(layout) => layout.finalize(dir, meta, committed_len),
-            Self::Bdev(layout) => layout.finalize(dir, meta, committed_len),
+            Self::File(layout) => layout.finalize(dir, meta, committed_len, checksum),
+            Self::Bdev(layout) => layout.finalize(dir, meta, committed_len, checksum),
         }
     }
 

@@ -502,7 +502,7 @@ mod test {
 
         // commit block
         // commit block (committed_len = 1MB, the actual data written)
-        let final1 = layout.finalize(&dir, &tmp, ByteUnit::MB as i64)?;
+        let final1 = layout.finalize(&dir, &tmp, ByteUnit::MB as i64, false)?;
         let file = FileLayout::block_path(&dir, &final1)?;
         dir.release_space(false, block.len);
         dir.reserve_space(true, final1.len);
@@ -531,7 +531,7 @@ mod test {
             bdev_offset: 0,
         };
         let layout = BdevLayout::new(None);
-        let r = layout.finalize(&dir, &meta, 2048)?;
+        let r = layout.finalize(&dir, &meta, 2048, false)?;
         assert_eq!(r.len, 2048);
         Ok(())
     }
