@@ -1917,6 +1917,14 @@ mod test {
         // 3: pending entries signaled with -ESHUTDOWN, DMA refs kept until reclaim
         assert_eq!(completion_1.wait(0), -libc::ESHUTDOWN);
         assert_eq!(completion_2.wait(0), -libc::ESHUTDOWN);
+        assert!(
+            completion_1.was_forced(),
+            "unregister-forced completion must be marked forced"
+        );
+        assert!(
+            completion_2.was_forced(),
+            "unregister-forced completion must be marked forced"
+        );
         assert_eq!(inflight_1.load(Ordering::Acquire), 1);
         assert_eq!(inflight_2.load(Ordering::Acquire), 1);
 

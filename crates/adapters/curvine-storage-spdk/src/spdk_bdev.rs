@@ -1417,4 +1417,60 @@ mod test {
 
         std::mem::forget(bdev);
     }
+
+    /// Control: confirmed EIO must not mark uncertain (flush version).
+    #[test]
+    fn spdk_flush_eio_does_not_mark_uncertain() {
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+        // No timeout: avoid racing the 1ms deadline against thread scheduling.
+        bdev.io_timeout_ms = 0;
+
+        let responder = std::thread::spawn(move || {
+            let req = rx.recv().expect("flush should submit exactly once");
+            assert!(req.completion.complete(-libc::EIO));
+            rx
+        });
+
+        let err = bdev
+            .spdk_flush()
+            .expect_err("flush should fail with a confirmed EIO");
+        assert!(err.to_string().contains("NVMe flush failed"), "{}", err);
+        assert!(bdev.io_channel.qpair_dead.load(Ordering::Acquire));
+        assert!(
+            !bdev.has_uncertain_writes(),
+            "confirmed EIO is not uncertain"
+        );
+
+        let rx = responder.join().expect("responder thread must not panic");
+        assert!(rx.try_recv().is_err(), "only one submit expected");
+
+        std::mem::forget(bdev);
+    }
+
+    /// Forced completion must be uncertain regardless of status (-ESHUTDOWN
+    /// here, not just -EIO); it's provenance, not errno, that decides.
+    #[test]
+    fn spdk_write_forced_eshutdown_marks_uncertain() {
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+
+        let responder = std::thread::spawn(move || {
+            let req = rx.recv().expect("write should submit exactly once");
+            assert!(req.completion.force_complete(-libc::ESHUTDOWN));
+            rx
+        });
+
+        let err = bdev
+            .spdk_write(0, &[0u8; 512])
+            .expect_err("write should fail with a forced, nonterminal ESHUTDOWN");
+        assert!(err.to_string().contains("NVMe write failed"), "{}", err);
+        assert!(
+            bdev.has_uncertain_writes(),
+            "forced, nonterminal completion must be uncertain regardless of status"
+        );
+
+        let rx = responder.join().expect("responder thread must not panic");
+        assert!(rx.try_recv().is_err(), "only one submit expected");
+
+        std::mem::forget(bdev);
+    }
 }
