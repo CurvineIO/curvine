@@ -42,9 +42,10 @@ impl VfsMetaStore {
         self.mem.put(meta)
     }
 
-    /// Like put(), but propagates a persistence failure instead of only
-    /// logging it. Use where losing the durable record is unsafe (e.g.
-    /// quarantine).
+    /// Like put(), but reports a persistence failure instead of only
+    /// logging it. The in-memory update happens first and is NOT rolled
+    /// back on error (intentional, for quarantine semantics) — Err means
+    /// "not durable yet", not "nothing changed".
     pub fn put_checked(&mut self, meta: BlockMeta) -> CommonResult<Option<BlockMeta>> {
         let persist_result = self.persist_spdk_put_checked(&meta);
         let previous = self.mem.put(meta);
