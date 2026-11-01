@@ -555,6 +555,10 @@ impl VfsDataset {
             None => return err_box!("Not found block {}", id),
             Some(meta) => meta,
         };
+        if meta.is_quarantined() {
+            // Write may still be in flight; keep the extent reserved.
+            return err_box!("block {} is quarantined; refusing to remove", id);
+        }
         let layout = self.layouts.get(meta.storage_type()).clone();
         let dir = match self.dir_list.get_dir(meta.dir_id()) {
             None => return err_box!("No storage directory found: {:?}", meta.dir_id()),
@@ -780,6 +784,11 @@ impl Dataset for VfsDataset {
         let Some(meta) = self.meta.get(block.id).cloned() else {
             return Ok(());
         };
+
+        if meta.is_quarantined() {
+            // Already quarantined: no-op, extent stays reserved.
+            return Ok(());
+        }
 
         if let Some(committed) = self.committed_rewrites.get(&block.id).cloned() {
             let (layout, dir) = self.layout_for(&meta)?;
@@ -1914,6 +1923,69 @@ mod test {
         assert_eq!(alloc.free_list_bytes(), 0);
 
         // New block must get a fresh offset, not the quarantined one.
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let m2 = ds.open_block(&b2)?;
+        assert_eq!(m2.bdev_offset, 4096, "must not reuse quarantined offset 0");
+        Ok(())
+    }
+
+    /// Ordinary abort (abort_replication_write's route) on a quarantined
+    /// block must be a no-op, not release the extent.
+    #[test]
+    fn abort_on_quarantined_block_keeps_extent_reserved() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        ds.abort_block_uncertain(&b1)?;
+
+        // Simulates abort_replication_write's revoke path.
+        ds.abort_block(&b1)?;
+
+        let meta = ds
+            .get_block(1)
+            .expect("quarantined block must survive abort");
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "ordinary abort must not free a quarantined extent"
+        );
+
+        // Must get a fresh offset, not the quarantined one.
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let m2 = ds.open_block(&b2)?;
+        assert_eq!(m2.bdev_offset, 4096, "must not reuse quarantined offset 0");
+        Ok(())
+    }
+
+    /// Async deletion (async_remove_block's route) on a quarantined block
+    /// must be rejected, not release the extent.
+    #[test]
+    fn remove_quarantined_block_is_rejected_and_extent_stays_reserved() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        ds.abort_block_uncertain(&b1)?;
+
+        // Simulates async_remove_block's route.
+        assert!(
+            ds.remove_block_state_by_id(1).is_err(),
+            "removal of a quarantined block must be rejected"
+        );
+
+        let meta = ds
+            .get_block(1)
+            .expect("quarantined block must survive removal attempt");
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "rejected removal must not free a quarantined extent"
+        );
+
+        // Must get a fresh offset, not the quarantined one.
         let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
         let m2 = ds.open_block(&b2)?;
         assert_eq!(m2.bdev_offset, 4096, "must not reuse quarantined offset 0");
