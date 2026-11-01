@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::handler::{Frame, MessageHandler, StreamHandler, TestMessageHandler};
+use crate::handler::{BufferHandler, Frame, MessageHandler, StreamHandler, TestMessageHandler};
 use crate::ServerConf;
 use curvine_net::net::ConnState;
 use curvine_runtime::runtime::Runtime;
@@ -68,6 +68,31 @@ pub trait HandlerService: Send + Sync + 'static {
         StreamHandler::new(rt, frame, handler, conf)
     }
 
+    /// Builds a [`BufferHandler`], which processes requests of one connection
+    /// concurrently. Used by `RpcServer` when [`is_stream`](Self::is_stream)
+    /// returns false.
+    fn get_buffer_handler<F: Frame>(
+        &self,
+        rt: Arc<Runtime>,
+        frame: F,
+        conf: &ServerConf,
+    ) -> BufferHandler<Self::Item> {
+        let conn_state = if self.has_conn_state() {
+            Some(frame.new_conn_state())
+        } else {
+            None
+        };
+
+        let handler = self.get_message_handler(conn_state);
+        BufferHandler::new(rt, frame.split(), handler, self.get_limit(), conf)
+    }
+
+    /// `true` (default): requests on a connection are processed one at a time
+    /// by [`StreamHandler`]. Required for stateful streams.
+    ///
+    /// `false`: requests are processed concurrently by [`BufferHandler`] and
+    /// responses may be out of order. The service must also implement
+    /// [`get_limit`](Self::get_limit).
     fn is_stream(&self) -> bool {
         true
     }

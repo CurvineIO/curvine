@@ -22,7 +22,7 @@ mod fs_dir_watchdog;
 pub use self::fs_dir_watchdog::FsDirWatchdog;
 
 mod trash_purger;
-pub use self::trash_purger::{PendingTrashPurger, PurgeOutcome, TrashPurger};
+pub use self::trash_purger::{PendingTrashPurger, PurgeOutcome, PurgeStop, TrashPurger};
 
 mod trash_expunger;
 pub use self::trash_expunger::{TrashExpungeResult, TrashExpunger};
