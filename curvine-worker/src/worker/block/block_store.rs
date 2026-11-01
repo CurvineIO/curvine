@@ -435,6 +435,12 @@ impl BlockStore {
         Ok(b.clone())
     }
 
+    /// Like get_block(), but "not found" is Ok(None), not an Err.
+    pub fn get_block_opt(&self, id: i64) -> CommonResult<Option<BlockMeta>> {
+        let state = self.read()?;
+        Ok(state.get_readable_block(id).cloned())
+    }
+
     pub fn open_writer(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockWriteContext> {
         let (layout, dir) = {
             let state = self.read()?;

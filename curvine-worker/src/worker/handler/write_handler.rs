@@ -401,12 +401,12 @@ impl WriteHandler {
                 commit,
                 commit_err
             );
-            // A transient finalize failure rolls the block back to Writing
-            // (retryable), so only latch is_commit if it's actually terminal:
-            // removed, quarantined, or already finalized.
-            let terminal = match self.store.get_block(context.block.id) {
-                Ok(meta) => meta.is_quarantined() || meta.is_final(),
-                Err(_) => true,
+            // Only latch is_commit if truly terminal; stay retryable
+            // otherwise (transient rollback or an unreadable state).
+            let terminal = match self.store.get_block_opt(context.block.id) {
+                Ok(Some(meta)) => meta.is_quarantined() || meta.is_final(),
+                Ok(None) => true,
+                Err(_) => false,
             };
             if terminal {
                 self.is_commit = true;
