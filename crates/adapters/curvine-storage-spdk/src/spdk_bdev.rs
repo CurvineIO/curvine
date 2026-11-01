@@ -1337,6 +1337,8 @@ mod test {
     #[test]
     fn spdk_write_eio_does_not_mark_uncertain() {
         let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+        // No timeout: avoid racing the 1ms deadline against thread scheduling.
+        bdev.io_timeout_ms = 0;
 
         let responder = std::thread::spawn(move || {
             let req = rx.recv().expect("write should submit exactly once");
