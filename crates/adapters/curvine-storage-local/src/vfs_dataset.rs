@@ -63,6 +63,8 @@ pub struct VfsDataset {
     committed_rewrites: HashMap<i64, BlockMeta>,
     layouts: BlockLayouts,
     num_blocks_to_delete: AtomicUsize,
+    /// Write a checksum sidecar when finalizing file-layout blocks.
+    block_checksum: bool,
 }
 
 pub struct RemovedBlockState {
@@ -91,11 +93,12 @@ pub struct FileFinalizeReservation {
     writing: BlockMeta,
     pending: BlockMeta,
     dir: Arc<VfsDir>,
+    checksum: bool,
 }
 
 impl FileFinalizeReservation {
     pub fn prepare(&self, committed_len: i64) -> CommonResult<FileFinalizePlan> {
-        FileLayout::prepare_finalize(&self.dir, &self.pending, committed_len)
+        FileLayout::prepare_finalize(&self.dir, &self.pending, committed_len, self.checksum)
     }
 }
 
@@ -143,6 +146,7 @@ impl VfsDataset {
             committed_rewrites: HashMap::new(),
             layouts: BlockLayouts::new(spdk_meta),
             num_blocks_to_delete: AtomicUsize::new(0),
+            block_checksum: false,
         };
         ds.initialize()?;
         Ok(ds)
@@ -213,7 +217,9 @@ impl VfsDataset {
             None
         };
 
-        Self::new(cluster_id, dir_list, spdk_meta)
+        let mut ds = Self::new(cluster_id, dir_list, spdk_meta)?;
+        ds.block_checksum = conf.worker.block_checksum;
+        Ok(ds)
     }
 
     // Initialize.
@@ -432,6 +438,7 @@ impl VfsDataset {
             writing,
             pending,
             dir,
+            checksum: self.block_checksum,
         }))
     }
 
@@ -771,8 +778,8 @@ impl Dataset for VfsDataset {
 mod test {
     use super::{normalize_free_ratio, MAX_FREE_RATIO};
     use crate::{
-        BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion,
-        VfsDataset, VfsDir,
+        BlockChecksum, BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore,
+        StorageVersion, VfsDataset, VfsDir, DEFAULT_CHECKSUM_CHUNK_SIZE,
     };
     use crate::{BlockMeta, BlockState};
     use curvine_config::{ClusterConf, WorkerConf};
@@ -1460,6 +1467,212 @@ mod test {
         assert!(!active_path.exists());
         assert!(!staging_path.exists());
         assert!(ds.committed_rewrites.is_empty());
+        Ok(())
+    }
+
+    fn checksum_data_set(dir: &str) -> VfsDataset {
+        let mut ds = create_data_set(true, dir);
+        ds.block_checksum = true;
+        ds
+    }
+
+    fn block_file(ds: &VfsDataset, meta: &BlockMeta) -> CommonResult<std::path::PathBuf> {
+        FileLayout::block_path(ds.find_dir(meta.dir_id())?, meta)
+    }
+
+    /// Open a block, replace its staging file with `bytes`, and finalize it
+    /// through the reservation path `BlockStore` uses.
+    fn write_and_finalize(
+        ds: &mut VfsDataset,
+        block: &mut ExtendedBlock,
+        bytes: &[u8],
+    ) -> CommonResult<BlockMeta> {
+        let writing = ds.open_block(block)?;
+        std::fs::write(block_file(ds, &writing)?, bytes)?;
+        block.len = bytes.len() as i64;
+        finalize_reserved(ds, block)
+    }
+
+    fn finalize_reserved(ds: &mut VfsDataset, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        let reservation = ds
+            .reserve_file_finalize(block)?
+            .expect("file block must use reservation");
+        match reservation.prepare(block.len) {
+            Ok(plan) => ds.publish_file_finalize(&reservation, plan),
+            Err(e) => {
+                ds.rollback_file_finalize(&reservation)?;
+                Err(e)
+            }
+        }
+    }
+
+    fn read_checksum(block_path: &std::path::Path) -> CommonResult<BlockChecksum> {
+        let buf = std::fs::read(FileLayout::checksum_path_of(block_path))?;
+        Ok(BlockChecksum::decode(&buf)?)
+    }
+
+    fn assert_checksum_matches(block_path: &std::path::Path) -> CommonResult<()> {
+        let data = std::fs::read(block_path)?;
+        let expected = BlockChecksum::compute(DEFAULT_CHECKSUM_CHUNK_SIZE, &data)?;
+        assert_eq!(read_checksum(block_path)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_writes_checksum_sidecar_when_enabled() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-finalize");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[7u8; 60])?;
+
+        let active_path = block_file(&ds, &finalized)?;
+        assert_checksum_matches(&active_path)?;
+        assert_eq!(read_checksum(&active_path)?.data_len(), 60);
+        let staging_dir = ds.find_dir(finalized.dir_id())?.base_path().join("staging");
+        assert_eq!(std::fs::read_dir(staging_dir)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_writes_no_sidecar_when_disabled() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "checksum-disabled");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[7u8; 60])?;
+
+        let active_path = block_file(&ds, &finalized)?;
+        assert!(!FileLayout::checksum_path_of(&active_path).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_block_gets_empty_checksum() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-empty");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[])?;
+
+        let sum = read_checksum(&block_file(&ds, &finalized)?)?;
+        assert_eq!(sum.data_len(), 0);
+        assert_eq!(sum.chunk_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rewrite_replaces_checksum_sidecar() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-rewrite");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let first = write_and_finalize(&mut ds, &mut block, &[1u8; 45])?;
+        let active_path = block_file(&ds, &first)?;
+
+        // Shorter rewrite: the sidecar must describe only the new bytes.
+        block.len = 50;
+        let rewritten = write_and_finalize(&mut ds, &mut block, &[2u8; 30])?;
+        assert_eq!(block_file(&ds, &rewritten)?, active_path);
+        assert_checksum_matches(&active_path)?;
+        assert_eq!(read_checksum(&active_path)?.data_len(), 30);
+        Ok(())
+    }
+
+    #[test]
+    fn rewrite_with_checksum_off_removes_stale_sidecar() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-rewrite-off");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let first = write_and_finalize(&mut ds, &mut block, &[1u8; 40])?;
+        let checksum_path = FileLayout::checksum_path_of(&block_file(&ds, &first)?);
+        assert!(checksum_path.exists());
+
+        ds.block_checksum = false;
+        block.len = 50;
+        write_and_finalize(&mut ds, &mut block, &[2u8; 40])?;
+        assert!(!checksum_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_rewrite_checksum_covers_materialized_tail() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-sparse-rewrite");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        write_and_finalize(&mut ds, &mut block, &[b'B'; 20])?;
+
+        // The staging copy holds 20 bytes; committing 50 extends it with zeros.
+        block.len = 50;
+        let rewriting = ds.open_block(&block)?;
+        assert_eq!(std::fs::metadata(block_file(&ds, &rewriting)?)?.len(), 20);
+        let published = finalize_reserved(&mut ds, &block)?;
+
+        let active_path = block_file(&ds, &published)?;
+        assert_eq!(std::fs::metadata(&active_path)?.len(), 50);
+        assert_checksum_matches(&active_path)?;
+        assert_eq!(read_checksum(&active_path)?.data_len(), 50);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_finalize_leaves_no_checksum_sidecar() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-failed-finalize");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let writing = ds.open_block(&block)?;
+        let staging_path = block_file(&ds, &writing)?;
+        std::fs::write(&staging_path, [3u8; 40])?;
+
+        // Length mismatch fails in prepare.
+        block.len = 41;
+        assert!(finalize_reserved(&mut ds, &block).is_err());
+        assert!(!FileLayout::checksum_path_of(&staging_path).exists());
+
+        // A lost reservation fails in publish after the sidecar was written.
+        block.len = 40;
+        let reservation = ds.reserve_file_finalize(&block)?.unwrap();
+        let plan = reservation.prepare(block.len)?;
+        assert!(FileLayout::checksum_path_of(&staging_path).exists());
+        ds.rollback_file_finalize(&reservation)?;
+        assert!(ds.publish_file_finalize(&reservation, plan).is_err());
+        assert!(!FileLayout::checksum_path_of(&staging_path).exists());
+        assert!(staging_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_block_deletes_checksum_sidecar() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-remove");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[5u8; 40])?;
+        let active_path = block_file(&ds, &finalized)?;
+
+        ds.remove_block(&block)?;
+        assert!(!active_path.exists());
+        assert!(!FileLayout::checksum_path_of(&active_path).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn scan_removes_untrusted_and_orphan_sidecars() -> CommonResult<()> {
+        let name = "checksum-scan";
+        let mut ds = checksum_data_set(name);
+        let mut kept = ExtendedBlock::with_mem(1, "100B")?;
+        let kept_meta = write_and_finalize(&mut ds, &mut kept, &[1u8; 30])?;
+        let kept_path = block_file(&ds, &kept_meta)?;
+
+        // Orphan: a finalized block whose file vanished but sidecar remains.
+        let mut orphan = ExtendedBlock::with_mem(2, "50B")?;
+        let orphan_meta = write_and_finalize(&mut ds, &mut orphan, &[2u8; 20])?;
+        let orphan_path = block_file(&ds, &orphan_meta)?;
+        std::fs::remove_file(&orphan_path)?;
+
+        // Staging sidecar left by a crash during finalize.
+        let staging = ExtendedBlock::with_mem(3, "10B")?;
+        let staging_meta = ds.open_block(&staging)?;
+        let staging_path = block_file(&ds, &staging_meta)?;
+        std::fs::write(&staging_path, [3u8; 10])?;
+        std::fs::write(FileLayout::checksum_path_of(&staging_path), b"torn")?;
+        drop(ds);
+
+        let restarted = create_data_set(false, name);
+        assert_eq!(restarted.num_blocks(), 2);
+        assert!(restarted.get_block(1).unwrap().is_final());
+        assert!(!restarted.get_block(3).unwrap().is_final());
+        assert_checksum_matches(&kept_path)?;
+        assert!(!FileLayout::checksum_path_of(&orphan_path).exists());
+        assert!(!FileLayout::checksum_path_of(&staging_path).exists());
+        assert!(staging_path.exists());
         Ok(())
     }
     #[test]

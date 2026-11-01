@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::layout::{validate_open_offset, BlockLayout};
-use crate::{BlockMeta, BlockState};
+use crate::{
+    BlockChecksum, BlockMeta, BlockState, CHECKSUM_FILE_SUFFIX, DEFAULT_CHECKSUM_CHUNK_SIZE,
+};
 use crate::{BlockReadContext, BlockWriteContext, VfsDir};
 use curvine_core_error::{err_box, try_err, CommonResult};
 use curvine_io::{IOResult, LocalFile};
@@ -22,8 +24,10 @@ use curvine_model::ExtendedBlock;
 use curvine_runtime::common::ByteUnit;
 use curvine_runtime::common::FileUtils;
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy)]
 pub struct FileLayout;
@@ -31,15 +35,37 @@ pub struct FileLayout;
 const ACTIVE_DIR: &str = "active";
 const STAGING_DIR: &str = "staging";
 
+/// Work prepared outside the dataset lock, published under it.
+///
+/// When checksums are enabled, `staging_checksum` is a synced sidecar for the
+/// staging block. Dropping an unpublished plan removes it, so every failed
+/// finalize path (prepare error, lost reservation, rename error) leaves no
+/// orphan sidecar behind.
 pub struct FileFinalizePlan {
     final_meta: BlockMeta,
     staging_path: PathBuf,
     active_path: PathBuf,
+    staging_checksum: Option<PathBuf>,
+    is_rewrite: bool,
 }
 
 impl FileFinalizePlan {
     pub(crate) fn final_meta(&self) -> &BlockMeta {
         &self.final_meta
+    }
+}
+
+impl Drop for FileFinalizePlan {
+    fn drop(&mut self) {
+        if let Some(path) = self.staging_checksum.take() {
+            if let Err(e) = FileLayout::remove_if_exists(&path) {
+                log::warn!(
+                    "failed to remove unpublished checksum {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
     }
 }
 
@@ -88,10 +114,57 @@ impl FileLayout {
         Ok(Self::block_dir(dir, meta)?.join(meta.state().get_name(meta.id())))
     }
 
+    /// Checksum sidecar path for a block file path.
+    pub fn checksum_path_of(block_path: &Path) -> PathBuf {
+        let mut name = OsString::from(block_path.as_os_str());
+        name.push(CHECKSUM_FILE_SUFFIX);
+        PathBuf::from(name)
+    }
+
+    fn is_checksum_file(file: &str) -> bool {
+        file.ends_with(CHECKSUM_FILE_SUFFIX)
+    }
+
+    fn remove_if_exists(path: &Path) -> std::io::Result<()> {
+        match fs::remove_file(path) {
+            Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// Compute the sidecar for `block_path` and write it, synced, next to it.
+    /// `expected_len` guards against the file changing under the read.
+    fn write_checksum(block_path: &Path, expected_len: i64) -> CommonResult<PathBuf> {
+        let path = Self::checksum_path_of(block_path);
+        let result = (|| -> CommonResult<()> {
+            let sum =
+                BlockChecksum::from_reader(DEFAULT_CHECKSUM_CHUNK_SIZE, File::open(block_path)?)?;
+            if sum.data_len() != expected_len as u64 {
+                return err_box!(
+                    "checksum of {} covered {} bytes, expected {}",
+                    block_path.display(),
+                    sum.data_len(),
+                    expected_len
+                );
+            }
+            let mut file = File::create(&path)?;
+            file.write_all(&sum.encode())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = Self::remove_if_exists(&path);
+            return Err(e);
+        }
+        Ok(path)
+    }
+
+    /// `checksum` writes a synced sidecar for the staging file before publish.
     pub(crate) fn prepare_finalize(
         dir: &VfsDir,
         meta: &BlockMeta,
         committed_len: i64,
+        checksum: bool,
     ) -> CommonResult<FileFinalizePlan> {
         let staging_path = Self::block_path(dir, meta)?;
         // Sparse seek-past-EOF resize can raise a committed block's logical
@@ -123,16 +196,45 @@ impl FileLayout {
         }
 
         let active_path = Self::block_path(dir, &final_meta)?;
+        let staging_checksum = if checksum {
+            Some(Self::write_checksum(&staging_path, committed_len)?)
+        } else {
+            None
+        };
         Ok(FileFinalizePlan {
             final_meta,
             staging_path,
             active_path,
+            staging_checksum,
+            is_rewrite,
         })
     }
 
-    pub(crate) fn publish_finalize(plan: FileFinalizePlan) -> CommonResult<BlockMeta> {
-        FileUtils::rename(plan.staging_path, plan.active_path)?;
-        Ok(plan.final_meta)
+    /// Publish order keeps a block from ever pairing with another generation's
+    /// sidecar: drop the old active sidecar, rename the block, then rename the
+    /// new sidecar. A crash in between leaves a block without a sidecar.
+    pub(crate) fn publish_finalize(mut plan: FileFinalizePlan) -> CommonResult<BlockMeta> {
+        let active_checksum = Self::checksum_path_of(&plan.active_path);
+        // A rewrite replaces the committed block; its sidecar is stale even
+        // when checksums are now off. Fail before the rename so rollback keeps
+        // the committed block with its matching sidecar.
+        if plan.is_rewrite || plan.staging_checksum.is_some() {
+            Self::remove_if_exists(&active_checksum)?;
+        }
+        FileUtils::rename(&plan.staging_path, &plan.active_path)?;
+        if let Some(staging_checksum) = plan.staging_checksum.take() {
+            if let Err(e) = fs::rename(&staging_checksum, &active_checksum) {
+                // The block is already visible; keep it and publish without a
+                // sidecar rather than failing a durable rename.
+                log::warn!(
+                    "block {} published without checksum, sidecar rename failed: {}",
+                    plan.final_meta.id(),
+                    e
+                );
+                let _ = Self::remove_if_exists(&staging_checksum);
+            }
+        }
+        Ok(plan.final_meta.clone())
     }
 
     fn block_file(dir: &VfsDir, meta: &BlockMeta) -> CommonResult<String> {
@@ -205,7 +307,7 @@ impl BlockLayout for FileLayout {
         meta: &BlockMeta,
         committed_len: i64,
     ) -> CommonResult<BlockMeta> {
-        let plan = Self::prepare_finalize(dir, meta, committed_len)?;
+        let plan = Self::prepare_finalize(dir, meta, committed_len, false)?;
         Self::publish_finalize(plan)
     }
 
@@ -216,14 +318,32 @@ impl BlockLayout for FileLayout {
 
         let mut blocks = vec![];
         let mut active_ids = HashSet::new();
+        let mut active_files = HashSet::new();
+        let mut active_checksums = vec![];
         for file in active_dir {
-            if let Ok(meta) = BlockMeta::from_file(&file, BlockState::Finalized, dir) {
+            if Self::is_checksum_file(&file) {
+                active_checksums.push(file);
+            } else if let Ok(meta) = BlockMeta::from_file(&file, BlockState::Finalized, dir) {
                 active_ids.insert(meta.id());
+                active_files.insert(file);
                 blocks.push(meta);
+            }
+        }
+        // Remove sidecars whose block is gone (crash during deallocate).
+        for file in active_checksums {
+            let block = file.strip_suffix(CHECKSUM_FILE_SUFFIX).unwrap_or(&file);
+            if !active_files.contains(block) {
+                Self::remove_if_exists(Path::new(&file))?;
             }
         }
 
         for file in staging_dir {
+            // Staging blocks restart as Recovering with unknown content, so
+            // any staging sidecar is untrusted.
+            if Self::is_checksum_file(&file) {
+                Self::remove_if_exists(Path::new(&file))?;
+                continue;
+            }
             if let Ok(meta) = BlockMeta::from_file(&file, BlockState::Recovering, dir) {
                 // A crash during a rewrite can leave the committed active file
                 // and an incomplete staging copy. Prefer the published active
@@ -243,7 +363,14 @@ impl BlockLayout for FileLayout {
     fn release(&self, _dir: &VfsDir, _meta: &BlockMeta) {}
 
     fn deallocate(&self, dir: &VfsDir, meta: &BlockMeta) -> CommonResult<()> {
-        FileUtils::delete_path(Self::block_path(dir, meta)?, false)?;
+        let path = Self::block_path(dir, meta)?;
+        FileUtils::delete_path(&path, false)?;
+        // The block is already gone, so a leftover sidecar is harmless here and
+        // is removed by the next scan.
+        let checksum = Self::checksum_path_of(&path);
+        if let Err(e) = Self::remove_if_exists(&checksum) {
+            log::warn!("failed to remove checksum {}: {}", checksum.display(), e);
+        }
         Ok(())
     }
 
