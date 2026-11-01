@@ -811,6 +811,10 @@ impl Dataset for VfsDataset {
             return Ok(());
         };
 
+        if meta.is_quarantined() {
+            return Ok(());
+        }
+
         if meta.storage_type() != StorageType::SpdkDisk {
             return self.abort_block(block);
         }
@@ -2020,6 +2024,42 @@ mod test {
         );
 
         drop(ds2);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// Repeated abort_block_uncertain() on a quarantined block must be a
+    /// no-op: no re-persist, no state/extent change.
+    #[test]
+    fn abort_block_uncertain_is_idempotent_for_already_quarantined_block() -> CommonResult<()> {
+        let path = "../testing/spdk_quarantine_idempotent_abort";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let mut ds = VfsDataset::new("t", DirList::new(vec![dir])?, Some(store.clone()))?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.abort_block_uncertain(&block)?;
+
+        // Force persistence to fail, so success only happens via a
+        // short-circuit before put_checked().
+        store.set_force_put_failure_for_test(true);
+        let result = ds.abort_block_uncertain(&block);
+        store.set_force_put_failure_for_test(false);
+
+        assert!(
+            result.is_ok(),
+            "repeated abort_block_uncertain on an already-quarantined block \
+             must be a no-op: {result:?}"
+        );
+        let meta = ds.get_block(1).expect("block must still exist");
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(alloc.free_list_size(), 0);
+
+        drop(ds);
         drop(store);
         let _ = std::fs::remove_dir_all(path);
         Ok(())
