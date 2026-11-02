@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+#[cfg(feature = "transport")]
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Status};
 
@@ -24,7 +25,9 @@ pub const REQUEST_ID_METADATA: &str = "x-curvine-request-id";
 /// Includes framing overhead above the largest supported 16 MiB data chunk.
 pub const MAX_MESSAGE_BYTES: usize = 20 * 1024 * 1024;
 
+#[cfg(feature = "transport")]
 pub use tonic_health::server::health_reporter;
+#[cfg(feature = "transport")]
 pub use tonic_reflection as reflection;
 
 /// File-based TLS identity and reflection settings for one component.
@@ -166,6 +169,8 @@ pub fn set_request_id<T>(request: &mut Request<T>, id: i64) {
 
 /// Missing or invalid IDs must fail closed: silently generating a new one on
 /// the server would break deduplication after retries.
+// Match tonic's Status-returning API.
+#[allow(clippy::result_large_err)]
 pub fn request_id<T>(request: &Request<T>) -> Result<i64, Status> {
     request
         .metadata()
@@ -228,6 +233,7 @@ impl Default for TransportConfig {
     }
 }
 
+#[cfg(feature = "transport")]
 impl TransportConfig {
     /// Service clients and servers must also apply `max_message_bytes` to
     /// their generated encode/decode limit setters.

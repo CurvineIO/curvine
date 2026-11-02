@@ -36,7 +36,7 @@ required-features = ["lancedb"]
 curvine-fault = { workspace = true }
 curvine-core-error = { workspace = true }
 curvine-runtime = { workspace = true }
-curvine-rpc = { workspace = true }
+curvine-rpc = { workspace = true, features = ["transport"] }
 curvine-net = { workspace = true }
 curvine-io = { workspace = true }
 curvine-model = { workspace = true }

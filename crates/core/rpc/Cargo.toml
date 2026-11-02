@@ -17,10 +17,18 @@ prost = { workspace = true }
 num_enum = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
-tonic = { version = "0.9", features = ["tls"] }
-tonic-health = "0.9"
-tonic-reflection = "0.9"
+tonic = { version = "0.9", default-features = false, features = ["codegen", "prost"] }
+tonic-health = { version = "0.9", optional = true }
+tonic-reflection = { version = "0.9", optional = true }
 
 [dev-dependencies]
 curvine-proto = { workspace = true }
 futures = { workspace = true }
+
+[features]
+default = []
+transport = ["tonic/transport", "tonic/tls", "dep:tonic-health", "dep:tonic-reflection"]
+
+[[test]]
+name = "grpc_tls"
+required-features = ["transport"]

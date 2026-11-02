@@ -38,6 +38,8 @@ impl WorkerControlGrpcHandler {
         Self { service, tracker }
     }
 
+    // Preserve tonic's Status-returning API.
+    #[allow(clippy::result_large_err)]
     async fn dispatch<Q, R>(
         &self,
         code: RpcCode,

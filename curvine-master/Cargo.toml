@@ -10,7 +10,7 @@ fault-injection = ["curvine-fault/http-server"]
 
 [dependencies]
 curvine-core-error = { workspace = true }
-curvine-rpc = { workspace = true }
+curvine-rpc = { workspace = true, features = ["transport"] }
 curvine-net = { workspace = true }
 curvine-raft = { workspace = true }
 curvine-proto = { workspace = true }

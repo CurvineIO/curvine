@@ -9,7 +9,7 @@ curvine-io = { workspace = true }
 curvine-sys = { workspace = true }
 curvine-core-error = { workspace = true }
 curvine-net = { workspace = true }
-curvine-rpc = { workspace = true }
+curvine-rpc = { workspace = true, features = ["transport"] }
 curvine-runtime = { workspace = true }
 curvine-error = { workspace = true }
 curvine-proto = { workspace = true }

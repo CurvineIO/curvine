@@ -21,6 +21,8 @@ pub mod rocksdb {
 }
 
 pub mod proto {
+    // Generated tonic signatures must return Status by value.
+    #[allow(clippy::result_large_err)]
     pub mod raft {
         include!(concat!(env!("OUT_DIR"), "/protos/raft.rs"));
         pub const FILE_DESCRIPTOR_SET: &[u8] =

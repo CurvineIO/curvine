@@ -48,7 +48,7 @@ curvine-config = { workspace = true }
 curvine-sys = { workspace = true }
 curvine-alloc = { workspace = true }
 curvine-model = { workspace = true }
-curvine-rpc = { workspace = true }
+curvine-rpc = { workspace = true, features = ["transport"] }
 curvine-runtime = { workspace = true }
 curvine-client-core = { workspace = true }
 curvine-job-client = { workspace = true }

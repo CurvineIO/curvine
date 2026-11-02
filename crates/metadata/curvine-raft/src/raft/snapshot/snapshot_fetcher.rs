@@ -28,7 +28,7 @@ pub enum SnapshotFetcher {
     // member must still own the copy it installs, so they are materialized into
     // the directory carried here before the snapshot is returned.
     OwnedCopy(SnapshotData, String),
-    Remote(SnapshotData, DownloadJob),
+    Remote(SnapshotData, Box<DownloadJob>),
 }
 
 impl SnapshotFetcher {
@@ -87,7 +87,7 @@ impl SnapshotFetcher {
         };
         let dir = app_store.snapshot_dir(Utils::rand_id())?;
         let download_job = DownloadJob::new(data.node_id, dir, files.clone(), conf, client);
-        Ok(SnapshotFetcher::Remote(data, download_job))
+        Ok(SnapshotFetcher::Remote(data, Box::new(download_job)))
     }
 
     /// A local copy is reusable only when every manifest file exists with the

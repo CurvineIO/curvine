@@ -31,7 +31,7 @@ fault-injection = [
 
 [dependencies]
 curvine-core-error = { workspace = true }
-curvine-rpc = { workspace = true }
+curvine-rpc = { workspace = true, features = ["transport"] }
 curvine-net = { workspace = true }
 curvine-io = { workspace = true }
 curvine-proto = { workspace = true }

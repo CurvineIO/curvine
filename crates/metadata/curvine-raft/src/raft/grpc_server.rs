@@ -25,6 +25,8 @@ impl RaftGrpcServer {
         Self { service }
     }
 
+    // Preserve tonic's Status-returning API.
+    #[allow(clippy::result_large_err)]
     async fn call<T: ProtoMessage, R: ProtoMessage + Default>(
         &self,
         request: Request<T>,

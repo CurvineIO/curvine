@@ -40,9 +40,12 @@ fn grpc_remote_block_write_flush_and_seek_read() -> CommonResult<()> {
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
     rt.block_on(async move {
-        let mut master = MasterServiceClient::connect(format!("http://{}", master_addr))
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", master_addr))
+            .map_err(|error| curvine_error::FsError::common(error.to_string()))?
+            .connect()
             .await
             .map_err(|error| curvine_error::FsError::common(error.to_string()))?;
+        let mut master = MasterServiceClient::new(channel);
         let create = CreateFileRequest {
             path: "/grpc-retry-dedup".into(),
             opts: ProtoUtils::create_opts_to_pb(CreateFileOpts::with_create(true), "test"),

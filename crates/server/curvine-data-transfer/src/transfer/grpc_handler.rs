@@ -116,6 +116,8 @@ where
         Self { service, tracker }
     }
 
+    // This adapter implements tonic's Status-returning service contract.
+    #[allow(clippy::result_large_err)]
     async fn dispatch<Q, R>(&self, code: RpcCode, request: Q) -> Result<Response<R>, Status>
     where
         Q: ProtoMessage + Debug + Send + 'static,
@@ -267,9 +269,12 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let mut client = TransferServiceClient::connect(format!("http://{address}"))
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
             .await
             .unwrap();
+        let mut client = TransferServiceClient::new(channel);
         let request = SubmitTransferRequest {
             kind: curvine_model::TransferKind::Load as i32,
             source_path: "s3://bucket/source".into(),

@@ -816,7 +816,7 @@ fn block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         .proto_header(request.clone())
         .build();
 
-    let client = worker_client(&conf)?;
+    let client = worker_client(conf)?;
 
     let response: BlockWriteResponse = client.rpc(msg)?.parse_header()?;
 
@@ -939,7 +939,7 @@ fn block_read(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         .proto_header(request)
         .build();
 
-    let client = worker_client(&conf)?;
+    let client = worker_client(conf)?;
     seq_id += 1;
     let rep: BlockReadResponse = client.rpc_check(msg)?.parse_header()?;
     println!("read-reap: {:#?}", rep);
@@ -987,7 +987,7 @@ fn block_read_bytes(id: i64, len: i64, conf: &ClusterConf) -> CommonResult<Vec<u
     };
 
     let req_id = Utils::req_id();
-    let client = worker_client(&conf)?;
+    let client = worker_client(conf)?;
     let open = Builder::new()
         .code(RpcCode::ReadBlock)
         .req_id(req_id)

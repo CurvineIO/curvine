@@ -126,6 +126,8 @@ enum StreamMode {
 }
 
 impl StreamState {
+    // Preserve tonic's Status-returning API.
+    #[allow(clippy::result_large_err)]
     fn open(request: &BlockDataRequest) -> Result<Self, Status> {
         let (block_id, mode, cleanup_write) = match request.operation.as_ref() {
             Some(Operation::OpenRead(_)) | Some(Operation::OpenBatch(_)) => {
@@ -168,6 +170,8 @@ impl StreamState {
         })
     }
 
+    // Preserve tonic's Status-returning API.
+    #[allow(clippy::result_large_err)]
     fn validate(&mut self, request: &BlockDataRequest) -> Result<(), Status> {
         if request.req_id != self.req_id
             || request.seq_id != self.next_seq
@@ -210,6 +214,8 @@ impl StreamState {
     }
 }
 
+// Preserve tonic's Status-returning API.
+#[allow(clippy::result_large_err)]
 fn into_message(request: BlockDataRequest, state: &StreamState) -> Result<(Message, bool), Status> {
     let mut builder = Builder::new().req_id(request.req_id).seq_id(request.seq_id);
     let operation = request
@@ -295,6 +301,8 @@ fn into_message(request: BlockDataRequest, state: &StreamState) -> Result<(Messa
     Ok((msg, done))
 }
 
+// Preserve tonic's Status-returning API.
+#[allow(clippy::result_large_err)]
 fn into_response(request: &Message, response: Message) -> Result<BlockDataResponse, Status> {
     let result = if !response.is_success() {
         let error = response

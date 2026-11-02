@@ -175,6 +175,8 @@ impl GrpcMasterClient {
         }
     }
 
+    // Preserve tonic Status until retry classification.
+    #[allow(clippy::result_large_err)]
     async fn invoke(
         mut client: MasterServiceClient<Channel>,
         msg: &Message,

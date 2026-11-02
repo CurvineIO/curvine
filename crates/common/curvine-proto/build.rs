@@ -40,7 +40,9 @@ fn main() {
 
     let mut build = prost_build::Config::new();
     build.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
+    // Runtime crates construct channels; API crates need no HTTP server stack.
     tonic_build::configure()
+        .build_transport(false)
         .out_dir(&output)
         .file_descriptor_set_path(PathBuf::from(&output).join("descriptor.bin"))
         .compile_with_config(build, &proto_files, &[proto_dir])

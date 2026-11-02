@@ -8,7 +8,7 @@ description = "Curvine Raft metadata adapter."
 [dependencies]
 curvine-core-error = { workspace = true }
 curvine-runtime = { workspace = true }
-curvine-rpc = { workspace = true }
+curvine-rpc = { workspace = true, features = ["transport"] }
 curvine-net = { workspace = true }
 curvine-io = { workspace = true }
 bincode = { workspace = true }

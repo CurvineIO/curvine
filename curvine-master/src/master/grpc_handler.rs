@@ -151,6 +151,8 @@ impl MasterGrpcHandler {
         }
     }
 
+    // This adapter implements tonic's Status-returning service contract.
+    #[allow(clippy::result_large_err)]
     async fn dispatch<Q, R>(
         &self,
         code: RpcCode,

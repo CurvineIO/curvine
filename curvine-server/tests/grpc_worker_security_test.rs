@@ -31,8 +31,10 @@ fn fixture(name: &str) -> String {
 }
 
 fn start_worker(reflection: bool) -> (u16, GrpcConfig) {
-    let mut conf = ClusterConf::default();
-    conf.format_worker = true;
+    let mut conf = ClusterConf {
+        format_worker: true,
+        ..Default::default()
+    };
     conf.worker.rpc_port = NetUtils::hold_available_port();
     conf.worker.data_dir = vec![format!(
         "[MEM:10MB]../testing/grpc-security-{}",
@@ -88,6 +90,7 @@ async fn wait_ready(port: u16, config: &GrpcConfig) -> tonic::transport::Channel
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn listed_services(channel: tonic::transport::Channel) -> Result<Vec<String>, tonic::Status> {
     let request = ServerReflectionRequest {
         host: String::new(),
