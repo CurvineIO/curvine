@@ -236,6 +236,7 @@ impl RpcMessage {
     pub fn data_bytes(&self) -> Option<&[u8]> {
         match &self.data {
             DataSlice::Buffer(buf) => Some(buf),
+            DataSlice::Bytes(buf) => Some(buf),
             _ => None,
         }
     }

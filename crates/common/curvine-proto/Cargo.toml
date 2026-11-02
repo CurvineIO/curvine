@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 prost = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 tonic = { version = "0.9", default-features = false, features = ["codegen", "prost"] }
 

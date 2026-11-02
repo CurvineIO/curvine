@@ -241,7 +241,7 @@ fn into_message(request: BlockDataRequest, state: &StreamState) -> Result<(Messa
                 builder = builder.proto_header(header);
             }
             if let Some(data) = chunk.data {
-                builder = builder.data(DataSlice::Bytes(data.into()));
+                builder = builder.data(DataSlice::Bytes(data));
             }
             (RpcCode::WriteBlock, RequestStatus::Running, false)
         }
@@ -341,7 +341,7 @@ fn into_response(request: &Message, response: Message) -> Result<BlockDataRespon
                     .map_err(|e| Status::internal(e.to_string()))?,
             ),
             (RpcCode::ReadBlock, RequestStatus::Running) => {
-                OperationResult::Data(response.data.to_bytes().to_vec())
+                OperationResult::Data(response.data.to_bytes())
             }
             _ => OperationResult::Ack(true),
         }

@@ -110,8 +110,8 @@ impl GrpcBlockClient {
         })
     }
 
-    pub async fn rpc(&self, msg: Message, token: Option<&str>) -> FsResult<Message> {
-        let frame = request_frame(&msg, token)?;
+    pub async fn rpc(&self, mut msg: Message, token: Option<&str>) -> FsResult<Message> {
+        let frame = request_frame(&mut msg, token)?;
         let is_open = msg.request_status() == RequestStatus::Open;
         let is_done = matches!(
             msg.request_status(),
@@ -169,14 +169,14 @@ impl GrpcBlockClient {
     /// A window of one preserves the synchronous per-chunk acknowledgement.
     pub async fn write_pipelined(
         &self,
-        msg: Message,
+        mut msg: Message,
         token: Option<&str>,
         window: usize,
     ) -> FsResult<()> {
         if window <= 1 {
             return self.rpc(msg, token).await?.check_error_ext::<FsError>();
         }
-        let frame = request_frame(&msg, token)?;
+        let frame = request_frame(&mut msg, token)?;
         let mut stream = self.stream.lock().await;
         let result = async {
             let exchange = stream
@@ -218,7 +218,7 @@ impl GrpcBlockClient {
     }
 }
 
-fn request_frame(msg: &Message, token: Option<&str>) -> FsResult<BlockDataRequest> {
+fn request_frame(msg: &mut Message, token: Option<&str>) -> FsResult<BlockDataRequest> {
     let op = match (RpcCode::from(msg.code()), msg.request_status()) {
         (RpcCode::ReadBlock, RequestStatus::Open) => Operation::OpenRead(msg.parse_header()?),
         (RpcCode::ReadBlock, RequestStatus::Running) => Operation::ReadChunk(ReadBlockChunk {
@@ -247,7 +247,7 @@ fn request_frame(msg: &Message, token: Option<&str>) -> FsResult<BlockDataReques
                 data: if msg.data.is_empty() {
                     None
                 } else {
-                    Some(msg.data.as_slice().to_vec())
+                    Some(std::mem::replace(&mut msg.data, DataSlice::Empty).to_bytes())
                 },
             })
         }
@@ -333,10 +333,7 @@ fn response_message(request: &Message, response: BlockDataResponse) -> FsResult<
         OperationResult::WrittenBatch(header) => {
             Ok(Builder::success(request).proto_header(header).build())
         }
-        OperationResult::Data(data) => Ok(request.success_with_data(
-            None,
-            DataSlice::Buffer(bytes::BytesMut::from(data.as_slice())),
-        )),
+        OperationResult::Data(data) => Ok(request.success_with_data(None, DataSlice::Bytes(data))),
         OperationResult::Ack(true) => Ok(request.success()),
         OperationResult::Ack(false) => Err(FsError::common("block operation was not acknowledged")),
         OperationResult::Error(error) => {
@@ -594,7 +591,7 @@ mod tests {
                 while let Some(request) = input.message().await? {
                     let result = match request.operation {
                         Some(Operation::OpenRead(_)) => OperationResult::OpenedRead(Default::default()),
-                        Some(Operation::ReadChunk(_)) => OperationResult::Data(b"abc".to_vec()),
+                        Some(Operation::ReadChunk(_)) => OperationResult::Data(bytes::Bytes::from_static(b"abc")),
                         Some(Operation::CompleteRead(_)) => OperationResult::Ack(true),
                         _ => Err(tonic::Status::invalid_argument("unexpected request"))?,
                     };
@@ -657,19 +654,51 @@ mod tests {
             flush: false,
             is_last: false,
         };
-        let message = Builder::new()
+        let mut message = Builder::new()
             .code(RpcCode::ReadBlock)
             .request(RequestStatus::Running)
             .req_id(31)
             .seq_id(4)
             .proto_header(header.clone())
             .build();
-        let frame = request_frame(&message, None).unwrap();
+        let frame = request_frame(&mut message, None).unwrap();
         assert_eq!((frame.req_id, frame.seq_id), (31, 4));
         match frame.operation.unwrap() {
             Operation::ReadChunk(chunk) => assert_eq!(chunk.header, Some(header)),
             _ => panic!("unexpected operation"),
         }
+    }
+
+    #[test]
+    fn payload_buffers_are_transferred_without_copying() {
+        let payload = bytes::Bytes::from(vec![7u8; 4096]);
+        let ptr = payload.as_ptr();
+        let mut message = Builder::new()
+            .code(RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .data(DataSlice::Bytes(payload))
+            .build();
+        let frame = request_frame(&mut message, None).unwrap();
+        match frame.operation.unwrap() {
+            Operation::WriteChunk(chunk) => assert_eq!(chunk.data.unwrap().as_ptr(), ptr),
+            _ => panic!("unexpected operation"),
+        }
+        assert!(message.data.is_empty());
+
+        let payload = bytes::Bytes::from(vec![3u8; 4096]);
+        let ptr = payload.as_ptr();
+        let request = Builder::new()
+            .code(RpcCode::ReadBlock)
+            .request(RequestStatus::Running)
+            .build();
+        let response = BlockDataResponse {
+            req_id: request.req_id(),
+            seq_id: request.seq_id(),
+            result: Some(OperationResult::Data(payload)),
+        };
+        let message = response_message(&request, response).unwrap();
+        assert_eq!(message.data.as_slice().as_ptr(), ptr);
+        assert_eq!(message.data_bytes().unwrap().len(), 4096);
     }
 
     #[test]

@@ -39,6 +39,11 @@ fn main() {
     fs::create_dir_all(&output).unwrap();
 
     let mut build = prost_build::Config::new();
+    // Retain reference-counted payload buffers across protobuf decoding.
+    build.bytes([
+        ".proto.BlockDataResponse.data",
+        ".proto.WriteBlockChunk.data",
+    ]);
     build.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
     // Runtime crates construct channels; API crates need no HTTP server stack.
     tonic_build::configure()
