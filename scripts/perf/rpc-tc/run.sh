@@ -24,11 +24,33 @@ server_created=0
 client_created=0
 link_created=0
 cleanup() {
-    # Stop all processes still attached to namespaces we created.
-    for ns in "$server_ns" "$client_ns"; do
-        if [[ $ns == "$server_ns" && $server_created == 1 ]] || [[ $ns == "$client_ns" && $client_created == 1 ]]; then
-            while read -r pid; do [[ -z $pid ]] || kill "$pid" 2>/dev/null || true; done < <(ip netns pids "$ns" 2>/dev/null)
+    # Capture shaping counters after CPU timing has finished, before teardown.
+    if [[ -n ${RPC_TC_RESULT_DIR:-} ]]; then
+        if (( server_created )); then
+            ip netns exec "$server_ns" tc -s -j qdisc show > "$RPC_TC_RESULT_DIR/server-qdisc.json" 2>/dev/null || true
         fi
+        if (( client_created )); then
+            ip netns exec "$client_ns" tc -s -j qdisc show > "$RPC_TC_RESULT_DIR/client-qdisc.json" 2>/dev/null || true
+        fi
+    fi
+    # Stop only processes in namespaces owned by this run. A worker may wait
+    # to unregister from the stopped master; do not let it contaminate later runs.
+    local owned=()
+    (( server_created )) && owned+=("$server_ns")
+    (( client_created )) && owned+=("$client_ns")
+    for ns in "${owned[@]}"; do
+        while read -r pid; do [[ -z $pid ]] || kill "$pid" 2>/dev/null || true; done < <(ip netns pids "$ns" 2>/dev/null)
+    done
+    for ((attempt=0; attempt<20; attempt++)); do
+        local remaining=''
+        for ns in "${owned[@]}"; do
+            remaining+=$(ip netns pids "$ns" 2>/dev/null || true)
+        done
+        [[ -n $remaining ]] || break
+        sleep 0.1
+    done
+    for ns in "${owned[@]}"; do
+        while read -r pid; do [[ -z $pid ]] || kill -KILL "$pid" 2>/dev/null || true; done < <(ip netns pids "$ns" 2>/dev/null)
     done
     if [[ -n $server_pid ]]; then
         kill "$server_pid" 2>/dev/null || true
