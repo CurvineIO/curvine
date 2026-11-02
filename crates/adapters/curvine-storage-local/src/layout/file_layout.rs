@@ -14,7 +14,7 @@
 
 use crate::layout::{validate_open_offset, BlockLayout};
 use crate::{
-    BlockChecksum, BlockMeta, BlockState, ChecksumVerify, CHECKSUM_FILE_SUFFIX,
+    BlockChecksum, BlockMeta, BlockState, ChecksumHeader, ChecksumVerify, CHECKSUM_FILE_SUFFIX,
     DEFAULT_CHECKSUM_CHUNK_SIZE,
 };
 use crate::{BlockReadContext, BlockWriteContext, VfsDir};
@@ -27,7 +27,7 @@ use curvine_runtime::common::FileUtils;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy)]
@@ -124,20 +124,69 @@ impl FileLayout {
     /// Load the sidecar of `block_path`, `Ok(None)` when it does not exist.
     /// Called right after opening the block file under the dataset read lock,
     /// so both belong to the same published generation.
-    fn read_checksum(block_path: &Path) -> IOResult<Option<BlockChecksum>> {
+    ///
+    /// The header is checked against `file_len` and the sidecar's own size
+    /// before the rest is read, and the read is capped at that size, so a
+    /// damaged or enlarged sidecar fails without loading it into memory.
+    fn read_checksum(
+        block_id: i64,
+        block_path: &Path,
+        file_len: i64,
+    ) -> IOResult<Option<BlockChecksum>> {
         let checksum_path = Self::checksum_path_of(block_path);
-        let buf = match fs::read(&checksum_path) {
-            Ok(buf) => buf,
+        let mut file = match File::open(&checksum_path) {
+            Ok(file) => file,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        match BlockChecksum::decode(&buf) {
-            Ok(checksum) => Ok(Some(checksum)),
-            Err(e) => err_box!(
+        let invalid = |reason: String| -> IOResult<Option<BlockChecksum>> {
+            err_box!(
                 "invalid checksum sidecar {}: {}",
                 checksum_path.display(),
-                e
-            ),
+                reason
+            )
+        };
+
+        let sidecar_len = file.metadata()?.len();
+        let mut buf = vec![0u8; ChecksumHeader::LEN];
+        match file.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                return invalid(format!("checksum data too short: {sidecar_len} bytes"));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let header = match ChecksumHeader::parse(&buf) {
+            Ok(header) => header,
+            Err(e) => return invalid(e.to_string()),
+        };
+        // Finalize materializes the file to the checksummed length, so a
+        // different file length means the block changed afterwards.
+        if header.data_len as i64 != file_len {
+            return err_box!(
+                "Block {} checksum length mismatch: checksum covers {}, file length {}",
+                block_id,
+                header.data_len,
+                file_len
+            );
+        }
+        let expected = match header.encoded_len() {
+            Some(len) if len == sidecar_len => len,
+            _ => return invalid(format!("size {sidecar_len} does not match its header")),
+        };
+
+        // One byte past `expected` detects a sidecar that grew after the size
+        // check.
+        let rest = expected - ChecksumHeader::LEN as u64;
+        (&mut file).take(rest + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 != expected {
+            return invalid(format!(
+                "size changed while reading, expected {expected} bytes"
+            ));
+        }
+        match BlockChecksum::decode(&buf) {
+            Ok(checksum) => Ok(Some(checksum)),
+            Err(e) => invalid(e.to_string()),
         }
     }
 
@@ -465,15 +514,7 @@ impl BlockLayout for FileLayout {
             return Ok(reader);
         }
 
-        match Self::read_checksum(Path::new(&file))? {
-            // Finalize materializes the file to the checksummed length, so a
-            // different file length means the block changed afterwards.
-            Some(checksum) if checksum.data_len() as i64 != file_len => err_box!(
-                "Block {} checksum length mismatch: checksum covers {}, file length {}",
-                meta.id,
-                checksum.data_len(),
-                file_len
-            ),
+        match Self::read_checksum(meta.id, Path::new(&file), file_len)? {
             Some(checksum) => reader.with_checksum(checksum),
             None if verify == ChecksumVerify::RequireSidecar => {
                 err_box!("Block {} has no checksum sidecar", meta.id)

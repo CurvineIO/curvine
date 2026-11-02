@@ -255,20 +255,8 @@ impl BlockChecksum {
             );
         }
 
-        if body[0..4] != CHECKSUM_MAGIC {
-            return err_box!("invalid checksum magic: {:?}", &body[0..4]);
-        }
-        let version = u16::from_le_bytes(body[4..6].try_into().unwrap());
-        if version != CHECKSUM_VERSION {
-            return err_box!("unsupported checksum version: {}", version);
-        }
-        let reserved = u16::from_le_bytes(body[6..8].try_into().unwrap());
-        if reserved != 0 {
-            return err_box!("invalid checksum reserved field: {}", reserved);
-        }
-        let chunk_size = u32::from_le_bytes(body[8..12].try_into().unwrap());
-        let data_len = u64::from_le_bytes(body[12..20].try_into().unwrap());
-        check_chunk_size(chunk_size)?;
+        let header = ChecksumHeader::parse(body)?;
+        let (chunk_size, data_len) = (header.chunk_size, header.data_len);
 
         let (crc_chunks, rest) = body[HEADER_LEN..].as_chunks::<CRC_LEN>();
         if !rest.is_empty() {
@@ -276,6 +264,52 @@ impl BlockChecksum {
         }
         let crcs = crc_chunks.iter().map(|c| u32::from_le_bytes(*c)).collect();
         Self::from_parts(chunk_size, data_len, crcs)
+    }
+}
+
+/// Fixed-size header of an encoded checksum, read before the rest so a
+/// caller can bound the sidecar size before loading it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChecksumHeader {
+    pub chunk_size: u32,
+    pub data_len: u64,
+}
+
+impl ChecksumHeader {
+    /// Encoded header size in bytes.
+    pub const LEN: usize = HEADER_LEN;
+
+    /// Parse and validate the first [`Self::LEN`] bytes of `buf`.
+    pub fn parse(buf: &[u8]) -> IOResult<Self> {
+        if buf.len() < HEADER_LEN {
+            return err_box!("checksum data too short: {} bytes", buf.len());
+        }
+        if buf[0..4] != CHECKSUM_MAGIC {
+            return err_box!("invalid checksum magic: {:?}", &buf[0..4]);
+        }
+        let version = u16::from_le_bytes(buf[4..6].try_into().unwrap());
+        if version != CHECKSUM_VERSION {
+            return err_box!("unsupported checksum version: {}", version);
+        }
+        let reserved = u16::from_le_bytes(buf[6..8].try_into().unwrap());
+        if reserved != 0 {
+            return err_box!("invalid checksum reserved field: {}", reserved);
+        }
+        let chunk_size = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let data_len = u64::from_le_bytes(buf[12..20].try_into().unwrap());
+        check_chunk_size(chunk_size)?;
+        Ok(Self {
+            chunk_size,
+            data_len,
+        })
+    }
+
+    /// Size in bytes of the full encoded form this header describes, `None`
+    /// on overflow.
+    pub fn encoded_len(&self) -> Option<u64> {
+        chunk_count(self.data_len, self.chunk_size)
+            .checked_mul(CRC_LEN as u64)?
+            .checked_add((HEADER_LEN + CRC_LEN) as u64)
     }
 }
 
@@ -501,6 +535,30 @@ mod tests {
             assert_eq!(buf.len(), sum.encoded_len());
             assert_eq!(BlockChecksum::decode(&buf).unwrap(), sum, "len={}", len);
         }
+    }
+
+    #[test]
+    fn header_describes_the_encoded_size() {
+        for (chunk_size, len) in [
+            (4, 0),
+            (4, 10),
+            (4, 12),
+            (DEFAULT_CHECKSUM_CHUNK_SIZE, 150_017),
+        ] {
+            let buf = BlockChecksum::compute(chunk_size, &sample(len))
+                .unwrap()
+                .encode();
+            let header = ChecksumHeader::parse(&buf).unwrap();
+            assert_eq!(header.chunk_size, chunk_size);
+            assert_eq!(header.data_len, len as u64);
+            assert_eq!(header.encoded_len(), Some(buf.len() as u64));
+        }
+        let huge = ChecksumHeader {
+            chunk_size: 1,
+            data_len: u64::MAX,
+        };
+        assert_eq!(huge.encoded_len(), None);
+        assert!(ChecksumHeader::parse(&[0u8; ChecksumHeader::LEN - 1]).is_err());
     }
 
     #[test]

@@ -799,7 +799,7 @@ mod test {
         BlockChecksum, BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore,
         StorageVersion, VfsDataset, VfsDir, DEFAULT_CHECKSUM_CHUNK_SIZE,
     };
-    use crate::{BlockMeta, BlockState, ChecksumVerify};
+    use crate::{BlockMeta, BlockState, ChecksumHeader, ChecksumVerify};
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_core_error::CommonResult;
     use curvine_io::DataSlice;
@@ -1736,6 +1736,36 @@ mod test {
             .unwrap_err()
             .to_string();
         assert!(err.contains("checksum length mismatch"), "{err}");
+
+        // Enlarged sidecar: rejected from its size, before it is loaded.
+        let mut enlarged = sidecar.clone();
+        enlarged.resize(sidecar.len() + 1024 * 1024, 0);
+        std::fs::write(&checksum_path, &enlarged)?;
+        let err = read_block(&ds, &finalized, 30, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match its header"), "{err}");
+
+        // Header with a chunk size that implies a different sidecar size.
+        let small_chunks = BlockChecksum::compute(1, &[9u8; 30])?.encode();
+        let mut mixed = small_chunks[..ChecksumHeader::LEN].to_vec();
+        mixed.extend_from_slice(&sidecar[ChecksumHeader::LEN..]);
+        std::fs::write(&checksum_path, &mixed)?;
+        let err = read_block(&ds, &finalized, 30, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match its header"), "{err}");
+
+        // Header shorter than its fixed size.
+        std::fs::write(&checksum_path, &sidecar[..8])?;
+        let err = read_block(&ds, &finalized, 30, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid checksum sidecar"), "{err}");
+
+        // A valid sidecar still verifies.
+        std::fs::write(&checksum_path, &sidecar)?;
+        assert_eq!(read_block(&ds, &finalized, 30, verify)?, vec![9u8; 30]);
         Ok(())
     }
 
