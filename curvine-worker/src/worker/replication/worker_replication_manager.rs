@@ -248,7 +248,15 @@ impl WorkerReplicationManager {
             let mut remaining = block_meta.len;
             while remaining > 0 {
                 let size = remaining.min(self.replicate_chunk_size as i64);
-                let slice = reader.read_region(true, size as i32)?;
+                let slice = match reader.read_region(true, size as i32) {
+                    Ok(slice) => slice,
+                    Err(e) => {
+                        if reader.checksum_mismatch() {
+                            self.block_store.report_corrupt(job.block_id, reader.path());
+                        }
+                        return Err(e.into());
+                    }
+                };
                 let read_len = slice.len() as i64;
                 if read_len == 0 {
                     return err_box!(

@@ -212,6 +212,9 @@ impl ReadHandler {
             Ok(region) => region,
             Err(e) => {
                 Self::record_read_error(self.metrics, context.dir_id, &e);
+                if file.checksum_mismatch() {
+                    self.store.report_corrupt(context.block_id, file.path());
+                }
                 return Err(e.into());
             }
         };

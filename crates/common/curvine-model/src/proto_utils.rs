@@ -600,6 +600,7 @@ impl ProtoUtils {
                 status: BlockReportStatus::from(block.status),
                 storage_type: StorageType::from(block.storage_type),
                 block_size: block.block_size,
+                corrupted: block.corrupted.unwrap_or(false),
             };
             dst.blocks.push(dst_blocks);
         }

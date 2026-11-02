@@ -14,9 +14,11 @@
 
 use super::{BlockStore, HeartbeatTask};
 use crate::worker::storage::Dataset;
+use bytes::BytesMut;
 use curvine_config::{ClusterConf, WorkerConf};
 use curvine_core_error::CommonResult;
-use curvine_model::{BlockReportStatus, DeleteBlockCmd, WorkerCommand};
+use curvine_io::DataSlice;
+use curvine_model::{BlockReportStatus, DeleteBlockCmd, ExtendedBlock, WorkerCommand};
 use curvine_runtime::runtime::GroupExecutor;
 use dashmap::{DashMap, DashSet};
 use std::sync::{mpsc, Arc};
@@ -92,6 +94,53 @@ fn report_is_emitted_only_after_delete_completes() -> CommonResult<()> {
     );
     // GroupExecutor's Drop waits for its worker threads; leaking this test-only
     // executor lets the process shutdown reclaim the idle thread deterministically.
+    std::mem::forget(executor);
+    Ok(())
+}
+
+#[test]
+fn corrupt_block_is_removed_and_reported_as_corrupted() -> CommonResult<()> {
+    let conf = ClusterConf {
+        format_worker: true,
+        worker: WorkerConf {
+            dir_reserved: "0".to_string(),
+            data_dir: vec!["[MEM:4MB]../testing/heartbeat-task-corrupt".to_string()],
+            block_checksum: true,
+            block_checksum_verify: true,
+            ..WorkerConf::default()
+        },
+        ..ClusterConf::default()
+    };
+    let store = BlockStore::new("test", &conf)?;
+    let data: Vec<u8> = (0..100 * 1024).map(|i| (i % 251) as u8).collect();
+    let mut block = ExtendedBlock::with_mem(7, "1MB")?;
+    let meta = store.open_block(&block)?;
+    let mut writer = store.open_writer(&meta, 0)?;
+    writer.write_region(&DataSlice::Buffer(BytesMut::from(&data[..])))?;
+    writer.flush()?;
+    drop(writer);
+    block.len = data.len() as i64;
+    let finalized = store.finalize_block(&block)?;
+
+    let path = store.short_circuit(&finalized)?.unwrap();
+    let mut corrupted = data.clone();
+    corrupted[10] ^= 0xff;
+    std::fs::write(&path, &corrupted)?;
+    store.report_corrupt(finalized.id, &path);
+
+    let executor = Arc::new(GroupExecutor::new("heartbeat-corrupt-test", 1, 2));
+    let reports = Arc::new(DashMap::new());
+    HeartbeatTask::invalidate_corrupt_task(executor.clone(), store.clone(), reports.clone());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !reports.contains_key(&7) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let report = reports.get(&7).expect("missing corrupted report");
+    assert_eq!(report.status, BlockReportStatus::Deleted);
+    assert!(report.corrupted);
+    assert_eq!(report.block_size, data.len() as i64);
+    assert!(store.get_block(7).is_err());
     std::mem::forget(executor);
     Ok(())
 }
