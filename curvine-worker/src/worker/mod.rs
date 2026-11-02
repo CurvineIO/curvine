@@ -14,7 +14,6 @@
 
 mod control_grpc;
 pub mod grpc_data;
-mod read_executor;
 pub mod worker_server;
 pub(crate) use self::control_grpc::WorkerControlGrpcHandler;
 pub use self::worker_server::*;

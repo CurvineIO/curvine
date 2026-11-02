@@ -25,7 +25,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use super::handler::WorkerHandler;
-use super::read_executor::{ReadExecutorHandle, ReadTaskError};
 use super::WorkerService;
 
 /// The service creates an independent stateful handler for each gRPC stream.
@@ -33,30 +32,11 @@ use super::WorkerService;
 pub struct GrpcBlockDataService {
     service: WorkerService,
     tracker: StreamTracker,
-    read_executor: Option<ReadExecutorHandle>,
 }
 
 impl GrpcBlockDataService {
-    /// Preserve the standalone adapter's original blocking-dispatch behavior.
-    /// A worker server supplies its own shared pool with `with_read_executor`.
     pub fn new(service: WorkerService, tracker: StreamTracker) -> Self {
-        Self {
-            service,
-            tracker,
-            read_executor: None,
-        }
-    }
-
-    pub(crate) fn with_read_executor(
-        service: WorkerService,
-        tracker: StreamTracker,
-        read_executor: ReadExecutorHandle,
-    ) -> Self {
-        Self {
-            service,
-            tracker,
-            read_executor: Some(read_executor),
-        }
+        Self { service, tracker }
     }
 }
 
@@ -350,71 +330,6 @@ impl PreparedOperation {
     }
 }
 
-#[allow(clippy::result_large_err)]
-async fn execute_read(
-    executor: &ReadExecutorHandle,
-    operation: PreparedOperation,
-    worker: Arc<WorkerHandler>,
-    responses: &tokio::sync::mpsc::Sender<Result<BlockDataResponse, Status>>,
-    stop: &mut watch::Receiver<bool>,
-) -> Result<Option<OperationReply>, Status> {
-    execute_cancellable(
-        executor,
-        move || {
-            let result = operation.execute(&worker);
-            // The waiter may release its handler immediately after completion.
-            drop(worker);
-            result
-        },
-        responses,
-        stop,
-    )
-    .await?
-    .transpose()
-}
-
-#[allow(clippy::result_large_err)]
-async fn execute_cancellable<F, T>(
-    executor: &ReadExecutorHandle,
-    work: F,
-    responses: &tokio::sync::mpsc::Sender<Result<BlockDataResponse, Status>>,
-    stop: &mut watch::Receiver<bool>,
-) -> Result<Option<T>, Status>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    let mut task = tokio::select! {
-        biased;
-        _ = responses.closed() => return Ok(None),
-        _ = stop.changed() => return Ok(None),
-        task = executor.submit(work) => task.map_err(read_task_error)?,
-    };
-    let result = tokio::select! {
-        biased;
-        _ = responses.closed() => {
-            task.cancel();
-            let _ = task.wait().await;
-            return Ok(None);
-        }
-        _ = stop.changed() => {
-            task.cancel();
-            let _ = task.wait().await;
-            return Ok(None);
-        }
-        result = task.wait() => result,
-    };
-    result.map(Some).map_err(read_task_error)
-}
-
-fn read_task_error(error: ReadTaskError) -> Status {
-    match error {
-        ReadTaskError::Closed => Status::unavailable("worker read executor is shutting down"),
-        ReadTaskError::Cancelled => Status::cancelled("worker read was cancelled"),
-        ReadTaskError::Panicked => Status::internal("worker read executor task panicked"),
-    }
-}
-
 // Preserve tonic's Status-returning API.
 #[allow(clippy::result_large_err)]
 fn into_message(request: BlockDataRequest, state: &StreamState) -> Result<(Message, bool), Status> {
@@ -577,7 +492,6 @@ impl BlockDataService for GrpcBlockDataService {
         handler.buffered_reads = true;
         handler.client_addr = peer;
         let handler = Arc::new(handler);
-        let read_executor = self.read_executor.clone();
         // At most one response waits for transport backpressure; processing is sequential.
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
@@ -638,18 +552,9 @@ impl BlockDataService for GrpcBlockDataService {
                             status,
                             done,
                             success,
-                        } = if let (PreparedOperation::Read { .. }, Some(executor)) =
-                            (&operation, read_executor.as_ref())
-                        {
-                            match execute_read(executor, operation, worker, &tx, &mut stop).await? {
-                                Some(reply) => reply,
-                                None => return Ok(None),
-                            }
-                        } else {
-                            tokio::task::spawn_blocking(move || operation.execute(&worker))
-                                .await
-                                .map_err(|e| Status::internal(e.to_string()))??
-                        };
+                        } = tokio::task::spawn_blocking(move || operation.execute(&worker))
+                            .await
+                            .map_err(|e| Status::internal(e.to_string()))??;
                         if success && status == RequestStatus::Open {
                             state.as_mut().expect("initialized").opened = true;
                         }
@@ -659,18 +564,17 @@ impl BlockDataService for GrpcBlockDataService {
                         }
                         let terminate =
                             (done && success) || (!success && status == RequestStatus::Open);
-                        Ok::<_, Status>(Some((response, terminate)))
+                        Ok::<_, Status>((response, terminate))
                     }
                     .await;
                     match result {
-                        Ok(Some((reply, done))) => {
+                        Ok((reply, done)) => {
                             if tokio::select! { _ = stop.changed() => true, sent = tx.send(Ok(reply)) => sent.is_err() }
                                 || done
                             {
                                 break 'stream;
                             }
                         }
-                        Ok(None) => break 'stream,
                         Err(error) => {
                             tokio::select! { _ = stop.changed() => {}, _ = tx.send(Err(error)) => {} }
                             break 'stream;
@@ -726,10 +630,7 @@ impl BlockDataService for GrpcBlockDataService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::read_executor::ReadExecutor;
     use curvine_proto::{BlockReadRequest, BlockWriteRequest, ReadBlockChunk, WriteBlockChunk};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
 
     fn frame(seq_id: i32, operation: Operation, token: Option<&str>) -> BlockDataRequest {
         BlockDataRequest {
@@ -809,147 +710,5 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), tracker.wait_drained())
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn disconnected_stream_waits_for_inflight_read_before_cleanup() {
-        struct Probe(Arc<AtomicBool>);
-        impl Drop for Probe {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
-            }
-        }
-        let executor = ReadExecutor::with_size(1, 2).unwrap();
-        let handle = executor.handle();
-        let tracker = StreamTracker::default();
-        let guard = tracker.register().unwrap();
-        let mut stop = tracker.0.stop.subscribe();
-        let (responses, receiver) = tokio::sync::mpsc::channel(1);
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let dropped = Arc::new(AtomicBool::new(false));
-        let probe = Probe(dropped.clone());
-        let stream = tokio::spawn(async move {
-            let _guard = guard;
-            execute_cancellable(
-                &handle,
-                move || {
-                    let _probe = probe;
-                    let _ = started_tx.send(());
-                    release_rx.recv().unwrap();
-                },
-                &responses,
-                &mut stop,
-            )
-            .await
-        });
-        started_rx.await.unwrap();
-        drop(receiver);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), tracker.wait_drained())
-                .await
-                .is_err()
-        );
-        assert!(!dropped.load(Ordering::Acquire));
-        release_tx.send(()).unwrap();
-        assert!(stream.await.unwrap().unwrap().is_none());
-        assert!(dropped.load(Ordering::Acquire));
-        tracker.wait_drained().await;
-        executor.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn shutdown_removes_queued_read_without_waiting_for_busy_threads() {
-        let executor = ReadExecutor::with_size(1, 2).unwrap();
-        let handle = executor.handle();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let mut running = handle
-            .submit(move || {
-                let _ = started_tx.send(());
-                release_rx.recv().unwrap();
-            })
-            .await
-            .unwrap();
-        started_rx.await.unwrap();
-        let tracker = StreamTracker::default();
-        let guard = tracker.register().unwrap();
-        let mut stop = tracker.0.stop.subscribe();
-        let (responses, _receiver) = tokio::sync::mpsc::channel(1);
-        let ran = Arc::new(AtomicBool::new(false));
-        let job_ran = ran.clone();
-        let stream_handle = handle.clone();
-        let stream = tokio::spawn(async move {
-            let _guard = guard;
-            execute_cancellable(
-                &stream_handle,
-                move || job_ran.store(true, Ordering::Release),
-                &responses,
-                &mut stop,
-            )
-            .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while handle.queued_len() != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        tracker.shutdown();
-        tokio::time::timeout(Duration::from_secs(2), tracker.wait_drained())
-            .await
-            .unwrap();
-        assert!(stream.await.unwrap().unwrap().is_none());
-        assert!(!ran.load(Ordering::Acquire));
-        assert_eq!(handle.queued_len(), 0);
-        release_tx.send(()).unwrap();
-        running.wait().await.unwrap();
-        executor.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn disconnect_cancels_wait_for_a_full_queue() {
-        struct Probe(Arc<AtomicBool>);
-        impl Drop for Probe {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
-            }
-        }
-        let executor = ReadExecutor::with_size(1, 1).unwrap();
-        let handle = executor.handle();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let mut running = handle
-            .submit(move || {
-                let _ = started_tx.send(());
-                release_rx.recv().unwrap();
-            })
-            .await
-            .unwrap();
-        started_rx.await.unwrap();
-        let mut queued = handle.submit(|| ()).await.unwrap();
-        assert_eq!(handle.queued_len(), 1);
-        let tracker = StreamTracker::default();
-        let guard = tracker.register().unwrap();
-        let mut stop = tracker.0.stop.subscribe();
-        let (responses, receiver) = tokio::sync::mpsc::channel(1);
-        let dropped = Arc::new(AtomicBool::new(false));
-        let probe = Probe(dropped.clone());
-        let stream = tokio::spawn(async move {
-            let _guard = guard;
-            execute_cancellable(&handle, move || drop(probe), &responses, &mut stop).await
-        });
-        tokio::task::yield_now().await;
-        drop(receiver);
-        tokio::time::timeout(Duration::from_secs(2), tracker.wait_drained())
-            .await
-            .unwrap();
-        assert!(stream.await.unwrap().unwrap().is_none());
-        assert!(dropped.load(Ordering::Acquire));
-        release_tx.send(()).unwrap();
-        running.wait().await.unwrap();
-        queued.wait().await.unwrap();
-        executor.shutdown().await;
     }
 }
