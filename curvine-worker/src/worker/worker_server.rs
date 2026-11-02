@@ -15,6 +15,7 @@
 use crate::worker::block::{BlockActor, BlockStore};
 use crate::worker::grpc_data::{GrpcBlockDataService, StreamTracker};
 use crate::worker::handler::{ConnectionPeer, WorkerHandler, WorkerRouterHandler};
+use crate::worker::read_executor::ReadExecutor;
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use crate::worker::task::TaskManager;
@@ -313,6 +314,7 @@ impl Worker {
             .await
             .map_err(|error| CommonError::from(error.to_string()))??;
         let address = listener.local_addr()?;
+        let read_executor = ReadExecutor::new()?;
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         self.shutdown = Some(stop_tx);
         let status = self.monitor.new_listener();
@@ -329,9 +331,10 @@ impl Worker {
         health
             .set_serving::<WorkerControlServiceServer<WorkerControlGrpcHandler>>()
             .await;
-        let data_service = BlockDataServiceServer::new(GrpcBlockDataService::new(
+        let data_service = BlockDataServiceServer::new(GrpcBlockDataService::with_read_executor(
             service.clone(),
             tracker.clone(),
+            read_executor.handle(),
         ))
         .max_decoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES)
         .max_encoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES);
@@ -393,6 +396,7 @@ impl Worker {
             monitor.advance_shutdown();
             tracker.shutdown();
             tracker.wait_drained().await;
+            read_executor.shutdown().await;
             // Keep synchronous heartbeat and storage shutdown off the I/O runtime.
             let _ = tokio::task::spawn_blocking(move || {
                 if unregister && registered.load(Ordering::Acquire) {
