@@ -724,7 +724,16 @@ impl Default for FuseConf {
 
             path_lock_stripes: 1024,
 
-            log: LogConf::default(),
+            // Dedicated file name so a fuse process does not share the
+            // client/sdk log ("curvine.log") by default. Only configs that omit
+            // `[fuse] log` inherit this: a partial table such as
+            // `log = { level = "debug" }` still takes `file_name` from LogConf's
+            // own serde default (empty), which Logger turns into "curvine", as
+            // master/worker/transfer do today.
+            log: LogConf {
+                file_name: "fuse.log".to_string(),
+                ..Default::default()
+            },
         };
 
         conf.init().unwrap();
@@ -745,6 +754,19 @@ mod tests {
     #[test]
     fn async_delete_is_opt_in() {
         assert!(!FuseConf::default().async_delete);
+    }
+
+    #[test]
+    fn default_log_file_name_is_fuse() {
+        assert_eq!(FuseConf::default().log.file_name, "fuse.log");
+    }
+
+    #[test]
+    fn fuse_section_without_log_keeps_fuse_file_name() {
+        // Deployment templates (fluid, example, spdk) may omit `[fuse] log`; the
+        // default must still name the file instead of falling back to "curvine".
+        let conf: FuseConf = toml::from_str("io_threads = 1").unwrap();
+        assert_eq!(conf.log.file_name, "fuse.log");
     }
 
     #[test]
