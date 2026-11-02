@@ -36,6 +36,12 @@ pub trait BlockIO: Send {
         false
     }
 
+    /// Whether a submitted write/flush's terminal outcome was not
+    /// confirmed (timeout or synthesized completion).
+    fn has_uncertain_writes(&self) -> bool {
+        false
+    }
+
     fn as_local(&self) -> Option<&LocalFile> {
         None
     }
