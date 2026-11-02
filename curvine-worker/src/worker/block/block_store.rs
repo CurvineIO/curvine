@@ -19,7 +19,7 @@ use crate::worker::storage::{
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
-use curvine_model::{ExtendedBlock, StorageInfo};
+use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
 use dashmap::{DashMap, DashSet};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
@@ -74,6 +74,27 @@ pub enum CorruptCheck {
     /// The block cannot be checked yet because a writer holds it or it is
     /// not finalized. The caller requeues it for a later heartbeat.
     Retry(String),
+}
+
+/// Outcome of the lock-free verification of one block by the startup scan.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScanResult {
+    /// Every chunk matched its sidecar.
+    Verified,
+    /// A chunk failed its CRC.
+    Mismatch,
+    /// The block has no sidecar and the policy reads it unverified.
+    NoSidecar,
+    /// The block has no sidecar but the policy requires one.
+    Unverifiable,
+    /// Not a finalized file block any more, or the scan stopped.
+    Skipped,
+}
+
+/// The store's checksum policy rejects `meta` when it has no sidecar.
+/// SPDK blocks never have one and are not checked.
+fn requires_sidecar(verify: ChecksumVerify, meta: &BlockMeta) -> bool {
+    verify == ChecksumVerify::RequireSidecar && meta.storage_type() != StorageType::SpdkDisk
 }
 
 #[derive(Clone)]
@@ -596,6 +617,70 @@ impl BlockStore {
             .collect()
     }
 
+    /// Record that the startup scan found `id` without a sidecar while the
+    /// policy requires one. The block is unreadable, so it goes through the
+    /// same re-check and removal as a corrupt one.
+    pub fn report_unverifiable(&self, id: i64) {
+        if self.corrupt_blocks.insert(id, 0).is_none() {
+            log::error!(
+                "block {} has no checksum sidecar but one is required; queued for invalidation",
+                id
+            );
+        }
+    }
+
+    /// Verify a finalized block without the stripe lock, reading at most
+    /// `read_len` bytes at a time and calling `on_read` with each length
+    /// read, which may sleep to limit the rate or return false to stop.
+    ///
+    /// The reader opens the block file and its sidecar together under the
+    /// dataset read lock, so a concurrent rewrite or delete cannot mix two
+    /// generations. Finding a mismatch only reports it: removal re-checks
+    /// the block under the lock.
+    pub fn scan_block(
+        &self,
+        id: i64,
+        read_len: i32,
+        mut on_read: impl FnMut(i64) -> bool,
+    ) -> CommonResult<ScanResult> {
+        let (meta, required, mut reader) = {
+            let state = self.read()?;
+            let Some(meta) = state.get_block(id).cloned() else {
+                return Ok(ScanResult::Skipped);
+            };
+            if *meta.state() != BlockState::Finalized
+                || meta.storage_type() == StorageType::SpdkDisk
+            {
+                return Ok(ScanResult::Skipped);
+            }
+            let (layout, dir) = state.layout_for(&meta)?;
+            let reader =
+                layout.open_reader(&dir, &meta, 0, meta.len(), ChecksumVerify::AllowMissing)?;
+            let required = requires_sidecar(state.checksum_verify(), &meta);
+            (meta, required, reader)
+        };
+        if !reader.is_verified() {
+            return Ok(if required {
+                ScanResult::Unverifiable
+            } else {
+                ScanResult::NoSidecar
+            });
+        }
+        while reader.block_pos() < meta.len() {
+            let before = reader.block_pos();
+            if let Err(e) = reader.read_region(false, read_len) {
+                if reader.checksum_mismatch() {
+                    return Ok(ScanResult::Mismatch);
+                }
+                return Err(e.into());
+            }
+            if !on_read(reader.block_pos() - before) {
+                return Ok(ScanResult::Skipped);
+            }
+        }
+        Ok(ScanResult::Verified)
+    }
+
     /// Put a block back for the next heartbeat. A fresh read report that
     /// arrived meanwhile keeps its lower count.
     pub fn requeue_corrupt(&self, id: i64, failed_checks: u32) {
@@ -612,14 +697,15 @@ impl BlockStore {
     }
 
     /// Re-verify a block reported corrupt and remove it with its sidecar only
-    /// when the whole block fails again. Holding the stripe lock keeps
-    /// finalize, abort and delete out while the block is read.
+    /// when the whole block fails again, or when it has no sidecar while the
+    /// policy requires one. Holding the stripe lock keeps finalize, abort and
+    /// delete out while the block is read.
     pub fn invalidate_corrupt_block(&self, id: i64) -> CommonResult<CorruptCheck> {
         let _block_lock = self.block_lock(id, "invalidate");
         if self.block_uses(id).lock().contains_key(&id) {
             return Ok(CorruptCheck::Retry("block has an active writer".into()));
         }
-        let (block_len, mut reader) = {
+        let (block_len, unverifiable, mut reader) = {
             let state = self.read()?;
             let Some(meta) = state.get_block(id).cloned() else {
                 return Ok(CorruptCheck::Kept("block no longer exists".into()));
@@ -633,14 +719,19 @@ impl BlockStore {
             let (layout, dir) = state.layout_for(&meta)?;
             let reader =
                 layout.open_reader(&dir, &meta, 0, meta.len(), ChecksumVerify::AllowMissing)?;
-            (meta.len(), reader)
+            let unverifiable = requires_sidecar(state.checksum_verify(), &meta);
+            (meta.len(), unverifiable, reader)
         };
-        if !reader.is_verified() {
+        let reason = if reader.is_verified() {
+            "it failed checksum verification twice"
+        } else if unverifiable {
+            "it has no checksum sidecar but one is required"
+        } else {
             return Ok(CorruptCheck::Kept("block has no checksum sidecar".into()));
-        }
+        };
 
-        let mut confirmed = false;
-        while reader.block_pos() < block_len {
+        let mut confirmed = !reader.is_verified();
+        while !confirmed && reader.block_pos() < block_len {
             if let Err(e) = reader.read_region(false, REVERIFY_READ_LEN) {
                 if !reader.checksum_mismatch() {
                     return Err(e.into());
@@ -677,10 +768,7 @@ impl BlockStore {
         if let Ok(metrics) = Worker::get_metrics() {
             metrics.checksum_invalidated_count.inc();
         }
-        log::error!(
-            "removed block {} after it failed checksum verification twice",
-            id
-        );
+        log::error!("removed block {} because {}", id, reason);
         Ok(CorruptCheck::Removed(removed.meta))
     }
 
@@ -696,7 +784,7 @@ impl BlockStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::block::BlockState;
+    use crate::worker::block::{BlockState, ChecksumScan, ScanStats};
     use crate::worker::storage::{Dataset, FileLayout};
     use curvine_config::WorkerConf;
     use curvine_io::DataSlice;
@@ -1048,8 +1136,20 @@ mod tests {
         verify: bool,
         allow_missing: bool,
     ) -> CommonResult<BlockStore> {
+        open_checksum_store(name, write, verify, allow_missing, true)
+    }
+
+    /// Open the store in `name`; `format` false keeps the blocks on disk, as
+    /// a worker restart does.
+    fn open_checksum_store(
+        name: &str,
+        write: bool,
+        verify: bool,
+        allow_missing: bool,
+        format: bool,
+    ) -> CommonResult<BlockStore> {
         let conf = ClusterConf {
-            format_worker: true,
+            format_worker: format,
             worker: WorkerConf {
                 dir_reserved: "0".to_string(),
                 data_dir: vec![format!("[MEM:16MB]../testing/block-store-{name}")],
@@ -1485,6 +1585,122 @@ mod tests {
             wall_clock.as_micros(),
             max_latency.as_micros(),
         );
+        Ok(())
+    }
+
+    /// Overwrite the block file with zeros of the same length, the damage a
+    /// reboot without sync can leave (#1813).
+    fn zero_block(store: &BlockStore, meta: &BlockMeta) -> CommonResult<()> {
+        let path = store.short_circuit(meta)?.unwrap();
+        std::fs::write(&path, vec![0u8; meta.len() as usize])?;
+        Ok(())
+    }
+
+    #[test]
+    fn zeroed_block_after_restart_fails_verified_read() -> CommonResult<()> {
+        let name = "checksum-restart-zeroed";
+        let store = open_checksum_store(name, true, true, true, true)?;
+        let (finalized, data) = finalize_checksummed(&store, 1)?;
+        zero_block(&store, &finalized)?;
+        drop(store);
+
+        let store = open_checksum_store(name, true, true, true, false)?;
+        assert!(store.get_block(finalized.id)?.is_final());
+        let (_, mut reader) = store.open_reader_by_id(finalized.id, 0, data.len() as i64)?;
+        assert!(reader.read_region(false, 64 * 1024).is_err());
+        assert!(reader.checksum_mismatch());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_block_after_restart_follows_missing_sidecar_policy() -> CommonResult<()> {
+        let name = "checksum-restart-legacy";
+        // Written before checksums were enabled: no sidecar.
+        let store = open_checksum_store(name, false, false, true, true)?;
+        let data = vec![7u8; 100 * 1024];
+        let legacy = finalize_with_data(&store, 1, &data)?;
+        drop(store);
+
+        let store = open_checksum_store(name, true, true, true, false)?;
+        let (_, mut reader) = store.open_reader_by_id(legacy.id, 0, data.len() as i64)?;
+        assert!(!reader.is_verified());
+        assert_eq!(read_bytes(&mut reader, data.len() as i32)?, data);
+        drop(store);
+
+        let store = open_checksum_store(name, true, true, false, false)?;
+        let Err(err) = store.open_reader_by_id(legacy.id, 0, data.len() as i64) else {
+            panic!("a legacy block must be rejected when a sidecar is required");
+        };
+        assert!(err.to_string().contains("sidecar"), "{err}");
+        Ok(())
+    }
+
+    /// Restart a store holding a healthy, a zeroed and a legacy block.
+    fn restarted_store_for_scan(name: &str, allow_missing: bool) -> CommonResult<BlockStore> {
+        let store = open_checksum_store(name, false, false, true, true)?;
+        finalize_with_data(&store, 3, &[9u8; 1000])?;
+        drop(store);
+
+        let store = open_checksum_store(name, true, true, true, false)?;
+        finalize_checksummed(&store, 1)?;
+        let (zeroed, _) = finalize_checksummed(&store, 2)?;
+        zero_block(&store, &zeroed)?;
+        drop(store);
+
+        open_checksum_store(name, true, true, allow_missing, false)
+    }
+
+    #[test]
+    fn startup_scan_removes_zeroed_block_without_a_read() -> CommonResult<()> {
+        let store = restarted_store_for_scan("checksum-scan-allow-missing", true)?;
+        let stats = ChecksumScan::new(store.clone(), 0).run(|| false)?;
+        assert_eq!(
+            (stats.verified, stats.mismatched, stats.no_sidecar),
+            (1, 1, 1),
+            "{stats:?}"
+        );
+        assert_eq!(stats.unverifiable + stats.skipped + stats.failed, 0);
+        assert_eq!(store.take_corrupt_blocks(), vec![(2, 0)]);
+
+        assert!(matches!(
+            store.invalidate_corrupt_block(2)?,
+            CorruptCheck::Removed(_)
+        ));
+        assert!(store.get_block(2).is_err());
+        assert!(store.get_block(1)?.is_final());
+        assert!(store.get_block(3)?.is_final());
+        Ok(())
+    }
+
+    #[test]
+    fn startup_scan_removes_legacy_block_when_sidecar_is_required() -> CommonResult<()> {
+        let store = restarted_store_for_scan("checksum-scan-require", false)?;
+        let stats = ChecksumScan::new(store.clone(), 0).run(|| false)?;
+        assert_eq!(
+            (stats.verified, stats.mismatched, stats.unverifiable),
+            (1, 1, 1),
+            "{stats:?}"
+        );
+        let mut queued = store.take_corrupt_blocks();
+        queued.sort();
+        assert_eq!(queued, vec![(2, 0), (3, 0)]);
+
+        for id in [2, 3] {
+            match store.invalidate_corrupt_block(id)? {
+                CorruptCheck::Removed(_) => {}
+                other => panic!("block {id}: expected removal, got {other:?}"),
+            }
+        }
+        assert!(store.get_block(1)?.is_final());
+        Ok(())
+    }
+
+    #[test]
+    fn startup_scan_stops_when_the_worker_stops() -> CommonResult<()> {
+        let store = restarted_store_for_scan("checksum-scan-stop", true)?;
+        let stats = ChecksumScan::new(store.clone(), 0).run(|| true)?;
+        assert_eq!(stats, ScanStats::default());
+        assert!(store.take_corrupt_blocks().is_empty());
         Ok(())
     }
 }

@@ -296,7 +296,10 @@ impl FileLayout {
     ///    block id (rewrite, or a failed sidecar delete) is stale either way.
     /// 2. Rename the block. With a new sidecar, sync the directory so the block
     ///    rename is durable before the sidecar can become visible.
-    /// 3. Rename the new sidecar.
+    /// 3. Rename the new sidecar and sync the directory, so a block that
+    ///    survives an unclean reboot keeps its sidecar. Without that sync the
+    ///    rename can be lost while the block stays, and the block would then
+    ///    pass as a legacy block whose data cannot be verified (#1813).
     ///
     /// Outcomes on failure: if step 1 fails, publish fails before the rename
     /// and rollback keeps the committed block and its sidecar. If step 2's
@@ -311,16 +314,20 @@ impl FileLayout {
         FileUtils::rename(&plan.staging_path, &plan.active_path)?;
         if let Some(staging_checksum) = plan.staging_checksum.take() {
             let published = Self::sync_parent_dir(&plan.active_path)
-                .and_then(|_| fs::rename(&staging_checksum, &active_checksum));
+                .and_then(|_| fs::rename(&staging_checksum, &active_checksum))
+                .and_then(|_| Self::sync_parent_dir(&active_checksum));
             if let Err(e) = published {
                 // The block is already visible; keep it and publish without a
-                // sidecar rather than failing a completed rename.
+                // sidecar rather than failing a completed rename. A sidecar
+                // whose rename may not be durable is dropped too, so the block
+                // is unverified now rather than only after a crash.
                 log::warn!(
                     "block {} published without checksum, sidecar publish failed: {}",
                     plan.final_meta.id(),
                     e
                 );
                 let _ = Self::remove_if_exists(&staging_checksum);
+                let _ = Self::remove_if_exists(&active_checksum);
             }
         }
         Ok(plan.final_meta.clone())

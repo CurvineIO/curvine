@@ -194,6 +194,16 @@ pub struct WorkerConf {
     /// rejecting them only makes sense once every block has one.
     pub block_checksum_allow_missing: bool,
 
+    /// With `block_checksum_verify`, re-verify every finalized block in the
+    /// background after the worker starts (default true). Blocks that fail
+    /// are removed and reported like a failed read, so damage left by an
+    /// unclean shutdown is found even for blocks nobody reads.
+    pub block_checksum_scan_on_start: bool,
+
+    /// Read rate limit for the startup scan, per second, e.g. "64MB".
+    /// "0" (default) does not limit it.
+    pub block_checksum_scan_rate: String,
+
     // Pipe size
     pub pipe_buf_size: usize,
     // Number of cores of pipeline resource pool
@@ -225,6 +235,16 @@ impl WorkerConf {
     pub fn io_timeout_ms(&self) -> u64 {
         let dur = DurationUnit::from_str(&self.io_timeout).unwrap();
         dur.as_millis()
+    }
+
+    /// Whether the startup checksum scan runs: it needs read verification.
+    pub fn checksum_scan_enabled(&self) -> bool {
+        self.block_checksum_verify && self.block_checksum_scan_on_start
+    }
+
+    /// Startup scan rate in bytes per second; 0 means unlimited.
+    pub fn checksum_scan_bytes_per_sec(&self) -> CommonResult<u64> {
+        Ok(ByteUnit::from_str(&self.block_checksum_scan_rate)?.as_byte())
     }
 }
 
@@ -258,6 +278,8 @@ impl Default for WorkerConf {
             block_checksum: false,
             block_checksum_verify: false,
             block_checksum_allow_missing: true,
+            block_checksum_scan_on_start: true,
+            block_checksum_scan_rate: "0".to_string(),
 
             pipe_buf_size: 64 * 1024,
             pipe_pool_init_cap: 0,
@@ -320,6 +342,31 @@ mod tests {
         assert!(conf.block_checksum_verify);
         assert!(!conf.block_checksum_allow_missing);
         assert!(!conf.block_checksum);
+    }
+
+    #[test]
+    fn block_checksum_scan_follows_verify() {
+        let conf = WorkerConf::default();
+        assert!(conf.block_checksum_scan_on_start);
+        assert!(!conf.checksum_scan_enabled());
+        assert_eq!(conf.checksum_scan_bytes_per_sec().unwrap(), 0);
+
+        let conf: WorkerConf = toml::from_str("block_checksum_verify = true").unwrap();
+        assert!(conf.checksum_scan_enabled());
+
+        let conf: WorkerConf =
+            toml::from_str("block_checksum_verify = true\nblock_checksum_scan_on_start = false")
+                .unwrap();
+        assert!(!conf.checksum_scan_enabled());
+
+        let conf: WorkerConf = toml::from_str(r#"block_checksum_scan_rate = "64MB""#).unwrap();
+        assert_eq!(
+            conf.checksum_scan_bytes_per_sec().unwrap(),
+            64 * 1024 * 1024
+        );
+
+        let conf: WorkerConf = toml::from_str(r#"block_checksum_scan_rate = "fast""#).unwrap();
+        assert!(conf.checksum_scan_bytes_per_sec().is_err());
     }
 
     #[test]
