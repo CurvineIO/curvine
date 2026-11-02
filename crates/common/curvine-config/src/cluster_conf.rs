@@ -862,4 +862,34 @@ mod tests {
         assert_eq!(conf.transfer.hostname, "127.0.0.1");
         assert_eq!(conf.client.master_addrs[0].hostname, "cv-master");
     }
+
+    // The transfer service loads through ClusterConf::from_transfer (not a bare
+    // TransferConf deserialization) before TransferServer calls
+    // Logger::init(conf.transfer.log), so the transfer.log default must survive
+    // that whole pipeline. A top-level [log] must not leak into it either.
+    #[test]
+    fn transfer_load_keeps_transfer_log_file_name() {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-transfer-log-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                [transfer]
+                enabled = true
+
+                [log]
+                file_name = "curvine.log"
+            "#,
+        )
+        .unwrap();
+
+        let conf = ClusterConf::from_transfer(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(conf.transfer.log.file_name, "transfer.log");
+        assert_eq!(conf.log.file_name, "curvine.log");
+    }
 }

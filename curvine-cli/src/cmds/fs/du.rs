@@ -1,6 +1,8 @@
+use super::common::format_size;
+use super::content_summary::ContentSummary;
 use clap::Subcommand;
 use curvine_core_error::CommonResult;
-use curvine_fs_api::{CurvineURI, FileSystem};
+use curvine_fs_api::CurvineURI;
 use curvine_unified_fs::UnifiedFileSystem;
 
 #[derive(Subcommand, Debug)]
@@ -42,36 +44,69 @@ impl DuCommand {
 
                 match crate::cmds::fs::common::calculate_content_summary(&client, &path).await {
                     Ok(summary) => {
-                        // Get file status to determine replication factor
-                        let status = client.get_status(&path).await;
-                        // Default replication factor is 3 if we can't get the status
-                        let replicas = status.map(|s| s.replicas).unwrap_or(1) as i64;
-                        // Calculate disk space consumed with all replicas
-                        let disk_space = summary.length * replicas;
-
-                        // Format similar to HDFS du output with single replica data added
-                        if *human_readable {
-                            println!(
-                                "{:>15}  {:>15}  {:>15}  {}",
-                                crate::cmds::fs::common::format_size(summary.length as u64),
-                                crate::cmds::fs::common::format_size(summary.length as u64),
-                                crate::cmds::fs::common::format_size(disk_space as u64),
-                                path.full_path()
-                            );
-                        } else {
-                            println!(
-                                "{:>15}  {:>15}  {:>15}  {}",
-                                summary.length,
-                                summary.length,
-                                disk_space,
-                                path.full_path()
-                            );
-                        }
+                        println!(
+                            "{}",
+                            format_du_row(&summary, path.full_path(), *human_readable)
+                        );
                         Ok(())
                     }
                     Err(e) => Err(format!("Cannot access '{}': {}", path.full_path(), e).into()),
                 }
             }
         }
+    }
+}
+
+/// Formats one `du` output row: size, single replica size, size of all replicas, path.
+fn format_du_row(summary: &ContentSummary, path: &str, human_readable: bool) -> String {
+    // Format similar to HDFS du output with single replica data added
+    if human_readable {
+        format!(
+            "{:>15}  {:>15}  {:>15}  {}",
+            format_size(summary.length as u64),
+            format_size(summary.length as u64),
+            format_size(summary.space_consumed as u64),
+            path
+        )
+    } else {
+        format!(
+            "{:>15}  {:>15}  {:>15}  {}",
+            summary.length, summary.length, summary.space_consumed, path
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_du_row, ContentSummary};
+    use curvine_model::FileStatus;
+
+    fn file(len: i64, replicas: i32) -> FileStatus {
+        FileStatus {
+            len,
+            replicas,
+            ..Default::default()
+        }
+    }
+
+    fn mixed_replica_dir() -> ContentSummary {
+        let mut summary = ContentSummary::for_empty_dir();
+        summary.merge(&ContentSummary::for_file(&file(1024, 1)));
+        summary.merge(&ContentSummary::for_file(&file(512, 3)));
+        summary
+    }
+
+    #[test]
+    fn dir_row_reports_replicated_size_of_files() {
+        let row = format_du_row(&mixed_replica_dir(), "/du", false);
+        let expected = format!("{:>15}  {:>15}  {:>15}  /du", 1536, 1536, 2560);
+        assert_eq!(row, expected);
+    }
+
+    #[test]
+    fn dir_row_human_readable_reports_replicated_size_of_files() {
+        let row = format_du_row(&mixed_replica_dir(), "/du", true);
+        let expected = format!("{:>15}  {:>15}  {:>15}  /du", "1.5 KB", "1.5 KB", "2.5 KB");
+        assert_eq!(row, expected);
     }
 }

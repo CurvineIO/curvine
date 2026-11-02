@@ -743,6 +743,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
                 status: block.status.into(),
                 block_size: block.block_size,
                 storage_type: block.storage_type.into(),
+                corrupted: None,
             })
             .collect(),
     };
@@ -980,6 +981,72 @@ fn lost_worker_keeps_cache_valid_when_a_replica_survives() -> CommonResult<()> {
     let blocks = fs.get_block_locations(path)?;
     assert_eq!(blocks.block_locs.len(), 1);
     assert_eq!(blocks.block_locs[0].locs[0].worker_id, 101);
+    Ok(())
+}
+
+fn corrupted_report(worker_id: u32, block_id: i64, len: i64) -> BlockReportList {
+    BlockReportList {
+        report_id: 0,
+        cluster_id: "curvine".into(),
+        worker_id,
+        full_report: false,
+        total_len: 0,
+        blocks: vec![BlockReportInfo::with_corrupted(block_id, len)],
+    }
+}
+
+#[test]
+fn corrupted_report_drops_location_and_keeps_surviving_replica() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "corrupted-report-surviving-replica");
+    let path = "/cached-file";
+    let (_, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
+
+    let mut replica_worker = WorkerInfo::default();
+    replica_worker.address.worker_id = 101;
+    fs.add_test_worker(replica_worker);
+    fs.fs_dir
+        .read()
+        .add_block_location(block.block.id, BlockLocation::with_id(101))?;
+
+    let result = fs.block_report(
+        corrupted_report(block.locs[0].worker_id, block.block.id, block.block.len),
+        None,
+    )?;
+    assert_eq!(result.corrupt_blocks, vec![block.block.id]);
+
+    // Reads now go to the surviving replica only.
+    assert!(fs.file_status(path)?.cv_valid(None));
+    let blocks = fs.get_block_locations(path)?;
+    assert_eq!(blocks.block_locs.len(), 1);
+    assert_eq!(blocks.block_locs[0].locs.len(), 1);
+    assert_eq!(blocks.block_locs[0].locs[0].worker_id, 101);
+
+    // A plain deletion is not treated as corruption.
+    let mut plain = corrupted_report(101, block.block.id, block.block.len);
+    plain.blocks[0].corrupted = false;
+    assert!(fs.block_report(plain, None)?.corrupt_blocks.is_empty());
+    Ok(())
+}
+
+#[test]
+fn corrupted_last_replica_invalidates_cache_so_reads_fall_back_to_ufs() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "corrupted-report-last-replica");
+    let path = "/cached-file";
+    let (before, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
+    assert!(before.cv_valid(None));
+
+    let result = fs.block_report(
+        corrupted_report(block.locs[0].worker_id, block.block.id, block.block.len),
+        None,
+    )?;
+    assert_eq!(result.corrupt_blocks, vec![block.block.id]);
+
+    let after = fs.file_status(path)?;
+    assert!(!after.cv_valid(None));
+    assert!(after.ufs_exists());
+    assert!(fs.get_block_locations(path)?.block_locs.is_empty());
     Ok(())
 }
 

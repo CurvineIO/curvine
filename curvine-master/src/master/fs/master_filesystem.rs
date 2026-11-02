@@ -137,6 +137,9 @@ const PRE_ALLOC_PRUNE_THRESHOLD: usize = 65536;
 
 pub struct BlockReportResult {
     pub delete_blocks: Vec<i64>,
+    /// Blocks reported as removed for failing checksum verification and
+    /// queued for re-replication.
+    pub corrupt_blocks: Vec<i64>,
 }
 
 #[derive(Default)]
@@ -1927,6 +1930,7 @@ impl MasterFilesystem {
         if list.blocks.is_empty() && full_reported_blocks.is_none() {
             return Ok(BlockReportResult {
                 delete_blocks: Vec::new(),
+                corrupt_blocks: Vec::new(),
             });
         }
 
@@ -1984,6 +1988,7 @@ impl MasterFilesystem {
         }
 
         let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
+        let mut corrupt_blocks = Vec::new();
         let mut wm = self.worker_manager.write();
         for (item, exists) in checked {
             let loc = BlockLocation::new(list.worker_id, item.storage_type);
@@ -2009,6 +2014,9 @@ impl MasterFilesystem {
                     }
                 }
                 BlockReportStatus::Deleted => {
+                    if item.corrupted {
+                        corrupt_blocks.push(item.id);
+                    }
                     batch.push((false, item.id, loc));
                     wm.deleted_block(list.worker_id, item.id);
                 }
@@ -2018,6 +2026,11 @@ impl MasterFilesystem {
 
         // Keep the block ids of a completing batch so a failure can be retried.
         let retry_blocks = full_reported_blocks.clone();
+        let corrupt_handler = if corrupt_blocks.is_empty() {
+            None
+        } else {
+            replication_handler.clone()
+        };
         let applied = (|| -> FsResult<()> {
             if let Some(reported_blocks) = full_reported_blocks {
                 self.submit_full_block_reconcile(
@@ -2046,7 +2059,47 @@ impl MasterFilesystem {
         }
         applied?;
 
-        Ok(BlockReportResult { delete_blocks })
+        if !corrupt_blocks.is_empty() {
+            self.recover_corrupt_blocks(list.worker_id, &corrupt_blocks, corrupt_handler);
+        }
+
+        Ok(BlockReportResult {
+            delete_blocks,
+            corrupt_blocks,
+        })
+    }
+
+    /// A worker dropped these replicas because their data failed checksum
+    /// verification. Recover like a lost replica: invalidate cache files that
+    /// became unreadable, then queue the rest for re-replication.
+    fn recover_corrupt_blocks(
+        &self,
+        worker_id: u32,
+        block_ids: &[i64],
+        replication_handler: Option<MasterReplicationHandler>,
+    ) {
+        warn!(
+            "worker {} removed {} corrupt block replicas: {:?}",
+            worker_id,
+            block_ids.len(),
+            block_ids
+        );
+        let replication_block_ids = self.recover_removed_locations(worker_id, block_ids);
+        if replication_block_ids.is_empty() {
+            return;
+        }
+        let Some(replication_handler) = replication_handler else {
+            return;
+        };
+        let count = replication_block_ids.len();
+        if let Err(e) =
+            replication_handler.report_under_replicated_blocks(worker_id, replication_block_ids)
+        {
+            error!(
+                "Errors on reporting under-replicated {} corrupt blocks from worker {}. err: {:?}",
+                count, worker_id, e
+            );
+        }
     }
 
     fn submit_full_block_reconcile(
@@ -2227,6 +2280,18 @@ impl MasterFilesystem {
             let fs_dir = self.fs_dir.write();
             fs_dir.delete_locations(worker_id)?
         };
+        let replication_block_ids = self.recover_removed_locations(worker_id, &removed_block_ids);
+
+        Ok(LostWorkerLocationCleanup {
+            removed_block_ids,
+            replication_block_ids,
+        })
+    }
+
+    /// After `worker_id` lost the given block locations, invalidate cache
+    /// files that no replica can serve any more and schedule their surviving
+    /// replicas for deletion. Returns the blocks that still need repair.
+    fn recover_removed_locations(&self, worker_id: u32, removed_block_ids: &[i64]) -> Vec<i64> {
         let mut invalidated = CacheInvalidationResult::default();
 
         for chunk in removed_block_ids.chunks(Self::LOST_WORKER_INVALIDATION_CHUNK) {
@@ -2258,10 +2323,7 @@ impl MasterFilesystem {
                 .remove_blocks(&invalidated.delete_result);
         }
 
-        Ok(LostWorkerLocationCleanup {
-            removed_block_ids,
-            replication_block_ids,
-        })
+        replication_block_ids
     }
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
@@ -2720,6 +2782,52 @@ mod tests {
         assert!(!fs_dir
             .add_replication_location_if_needed(old_block_id, BlockLocation::with_id(200))
             .unwrap());
+    }
+
+    #[test]
+    fn corrupted_deletion_queues_the_block_for_re_replication() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("corrupted-deletion-re-replication");
+        let block_id = replication_file(&fs, "/corrupted-re-replication.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+        let handler = || Some(MasterReplicationHandler::new(manager.clone()));
+        let report = |worker_id, corrupted| BlockReportList {
+            report_id: 0,
+            cluster_id: "curvine".into(),
+            worker_id,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo {
+                corrupted,
+                ..BlockReportInfo::with_deleted(block_id, 0)
+            }],
+        };
+
+        // A plain deletion does not ask for a new replica.
+        fs.block_report(report(200, false), handler()).unwrap();
+        assert!(!manager.has_pending_repair(block_id));
+
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        let result = fs.block_report(report(200, true), handler()).unwrap();
+        assert_eq!(result.corrupt_blocks, vec![block_id]);
+        assert!(manager.has_pending_repair(block_id));
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100]
+        );
     }
 
     #[test]
