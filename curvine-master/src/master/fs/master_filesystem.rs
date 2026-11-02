@@ -2785,6 +2785,52 @@ mod tests {
     }
 
     #[test]
+    fn corrupted_deletion_queues_the_block_for_re_replication() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("corrupted-deletion-re-replication");
+        let block_id = replication_file(&fs, "/corrupted-re-replication.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+        let handler = || Some(MasterReplicationHandler::new(manager.clone()));
+        let report = |worker_id, corrupted| BlockReportList {
+            report_id: 0,
+            cluster_id: "curvine".into(),
+            worker_id,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo {
+                corrupted,
+                ..BlockReportInfo::with_deleted(block_id, 0)
+            }],
+        };
+
+        // A plain deletion does not ask for a new replica.
+        fs.block_report(report(200, false), handler()).unwrap();
+        assert!(!manager.has_pending_repair(block_id));
+
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        let result = fs.block_report(report(200, true), handler()).unwrap();
+        assert_eq!(result.corrupt_blocks, vec![block_id]);
+        assert!(manager.has_pending_repair(block_id));
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100]
+        );
+    }
+
+    #[test]
     fn replication_location_update_is_idempotent_and_respects_replica_count() {
         let fs = test_fs("replication-location-guard");
         let block_id = replication_file(&fs, "/replication-location-guard.log");
