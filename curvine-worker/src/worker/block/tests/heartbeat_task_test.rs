@@ -98,13 +98,13 @@ fn report_is_emitted_only_after_delete_completes() -> CommonResult<()> {
     Ok(())
 }
 
-#[test]
-fn corrupt_block_is_removed_and_reported_as_corrupted() -> CommonResult<()> {
+/// A finalized, checksummed block whose data was then corrupted on disk.
+fn corrupt_checksummed_block(name: &str, id: i64) -> CommonResult<(BlockStore, i64)> {
     let conf = ClusterConf {
         format_worker: true,
         worker: WorkerConf {
             dir_reserved: "0".to_string(),
-            data_dir: vec!["[MEM:4MB]../testing/heartbeat-task-corrupt".to_string()],
+            data_dir: vec![format!("[MEM:4MB]../testing/{name}")],
             block_checksum: true,
             block_checksum_verify: true,
             ..WorkerConf::default()
@@ -113,7 +113,7 @@ fn corrupt_block_is_removed_and_reported_as_corrupted() -> CommonResult<()> {
     };
     let store = BlockStore::new("test", &conf)?;
     let data: Vec<u8> = (0..100 * 1024).map(|i| (i % 251) as u8).collect();
-    let mut block = ExtendedBlock::with_mem(7, "1MB")?;
+    let mut block = ExtendedBlock::with_mem(id, "1MB")?;
     let meta = store.open_block(&block)?;
     let mut writer = store.open_writer(&meta, 0)?;
     writer.write_region(&DataSlice::Buffer(BytesMut::from(&data[..])))?;
@@ -123,24 +123,66 @@ fn corrupt_block_is_removed_and_reported_as_corrupted() -> CommonResult<()> {
     let finalized = store.finalize_block(&block)?;
 
     let path = store.short_circuit(&finalized)?.unwrap();
-    let mut corrupted = data.clone();
+    let mut corrupted = data;
     corrupted[10] ^= 0xff;
     std::fs::write(&path, &corrupted)?;
-    store.report_corrupt(finalized.id, &path);
+    Ok((store, block.len))
+}
+
+/// Wait until every job queued on the single-threaded `executor` has run.
+fn drain(executor: &GroupExecutor) {
+    let (tx, rx) = mpsc::channel();
+    executor.spawn(move || tx.send(()).unwrap()).unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn corrupt_block_is_removed_and_reported_as_corrupted() -> CommonResult<()> {
+    let (store, len) = corrupt_checksummed_block("heartbeat-task-corrupt", 7)?;
+    store.report_corrupt(7, "test");
 
     let executor = Arc::new(GroupExecutor::new("heartbeat-corrupt-test", 1, 2));
     let reports = Arc::new(DashMap::new());
     HeartbeatTask::invalidate_corrupt_task(executor.clone(), store.clone(), reports.clone());
+    drain(&executor);
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !reports.contains_key(&7) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    let report = reports.get(&7).expect("missing corrupted report");
+    let (_, report) = reports.remove(&7).expect("missing corrupted report");
     assert_eq!(report.status, BlockReportStatus::Deleted);
     assert!(report.corrupted);
-    assert_eq!(report.block_size, data.len() as i64);
+    assert_eq!(report.block_size, len);
     assert!(store.get_block(7).is_err());
+
+    // The id stays fenced until master acknowledges the corrupted deletion.
+    let block = ExtendedBlock::with_mem(7, "1MB")?;
+    assert!(store.open_block(&block).is_err());
+    let pending = DashSet::new();
+    HeartbeatTask::acknowledge(&store, &pending, &[report]);
+    store.open_block(&block)?;
+    std::mem::forget(executor);
+    Ok(())
+}
+
+#[test]
+fn corrupt_block_held_by_a_writer_is_cleaned_up_once_released() -> CommonResult<()> {
+    let (store, _) = corrupt_checksummed_block("heartbeat-task-corrupt-writer", 8)?;
+    store.report_corrupt(8, "test");
+
+    let executor = Arc::new(GroupExecutor::new("heartbeat-corrupt-writer-test", 1, 2));
+    let reports = Arc::new(DashMap::new());
+    let lease = store.ordinary_write_lease(8)?;
+    HeartbeatTask::invalidate_corrupt_task(executor.clone(), store.clone(), reports.clone());
+    drain(&executor);
+    assert!(reports.is_empty(), "a block with a writer must be kept");
+    assert!(store.get_block(8).is_ok());
+
+    // The writer goes away without replacing the block. No new read reports
+    // it, yet the next heartbeat still removes it.
+    drop(lease);
+    HeartbeatTask::invalidate_corrupt_task(executor.clone(), store.clone(), reports.clone());
+    drain(&executor);
+    let report = reports.get(&8).expect("requeued block was not cleaned up");
+    assert!(report.corrupted);
+    assert!(store.get_block(8).is_err());
     std::mem::forget(executor);
     Ok(())
 }

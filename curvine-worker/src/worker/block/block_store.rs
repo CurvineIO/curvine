@@ -20,7 +20,7 @@ use crate::worker::Worker;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo};
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -68,9 +68,12 @@ impl Drop for BlockWriteLease {
 pub enum CorruptCheck {
     /// The second full verification failed too; block and sidecar are gone.
     Removed(BlockMeta),
-    /// The block was kept: already gone, not finalized, in use, or the
-    /// second verification did not confirm the corruption.
+    /// The block was kept for good: it is already gone, has no sidecar, or
+    /// the second verification did not confirm the corruption.
     Kept(String),
+    /// The block cannot be checked yet because a writer holds it or it is
+    /// not finalized. The caller requeues it for a later heartbeat.
+    Retry(String),
 }
 
 #[derive(Clone)]
@@ -79,8 +82,13 @@ pub struct BlockStore {
     block_locks: Arc<Vec<Mutex<()>>>,
     uses: Arc<Vec<Mutex<HashMap<i64, BlockUse>>>>,
     replication_owner: Option<String>,
-    /// Blocks whose read failed a chunk CRC, waiting to be re-checked.
-    corrupt_blocks: Arc<DashSet<i64>>,
+    /// Blocks whose read failed a chunk CRC, waiting to be re-checked, with
+    /// the number of re-checks that already failed with an error.
+    corrupt_blocks: Arc<DashMap<i64, u32>>,
+    /// Blocks removed as corrupt whose deletion master has not acknowledged.
+    /// `open_block` refuses them: a replacement finalized before the report
+    /// lands would otherwise lose its location to that stale report.
+    fenced_blocks: Arc<DashSet<i64>>,
 }
 
 impl BlockStore {
@@ -95,7 +103,8 @@ impl BlockStore {
             ),
             replication_owner: None,
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
-            corrupt_blocks: Arc::new(DashSet::new()),
+            corrupt_blocks: Arc::new(DashMap::new()),
+            fenced_blocks: Arc::new(DashSet::new()),
         };
 
         Ok(block_store)
@@ -262,6 +271,12 @@ impl BlockStore {
     pub fn open_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let _block_lock = self.block_lock(block.id, "open");
         self.check_replication_owner(block.id)?;
+        if self.fenced_blocks.contains(&block.id) {
+            return curvine_core_error::err_box!(
+                "block {} was removed as corrupt; waiting for master to acknowledge the deletion",
+                block.id
+            );
+        }
         let reservation =
             self.with_dataset_write("open", |state| state.reserve_file_open(block))?;
 
@@ -564,7 +579,7 @@ impl BlockStore {
     /// Record that a read of `id` failed a chunk CRC. The heartbeat re-checks
     /// the block later, so the read path never blocks on removal.
     pub fn report_corrupt(&self, id: i64, path: &str) {
-        if self.corrupt_blocks.insert(id) {
+        if self.corrupt_blocks.insert(id, 0).is_none() {
             log::error!(
                 "block {} failed checksum verification, path {}; queued for invalidation",
                 id,
@@ -573,12 +588,27 @@ impl BlockStore {
         }
     }
 
-    pub fn take_corrupt_blocks(&self) -> Vec<i64> {
-        let ids: Vec<i64> = self.corrupt_blocks.iter().map(|id| *id).collect();
-        for id in &ids {
-            self.corrupt_blocks.remove(id);
-        }
-        ids
+    /// Drain the queued blocks with their count of failed re-checks.
+    pub fn take_corrupt_blocks(&self) -> Vec<(i64, u32)> {
+        let ids: Vec<i64> = self.corrupt_blocks.iter().map(|e| *e.key()).collect();
+        ids.into_iter()
+            .filter_map(|id| self.corrupt_blocks.remove(&id))
+            .collect()
+    }
+
+    /// Put a block back for the next heartbeat. A fresh read report that
+    /// arrived meanwhile keeps its lower count.
+    pub fn requeue_corrupt(&self, id: i64, failed_checks: u32) {
+        self.corrupt_blocks
+            .entry(id)
+            .and_modify(|n| *n = (*n).min(failed_checks))
+            .or_insert(failed_checks);
+    }
+
+    /// Master acknowledged the corrupted deletion of `id`; writers may
+    /// recreate it again.
+    pub fn unfence(&self, id: i64) {
+        self.fenced_blocks.remove(&id);
     }
 
     /// Re-verify a block reported corrupt and remove it with its sidecar only
@@ -587,7 +617,7 @@ impl BlockStore {
     pub fn invalidate_corrupt_block(&self, id: i64) -> CommonResult<CorruptCheck> {
         let _block_lock = self.block_lock(id, "invalidate");
         if self.block_uses(id).lock().contains_key(&id) {
-            return Ok(CorruptCheck::Kept("block has an active writer".into()));
+            return Ok(CorruptCheck::Retry("block has an active writer".into()));
         }
         let (block_len, mut reader) = {
             let state = self.read()?;
@@ -595,7 +625,7 @@ impl BlockStore {
                 return Ok(CorruptCheck::Kept("block no longer exists".into()));
             };
             if *meta.state() != BlockState::Finalized {
-                return Ok(CorruptCheck::Kept(format!(
+                return Ok(CorruptCheck::Retry(format!(
                     "block is {:?}, not finalized",
                     meta.state()
                 )));
@@ -642,6 +672,8 @@ impl BlockStore {
             return Err(e);
         }
         removed.release();
+        // Still under the stripe lock, so no open_block slips in between.
+        self.fenced_blocks.insert(id);
         if let Ok(metrics) = Worker::get_metrics() {
             metrics.checksum_invalidated_count.inc();
         }
@@ -1103,7 +1135,7 @@ mod tests {
         assert!(reader.checksum_mismatch());
         store.report_corrupt(finalized.id, reader.path());
         store.report_corrupt(finalized.id, reader.path());
-        assert_eq!(store.take_corrupt_blocks(), vec![finalized.id]);
+        assert_eq!(store.take_corrupt_blocks(), vec![(finalized.id, 0)]);
         assert!(store.take_corrupt_blocks().is_empty());
         assert!(store.get_block(finalized.id).is_ok());
 
@@ -1120,6 +1152,25 @@ mod tests {
             store.invalidate_corrupt_block(finalized.id)?,
             CorruptCheck::Kept(_)
         ));
+
+        // Until master acknowledges the deletion, the id cannot be recreated.
+        let block = ExtendedBlock::with_mem(finalized.id, "1MB")?;
+        let err = store.open_block(&block).unwrap_err();
+        assert!(err.to_string().contains("removed as corrupt"), "{err}");
+        store.unfence(finalized.id);
+        store.open_block(&block)?;
+        Ok(())
+    }
+
+    #[test]
+    fn requeue_keeps_the_lower_failure_count() -> CommonResult<()> {
+        let store = create_checksum_store_with("checksum-requeue", true, true)?;
+        store.requeue_corrupt(5, 2);
+        assert_eq!(store.take_corrupt_blocks(), vec![(5, 2)]);
+
+        store.report_corrupt(5, "fresh read");
+        store.requeue_corrupt(5, 2);
+        assert_eq!(store.take_corrupt_blocks(), vec![(5, 0)]);
         Ok(())
     }
 
@@ -1152,7 +1203,7 @@ mod tests {
         let lease = store.ordinary_write_lease(finalized.id)?;
         assert!(matches!(
             store.invalidate_corrupt_block(finalized.id)?,
-            CorruptCheck::Kept(_)
+            CorruptCheck::Retry(_)
         ));
         drop(lease);
         assert!(store.get_block(finalized.id).is_ok());
@@ -1161,7 +1212,7 @@ mod tests {
         let writing = store.open_block(&ExtendedBlock::with_mem(2, "1MB")?)?;
         assert!(matches!(
             store.invalidate_corrupt_block(writing.id)?,
-            CorruptCheck::Kept(_)
+            CorruptCheck::Retry(_)
         ));
 
         // Without a sidecar the corruption cannot be confirmed.
