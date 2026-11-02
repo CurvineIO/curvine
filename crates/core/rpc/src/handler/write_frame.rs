@@ -29,6 +29,13 @@ impl WriteFrame {
         Self { io, buf }
     }
 
+    /// Half-close the connection. The peer reads EOF and closes its end, so
+    /// the read half sees EOF too and the socket is released.
+    pub async fn shutdown(&mut self) -> IOResult<()> {
+        self.io.shutdown().await?;
+        Ok(())
+    }
+
     pub async fn send(&mut self, msg: &Message) -> IOResult<()> {
         msg.encode_protocol(&mut self.buf);
         self.io.write_all(&self.buf.split()).await?;

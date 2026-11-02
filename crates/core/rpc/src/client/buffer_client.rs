@@ -95,6 +95,12 @@ impl BufferClient {
                         // Channel has no data, and this timeout connection is automatically closed. .
                         info!("close idle connection: {}", client_state.conn_info());
                         client_state.set_closed();
+                        // Dropping the write half alone leaves the socket open
+                        // until the peer's own idle timeout, because the read
+                        // half still owns it. A half-close ends both.
+                        if let Err(e) = write_frame.shutdown().await {
+                            info!("idle shutdown {}: {}", client_state.conn_info(), e);
+                        }
 
                         break;
                     } else {
@@ -184,8 +190,9 @@ impl BufferClient {
                 Ok(v) => v,
 
                 Err(_) => {
-                    // If an error occurs in the network channel, the future ends.
-                    if client_state.has_error() {
+                    // A failed or closed connection takes no new requests, so
+                    // the read half has nothing left to wait for.
+                    if client_state.has_error() || client_state.is_closed() {
                         break;
                     } else {
                         continue;
