@@ -18,6 +18,7 @@ use crate::worker::storage::BlockWriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_core_error::{err_box, ternary, try_option_mut, CommonResult};
 use curvine_error::{FsError, FsResult};
+use curvine_io::DataSlice;
 use curvine_model::{ExtendedBlock, FileAllocMode};
 use curvine_proto::{BlockWriteResponse, DataHeaderProto};
 use curvine_rpc::message::{Builder, Message, RequestStatus};
@@ -274,20 +275,35 @@ impl WriteHandler {
     }
 
     pub fn write(&mut self, msg: &Message) -> FsResult<Message> {
+        let header = if msg.header_len() > 0 {
+            Some(msg.parse_header()?)
+        } else {
+            None
+        };
+        self.write_chunk(msg.req_id(), header, &msg.data)?;
+        Ok(msg.success())
+    }
+
+    pub(crate) fn write_chunk(
+        &mut self,
+        req_id: i64,
+        header: Option<DataHeaderProto>,
+        data: &DataSlice,
+    ) -> FsResult<()> {
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
-        Self::check_context(context, msg)?;
-
+        if context.req_id != req_id {
+            return err_box!("Write request identity mismatch");
+        }
         let mut need_flush = false;
-        if msg.header_len() > 0 {
-            let header: DataHeaderProto = msg.parse_header()?;
+        if let Some(header) = header {
             need_flush = Self::handle_data_header(file, context, header)?;
         }
 
-        let data_len = msg.data_len() as i64;
+        let data_len = data.len() as i64;
         if data_len > 0 {
             let spend = TimeSpent::new();
-            if let Err(e) = file.write_region(&msg.data) {
+            if let Err(e) = file.write_region(data) {
                 Self::record_write_error(self.metrics, context.dir_id, &e);
                 return Err(e.into());
             }
@@ -320,7 +336,7 @@ impl WriteHandler {
             }
         }
 
-        Ok(msg.success())
+        Ok(())
     }
 
     fn commit_block(&self, block: &ExtendedBlock, commit: bool) -> FsResult<()> {

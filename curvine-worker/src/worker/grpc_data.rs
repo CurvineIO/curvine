@@ -24,6 +24,7 @@ use tokio::sync::{watch, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use super::handler::WorkerHandler;
 use super::WorkerService;
 
 /// The service creates an independent stateful handler for each gRPC stream.
@@ -216,6 +217,121 @@ impl StreamState {
             .checked_add(1)
             .ok_or_else(|| Status::out_of_range("block sequence exhausted"))?;
         Ok(())
+    }
+}
+
+// Running payloads avoid the legacy Message header encode/decode round trip.
+// Replication, batches and lifecycle operations retain their existing adapters.
+enum PreparedOperation {
+    Read {
+        req_id: i64,
+        seq_id: i32,
+        header: Option<curvine_proto::DataHeaderProto>,
+    },
+    Write {
+        req_id: i64,
+        seq_id: i32,
+        header: Option<curvine_proto::DataHeaderProto>,
+        data: DataSlice,
+    },
+    Adapter(Message, bool),
+}
+
+struct OperationReply {
+    response: BlockDataResponse,
+    status: RequestStatus,
+    done: bool,
+    success: bool,
+}
+
+impl PreparedOperation {
+    #[allow(clippy::result_large_err)]
+    fn new(mut frame: BlockDataRequest, state: &StreamState) -> Result<Self, Status> {
+        let req_id = frame.req_id;
+        let seq_id = frame.seq_id;
+        if state.mode == StreamMode::Read
+            && matches!(frame.operation, Some(Operation::ReadChunk(_)))
+        {
+            let Some(Operation::ReadChunk(chunk)) = frame.operation.take() else {
+                unreachable!()
+            };
+            return Ok(Self::Read {
+                req_id,
+                seq_id,
+                header: chunk.header,
+            });
+        }
+        if state.mode == StreamMode::Write
+            && state.token.is_none()
+            && matches!(frame.operation, Some(Operation::WriteChunk(_)))
+        {
+            let Some(Operation::WriteChunk(chunk)) = frame.operation.take() else {
+                unreachable!()
+            };
+            let data = chunk.data.map(DataSlice::Bytes).unwrap_or(DataSlice::Empty);
+            return Ok(Self::Write {
+                req_id,
+                seq_id,
+                header: chunk.header,
+                data,
+            });
+        }
+        let (message, done) = into_message(frame, state)?;
+        Ok(Self::Adapter(message, done))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn execute(self, worker: &WorkerHandler) -> Result<OperationReply, Status> {
+        let (req_id, seq_id, result) = match self {
+            Self::Read {
+                req_id,
+                seq_id,
+                header,
+            } => (
+                req_id,
+                seq_id,
+                worker
+                    .read_chunk(req_id, header)
+                    .map(|data| OperationResult::Data(data.to_bytes())),
+            ),
+            Self::Write {
+                req_id,
+                seq_id,
+                header,
+                data,
+            } => (
+                req_id,
+                seq_id,
+                worker
+                    .write_chunk(req_id, header, &data)
+                    .map(|()| OperationResult::Ack(true)),
+            ),
+            Self::Adapter(msg, done) => {
+                let response = worker
+                    .handle(&msg)
+                    .unwrap_or_else(|error| msg.error_ext(&error));
+                let success = response.is_success();
+                return Ok(OperationReply {
+                    response: into_response(&msg, response)?,
+                    status: msg.request_status(),
+                    done,
+                    success,
+                });
+            }
+        };
+        let success = result.is_ok();
+        let result = result
+            .unwrap_or_else(|error| OperationResult::Error(curvine_error::grpc::to_detail(&error)));
+        Ok(OperationReply {
+            response: BlockDataResponse {
+                req_id,
+                seq_id,
+                result: Some(result),
+            },
+            status: RequestStatus::Running,
+            done: false,
+            success,
+        })
     }
 }
 
@@ -434,35 +550,35 @@ impl BlockDataService for GrpcBlockDataService {
                             }
                             let stream_state = state.as_mut().expect("initialized");
                             stream_state.validate(&frame)?;
-                            messages.push(into_message(frame, stream_state)?);
+                            messages.push(PreparedOperation::new(frame, stream_state)?);
                         }
                         let worker = handler.clone();
                         let responses = tokio::task::spawn_blocking(move || {
                             messages
                                 .into_iter()
-                                .map(|(msg, done)| {
-                                    let response = worker
-                                        .handle(&msg)
-                                        .unwrap_or_else(|error| msg.error_ext(&error));
-                                    (msg, response, done)
-                                })
+                                .map(|operation| operation.execute(&worker))
                                 .collect::<Vec<_>>()
                         })
                         .await
                         .map_err(|e| Status::internal(e.to_string()))?;
                         let mut replies = Vec::with_capacity(responses.len());
-                        for (msg, response, done) in responses {
-                            let success = response.is_success();
-                            if success && msg.request_status() == RequestStatus::Open {
+                        for reply in responses {
+                            let OperationReply {
+                                response,
+                                status,
+                                done,
+                                success,
+                            } = reply?;
+                            if success && status == RequestStatus::Open {
                                 state.as_mut().expect("initialized").opened = true;
                             }
                             if success && done {
                                 state.as_mut().expect("initialized").cleanup_write = None;
                                 state.as_mut().expect("initialized").cleanup_batch = None;
                             }
-                            let terminate = (done && success)
-                                || (!success && msg.request_status() == RequestStatus::Open);
-                            replies.push((into_response(&msg, response)?, terminate));
+                            let terminate =
+                                (done && success) || (!success && status == RequestStatus::Open);
+                            replies.push((response, terminate));
                         }
                         Ok::<_, Status>(replies)
                     }

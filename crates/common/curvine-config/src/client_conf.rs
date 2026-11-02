@@ -590,11 +590,17 @@ mod tests {
     #[test]
     fn read_pipeline_window_requires_a_bounded_positive_value() {
         for window in [0, 33] {
-            let mut conf = ClientConf { read_pipeline_window: window, ..Default::default() };
+            let mut conf = ClientConf {
+                read_pipeline_window: window,
+                ..Default::default()
+            };
             assert!(conf.init().is_err());
         }
         for window in [1, 4, 8, 32] {
-            let mut conf = ClientConf { read_pipeline_window: window, ..Default::default() };
+            let mut conf = ClientConf {
+                read_pipeline_window: window,
+                ..Default::default()
+            };
             conf.init().unwrap();
         }
     }

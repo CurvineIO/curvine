@@ -927,19 +927,50 @@ mod tests {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let task = tokio::spawn(tonic::transport::Server::builder()
-            .add_service(BlockDataServiceServer::new(BurstRead(calls.clone())))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)));
-        let client = GrpcBlockClient::connect(format!("http://{addr}"), Duration::from_secs(5)).await.unwrap();
-        let msg = |seq, status| Builder::new().code(RpcCode::ReadBlock).req_id(7).seq_id(seq).request(status);
-        client.rpc(msg(0, RequestStatus::Open).proto_header(BlockReadRequest {
-            len: 30, chunk_size: 3, ..Default::default()
-        }).build(), None).await.unwrap();
+        let task = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(BlockDataServiceServer::new(BurstRead(calls.clone())))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let client = GrpcBlockClient::connect(format!("http://{addr}"), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let msg = |seq, status| {
+            Builder::new()
+                .code(RpcCode::ReadBlock)
+                .req_id(7)
+                .seq_id(seq)
+                .request(status)
+        };
+        client
+            .rpc(
+                msg(0, RequestStatus::Open)
+                    .proto_header(BlockReadRequest {
+                        len: 30,
+                        chunk_size: 3,
+                        ..Default::default()
+                    })
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
         for seq in 1..=10 {
-            let response = client.rpc(msg(seq, RequestStatus::Running).build(), None).await.unwrap();
+            let response = client
+                .rpc(msg(seq, RequestStatus::Running).build(), None)
+                .await
+                .unwrap();
             assert_eq!(response.data.as_slice(), &[((seq - 1) * 3) as u8; 3]);
         }
-        client.rpc(msg(11, RequestStatus::Complete).proto_header(BlockReadRequest::default()).build(), None).await.unwrap();
+        client
+            .rpc(
+                msg(11, RequestStatus::Complete)
+                    .proto_header(BlockReadRequest::default())
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 7);
         assert_eq!(calls[0], (1, 4, None));
