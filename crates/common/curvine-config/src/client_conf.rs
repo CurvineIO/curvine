@@ -60,7 +60,8 @@ pub struct ClientConf {
     /// one waits for each acknowledgement; larger values overlap network RTTs.
     #[client_cli]
     pub write_pipeline_window: usize,
-    /// Maximum sequential read chunks requested in one gRPC burst.
+    /// Maximum sequential read chunks requested in one gRPC burst. Zero
+    /// selects the experimental automatic window; the default is one.
     pub read_pipeline_window: usize,
 
     #[serde(skip)]
@@ -345,8 +346,8 @@ impl ClientConf {
     pub const DEFAULT_MAX_READ_PARALLEL: i64 = 8;
 
     pub fn init(&mut self) -> CommonResult<()> {
-        if !(1..=32).contains(&self.read_pipeline_window) {
-            return err_box!("client.read_pipeline_window must be in 1..=32");
+        if self.read_pipeline_window > 32 {
+            return err_box!("client.read_pipeline_window must be in 0..=32");
         }
         if !(1..=1024).contains(&self.write_pipeline_window) {
             return err_box!("client.write_pipeline_window must be in 1..=1024");
@@ -588,15 +589,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_pipeline_window_requires_a_bounded_positive_value() {
-        for window in [0, 33] {
+    fn read_pipeline_window_accepts_auto_and_bounded_fixed_values() {
+        for window in [33, usize::MAX] {
             let mut conf = ClientConf {
                 read_pipeline_window: window,
                 ..Default::default()
             };
             assert!(conf.init().is_err());
         }
-        for window in [1, 4, 8, 32] {
+        for window in [0, 1, 4, 8, 32] {
             let mut conf = ClientConf {
                 read_pipeline_window: window,
                 ..Default::default()

@@ -103,3 +103,5 @@ use each binary's compiled default. Record this tuning choice when comparing
 runs. The [incremental results](results/grpc-priorities-2026-11-02/README.md)
 include every priority checkpoint, conservative defaults, and the final opt-in
 configuration, with CPU, P99, throughput, RSS and per-run values.
+
+`RPC_TC_READ_WINDOW=0` selects experimental automatic read pipelining when supported by the candidate. The compiled default remains 1 until the acceptance gate passes. Record this override with experimental results; do not label those runs as default-mode gate results.

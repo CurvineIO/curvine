@@ -7,8 +7,9 @@
 //! Client transport for the typed block data stream.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::block::adaptive_read::{AdaptiveReadWindow, MAX_AUTO_BYTES};
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::RpcCode;
 use curvine_io::DataSlice;
@@ -31,9 +32,56 @@ struct Exchange {
 struct ReadWindow {
     len: i64,
     next_offset: i64,
+    delivered_offset: i64,
     chunk_size: usize,
     next_seq: i32,
-    pending: VecDeque<i32>,
+    pending: VecDeque<PendingRead>,
+}
+
+struct PendingRead {
+    seq: i32,
+    sample: Option<(u64, Instant)>,
+}
+
+enum ReadPolicy {
+    Fixed(usize),
+    Adaptive(AdaptiveReadWindow),
+}
+
+impl ReadPolicy {
+    fn window(&self, chunk_size: usize) -> usize {
+        match self {
+            Self::Fixed(window) => *window,
+            Self::Adaptive(controller) => controller.window(chunk_size),
+        }
+    }
+
+    fn budget(&self) -> usize {
+        match self {
+            Self::Fixed(_) => 32 * 1024 * 1024,
+            Self::Adaptive(_) => MAX_AUTO_BYTES,
+        }
+    }
+
+    fn end_stream(&mut self) {
+        if let Self::Adaptive(controller) = self {
+            controller.end_stream();
+        }
+    }
+
+    fn fail(&mut self) {
+        if let Self::Adaptive(controller) = self {
+            controller.fail();
+        }
+    }
+}
+
+struct ClientState {
+    stream: Option<Exchange>,
+    // The pool is keyed by worker and keeps this client with its channel.
+    // Learned state therefore survives stream resets, but never moves to a
+    // different worker or survives destruction of this client.
+    read_policy: ReadPolicy,
 }
 
 impl ReadWindow {
@@ -86,17 +134,18 @@ impl Exchange {
 /// An idle client holds an HTTP/2 channel; each block gets its own stream.
 pub struct GrpcBlockClient {
     client: BlockDataServiceClient<Channel>,
-    stream: Mutex<Option<Exchange>>,
+    state: Mutex<ClientState>,
     timeout: Duration,
-    read_window: usize,
 }
 
 impl GrpcBlockClient {
     /// Returning a client to the idle pool must close an unfinished block
     /// stream so the next borrower cannot inherit its writer or reader.
     pub fn reset(&self) {
-        if let Ok(mut stream) = self.stream.try_lock() {
-            *stream = None;
+        if let Ok(mut state) = self.state.try_lock() {
+            if state.stream.take().is_some() {
+                state.read_policy.end_stream();
+            }
         }
     }
 
@@ -125,14 +174,23 @@ impl GrpcBlockClient {
             client: BlockDataServiceClient::new(channel)
                 .max_decoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES),
-            stream: Mutex::new(None),
+            state: Mutex::new(ClientState {
+                stream: None,
+                read_policy: ReadPolicy::Fixed(1),
+            }),
             timeout,
-            read_window: 1,
         })
     }
 
+    /// Select a fixed window. As before, values outside 1..=32 are clamped.
     pub fn with_read_window(mut self, window: usize) -> Self {
-        self.read_window = window.clamp(1, 32);
+        self.state.get_mut().read_policy = ReadPolicy::Fixed(window.clamp(1, 32));
+        self
+    }
+
+    /// Select the experimental automatic read window for this connection.
+    pub fn with_adaptive_read_window(mut self) -> Self {
+        self.state.get_mut().read_policy = ReadPolicy::Adaptive(AdaptiveReadWindow::new());
         self
     }
 
@@ -143,7 +201,11 @@ impl GrpcBlockClient {
             msg.request_status(),
             RequestStatus::Complete | RequestStatus::Cancel
         );
-        let mut stream = self.stream.lock().await;
+        let mut state = self.state.lock().await;
+        let ClientState {
+            stream,
+            read_policy,
+        } = &mut *state;
         let exchange = async {
             if is_open {
                 if stream.is_some() {
@@ -163,6 +225,7 @@ impl GrpcBlockClient {
                         Some(Operation::OpenRead(open)) => Some(ReadWindow {
                             len: open.len,
                             next_offset: open.off,
+                            delivered_offset: open.off,
                             chunk_size: open.chunk_size.max(1) as usize,
                             next_seq: frame.seq_id,
                             pending: VecDeque::new(),
@@ -184,58 +247,113 @@ impl GrpcBlockClient {
                 if chunk.is_none() || seek.is_some() {
                     // A seek or completion is a barrier: discard prefetched replies,
                     // but verify every identity before issuing a new operation.
-                    while let Some(seq) = read.pending.pop_front() {
+                    while let Some(pending) = read.pending.front() {
                         let response = exchange
                             .rx
                             .message()
                             .await
                             .map_err(curvine_error::grpc::from_status)?
                             .ok_or_else(|| FsError::common("read stream closed while draining"))?;
-                        if response.req_id != msg.req_id() || response.seq_id != seq {
+                        if response.req_id != msg.req_id() || response.seq_id != pending.seq {
                             return Err(FsError::common("prefetched read identity mismatch"));
                         }
+                        // Fixed windows have always discarded these replies
+                        // after checking their identities. Only adaptive mode
+                        // treats speculative failures as a reason to stop.
+                        if matches!(&*read_policy, ReadPolicy::Adaptive(_)) {
+                            match response.result {
+                                Some(OperationResult::Data(_)) => (),
+                                Some(OperationResult::Error(detail)) => {
+                                    return Err(curvine_error::grpc::from_detail(&detail)
+                                        .unwrap_or_else(|| FsError::common(detail.message)));
+                                }
+                                _ => {
+                                    return Err(FsError::common(
+                                        "unexpected prefetched read response",
+                                    ))
+                                }
+                            }
+                        }
+                        read.pending.pop_front();
                     }
                     if let Some(header) = seek {
+                        if let ReadPolicy::Adaptive(controller) = &mut *read_policy {
+                            if header.offset != read.delivered_offset {
+                                let eof_rewind = read.delivered_offset >= read.len
+                                    && header.offset < read.delivered_offset;
+                                controller.seek(eof_rewind);
+                            }
+                        }
                         read.next_offset = header.offset;
+                        read.delivered_offset = header.offset;
                     }
                 }
                 if let Some(chunk) = chunk {
                     let remaining = read.len.saturating_sub(read.next_offset).max(0) as usize;
-                    if read.pending.len() < self.read_window
-                        && (remaining > 0 || read.pending.is_empty())
-                    {
+                    let window = read_policy.window(read.chunk_size);
+                    if read.pending.len() < window && (remaining > 0 || read.pending.is_empty()) {
                         let available = remaining.div_ceil(read.chunk_size).max(1);
-                        // Bound speculative data independently of configured chunk size.
-                        let budget = (32 * 1024 * 1024 / read.chunk_size).max(1);
-                        let count = (self.read_window - read.pending.len())
-                            .min(available)
-                            .min(budget);
+                        // Automatic mode bounds all pending chunks; fixed mode
+                        // retains its existing per-burst budget and behavior.
+                        let budget = (read_policy.budget() / read.chunk_size).max(1);
+                        let count = (window - read.pending.len()).min(available).min(budget);
                         chunk.chunks = Some(count as u32);
-                        let seq = read.sequence(count)?;
+                        let seq = read.next_seq;
+                        let next_seq = seq
+                            .checked_add(count as i32)
+                            .ok_or_else(|| FsError::common("block read sequence exhausted"))?;
                         frame.seq_id = seq;
-                        for index in 0..count {
-                            read.pending.push_back(seq + index as i32);
-                        }
-                        read.next_offset = read
-                            .next_offset
-                            .saturating_add(count.saturating_mul(read.chunk_size) as i64)
-                            .min(read.len);
+                        let sample = match &*read_policy {
+                            ReadPolicy::Fixed(_) => None,
+                            ReadPolicy::Adaptive(controller) => {
+                                Some((controller.generation(), Instant::now()))
+                            }
+                        };
                         exchange
                             .tx
                             .send(frame)
                             .await
                             .map_err(|e| FsError::common(e.to_string()))?;
+                        // No state is changed until the send succeeds, so a
+                        // cancelled send cannot leave phantom queued reads.
+                        read.next_seq = next_seq;
+                        for index in 0..count {
+                            read.pending.push_back(PendingRead {
+                                seq: seq + index as i32,
+                                sample,
+                            });
+                        }
+                        read.next_offset = read
+                            .next_offset
+                            .saturating_add(count.saturating_mul(read.chunk_size) as i64)
+                            .min(read.len);
                     }
-                    let seq = read.pending.pop_front().expect("scheduled read");
+                    let pending = read.pending.front().expect("scheduled read");
                     let mut response = exchange
                         .rx
                         .message()
                         .await
                         .map_err(curvine_error::grpc::from_status)?
                         .ok_or_else(|| FsError::common("read stream closed without response"))?;
-                    if response.req_id != msg.req_id() || response.seq_id != seq {
+                    if response.req_id != msg.req_id() || response.seq_id != pending.seq {
                         return Err(FsError::common("prefetched read identity mismatch"));
                     }
+                    if let Some(OperationResult::Data(data)) = &response.result {
+                        read.delivered_offset =
+                            read.delivered_offset.saturating_add(data.len() as i64);
+                        if let (Some((generation, sent)), ReadPolicy::Adaptive(controller)) =
+                            (pending.sample, &mut *read_policy)
+                        {
+                            controller.observe(
+                                generation,
+                                sent,
+                                Instant::now(),
+                                data.len(),
+                                AdaptiveReadWindow::max_window(read.chunk_size),
+                            );
+                        }
+                    }
+                    read.pending.pop_front();
                     response.seq_id = msg.seq_id();
                     return response_message(&msg, response);
                 }
@@ -269,6 +387,14 @@ impl GrpcBlockClient {
             || (is_done && result.as_ref().is_ok_and(|reply| reply.is_success()))
             || (is_open && result.as_ref().is_ok_and(|reply| !reply.is_success()))
         {
+            if result.is_err()
+                || (RpcCode::from(msg.code()) == RpcCode::ReadBlock
+                    && result.as_ref().is_ok_and(|reply| !reply.is_success()))
+            {
+                read_policy.fail();
+            } else {
+                read_policy.end_stream();
+            }
             *stream = None;
         }
         result
@@ -286,7 +412,8 @@ impl GrpcBlockClient {
             return self.rpc(msg, token).await?.check_error_ext::<FsError>();
         }
         let frame = request_frame(&mut msg, token)?;
-        let mut stream = self.stream.lock().await;
+        let mut state = self.state.lock().await;
+        let stream = &mut state.stream;
         let result = async {
             let exchange = stream
                 .as_mut()
@@ -309,19 +436,21 @@ impl GrpcBlockClient {
         .await;
         if result.is_err() {
             *stream = None;
+            state.read_policy.fail();
         }
         result
     }
 
     /// Wait for queued writes before changing the write position.
     pub async fn drain_writes(&self) -> FsResult<()> {
-        let mut stream = self.stream.lock().await;
-        let result = match stream.as_mut() {
+        let mut state = self.state.lock().await;
+        let result = match state.stream.as_mut() {
             Some(exchange) => exchange.drain_writes().await,
             None => Err(FsError::common("block stream is not open")),
         };
         if result.is_err() {
-            *stream = None;
+            state.stream = None;
+            state.read_policy.fail();
         }
         result
     }
@@ -980,6 +1109,444 @@ mod tests {
         assert_eq!(calls[1], (5, 1, None));
         assert!(calls[1..].iter().all(|(_, count, _)| *count == 1));
         task.abort();
+    }
+
+    // Seed an accepted window without relying on wall-clock/network timing in
+    // the protocol tests. Leave window 4 unavailable during the trial.
+    async fn seed_stable_window_two(client: &GrpcBlockClient) {
+        let mut state = client.state.lock().await;
+        let ReadPolicy::Adaptive(controller) = &mut state.read_policy else {
+            panic!("expected adaptive read policy");
+        };
+        let origin = Instant::now();
+        for (phase, interval) in [(0, 2000), (1, 1500)] {
+            for i in 0..32u64 {
+                let sent =
+                    origin + Duration::from_secs(phase) + Duration::from_micros(interval * i);
+                controller.observe(
+                    controller.generation(),
+                    sent,
+                    sent + Duration::from_millis(1),
+                    1024 * 1024,
+                    2,
+                );
+            }
+        }
+        assert_eq!(controller.window(3), 2);
+    }
+
+    async fn seed_stable_window_four(client: &GrpcBlockClient) {
+        let mut state = client.state.lock().await;
+        let ReadPolicy::Adaptive(controller) = &mut state.read_policy else {
+            panic!("expected adaptive read policy");
+        };
+        let origin = Instant::now();
+        for (phase, interval) in [(0, 2000), (1, 1500), (2, 1100)] {
+            for i in 0..32u64 {
+                let sent =
+                    origin + Duration::from_secs(phase) + Duration::from_micros(interval * i);
+                controller.observe(
+                    controller.generation(),
+                    sent,
+                    sent + Duration::from_millis(1),
+                    1024 * 1024,
+                    4,
+                );
+            }
+        }
+        assert_eq!(controller.window(3), 4);
+    }
+
+    fn read_request(seq: i32, status: RequestStatus) -> Builder {
+        Builder::new()
+            .code(RpcCode::ReadBlock)
+            .req_id(7)
+            .seq_id(seq)
+            .request(status)
+    }
+
+    async fn open_test_read(client: &GrpcBlockClient, len: i64) {
+        client
+            .rpc(
+                read_request(0, RequestStatus::Open)
+                    .proto_header(BlockReadRequest {
+                        len,
+                        chunk_size: 3,
+                        ..Default::default()
+                    })
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn adaptive_seek_drains_pending_and_resets_window() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(BlockDataServiceServer::new(BurstRead(calls.clone())))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let client = GrpcBlockClient::connect(format!("http://{addr}"), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .with_adaptive_read_window();
+        seed_stable_window_two(&client).await;
+        open_test_read(&client, 30).await;
+        let first = client
+            .rpc(read_request(1, RequestStatus::Running).build(), None)
+            .await
+            .unwrap();
+        assert_eq!(first.data.as_slice(), &[0; 3]);
+        let seeked = client
+            .rpc(
+                read_request(2, RequestStatus::Running)
+                    .proto_header(DataHeaderProto {
+                        offset: 12,
+                        ..Default::default()
+                    })
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(seeked.data.as_slice(), &[12; 3]);
+        assert_eq!(*calls.lock().unwrap(), vec![(1, 2, None), (3, 1, Some(12))]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn adaptive_eof_rewind_and_pool_reset_keep_learned_window() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(BlockDataServiceServer::new(BurstRead(calls.clone())))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let client = GrpcBlockClient::connect(format!("http://{addr}"), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .with_adaptive_read_window();
+        seed_stable_window_two(&client).await;
+        open_test_read(&client, 6).await;
+        for seq in 1..=2 {
+            client
+                .rpc(read_request(seq, RequestStatus::Running).build(), None)
+                .await
+                .unwrap();
+        }
+        client
+            .rpc(
+                read_request(3, RequestStatus::Running)
+                    .proto_header(DataHeaderProto {
+                        offset: 0,
+                        ..Default::default()
+                    })
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        client.reset();
+        open_test_read(&client, 6).await;
+        client
+            .rpc(read_request(1, RequestStatus::Running).build(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(1, 2, None), (3, 2, Some(0)), (1, 2, None)]
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn adaptive_prefetch_bounds_total_outstanding_for_different_chunk_sizes() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(BlockDataServiceServer::new(BurstRead(calls.clone())))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let client = GrpcBlockClient::connect(format!("http://{addr}"), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .with_adaptive_read_window();
+        seed_stable_window_four(&client).await;
+        for (chunk_size, max_pending) in
+            [(1024 * 1024, 4), (2 * 1024 * 1024, 2), (5 * 1024 * 1024, 1)]
+        {
+            calls.lock().unwrap().clear();
+            client
+                .rpc(
+                    read_request(0, RequestStatus::Open)
+                        .proto_header(BlockReadRequest {
+                            len: i64::from(chunk_size) * 8,
+                            chunk_size,
+                            ..Default::default()
+                        })
+                        .build(),
+                    None,
+                )
+                .await
+                .unwrap();
+            for seq in 1..=3 {
+                client
+                    .rpc(read_request(seq, RequestStatus::Running).build(), None)
+                    .await
+                    .unwrap();
+                let state = client.state.lock().await;
+                let pending = &state
+                    .stream
+                    .as_ref()
+                    .unwrap()
+                    .read
+                    .as_ref()
+                    .unwrap()
+                    .pending;
+                // The response just returned occupied one slot while in flight.
+                assert!(pending.len() < max_pending);
+            }
+            let calls = calls.lock().unwrap();
+            // Requests from the just-reset stream may still reach the mock
+            // server after the call log is cleared. The first request of the
+            // newly opened stream is always wire sequence 1.
+            let first = calls.iter().find(|(seq, _, _)| *seq == 1).unwrap();
+            assert_eq!(first.1 as usize, max_pending);
+            assert!(calls
+                .iter()
+                .filter(|(seq, _, _)| *seq != 1)
+                .all(|(_, count, _)| *count == 1));
+            drop(calls);
+            client.reset();
+        }
+        task.abort();
+    }
+
+    struct BadPrefetch;
+
+    #[tonic::async_trait]
+    impl BlockDataService for BadPrefetch {
+        type ExchangeStream =
+            Pin<Box<dyn futures::Stream<Item = Result<BlockDataResponse, Status>> + Send>>;
+
+        async fn exchange(
+            &self,
+            request: tonic::Request<tonic::Streaming<BlockDataRequest>>,
+        ) -> Result<tonic::Response<Self::ExchangeStream>, Status> {
+            let mut input = request.into_inner();
+            let output = async_stream::try_stream! {
+                while let Some(request) = input.message().await? {
+                    match request.operation {
+                        Some(Operation::OpenRead(_)) => yield BlockDataResponse {
+                            req_id: request.req_id, seq_id: request.seq_id,
+                            result: Some(OperationResult::OpenedRead(Default::default())),
+                        },
+                        Some(Operation::ReadChunk(_)) => {
+                            yield BlockDataResponse { req_id: request.req_id, seq_id: request.seq_id,
+                                result: Some(OperationResult::Data(bytes::Bytes::from_static(b"abc"))) };
+                            yield BlockDataResponse { req_id: request.req_id, seq_id: request.seq_id + 1,
+                                result: Some(OperationResult::Error(curvine_error::grpc::to_detail(
+                                    &FsError::common("prefetch failed")))) };
+                        },
+                        Some(Operation::CompleteRead(_)) => yield BlockDataResponse {
+                            req_id: request.req_id, seq_id: request.seq_id,
+                            result: Some(OperationResult::Ack(true)),
+                        },
+                        _ => Err(Status::invalid_argument("unexpected operation"))?,
+                    }
+                }
+            };
+            Ok(tonic::Response::new(Box::pin(output)))
+        }
+    }
+
+    #[tokio::test]
+    async fn fixed_window_discards_speculative_errors_at_seek_and_completion() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(BlockDataServiceServer::new(BadPrefetch))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let client = GrpcBlockClient::connect(format!("http://{addr}"), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .with_read_window(2);
+        open_test_read(&client, 30).await;
+        client
+            .rpc(read_request(1, RequestStatus::Running).build(), None)
+            .await
+            .unwrap();
+        let seeked = client
+            .rpc(
+                read_request(2, RequestStatus::Running)
+                    .proto_header(DataHeaderProto {
+                        offset: 12,
+                        ..Default::default()
+                    })
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(seeked.data.as_slice(), b"abc");
+        let completed = client
+            .rpc(
+                read_request(3, RequestStatus::Complete)
+                    .proto_header(BlockReadRequest::default())
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(completed.is_success());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn seek_rejects_error_in_drained_prefetch_and_disables_auto() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(BlockDataServiceServer::new(BadPrefetch))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let client = GrpcBlockClient::connect(format!("http://{addr}"), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .with_adaptive_read_window();
+        seed_stable_window_two(&client).await;
+        open_test_read(&client, 30).await;
+        client
+            .rpc(read_request(1, RequestStatus::Running).build(), None)
+            .await
+            .unwrap();
+        let error = client
+            .rpc(
+                read_request(2, RequestStatus::Running)
+                    .proto_header(DataHeaderProto {
+                        offset: 12,
+                        ..Default::default()
+                    })
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("prefetch failed"));
+        let state = client.state.lock().await;
+        assert!(state.stream.is_none());
+        assert_eq!(state.read_policy.window(3), 1);
+        drop(state);
+        // A failure permanently disables further growth on this client.
+        let mut state = client.state.lock().await;
+        let ReadPolicy::Adaptive(controller) = &mut state.read_policy else {
+            panic!("expected auto")
+        };
+        let now = Instant::now();
+        for i in 0..32u64 {
+            let sent = now + Duration::from_millis(i);
+            controller.observe(
+                controller.generation(),
+                sent,
+                sent + Duration::from_micros(500),
+                1024 * 1024,
+                4,
+            );
+        }
+        assert_eq!(controller.window(3), 1);
+        task.abort();
+    }
+
+    struct BrokenRead {
+        hang: bool,
+    }
+
+    #[tonic::async_trait]
+    impl BlockDataService for BrokenRead {
+        type ExchangeStream =
+            Pin<Box<dyn futures::Stream<Item = Result<BlockDataResponse, Status>> + Send>>;
+
+        async fn exchange(
+            &self,
+            request: tonic::Request<tonic::Streaming<BlockDataRequest>>,
+        ) -> Result<tonic::Response<Self::ExchangeStream>, Status> {
+            let mut input = request.into_inner();
+            let hang = self.hang;
+            let output = async_stream::try_stream! {
+                while let Some(request) = input.message().await? {
+                    match request.operation {
+                        Some(Operation::OpenRead(_)) => yield BlockDataResponse {
+                            req_id: request.req_id, seq_id: request.seq_id,
+                            result: Some(OperationResult::OpenedRead(Default::default())),
+                        },
+                        Some(Operation::ReadChunk(_)) => {
+                            if hang {
+                                std::future::pending::<()>().await;
+                            }
+                            Err(Status::unavailable("read transport failed"))?;
+                        },
+                        _ => Err(Status::invalid_argument("unexpected operation"))?,
+                    }
+                }
+            };
+            Ok(tonic::Response::new(Box::pin(output)))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_transport_errors_and_timeouts_disable_auto_for_the_connection() {
+        for hang in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(BlockDataServiceServer::new(BrokenRead { hang }))
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+            );
+            let mut client =
+                GrpcBlockClient::connect(format!("http://{addr}"), Duration::from_secs(5))
+                    .await
+                    .unwrap()
+                    .with_adaptive_read_window();
+            client.timeout = Duration::from_millis(100);
+            seed_stable_window_two(&client).await;
+            open_test_read(&client, 30).await;
+            assert!(client
+                .rpc(read_request(1, RequestStatus::Running).build(), None)
+                .await
+                .is_err());
+            let mut state = client.state.lock().await;
+            assert!(state.stream.is_none());
+            let ReadPolicy::Adaptive(controller) = &mut state.read_policy else {
+                panic!("expected auto");
+            };
+            assert_eq!(controller.window(3), 1);
+            let now = Instant::now();
+            for i in 0..32u64 {
+                let sent = now + Duration::from_millis(i);
+                controller.observe(
+                    controller.generation(),
+                    sent,
+                    sent + Duration::from_micros(500),
+                    1024 * 1024,
+                    4,
+                );
+            }
+            assert_eq!(controller.window(3), 1);
+            task.abort();
+        }
     }
 
     #[test]

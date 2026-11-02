@@ -278,7 +278,13 @@ impl FsContext {
                     tls.as_ref(),
                 )
                 .await
-                .map(|client| client.with_read_window(read_window))
+                .map(|client| {
+                    if read_window == 0 {
+                        client.with_adaptive_read_window()
+                    } else {
+                        client.with_read_window(read_window)
+                    }
+                })
             })
             .await
             .map_err(curvine_io::IOError::create)?

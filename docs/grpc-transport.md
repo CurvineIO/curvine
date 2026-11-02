@@ -1,4 +1,32 @@
-# gRPC TLS and reflection
+# gRPC transport
+
+## Remote read pipelining
+
+The client can overlap requests for sequential chunks on a remote gRPC block
+read. Set `read_pipeline_window` in `[client]`:
+
+```toml
+[client]
+read_pipeline_window = 1  # default; use 0 to opt in to experimental automatic sizing
+```
+
+The default `1` requests one chunk at a time. Values from `1` through `32`
+select a fixed request window. A value of `0` enables an experimental
+automatic policy that starts at one request and can grow to at most four. It
+limits speculative data to 4 MiB, while always allowing at least one chunk
+even when the configured read chunk size exceeds that budget. The automatic
+policy remains opt-in.
+
+After 32 successful sequential responses above 128 MiB/s, auto mode trials
+windows of two and then four. Each trial needs 32 new responses and must
+improve throughput by at least 10% while keeping request P95 latency within
+110% of the previous stable window. A rejected trial, transport failure or
+read protocol failure returns to one and disables growth for that pooled
+client connection. A nonsequential seek drains pending replies and resets
+the window to one. Accepted settings survive completed streams, EOF rewinds
+and reuse of that client for the same worker; incomplete trials do not.
+
+## TLS and reflection
 
 The master, worker, transfer service, and Raft journal use gRPC. TLS and
 reflection are disabled by default. Configure each listener under

@@ -48,8 +48,8 @@ master_addrs = [{{ hostname = "192.0.2.1", port = 8995 }}]
 window = os.environ.get("RPC_TC_READ_WINDOW")
 if window is not None:
     value = int(window)
-    if not 1 <= value <= 32:
-        raise ValueError("RPC_TC_READ_WINDOW must be in 1..=32")
+    if not 0 <= value <= 32:
+        raise ValueError("RPC_TC_READ_WINDOW must be in 0..=32 (0 selects experimental auto)")
     config += f"read_pipeline_window = {value}\n"
 (root / "config.toml").write_text(config, encoding="utf-8")
 PY
