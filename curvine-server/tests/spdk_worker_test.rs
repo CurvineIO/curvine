@@ -1,5 +1,7 @@
 #![cfg(feature = "spdk")]
 mod common;
+#[path = "common/grpc_test_client.rs"]
+mod grpc_test_client;
 use curvine_config::ClusterConf;
 use curvine_core_error::CommonResult;
 use curvine_fs_api::RpcCode;
@@ -87,7 +89,7 @@ fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         .proto_header(request)
         .build();
 
-    let client = conf.worker_sync_client()?;
+    let client = grpc_test_client::worker_client(&conf)?;
     let response: BlockWriteResponse = client.rpc(msg)?.parse_header()?;
     assert_eq!(response.off, 0);
     assert!(
@@ -157,7 +159,7 @@ fn spdk_block_read(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         .proto_header(request)
         .build();
 
-    let client = conf.worker_sync_client()?;
+    let client = grpc_test_client::worker_client(&conf)?;
     seq_id += 1;
     let rep: BlockReadResponse = client.rpc_check(msg)?.parse_header()?;
     assert!(
@@ -245,7 +247,7 @@ fn test_spdk_worker_end_to_end() -> CommonResult<()> {
             .proto_header(request)
             .build();
 
-        let client = conf.worker_sync_client()?;
+        let client = grpc_test_client::worker_client(&conf)?;
         let response: BlockWriteResponse = client.rpc(msg)?.parse_header()?;
         assert!(
             response.path.is_none(),

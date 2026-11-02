@@ -67,7 +67,7 @@ impl BlockWriterLocal {
                 // No local path available (e.g. SPDK bdev without filesystem path).
                 // Abort the block on the server before returning so state is clean.
                 let _ = client
-                    .write_commit(&block, pos, block_size, req_id, 0, true)
+                    .write_commit(&block, pos, block_size, req_id, seq_id + 1, true)
                     .await;
                 return Err(FsError::no_local_path(format!(
                     "no local path for block {} (storage type {:?})",

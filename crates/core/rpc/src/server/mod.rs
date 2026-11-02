@@ -15,8 +15,5 @@
 mod server_conf;
 pub use self::server_conf::ServerConf;
 
-mod rpc_server;
-pub use self::rpc_server::RpcServer;
-
 mod server_monitor;
 pub use self::server_monitor::*;

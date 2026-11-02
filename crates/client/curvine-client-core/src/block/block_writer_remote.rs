@@ -194,6 +194,9 @@ impl BlockWriterRemote {
             );
         }
 
+        // Surface failed queued writes before changing the logical position.
+        self.client.drain_writes().await?;
+
         // Set new position and pending header
         self.pos = pos;
         self.pending_header = Some(DataHeaderProto {

@@ -232,6 +232,13 @@ impl Cluster {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!("curvine-1718-rpc-{}", Utils::rand_id()));
         fs::create_dir_all(&root).unwrap();
+        let tls = std::env::var_os("CURVINE_TEST_RAFT_TLS").is_some();
+        let fixture = |name: &str| {
+            format!(
+                "{}/../../core/rpc/tests/fixtures/grpc_tls/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        };
         // Hold all reservations until every address has been chosen.
         let ports: Vec<_> = (0..3)
             .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
@@ -245,6 +252,22 @@ impl Cluster {
             .iter()
             .enumerate()
             .map(|(i, peer)| JournalConf {
+                grpc: if tls {
+                    curvine_rpc::grpc::GrpcConfig {
+                        tls_enabled: true,
+                        ca_cert_path: fixture("ca.pem"),
+                        server_cert_path: fixture("server.pem"),
+                        server_key_path: fixture("server.key"),
+                        client_cert_path: fixture("client.pem"),
+                        client_key_path: fixture("client.key"),
+                        domain_name: "localhost".into(),
+                        require_client_auth: true,
+                        enable_reflection: true,
+                        ..Default::default()
+                    }
+                } else {
+                    Default::default()
+                },
                 hostname: "127.0.0.1".into(),
                 rpc_port: peer.port,
                 journal_addrs: peers.clone(),

@@ -7,9 +7,11 @@ license.workspace = true
 [dependencies]
 prost = { workspace = true }
 serde = { workspace = true }
+tonic = "0.9"
 
 [features]
 default = []
 
 [build-dependencies]
 prost-build = { workspace = true }
+tonic-build = "0.9"

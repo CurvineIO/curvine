@@ -248,7 +248,8 @@ impl WorkerReplicationManager {
             let mut remaining = block_meta.len;
             while remaining > 0 {
                 let size = remaining.min(self.replicate_chunk_size as i64);
-                let slice = reader.read_region(true, size as i32)?;
+                // The gRPC protobuf encoder requires in-memory payloads.
+                let slice = reader.read_region(false, size as i32)?;
                 let read_len = slice.len() as i64;
                 if read_len == 0 {
                     return err_box!(

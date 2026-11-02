@@ -22,7 +22,6 @@ use curvine_fs_api::{Path, RpcCode};
 use curvine_model::ProtoUtils;
 use curvine_model::*;
 use curvine_proto::*;
-use curvine_rpc::client::ClusterConnector;
 use curvine_rpc::message::MessageBuilder;
 use curvine_runtime::runtime::RpcRuntime;
 use log::warn;
@@ -33,7 +32,6 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct FsClient {
     context: Arc<FsContext>,
-    connector: Arc<ClusterConnector>,
 }
 
 struct CompleteFileOptions {
@@ -69,8 +67,7 @@ impl Drop for HandshakeReportGuard<'_> {
 
 impl FsClient {
     pub fn new(context: Arc<FsContext>) -> Self {
-        let connector = context.connector.clone();
-        Self { context, connector }
+        Self { context }
     }
 
     pub fn context(&self) -> &Arc<FsContext> {
@@ -1129,9 +1126,12 @@ impl FsClient {
         T: PMessage + Default,
         R: PMessage + Default,
     {
-        self.connector
-            .proto_rpc::<T, R, FsError>(code, header)
-            .await
+        let bytes = self.raw_rpc_bytes(code, header).await?;
+        if bytes.is_empty() {
+            Ok(R::default())
+        } else {
+            R::decode(bytes.freeze()).map_err(|error| FsError::common(error.to_string()))
+        }
     }
 
     /// Raw bytes master RPC without the lazy handshake guard; see
@@ -1139,7 +1139,7 @@ impl FsClient {
     async fn raw_rpc_bytes(&self, code: RpcCode, header: impl PMessage) -> FsResult<BytesMut> {
         let msg = MessageBuilder::new_rpc(code).proto_header(header).build();
 
-        let msg = self.connector.rpc::<FsError>(msg).await?;
+        let msg = self.context.grpc_master.rpc(msg).await?;
         match msg.header {
             None => Ok(BytesMut::new()),
             Some(v) => Ok(v),

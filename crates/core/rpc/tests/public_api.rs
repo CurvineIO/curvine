@@ -13,20 +13,17 @@
 // limitations under the License.
 
 use curvine_rpc::{
-    client::{ClientConf, ClientFactory, RpcClient},
-    handler::RpcCodec,
+    client::ClientConf,
+    grpc::TransportConfig,
     message::Message,
-    server::{RpcServer, ServerConf, ServerMonitor},
+    server::{ServerConf, ServerMonitor},
 };
 
 #[test]
 fn exposes_rpc_infrastructure() {
     let _ = std::any::TypeId::of::<ClientConf>();
-    let _ = std::any::TypeId::of::<ClientFactory>();
-    let _ = std::any::TypeId::of::<RpcClient>();
-    let _ = std::any::TypeId::of::<RpcCodec>();
+    let _ = std::any::TypeId::of::<TransportConfig>();
     let _ = std::any::TypeId::of::<Message>();
-    let _ = std::any::TypeId::of::<RpcServer<()>>();
     let _ = std::any::TypeId::of::<ServerMonitor>();
     let _ = ServerConf::with_hostname("127.0.0.1", 8995);
 }

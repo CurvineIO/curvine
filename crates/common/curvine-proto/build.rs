@@ -27,6 +27,7 @@ fn main() {
         "transfer.proto",
         "mount.proto",
         "replication.proto",
+        "rpc.proto",
     ];
 
     for name in &proto_files {
@@ -39,8 +40,9 @@ fn main() {
 
     let mut build = prost_build::Config::new();
     build.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
-    build
+    tonic_build::configure()
         .out_dir(&output)
-        .compile_protos(&proto_files, &[proto_dir])
+        .file_descriptor_set_path(PathBuf::from(&output).join("descriptor.bin"))
+        .compile_with_config(build, &proto_files, &[proto_dir])
         .unwrap();
 }

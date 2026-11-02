@@ -36,6 +36,8 @@ moka = { workspace = true }
 fxhash = { workspace = true }
 linked-hash-map = { workspace = true }
 rand = { workspace = true }
+tonic = "0.9"
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [features]
 default = []

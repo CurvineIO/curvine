@@ -26,9 +26,10 @@ fn main() {
 
     let src = vec!["raft.proto"];
     let mut build = prost_build::Config::new();
-    build
+    build.extern_path(".eraftpb", "::raft::eraftpb");
+    tonic_build::configure()
         .out_dir(&output)
-        .extern_path(".eraftpb", "::raft::eraftpb")
-        .compile_protos(&src, &["proto/", ""])
+        .file_descriptor_set_path(std::path::PathBuf::from(&output).join("descriptor.bin"))
+        .compile_with_config(build, &src, &["proto/", ""])
         .unwrap();
 }

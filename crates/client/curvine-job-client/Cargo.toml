@@ -16,6 +16,8 @@ curvine-net = { workspace = true }
 curvine-rpc = { workspace = true }
 curvine-runtime = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
+tonic = "0.9"
 log = { workspace = true }
 bincode = { workspace = true }
 serde = { workspace = true }

@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::handler::{BufferHandler, Frame, MessageHandler, StreamHandler, TestMessageHandler};
-use crate::ServerConf;
+use crate::handler::{MessageHandler, TestMessageHandler};
 use curvine_net::net::ConnState;
-use curvine_runtime::runtime::Runtime;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -40,9 +38,8 @@ impl LimitConf {
 /// 1. Manage the creation of MessageHandler.
 /// 2. Global variables required to manage business logic.
 ///
-/// Unlike ordinary RPC frameworks, orpc also handles stateful file read/write
-/// streams. Handlers are shared through `Arc`, so connection-local mutable
-/// state must use explicit interior synchronization.
+/// Handlers are shared through `Arc`, so connection-local mutable state must
+/// use explicit interior synchronization.
 pub trait HandlerService: Send + Sync + 'static {
     type Item: MessageHandler;
     // Whether to pass connection information.
@@ -52,53 +49,13 @@ pub trait HandlerService: Send + Sync + 'static {
 
     fn get_message_handler(&self, conn_info: Option<ConnState>) -> Self::Item;
 
-    fn get_stream_handler<F: Frame>(
-        &self,
-        rt: Arc<Runtime>,
-        frame: F,
-        conf: &ServerConf,
-    ) -> StreamHandler<F, Self::Item> {
-        let conn_state = if self.has_conn_state() {
-            Some(frame.new_conn_state())
-        } else {
-            None
-        };
-
-        let handler = self.get_message_handler(conn_state);
-        StreamHandler::new(rt, frame, handler, conf)
-    }
-
-    /// Builds a [`BufferHandler`], which processes requests of one connection
-    /// concurrently. Used by `RpcServer` when [`is_stream`](Self::is_stream)
-    /// returns false.
-    fn get_buffer_handler<F: Frame>(
-        &self,
-        rt: Arc<Runtime>,
-        frame: F,
-        conf: &ServerConf,
-    ) -> BufferHandler<Self::Item> {
-        let conn_state = if self.has_conn_state() {
-            Some(frame.new_conn_state())
-        } else {
-            None
-        };
-
-        let handler = self.get_message_handler(conn_state);
-        BufferHandler::new(rt, frame.split(), handler, self.get_limit(), conf)
-    }
-
-    /// `true` (default): requests on a connection are processed one at a time
-    /// by [`StreamHandler`]. Required for stateful streams.
-    ///
-    /// `false`: requests are processed concurrently by [`BufferHandler`] and
-    /// responses may be out of order. The service must also implement
-    /// [`get_limit`](Self::get_limit).
+    /// Whether the service requires ordered dispatch.
     fn is_stream(&self) -> bool {
         true
     }
 
     fn get_limit(&self) -> LimitConf {
-        panic!("BufferHandler service must provide a shared LimitConf")
+        panic!("service must provide a shared LimitConf")
     }
 }
 
@@ -142,8 +99,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "BufferHandler service must provide a shared LimitConf")]
-    fn buffer_service_must_provide_shared_limit() {
+    #[should_panic(expected = "service must provide a shared LimitConf")]
+    fn service_must_provide_shared_limit() {
         TestService.get_limit();
     }
 }

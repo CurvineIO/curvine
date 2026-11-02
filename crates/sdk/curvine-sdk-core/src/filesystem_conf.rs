@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FilesystemConf {
+    /// gRPC client TLS identity and certificate settings.
+    pub grpc: curvine_rpc::grpc::GrpcConfig,
     pub master_addrs: String,
     pub client_hostname: String,
     pub io_threads: usize,
@@ -34,6 +36,8 @@ pub struct FilesystemConf {
 
     pub write_chunk_size: String,
     pub write_chunk_num: usize,
+    /// Number of unacknowledged data chunks; zero selects the client default.
+    pub write_pipeline_window: usize,
 
     pub read_chunk_size: String,
     pub read_chunk_num: usize,
@@ -228,6 +232,7 @@ impl FilesystemConf {
         };
 
         let client = ClientConf {
+            grpc: self.grpc,
             master_addrs,
             hostname: self.client_hostname.trim().to_string(),
             io_threads: self.io_threads,
@@ -240,6 +245,11 @@ impl FilesystemConf {
             write_chunk_size: 0,
             write_chunk_size_str: self.write_chunk_size,
             write_chunk_num: self.write_chunk_num,
+            write_pipeline_window: if self.write_pipeline_window == 0 {
+                ClientConf::default().write_pipeline_window
+            } else {
+                self.write_pipeline_window
+            },
 
             read_chunk_size: 0,
             read_chunk_size_str: self.read_chunk_size,
@@ -346,6 +356,39 @@ impl FilesystemConf {
 mod tests {
     use super::{FilesystemConf, TransferClientConf};
     use curvine_config::ClientConf;
+
+    #[test]
+    fn grpc_tls_and_write_pipeline_settings_survive_sdk_conversion() {
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.grpc.tls_enabled = true;
+        conf.grpc.ca_cert_path = "/test/ca.pem".into();
+        conf.grpc.domain_name = "worker.example".into();
+        conf.write_pipeline_window = 32;
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.write_pipeline_window, 32);
+        assert!(cluster.client.grpc.tls_enabled);
+        assert_eq!(cluster.client.grpc.ca_cert_path, "/test/ca.pem");
+        assert_eq!(cluster.client.grpc.domain_name, "worker.example");
+    }
+
+    #[test]
+    fn parses_grpc_tls_and_write_pipeline_settings() {
+        let conf = FilesystemConf::from_str(
+            r#"
+            master_addrs = "master-0:8995"
+            write_pipeline_window = 16
+            [grpc]
+            tls_enabled = true
+            ca_cert_path = "/test/ca.pem"
+            domain_name = "worker.example"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(conf.write_pipeline_window, 16);
+        assert!(conf.grpc.tls_enabled);
+        assert_eq!(conf.grpc.ca_cert_path, "/test/ca.pem");
+        assert_eq!(conf.grpc.domain_name, "worker.example");
+    }
 
     #[test]
     fn default_master_conn_pool_size_is_one() {

@@ -55,6 +55,7 @@ curvine-job-client = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true }
 prost = { workspace = true }
+tonic = "0.9"
 serde = { workspace = true }
 log = { workspace = true }
 once_cell = { workspace = true }

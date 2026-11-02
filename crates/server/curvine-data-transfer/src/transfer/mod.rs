@@ -53,6 +53,9 @@ pub use self::scheduler::TransferScheduler;
 mod handler;
 pub use self::handler::TransferHandler;
 
+mod grpc_handler;
+pub use self::grpc_handler::TransferGrpcHandler;
+
 #[cfg(feature = "transfer-web")]
 mod router_handler;
 #[cfg(feature = "transfer-web")]

@@ -12,10 +12,15 @@ curvine-core-error = { workspace = true }
 curvine-net = { workspace = true }
 curvine-runtime = { workspace = true }
 bytes = { workspace = true }
-futures = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
 prost = { workspace = true }
 num_enum = { workspace = true }
 log = { workspace = true }
-socket2 = { workspace = true }
+serde = { workspace = true }
+tonic = { version = "0.9", features = ["tls"] }
+tonic-health = "0.9"
+tonic-reflection = "0.9"
+
+[dev-dependencies]
+curvine-proto = { workspace = true }
+futures = { workspace = true }

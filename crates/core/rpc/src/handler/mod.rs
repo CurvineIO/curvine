@@ -12,32 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod rpc_frame;
-pub use self::rpc_frame::RpcFrame;
-
 mod message_handler;
 pub use self::message_handler::*;
 
 mod handler_service;
 pub use self::handler_service::{HandlerService, LimitConf};
-
-mod rpc_codec;
-pub use self::rpc_codec::RpcCodec;
-
-mod stream_handler;
-pub use self::stream_handler::StreamHandler;
-
-mod buffer_handler;
-pub use self::buffer_handler::BufferHandler;
-
-mod write_frame;
-pub use self::write_frame::WriteFrame;
-
-mod read_frame;
-pub use self::read_frame::ReadFrame;
-
-mod frame;
-pub use self::frame::Frame;
-
-mod frame_buf;
-pub use self::frame_buf::FrameBuf;

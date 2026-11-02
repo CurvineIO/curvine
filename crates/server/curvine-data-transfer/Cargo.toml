@@ -58,6 +58,7 @@ curvine-ufs-api = { workspace = true }
 curvine-fault = { workspace = true }
 curvine-web = { workspace = true, optional = true }
 prost = { workspace = true }
+tonic = "0.9"
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

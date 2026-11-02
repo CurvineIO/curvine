@@ -75,6 +75,8 @@ pub struct WorkerHandler {
     /// without explicit configuration.
     pub compatibility_policy: Arc<CompatibilityPolicy>,
     pub client_addr: String,
+    /// gRPC encodes payloads in memory and cannot transmit a file descriptor.
+    pub(crate) buffered_reads: bool,
 }
 
 impl MessageHandler for WorkerHandler {
@@ -342,11 +344,14 @@ impl WorkerHandler {
         };
 
         if need_new_handler {
-            let _ = handler.replace(BlockHandler::new(
-                code,
-                self.store.clone(),
-                self.client_addr.clone(),
-            )?);
+            let mut new_handler =
+                BlockHandler::new(code, self.store.clone(), self.client_addr.clone())?;
+            if self.buffered_reads {
+                if let BlockHandler::Reader(reader) = &mut new_handler {
+                    reader.enable_send_file = false;
+                }
+            }
+            let _ = handler.replace(new_handler);
         }
 
         match handler.as_mut() {

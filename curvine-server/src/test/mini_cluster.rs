@@ -23,8 +23,8 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_net::net::{InetAddr, NetUtils};
+use curvine_proto::master_service_client::MasterServiceClient;
 use curvine_raft::raft::{NodeId, RaftPeer};
-use curvine_rpc::client::RpcClient;
 #[cfg(feature = "fault-injection")]
 use curvine_rpc::handler::HandlerService;
 use curvine_runtime::common::LocalTime;
@@ -35,6 +35,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
+use tonic::transport::Channel;
 
 pub struct MasterEntry(MasterFilesystem, Arc<MasterReplicationManager>);
 
@@ -58,7 +59,7 @@ impl MiniCluster {
     fn reserve_test_port() -> u16 {
         let ports = RESERVED_TEST_PORTS.get_or_init(|| Mutex::new(HashSet::new()));
         loop {
-            // hold_available_port keeps the socket bound until RpcServer::run() calls
+            // hold_available_port keeps the socket bound until the server calls
             // take_held_listener, preventing TOCTOU races across parallel nextest processes.
             let port = NetUtils::hold_available_port();
             let mut guard = ports.lock().unwrap();
@@ -189,10 +190,7 @@ impl MiniCluster {
 
             if raft_leader_ready {
                 // Additional check: try to create a simple RPC connection to verify the service is actually listening
-                let conf = self.master_conf().client_rpc_conf();
-                let addr = self.master_conf().master_addr();
-
-                match RpcClient::with_raw(&addr, &conf).await {
+                match self.master_client().await {
                     Ok(_client) => {
                         info!("Master service is ready (Raft leader elected and RPC service listening), retry count: {}", retry_count);
                         return Ok(());
@@ -260,11 +258,13 @@ impl MiniCluster {
         err_box!("Cluster failed to become ready within 20 seconds")
     }
 
-    pub async fn master_client(&self) -> CommonResult<RpcClient> {
-        let conf = self.master_conf().client_rpc_conf();
+    pub async fn master_client(&self) -> CommonResult<MasterServiceClient<Channel>> {
         let addr = self.master_conf().master_addr();
-        let client = RpcClient::with_raw(&addr, &conf).await?;
-        Ok(client)
+        let grpc = &self.master_conf().client.grpc;
+        let tls = grpc.client_tls(&addr.hostname)?;
+        let endpoint = curvine_rpc::grpc::TransportConfig::default()
+            .endpoint(grpc.uri(&addr.hostname, addr.port), tls.as_ref())?;
+        Ok(MasterServiceClient::new(endpoint.connect().await?))
     }
 
     pub fn master_conf(&self) -> &ClusterConf {

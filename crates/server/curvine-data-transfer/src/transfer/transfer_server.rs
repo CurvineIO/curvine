@@ -21,18 +21,21 @@ use curvine_config::{ClusterConf, TransferStoreType};
 use curvine_core_error::CommonResult;
 use curvine_error::FsError;
 use curvine_net::net::ConnState;
+use curvine_net::net::NetUtils;
+use curvine_proto::transfer_service_server::TransferServiceServer;
 use curvine_rpc::handler::HandlerService;
-use curvine_rpc::server::{RpcServer, ServerStateListener};
+use curvine_rpc::server::{ServerConf, ServerMonitor, ServerStateListener};
 use curvine_runtime::common::Logger;
-use curvine_runtime::runtime::RpcRuntime;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::transfer::grpc_handler::TransferRequestTracker;
 use crate::transfer::{
     ClusterMetadataCache, MemoryTransferStore, MysqlTransferStore, PostgresTransferStore,
-    SqliteTransferStore, TransferHandler, TransferMetrics, TransferPlanner, TransferRouterHandler,
-    TransferScheduler, TransferService, TransferStoreBackend,
+    SqliteTransferStore, TransferGrpcHandler, TransferHandler, TransferMetrics, TransferPlanner,
+    TransferRouterHandler, TransferScheduler, TransferService, TransferStoreBackend,
 };
 
 #[derive(Clone)]
@@ -81,7 +84,9 @@ impl WebHandlerService for TransferRpcService {
 }
 
 pub struct TransferServer {
-    rpc_server: RpcServer<TransferRpcService>,
+    rpc_rt: Arc<Runtime>,
+    rpc_conf: ServerConf,
+    rpc_service: TransferRpcService,
     web_server: WebServer<TransferRpcService>,
     cluster_cache: ClusterMetadataCache,
     scheduler: TransferScheduler<TransferStoreBackend>,
@@ -182,15 +187,12 @@ impl TransferServer {
             store_backend,
             cache.clone(),
         );
-        let rpc_server =
-            RpcServer::with_rt(rt.clone(), conf.transfer_server_conf(), service.clone());
-        let web_server = WebServer::with_rt(rt, conf.transfer_web_conf(), service);
-        let stop_on_rpc_stop = stop.clone();
-        rpc_server.add_shutdown_hook(move || {
-            stop_on_rpc_stop.store(true, Ordering::Relaxed);
-        });
+        let rpc_conf = conf.transfer_server_conf();
+        let web_server = WebServer::with_rt(rt.clone(), conf.transfer_web_conf(), service.clone());
         Ok(Self {
-            rpc_server,
+            rpc_rt: rt,
+            rpc_conf,
+            rpc_service: service,
             web_server,
             cluster_cache: cache,
             scheduler,
@@ -208,12 +210,75 @@ impl TransferServer {
 
         let result = async {
             self.cluster_cache.refresh().await?;
-            self.scheduler
-                .start(self.rpc_server.clone_rt(), self.stop.clone());
-            info!("Starting curvine-transfer rpc server");
-            let mut rpc_status = self.rpc_server.start();
-            rpc_status.wait_running().await?;
+            let hostname = std::env::var("ORPC_BIND_HOSTNAME")
+                .unwrap_or_else(|_| self.rpc_conf.hostname.clone());
+            let address = format!("{}:{}", hostname, self.rpc_conf.port);
+            let listener = match NetUtils::take_held_listener(self.rpc_conf.port) {
+                Some(listener) => {
+                    listener.set_nonblocking(true)?;
+                    tokio::net::TcpListener::from_std(listener)?
+                }
+                None => tokio::net::TcpListener::bind(&address).await?,
+            };
+            self.scheduler.start(self.rpc_rt.clone(), self.stop.clone());
+            let monitor = Arc::new(ServerMonitor::new());
+            let rpc_status = monitor.new_listener();
+            let task_monitor = monitor.clone();
+            let stop = self.stop.clone();
+            let task_ready = self.ready.clone();
+            let tracker = TransferRequestTracker::default();
+            let handler = TransferGrpcHandler::with_tracker(self.rpc_service.service.clone(), tracker.clone());
+            let (mut health, health_service) = curvine_rpc::grpc::health_reporter();
+            health
+                .set_serving::<TransferServiceServer<TransferGrpcHandler<TransferStoreBackend>>>()
+                .await;
+            let tls = self.rpc_conf.grpc.server_tls()?;
+            let reflection = if self.rpc_conf.grpc.enable_reflection {
+                Some(curvine_rpc::grpc::reflection::server::Builder::configure()
+                    .register_encoded_file_descriptor_set(curvine_proto::FILE_DESCRIPTOR_SET)
+                    .with_service_name("proto.TransferService")
+                    .build()?)
+            } else { None };
+            let mut grpc_server = curvine_rpc::grpc::TransportConfig::default().server(tls.as_ref())?;
+            monitor.advance_running();
             ready.store(true, Ordering::Relaxed);
+            self.rpc_rt.spawn(async move {
+                let shutdown_tracker = tracker.clone();
+                let shutdown_ready = task_ready.clone();
+                let shutdown_stop = stop.clone();
+                let shutdown_monitor = task_monitor.clone();
+                let incoming = futures::stream::unfold(listener, |listener| async move {
+                    Some((listener.accept().await.map(|(stream, _)| stream), listener))
+                });
+                let service = TransferServiceServer::new(handler)
+                    .max_decoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES);
+                let result = grpc_server
+                    .add_optional_service(reflection)
+                    .add_service(health_service)
+                    .add_service(service)
+                    .serve_with_incoming_shutdown(incoming, async move {
+                        shutdown_signal().await;
+                        shutdown_tracker.shutdown();
+                        shutdown_ready.store(false, Ordering::Relaxed);
+                        shutdown_stop.store(true, Ordering::Relaxed);
+                        shutdown_monitor.advance_shutdown();
+                        health
+                            .set_not_serving::<TransferServiceServer<TransferGrpcHandler<TransferStoreBackend>>>()
+                            .await;
+                    })
+                    .await;
+                if let Err(error) = result {
+                    log::error!("transfer gRPC server stopped: {}", error);
+                }
+                task_ready.store(false, Ordering::Relaxed);
+                task_monitor.advance_shutdown();
+                stop.store(true, Ordering::Relaxed);
+                tracker.shutdown();
+                tracker.wait_drained().await;
+                task_monitor.advance_stop();
+            });
+            info!("Starting curvine-transfer gRPC server on {}", address);
             Ok(rpc_status)
         }
         .await;
@@ -225,7 +290,7 @@ impl TransferServer {
     }
 
     pub fn block_on_start(self) -> CommonResult<()> {
-        let rt = self.rpc_server.clone_rt();
+        let rt = self.rpc_rt.clone();
         rt.block_on(async move {
             let mut status = self.start().await?;
             if let Err(err) = status.wait_stop().await {
@@ -234,4 +299,24 @@ impl TransferServer {
             Ok(())
         })
     }
+}
+
+async fn shutdown_signal() {
+    #[cfg(target_os = "linux")]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = terminate.recv() => {},
+                }
+            }
+            Err(error) => {
+                log::error!("failed to register SIGTERM handler: {}", error);
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = tokio::signal::ctrl_c().await;
 }

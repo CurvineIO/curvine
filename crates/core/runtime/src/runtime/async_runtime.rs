@@ -20,7 +20,7 @@ use tokio::time::Duration;
 
 #[derive(Debug)]
 pub struct AsyncRuntime {
-    inner: Runtime,
+    inner: Option<Runtime>,
     name_prefix: String,
     io_threads: usize,
     worker_threads: usize,
@@ -40,7 +40,7 @@ impl AsyncRuntime {
 
         let rt = builder.build().unwrap();
         AsyncRuntime {
-            inner: rt,
+            inner: Some(rt),
             name_prefix: String::from(name_prefix.as_ref()),
             io_threads,
             worker_threads,
@@ -56,7 +56,7 @@ impl AsyncRuntime {
             .unwrap();
 
         AsyncRuntime {
-            inner: rt,
+            inner: Some(rt),
             name_prefix: name.to_string(),
             io_threads: 1,
             worker_threads: 0,
@@ -72,8 +72,23 @@ impl AsyncRuntime {
         Self::new("single", 1, 1)
     }
 
-    pub fn shutdown_background(self) {
-        self.inner.shutdown_background();
+    pub fn shutdown_background(mut self) {
+        if let Some(runtime) = self.inner.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+impl Drop for AsyncRuntime {
+    fn drop(&mut self) {
+        // Tokio's ordinary Runtime destructor blocks and panics when a last
+        // owner is released by an async task. The runtime can instead shut
+        // down without blocking that task or its executor.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            if let Some(runtime) = self.inner.take() {
+                runtime.shutdown_background();
+            }
+        }
     }
 }
 
@@ -95,14 +110,17 @@ impl RpcRuntime for AsyncRuntime {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.inner.spawn(task)
+        self.inner.as_ref().expect("runtime shut down").spawn(task)
     }
 
     fn block_on<F>(&self, task: F) -> F::Output
     where
         F: Future,
     {
-        self.inner.block_on(task)
+        self.inner
+            .as_ref()
+            .expect("runtime shut down")
+            .block_on(task)
     }
 
     fn spawn_blocking<F, R>(&self, task: F) -> JoinHandle<R>
@@ -110,6 +128,19 @@ impl RpcRuntime for AsyncRuntime {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        self.inner.spawn_blocking(task)
+        self.inner
+            .as_ref()
+            .expect("runtime shut down")
+            .spawn_blocking(task)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AsyncRuntime;
+
+    #[tokio::test]
+    async fn dropping_runtime_from_async_context_does_not_panic() {
+        drop(AsyncRuntime::single());
     }
 }

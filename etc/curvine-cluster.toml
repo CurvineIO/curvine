@@ -187,6 +187,9 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 
 # Customer service configuration.
 [client]
+# Maximum unacknowledged remote write chunks per block stream (1 disables
+# pipelining; allowed range 1..=1024). Flush, seek and commit wait for them.
+# write_pipeline_window = 8
 
 [transfer]
 # Set to true to start the standalone Transfer service. Local SQLite storage,

@@ -50,3 +50,4 @@ pub use self::batch_block_writer_local::BatchBlockWriterLocal;
 
 mod block_client_pool;
 pub use self::block_client_pool::BlockClientPool;
+pub mod grpc_block_client;
