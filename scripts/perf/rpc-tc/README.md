@@ -81,3 +81,25 @@ server TCP port. For coordinated result collection, set `RPC_TC_RESULT_DIR`,
 `RPC_TC_TRANSPORT`, and `RPC_TC_REVISION`; the client must use the ready/go and
 `client.json` protocol implemented by the supplied workload. `bench.sh` sets
 these and the binary hashes automatically.
+
+For incremental gRPC optimizations, keep the server and client binaries for each
+checkpoint and use `--baseline` and `--candidate` instead of the ORPC-specific
+flags. Both groups can then contain gRPC runs; workload and binary consistency
+checks still apply:
+
+```sh
+scripts/perf/rpc-tc/compare.py --baseline before-1/result.json before-2/result.json \
+  --candidate after-1/result.json after-2/result.json
+```
+
+The runner gives owned processes two seconds to terminate, then kills any that
+remain in its namespaces before deleting them. This prevents workers waiting
+for an unavailable master from surviving into a later trial. Final `tc` counters
+are saved in `server-qdisc.json` and `client-qdisc.json` after measurement.
+
+For the final implementation, `RPC_TC_READ_WINDOW=4` selects the opt-in read
+pipeline in the generated client config (valid values 1–32); leave it unset to
+use each binary's compiled default. Record this tuning choice when comparing
+runs. The [incremental results](results/grpc-priorities-2026-11-02/README.md)
+include every priority checkpoint, conservative defaults, and the final opt-in
+configuration, with CPU, P99, throughput, RSS and per-run values.

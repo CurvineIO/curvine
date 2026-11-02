@@ -20,7 +20,7 @@ mkdir "$result_dir/cluster"
 # The unique result directory owns all data that format_master/worker may remove.
 # Both servers share this config and run on the server side of the veth pair.
 python3 - "$result_dir" <<'PY'
-import json, pathlib, sys
+import json, os, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 q = lambda value: json.dumps(str(value), ensure_ascii=True)
 config = f'''format_master = true
@@ -45,6 +45,12 @@ log = {{ level = "error", log_dir = "stdout" }}
 hostname = "192.0.2.2"
 master_addrs = [{{ hostname = "192.0.2.1", port = 8995 }}]
 '''
+window = os.environ.get("RPC_TC_READ_WINDOW")
+if window is not None:
+    value = int(window)
+    if not 1 <= value <= 32:
+        raise ValueError("RPC_TC_READ_WINDOW must be in 1..=32")
+    config += f"read_pipeline_window = {value}\n"
 (root / "config.toml").write_text(config, encoding="utf-8")
 PY
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)

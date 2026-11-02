@@ -52,6 +52,17 @@ class MeasurementTests(unittest.TestCase):
         self.assertTrue(report["provisional_pass"])
         self.assertEqual(report["grpc_over_orpc"]["p99"], 1.0)
 
+    def test_grpc_checkpoint_comparison(self):
+        self.finish("base", "grpc", "first-checkpoint")
+        self.finish("candidate", "grpc", "second-checkpoint")
+        result = subprocess.run([sys.executable, str(HERE / "compare.py"),
+                                 "--baseline", str(self.path / "base"),
+                                 "--candidate", str(self.path / "candidate")],
+                                capture_output=True, text=True, check=True)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["candidate_over_baseline"]["cpu_per_gib"], 1.0)
+        self.assertEqual(report["revisions"]["baseline"], "first-checkpoint")
+
     def test_restarted_server_invalidates_result(self):
         self.after["processes"]["123"]["start"] = 43
         (self.path / "after").write_text(json.dumps(self.after), encoding="utf-8")

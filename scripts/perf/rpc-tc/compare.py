@@ -55,15 +55,25 @@ def read_run(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--orpc", nargs="+", required=True, help="ORPC run JSON files")
-    parser.add_argument("--grpc", nargs="+", required=True, help="gRPC run JSON files")
+    base_args = parser.add_mutually_exclusive_group(required=True)
+    base_args.add_argument("--orpc", nargs="+", help="ORPC baseline run JSON files")
+    base_args.add_argument("--baseline", nargs="+", help="Baseline checkpoint run JSON files")
+    candidate_args = parser.add_mutually_exclusive_group(required=True)
+    candidate_args.add_argument("--grpc", nargs="+", help="gRPC candidate run JSON files")
+    candidate_args.add_argument("--candidate", nargs="+", help="Candidate checkpoint run JSON files")
     args = parser.parse_args()
-    if len(args.orpc) != len(args.grpc):
-        parser.error("provide the same number of runs for both transports")
+    checkpoints = args.baseline is not None
+    if checkpoints != (args.candidate is not None):
+        parser.error("use either --orpc/--grpc or --baseline/--candidate")
+    base_paths = args.baseline if checkpoints else args.orpc
+    candidate_paths = args.candidate if checkpoints else args.grpc
+    base_label, candidate_label = ("baseline", "candidate") if checkpoints else ("orpc", "grpc")
+    if len(base_paths) != len(candidate_paths):
+        parser.error("provide the same number of runs for both groups")
     try:
-        baseline = [read_run(path) for path in args.orpc]
-        candidate = [read_run(path) for path in args.grpc]
-        if any(run["transport"] != "orpc" for run in baseline) or any(run["transport"] != "grpc" for run in candidate):
+        baseline = [read_run(path) for path in base_paths]
+        candidate = [read_run(path) for path in candidate_paths]
+        if not checkpoints and (any(run["transport"] != "orpc" for run in baseline) or any(run["transport"] != "grpc" for run in candidate)):
             raise ValueError("transport labels do not match their argument groups")
         all_runs = baseline + candidate
         if any(run["workload"] != all_runs[0]["workload"] for run in all_runs):
@@ -79,10 +89,10 @@ def main():
         print(f"invalid benchmark data: {error}", file=sys.stderr)
         return 2
     passed = ratios["throughput"] >= 0.85 and ratios["p99"] <= 1.10 and ratios["cpu_per_gib"] <= 1.15
-    print(json.dumps({"grpc_over_orpc": ratios,
-                      "median": {"orpc": {key: med(baseline, key) for key in ratios},
-                                 "grpc": {key: med(candidate, key) for key in ratios}},
-                      "revisions": {"orpc": baseline[0]["revision"], "grpc": candidate[0]["revision"]},
+    print(json.dumps({f"{candidate_label}_over_{base_label}": ratios,
+                      "median": {base_label: {key: med(baseline, key) for key in ratios},
+                                 candidate_label: {key: med(candidate, key) for key in ratios}},
+                      "revisions": {base_label: baseline[0]["revision"], candidate_label: candidate[0]["revision"]},
                       "runs_per_transport": len(baseline), "provisional_pass": passed,
                       "note": "Valid only for matched workloads; tc results do not establish the hardware gate."}, indent=2))
     return 0 if passed else 1
