@@ -82,6 +82,8 @@ service WorkerControlService {
 }
 
 message ReadBlockChunk {
+  // Bounded sequential burst; responses use consecutive wire sequence IDs.
+  optional uint32 chunks = 2 [default = 1];
   optional DataHeaderProto header = 1;
 }
 

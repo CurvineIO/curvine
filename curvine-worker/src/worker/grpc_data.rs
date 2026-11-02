@@ -380,7 +380,7 @@ impl BlockDataService for GrpcBlockDataService {
         tokio::spawn(async move {
             let _guard = guard;
             let mut state: Option<StreamState> = None;
-            loop {
+            'stream: loop {
                 if *stop.borrow() {
                     break;
                 }
@@ -393,48 +393,78 @@ impl BlockDataService for GrpcBlockDataService {
                         break;
                     }
                 };
-                let result = async {
-                    if state.is_none() {
-                        state = Some(StreamState::open(&frame)?);
-                    }
-                    let stream_state = state.as_mut().expect("initialized");
-                    stream_state.validate(&frame)?;
-                    let (msg, done) = into_message(frame, stream_state)?;
-                    let worker = handler.clone();
-                    let (msg, response) = tokio::task::spawn_blocking(move || {
-                        let result = worker.handle(&msg);
-                        (msg, result)
-                    })
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                    let response = match response {
-                        Ok(response) => response,
-                        Err(error) => msg.error_ext(&error),
-                    };
-                    let success = response.is_success();
-                    if success && msg.request_status() == RequestStatus::Open {
-                        state.as_mut().expect("initialized").opened = true;
-                    }
-                    if success && done {
-                        state.as_mut().expect("initialized").cleanup_write = None;
-                        state.as_mut().expect("initialized").cleanup_batch = None;
-                    }
-                    let terminate = (done && success)
-                        || (!success && msg.request_status() == RequestStatus::Open);
-                    Ok::<_, Status>((into_response(&msg, response)?, terminate))
+                let chunks = match frame.operation.as_ref() {
+                    Some(Operation::ReadChunk(chunk)) => chunk.chunks.unwrap_or(1),
+                    _ => 1,
+                };
+                if !(1..=32).contains(&chunks) {
+                    let _ = tx
+                        .send(Err(Status::invalid_argument(
+                            "read burst must be in 1..=32",
+                        )))
+                        .await;
+                    break;
                 }
-                .await;
-                match result {
-                    Ok((reply, done)) => {
-                        if tokio::select! { _ = stop.changed() => true, sent = tx.send(Ok(reply)) => sent.is_err() }
-                            || done
-                        {
-                            break;
+                let first_seq = frame.seq_id;
+                for index in 0..chunks {
+                    let mut frame = frame.clone();
+                    frame.seq_id = match first_seq.checked_add(index as i32) {
+                        Some(seq) => seq,
+                        None => {
+                            let _ = tx
+                                .send(Err(Status::out_of_range("read sequence exhausted")))
+                                .await;
+                            break 'stream;
+                        }
+                    };
+                    if index != 0 {
+                        if let Some(Operation::ReadChunk(chunk)) = frame.operation.as_mut() {
+                            chunk.header = None;
                         }
                     }
-                    Err(error) => {
-                        tokio::select! { _ = stop.changed() => {}, _ = tx.send(Err(error)) => {} }
-                        break;
+                    let result = async {
+                        if state.is_none() {
+                            state = Some(StreamState::open(&frame)?);
+                        }
+                        let stream_state = state.as_mut().expect("initialized");
+                        stream_state.validate(&frame)?;
+                        let (msg, done) = into_message(frame, stream_state)?;
+                        let worker = handler.clone();
+                        let (msg, response) = tokio::task::spawn_blocking(move || {
+                            let result = worker.handle(&msg);
+                            (msg, result)
+                        })
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                        let response = match response {
+                            Ok(response) => response,
+                            Err(error) => msg.error_ext(&error),
+                        };
+                        let success = response.is_success();
+                        if success && msg.request_status() == RequestStatus::Open {
+                            state.as_mut().expect("initialized").opened = true;
+                        }
+                        if success && done {
+                            state.as_mut().expect("initialized").cleanup_write = None;
+                            state.as_mut().expect("initialized").cleanup_batch = None;
+                        }
+                        let terminate = (done && success)
+                            || (!success && msg.request_status() == RequestStatus::Open);
+                        Ok::<_, Status>((into_response(&msg, response)?, terminate))
+                    }
+                    .await;
+                    match result {
+                        Ok((reply, done)) => {
+                            if tokio::select! { _ = stop.changed() => true, sent = tx.send(Ok(reply)) => sent.is_err() }
+                                || done
+                            {
+                                break 'stream;
+                            }
+                        }
+                        Err(error) => {
+                            tokio::select! { _ = stop.changed() => {}, _ = tx.send(Err(error)) => {} }
+                            break 'stream;
+                        }
                     }
                 }
             }
@@ -505,7 +535,10 @@ mod tests {
         state.opened = true;
         let next = frame(
             1,
-            Operation::ReadChunk(ReadBlockChunk { header: None }),
+            Operation::ReadChunk(ReadBlockChunk {
+                header: None,
+                chunks: None,
+            }),
             None,
         );
         state.validate(&next).unwrap();

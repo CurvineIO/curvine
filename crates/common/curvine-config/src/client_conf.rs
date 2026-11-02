@@ -60,6 +60,8 @@ pub struct ClientConf {
     /// one waits for each acknowledgement; larger values overlap network RTTs.
     #[client_cli]
     pub write_pipeline_window: usize,
+    /// Maximum sequential read chunks requested in one gRPC burst.
+    pub read_pipeline_window: usize,
 
     #[serde(skip)]
     pub read_chunk_size: usize,
@@ -343,6 +345,9 @@ impl ClientConf {
     pub const DEFAULT_MAX_READ_PARALLEL: i64 = 8;
 
     pub fn init(&mut self) -> CommonResult<()> {
+        if !(1..=32).contains(&self.read_pipeline_window) {
+            return err_box!("client.read_pipeline_window must be in 1..=32");
+        }
         if !(1..=1024).contains(&self.write_pipeline_window) {
             return err_box!("client.write_pipeline_window must be in 1..=1024");
         }
@@ -476,6 +481,7 @@ impl Default for ClientConf {
             write_chunk_size_str: "128KB".to_owned(),
             write_chunk_num: 8,
             write_pipeline_window: 8,
+            read_pipeline_window: 4,
 
             read_chunk_size: 0,
             read_chunk_size_str: "128KB".to_owned(),

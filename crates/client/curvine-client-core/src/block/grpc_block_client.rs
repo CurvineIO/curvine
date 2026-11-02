@@ -25,6 +25,25 @@ struct Exchange {
     tx: mpsc::Sender<BlockDataRequest>,
     rx: tonic::Streaming<BlockDataResponse>,
     pending: VecDeque<PendingWrite>,
+    read: Option<ReadWindow>,
+}
+
+struct ReadWindow {
+    len: i64,
+    next_offset: i64,
+    chunk_size: usize,
+    next_seq: i32,
+    pending: VecDeque<i32>,
+}
+
+impl ReadWindow {
+    fn sequence(&mut self, count: usize) -> FsResult<i32> {
+        let seq = self.next_seq;
+        self.next_seq = seq
+            .checked_add(count as i32)
+            .ok_or_else(|| FsError::common("block read sequence exhausted"))?;
+        Ok(seq)
+    }
 }
 
 struct PendingWrite {
@@ -69,6 +88,7 @@ pub struct GrpcBlockClient {
     client: BlockDataServiceClient<Channel>,
     stream: Mutex<Option<Exchange>>,
     timeout: Duration,
+    read_window: usize,
 }
 
 impl GrpcBlockClient {
@@ -107,11 +127,17 @@ impl GrpcBlockClient {
                 .max_encoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES),
             stream: Mutex::new(None),
             timeout,
+            read_window: 4,
         })
     }
 
+    pub fn with_read_window(mut self, window: usize) -> Self {
+        self.read_window = window.clamp(1, 32);
+        self
+    }
+
     pub async fn rpc(&self, mut msg: Message, token: Option<&str>) -> FsResult<Message> {
-        let frame = request_frame(&mut msg, token)?;
+        let mut frame = request_frame(&mut msg, token)?;
         let is_open = msg.request_status() == RequestStatus::Open;
         let is_done = matches!(
             msg.request_status(),
@@ -133,23 +159,100 @@ impl GrpcBlockClient {
                     tx,
                     rx: response.into_inner(),
                     pending: VecDeque::new(),
+                    read: match frame.operation.as_ref() {
+                        Some(Operation::OpenRead(open)) => Some(ReadWindow {
+                            len: open.len,
+                            next_offset: open.off,
+                            chunk_size: open.chunk_size.max(1) as usize,
+                            next_seq: frame.seq_id,
+                            pending: VecDeque::new(),
+                        }),
+                        _ => None,
+                    },
                 });
             }
             let exchange = stream
                 .as_mut()
                 .ok_or_else(|| FsError::common("block stream is not open"))?;
             exchange.drain_writes().await?;
+            if let Some(read) = &mut exchange.read {
+                let chunk = match frame.operation.as_mut() {
+                    Some(Operation::ReadChunk(chunk)) => Some(chunk),
+                    _ => None,
+                };
+                let seek = chunk.as_ref().and_then(|chunk| chunk.header.as_ref());
+                if chunk.is_none() || seek.is_some() {
+                    // A seek or completion is a barrier: discard prefetched replies,
+                    // but verify every identity before issuing a new operation.
+                    while let Some(seq) = read.pending.pop_front() {
+                        let response = exchange
+                            .rx
+                            .message()
+                            .await
+                            .map_err(curvine_error::grpc::from_status)?
+                            .ok_or_else(|| FsError::common("read stream closed while draining"))?;
+                        if response.req_id != msg.req_id() || response.seq_id != seq {
+                            return Err(FsError::common("prefetched read identity mismatch"));
+                        }
+                    }
+                    if let Some(header) = seek {
+                        read.next_offset = header.offset;
+                    }
+                }
+                if let Some(chunk) = chunk {
+                    if read.pending.is_empty() {
+                        let remaining = read.len.saturating_sub(read.next_offset).max(0) as usize;
+                        let available = remaining.div_ceil(read.chunk_size).max(1);
+                        // Bound speculative data independently of configured chunk size.
+                        let budget = (32 * 1024 * 1024 / read.chunk_size).max(1);
+                        let count = self.read_window.min(available).min(budget);
+                        chunk.chunks = Some(count as u32);
+                        let seq = read.sequence(count)?;
+                        frame.seq_id = seq;
+                        for index in 0..count {
+                            read.pending.push_back(seq + index as i32);
+                        }
+                        read.next_offset = read
+                            .next_offset
+                            .saturating_add(count.saturating_mul(read.chunk_size) as i64)
+                            .min(read.len);
+                        exchange
+                            .tx
+                            .send(frame)
+                            .await
+                            .map_err(|e| FsError::common(e.to_string()))?;
+                    }
+                    let seq = read.pending.pop_front().expect("scheduled read");
+                    let mut response = exchange
+                        .rx
+                        .message()
+                        .await
+                        .map_err(curvine_error::grpc::from_status)?
+                        .ok_or_else(|| FsError::common("read stream closed without response"))?;
+                    if response.req_id != msg.req_id() || response.seq_id != seq {
+                        return Err(FsError::common("prefetched read identity mismatch"));
+                    }
+                    response.seq_id = msg.seq_id();
+                    return response_message(&msg, response);
+                }
+                frame.seq_id = read.sequence(1)?;
+            }
+            let wire_seq = frame.seq_id;
             exchange
                 .tx
                 .send(frame)
                 .await
                 .map_err(|e| FsError::common(e.to_string()))?;
-            let response = exchange
+            let mut response = exchange
                 .rx
                 .message()
                 .await
                 .map_err(curvine_error::grpc::from_status)?
                 .ok_or_else(|| FsError::common("block stream closed without acknowledgement"))?;
+            if response.seq_id != wire_seq {
+                return Err(FsError::common("block acknowledgement identity mismatch"));
+            }
+            response.seq_id = msg.seq_id();
             response_message(&msg, response)
         };
         let result = match tokio::time::timeout(self.timeout, exchange).await {
@@ -157,6 +260,8 @@ impl GrpcBlockClient {
             Err(e) => Err(FsError::from(e)),
         };
         if result.is_err()
+            || (RpcCode::from(msg.code()) == RpcCode::ReadBlock
+                && result.as_ref().is_ok_and(|reply| !reply.is_success()))
             || (is_done && result.as_ref().is_ok_and(|reply| reply.is_success()))
             || (is_open && result.as_ref().is_ok_and(|reply| !reply.is_success()))
         {
@@ -222,6 +327,7 @@ fn request_frame(msg: &mut Message, token: Option<&str>) -> FsResult<BlockDataRe
     let op = match (RpcCode::from(msg.code()), msg.request_status()) {
         (RpcCode::ReadBlock, RequestStatus::Open) => Operation::OpenRead(msg.parse_header()?),
         (RpcCode::ReadBlock, RequestStatus::Running) => Operation::ReadChunk(ReadBlockChunk {
+            chunks: None,
             header: if msg.header_len() > 0 {
                 Some(msg.parse_header()?)
             } else {
@@ -353,6 +459,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::sync::{oneshot, Notify};
+    use tonic::Status;
 
     struct DelayedWrites {
         window: usize,
@@ -667,6 +774,148 @@ mod tests {
             Operation::ReadChunk(chunk) => assert_eq!(chunk.header, Some(header)),
             _ => panic!("unexpected operation"),
         }
+    }
+
+    struct BurstRead(Arc<std::sync::Mutex<Vec<(i32, u32, Option<i64>)>>>);
+
+    #[tonic::async_trait]
+    impl BlockDataService for BurstRead {
+        type ExchangeStream =
+            Pin<Box<dyn futures::Stream<Item = Result<BlockDataResponse, Status>> + Send>>;
+        async fn exchange(
+            &self,
+            request: tonic::Request<tonic::Streaming<BlockDataRequest>>,
+        ) -> Result<tonic::Response<Self::ExchangeStream>, Status> {
+            let mut input = request.into_inner();
+            let calls = self.0.clone();
+            let output = async_stream::try_stream! {
+                let mut offset = 0;
+                let mut next_seq = 0;
+                while let Some(request) = input.message().await? {
+                    if request.seq_id != next_seq { Err(Status::invalid_argument("sequence mismatch"))?; }
+                    match request.operation {
+                        Some(Operation::ReadChunk(chunk)) => {
+                            let count = chunk.chunks.unwrap_or(1);
+                            calls.lock().unwrap().push((request.seq_id, count, chunk.header.as_ref().map(|h| h.offset)));
+                            if let Some(header) = chunk.header { offset = header.offset; }
+                            for index in 0..count {
+                                yield BlockDataResponse { req_id: request.req_id, seq_id: request.seq_id + index as i32,
+                                    result: Some(OperationResult::Data(bytes::Bytes::from(vec![offset as u8; 3]))) };
+                                offset += 3;
+                                next_seq += 1;
+                            }
+                        }
+                        Some(Operation::OpenRead(_)) => {
+                            next_seq += 1;
+                            yield BlockDataResponse { req_id: request.req_id, seq_id: request.seq_id,
+                                result: Some(OperationResult::OpenedRead(Default::default())) };
+                        }
+                        Some(Operation::CompleteRead(_)) => {
+                            next_seq += 1;
+                            yield BlockDataResponse { req_id: request.req_id, seq_id: request.seq_id, result: Some(OperationResult::Ack(true)) };
+                        }
+                        _ => Err(Status::invalid_argument("unexpected operation"))?,
+                    }
+                }
+            };
+            Ok(tonic::Response::new(Box::pin(output)))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_bursts_preserve_seek_completion_and_wire_identity() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(BlockDataServiceServer::new(BurstRead(calls.clone())))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let client = GrpcBlockClient::connect(format!("http://{addr}"), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let msg = |seq, status| {
+            Builder::new()
+                .code(RpcCode::ReadBlock)
+                .req_id(7)
+                .seq_id(seq)
+                .request(status)
+        };
+        client
+            .rpc(
+                msg(0, RequestStatus::Open)
+                    .proto_header(BlockReadRequest {
+                        len: 12,
+                        chunk_size: 3,
+                        ..Default::default()
+                    })
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        let first = client
+            .rpc(msg(1, RequestStatus::Running).build(), None)
+            .await
+            .unwrap();
+        assert_eq!(first.data.as_slice(), &[0; 3]);
+        let seeked = client
+            .rpc(
+                msg(2, RequestStatus::Running)
+                    .proto_header(DataHeaderProto {
+                        offset: 6,
+                        ..Default::default()
+                    })
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(seeked.data.as_slice(), &[6; 3]);
+        let next = client
+            .rpc(msg(3, RequestStatus::Running).build(), None)
+            .await
+            .unwrap();
+        assert_eq!(next.data.as_slice(), &[9; 3]);
+        client
+            .rpc(
+                msg(4, RequestStatus::Complete)
+                    .proto_header(BlockReadRequest::default())
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![(1, 4, None), (5, 2, Some(6))]);
+        // Reopen then complete while replies are still prefetched.
+        client
+            .rpc(
+                msg(0, RequestStatus::Open)
+                    .proto_header(BlockReadRequest {
+                        len: 12,
+                        chunk_size: 3,
+                        ..Default::default()
+                    })
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        client
+            .rpc(msg(1, RequestStatus::Running).build(), None)
+            .await
+            .unwrap();
+        client
+            .rpc(
+                msg(2, RequestStatus::Complete)
+                    .proto_header(BlockReadRequest::default())
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        task.abort();
     }
 
     #[test]

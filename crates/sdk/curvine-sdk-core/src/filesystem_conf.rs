@@ -38,6 +38,7 @@ pub struct FilesystemConf {
     pub write_chunk_num: usize,
     /// Number of unacknowledged data chunks; zero selects the client default.
     pub write_pipeline_window: usize,
+    pub read_pipeline_window: usize,
 
     pub read_chunk_size: String,
     pub read_chunk_num: usize,
@@ -251,6 +252,11 @@ impl FilesystemConf {
                 self.write_pipeline_window
             },
 
+            read_pipeline_window: if self.read_pipeline_window == 0 {
+                ClientConf::default().read_pipeline_window
+            } else {
+                self.read_pipeline_window
+            },
             read_chunk_size: 0,
             read_chunk_size_str: self.read_chunk_size,
             read_chunk_num: self.read_chunk_num,

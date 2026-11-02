@@ -266,6 +266,7 @@ impl FsContext {
         };
         let tls = grpc.client_tls(tls_name)?;
         let timeout = Duration::from_millis(self.conf.client.data_timeout_ms);
+        let read_window = self.conf.client.read_pipeline_window;
         // Tonic's channel background tasks must live on the filesystem runtime,
         // not whichever short-lived runtime happens to make the first request.
         let grpc = self
@@ -277,6 +278,7 @@ impl FsContext {
                     tls.as_ref(),
                 )
                 .await
+                .map(|client| client.with_read_window(read_window))
             })
             .await
             .map_err(curvine_io::IOError::create)?
