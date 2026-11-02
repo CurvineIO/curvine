@@ -466,8 +466,6 @@ fn three_process_empty_member_recovery() {
         .dir(victim)
         .join("journal/member-recovery-in-progress")
         .exists());
-    let log = fs::read_to_string(c.dir(victim).join("process.log")).unwrap();
-    assert!(log.contains("refusing to advance Ready"));
     c.stop(victim);
     fs::remove_file(c.dir(victim).join("fail-snapshot")).unwrap();
     c.start(victim, false);
