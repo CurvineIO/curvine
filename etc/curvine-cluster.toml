@@ -190,6 +190,8 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 # Maximum unacknowledged remote write chunks per block stream (1 disables
 # pipelining; allowed range 1..=1024). Flush, seek and commit wait for them.
 # write_pipeline_window = 8
+# Read pipelining is opt-in: values >1 may increase P99 on bandwidth-limited links.
+# read_pipeline_window = 1
 
 [transfer]
 # Set to true to start the standalone Transfer service. Local SQLite storage,

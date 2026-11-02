@@ -486,7 +486,6 @@ fn transfer_task_state_code(state: curvine_model::JobTaskState) -> i32 {
 mod tests {
     use super::{BlockWriteRequest, ConnectionPeer, WorkerHandler};
     use curvine_fs_api::RpcCode;
-    use curvine_io::DataSlice;
     use curvine_proto::{
         BlockReadRequest, BlocksBatchCommitRequest, BlocksBatchWriteRequest, ComponentInfoProto,
         DataHeaderProto, ExtendedBlockProto, FileTypeProto, FileWriteData, FilesBatchWriteRequest,

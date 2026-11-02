@@ -127,7 +127,7 @@ impl GrpcBlockClient {
                 .max_encoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES),
             stream: Mutex::new(None),
             timeout,
-            read_window: 4,
+            read_window: 1,
         })
     }
 
@@ -780,7 +780,8 @@ mod tests {
         }
     }
 
-    struct BurstRead(Arc<std::sync::Mutex<Vec<(i32, u32, Option<i64>)>>>);
+    type ReadCalls = Arc<std::sync::Mutex<Vec<(i32, u32, Option<i64>)>>>;
+    struct BurstRead(ReadCalls);
 
     #[tonic::async_trait]
     impl BlockDataService for BurstRead {
@@ -838,7 +839,8 @@ mod tests {
         );
         let client = GrpcBlockClient::connect(format!("http://{addr}"), Duration::from_secs(5))
             .await
-            .unwrap();
+            .unwrap()
+            .with_read_window(4);
         let msg = |seq, status| {
             Builder::new()
                 .code(RpcCode::ReadBlock)
@@ -934,7 +936,8 @@ mod tests {
         );
         let client = GrpcBlockClient::connect(format!("http://{addr}"), Duration::from_secs(5))
             .await
-            .unwrap();
+            .unwrap()
+            .with_read_window(4);
         let msg = |seq, status| {
             Builder::new()
                 .code(RpcCode::ReadBlock)

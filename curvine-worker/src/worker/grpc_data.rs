@@ -117,7 +117,6 @@ struct StreamState {
     cleanup_write: Option<curvine_proto::BlockWriteRequest>,
     cleanup_batch: Option<curvine_proto::BlocksBatchWriteRequest>,
     opened: bool,
-    read_chunk_size: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -169,10 +168,6 @@ impl StreamState {
                 _ => None,
             },
             opened: false,
-            read_chunk_size: match request.operation.as_ref() {
-                Some(Operation::OpenRead(open)) => open.chunk_size.max(1) as usize,
-                _ => 1,
-            },
         })
     }
 
@@ -478,6 +473,7 @@ fn into_response(request: &Message, response: Message) -> Result<BlockDataRespon
 impl BlockDataService for GrpcBlockDataService {
     type ExchangeStream = Pin<Box<dyn Stream<Item = Result<BlockDataResponse, Status>> + Send>>;
 
+    #[allow(clippy::result_large_err)]
     async fn exchange(
         &self,
         request: Request<tonic::Streaming<BlockDataRequest>>,
@@ -527,70 +523,56 @@ impl BlockDataService for GrpcBlockDataService {
                     break;
                 }
                 let first_seq = frame.seq_id;
-                // Amortize a blocking-pool handoff across a short sequential burst.
-                // No blocking thread is retained while the stream is idle.
-                let chunk_size = state.as_ref().map_or(1, |s| s.read_chunk_size);
-                let batch_size = (8 * 1024 * 1024 / chunk_size).clamp(1, 4);
-                for batch_start in (0..chunks).step_by(batch_size) {
+                for index in 0..chunks {
+                    let mut frame = frame.clone();
+                    frame.seq_id = match first_seq.checked_add(index as i32) {
+                        Some(seq) => seq,
+                        None => {
+                            let _ = tx
+                                .send(Err(Status::out_of_range("read sequence exhausted")))
+                                .await;
+                            break 'stream;
+                        }
+                    };
+                    if index != 0 {
+                        if let Some(Operation::ReadChunk(chunk)) = frame.operation.as_mut() {
+                            chunk.header = None;
+                        }
+                    }
                     let result = async {
-                        let mut messages = Vec::with_capacity(batch_size);
-                        for index in batch_start..chunks.min(batch_start + batch_size as u32) {
-                            let mut frame = frame.clone();
-                            frame.seq_id = first_seq
-                                .checked_add(index as i32)
-                                .ok_or_else(|| Status::out_of_range("read sequence exhausted"))?;
-                            if index != 0 {
-                                if let Some(Operation::ReadChunk(chunk)) = frame.operation.as_mut()
-                                {
-                                    chunk.header = None;
-                                }
-                            }
-                            if state.is_none() {
-                                state = Some(StreamState::open(&frame)?);
-                            }
-                            let stream_state = state.as_mut().expect("initialized");
-                            stream_state.validate(&frame)?;
-                            messages.push(PreparedOperation::new(frame, stream_state)?);
+                        if state.is_none() {
+                            state = Some(StreamState::open(&frame)?);
                         }
+                        let stream_state = state.as_mut().expect("initialized");
+                        stream_state.validate(&frame)?;
+                        let operation = PreparedOperation::new(frame, stream_state)?;
                         let worker = handler.clone();
-                        let responses = tokio::task::spawn_blocking(move || {
-                            messages
-                                .into_iter()
-                                .map(|operation| operation.execute(&worker))
-                                .collect::<Vec<_>>()
-                        })
-                        .await
-                        .map_err(|e| Status::internal(e.to_string()))?;
-                        let mut replies = Vec::with_capacity(responses.len());
-                        for reply in responses {
-                            let OperationReply {
-                                response,
-                                status,
-                                done,
-                                success,
-                            } = reply?;
-                            if success && status == RequestStatus::Open {
-                                state.as_mut().expect("initialized").opened = true;
-                            }
-                            if success && done {
-                                state.as_mut().expect("initialized").cleanup_write = None;
-                                state.as_mut().expect("initialized").cleanup_batch = None;
-                            }
-                            let terminate =
-                                (done && success) || (!success && status == RequestStatus::Open);
-                            replies.push((response, terminate));
+                        let OperationReply {
+                            response,
+                            status,
+                            done,
+                            success,
+                        } = tokio::task::spawn_blocking(move || operation.execute(&worker))
+                            .await
+                            .map_err(|e| Status::internal(e.to_string()))??;
+                        if success && status == RequestStatus::Open {
+                            state.as_mut().expect("initialized").opened = true;
                         }
-                        Ok::<_, Status>(replies)
+                        if success && done {
+                            state.as_mut().expect("initialized").cleanup_write = None;
+                            state.as_mut().expect("initialized").cleanup_batch = None;
+                        }
+                        let terminate =
+                            (done && success) || (!success && status == RequestStatus::Open);
+                        Ok::<_, Status>((response, terminate))
                     }
                     .await;
                     match result {
-                        Ok(replies) => {
-                            for (reply, done) in replies {
-                                if tokio::select! { _ = stop.changed() => true, sent = tx.send(Ok(reply)) => sent.is_err() }
-                                    || done
-                                {
-                                    break 'stream;
-                                }
+                        Ok((reply, done)) => {
+                            if tokio::select! { _ = stop.changed() => true, sent = tx.send(Ok(reply)) => sent.is_err() }
+                                || done
+                            {
+                                break 'stream;
                             }
                         }
                         Err(error) => {

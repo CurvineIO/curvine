@@ -481,7 +481,7 @@ impl Default for ClientConf {
             write_chunk_size_str: "128KB".to_owned(),
             write_chunk_num: 8,
             write_pipeline_window: 8,
-            read_pipeline_window: 4,
+            read_pipeline_window: 1,
 
             read_chunk_size: 0,
             read_chunk_size_str: "128KB".to_owned(),
