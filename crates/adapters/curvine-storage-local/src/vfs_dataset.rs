@@ -17,7 +17,7 @@ use crate::{
     BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirFreeRatio, DirList, FileLayout,
     SpdkMetaStore, StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
 };
-use crate::{BlockMeta, BlockState};
+use crate::{BlockMeta, BlockState, ChecksumVerify};
 use curvine_config::{ClusterConf, WorkerDataDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
@@ -65,6 +65,8 @@ pub struct VfsDataset {
     num_blocks_to_delete: AtomicUsize,
     /// Write a checksum sidecar when finalizing file-layout blocks.
     block_checksum: bool,
+    /// Verify file-layout block reads against their sidecar.
+    checksum_verify: ChecksumVerify,
 }
 
 pub struct RemovedBlockState {
@@ -153,6 +155,7 @@ impl VfsDataset {
             layouts: BlockLayouts::new(spdk_meta),
             num_blocks_to_delete: AtomicUsize::new(0),
             block_checksum: false,
+            checksum_verify: ChecksumVerify::Off,
         };
         ds.initialize()?;
         Ok(ds)
@@ -225,6 +228,10 @@ impl VfsDataset {
 
         let mut ds = Self::new(cluster_id, dir_list, spdk_meta)?;
         ds.block_checksum = conf.worker.block_checksum;
+        ds.checksum_verify = ChecksumVerify::from_conf(
+            conf.worker.block_checksum_verify,
+            conf.worker.block_checksum_allow_missing,
+        );
         Ok(ds)
     }
 
@@ -257,6 +264,11 @@ impl VfsDataset {
             None => err_box!("No storage directory found: {:?}", id),
             Some(v) => Ok(v),
         }
+    }
+
+    /// Read-side checksum verification mode for block readers.
+    pub fn checksum_verify(&self) -> ChecksumVerify {
+        self.checksum_verify
     }
 
     pub fn worker_id(&self) -> u32 {
@@ -787,7 +799,7 @@ mod test {
         BlockChecksum, BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore,
         StorageVersion, VfsDataset, VfsDir, DEFAULT_CHECKSUM_CHUNK_SIZE,
     };
-    use crate::{BlockMeta, BlockState};
+    use crate::{BlockMeta, BlockState, ChecksumHeader, ChecksumVerify};
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_core_error::CommonResult;
     use curvine_io::DataSlice;
@@ -1369,7 +1381,7 @@ mod test {
         // Master-side truncate up: logical length 50 exceeds the 20 committed
         // worker bytes, so the tail is a legitimate sparse hole.
         let dir = ds.find_dir(finalized.dir_id())?;
-        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 50)?;
+        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 50, ChecksumVerify::Off)?;
         let region = reader.read_region(false, 50)?;
         let bytes = match region {
             DataSlice::Buffer(bytes) => bytes,
@@ -1398,7 +1410,7 @@ mod test {
             .set_len(20)?;
 
         let dir = ds.find_dir(finalized.dir_id())?;
-        let err = match FileLayout.open_reader(dir, &finalized, 0, 50) {
+        let err = match FileLayout.open_reader(dir, &finalized, 0, 50, ChecksumVerify::Off) {
             Ok(_) => panic!("truncated block must not be served as a sparse tail"),
             Err(e) => e.to_string(),
         };
@@ -1410,12 +1422,14 @@ mod test {
         // A read bounded below the committed length but beyond the surviving
         // bytes is also rejected.
         let dir = ds.find_dir(finalized.dir_id())?;
-        assert!(FileLayout.open_reader(dir, &finalized, 0, 30).is_err());
+        assert!(FileLayout
+            .open_reader(dir, &finalized, 0, 30, ChecksumVerify::Off)
+            .is_err());
 
         // Master-side truncate down to the surviving bytes stays readable:
         // only min(meta.len, logical_len) bytes must be present.
         let dir = ds.find_dir(finalized.dir_id())?;
-        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 20)?;
+        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 20, ChecksumVerify::Off)?;
         let region = reader.read_region(false, 50)?;
         let bytes = match region {
             DataSlice::Buffer(bytes) => bytes,
@@ -1436,7 +1450,7 @@ mod test {
         let finalized = ds.finalize_block(&block)?;
 
         let dir = ds.find_dir(finalized.dir_id())?;
-        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 20)?;
+        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 20, ChecksumVerify::Off)?;
         let region = reader.read_region(false, 50)?;
         let bytes = match region {
             DataSlice::Buffer(bytes) => bytes,
@@ -1642,6 +1656,152 @@ mod test {
             FileLayout::checksum_path_of(std::path::Path::new("/data/blk_1")),
             std::path::PathBuf::from("/data/blk_1.crc")
         );
+    }
+
+    /// Read `[0, logical_len)` of a finalized block through `FileLayout`.
+    fn read_block(
+        ds: &VfsDataset,
+        meta: &BlockMeta,
+        logical_len: i64,
+        verify: ChecksumVerify,
+    ) -> CommonResult<Vec<u8>> {
+        let dir = ds.find_dir(meta.dir_id())?;
+        let mut reader = FileLayout.open_reader(dir, meta, 0, logical_len, verify)?;
+        let region = reader.read_region(false, logical_len as i32)?;
+        match region {
+            DataSlice::Buffer(bytes) => Ok(bytes.to_vec()),
+            other => panic!("expected buffered read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verified_read_detects_flipped_byte_after_finalize() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-verify-flip");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[4u8; 60])?;
+        let verify = ChecksumVerify::RequireSidecar;
+        assert_eq!(read_block(&ds, &finalized, 60, verify)?, vec![4u8; 60]);
+
+        let path = block_file(&ds, &finalized)?;
+        let mut data = std::fs::read(&path)?;
+        data[17] ^= 0x80;
+        std::fs::write(&path, &data)?;
+
+        let err = read_block(&ds, &finalized, 60, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("checksum mismatch"), "{err}");
+        // Verification off still returns the bytes, unchanged behavior.
+        assert_eq!(read_block(&ds, &finalized, 60, ChecksumVerify::Off)?, data);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_read_missing_sidecar_follows_policy() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "checksum-verify-missing");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[8u8; 30])?;
+        assert!(!FileLayout::checksum_path_of(&block_file(&ds, &finalized)?).exists());
+
+        let allowed = read_block(&ds, &finalized, 30, ChecksumVerify::AllowMissing)?;
+        assert_eq!(allowed, vec![8u8; 30]);
+        let err = read_block(&ds, &finalized, 30, ChecksumVerify::RequireSidecar)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no checksum sidecar"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn verified_read_rejects_bad_sidecar() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-verify-bad-sidecar");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[9u8; 30])?;
+        let path = block_file(&ds, &finalized)?;
+        let checksum_path = FileLayout::checksum_path_of(&path);
+        let verify = ChecksumVerify::AllowMissing;
+
+        // Torn sidecar: decoding fails, even under the lenient policy.
+        let sidecar = std::fs::read(&checksum_path)?;
+        std::fs::write(&checksum_path, &sidecar[..sidecar.len() - 1])?;
+        let err = read_block(&ds, &finalized, 30, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid checksum sidecar"), "{err}");
+
+        // Valid sidecar for a different length than the file.
+        let other = BlockChecksum::compute(DEFAULT_CHECKSUM_CHUNK_SIZE, &[9u8; 31])?;
+        std::fs::write(&checksum_path, other.encode())?;
+        let err = read_block(&ds, &finalized, 30, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("checksum length mismatch"), "{err}");
+
+        // Enlarged sidecar: rejected from its size, before it is loaded.
+        let mut enlarged = sidecar.clone();
+        enlarged.resize(sidecar.len() + 1024 * 1024, 0);
+        std::fs::write(&checksum_path, &enlarged)?;
+        let err = read_block(&ds, &finalized, 30, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match its header"), "{err}");
+
+        // Header with a chunk size that implies a different sidecar size.
+        let small_chunks = BlockChecksum::compute(1, &[9u8; 30])?.encode();
+        let mut mixed = small_chunks[..ChecksumHeader::LEN].to_vec();
+        mixed.extend_from_slice(&sidecar[ChecksumHeader::LEN..]);
+        std::fs::write(&checksum_path, &mixed)?;
+        let err = read_block(&ds, &finalized, 30, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match its header"), "{err}");
+
+        // Header shorter than its fixed size.
+        std::fs::write(&checksum_path, &sidecar[..8])?;
+        let err = read_block(&ds, &finalized, 30, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid checksum sidecar"), "{err}");
+
+        // A valid sidecar still verifies.
+        std::fs::write(&checksum_path, &sidecar)?;
+        assert_eq!(read_block(&ds, &finalized, 30, verify)?, vec![9u8; 30]);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_read_has_no_false_positive_after_rewrites() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-verify-rewrites");
+        let verify = ChecksumVerify::RequireSidecar;
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        write_and_finalize(&mut ds, &mut block, &[1u8; 45])?;
+
+        // Shorter rewrite.
+        block.len = 50;
+        let shorter = write_and_finalize(&mut ds, &mut block, &[2u8; 30])?;
+        assert_eq!(read_block(&ds, &shorter, 30, verify)?, vec![2u8; 30]);
+
+        // Sparse extension materialized at finalize.
+        block.len = 50;
+        ds.open_block(&block)?;
+        let extended = finalize_reserved(&mut ds, &block)?;
+        let mut expected = vec![2u8; 30];
+        expected.resize(50, 0);
+        assert_eq!(read_block(&ds, &extended, 50, verify)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_read_pads_master_truncate_up_tail() -> CommonResult<()> {
+        // Master-side truncate up: the logical length exceeds the committed
+        // file, which is the length the sidecar covers.
+        let mut ds = checksum_data_set("checksum-verify-truncate-up");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[3u8; 20])?;
+        let bytes = read_block(&ds, &finalized, 50, ChecksumVerify::RequireSidecar)?;
+        assert_eq!(&bytes[..20], &[3u8; 20]);
+        assert!(bytes[20..].iter().all(|byte| *byte == 0));
+        Ok(())
     }
 
     #[test]

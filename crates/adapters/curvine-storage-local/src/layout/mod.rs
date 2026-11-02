@@ -19,7 +19,7 @@ pub use self::bdev_layout::BdevLayout;
 pub(crate) use self::file_layout::FileFinalizePlan;
 pub use self::file_layout::FileLayout;
 
-use crate::BlockMeta;
+use crate::{BlockMeta, ChecksumVerify};
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::IOResult;
@@ -68,12 +68,15 @@ pub trait BlockLayout {
 
     fn open_writer(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext>;
 
+    /// `verify` asks layouts with checksum sidecars to verify reads; others
+    /// ignore it.
     fn open_reader(
         &self,
         dir: &VfsDir,
         meta: &BlockMeta,
         off: i64,
         logical_len: i64,
+        verify: ChecksumVerify,
     ) -> IOResult<BlockReadContext>;
 
     /// Local path a co-located client can open directly, `Ok(None)` if the
@@ -194,10 +197,11 @@ impl BlockLayout for BlockLayoutKind {
         meta: &BlockMeta,
         off: i64,
         logical_len: i64,
+        verify: ChecksumVerify,
     ) -> IOResult<BlockReadContext> {
         match self {
-            Self::File(layout) => layout.open_reader(dir, meta, off, logical_len),
-            Self::Bdev(layout) => layout.open_reader(dir, meta, off, logical_len),
+            Self::File(layout) => layout.open_reader(dir, meta, off, logical_len, verify),
+            Self::Bdev(layout) => layout.open_reader(dir, meta, off, logical_len, verify),
         }
     }
 

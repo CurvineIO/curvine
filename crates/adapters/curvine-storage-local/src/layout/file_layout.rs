@@ -14,7 +14,8 @@
 
 use crate::layout::{validate_open_offset, BlockLayout};
 use crate::{
-    BlockChecksum, BlockMeta, BlockState, CHECKSUM_FILE_SUFFIX, DEFAULT_CHECKSUM_CHUNK_SIZE,
+    BlockChecksum, BlockMeta, BlockState, ChecksumHeader, ChecksumVerify, CHECKSUM_FILE_SUFFIX,
+    DEFAULT_CHECKSUM_CHUNK_SIZE,
 };
 use crate::{BlockReadContext, BlockWriteContext, VfsDir};
 use curvine_core_error::{err_box, try_err, CommonResult};
@@ -26,7 +27,7 @@ use curvine_runtime::common::FileUtils;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy)]
@@ -118,6 +119,75 @@ impl FileLayout {
         let mut name = OsString::from(block_path.as_os_str());
         name.push(CHECKSUM_FILE_SUFFIX);
         PathBuf::from(name)
+    }
+
+    /// Load the sidecar of `block_path`, `Ok(None)` when it does not exist.
+    /// Called right after opening the block file under the dataset read lock,
+    /// so both belong to the same published generation.
+    ///
+    /// The header is checked against `file_len` and the sidecar's own size
+    /// before the rest is read, and the read is capped at that size, so a
+    /// damaged or enlarged sidecar fails without loading it into memory.
+    fn read_checksum(
+        block_id: i64,
+        block_path: &Path,
+        file_len: i64,
+    ) -> IOResult<Option<BlockChecksum>> {
+        let checksum_path = Self::checksum_path_of(block_path);
+        let mut file = match File::open(&checksum_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let invalid = |reason: String| -> IOResult<Option<BlockChecksum>> {
+            err_box!(
+                "invalid checksum sidecar {}: {}",
+                checksum_path.display(),
+                reason
+            )
+        };
+
+        let sidecar_len = file.metadata()?.len();
+        let mut buf = vec![0u8; ChecksumHeader::LEN];
+        match file.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                return invalid(format!("checksum data too short: {sidecar_len} bytes"));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let header = match ChecksumHeader::parse(&buf) {
+            Ok(header) => header,
+            Err(e) => return invalid(e.to_string()),
+        };
+        // Finalize materializes the file to the checksummed length, so a
+        // different file length means the block changed afterwards.
+        if header.data_len as i64 != file_len {
+            return err_box!(
+                "Block {} checksum length mismatch: checksum covers {}, file length {}",
+                block_id,
+                header.data_len,
+                file_len
+            );
+        }
+        let expected = match header.encoded_len() {
+            Some(len) if len == sidecar_len => len,
+            _ => return invalid(format!("size {sidecar_len} does not match its header")),
+        };
+
+        // One byte past `expected` detects a sidecar that grew after the size
+        // check.
+        let rest = expected - ChecksumHeader::LEN as u64;
+        (&mut file).take(rest + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 != expected {
+            return invalid(format!(
+                "size changed while reading, expected {expected} bytes"
+            ));
+        }
+        match BlockChecksum::decode(&buf) {
+            Ok(checksum) => Ok(Some(checksum)),
+            Err(e) => invalid(e.to_string()),
+        }
     }
 
     fn is_checksum_file(file: &str) -> bool {
@@ -407,6 +477,7 @@ impl BlockLayout for FileLayout {
         meta: &BlockMeta,
         off: i64,
         logical_len: i64,
+        verify: ChecksumVerify,
     ) -> IOResult<BlockReadContext> {
         let file = Self::block_file(dir, meta)?;
         // The opened file is the source of truth for bytes that can be read
@@ -434,7 +505,22 @@ impl BlockLayout for FileLayout {
             );
         }
         let physical_len = device.len().min(logical_len);
-        BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)
+        let file_len = device.len();
+        let reader = BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)?;
+        // Only a finalized generation has a published sidecar. Writing,
+        // Recovering and Finalizing blocks are served from staging, where the
+        // sidecar does not exist yet or is still being written by finalize.
+        if !verify.is_enabled() || !meta.is_final() {
+            return Ok(reader);
+        }
+
+        match Self::read_checksum(meta.id, Path::new(&file), file_len)? {
+            Some(checksum) => reader.with_checksum(checksum),
+            None if verify == ChecksumVerify::RequireSidecar => {
+                err_box!("Block {} has no checksum sidecar", meta.id)
+            }
+            None => Ok(reader),
+        }
     }
 
     fn short_circuit(&self, dir: &VfsDir, meta: &BlockMeta) -> CommonResult<Option<String>> {

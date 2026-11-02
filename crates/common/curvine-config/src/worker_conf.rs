@@ -173,14 +173,26 @@ pub struct WorkerConf {
     pub enable_splice: bool,
     pub enable_send_file: bool,
 
-    /// Switch for block data checksums (#1921). Off by default.
+    /// Write block data checksums (#1921). Off by default.
     ///
     /// When enabled, finalizing a local file block writes a per-chunk CRC32C
-    /// sidecar next to it. Reads do not verify it yet, so this does not provide
-    /// integrity protection on its own. Planned follow-up work will verify
-    /// checksums on read; once that lands, enabling it will route reads
-    /// through the worker, so sendfile and short-circuit reads will not be used.
+    /// sidecar next to it. Verification on read is controlled separately by
+    /// `block_checksum_verify`.
     pub block_checksum: bool,
+
+    /// Verify block data checksums on read (#1921). Off by default.
+    ///
+    /// When enabled, worker reads of local file blocks check every chunk
+    /// against its sidecar and fail with an IO error on mismatch, so corrupted
+    /// bytes are never returned. Sendfile and short-circuit reads are not used
+    /// while this is on, because they bypass the check.
+    pub block_checksum_verify: bool,
+
+    /// With `block_checksum_verify`, whether a block without a sidecar is read
+    /// unverified (true, default) or rejected (false). Blocks written before
+    /// `block_checksum` was enabled, or while it is off, have no sidecar, so
+    /// rejecting them only makes sense once every block has one.
+    pub block_checksum_allow_missing: bool,
 
     // Pipe size
     pub pipe_buf_size: usize,
@@ -244,6 +256,8 @@ impl Default for WorkerConf {
             enable_splice: false,
             enable_send_file: true,
             block_checksum: false,
+            block_checksum_verify: false,
+            block_checksum_allow_missing: true,
 
             pipe_buf_size: 64 * 1024,
             pipe_pool_init_cap: 0,
@@ -291,6 +305,21 @@ mod tests {
     fn block_checksum_parses_from_toml() {
         let conf: WorkerConf = toml::from_str("block_checksum = true").unwrap();
         assert!(conf.block_checksum);
+        assert!(!conf.block_checksum_verify);
+    }
+
+    #[test]
+    fn block_checksum_verify_defaults_and_parses() {
+        let conf = WorkerConf::default();
+        assert!(!conf.block_checksum_verify);
+        assert!(conf.block_checksum_allow_missing);
+
+        let conf: WorkerConf =
+            toml::from_str("block_checksum_verify = true\nblock_checksum_allow_missing = false")
+                .unwrap();
+        assert!(conf.block_checksum_verify);
+        assert!(!conf.block_checksum_allow_missing);
+        assert!(!conf.block_checksum);
     }
 
     #[test]

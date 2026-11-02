@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::layout::{validate_open_offset, BlockLayout};
-use crate::{BlockMeta, BlockState};
+use crate::{BlockMeta, BlockState, ChecksumVerify};
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::IOResult;
@@ -197,6 +197,7 @@ impl BlockLayout for BdevLayout {
         meta: &BlockMeta,
         off: i64,
         logical_len: i64,
+        _verify: ChecksumVerify,
     ) -> IOResult<BlockReadContext> {
         let physical_len = meta.len;
         let logical_len = logical_len.max(physical_len);
