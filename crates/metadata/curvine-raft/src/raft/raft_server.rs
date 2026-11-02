@@ -58,7 +58,8 @@ impl RaftServer {
             self.grpc.uri(&self.hostname, self.port),
             client_tls.as_ref(),
         )?;
-        let mut grpc_server = curvine_rpc::grpc::TransportConfig::default().server(tls.as_ref())?;
+        let transport = curvine_rpc::grpc::TransportConfig::default();
+        let mut grpc_server = transport.server(tls.as_ref())?;
         let reflection = if self.grpc.enable_reflection {
             Some(
                 curvine_rpc::grpc::reflection::server::Builder::configure()
@@ -87,9 +88,16 @@ impl RaftServer {
             .await;
         monitor.advance_running();
         self.rt.spawn(async move {
-            let incoming = futures::stream::unfold(listener, |listener| async move {
-                Some((listener.accept().await.map(|(stream, _)| stream), listener))
-            });
+            let incoming = futures::stream::unfold(
+                (listener, transport),
+                |(listener, transport)| async move {
+                    let accepted = listener.accept().await.and_then(|(stream, _)| {
+                        transport.configure_socket(&stream)?;
+                        Ok(stream)
+                    });
+                    Some((accepted, (listener, transport)))
+                },
+            );
             let service = crate::proto::raft::raft_service_server::RaftServiceServer::new(
                 crate::raft::grpc_server::RaftGrpcServer::new(service),
             )

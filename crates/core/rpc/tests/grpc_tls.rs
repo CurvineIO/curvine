@@ -244,3 +244,31 @@ async fn server_tls_without_client_auth_accepts_no_client_certificate() {
     let _ = stop.send(());
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn custom_incoming_socket_options_are_applied() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (client, accepted) =
+        tokio::join!(tokio::net::TcpStream::connect(address), listener.accept(),);
+    let _client = client.unwrap();
+    let (stream, _) = accepted.unwrap();
+    stream.set_nodelay(false).unwrap();
+    let socket = socket2::SockRef::from(&stream);
+    socket.set_keepalive(false).unwrap();
+
+    TransportConfig::default()
+        .configure_socket(&stream)
+        .unwrap();
+    assert!(stream.nodelay().unwrap());
+    assert!(socket.keepalive().unwrap());
+
+    TransportConfig {
+        tcp_keepalive: None,
+        ..Default::default()
+    }
+    .configure_socket(&stream)
+    .unwrap();
+    assert!(stream.nodelay().unwrap());
+    assert!(!socket.keepalive().unwrap());
+}

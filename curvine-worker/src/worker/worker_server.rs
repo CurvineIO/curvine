@@ -283,7 +283,8 @@ impl Worker {
         }
         let grpc_config = &self.service.conf.worker.grpc;
         let tls = grpc_config.server_tls()?;
-        let mut grpc_server = curvine_rpc::grpc::TransportConfig::default().server(tls.as_ref())?;
+        let transport = curvine_rpc::grpc::TransportConfig::default();
+        let mut grpc_server = transport.server(tls.as_ref())?;
         let reflection = if grpc_config.enable_reflection {
             Some(
                 curvine_rpc::grpc::reflection::server::Builder::configure()
@@ -343,13 +344,16 @@ impl Worker {
         let shutdown_monitor = monitor.clone();
         let shutdown_tracker = tracker.clone();
         self.rt.spawn(async move {
-            let incoming = futures::stream::unfold(listener, |listener| async move {
-                let accepted = listener.accept().await.and_then(|(stream, _)| {
-                    stream.set_nodelay(true)?;
-                    Ok(stream)
-                });
-                Some((accepted, listener))
-            });
+            let incoming = futures::stream::unfold(
+                (listener, transport),
+                |(listener, transport)| async move {
+                    let accepted = listener.accept().await.and_then(|(stream, _)| {
+                        transport.configure_socket(&stream)?;
+                        Ok(stream)
+                    });
+                    Some((accepted, (listener, transport)))
+                },
+            );
             let shutdown = async move {
                 #[cfg(unix)]
                 {

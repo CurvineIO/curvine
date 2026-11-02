@@ -239,7 +239,8 @@ impl TransferServer {
                     .with_service_name("proto.TransferService")
                     .build()?)
             } else { None };
-            let mut grpc_server = curvine_rpc::grpc::TransportConfig::default().server(tls.as_ref())?;
+            let transport = curvine_rpc::grpc::TransportConfig::default();
+            let mut grpc_server = transport.server(tls.as_ref())?;
             monitor.advance_running();
             ready.store(true, Ordering::Relaxed);
             self.rpc_rt.spawn(async move {
@@ -247,9 +248,16 @@ impl TransferServer {
                 let shutdown_ready = task_ready.clone();
                 let shutdown_stop = stop.clone();
                 let shutdown_monitor = task_monitor.clone();
-                let incoming = futures::stream::unfold(listener, |listener| async move {
-                    Some((listener.accept().await.map(|(stream, _)| stream), listener))
-                });
+                let incoming = futures::stream::unfold(
+                    (listener, transport),
+                    |(listener, transport)| async move {
+                        let accepted = listener.accept().await.and_then(|(stream, _)| {
+                            transport.configure_socket(&stream)?;
+                            Ok(stream)
+                        });
+                        Some((accepted, (listener, transport)))
+                    },
+                );
                 let service = TransferServiceServer::new(handler)
                     .max_decoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES)
                     .max_encoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES);

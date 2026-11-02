@@ -132,6 +132,12 @@ jobs:
           # destination-fencing chain; these tests require the explicit feature.
           cargo test -p curvine-tests --features fault-injection --test replication_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
 
+      - name: gRPC writer and transport regression tests
+        run: |
+          cargo test -p curvine-client-core --test block_writer_open_wiring_test --jobs ${{ env.CARGO_BUILD_JOBS }}
+          cargo test -p curvine-tests --test grpc_batch_writer_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
+          cargo test -p curvine-rpc --features transport --test grpc_tls --jobs ${{ env.CARGO_BUILD_JOBS }}
+
       - name: Minimal client artifact dependency guardrails
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"

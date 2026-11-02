@@ -50,7 +50,7 @@ impl BatchBlockWriterRemote {
                 0,
                 block_size,
                 req_id,
-                fs_context.write_chunk_size() as i32,
+                seq_id,
                 fs_context.write_chunk_size() as i32,
                 false,
             )
@@ -69,7 +69,7 @@ impl BatchBlockWriterRemote {
         });
         if let Err(error) = validation {
             let _ = client
-                .write_commit_batch(&blocks, pos, block_size, req_id, seq_id, true)
+                .write_commit_batch(&blocks, pos, block_size, req_id, seq_id + 1, true)
                 .await;
             return Err(error);
         }

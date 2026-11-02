@@ -241,6 +241,17 @@ impl Default for TransportConfig {
 
 #[cfg(feature = "transport")]
 impl TransportConfig {
+    /// Apply socket options before handing a custom incoming stream to tonic.
+    /// Server builder options only configure tonic's own TCP listener.
+    pub fn configure_socket(&self, stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+        stream.set_nodelay(true)?;
+        let socket = socket2::SockRef::from(stream);
+        match self.tcp_keepalive {
+            Some(time) => socket.set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(time)),
+            None => socket.set_keepalive(false),
+        }
+    }
+
     /// Service clients and servers must also apply `max_message_bytes` to
     /// their generated encode/decode limit setters.
     pub fn endpoint(

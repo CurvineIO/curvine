@@ -317,7 +317,8 @@ impl Master {
                 1
             };
             let tls = service.conf.master.grpc.server_tls()?;
-            let mut grpc_server = curvine_rpc::grpc::TransportConfig::default()
+            let transport = curvine_rpc::grpc::TransportConfig::default();
+            let mut grpc_server = transport
                 .server(tls.as_ref())?
                 .concurrency_limit_per_connection(conn_limit);
             let reflection = if service.conf.master.grpc.enable_reflection {
@@ -339,15 +340,16 @@ impl Master {
             tokio::spawn(async move {
                 let shutdown_tracker = tracker.clone();
                 let shutdown_monitor = task_monitor.clone();
-                let incoming = futures::stream::unfold(listener, |listener| async move {
-                    Some((
-                        listener
-                            .accept()
-                            .await
-                            .map(|(stream, _)| TrackedStream::new(stream, metrics)),
-                        listener,
-                    ))
-                });
+                let incoming = futures::stream::unfold(
+                    (listener, transport),
+                    |(listener, transport)| async move {
+                        let accepted = listener.accept().await.and_then(|(stream, _)| {
+                            transport.configure_socket(&stream)?;
+                            Ok(TrackedStream::new(stream, metrics))
+                        });
+                        Some((accepted, (listener, transport)))
+                    },
+                );
                 let service = MasterServiceServer::new(handler)
                     .max_decoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES)
                     .max_encoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES);
