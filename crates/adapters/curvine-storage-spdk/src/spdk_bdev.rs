@@ -387,13 +387,15 @@ impl SpdkBdev {
         }
         const SCT_GENERIC: u32 = 0x0;
         const SCT_PATH: u32 = 0x3;
-        const GENERIC_ABORTED_CODES: [u32; 6] = [
+        const GENERIC_ABORTED_CODES: [u32; 8] = [
             0x05, // ABORTED_POWER_LOSS
             0x07, // ABORTED_BY_REQUEST
             0x08, // ABORTED_SQ_DELETION
             0x09, // ABORTED_FAILED_FUSED
             0x0a, // ABORTED_MISSING_FUSED
             0x1b, // ABORTED_PREEMPT
+            0x21, // COMMAND_INTERRUPTED
+            0x22, // COMMAND_TRANSIENT_TRANSPORT_ERROR
         ];
         let code = (-rc) as u32;
         match code / 256 {
@@ -1591,7 +1593,7 @@ mod test {
     #[test]
     fn is_uncertain_abort_status_covers_full_blocklist() {
         // Generic (SCT=0) blocklist codes must be uncertain.
-        for sc in [0x05i32, 0x07, 0x08, 0x09, 0x0a, 0x1b] {
+        for sc in [0x05i32, 0x07, 0x08, 0x09, 0x0a, 0x1b, 0x21, 0x22] {
             let rc = -sc;
             assert!(
                 SpdkBdev::is_uncertain_abort_status(rc),
@@ -1607,7 +1609,15 @@ mod test {
         );
 
         // Codes not in the blocklist must be accepted (not uncertain).
-        for (sct, sc) in [(0u32, 0x02u32), (0, 0x80), (0, 0x00), (2, 0x08), (0, 0x71)] {
+        for (sct, sc) in [
+            (0u32, 0x02u32),
+            (0, 0x80),
+            (0, 0x00),
+            (0, 0x20),
+            (0, 0x23),
+            (2, 0x08),
+            (0, 0x71),
+        ] {
             let rc = -((sct * 256 + sc) as i32);
             assert!(
                 !SpdkBdev::is_uncertain_abort_status(rc),
