@@ -92,8 +92,9 @@ message WriteBlockChunk {
   optional bytes data = 2;
 }
 
-// One operation is outstanding at a time on each stream. Request identity
-// stays stable across the lifecycle, including a fenced replication write.
+// Operations are processed in wire sequence order on each stream. Writes may
+// be pipelined and reads may request bounded bursts. Request identity remains
+// stable across the lifecycle, including a fenced replication write.
 message BlockDataRequest {
   required int64 req_id = 1;
   required int32 seq_id = 2;

@@ -588,6 +588,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn read_pipeline_window_requires_a_bounded_positive_value() {
+        for window in [0, 33] {
+            let mut conf = ClientConf { read_pipeline_window: window, ..Default::default() };
+            assert!(conf.init().is_err());
+        }
+        for window in [1, 4, 8, 32] {
+            let mut conf = ClientConf { read_pipeline_window: window, ..Default::default() };
+            conf.init().unwrap();
+        }
+    }
+
+    #[test]
     fn write_pipeline_window_requires_a_bounded_positive_value() {
         for window in [0, 1025] {
             let mut conf = ClientConf {
