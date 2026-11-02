@@ -226,6 +226,15 @@ pub struct ClientConf {
     #[client_cli]
     pub close_timeout_secs: u64,
 
+    // Maximum time to wait for one request/response handshake with the write
+    // buffer background task (data enqueue, flush, complete, cancel, seek,
+    // resize), in milliseconds. Bounds how long a writer (and e.g. the Java
+    // SDK closeWriter) can block when the background task stops responding.
+    // Keep it above the slowest expected single data write.
+    #[serde(alias = "write_buffer_timeout")]
+    #[client_cli]
+    pub write_buffer_timeout_ms: u64,
+
     #[client_cli(skip)]
     pub metadata_operation_buckets: Vec<f64>,
 
@@ -318,6 +327,10 @@ impl ClientConf {
 
     pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
 
+    // Extra margin added on top of the budgets one handshake can legitimately
+    // wait on (see DEFAULT_WRITE_BUFFER_TIMEOUT_MARGIN_MS).
+    pub const DEFAULT_WRITE_BUFFER_TIMEOUT_MARGIN_MS: u64 = 60 * 1000;
+
     pub const DEFAULT_READ_PARALLEL: i64 = 1;
 
     pub const DEFAULT_MAX_READ_PARALLEL: i64 = 8;
@@ -362,6 +375,22 @@ impl ClientConf {
 
         self.seek_absorb_window =
             ByteUnit::from_str(&self.seek_absorb_window_str)?.as_byte() as i64;
+
+        // 0 means "unset" (e.g. the SDK FilesystemConf omits it): derive the
+        // default from the budgets one handshake legitimately waits on. One
+        // master RPC is a leader attempt bounded by rpc_timeout_ms followed
+        // by polling bounded by rpc_retry_max_duration_ms (~240s during a
+        // master failover), and a Complete also drains up to write_chunk_num
+        // queued chunks each bounded by data_timeout_ms. The deadline must
+        // exceed those budgets, otherwise slow-but-healthy closes get
+        // reported as failed (see #1908 review). A fixed margin covers the
+        // queue drain; strictly larger total budgets keep the derivation
+        // sound.
+        if self.write_buffer_timeout_ms == 0 {
+            self.write_buffer_timeout_ms = self.rpc_timeout_ms
+                + self.rpc_retry_max_duration_ms
+                + Self::DEFAULT_WRITE_BUFFER_TIMEOUT_MARGIN_MS;
+        }
 
         self.small_file_size = ByteUnit::from_str(&self.small_file_size_str)?.as_byte() as i64;
 
@@ -496,6 +525,10 @@ impl Default for ClientConf {
             heartbeat_interval_ms: Self::DEFAULT_HEARTBEAT_INTERVAL_MS,
 
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
+
+            // Placeholder; init() derives the real default from the RPC
+            // budgets when this stays 0 (unset).
+            write_buffer_timeout_ms: 0,
 
             metadata_operation_buckets: vec![
                 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
