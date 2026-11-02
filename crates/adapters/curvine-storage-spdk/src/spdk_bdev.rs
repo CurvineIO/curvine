@@ -379,25 +379,28 @@ impl SpdkBdev {
         )
     }
 
-    /// True if `rc` is a Generic abort status (SCT=0). SPDK can complete
-    /// a write/flush with one of these on qpair loss, via the normal
-    /// (non-forced) callback; the write may still have reached disk.
+    /// True if `rc` is a Generic (SCT=0) or Path (SCT=3) abort status:
+    /// SPDK can complete this way on qpair loss; write may still land.
     fn is_uncertain_abort_status(rc: i32) -> bool {
         if rc >= 0 {
             return false;
         }
         const SCT_GENERIC: u32 = 0x0;
-        const ABORTED_CODES: [u32; 7] = [
+        const SCT_PATH: u32 = 0x3;
+        const GENERIC_ABORTED_CODES: [u32; 6] = [
             0x05, // ABORTED_POWER_LOSS
             0x07, // ABORTED_BY_REQUEST
             0x08, // ABORTED_SQ_DELETION
             0x09, // ABORTED_FAILED_FUSED
             0x0a, // ABORTED_MISSING_FUSED
             0x1b, // ABORTED_PREEMPT
-            0x71, // ABORTED_BY_HOST
         ];
         let code = (-rc) as u32;
-        code / 256 == SCT_GENERIC && ABORTED_CODES.contains(&(code % 256))
+        match code / 256 {
+            SCT_GENERIC => GENERIC_ABORTED_CODES.contains(&(code % 256)),
+            SCT_PATH => code % 256 == 0x71, // ABORTED_BY_HOST
+            _ => false,
+        }
     }
 
     /// Check that the current position + len doesn't exceed device size.
@@ -1587,17 +1590,24 @@ mod test {
     /// Every blocklist code must be uncertain; codes outside it must not.
     #[test]
     fn is_uncertain_abort_status_covers_full_blocklist() {
-        // All 7 blocklist codes (SCT=0 Generic) must be uncertain.
-        for sc in [0x05i32, 0x07, 0x08, 0x09, 0x0a, 0x1b, 0x71] {
+        // Generic (SCT=0) blocklist codes must be uncertain.
+        for sc in [0x05i32, 0x07, 0x08, 0x09, 0x0a, 0x1b] {
             let rc = -sc;
             assert!(
                 SpdkBdev::is_uncertain_abort_status(rc),
-                "SC=0x{sc:02x} must be classified uncertain"
+                "SCT=0/SC=0x{sc:02x} must be classified uncertain"
             );
         }
 
+        // ABORTED_BY_HOST is Path (SCT=3), not Generic (SCT=0).
+        let rc = -((3 << 8) | 0x71);
+        assert!(
+            SpdkBdev::is_uncertain_abort_status(rc),
+            "SCT=3/SC=0x71 (ABORTED_BY_HOST) must be classified uncertain"
+        );
+
         // Codes not in the blocklist must be accepted (not uncertain).
-        for (sct, sc) in [(0u32, 0x02u32), (0, 0x80), (0, 0x00), (2, 0x08)] {
+        for (sct, sc) in [(0u32, 0x02u32), (0, 0x80), (0, 0x00), (2, 0x08), (0, 0x71)] {
             let rc = -((sct * 256 + sc) as i32);
             assert!(
                 !SpdkBdev::is_uncertain_abort_status(rc),
