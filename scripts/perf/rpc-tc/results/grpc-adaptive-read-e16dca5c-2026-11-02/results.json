@@ -1,0 +1,1778 @@
+{
+  "schema_version": 1,
+  "experiment_type": "adaptive_opt_in",
+  "provenance": "provenance.json",
+  "raw_archive": "raw-measurements.json.gz",
+  "orpc_gate_thresholds": {
+    "throughput_min": 0.85,
+    "p99_max": 1.1,
+    "cpu_per_gib_max": 1.15
+  },
+  "comparator_provisional_pass_thresholds": {
+    "throughput_min": 0.85,
+    "p99_max": 1.1,
+    "cpu_per_gib_max": 1.15
+  },
+  "all_orpc_gates_pass": false,
+  "profiles": {
+    "1gbit": {
+      "summary": {
+        "orpc": {
+          "throughput": {
+            "median": 119415143.60534988,
+            "min": 119156777.40308969,
+            "max": 119460356.4052403
+          },
+          "p99": {
+            "median": 82.671372,
+            "min": 73.683702,
+            "max": 116.973645
+          },
+          "cpu_per_gib": {
+            "median": 1.1300000000000001,
+            "min": 1.1175000000000002,
+            "max": 1.1425
+          },
+          "timed_reads_combined_rss_mib": {
+            "median": 113.15234375,
+            "min": 111.9375,
+            "max": 114.39453125
+          },
+          "whole_run_combined_rss_mib": {
+            "median": 113.15234375,
+            "min": 111.9375,
+            "max": 114.39453125
+          }
+        },
+        "previous": {
+          "throughput": {
+            "median": 119021249.80869068,
+            "min": 114701335.14596543,
+            "max": 119068165.01494247
+          },
+          "p99": {
+            "median": 87.358922,
+            "min": 79.476608,
+            "max": 95.816856
+          },
+          "cpu_per_gib": {
+            "median": 3.3925,
+            "min": 3.33,
+            "max": 3.4225
+          },
+          "timed_reads_combined_rss_mib": {
+            "median": 147.00390625,
+            "min": 146.9296875,
+            "max": 147.76171875
+          },
+          "whole_run_combined_rss_mib": {
+            "median": 147.00390625,
+            "min": 146.9296875,
+            "max": 147.76171875
+          }
+        },
+        "grpc": {
+          "throughput": {
+            "median": 119062925.66195862,
+            "min": 118984313.30566598,
+            "max": 119083052.85443501
+          },
+          "p99": {
+            "median": 88.673978,
+            "min": 77.393609,
+            "max": 98.590711
+          },
+          "cpu_per_gib": {
+            "median": 3.3825,
+            "min": 3.3625,
+            "max": 3.4475
+          },
+          "timed_reads_combined_rss_mib": {
+            "median": 149.15625,
+            "min": 146.3828125,
+            "max": 150.765625
+          },
+          "whole_run_combined_rss_mib": {
+            "median": 149.15625,
+            "min": 146.3828125,
+            "max": 150.765625
+          }
+        }
+      },
+      "orpc_comparison": {
+        "grpc_over_orpc": {
+          "throughput": 0.9970504750674228,
+          "p99": 1.0726080365522421,
+          "cpu_per_gib": 2.9933628318584065
+        },
+        "median": {
+          "orpc": {
+            "throughput": 119415143.60534988,
+            "p99": 82.671372,
+            "cpu_per_gib": 1.1300000000000001
+          },
+          "grpc": {
+            "throughput": 119062925.66195862,
+            "p99": 88.673978,
+            "cpu_per_gib": 3.3825
+          }
+        },
+        "revisions": {
+          "orpc": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+          "grpc": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd"
+        },
+        "runs_per_transport": 5,
+        "provisional_pass": false,
+        "note": "Valid only for matched workloads; tc results do not establish the hardware gate."
+      },
+      "orpc_ratios": {
+        "throughput": 0.9970504750674228,
+        "p99": 1.0726080365522421,
+        "cpu_per_gib": 2.9933628318584065
+      },
+      "orpc_gate": {
+        "checks": {
+          "throughput": true,
+          "p99": true,
+          "cpu_per_gib": false
+        },
+        "pass": false
+      },
+      "checkpoint_comparison": {
+        "candidate_over_baseline": {
+          "throughput": 1.0003501547272855,
+          "p99": 1.0150534824594104,
+          "cpu_per_gib": 0.9970523212969785
+        },
+        "median": {
+          "baseline": {
+            "throughput": 119021249.80869068,
+            "p99": 87.358922,
+            "cpu_per_gib": 3.3925
+          },
+          "candidate": {
+            "throughput": 119062925.66195862,
+            "p99": 88.673978,
+            "cpu_per_gib": 3.3825
+          }
+        },
+        "revisions": {
+          "baseline": "0eeb5054f92afe1457318525d109bc3e323b2312",
+          "candidate": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd"
+        },
+        "runs_per_transport": 5,
+        "provisional_pass": true,
+        "note": "Valid only for matched workloads; tc results do not establish the hardware gate."
+      },
+      "checkpoint_ratios": {
+        "throughput": 1.0003501547272855,
+        "p99": 1.0150534824594104,
+        "cpu_per_gib": 0.9970523212969785
+      }
+    },
+    "10gbit": {
+      "summary": {
+        "orpc": {
+          "throughput": {
+            "median": 1155949204.9659274,
+            "min": 1126990990.0131304,
+            "max": 1160272560.2194176
+          },
+          "p99": {
+            "median": 5.955485,
+            "min": 5.801946,
+            "max": 6.41823
+          },
+          "cpu_per_gib": {
+            "median": 0.9249999999999999,
+            "min": 0.88,
+            "max": 0.9775
+          },
+          "timed_reads_combined_rss_mib": {
+            "median": 112.63671875,
+            "min": 108.8125,
+            "max": 116.73828125
+          },
+          "whole_run_combined_rss_mib": {
+            "median": 112.63671875,
+            "min": 108.8125,
+            "max": 116.73828125
+          }
+        },
+        "previous": {
+          "throughput": {
+            "median": 697794777.5794411,
+            "min": 685975828.2644063,
+            "max": 716062584.1129861
+          },
+          "p99": {
+            "median": 8.899869,
+            "min": 8.504497,
+            "max": 9.039822
+          },
+          "cpu_per_gib": {
+            "median": 4.25,
+            "min": 4.2425,
+            "max": 4.3525
+          },
+          "timed_reads_combined_rss_mib": {
+            "median": 156.11328125,
+            "min": 153.37109375,
+            "max": 157.07421875
+          },
+          "whole_run_combined_rss_mib": {
+            "median": 156.11328125,
+            "min": 153.37109375,
+            "max": 157.07421875
+          }
+        },
+        "grpc": {
+          "throughput": {
+            "median": 842256824.0951421,
+            "min": 840093763.1191995,
+            "max": 846148511.5359511
+          },
+          "p99": {
+            "median": 8.447831,
+            "min": 8.341262,
+            "max": 8.834536
+          },
+          "cpu_per_gib": {
+            "median": 4.425,
+            "min": 4.32,
+            "max": 4.465
+          },
+          "timed_reads_combined_rss_mib": {
+            "median": 190.0390625,
+            "min": 185.203125,
+            "max": 194.73046875
+          },
+          "whole_run_combined_rss_mib": {
+            "median": 190.0390625,
+            "min": 185.203125,
+            "max": 194.73046875
+          }
+        }
+      },
+      "orpc_comparison": {
+        "grpc_over_orpc": {
+          "throughput": 0.728627884752054,
+          "p99": 1.418495890762885,
+          "cpu_per_gib": 4.783783783783784
+        },
+        "median": {
+          "orpc": {
+            "throughput": 1155949204.9659274,
+            "p99": 5.955485,
+            "cpu_per_gib": 0.9249999999999999
+          },
+          "grpc": {
+            "throughput": 842256824.0951421,
+            "p99": 8.447831,
+            "cpu_per_gib": 4.425
+          }
+        },
+        "revisions": {
+          "orpc": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+          "grpc": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd"
+        },
+        "runs_per_transport": 5,
+        "provisional_pass": false,
+        "note": "Valid only for matched workloads; tc results do not establish the hardware gate."
+      },
+      "orpc_ratios": {
+        "throughput": 0.728627884752054,
+        "p99": 1.418495890762885,
+        "cpu_per_gib": 4.783783783783784
+      },
+      "orpc_gate": {
+        "checks": {
+          "throughput": false,
+          "p99": false,
+          "cpu_per_gib": false
+        },
+        "pass": false
+      },
+      "checkpoint_comparison": {
+        "candidate_over_baseline": {
+          "throughput": 1.2070265515841505,
+          "p99": 0.9492084658774191,
+          "cpu_per_gib": 1.0411764705882351
+        },
+        "median": {
+          "baseline": {
+            "throughput": 697794777.5794411,
+            "p99": 8.899869,
+            "cpu_per_gib": 4.25
+          },
+          "candidate": {
+            "throughput": 842256824.0951421,
+            "p99": 8.447831,
+            "cpu_per_gib": 4.425
+          }
+        },
+        "revisions": {
+          "baseline": "0eeb5054f92afe1457318525d109bc3e323b2312",
+          "candidate": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd"
+        },
+        "runs_per_transport": 5,
+        "provisional_pass": true,
+        "note": "Valid only for matched workloads; tc results do not establish the hardware gate."
+      },
+      "checkpoint_ratios": {
+        "throughput": 1.2070265515841505,
+        "p99": 0.9492084658774191,
+        "cpu_per_gib": 1.0411764705882351
+      }
+    }
+  },
+  "runs": [
+    {
+      "id": "1gbit-1-orpc",
+      "rate": "1gbit",
+      "iteration": 1,
+      "label": "orpc",
+      "configured_read_pipeline_window": null,
+      "revision": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 36.044674836,
+      "client_cpu_seconds": 3.52,
+      "server_cpu_seconds": 1.05,
+      "metrics": {
+        "throughput": 119156777.40308969,
+        "p99": 90.140751,
+        "cpu_per_gib": 1.1425
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 44.40625,
+          "worker": 28.79296875,
+          "client": 40.984375,
+          "combined": 114.13671875
+        },
+        "timed_reads": {
+          "master": 44.40625,
+          "worker": 28.7578125,
+          "client": 40.984375,
+          "combined": 114.13671875
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4566034082,
+          "packets": 3024908,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 78644930,
+          "packets": 173171,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "3245a9960a51b0bc0d0cc92f3e103e08cdecf8b4e238fcf1e5ac40920a7c4ebf",
+      "canonical_result_sha256": "cf0d5e076f42d87d14460f37ada8957af759ccc2533ee26ae7e212b30f5710a0"
+    },
+    {
+      "id": "1gbit-1-previous",
+      "rate": "1gbit",
+      "iteration": 1,
+      "label": "previous",
+      "configured_read_pipeline_window": null,
+      "revision": "0eeb5054f92afe1457318525d109bc3e323b2312",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 37.44478903,
+      "client_cpu_seconds": 6.93,
+      "server_cpu_seconds": 6.62,
+      "metrics": {
+        "throughput": 114701335.14596543,
+        "p99": 79.476608,
+        "cpu_per_gib": 3.3875
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.68359375,
+          "worker": 61.00390625,
+          "client": 36.3359375,
+          "combined": 146.9296875
+        },
+        "timed_reads": {
+          "master": 49.68359375,
+          "worker": 61.00390625,
+          "client": 36.3359375,
+          "combined": 146.9296875
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4579460979,
+          "packets": 3191214,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 87988302,
+          "packets": 312596,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "bd6250bd97380efc0e43493869f7434468c564139670909e7074099184bbe25a",
+      "canonical_result_sha256": "83b6c4edf68cde271fc8aa5fceb52fecc736d2cf6ca21e7e22b1dd9005bd3927"
+    },
+    {
+      "id": "1gbit-1-grpc",
+      "rate": "1gbit",
+      "iteration": 1,
+      "label": "grpc",
+      "configured_read_pipeline_window": 0,
+      "revision": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 36.086977145,
+      "client_cpu_seconds": 7.01,
+      "server_cpu_seconds": 6.78,
+      "metrics": {
+        "throughput": 119017098.01689737,
+        "p99": 85.621787,
+        "cpu_per_gib": 3.4475
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.26953125,
+          "worker": 60.4375,
+          "client": 40.66796875,
+          "combined": 150.2421875
+        },
+        "timed_reads": {
+          "master": 49.26953125,
+          "worker": 60.4375,
+          "client": 40.66796875,
+          "combined": 150.2421875
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4580010652,
+          "packets": 3199820,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 88190325,
+          "packets": 315670,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "1154fc4893e81d664a84d3b85a2d88c6e7b2e6a1ab40f4b42d7baeda3690b5d1",
+      "canonical_result_sha256": "7ad2be0d6fadceff4d46df4cd0b0a3defc308358f5e2438401b64d8bb4c64095"
+    },
+    {
+      "id": "10gbit-1-orpc",
+      "rate": "10gbit",
+      "iteration": 1,
+      "label": "orpc",
+      "configured_read_pipeline_window": null,
+      "revision": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 3.754323957,
+      "client_cpu_seconds": 2.87,
+      "server_cpu_seconds": 0.84,
+      "metrics": {
+        "throughput": 1144005510.763652,
+        "p99": 6.41823,
+        "cpu_per_gib": 0.9275
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 44.4921875,
+          "worker": 27.9609375,
+          "client": 44.29296875,
+          "combined": 116.73828125
+        },
+        "timed_reads": {
+          "master": 44.4921875,
+          "worker": 27.9609375,
+          "client": 44.29296875,
+          "combined": 116.73828125
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4566090411,
+          "packets": 3024928,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 74768296,
+          "packets": 114441,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "443c31589e339ac248aedbf8baa8064dd04242e03570e2f552c20e0f1a57c4bc",
+      "canonical_result_sha256": "b2fd4cfbaeafb6baca4792bb0ec85d54a20a3dd54d80820d18d676305ab1deb7"
+    },
+    {
+      "id": "10gbit-1-previous",
+      "rate": "10gbit",
+      "iteration": 1,
+      "label": "previous",
+      "configured_read_pipeline_window": null,
+      "revision": "0eeb5054f92afe1457318525d109bc3e323b2312",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 5.9980334,
+      "client_cpu_seconds": 7.78,
+      "server_cpu_seconds": 9.45,
+      "metrics": {
+        "throughput": 716062584.1129861,
+        "p99": 8.899869,
+        "cpu_per_gib": 4.3075
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 48.796875,
+          "worker": 60.046875,
+          "client": 44.58984375,
+          "combined": 153.37109375
+        },
+        "timed_reads": {
+          "master": 48.734375,
+          "worker": 60.046875,
+          "client": 44.58984375,
+          "combined": 153.37109375
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4580487736,
+          "packets": 3206694,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 83230935,
+          "packets": 237702,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "2ac7e93d3c977cab2e2ee2394ec8f115684e0ac67f7fcb3daee5d3dfea7c4d45",
+      "canonical_result_sha256": "601b42a882be0ef33f2633a1231d0d9ee2cf779ec71eacb93a404a2d13e736b4"
+    },
+    {
+      "id": "10gbit-1-grpc",
+      "rate": "10gbit",
+      "iteration": 1,
+      "label": "grpc",
+      "configured_read_pipeline_window": 0,
+      "revision": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 5.075902442,
+      "client_cpu_seconds": 7.85,
+      "server_cpu_seconds": 9.85,
+      "metrics": {
+        "throughput": 846148511.5359511,
+        "p99": 8.418847,
+        "cpu_per_gib": 4.425
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.76171875,
+          "worker": 92.99609375,
+          "client": 47.09765625,
+          "combined": 189.80078125
+        },
+        "timed_reads": {
+          "master": 49.76171875,
+          "worker": 92.99609375,
+          "client": 47.09765625,
+          "combined": 189.80078125
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4579815959,
+          "packets": 3195082,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 84444254,
+          "packets": 252268,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "bec1ab5ee324ca0acb39ced18740f046edb44978d6cad9f5d74dfbc3f4dfbfdd",
+      "canonical_result_sha256": "1fc6efef27cd83cb7838dd77a932a0d43c7ae7cb0adff4768f35c0bbd103f9c4"
+    },
+    {
+      "id": "10gbit-2-grpc",
+      "rate": "10gbit",
+      "iteration": 2,
+      "label": "grpc",
+      "configured_read_pipeline_window": 0,
+      "revision": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 5.10306722,
+      "client_cpu_seconds": 7.86,
+      "server_cpu_seconds": 9.89,
+      "metrics": {
+        "throughput": 841644272.1285572,
+        "p99": 8.447831,
+        "cpu_per_gib": 4.4375
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.5234375,
+          "worker": 94.68359375,
+          "client": 48.73046875,
+          "combined": 192.40625
+        },
+        "timed_reads": {
+          "master": 49.5234375,
+          "worker": 94.68359375,
+          "client": 48.73046875,
+          "combined": 192.40625
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4579869786,
+          "packets": 3195614,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 84347218,
+          "packets": 250689,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "9be4bc0cd479e426ea2bd42f1f3650bf740d0988200103bfccd93f25d5fd7cc2",
+      "canonical_result_sha256": "2f56dab587f9d3f4024fc426ec00efbf6e742b1c3c4a39699554f2e97f32a1b5"
+    },
+    {
+      "id": "10gbit-2-previous",
+      "rate": "10gbit",
+      "iteration": 2,
+      "label": "previous",
+      "configured_read_pipeline_window": null,
+      "revision": "0eeb5054f92afe1457318525d109bc3e323b2312",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 6.155057954,
+      "client_cpu_seconds": 7.77,
+      "server_cpu_seconds": 9.64,
+      "metrics": {
+        "throughput": 697794777.5794411,
+        "p99": 9.007209,
+        "cpu_per_gib": 4.3525
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.0859375,
+          "worker": 61.05859375,
+          "client": 45.97265625,
+          "combined": 156.11328125
+        },
+        "timed_reads": {
+          "master": 49.0859375,
+          "worker": 61.05859375,
+          "client": 45.97265625,
+          "combined": 156.11328125
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4580405532,
+          "packets": 3204740,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 83252253,
+          "packets": 237815,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "6a37dcd40f3d971aaf2821d225148da20f9f950d4eae556a34e284eee4a8e8a4",
+      "canonical_result_sha256": "3e1df69c21bb768d542d9ae098304a9351465014616ad8e9cfeed507745a76c6"
+    },
+    {
+      "id": "10gbit-2-orpc",
+      "rate": "10gbit",
+      "iteration": 2,
+      "label": "orpc",
+      "configured_read_pipeline_window": null,
+      "revision": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 3.70604106,
+      "client_cpu_seconds": 2.86,
+      "server_cpu_seconds": 0.84,
+      "metrics": {
+        "throughput": 1158909797.9394755,
+        "p99": 5.955485,
+        "cpu_per_gib": 0.9249999999999999
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 44.7109375,
+          "worker": 28.51171875,
+          "client": 43.0078125,
+          "combined": 116.21875
+        },
+        "timed_reads": {
+          "master": 44.7109375,
+          "worker": 28.50390625,
+          "client": 43.0078125,
+          "combined": 116.21875
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4566018629,
+          "packets": 3024873,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 74808494,
+          "packets": 115052,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "a72716d732c91c50850471f115b043e50ac366691dcc774320c80bb7400e162e",
+      "canonical_result_sha256": "e2646e827ee6135615f088008c330a9bad48d8a44c55792422c1a86c813f1db3"
+    },
+    {
+      "id": "1gbit-2-grpc",
+      "rate": "1gbit",
+      "iteration": 2,
+      "label": "grpc",
+      "configured_read_pipeline_window": 0,
+      "revision": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 36.071966031,
+      "client_cpu_seconds": 7.01,
+      "server_cpu_seconds": 6.74,
+      "metrics": {
+        "throughput": 119066626.20797919,
+        "p99": 77.393609,
+        "cpu_per_gib": 3.4375
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.2578125,
+          "worker": 61.14453125,
+          "client": 40.42578125,
+          "combined": 150.765625
+        },
+        "timed_reads": {
+          "master": 49.1953125,
+          "worker": 61.14453125,
+          "client": 40.42578125,
+          "combined": 150.765625
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4580012665,
+          "packets": 3199851,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 88197697,
+          "packets": 315788,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "f2813a0299837e62c501b70c4b14e985b7ec773c8603b8005afde0a28ef9570d",
+      "canonical_result_sha256": "83e0d3156c86e1e34902bc73254b8a55c4400d761733b4d6ba09112055735e12"
+    },
+    {
+      "id": "1gbit-2-previous",
+      "rate": "1gbit",
+      "iteration": 2,
+      "label": "previous",
+      "configured_read_pipeline_window": null,
+      "revision": "0eeb5054f92afe1457318525d109bc3e323b2312",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 36.073923908,
+      "client_cpu_seconds": 6.88,
+      "server_cpu_seconds": 6.69,
+      "metrics": {
+        "throughput": 119060163.98309027,
+        "p99": 86.293055,
+        "cpu_per_gib": 3.3925
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.08984375,
+          "worker": 59.25,
+          "client": 39.0390625,
+          "combined": 147.29296875
+        },
+        "timed_reads": {
+          "master": 49.02734375,
+          "worker": 59.25,
+          "client": 39.0390625,
+          "combined": 147.29296875
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4580009120,
+          "packets": 3199796,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 88241514,
+          "packets": 316452,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "267102e2c7186322e729fd9fa3b3aeb2a7a0f35b7f40b29cce5e033f9f488778",
+      "canonical_result_sha256": "39fe6e9ace51a0e5ebbd41b93d57302666aad1b802c4e762abcd94dbf2485823"
+    },
+    {
+      "id": "1gbit-2-orpc",
+      "rate": "1gbit",
+      "iteration": 2,
+      "label": "orpc",
+      "configured_read_pipeline_window": null,
+      "revision": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 35.966688699,
+      "client_cpu_seconds": 3.49,
+      "server_cpu_seconds": 1.03,
+      "metrics": {
+        "throughput": 119415143.60534988,
+        "p99": 82.671372,
+        "cpu_per_gib": 1.1300000000000001
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 44.62109375,
+          "worker": 27.8671875,
+          "client": 39.78125,
+          "combined": 112.26953125
+        },
+        "timed_reads": {
+          "master": 44.62109375,
+          "worker": 27.8671875,
+          "client": 39.78125,
+          "combined": 112.26953125
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4566021088,
+          "packets": 3024903,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 78820159,
+          "packets": 175826,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "2d59af4bacb6c2a1e59ef4c5ee1f04700f8ac7193e007003f119898c3613953f",
+      "canonical_result_sha256": "e537644d0b6f2b7f90d63e5e7aa6d4150e550a5425b8cbdaee4737cb1dc98a95"
+    },
+    {
+      "id": "1gbit-3-orpc",
+      "rate": "1gbit",
+      "iteration": 3,
+      "label": "orpc",
+      "configured_read_pipeline_window": null,
+      "revision": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 35.9615409,
+      "client_cpu_seconds": 3.46,
+      "server_cpu_seconds": 1.08,
+      "metrics": {
+        "throughput": 119432237.56577127,
+        "p99": 116.973645,
+        "cpu_per_gib": 1.135
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 44.6328125,
+          "worker": 28.8359375,
+          "client": 39.72265625,
+          "combined": 113.15234375
+        },
+        "timed_reads": {
+          "master": 44.6328125,
+          "worker": 28.8359375,
+          "client": 39.72265625,
+          "combined": 113.15234375
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4566021406,
+          "packets": 3024914,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 78801277,
+          "packets": 175535,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "3d6f7cb635e371df01676945b61e34a97dad1364aa3ab8fbd3375b9d517ef7b6",
+      "canonical_result_sha256": "07ff278184b5eb8c602921599af8a8b0ee715b9ed5ab4a3b7febb90d43bff211"
+    },
+    {
+      "id": "1gbit-3-previous",
+      "rate": "1gbit",
+      "iteration": 3,
+      "label": "previous",
+      "configured_read_pipeline_window": null,
+      "revision": "0eeb5054f92afe1457318525d109bc3e323b2312",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 36.071499846,
+      "client_cpu_seconds": 6.92,
+      "server_cpu_seconds": 6.66,
+      "metrics": {
+        "throughput": 119068165.01494247,
+        "p99": 87.358922,
+        "cpu_per_gib": 3.395
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.54296875,
+          "worker": 60.296875,
+          "client": 37.98828125,
+          "combined": 147.76171875
+        },
+        "timed_reads": {
+          "master": 49.48046875,
+          "worker": 60.296875,
+          "client": 37.98828125,
+          "combined": 147.76171875
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4580012161,
+          "packets": 3199846,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 88198041,
+          "packets": 315794,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "9cf87893d631782da2151b59cf501ee0555aa0624fc301b73c3fc33b84aadcab",
+      "canonical_result_sha256": "cd35d6a6f476db262b120f42751beee6a88a1927abd3543fbf8ca007b056f2a8"
+    },
+    {
+      "id": "1gbit-3-grpc",
+      "rate": "1gbit",
+      "iteration": 3,
+      "label": "grpc",
+      "configured_read_pipeline_window": 0,
+      "revision": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 36.073087169,
+      "client_cpu_seconds": 6.85,
+      "server_cpu_seconds": 6.68,
+      "metrics": {
+        "throughput": 119062925.66195862,
+        "p99": 89.028268,
+        "cpu_per_gib": 3.3825
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.7265625,
+          "worker": 59.828125,
+          "client": 38.08984375,
+          "combined": 147.5625
+        },
+        "timed_reads": {
+          "master": 49.7265625,
+          "worker": 59.828125,
+          "client": 38.08984375,
+          "combined": 147.5625
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4580028735,
+          "packets": 3200094,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 88242464,
+          "packets": 316458,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "9f8c3f50a17e269df5ea2f9e85f8ec340947ec3615a7a18d6f0cdfbb3f17b3c1",
+      "canonical_result_sha256": "8b4706fb501238e2366c1459d0dd8286e5fc3409696d3be7564b8523e52f7e2a"
+    },
+    {
+      "id": "10gbit-3-orpc",
+      "rate": "10gbit",
+      "iteration": 3,
+      "label": "orpc",
+      "configured_read_pipeline_window": null,
+      "revision": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 3.811004111,
+      "client_cpu_seconds": 3.1,
+      "server_cpu_seconds": 0.81,
+      "metrics": {
+        "throughput": 1126990990.0131304,
+        "p99": 6.411218,
+        "cpu_per_gib": 0.9775
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 44.5078125,
+          "worker": 28.3125,
+          "client": 39.8203125,
+          "combined": 112.63671875
+        },
+        "timed_reads": {
+          "master": 44.5078125,
+          "worker": 28.3125,
+          "client": 39.8203125,
+          "combined": 112.63671875
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4566088087,
+          "packets": 3024939,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 74662376,
+          "packets": 112837,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "a775d688f7a08cc4d7db5d2f8212a90d3974a429c98e665b2eb897e2dd6d542b",
+      "canonical_result_sha256": "7b8054d72b781c75ca0b178fa88da2a3f8490d13cce20fed5b896c8c61ba2c92"
+    },
+    {
+      "id": "10gbit-3-previous",
+      "rate": "10gbit",
+      "iteration": 3,
+      "label": "previous",
+      "configured_read_pipeline_window": null,
+      "revision": "0eeb5054f92afe1457318525d109bc3e323b2312",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 6.261105886,
+      "client_cpu_seconds": 7.72,
+      "server_cpu_seconds": 9.25,
+      "metrics": {
+        "throughput": 685975828.2644063,
+        "p99": 9.039822,
+        "cpu_per_gib": 4.2425
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.1796875,
+          "worker": 60.57421875,
+          "client": 44.44140625,
+          "combined": 154.19140625
+        },
+        "timed_reads": {
+          "master": 49.1796875,
+          "worker": 60.57421875,
+          "client": 44.44140625,
+          "combined": 154.19140625
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4580344208,
+          "packets": 3203109,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 83014005,
+          "packets": 234547,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "8acb8bc6ae4b041a3204f2b189b0c3b9634958fe3d38c5b92006e1645e2d0262",
+      "canonical_result_sha256": "399a75f3220859652c42f2d2a6b37d83ffc79363b9bf86844acd23378c364bdb"
+    },
+    {
+      "id": "10gbit-3-grpc",
+      "rate": "10gbit",
+      "iteration": 3,
+      "label": "grpc",
+      "configured_read_pipeline_window": 0,
+      "revision": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 5.099355889,
+      "client_cpu_seconds": 7.77,
+      "server_cpu_seconds": 9.84,
+      "metrics": {
+        "throughput": 842256824.0951421,
+        "p99": 8.595338,
+        "cpu_per_gib": 4.4025
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.1640625,
+          "worker": 92.109375,
+          "client": 48.7890625,
+          "combined": 190.0390625
+        },
+        "timed_reads": {
+          "master": 49.1640625,
+          "worker": 92.109375,
+          "client": 48.7890625,
+          "combined": 190.0390625
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4579714190,
+          "packets": 3194283,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 84418821,
+          "packets": 251807,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "9009c05997cfb4e3179817a0c4c530f9b42b357ec65af1f8723517bd57ff3aee",
+      "canonical_result_sha256": "6633a5fbfa890e3cb0bc51ef198e6aa2c8cbbf58e07752325d6a4a3c991c42cc"
+    },
+    {
+      "id": "10gbit-4-grpc",
+      "rate": "10gbit",
+      "iteration": 4,
+      "label": "grpc",
+      "configured_read_pipeline_window": 0,
+      "revision": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 5.081293088,
+      "client_cpu_seconds": 7.89,
+      "server_cpu_seconds": 9.97,
+      "metrics": {
+        "throughput": 845250848.872113,
+        "p99": 8.834536,
+        "cpu_per_gib": 4.465
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.296875,
+          "worker": 98.50390625,
+          "client": 46.9921875,
+          "combined": 194.73046875
+        },
+        "timed_reads": {
+          "master": 49.234375,
+          "worker": 98.50390625,
+          "client": 46.9921875,
+          "combined": 194.73046875
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4579950274,
+          "packets": 3196580,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 84475314,
+          "packets": 252348,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "780e5877c4b9fadce50cb95551934e816404ce0cd52ca0d5b13e9988f3a603b7",
+      "canonical_result_sha256": "1b2a1e87669be65d633d6c43f689b24e2cee9e10bf40aa630e15e80877200a04"
+    },
+    {
+      "id": "10gbit-4-previous",
+      "rate": "10gbit",
+      "iteration": 4,
+      "label": "previous",
+      "configured_read_pipeline_window": null,
+      "revision": "0eeb5054f92afe1457318525d109bc3e323b2312",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 6.16540424,
+      "client_cpu_seconds": 7.62,
+      "server_cpu_seconds": 9.35,
+      "metrics": {
+        "throughput": 696623794.4521217,
+        "p99": 8.504497,
+        "cpu_per_gib": 4.2425
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.19140625,
+          "worker": 60.31640625,
+          "client": 47.56640625,
+          "combined": 157.07421875
+        },
+        "timed_reads": {
+          "master": 49.19140625,
+          "worker": 60.31640625,
+          "client": 47.56640625,
+          "combined": 157.07421875
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4580410462,
+          "packets": 3204009,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 83084578,
+          "packets": 235546,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "695b8d409bb66b86b1be33ed2a5242ee3f113407468619883b4d523465a5ec5d",
+      "canonical_result_sha256": "544d3d97f30be8be5d0806e733d103b48431ae5f99bdae9c9b951d7b9d28442b"
+    },
+    {
+      "id": "10gbit-4-orpc",
+      "rate": "10gbit",
+      "iteration": 4,
+      "label": "orpc",
+      "configured_read_pipeline_window": null,
+      "revision": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 3.715532895,
+      "client_cpu_seconds": 2.79,
+      "server_cpu_seconds": 0.8,
+      "metrics": {
+        "throughput": 1155949204.9659274,
+        "p99": 5.801946,
+        "cpu_per_gib": 0.8975
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 44.3046875,
+          "worker": 28.58203125,
+          "client": 38.875,
+          "combined": 111.76171875
+        },
+        "timed_reads": {
+          "master": 44.3046875,
+          "worker": 28.58203125,
+          "client": 38.875,
+          "combined": 111.76171875
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4566018377,
+          "packets": 3024869,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 74829038,
+          "packets": 115364,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "4b6afd08633d5728a6578d949c33956769bde7a1e1439a25d3875c96159f09dc",
+      "canonical_result_sha256": "efe6082c2f7b751ae7d0475e2698466b7d6875ed6e57833bcd1b0f812a21aa8d"
+    },
+    {
+      "id": "1gbit-4-grpc",
+      "rate": "1gbit",
+      "iteration": 4,
+      "label": "grpc",
+      "configured_read_pipeline_window": 0,
+      "revision": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 36.096920482,
+      "client_cpu_seconds": 6.8,
+      "server_cpu_seconds": 6.66,
+      "metrics": {
+        "throughput": 118984313.30566598,
+        "p99": 88.673978,
+        "cpu_per_gib": 3.365
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.19921875,
+          "worker": 60.62890625,
+          "client": 36.67578125,
+          "combined": 146.3828125
+        },
+        "timed_reads": {
+          "master": 49.19921875,
+          "worker": 60.62890625,
+          "client": 36.67578125,
+          "combined": 146.3828125
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4580021538,
+          "packets": 3199969,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 88241411,
+          "packets": 316452,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "2dba703aaa5bec4084a791e24ca5e39df96a152bc3e2b338057af708685b3f13",
+      "canonical_result_sha256": "91f878ca15131bd6e72e8a81a2c975d713cfe623fbb1939e1be5d01fbf124cd9"
+    },
+    {
+      "id": "1gbit-4-previous",
+      "rate": "1gbit",
+      "iteration": 4,
+      "label": "previous",
+      "configured_read_pipeline_window": null,
+      "revision": "0eeb5054f92afe1457318525d109bc3e323b2312",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 36.085718331,
+      "client_cpu_seconds": 6.8,
+      "server_cpu_seconds": 6.52,
+      "metrics": {
+        "throughput": 119021249.80869068,
+        "p99": 92.715508,
+        "cpu_per_gib": 3.33
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 48.84375,
+          "worker": 59.953125,
+          "client": 38.3125,
+          "combined": 147.0
+        },
+        "timed_reads": {
+          "master": 48.84375,
+          "worker": 59.953125,
+          "client": 38.3125,
+          "combined": 147.0
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4580035925,
+          "packets": 3200202,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 88260794,
+          "packets": 316742,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "313d45c0bcd98a559a1a91c9f334c48188bd1f31ab5cdaaa090e74baef4a1a10",
+      "canonical_result_sha256": "b90210d92e213373f97a9cfbab8409a9b0a1721ea057d692412adeeb26ec4336"
+    },
+    {
+      "id": "1gbit-4-orpc",
+      "rate": "1gbit",
+      "iteration": 4,
+      "label": "orpc",
+      "configured_read_pipeline_window": null,
+      "revision": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 35.967903586,
+      "client_cpu_seconds": 3.35,
+      "server_cpu_seconds": 1.13,
+      "metrics": {
+        "throughput": 119411110.12296407,
+        "p99": 79.73696,
+        "cpu_per_gib": 1.12
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 44.71875,
+          "worker": 28.87890625,
+          "client": 40.91015625,
+          "combined": 114.39453125
+        },
+        "timed_reads": {
+          "master": 44.71875,
+          "worker": 28.87890625,
+          "client": 40.91015625,
+          "combined": 114.39453125
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4566020982,
+          "packets": 3024907,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 78783701,
+          "packets": 175270,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "cd616dac8761d66ee742d8fcb8a2b97a63e1c99bc85d7f942a9da1539a464e7e",
+      "canonical_result_sha256": "5a8a0b6f4cfcb5df9b8fe0d7534b518cee76ceebbd85dbe632322da4dd337317"
+    },
+    {
+      "id": "1gbit-5-orpc",
+      "rate": "1gbit",
+      "iteration": 5,
+      "label": "orpc",
+      "configured_read_pipeline_window": null,
+      "revision": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 35.953076194,
+      "client_cpu_seconds": 3.43,
+      "server_cpu_seconds": 1.04,
+      "metrics": {
+        "throughput": 119460356.4052403,
+        "p99": 73.683702,
+        "cpu_per_gib": 1.1175000000000002
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 44.37890625,
+          "worker": 28.09375,
+          "client": 39.46875,
+          "combined": 111.9375
+        },
+        "timed_reads": {
+          "master": 44.37890625,
+          "worker": 28.09375,
+          "client": 39.46875,
+          "combined": 111.9375
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4566021006,
+          "packets": 3024905,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 78799954,
+          "packets": 175516,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "fb966679bd55dc152049691e548a57255182310d135c0add225cc85ff463902d",
+      "canonical_result_sha256": "167027fa29c293628446660ef15a2d2c03c269f93cf02d78253d7a327c066b74"
+    },
+    {
+      "id": "1gbit-5-previous",
+      "rate": "1gbit",
+      "iteration": 5,
+      "label": "previous",
+      "configured_read_pipeline_window": null,
+      "revision": "0eeb5054f92afe1457318525d109bc3e323b2312",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 36.363347091,
+      "client_cpu_seconds": 7.06,
+      "server_cpu_seconds": 6.63,
+      "metrics": {
+        "throughput": 118112540.2249622,
+        "p99": 95.816856,
+        "cpu_per_gib": 3.4225
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.36328125,
+          "worker": 59.8359375,
+          "client": 37.93359375,
+          "combined": 147.00390625
+        },
+        "timed_reads": {
+          "master": 49.36328125,
+          "worker": 59.8359375,
+          "client": 37.93359375,
+          "combined": 147.00390625
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4579889800,
+          "packets": 3197801,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 88221285,
+          "packets": 316145,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "83ba4cbd03aa8d921d87304063098ed49245d91630f8217716a3ba1adb4008ad",
+      "canonical_result_sha256": "475d7241ee22b296a5f9ae16090f85875a81c6c798b4a366b5eba3d88432151c"
+    },
+    {
+      "id": "1gbit-5-grpc",
+      "rate": "1gbit",
+      "iteration": 5,
+      "label": "grpc",
+      "configured_read_pipeline_window": 0,
+      "revision": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 36.066990164,
+      "client_cpu_seconds": 6.88,
+      "server_cpu_seconds": 6.57,
+      "metrics": {
+        "throughput": 119083052.85443501,
+        "p99": 98.590711,
+        "cpu_per_gib": 3.3625
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 48.8515625,
+          "worker": 60.2734375,
+          "client": 40.15625,
+          "combined": 149.15625
+        },
+        "timed_reads": {
+          "master": 48.7265625,
+          "worker": 60.2734375,
+          "client": 40.15625,
+          "combined": 149.15625
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4580019116,
+          "packets": 3199948,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 88259357,
+          "packets": 316720,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "9d507dca4cbe7d6b6dd15a8d3d9e7479b929fa46fbfb022a1a3a10db35e62b1a",
+      "canonical_result_sha256": "eec0f02b9cb27e8393605ede4f1839d9dae7d1d176af1828e9f668b70bee3bdb"
+    },
+    {
+      "id": "10gbit-5-orpc",
+      "rate": "10gbit",
+      "iteration": 5,
+      "label": "orpc",
+      "configured_read_pipeline_window": null,
+      "revision": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 3.701688244,
+      "client_cpu_seconds": 2.71,
+      "server_cpu_seconds": 0.81,
+      "metrics": {
+        "throughput": 1160272560.2194176,
+        "p99": 5.924026,
+        "cpu_per_gib": 0.88
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 44.3515625,
+          "worker": 27.84765625,
+          "client": 36.65625,
+          "combined": 108.8125
+        },
+        "timed_reads": {
+          "master": 44.3515625,
+          "worker": 27.8046875,
+          "client": 36.65625,
+          "combined": 108.8125
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4566087127,
+          "packets": 3024926,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 74824926,
+          "packets": 115300,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "ddc9ee86d38516d104312f45a5fb817958917f9e1fd3a38d6245e727f3914e10",
+      "canonical_result_sha256": "098b3bc40e44d8c8a04967d429ea3621bf7ac1233f9c5b6444f727bdcf9b8cef"
+    },
+    {
+      "id": "10gbit-5-previous",
+      "rate": "10gbit",
+      "iteration": 5,
+      "label": "previous",
+      "configured_read_pipeline_window": null,
+      "revision": "0eeb5054f92afe1457318525d109bc3e323b2312",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 6.087515323,
+      "client_cpu_seconds": 7.7,
+      "server_cpu_seconds": 9.3,
+      "metrics": {
+        "throughput": 705536999.5986128,
+        "p99": 8.885351,
+        "cpu_per_gib": 4.25
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 48.8359375,
+          "worker": 60.7734375,
+          "client": 46.88671875,
+          "combined": 156.4921875
+        },
+        "timed_reads": {
+          "master": 48.83203125,
+          "worker": 60.7734375,
+          "client": 46.88671875,
+          "combined": 156.4921875
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4580310185,
+          "packets": 3203808,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 83437011,
+          "packets": 240785,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "11b3ca3566b210ac2093fa988837c410c13f123a21d1eb6f8a61317d480d00b4",
+      "canonical_result_sha256": "11f01332c3bd2b6688adf29b7b2a8ca2e4826a4fceee0888b02e4308b4deb4aa"
+    },
+    {
+      "id": "10gbit-5-grpc",
+      "rate": "10gbit",
+      "iteration": 5,
+      "label": "grpc",
+      "configured_read_pipeline_window": 0,
+      "revision": "e16dca5c374c1dd63fe9c7e5ad434ff9d21220fd",
+      "bytes": 4294967296,
+      "latency_samples": 4096,
+      "elapsed_seconds": 5.112485635,
+      "client_cpu_seconds": 7.67,
+      "server_cpu_seconds": 9.61,
+      "metrics": {
+        "throughput": 840093763.1191995,
+        "p99": 8.341262,
+        "cpu_per_gib": 4.32
+      },
+      "memory_mib": {
+        "whole_run": {
+          "master": 49.61328125,
+          "worker": 89.88671875,
+          "client": 47.53515625,
+          "combined": 185.203125
+        },
+        "timed_reads": {
+          "master": 49.61328125,
+          "worker": 89.88671875,
+          "client": 47.53515625,
+          "combined": 185.203125
+        }
+      },
+      "qdisc": {
+        "server": {
+          "drops": 0,
+          "bytes": 4579840726,
+          "packets": 3194928,
+          "backlog": 0
+        },
+        "client": {
+          "drops": 0,
+          "bytes": 84247102,
+          "packets": 249455,
+          "backlog": 0
+        }
+      },
+      "result_file_sha256": "e41624a7ba23b402417f5de8a94aa682eaf74661072c99481bd25acbb8c1cdcd",
+      "canonical_result_sha256": "de36f047540967d5dee389aa5d9cadf5364493ad3c35652ceaf899abd08b5e4e"
+    }
+  ],
+  "adaptive_default_policy": {
+    "configured_auto_window": 0,
+    "compiled_default_window": 1,
+    "orpc_gate_passes_both_profiles": false,
+    "default_change_requires_separate_decision": true
+  },
+  "raw_archive_sha256": "ae1657d087daf9901469d6fdd78594ac22e12317b1eb11c3a5a6f24c0c21eb67"
+}
