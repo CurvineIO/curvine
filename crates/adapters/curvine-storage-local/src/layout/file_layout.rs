@@ -458,7 +458,10 @@ impl BlockLayout for FileLayout {
         let physical_len = device.len().min(logical_len);
         let file_len = device.len();
         let reader = BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)?;
-        if !verify.is_enabled() {
+        // Only a finalized generation has a published sidecar. Writing,
+        // Recovering and Finalizing blocks are served from staging, where the
+        // sidecar does not exist yet or is still being written by finalize.
+        if !verify.is_enabled() || !meta.is_final() {
             return Ok(reader);
         }
 

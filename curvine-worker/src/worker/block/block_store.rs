@@ -403,13 +403,12 @@ impl BlockStore {
         off: i64,
         logical_len: i64,
     ) -> CommonResult<BlockReadContext> {
-        let (layout, dir, verify) = {
-            let state = self.read()?;
-            let (layout, dir) = state.layout_for(meta)?;
-            (layout, dir, state.checksum_verify())
-        };
+        // Hold the dataset read lock while opening, so a finalize publish
+        // cannot pair the block file with another generation's sidecar.
+        let state = self.read()?;
+        let (layout, dir) = state.layout_for(meta)?;
         layout
-            .open_reader(&dir, meta, off, logical_len, verify)
+            .open_reader(&dir, meta, off, logical_len, state.checksum_verify())
             .map_err(Into::into)
     }
 
@@ -900,6 +899,15 @@ mod tests {
         write: bool,
         verify: bool,
     ) -> CommonResult<BlockStore> {
+        create_checksum_store_with_policy(name, write, verify, true)
+    }
+
+    fn create_checksum_store_with_policy(
+        name: &str,
+        write: bool,
+        verify: bool,
+        allow_missing: bool,
+    ) -> CommonResult<BlockStore> {
         let conf = ClusterConf {
             format_worker: true,
             worker: WorkerConf {
@@ -907,6 +915,7 @@ mod tests {
                 data_dir: vec![format!("[MEM:16MB]../testing/block-store-{name}")],
                 block_checksum: write,
                 block_checksum_verify: verify,
+                block_checksum_allow_missing: allow_missing,
                 ..WorkerConf::default()
             },
             ..ClusterConf::default()
@@ -956,6 +965,42 @@ mod tests {
         // Replication reads the source at its stored length with send_file.
         let (_, mut reader) = store.open_reader_by_id_at_stored_len(finalized.id, 64 * 1024)?;
         assert!(reader.read_region(true, 64 * 1024).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unfinalized_blocks_are_read_without_verification() -> CommonResult<()> {
+        // RequireSidecar rejects finalized blocks without a sidecar, but a
+        // block that is still being written cannot have one yet.
+        let store =
+            create_checksum_store_with_policy("checksum-verify-staging", true, true, false)?;
+        let block = ExtendedBlock::with_mem(1, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let mut writer = store.open_writer(&meta, 0)?;
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&[3u8; 4096][..])))?;
+        writer.flush()?;
+        drop(writer);
+
+        let (read_meta, mut reader) = store.open_reader_by_id(block.id, 0, 4096)?;
+        assert_eq!(read_meta.state(), &BlockState::Writing);
+        assert!(!reader.is_verified());
+        assert_eq!(read_bytes(&mut reader, 4096)?, vec![3u8; 4096]);
+
+        // Finalize writes the staging sidecar outside the dataset lock; an
+        // empty file is what a reader can see right after `File::create`.
+        let staging_path = store.short_circuit(&meta)?.unwrap();
+        let staging_checksum = FileLayout::checksum_path_of(std::path::Path::new(&staging_path));
+        let reservation = store
+            .write()?
+            .reserve_file_finalize(&block)?
+            .expect("file block finalize must reserve");
+        std::fs::write(&staging_checksum, b"")?;
+        let (read_meta, mut reader) = store.open_reader_by_id(block.id, 0, 4096)?;
+        assert_eq!(read_meta.state(), &BlockState::Finalizing);
+        assert!(!reader.is_verified());
+        assert_eq!(read_bytes(&mut reader, 4096)?, vec![3u8; 4096]);
+        store.write()?.rollback_file_finalize(&reservation)?;
+        let _ = std::fs::remove_file(&staging_checksum);
         Ok(())
     }
 
