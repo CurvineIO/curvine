@@ -220,6 +220,10 @@ pub struct TransportConfig {
     pub request_timeout: Option<Duration>,
     pub tcp_keepalive: Option<Duration>,
     pub max_message_bytes: usize,
+    /// Receive credit per HTTP/2 stream; buffers are allocated as data arrives.
+    pub stream_window_bytes: u32,
+    /// Aggregate receive credit per HTTP/2 connection.
+    pub connection_window_bytes: u32,
 }
 
 impl Default for TransportConfig {
@@ -229,6 +233,8 @@ impl Default for TransportConfig {
             request_timeout: Some(Duration::from_secs(30)),
             tcp_keepalive: Some(Duration::from_secs(60)),
             max_message_bytes: MAX_MESSAGE_BYTES,
+            stream_window_bytes: 4 * 1024 * 1024,
+            connection_window_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -244,7 +250,9 @@ impl TransportConfig {
     ) -> Result<Endpoint, tonic::transport::Error> {
         let mut endpoint = Endpoint::from_shared(address)?
             .connect_timeout(self.connect_timeout)
-            .tcp_keepalive(self.tcp_keepalive);
+            .tcp_keepalive(self.tcp_keepalive)
+            .initial_stream_window_size(self.stream_window_bytes)
+            .initial_connection_window_size(self.connection_window_bytes);
         if let Some(timeout) = self.request_timeout {
             endpoint = endpoint.timeout(timeout);
         }
@@ -261,7 +269,10 @@ impl TransportConfig {
     }
 
     pub fn server(&self, tls: Option<&ServerTls>) -> Result<Server, tonic::transport::Error> {
-        let mut server = Server::builder().tcp_keepalive(self.tcp_keepalive);
+        let mut server = Server::builder()
+            .tcp_keepalive(self.tcp_keepalive)
+            .initial_stream_window_size(self.stream_window_bytes)
+            .initial_connection_window_size(self.connection_window_bytes);
         if let Some(tls) = tls {
             let mut config = ServerTlsConfig::new().identity(Identity::from_pem(
                 &tls.certificate_pem,
