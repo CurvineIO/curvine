@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::layout::FileFinalizePlan;
+use crate::layout::{FileFinalizePlan, SidecarSync};
 use crate::{
     BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirFreeRatio, DirList, FileLayout,
     SpdkMetaStore, StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
@@ -464,7 +464,7 @@ impl VfsDataset {
         &mut self,
         reservation: &FileFinalizeReservation,
         plan: FileFinalizePlan,
-    ) -> CommonResult<BlockMeta> {
+    ) -> CommonResult<(BlockMeta, Option<SidecarSync>)> {
         let pending = self.get_block_check(reservation.pending.id())?.clone();
         if pending.state() != &BlockState::Finalizing {
             return err_box!(
@@ -483,7 +483,8 @@ impl VfsDataset {
 
         // The plan already performed stat and directory preparation. Hold this
         // lock only while the rename becomes visible and metadata is published.
-        let final_meta = FileLayout::publish_finalize(plan)?;
+        // The returned sidecar sync is left to the caller, outside this lock.
+        let (final_meta, sync) = FileLayout::publish_finalize(plan)?;
         if let Some(committed) = self.committed_rewrites.remove(&pending.id()) {
             reservation
                 .dir
@@ -496,7 +497,7 @@ impl VfsDataset {
             .dir
             .reserve_space(true, final_meta.physical_bytes());
         self.meta.put(final_meta.clone());
-        Ok(final_meta)
+        Ok((final_meta, sync))
     }
 
     pub fn rollback_file_finalize(
@@ -1518,7 +1519,13 @@ mod test {
             .reserve_file_finalize(block)?
             .expect("file block must use reservation");
         match reservation.prepare(block.len) {
-            Ok(plan) => ds.publish_file_finalize(&reservation, plan),
+            Ok(plan) => {
+                let (meta, sync) = ds.publish_file_finalize(&reservation, plan)?;
+                if let Some(sync) = sync {
+                    sync.finish();
+                }
+                Ok(meta)
+            }
             Err(e) => {
                 ds.rollback_file_finalize(&reservation)?;
                 Err(e)

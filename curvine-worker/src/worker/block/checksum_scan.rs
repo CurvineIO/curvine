@@ -17,16 +17,36 @@
 //! An unclean shutdown can leave a block whose data no longer matches its
 //! sidecar, for example zeroed pages after a reboot without sync (#1813).
 //! Reads already catch that block, but only when someone reads it. The scan
-//! verifies every finalized block once after startup and queues each failure
-//! for the same heartbeat re-check and removal a failed read uses.
+//! verifies every finalized block once after startup and queues each CRC
+//! mismatch for the same heartbeat re-check and removal a failed read uses.
 
 use crate::worker::block::{BlockStore, ScanResult};
 use curvine_core_error::CommonResult;
 use log::{error, info, warn};
 use std::time::{Duration, Instant};
 
-/// Read size of one scan step, also the throttle and stop-check granularity.
+/// Read size of one scan step, also the throttle granularity.
 const SCAN_READ_LEN: i32 = 1024 * 1024;
+
+/// Longest single sleep of the throttle, so a stop is seen within this time
+/// even at a low rate.
+const STOP_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Sleep for `delay` in slices of at most [`STOP_CHECK_INTERVAL`]; return
+/// false as soon as `stopped` reports true.
+fn sleep_unless_stopped(delay: Duration, stopped: &impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + delay;
+    loop {
+        if stopped() {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(left.min(STOP_CHECK_INTERVAL));
+    }
+}
 
 /// Counters of one scan pass.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -81,10 +101,11 @@ impl ChecksumScan {
     }
 
     /// Scan every block in the store once, stopping early when `stopped`
-    /// returns true. A mismatch, or a missing sidecar while the policy
-    /// requires one, is queued for the heartbeat re-check. Other errors such
-    /// as an invalid sidecar are only logged: they do not prove the data is
-    /// wrong.
+    /// returns true. Only a CRC mismatch is queued for the heartbeat
+    /// re-check. A block without a sidecar while the policy requires one is
+    /// counted as unverifiable and kept: reads reject it, but it may hold good
+    /// data and be the only replica. Other errors such as an invalid sidecar
+    /// are only logged: they do not prove the data is wrong.
     pub fn run(&self, stopped: impl Fn() -> bool) -> CommonResult<ScanStats> {
         let blocks = self.store.all_blocks()?;
         let mut throttle = Throttle::new(self.bytes_per_sec);
@@ -103,10 +124,7 @@ impl ChecksumScan {
             }
             let result = self.store.scan_block(meta.id, SCAN_READ_LEN, |len| {
                 let delay = throttle.delay_after(len as u64);
-                if !delay.is_zero() {
-                    std::thread::sleep(delay);
-                }
-                !stopped()
+                sleep_unless_stopped(delay, &stopped)
             });
             match result {
                 Ok(ScanResult::Verified) => stats.verified += 1,
@@ -115,10 +133,7 @@ impl ChecksumScan {
                     self.store.report_corrupt(meta.id, "startup checksum scan");
                 }
                 Ok(ScanResult::NoSidecar) => stats.no_sidecar += 1,
-                Ok(ScanResult::Unverifiable) => {
-                    stats.unverifiable += 1;
-                    self.store.report_unverifiable(meta.id);
-                }
+                Ok(ScanResult::Unverifiable) => stats.unverifiable += 1,
                 Ok(ScanResult::Skipped) => stats.skipped += 1,
                 Err(e) => {
                     stats.failed += 1;
@@ -128,8 +143,13 @@ impl ChecksumScan {
         }
         stats.bytes = throttle.bytes;
 
-        if stats.mismatched > 0 || stats.unverifiable > 0 || stats.failed > 0 {
+        if stats.mismatched > 0 || stats.failed > 0 {
             error!("block checksum scan finished: {:?}", stats);
+        } else if stats.unverifiable > 0 {
+            warn!(
+                "block checksum scan finished: {:?}; {} blocks have no sidecar and cannot be read while block_checksum_allow_missing is false",
+                stats, stats.unverifiable
+            );
         } else {
             info!("block checksum scan finished: {:?}", stats);
         }
@@ -150,5 +170,31 @@ mod tests {
         let delay = throttle.delay_after(2 * 1024 * 1024);
         assert!(delay > Duration::from_millis(1900), "{delay:?}");
         assert!(delay <= Duration::from_secs(2), "{delay:?}");
+    }
+
+    #[test]
+    fn throttle_sleep_returns_soon_after_stop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        assert!(sleep_unless_stopped(Duration::from_millis(10), &|| false));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = stop.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            setter.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        // At "1KB" a 1 MiB step would wait about 1024 s.
+        let finished =
+            sleep_unless_stopped(Duration::from_secs(1024), &|| stop.load(Ordering::Acquire));
+        handle.join().unwrap();
+        assert!(!finished);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }
