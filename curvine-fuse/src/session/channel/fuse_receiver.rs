@@ -770,6 +770,131 @@ mod tests {
     use tokio::sync::{watch, Notify};
 
     #[test]
+    fn real_filesystem_metadata_fits_default_worker_stack() {
+        // Construct the complete dispatcher on a larger harness stack, then
+        // execute it on an ordinary 2 MiB worker as the mount process does.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use crate::fs::CurvineFileSystem;
+                use crate::raw::fuse_abi::{fuse_getattr_in, fuse_in_header, fuse_init_in};
+                use crate::session::FuseTask;
+                use crate::{FuseUtils, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION};
+                use bytes::BufMut;
+                use curvine_config::ClusterConf;
+
+                let rt = Arc::new(AsyncRuntime::single());
+                let mut conf = ClusterConf::default();
+                conf.fuse.metrics_enabled = false;
+                conf.fuse.enable_meta_cache = false;
+                conf.client.enable_unified_fs = true;
+                conf.master.hostname = "127.0.0.1".into();
+                conf.master.rpc_port = 0;
+                conf.client.conn_timeout_ms = 20;
+                conf.client.rpc_timeout_ms = 20;
+                conf.client.rpc_retry_max_duration_ms = 20;
+                let fs = Arc::new(CurvineFileSystem::new(conf, rt.clone()).unwrap());
+                let init = fuse_init_in {
+                    major: FUSE_KERNEL_VERSION,
+                    minor: FUSE_KERNEL_MINOR_VERSION,
+                    max_readahead: 0,
+                    flags: 0,
+                };
+                let header = fuse_in_header {
+                    len: (size_of::<fuse_in_header>() + size_of::<fuse_init_in>()) as u32,
+                    opcode: 26, // FUSE_INIT
+                    unique: 1,
+                    ..Default::default()
+                };
+                let mut bytes = BytesMut::new();
+                bytes.put_slice(FuseUtils::struct_as_bytes(&header));
+                bytes.put_slice(FuseUtils::struct_as_bytes(&init));
+                let worker = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_stack_size(2 * 1024 * 1024)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                worker.block_on(async move {
+                    use std::io::Write;
+                    use std::os::fd::IntoRawFd;
+                    use std::os::unix::net::UnixStream;
+
+                    let (input, mut kernel) = UnixStream::pair().unwrap();
+                    input.set_nonblocking(true).unwrap();
+                    let input = OwnedFd::new(input.into_raw_fd());
+                    let kernel_fd = Arc::new(AsyncFd::new(input.as_borrowed()).unwrap());
+                    let (tx, mut rx) = AsyncChannel::new(1).split();
+                    let receiver = FuseReceiver::new(
+                        fs,
+                        rt,
+                        kernel_fd,
+                        tx,
+                        4096,
+                        false,
+                        false,
+                        false,
+                        Arc::new(FastDashMap::default()),
+                        false,
+                    )
+                    .unwrap();
+                    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                    kernel.write_all(&bytes).unwrap();
+                    let future = receiver.start(shutdown_rx);
+                    let inline_bytes = std::mem::size_of_val(&future);
+                    eprintln!("FUSE receiver inline state: {inline_bytes} bytes");
+                    assert!(
+                        inline_bytes <= 64 * 1024,
+                        "FUSE receiver retains {inline_bytes} bytes of inline async state"
+                    );
+                    let running = tokio::spawn(future);
+                    let reply = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                        .await
+                        .unwrap()
+                        .expect("INIT reply");
+                    match reply {
+                        FuseTask::Reply(data) => assert_eq!(data.header().error, 0),
+                        _ => panic!("unexpected INIT reply task"),
+                    }
+                    // GETATTR traverses the real unified mount-cache and master
+                    // RPC stack. The unavailable master must produce an errno reply.
+                    let getattr = fuse_getattr_in::default();
+                    let header = fuse_in_header {
+                        len: (size_of::<fuse_in_header>() + size_of::<fuse_getattr_in>()) as u32,
+                        opcode: 3, // FUSE_GETATTR
+                        unique: 2,
+                        nodeid: 1,
+                        ..Default::default()
+                    };
+                    let mut bytes = BytesMut::new();
+                    bytes.put_slice(FuseUtils::struct_as_bytes(&header));
+                    bytes.put_slice(FuseUtils::struct_as_bytes(&getattr));
+                    kernel.write_all(&bytes).unwrap();
+                    let reply = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                        .await
+                        .unwrap()
+                        .expect("GETATTR reply");
+                    match reply {
+                        FuseTask::Reply(data) => {
+                            assert_eq!(data.header().unique, 2);
+                            assert_ne!(data.header().error, 0);
+                        }
+                        _ => panic!("unexpected GETATTR reply task"),
+                    }
+                    shutdown_tx.send(true).unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), running)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn receiver_exits_when_shutdown_channel_closes() {
         let rt = Arc::new(AsyncRuntime::single());
         rt.clone().block_on(async move {

@@ -137,6 +137,7 @@ jobs:
           cargo test -p curvine-client-core --test block_writer_open_wiring_test --jobs ${{ env.CARGO_BUILD_JOBS }}
           cargo test -p curvine-tests --test grpc_batch_writer_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
           cargo test -p curvine-rpc --features transport --test grpc_tls --jobs ${{ env.CARGO_BUILD_JOBS }}
+          cargo test -p curvine-fuse --lib real_filesystem_metadata_fits_default_worker_stack --jobs ${{ env.CARGO_BUILD_JOBS }}
 
       - name: Minimal client artifact dependency guardrails
         run: |

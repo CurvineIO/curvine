@@ -21,6 +21,7 @@ use curvine_rpc::message::{Builder, Message};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::{
+    future::Future,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Weak,
@@ -74,7 +75,13 @@ impl GrpcMasterClient {
         })
     }
 
-    pub(crate) async fn rpc(&self, msg: Message) -> FsResult<Message> {
+    // Keep tonic's typed dispatch state out of each filesystem caller. Nested
+    // unified/FUSE metadata calls otherwise exhaust a debug worker's stack.
+    pub(crate) fn rpc(&self, msg: Message) -> impl Future<Output = FsResult<Message>> + Send + '_ {
+        Box::pin(self.rpc_inner(msg))
+    }
+
+    async fn rpc_inner(&self, msg: Message) -> FsResult<Message> {
         let channels = self
             .channels
             .get_or_try_init(|| async {
