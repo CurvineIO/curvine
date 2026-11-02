@@ -41,7 +41,7 @@ mod worker_conf;
 pub use self::worker_conf::{WorkerConf, WorkerDataDir};
 
 mod cluster_conf;
-pub use self::cluster_conf::ClusterConf;
+pub use self::cluster_conf::{ClusterConf, S3GatewayConf};
 
 mod cli_conf;
 pub use self::cli_conf::CliConf;
