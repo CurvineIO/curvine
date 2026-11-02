@@ -132,6 +132,7 @@ impl MasterClient {
                 status: status.into(),
                 block_size: block.len,
                 storage_type: block.storage_type().into(),
+                corrupted: None,
             };
             req.blocks.push(info)
         }
@@ -161,6 +162,7 @@ impl MasterClient {
                 status: block.status.into(),
                 block_size: block.block_size,
                 storage_type: block.storage_type.into(),
+                corrupted: block.corrupted.then_some(true),
             };
             req.blocks.push(info);
         }

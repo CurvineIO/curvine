@@ -164,6 +164,9 @@ pub struct BlockReadContext {
     block_pos: i64,
     /// When set, every physical read is widened to whole chunks and verified.
     checksum: Option<BlockChecksum>,
+    /// Set once a chunk's data failed its CRC. Other read errors leave it
+    /// unset, so callers can tell corrupt data from IO or policy failures.
+    checksum_mismatch: bool,
 }
 
 impl BlockReadContext {
@@ -221,6 +224,7 @@ impl BlockReadContext {
             physical_len,
             block_pos: initial_off,
             checksum: None,
+            checksum_mismatch: false,
         })
     }
 
@@ -241,6 +245,11 @@ impl BlockReadContext {
 
     pub fn is_verified(&self) -> bool {
         self.checksum.is_some()
+    }
+
+    /// True when a read failed because chunk data did not match its CRC.
+    pub fn checksum_mismatch(&self) -> bool {
+        self.checksum_mismatch
     }
 
     pub fn path(&self) -> &str {
@@ -398,6 +407,9 @@ impl BlockReadContext {
             let lo = (range.start - first.start) as usize;
             let hi = (range.end - first.start) as usize;
             if let Err(e) = checksum.verify_chunk(index, &buf[lo..hi]) {
+                // Index and length are valid by construction, so the only
+                // failure left is a CRC mismatch.
+                self.checksum_mismatch = true;
                 return err_box!("block {} {}", self.device.path(), e);
             }
         }
@@ -575,7 +587,9 @@ mod tests {
         // Chunks before the corrupted one still read; any read touching
         // chunk 2 [8, 12) fails, even when the request covers one clean byte.
         assert_eq!(slice_bytes(&ctx.read_region(false, 8)?), b"01234567");
+        assert!(!ctx.checksum_mismatch());
         let err = ctx.read_region(false, 1).unwrap_err().to_string();
+        assert!(ctx.checksum_mismatch());
         assert!(err.contains("checksum mismatch at chunk 2"), "{err}");
         assert!(err.contains(&path), "{err}");
 
@@ -583,6 +597,24 @@ mod tests {
         assert_eq!(ctx.block_pos(), 8);
         ctx.seek_to(12)?;
         assert_eq!(slice_bytes(&ctx.read_region(false, 4)?), b"cdef");
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_short_read_is_not_a_checksum_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+        let data = b"0123456789abcdef";
+        let (path, mut ctx) = verified_reader(data, data.len() as i64, 0)?;
+        // Truncate under the open session: the read fails short, but the
+        // data that was read is not known to be corrupt.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_len(10)?;
+        ctx.seek_to(8)?;
+        assert!(ctx.read_region(false, 8).is_err());
+        assert!(!ctx.checksum_mismatch());
 
         let _ = remove_file(&path);
         Ok(())

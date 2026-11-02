@@ -15,7 +15,7 @@
 pub use curvine_storage_local::{BlockMeta, BlockState};
 
 mod block_store;
-pub use self::block_store::BlockStore;
+pub use self::block_store::{BlockStore, CorruptCheck};
 
 mod master_client;
 pub use self::master_client::MasterClient;
