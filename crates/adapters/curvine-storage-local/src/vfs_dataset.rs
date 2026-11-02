@@ -1460,7 +1460,7 @@ mod test {
             assert_eq!(meta.len(), 50);
             assert_eq!(meta.committed_len(), None);
             let dir = ds.find_dir(meta.dir_id())?;
-            let mut reader = FileLayout.open_reader(dir, &meta, 0, 50)?;
+            let mut reader = FileLayout.open_reader(dir, &meta, 0, 50, ChecksumVerify::Off)?;
             let region = reader.read_region(false, 50)?;
             let bytes = match region {
                 DataSlice::Buffer(bytes) => bytes,
