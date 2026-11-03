@@ -32,6 +32,9 @@ pub struct FsReaderBase {
     file_blocks: SearchFileBlocks,
     pos: i64,
     len: i64,
+    // File offset the caller will read up to; block readers do not prefetch
+    // past it.
+    prefetch_end: i64,
 
     // The block that is currently being read
     cur_reader: Option<BlockReader>,
@@ -56,6 +59,7 @@ impl FsReaderBase {
             file_blocks: SearchFileBlocks::new(file_blocks),
             pos: 0,
             len,
+            prefetch_end: len,
             cur_reader: None,
             cache_limit,
             cache_readers,
@@ -64,6 +68,12 @@ impl FsReaderBase {
 
     pub fn disable_cache_handles(&mut self) {
         self.cache_limit = 0;
+    }
+
+    /// Limit prefetching to `end`, the file offset the caller will read up
+    /// to; it applies until changed. Reads past it still succeed.
+    pub fn set_prefetch_end(&mut self, end: i64) {
+        self.prefetch_end = end.min(self.len);
     }
 
     pub fn remaining(&self) -> i64 {
@@ -200,6 +210,9 @@ impl FsReaderBase {
             }
         }
 
-        Ok(try_option_mut!(self.cur_reader))
+        let reader = try_option_mut!(self.cur_reader);
+        // The reader's block starts at file offset `self.pos - reader.pos()`.
+        reader.set_prefetch_end(self.prefetch_end - (self.pos - reader.pos()));
+        Ok(reader)
     }
 }

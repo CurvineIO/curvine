@@ -140,7 +140,7 @@ impl FsReaderParallel {
             None => {
                 // To read the first slice, you need to seek to start position.
                 let idx = *self.cur_idx.insert(0);
-                self.inner.seek(self.alloc_slices[idx].start).await?;
+                self.seek_slice(idx, self.alloc_slices[idx].start).await?;
             }
 
             Some(idx) if self.inner.pos() >= self.alloc_slices[idx].end => {
@@ -150,7 +150,7 @@ impl FsReaderParallel {
                     return Ok(FileChunk::default());
                 } else {
                     let idx = *self.cur_idx.insert(next_idx);
-                    self.inner.seek(self.alloc_slices[idx].start).await?;
+                    self.seek_slice(idx, self.alloc_slices[idx].start).await?;
                 }
             }
 
@@ -168,6 +168,13 @@ impl FsReaderParallel {
         self.inner.complete().await
     }
 
+    // Seek within slice `idx`. The lane reads the slice and then moves to its
+    // next one, so nothing past the slice end is prefetched.
+    async fn seek_slice(&mut self, idx: usize, pos: i64) -> FsResult<()> {
+        self.inner.set_prefetch_end(self.alloc_slices[idx].end);
+        self.inner.seek(pos).await
+    }
+
     pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
         let align_pos = pos;
 
@@ -176,13 +183,14 @@ impl FsReaderParallel {
         match self.alloc_slices.get(index) {
             Some(v) => {
                 let seek_pos = align_pos.max(v.start);
-                self.inner.seek(seek_pos).await?;
+                self.seek_slice(index, seek_pos).await?;
                 let _ = self.cur_idx.insert(index);
             }
 
             None => {
                 if let Some(last_slice) = self.alloc_slices.last() {
-                    self.inner.seek(last_slice.end).await?;
+                    self.seek_slice(self.alloc_slices.len() - 1, last_slice.end)
+                        .await?;
                     let _ = self.cur_idx.insert(self.alloc_slices.len() - 1);
                 } else {
                     self.inner.seek(0).await?;

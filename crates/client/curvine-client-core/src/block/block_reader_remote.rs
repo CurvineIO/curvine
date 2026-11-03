@@ -39,6 +39,9 @@ pub struct BlockReaderRemote {
     stale: VecDeque<i32>,
     // Offset the requests sent so far will have read up to.
     requested: i64,
+    // Block offset the caller will read up to; requests beyond the next one
+    // are not sent past it. Defaults to the block length.
+    prefetch_end: i64,
     depth: usize,
     chunk_size: i64,
 }
@@ -102,6 +105,7 @@ impl BlockReaderRemote {
             in_flight: VecDeque::new(),
             stale: VecDeque::new(),
             requested: off,
+            prefetch_end: len,
             depth: conf.read_pipeline_depth.max(1),
             chunk_size: conf.read_chunk_size.max(1) as i64,
         }
@@ -128,6 +132,12 @@ impl BlockReaderRemote {
         self.len - self.pos
     }
 
+    /// Limit prefetching to `end`, the block offset the caller will read up
+    /// to. Reads past it still succeed, one request at a time.
+    pub fn set_prefetch_end(&mut self, end: i64) {
+        self.prefetch_end = end.min(self.len);
+    }
+
     pub fn seek(&mut self, pos: i64) -> FsResult<i64> {
         // Responses already requested belong to the old position.
         self.stale.extend(self.in_flight.drain(..));
@@ -147,29 +157,37 @@ impl BlockReaderRemote {
         }
 
         self.drain_stale().await?;
-        // Keep up to `depth` chunk requests in flight, not past the end of the
-        // range. Always keep one, in case the worker returned a short chunk.
+        // Keep up to `depth` chunk requests in flight, not past what the caller
+        // will read. Always keep one, in case the worker returned a short chunk.
+        //
+        // The queues are updated before a send and after a receive, so if this
+        // future is dropped mid-await they still show the connection is busy.
         while self.in_flight.len() < self.depth
-            && (self.requested < self.len || self.in_flight.is_empty())
+            && (self.requested < self.prefetch_end || self.in_flight.is_empty())
         {
             let seq_id = self.next_seq_id();
             let header = self.header.take();
-            self.client.send_read(self.req_id, seq_id, header).await?;
             self.in_flight.push_back(seq_id);
             self.requested += self.chunk_size;
+            self.client.send_read(self.req_id, seq_id, header).await?;
         }
-        let Some(seq_id) = self.in_flight.pop_front() else {
+        let Some(&seq_id) = self.in_flight.front() else {
             return err_box!("No read request in flight at pos {}", self.pos);
         };
         let chunk = self.client.receive_read(self.req_id, seq_id).await?;
+        self.in_flight.pop_front();
 
         self.pos += chunk.len() as i64;
         Ok(chunk)
     }
 
     async fn drain_stale(&mut self) -> FsResult<()> {
-        while let Some(seq_id) = self.stale.pop_front() {
-            self.client.receive_read(self.req_id, seq_id).await?;
+        while let Some(&seq_id) = self.stale.front() {
+            let chunk = self.client.receive_read(self.req_id, seq_id).await?;
+            self.stale.pop_front();
+            FsContext::get_metrics()
+                .read_discarded_bytes
+                .inc_by(chunk.len() as i64);
         }
         Ok(())
     }

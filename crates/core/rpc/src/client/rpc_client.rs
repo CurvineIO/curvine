@@ -94,39 +94,20 @@ impl RpcClient {
         let req_id = msg.req_id();
         let seq_id = msg.seq_id();
 
-        let rep_msg = match &self.sender {
-            BoxSender::Frame(f) => {
-                let frame = f.as_mut();
-                if let Err(e) = frame.send(msg).await {
-                    self.set_closed();
-                    return Err(e);
-                }
-
-                let msg = match frame.receive().await {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        self.set_closed();
-                        return Err(e);
-                    }
-                };
-
-                if msg.is_empty() {
-                    self.set_closed();
-                    return err_box!("Connection {} is closed", self.state.conn_info());
-                } else {
-                    msg
-                }
+        match &self.sender {
+            BoxSender::Frame(_) => {
+                self.send(msg).await?;
+                self.receive(req_id, seq_id).await
             }
 
             BoxSender::Channel(c) => {
                 let (tx, rx) = oneshot::channel();
                 try_err!(c.send(Envelope::new(msg.into_box(), tx)).await);
-                try_err!(rx.await)?
+                let rep_msg = try_err!(rx.await)?;
+                RawClient::check_response(req_id, seq_id, &rep_msg)?;
+                Ok(rep_msg)
             }
-        };
-
-        RawClient::check_response(req_id, seq_id, &rep_msg)?;
-        Ok(rep_msg)
+        }
     }
 
     /// Send a request without waiting for its response. Raw clients only: the

@@ -362,27 +362,6 @@ impl BlockClient {
         Ok(())
     }
 
-    pub async fn read_data(
-        &self,
-        req_id: i64,
-        seq_id: i32,
-        header: Option<DataHeaderProto>,
-    ) -> FsResult<DataSlice> {
-        let builder = Builder::new()
-            .code(RpcCode::ReadBlock)
-            .request(RequestStatus::Running)
-            .req_id(req_id)
-            .seq_id(seq_id);
-
-        let msg = if let Some(header) = header {
-            builder.proto_header(header).build()
-        } else {
-            builder.build()
-        };
-
-        let rep = self.rpc(msg).await?;
-        Ok(rep.data)
-    }
     pub async fn write_blocks_batch(
         &self,
         blocks: &[ExtendedBlock],
