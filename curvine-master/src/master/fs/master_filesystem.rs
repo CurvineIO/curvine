@@ -31,6 +31,10 @@ use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS;
+
+/// Bounded optimistic-read retries before falling back to the stable
+/// shared-lock resolve.
+const OPTIMISTIC_READ_RETRIES: usize = 8;
 use curvine_model::*;
 use curvine_raft::conf::JournalConfExt;
 use curvine_runtime::common::LocalTime;
@@ -1035,41 +1039,37 @@ impl MasterFilesystem {
         inode_id: Option<i64>,
     ) -> FsResult<FileStatus> {
         let path = path.as_ref();
-        let fs_dir = self.fs_dir.read();
         if inode_id.is_none_or(|id| id <= 0) {
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            return match inp.get_last_inode() {
+            // Optimistic walk: shared directory handles + version re-check,
+            // falling back to the stable shared-lock resolve on starvation.
+            // The fallback keeps the pending-path rejection for clients.
+            let inp = match self.resolve_shared_retry(path)? {
+                Some(inp) if !trash::is_pending_path(inp.path()) => Some(inp),
+                Some(_) => None,
+                None => {
+                    let fs_dir = self.fs_dir.read();
+                    Self::resolve_path(&fs_dir, path).ok()
+                }
+            };
+            return match inp.as_ref().and_then(|inp| inp.get_last_inode()) {
                 Some(inode) => Ok(inode.to_file_status(path)?),
                 None => err_ext!(FsError::file_not_found(path)),
             };
         }
-        let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        let inode = {
+            let fs_dir = self.fs_dir.read();
+            Self::resolve_file_inode(&fs_dir, path, inode_id)?
+        };
         Ok(inode.to_file_status(path)?)
     }
 
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
-        // Optimistic protocol: walk shared directory handles, re-validate the
-        // captured versions, retry on invalidation. Never takes the global
-        // fs_dir lock; bounded retries fall back below.
         let path = path.as_ref();
-        for _ in 0..8 {
-            // The read guard only fetches the root view; the walk itself runs
-            // on shared Arc handles plus the store reference.
-            let root = self.fs_dir.read().root_dir().clone();
-            let store_ref = {
-                let fs_dir = self.fs_dir.read();
-                // Cheap clone of the store Arc-shaped wrapper is not
-                // available; borrow within this scope instead.
-                InodePath::resolve_shared(&root, path, &fs_dir.store)
-            };
-            let inp = store_ref?;
-            if inp.walk_is_current() {
-                if trash::is_pending_path(inp.path()) {
-                    return Ok(false);
-                }
-                return Ok(inp.get_last_inode().is_some());
+        if let Some(inp) = self.resolve_shared_retry(path)? {
+            if trash::is_pending_path(inp.path()) {
+                return Ok(false);
             }
-            std::thread::yield_now();
+            return Ok(inp.get_last_inode().is_some());
         }
         // Progress fallback: stable read under the shared lock (reads are
         // cheap; this is not the global write lock).
@@ -1081,10 +1081,31 @@ impl MasterFilesystem {
         Ok(inp.get_last_inode().is_some())
     }
 
+    /// Optimistic read resolution: walk shared directory handles, re-validate
+    /// captured odd/even sequence versions and retry on invalidation. The
+    /// shared-lock window is limited to fetching the root view and the store
+    /// borrow. Returns `None` after `OPTIMISTIC_READ_RETRIES` failed walks so
+    /// concurrent writers cannot starve a reader; callers fall back to the
+    /// stable shared-lock path.
+    fn resolve_shared_retry(&self, path: &str) -> FsResult<Option<InodePath>> {
+        for _ in 0..OPTIMISTIC_READ_RETRIES {
+            let root = self.fs_dir.read().root_dir().clone();
+            let inp = {
+                let fs_dir = self.fs_dir.read();
+                InodePath::resolve_shared(&root, path, &fs_dir.store)?
+            };
+            if inp.walk_is_current() {
+                return Ok(Some(inp));
+            }
+            std::thread::yield_now();
+        }
+        Ok(None)
+    }
+
     pub fn list_status<T: AsRef<str>>(&self, path: T) -> FsResult<Vec<FileStatus>> {
-        let fs_dir = self.fs_dir.read();
         let (is_glob_pattern, _) = parse_glob_pattern(path.as_ref());
         if is_glob_pattern {
+            let fs_dir = self.fs_dir.read();
             let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;
             let mut all_statuses = Vec::new();
             for path in &paths {
@@ -1094,12 +1115,20 @@ impl MasterFilesystem {
                 let statuses = fs_dir.list_status(path)?;
                 all_statuses.extend(Self::hide_pending(path.path(), statuses));
             }
-            Ok(all_statuses)
-        } else {
-            let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
-            let statuses = fs_dir.list_status(&inp)?;
-            Ok(Self::hide_pending(inp.path(), statuses))
+            return Ok(all_statuses);
         }
+
+        // Versioned walk validates the listing snapshot; the listing itself
+        // only borrows the store, so no global lock is needed on this path.
+        let inp = match self.resolve_shared_retry(path.as_ref())? {
+            Some(inp) if !trash::is_pending_path(inp.path()) => inp,
+            _ => {
+                let fs_dir = self.fs_dir.read();
+                Self::resolve_path(&fs_dir, path.as_ref())?
+            }
+        };
+        let statuses = self.fs_dir.read().list_status(&inp)?;
+        Ok(Self::hide_pending(inp.path(), statuses))
     }
 
     pub fn list_options<T: AsRef<str>>(
@@ -1108,15 +1137,19 @@ impl MasterFilesystem {
         opts: ListOptions,
     ) -> FsResult<Vec<FileStatus>> {
         let path = path.as_ref();
-        let fs_dir = self.fs_dir.read();
-        let (is_glob_pattern, _) = parse_glob_pattern(path);
-        if is_glob_pattern {
-            err_box!("list_options does not support glob pattern, path {}", path)
-        } else {
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            let statuses = fs_dir.list_options(&inp, &opts)?;
-            Ok(Self::hide_pending(inp.path(), statuses))
+        if parse_glob_pattern(path).0 {
+            return err_box!("list_options does not support glob pattern, path {}", path);
         }
+
+        let inp = match self.resolve_shared_retry(path)? {
+            Some(inp) if !trash::is_pending_path(inp.path()) => inp,
+            _ => {
+                let fs_dir = self.fs_dir.read();
+                Self::resolve_path(&fs_dir, path)?
+            }
+        };
+        let statuses = self.fs_dir.read().list_options(&inp, &opts)?;
+        Ok(Self::hide_pending(inp.path(), statuses))
     }
 
     /// Resolves a client-supplied path. `/.Trash/.pending` is master-owned
@@ -1464,9 +1497,14 @@ impl MasterFilesystem {
     }
 
     pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
-        let fs_dir = self.fs_dir.read();
         let path = path.as_ref();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let inp = match self.resolve_shared_retry(path)? {
+            Some(inp) if !trash::is_pending_path(inp.path()) => inp,
+            _ => {
+                let fs_dir = self.fs_dir.read();
+                Self::resolve_path(&fs_dir, path)?
+            }
+        };
 
         let inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -1479,14 +1517,15 @@ impl MasterFilesystem {
         let needs_touch = inode.is_file() && Self::atime_refresh_due(&inode);
 
         let file = inode.as_file_ref()?;
-        let block_locs = self.get_block_locs(path, &fs_dir, file)?;
+        // Short shared-lock window for the store/evictor lookup; the versioned
+        // walk above already validated the inode snapshot.
+        let block_locs = self.get_block_locs(path, &self.fs_dir.read(), file)?;
         let locate_blocks = FileBlocks {
             status: inode.to_file_status(path)?,
             block_locs,
         };
 
         if needs_touch {
-            drop(fs_dir);
             // Best-effort refresh: a concurrent delete (or any re-resolve
             // failure) between the read and write locks must not turn an
             // already-successful locate into an error, so both failures are
