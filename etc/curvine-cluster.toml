@@ -121,6 +121,30 @@ log = { level = "info", log_dir = "logs", file_name = "master.log" }
 # min_client_version = "0.1.0"
 # blocked_versions = ["0.2.5"]
 
+# Metadata DB (RocksDB). The built-in defaults target a 10-50M inode master
+# with 32-64GB memory and at least 6 cores. block_cache_size is a capacity
+# limit, not an upfront allocation, but on a smaller master it competes with
+# the OS page cache that serves the same SST reads, and the background jobs
+# compete with RPC threads for CPU. With less than 32GB memory, lower
+# block_cache_size; with fewer than 6 cores, lower max_background_jobs.
+#
+# NOTE: a [master.rocksdb] table replaces the built-in master defaults instead
+# of merging with them. Any key left out falls back to the generic RocksDB
+# default (64MB cache, 2 jobs, no compression, WAL on, no bloom filter).
+# Uncomment the whole block below and edit only the values you need.
+# [master.rocksdb]
+# block_size = "4KB"
+# disable_wal = true
+# use_bloom_filter = true
+# cache_index_and_filter_blocks = true
+# pin_l0_filter_and_index_blocks_in_cache = true
+# block_cache_size = "4GB"
+# max_background_jobs = 6
+# max_subcompactions = 2
+# compression_type = "lz4"
+# max_bytes_for_level_base = "2GB"
+# enable_statistics = true
+
 # Optional standalone stateless metadata service. Disabled by default; start it
 # with `curvine-server --service mds` after enabling this flag.
 [mds]
