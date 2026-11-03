@@ -230,6 +230,10 @@ impl JournalWriter {
         self.read_barrier.require_catch_up(required_index);
     }
 
+    pub fn fence_metadata(&self) {
+        self.read_barrier.fence();
+    }
+
     pub fn advance_metadata_applied(&self, applied_index: u64) {
         self.read_barrier.advance_applied(applied_index);
     }

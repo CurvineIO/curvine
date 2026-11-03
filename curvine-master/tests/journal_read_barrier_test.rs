@@ -38,6 +38,18 @@ fn read_barrier_requires_explicit_catch_up() {
 }
 
 #[test]
+fn read_barrier_fence_rejects_until_catch_up() {
+    let barrier = JournalReadBarrier::new();
+    barrier.advance_catch_up(41);
+    assert!(barrier.is_current());
+
+    barrier.fence();
+    assert!(barrier.ensure_current().is_err());
+    barrier.advance_catch_up(42);
+    assert!(barrier.ensure_current().is_ok());
+}
+
+#[test]
 fn concurrent_updates_cannot_mark_unapplied_entries_current() {
     for _ in 0..100 {
         let barrier = Arc::new(JournalReadBarrier::new());

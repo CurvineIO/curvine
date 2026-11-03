@@ -46,6 +46,12 @@ impl JournalReadBarrier {
         state.catching_up = state.applied_index < state.required_index;
     }
 
+    pub fn fence(&self) {
+        let mut state = self.state.write();
+        state.required_index = state.applied_index.saturating_add(1);
+        state.catching_up = true;
+    }
+
     pub fn advance_applied(&self, applied_index: u64) {
         let mut state = self.state.write();
         if !state.catching_up {

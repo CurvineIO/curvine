@@ -514,6 +514,10 @@ impl JournalLoader {
             }
         } else {
             self.recovery.set_ufs_caught_up(false);
+            // A follower must not publish namespace writes while its metadata
+            // view may lag committed Raft state. The leader promotion path
+            // clears this fence after catch_up_committed_metadata().
+            self.journal_writer.fence_metadata();
         }
         self.ufs_wake.notify_one();
     }
@@ -1631,6 +1635,9 @@ impl AppStorage for JournalLoader {
 
     async fn role_change(&self, role: StateRole) -> RaftResult<()> {
         if !self.has_apply_worker {
+            if role != StateRole::Leader {
+                self.journal_writer.fence_metadata();
+            }
             if role == StateRole::Leader {
                 self.catch_up_committed_metadata().await?;
             }
