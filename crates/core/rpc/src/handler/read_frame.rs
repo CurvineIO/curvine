@@ -12,27 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io;
-use std::mem;
+use std::ops::DerefMut;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, ReadHalf};
 use tokio::net::TcpStream;
 
-use crate::handler::rpc_frame::FrameSate;
 use crate::handler::FrameBuf;
 use crate::message;
-use crate::message::Message;
+use crate::message::{Message, Protocol};
 use curvine_io::{DataSlice, IOResult};
 
 pub struct ReadFrame {
     io: ReadHalf<TcpStream>,
     buf: FrameBuf,
+    /// Protocol head decoded but still waiting for its header/data sections;
+    /// lets a frame span multiple socket reads without losing buffered bytes.
+    pending: Option<(Protocol, i32, i32)>,
 }
 
 impl ReadFrame {
     pub(crate) fn new(io: ReadHalf<TcpStream>, buf: FrameBuf) -> Self {
-        Self { io, buf }
+        Self {
+            io,
+            buf,
+            pending: None,
+        }
     }
 
     // Read data of the specified length.
@@ -48,52 +53,80 @@ impl ReadFrame {
         Ok(buf)
     }
 
+    /// Receives the next complete message. Bytes read from the socket are
+    /// buffered, so one syscall can satisfy several back-to-back messages
+    /// instead of the per-frame `read_exact` calls of the exact-read path.
     pub async fn receive(&mut self) -> IOResult<Message> {
-        let mut state = FrameSate::Head;
         loop {
-            match state {
-                FrameSate::Head => {
-                    let mut buf = match self.read_full(message::PROTOCOL_SIZE).await {
-                        Ok(v) => v,
-                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                            return Ok(Message::empty());
+            match self.pending.take() {
+                Some((protocol, header_size, data_size)) => {
+                    let need = (header_size + data_size) as usize;
+                    if self.buf.len() < need {
+                        self.pending = Some((protocol, header_size, data_size));
+                    } else {
+                        let header = if header_size > 0 {
+                            Some(self.buf.split_to(header_size as usize))
+                        } else {
+                            None
+                        };
+
+                        let data = if data_size > 0 {
+                            DataSlice::Buffer(self.buf.split_to(data_size as usize))
+                        } else {
+                            DataSlice::Empty
+                        };
+                        let mut msg = Message::new(protocol, header, data);
+                        self.buf.maybe_shrink();
+
+                        // Heartbeat message.
+                        if msg.is_heartbeat() {
+                            continue;
+                        } else {
+                            msg.set_time();
+                            return Ok(msg);
                         }
-                        Err(e) => return Err(e),
-                    };
-
-                    let (protocol, header_size, data_size) = Message::decode_protocol(&mut buf)?;
-                    let _ = mem::replace(
-                        &mut state,
-                        FrameSate::Data(protocol, header_size, data_size),
-                    );
-                }
-
-                FrameSate::Data(protocol, header_size, data_size) => {
-                    let header = if header_size > 0 {
-                        let buf = self.read_full(header_size).await?;
-                        Some(buf)
-                    } else {
-                        None
-                    };
-
-                    let data = if data_size <= 0 {
-                        DataSlice::Empty
-                    } else {
-                        let bytes = self.read_full(data_size).await?;
-                        DataSlice::Buffer(bytes)
-                    };
-                    let mut msg = Message::new(protocol, header, data);
-
-                    let _ = mem::replace(&mut state, FrameSate::Head);
-
-                    // Heartbeat message.
-                    if msg.is_heartbeat() {
-                        continue;
-                    } else {
-                        msg.set_time();
-                        return Ok(msg);
                     }
                 }
+
+                None => {
+                    if self.buf.len() >= message::PROTOCOL_SIZE as usize {
+                        let (protocol, header_size, data_size) =
+                            Message::decode_protocol(self.buf.deref_mut())?;
+                        // decode_protocol only bounds data_size; header_size is
+                        // attacker-controlled on a server, and a negative value
+                        // would wrap `(header_size + data_size) as usize` into a
+                        // target the buffer can never reach, stalling the
+                        // connection while it grows without bound.
+                        if header_size < 0
+                            || header_size as i64 + data_size as i64 > message::MAX_DATE_SIZE as i64
+                        {
+                            return err_box!(
+                                "invalid frame head: header_size={}, data_size={}",
+                                header_size,
+                                data_size
+                            );
+                        }
+                        self.pending = Some((protocol, header_size, data_size));
+                        continue;
+                    }
+                }
+            }
+
+            // Need more bytes from the socket. Reserve explicitly so read_buf
+            // can never report a zero-byte read that would be mistaken for EOF
+            // when the buffer happens to be full.
+            self.buf.reserve(1);
+            let n = self.io.read_buf(self.buf.deref_mut()).await?;
+            if n == 0 {
+                // Peer EOF before any frame body: clean close, matches the
+                // exact-read path's Head-state EOF contract.
+                if self.pending.is_none() {
+                    return Ok(Message::empty());
+                }
+                return err_box!(
+                    "connection closed mid-frame: {} buffered bytes",
+                    self.buf.len()
+                );
             }
         }
     }
@@ -103,6 +136,8 @@ impl ReadFrame {
 mod tests {
     use super::*;
     use crate::message::Builder;
+    use bytes::BufMut;
+    use curvine_io::DataSlice;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
@@ -148,5 +183,79 @@ mod tests {
             msg.time.is_some(),
             "ReadFrame::receive must stamp the receipt time for handlers"
         );
+    }
+
+    async fn setup_pair() -> (ReadFrame, tokio::io::WriteHalf<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+
+        // Write on the client's write half, read on the server's read half.
+        let (_, client_write) = tokio::io::split(client);
+        let (read_half, _) = tokio::io::split(server_stream);
+        let read_frame = ReadFrame::new(read_half, FrameBuf::new(0));
+        (read_frame, client_write)
+    }
+
+    #[tokio::test]
+    async fn receive_parses_coalesced_frames_from_one_write() {
+        let (mut read_frame, mut client_write) = setup_pair().await;
+
+        let mut frames = BytesMut::new();
+        Builder::new_rpc(1i8).build().encode(&mut frames).unwrap();
+        Builder::new_rpc(2i8).build().encode(&mut frames).unwrap();
+        client_write.write_all(&frames).await.unwrap();
+
+        let m1 = read_frame.receive().await.unwrap();
+        let m2 = read_frame.receive().await.unwrap();
+        assert_eq!(m1.protocol.code, 1);
+        assert_eq!(m2.protocol.code, 2);
+    }
+
+    #[tokio::test]
+    async fn receive_assembles_frame_spanning_multiple_reads() {
+        let (mut read_frame, mut client_write) = setup_pair().await;
+
+        let mut frame = BytesMut::new();
+        Builder::new_rpc(1i8)
+            .data(DataSlice::Buffer(BytesMut::zeroed(1024)))
+            .build()
+            .encode(&mut frame)
+            .unwrap();
+
+        let rest = frame.split_off(50);
+        client_write.write_all(&frame[..]).await.unwrap();
+
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            client_write.write_all(&rest).await.unwrap();
+        });
+
+        let msg = read_frame.receive().await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(msg.protocol.code, 1);
+        assert_eq!(msg.data.len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn receive_rejects_invalid_header_size() {
+        let (mut read_frame, mut client_write) = setup_pair().await;
+
+        // A corrupt head: negative header_size makes
+        // (header_size + data_size) as usize wrap around, which must be
+        // rejected instead of stalling the connection.
+        let mut frame = BytesMut::new();
+        frame.put_i32(22);
+        frame.put_i32(-8);
+        frame.put_i8(0);
+        frame.put_i8(0);
+        frame.put_i64(0);
+        frame.put_i32(0);
+        client_write.write_all(&frame).await.unwrap();
+
+        let res = read_frame.receive().await;
+        assert!(res.is_err(), "negative header_size must be rejected");
     }
 }
