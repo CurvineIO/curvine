@@ -37,8 +37,10 @@ class S3TestConfig:
     
     def __init__(self):
         self.endpoint_url = 'http://localhost:9900'
-        self.access_key = 'AqU4axe4feDyIielarPI'
-        self.secret_key = '0CJZ2QfHi2tDb4DKuCJ2vnBEUXg5EYQt'
+        # Read the credentials from the environment; see the README for how to
+        # create one with `curvine-s3-gateway credential generate`.
+        self.access_key = os.environ.get('AWS_ACCESS_KEY_ID', '')
+        self.secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY', '')
         self.region = 'us-east-1'
         self.test_bucket = f'python-test-{int(time.time())}'
         self.temp_dir = tempfile.mkdtemp(prefix='curvine-s3-test-')

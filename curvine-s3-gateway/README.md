@@ -18,14 +18,17 @@ Curvine S3 Object Gateway is an S3-compatible object storage gateway that provid
 ### 1. Standalone Mode
 
 ```bash
-# Start with default configuration file (etc/curvine-cluster.toml)
-./build/bin/curvine-s3-gateway.sh
+# 1. Register an access key (printed once by the tool, store it securely)
+./build/bin/curvine-s3-gateway.sh credential generate --description local
 
-# Start with custom configuration file
-./build/bin/curvine-s3-gateway.sh --conf /path/to/curvine.conf
+# 2. Start with the default configuration file (etc/curvine-cluster.toml)
+./build/bin/curvine-s3-gateway.sh serve
 
-# Override listen address and region from configuration
-./build/bin/curvine-s3-gateway.sh \
+# Start with a custom configuration file
+./build/bin/curvine-s3-gateway.sh serve --conf /path/to/curvine.conf
+
+# Override the listen address and region from the configuration
+./build/bin/curvine-s3-gateway.sh serve \
     --conf /path/to/curvine.conf \
     --listen 0.0.0.0:9000 \
     --region us-west-2
@@ -37,16 +40,6 @@ Curvine S3 Object Gateway is an S3-compatible object storage gateway that provid
 ```
 
 ### 2. Integrated with Master
-
-```bash
-# Start Master with S3 gateway enabled
-cargo run --bin curvine-server -- \
-    --service master \
-    --conf /path/to/curvine.conf \
-    --enable-object-gateway \
-    --object-listen 0.0.0.0:9900 \
-    --object-region us-east-1
-```
 
 ### 3. Building from Source
 
@@ -65,26 +58,43 @@ cargo doc --open
 
 ### Environment Variables
 
-- `AWS_ACCESS_KEY_ID` or `S3_ACCESS_KEY`: S3 access key (default: AqU4axe4feDyIielarPI)
-- `AWS_SECRET_ACCESS_KEY` or `S3_SECRET_KEY`: S3 secret key (default: 0CJZ2QfHi2tDb4DKuCJ2vnBEUXg5EYQt)
-- `RUST_LOG`: Logging level (e.g., `debug`, `info`, `warn`, `error`)
+- `AWS_ACCESS_KEY_ID` or `CURVINE_ACCESS_KEY`: S3 access key, used as a fallback
+  when the credential store is empty.
+- `AWS_SECRET_ACCESS_KEY` or `CURVINE_SECRET_KEY`: matching S3 secret key.
+- `RUST_LOG`: Logging level (e.g., `debug`, `info`, `warn`, `error`).
+
+There are no built-in default credentials: create one with
+`curvine-s3-gateway credential generate` or set the
+`s3_gateway.access_key`/`s3_gateway.secret_key` configuration pair.
 
 ### Configuration File
 
 S3 gateway supports configuration via Curvine cluster configuration file:
 
 ```toml
-[object]
+[s3_gateway]
 # Listen address and port
 listen = "0.0.0.0:9900"
 # S3 region identifier
 region = "us-east-1"
-# Multipart upload temporary directory
-multipart_temp = "/tmp/curvine-multipart"
-# Request timeout in seconds
-timeout = 30
-# Maximum concurrent connections
-max_connections = 1000
+# Staging directory for PUT bodies and multipart parts
+put_temp_dir = "/tmp/curvine-temp"
+# Body sizes kept in memory instead of staged to disk
+put_memory_buffer_threshold = 1048576
+put_max_memory_buffer = 16777216
+# Optional fixed credential pair (overrides the credential store)
+# access_key = "AKIA..."
+# secret_key = "..."
+# Credential store file (default: ~/.curvine/credentials.jsonl)
+# credentials_path = "/etc/curvine/s3-credentials.jsonl"
+# Share credentials through Curvine instead of the local file
+enable_distributed_auth = false
+# Credential cache refresh interval in seconds
+cache_refresh_interval_secs = 30
+# GET read chunk size in MiB
+get_chunk_size_mb = 1.0
+# Gateway metrics/health web port
+web_port = 9003
 ```
 
 ### Command Line Arguments
@@ -105,8 +115,8 @@ max_connections = 1000
 
 ```bash
 # Configure AWS CLI to use Curvine S3 gateway
-export AWS_ACCESS_KEY_ID=AqU4axe4feDyIielarPI
-export AWS_SECRET_ACCESS_KEY=0CJZ2QfHi2tDb4DKuCJ2vnBEUXg5EYQt
+export AWS_ACCESS_KEY_ID=<your-access-key>
+export AWS_SECRET_ACCESS_KEY=<your-secret-key>
 export AWS_DEFAULT_REGION=us-east-1
 
 # Create a bucket
@@ -135,7 +145,7 @@ aws s3 sync /local/directory s3://mybucket/prefix/ --endpoint-url http://localho
 
 ```bash
 # Configure MinIO client
-mc alias set curvine http://localhost:9900 AqU4axe4feDyIielarPI 0CJZ2QfHi2tDb4DKuCJ2vnBEUXg5EYQt
+mc alias set curvine http://localhost:9900 <your-access-key> <your-secret-key>
 
 # Create a bucket
 mc mb curvine/mybucket
@@ -222,8 +232,8 @@ from botocore.config import Config
 s3_client = boto3.client(
     's3',
     endpoint_url='http://localhost:9900',
-    aws_access_key_id='AqU4axe4feDyIielarPI',
-    aws_secret_access_key='0CJZ2QfHi2tDb4DKuCJ2vnBEUXg5EYQt',
+    aws_access_key_id='<your-access-key>',
+    aws_secret_access_key='<your-secret-key>',
     region_name='us-east-1',
     config=Config(retries={'max_attempts': 3})
 )

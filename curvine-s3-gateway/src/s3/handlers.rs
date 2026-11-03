@@ -423,8 +423,8 @@ impl PutObjectHandler for S3Handlers {
         }
     }
 
-    fn get_temp_dir(&self) -> String {
-        self.temp_storage.config().temp_dir.clone()
+    fn temp_storage(&self) -> std::sync::Arc<TempStorageEnum> {
+        self.temp_storage.clone()
     }
 }
 

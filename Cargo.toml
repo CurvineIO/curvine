@@ -101,7 +101,8 @@ default-members = [
     "curvine-fuse",
     "curvine-web",
     "curvine-ufs",
-    "curvine-cli"
+    "curvine-cli",
+    "curvine-s3-gateway"
 ]
 
 [workspace.package]

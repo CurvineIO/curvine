@@ -34,11 +34,15 @@ pub mod io {
     use std::ops::{Deref, DerefMut};
     use tokio::io::AsyncReadExt;
 
+    // The Curvine reader is much larger than the other variants, so box it
+    // instead of inflating every reader value.
     pub enum PollReaderEnum {
         Body(crate::http::axum::BodyReader),
         File(tokio::fs::File),
         InMemory(InMemoryPollReader),
         BufCursor(tokio::io::BufReader<std::io::Cursor<Vec<u8>>>),
+        /// Object body staged in Curvine when distributed temp storage is on.
+        Curvine(Box<curvine_client::unified::UnifiedReader>),
     }
 
     impl PollReaderEnum {
@@ -59,6 +63,18 @@ pub mod io {
                 }
                 PollReaderEnum::InMemory(r) => r.poll_read_impl().await,
                 PollReaderEnum::BufCursor(r) => {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    match r.read(&mut buf).await {
+                        Ok(0) => Ok(None),
+                        Ok(n) => {
+                            buf.truncate(n);
+                            Ok(Some(buf))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                PollReaderEnum::Curvine(r) => {
+                    use curvine_fs_api::Reader;
                     let mut buf = vec![0u8; 64 * 1024];
                     match r.read(&mut buf).await {
                         Ok(0) => Ok(None),

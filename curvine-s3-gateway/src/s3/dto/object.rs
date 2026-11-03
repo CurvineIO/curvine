@@ -165,6 +165,10 @@ pub struct ListObjectResult {
     pub max_keys: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_continuation_token: Option<String>,
     pub is_truncated: bool,
     #[serde(default)]
     pub contents: Vec<ListObjectContent>,
@@ -181,6 +185,8 @@ impl Default for ListObjectResult {
             key_count: None,
             max_keys: None,
             delimiter: None,
+            continuation_token: None,
+            next_continuation_token: None,
             is_truncated: false,
             contents: Vec::new(),
             common_prefixes: Vec::new(),

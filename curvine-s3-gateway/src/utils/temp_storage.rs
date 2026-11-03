@@ -20,6 +20,38 @@ use std::future::Future;
 const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 const MIN_BUFFER_SIZE: usize = 64 * 1024;
 
+/// Verification a staged object body must satisfy before it is handed to the
+/// object handler.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StageExpect<'a> {
+    /// Expected `x-amz-content-sha256` in lowercase hex, unless the client sent
+    /// `UNSIGNED-PAYLOAD`.
+    pub sha256_hex: Option<&'a str>,
+    /// Expected `content-length`.
+    pub content_length: Option<usize>,
+}
+
+impl StageExpect<'_> {
+    /// Returns a message describing the mismatch, or `Ok(())` when the staged
+    /// bytes satisfy the request's declared hash and length.
+    pub fn check(self, staged: usize, sha256_hex: &str) -> Result<(), String> {
+        if let Some(expected) = self.content_length {
+            if staged != expected {
+                return Err(format!(
+                    "staged body length {} does not match content-length {}",
+                    staged, expected
+                ));
+            }
+        }
+        if let Some(expected) = self.sha256_hex {
+            if !expected.eq_ignore_ascii_case(sha256_hex) {
+                return Err("staged body sha256 does not match x-amz-content-sha256".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TempStorageConfig {
     pub temp_dir: String,
@@ -158,6 +190,65 @@ impl LocalTempStorage {
 
         let digest = hasher.compute();
         Ok(format!("\"{:x}\"", digest))
+    }
+
+    /// Stages a single-object body on local disk and returns the reader plus
+    /// the temp path to remove afterwards.
+    pub async fn stage_object<R: crate::utils::io::PollRead + Send>(
+        &self,
+        staging_id: &str,
+        body: &mut R,
+        expect: StageExpect<'_>,
+    ) -> Result<crate::utils::io::PollReaderEnum, String> {
+        use crate::utils::io::PollReaderEnum;
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+        let dir = format!("{}/{}", self.config.temp_dir, staging_id);
+        let path = format!("{}/body", dir);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| format!("Failed to create staging dir {}: {}", dir, e))?;
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .await
+            .map_err(|e| format!("Failed to create staging file {}: {}", path, e))?;
+
+        let mut hasher = sha2::Sha256::new();
+        let mut staged: usize = 0;
+        while let Some(chunk) = body.poll_read().await? {
+            use sha2::Digest;
+            hasher.update(&chunk);
+            staged += chunk.len();
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| format!("Failed to stage body: {}", e))?;
+        }
+        file.flush()
+            .await
+            .map_err(|e| format!("Failed to flush staged body: {}", e))?;
+
+        use sha2::Digest;
+        expect.check(staged, &hex::encode(hasher.finalize()))?;
+
+        file.seek(std::io::SeekFrom::Start(0))
+            .await
+            .map_err(|e| format!("Failed to rewind staged body: {}", e))?;
+
+        Ok(PollReaderEnum::File(file))
+    }
+
+    /// Removes a staged single-object body.
+    pub async fn cleanup_object(&self, staging_id: &str) -> Result<(), String> {
+        let dir = format!("{}/{}", self.config.temp_dir, staging_id);
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("Failed to remove staging dir {}: {}", dir, e)),
+        }
     }
 
     /// Stream read part data to Writer
@@ -335,6 +426,67 @@ impl CurvineTempStorage {
         Ok(format!("\"{:x}\"", digest))
     }
 
+    /// Stages a single-object body in Curvine and returns a reader over it.
+    pub async fn stage_object<R: crate::utils::io::PollRead + Send>(
+        &self,
+        staging_id: &str,
+        body: &mut R,
+        expect: StageExpect<'_>,
+    ) -> Result<crate::utils::io::PollReaderEnum, String> {
+        use crate::utils::io::PollReaderEnum;
+        use sha2::Digest;
+
+        let path = Path::from_str(format!("{}/{}/body", self.config.temp_dir, staging_id))
+            .map_err(|e| format!("Invalid staging path: {}", e))?;
+        let mut writer = self
+            .fs
+            .create(&path, true)
+            .await
+            .map_err(|e| format!("Failed to create staging file in Curvine: {}", e))?;
+
+        let mut hasher = sha2::Sha256::new();
+        let mut staged: usize = 0;
+        while let Some(chunk) = body.poll_read().await? {
+            hasher.update(&chunk);
+            staged += chunk.len();
+            writer
+                .write(&chunk)
+                .await
+                .map_err(|e| format!("Failed to stage body in Curvine: {}", e))?;
+        }
+        writer
+            .complete()
+            .await
+            .map_err(|e| format!("Failed to complete staged body in Curvine: {}", e))?;
+
+        expect.check(staged, &hex::encode(hasher.finalize()))?;
+
+        let reader = self
+            .fs
+            .open(&path)
+            .await
+            .map_err(|e| format!("Failed to reopen staged body in Curvine: {}", e))?;
+        Ok(PollReaderEnum::Curvine(Box::new(reader)))
+    }
+
+    /// Removes a staged single-object body. Staging is internal state, so it
+    /// is purged permanently instead of being parked in `/.Trash`.
+    pub async fn cleanup_object(&self, staging_id: &str) -> Result<(), String> {
+        let path = Path::from_str(format!("{}/{}", self.config.temp_dir, staging_id))
+            .map_err(|e| format!("Invalid staging path: {}", e))?;
+        match self.fs.delete_with_opts(&path, true, true).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("not found") || msg.contains("not exists") {
+                    Ok(())
+                } else {
+                    Err(format!("Failed to remove staging dir: {}", e))
+                }
+            }
+        }
+    }
+
     /// Stream read part data to Writer
     pub async fn read_part_stream<W: Writer>(
         &self,
@@ -485,6 +637,27 @@ impl TempStorageEnum {
         match self {
             TempStorageEnum::Local(_) => "local",
             TempStorageEnum::Curvine(_) => "curvine",
+        }
+    }
+
+    /// Stages a single-object body in the configured temp storage.
+    pub async fn stage_object<R: crate::utils::io::PollRead + Send>(
+        &self,
+        staging_id: &str,
+        body: &mut R,
+        expect: StageExpect<'_>,
+    ) -> Result<crate::utils::io::PollReaderEnum, String> {
+        match self {
+            TempStorageEnum::Local(s) => s.stage_object(staging_id, body, expect).await,
+            TempStorageEnum::Curvine(s) => s.stage_object(staging_id, body, expect).await,
+        }
+    }
+
+    /// Removes a staged single-object body.
+    pub async fn cleanup_object(&self, staging_id: &str) -> Result<(), String> {
+        match self {
+            TempStorageEnum::Local(s) => s.cleanup_object(staging_id).await,
+            TempStorageEnum::Curvine(s) => s.cleanup_object(staging_id).await,
         }
     }
 
@@ -701,5 +874,51 @@ mod tests {
 
         storage.cleanup(upload_id).await.unwrap();
         let _ = std::fs::remove_dir_all(&temp_path);
+    }
+}
+
+#[cfg(test)]
+mod stage_expect_tests {
+    use super::StageExpect;
+
+    #[test]
+    fn accepts_matching_length_and_hash() {
+        let expect = StageExpect {
+            sha256_hex: Some("abcdef"),
+            content_length: Some(10),
+        };
+        assert!(expect.check(10, "abcdef").is_ok());
+        // Hex comparison is case-insensitive.
+        assert!(expect.check(10, "ABCDEF").is_ok());
+    }
+
+    #[test]
+    fn rejects_length_mismatch() {
+        let expect = StageExpect {
+            sha256_hex: None,
+            content_length: Some(10),
+        };
+        let err = expect.check(9, "x").unwrap_err();
+        assert!(err.contains("does not match content-length"), "{err}");
+    }
+
+    #[test]
+    fn rejects_hash_mismatch() {
+        let expect = StageExpect {
+            sha256_hex: Some("abcdef"),
+            content_length: None,
+        };
+        let err = expect.check(10, "000000").unwrap_err();
+        assert!(err.contains("sha256"), "{err}");
+    }
+
+    #[test]
+    fn unsigned_payload_skips_hash_verification() {
+        let expect = StageExpect {
+            sha256_hex: None,
+            content_length: None,
+        };
+        assert!(expect.check(0, "").is_ok());
+        assert!(expect.check(12345, "anything").is_ok());
     }
 }

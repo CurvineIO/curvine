@@ -92,9 +92,8 @@ pub trait GetObjectHandler: HeadHandler {
 extern crate serde;
 use serde::Serialize;
 use sha1::Digest;
-use tokio::io::AsyncSeekExt;
 
-use crate::utils::io::{PollRead, PollWrite};
+use crate::utils::io::PollWrite;
 
 pub use crate::s3::dto::{Bucket, Buckets, CommonPrefix, ListAllMyBucketsResult, Owner};
 pub use crate::s3::dto::{ListObjectContent, ListObjectResult};
@@ -519,7 +518,7 @@ pub async fn handle_get_list_object<
     let ret = handler.handle(&opt, bucket.as_str()).await;
     match ret {
         Ok(ans) => {
-            let (contents, common_prefixes) = if let Some(ref delim) = opt.delimiter {
+            let (mut contents, common_prefixes) = if let Some(ref delim) = opt.delimiter {
                 let files = ans
                     .into_iter()
                     .filter(|item| !item.key.ends_with(delim))
@@ -529,6 +528,28 @@ pub async fn handle_get_list_object<
                 (ans, vec![])
             };
 
+            // S3 requires lexicographic key order and honours
+            // `max-keys`/`continuation-token`; without this a directory with
+            // more than 1000 objects was returned in one response.
+            contents.sort_by(|a, b| a.key.cmp(&b.key));
+            if let Some(start_after) = opt.start_after.as_deref() {
+                contents.retain(|item| item.key.as_str() > start_after);
+            }
+            if let Some(token) = opt.continuation_token.as_deref() {
+                contents.retain(|item| item.key.as_str() > token);
+            }
+
+            let max_keys = opt.max_keys.unwrap_or(1000).max(1) as usize;
+            let is_truncated = contents.len() > max_keys;
+            if is_truncated {
+                contents.truncate(max_keys);
+            }
+            let next_continuation_token = if is_truncated {
+                contents.last().map(|item| item.key.clone())
+            } else {
+                None
+            };
+
             let total_count = contents.len() + common_prefixes.len();
 
             let result = ListObjectResult {
@@ -536,9 +557,11 @@ pub async fn handle_get_list_object<
                 name: bucket,
                 prefix: opt.prefix,
                 key_count: Some(total_count as u32),
-                max_keys: Some(opt.max_keys.unwrap_or(1000) as u32),
+                max_keys: Some(max_keys as u32),
                 delimiter: opt.delimiter,
-                is_truncated: false,
+                continuation_token: opt.continuation_token,
+                next_continuation_token,
+                is_truncated,
                 contents,
                 common_prefixes,
             };
@@ -697,8 +720,11 @@ pub trait PutObjectHandler: Send + Sync {
         body: crate::utils::io::PollReaderEnum,
     ) -> impl std::future::Future<Output = Result<String, String>> + Send;
 
-    /// Get the temporary directory path for storing temporary files during PUT operations
-    fn get_temp_dir(&self) -> String;
+    /// Temporary storage used to stage object bodies before Curvine sees them.
+    ///
+    /// Exposed instead of a bare directory path: with distributed temp storage
+    /// the staging area is a Curvine path, which `tokio::fs` cannot write.
+    fn temp_storage(&self) -> std::sync::Arc<crate::utils::temp_storage::TempStorageEnum>;
 }
 
 /// Parse bucket and object names from URL path for PUT operations
@@ -749,11 +775,12 @@ pub async fn handle_put_object<
     F: VResponse,
     H: PutObjectHandler + Send + Sync,
 >(
-    mut v4head: crate::auth::sig_v4::V4Head,
+    v4head: crate::auth::sig_v4::V4Head,
     req: T,
     resp: &mut F,
     handler: &H,
 ) {
+    let _ = &v4head;
     if req.method() != "PUT" {
         resp.set_status(405);
         resp.send_header();
@@ -850,7 +877,7 @@ pub async fn handle_put_object<
             return;
         }
     };
-    let r = match req.get_body_reader().await {
+    let mut r = match req.get_body_reader().await {
         Ok(val) => val,
         Err(err) => {
             log::error!(
@@ -944,223 +971,83 @@ pub async fn handle_put_object<
                     }
                 }
             } else {
-                let temp_dir = handler.get_temp_dir();
-                // Ensure temp directory exists (for local filesystem only)
-                if !temp_dir.starts_with("/system") {
-                    let _ = tokio::fs::create_dir_all(&temp_dir).await;
-                }
-                match tokio::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .read(true)
-                    .mode(0o644)
-                    .open(format!("{}/{}", temp_dir, cs))
+                // Stage through the configured temp storage: with distributed
+                // staging the path lives in Curvine and `tokio::fs` cannot
+                // write it.
+                let storage = handler.temp_storage();
+                let staging_id = uuid::Uuid::new_v4().to_string();
+                let reader = match storage
+                    .stage_object(
+                        &staging_id,
+                        &mut r,
+                        crate::utils::temp_storage::StageExpect {
+                            sha256_hex: Some(&cs),
+                            content_length: Some(content_length),
+                        },
+                    )
                     .await
                 {
-                    Ok(mut fd) => match parse_body(r, &mut fd, &cs, content_length).await {
-                        Ok(_) => {
-                            if let Err(err) = fd.seek(std::io::SeekFrom::Start(0)).await {
-                                log::error!("fd seek failed {err}");
-                                resp.set_status(500);
-                                resp.send_header();
-                                return;
-                            }
-                            let reader = crate::utils::io::PollReaderEnum::File(fd);
-                            handler
-                                .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
-                                .await
-                        }
-                        Err(err) => match err {
-                            ParseBodyError::HashMismatch => {
-                                log::warn!("put object hash not match");
-                                resp.set_status(400);
-                                resp.send_header();
-                                return;
-                            }
-                            ParseBodyError::ContentLengthMismatch => {
-                                log::warn!("content length invalid");
-                                resp.set_status(400);
-                                resp.send_header();
-                                return;
-                            }
-                            ParseBodyError::Io(err) => {
-                                log::error!("parse body io error {err}");
-                                resp.set_status(500);
-                                resp.send_header();
-                                return;
-                            }
-                            ParseBodyError::InvalidEncoding(err) => {
-                                log::error!("invalid content encoding: {err}");
-                                resp.set_status(400);
-                                resp.send_header();
-                                return;
-                            }
-                            ParseBodyError::Unsupported(err) => {
-                                log::warn!("unsupported body framing: {err}");
-                                resp.set_status(400);
-                                resp.send_header();
-                                return;
-                            }
-                        },
-                    },
-                    Err(err) => {
-                        log::error!("open local path error {err}");
-                        resp.set_status(500);
+                    Ok(reader) => reader,
+                    Err(e) => {
+                        log::warn!("failed to stage PUT body: {e}");
+                        let _ = storage.cleanup_object(&staging_id).await;
+                        resp.set_status(if e.contains("does not match") {
+                            400
+                        } else {
+                            500
+                        });
                         resp.send_header();
                         return;
                     }
+                };
+
+                let ret = handler
+                    .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
+                    .await;
+                if let Err(e) = storage.cleanup_object(&staging_id).await {
+                    log::warn!("failed to clean staging {staging_id}: {e}");
                 }
+                ret
             }
         }
         ContentSha256::Streaming => {
-            let temp_dir = handler.get_temp_dir();
-            // Ensure temp directory exists (for local filesystem only)
-            if !temp_dir.starts_with("/system") {
-                let _ = tokio::fs::create_dir_all(&temp_dir).await;
-            }
-            let file_name = uuid::Uuid::new_v4().to_string()[..8].to_string();
-            let file_name = format!("{}/{}", temp_dir, file_name);
-            let ret = match tokio::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .read(true)
-                .mode(0o644)
-                .open(file_name.as_str())
-                .await
-            {
-                Ok(mut fd) => crate::utils::chunk_parse(r, &mut fd, v4head.hasher()).await,
-                Err(err) => {
-                    log::error!("open local temp file error {err}");
-                    resp.set_status(500);
-                    resp.send_header();
-                    return;
-                }
-            };
-            if let Err(err) = ret {
-                if let Err(cleanup_err) = tokio::fs::remove_file(file_name.as_str()).await {
-                    log::warn!("remove temp file {file_name} failed: {cleanup_err}");
-                }
-                match err {
-                    crate::utils::ChunkParseError::HashNoMatch => {
-                        log::warn!("accept hash no match request");
-                        resp.set_status(400);
-                        resp.send_header();
-                        return;
-                    }
-                    crate::utils::ChunkParseError::IllegalContent => {
-                        log::warn!("accept illegal content request");
-                        resp.set_status(400);
-                        resp.send_header();
-                        return;
-                    }
-                    crate::utils::ChunkParseError::Io(err) => {
-                        log::error!("local io error {err}");
-                        resp.set_status(500);
-                        resp.send_header();
-                        return;
-                    }
-                }
-            }
-            match tokio::fs::OpenOptions::new()
-                .read(true)
-                .open(file_name.as_str())
-                .await
-            {
-                Ok(fd) => {
-                    let reader = crate::utils::io::PollReaderEnum::File(fd);
-                    let ret = handler
-                        .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
-                        .await;
-                    if let Err(cleanup_err) = tokio::fs::remove_file(file_name.as_str()).await {
-                        log::warn!("remove temp file {file_name} failed: {cleanup_err}");
-                    }
-                    ret
-                }
-                Err(err) => {
-                    log::error!("open file {file_name} error {err}");
-                    resp.set_status(500);
-                    resp.send_header();
-                    if let Err(cleanup_err) = tokio::fs::remove_file(file_name.as_str()).await {
-                        log::warn!("remove temp file {file_name} failed: {cleanup_err}");
-                    }
-                    return;
-                }
-            }
+            // Chunked SigV4 payloads are rejected earlier by `get_body_stream`;
+            // reaching here means the framing was not decoded, so fail with a
+            // client error instead of staging an unverified body.
+            log::warn!("STREAMING-AWS4-HMAC-SHA256-PAYLOAD bodies are not supported");
+            resp.set_status(400);
+            resp.send_header();
+            return;
         }
         ContentSha256::Unsigned => {
-            // No hash verification; stream body into a temp file, then pass to handler
-            let temp_dir = handler.get_temp_dir();
-            // Ensure temp directory exists (for local filesystem only)
-            if !temp_dir.starts_with("/system") {
-                let _ = tokio::fs::create_dir_all(&temp_dir).await;
-            }
-            let file_name = uuid::Uuid::new_v4().to_string()[..8].to_string();
-            let file_name = format!("{}/{}", temp_dir, file_name);
-            let ret = match tokio::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .read(true)
-                .mode(0o644)
-                .open(file_name.as_str())
-                .await
-            {
-                Ok(mut fd) => {
-                    // write all body to temp file using BytesMut accumulation
-                    let mut reader = r;
-                    use bytes::BytesMut;
-                    use tokio::io::AsyncWriteExt;
-                    loop {
-                        match reader.poll_read().await {
-                            Ok(Some(buf)) => {
-                                // Use BytesMut to avoid zero-prefill Vec issues
-                                let mut bytes_chunk = BytesMut::with_capacity(buf.len());
-                                bytes_chunk.extend_from_slice(&buf);
-                                if let Err(e) = fd.write_all(&bytes_chunk).await {
-                                    log::error!("unsigned write error {e}");
-                                    break Err(format!("write error {e}"));
-                                }
-                            }
-                            Ok(None) => break Ok(()),
-                            Err(e) => {
-                                log::error!("unsigned read error {e}");
-                                break Err(e);
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    log::error!("open local temp file error {err}");
-                    resp.set_status(500);
-                    resp.send_header();
-                    return;
-                }
+            // No hash to verify, so the body can be staged through the
+            // configured temp storage (local or Curvine) and streamed to the
+            // handler; `tokio::fs` cannot address a Curvine staging path.
+            let storage = handler.temp_storage();
+            let staging_id = uuid::Uuid::new_v4().to_string();
+            let expect = crate::utils::temp_storage::StageExpect {
+                sha256_hex: None,
+                content_length: opt.content_length.and_then(|v| usize::try_from(v).ok()),
             };
-
-            if let Err(_err) = ret {
-                let _ = tokio::fs::remove_file(file_name.as_str()).await;
-                resp.set_status(500);
-                resp.send_header();
-                return;
-            }
-
-            match tokio::fs::OpenOptions::new()
-                .read(true)
-                .open(file_name.as_str())
-                .await
-            {
-                Ok(fd) => {
-                    let reader = crate::utils::io::PollReaderEnum::File(fd);
+            match storage.stage_object(&staging_id, &mut r, expect).await {
+                Ok(reader) => {
                     let ret = handler
                         .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
                         .await;
-                    let _ = tokio::fs::remove_file(file_name.as_str()).await;
+                    if let Err(e) = storage.cleanup_object(&staging_id).await {
+                        log::warn!("failed to clean staging {staging_id}: {e}");
+                    }
                     ret
                 }
-                Err(err) => {
-                    log::error!("open file {file_name} error {err}");
-                    resp.set_status(500);
+                Err(e) => {
+                    log::warn!("failed to stage unsigned PUT body: {e}");
+                    let _ = storage.cleanup_object(&staging_id).await;
+                    resp.set_status(if e.contains("does not match") {
+                        400
+                    } else {
+                        500
+                    });
                     resp.send_header();
-                    let _ = tokio::fs::remove_file(file_name.as_str()).await;
                     return;
                 }
             }
