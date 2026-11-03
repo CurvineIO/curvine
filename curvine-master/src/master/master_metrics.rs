@@ -495,6 +495,8 @@ impl MasterMetrics {
         if !succeeded {
             self.checkpoint_fail_count.inc();
         }
+        // Total before flush: a reader that samples the flush time first then
+        // always sees checkpoint_time >= checkpoint_flush_time.
         self.checkpoint_time.inc_by(total_ms as i64);
         self.checkpoint_flush_time.inc_by(flush_ms as i64);
         self.checkpoint_last_duration_ms.set(total_ms as i64);

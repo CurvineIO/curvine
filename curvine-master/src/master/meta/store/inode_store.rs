@@ -1126,7 +1126,10 @@ mod tests {
             metrics.checkpoint_count.get() > count,
             "every checkpoint must be counted"
         );
-        assert!(metrics.checkpoint_time.get() >= metrics.checkpoint_flush_time.get());
+        // `record_checkpoint` adds to the total before the flush time, so reading
+        // the flush time first keeps `total >= flush` under concurrent updates.
+        let flush_time = metrics.checkpoint_flush_time.get();
+        assert!(metrics.checkpoint_time.get() >= flush_time);
 
         Ok(())
     }
