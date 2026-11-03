@@ -9,7 +9,7 @@ name = "curvine-s3-gateway"
 path = "src/bin/curvine-s3-gateway.rs"
 
 [dependencies]
-clap = { workspace = true }
+clap = { version = "4.3.10", features = ["derive", "env"] }
 axum = { version = "0.8.4", features = ["macros"] }
 tokio = { workspace = true }
 bytes = { workspace = true }

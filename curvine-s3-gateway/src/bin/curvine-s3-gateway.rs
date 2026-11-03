@@ -66,7 +66,9 @@ pub enum CredentialAction {
     Add {
         #[arg(long)]
         access_key: String,
-        #[arg(long)]
+        /// Secret key. Prefer CURVINE_SECRET_KEY so it stays out of the
+        /// process list and shell history.
+        #[arg(long, env = "CURVINE_SECRET_KEY", hide_env_values = true)]
         secret_key: String,
         #[arg(long)]
         description: Option<String>,
@@ -76,6 +78,9 @@ pub enum CredentialAction {
         description: Option<String>,
     },
     List {
+        /// Reveal the full secret keys of stored credentials. This is a
+        /// deliberate operator action for recovery/debugging; without it each
+        /// key is printed masked.
         #[arg(long)]
         show_secrets: bool,
     },
@@ -298,6 +303,12 @@ async fn add_entry(
     }
 }
 
+/// Prints a newly generated credential.
+///
+/// The secret is emitted exactly once because there is no other way for the
+/// operator to obtain it — the store keeps it and later listings only show the
+/// masked form. Writing it to stdout (not the log) keeps it out of log files;
+/// callers are expected to capture it directly.
 async fn add_generated(
     store: &(impl CredentialStore + ?Sized),
     entry: CredentialEntry,
@@ -306,11 +317,11 @@ async fn add_generated(
 ) -> CommonResult<()> {
     match store.add_credential(entry).await {
         Ok(()) => {
-            // The generated secret is shown exactly once so the operator can
-            // store it; after this point only the masked form is available.
+            let generated_secret = secret_key.expose();
             println!("✓ Successfully generated and added new credential:");
-            println!("  Access Key: {}", access_key);
-            println!("  Secret Key: {}", secret_key.expose());
+            println!("  Access Key: {access_key}");
+            // codeql[rust/cleartext-logging]: one-time operator bootstrap output.
+            println!("  Secret Key: {generated_secret}");
             println!("\n⚠️  Please save these credentials securely. The secret key will not be shown again.");
             Ok(())
         }
@@ -340,6 +351,8 @@ async fn list_entries(
                 println!("  Access Key: {}", entry.access_key);
 
                 if show_secrets {
+                    // codeql[rust/cleartext-logging]: explicit operator request
+                    // (`--show-secrets`) for credential recovery.
                     println!("  Secret Key: {}", entry.secret_key.expose());
                 } else {
                     println!("  Secret Key: {}", entry.secret_key.masked());
