@@ -497,6 +497,7 @@ mod tests {
     use curvine_io::{BlockIO, DataSlice};
     use curvine_model::{ExtendedBlock, FileType, StorageType};
     use curvine_runtime::common::Utils;
+    use curvine_storage_local::Dataset;
 
     fn store() -> CommonResult<BlockStore> {
         let conf = ClusterConf {
@@ -732,39 +733,52 @@ mod tests {
         Ok(())
     }
 
-    // Regression test for the rewrite scenario (szbr00): when a batch rewrites
-    // an already-finalized block on a file layout, rollback must abort the new
-    // Writing generation and release its reserved capacity, while the old
-    // committed copy stays readable.
+    // Regression test for the rewrite scenario (szbr00): a batch that
+    // rewrites an already-finalized block on a file layout. The real rewrite
+    // order is: finalize block 1 first, then open_batch over it — only then
+    // does the dataset move the old meta into `committed_rewrites` and start
+    // a new Writing generation. Rollback must abort that new generation,
+    // release its reserved capacity, and keep the old committed copy.
     #[test]
     fn rewrite_rollback_aborts_new_generation_keeps_committed_copy() -> CommonResult<()> {
         let store = store()?;
         let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
 
-        // Open a 3-block batch that adds blocks 1..=3 (1 is a fresh block).
-        open_batch(&mut handler)?;
-        // Now finalize block 1 through the store, as a committed generation.
-        // `open_batch` already rewrote block 1 into Writing; the fresh-open
-        // path does not record a committed generation (reserve_file_open with
-        // `Some(meta) + is_final` is what preserves it), so finalizing turns
-        // it into Finalized.
+        // No batch is open yet: create block 1 and finalize it first, so the
+        // batch later rewrites a committed generation.
+        let available_before = store.read()?.available();
         let block1 = ExtendedBlock::new(1, 0, StorageType::Mem, FileType::File);
+        store.open_block(&block1)?;
         store.finalize_block(&block1)?;
-        assert!(store.get_block(1)?.is_final());
+        assert!(store.read()?.get_block(1).unwrap().is_final());
 
-        // Now trigger rollback via req_id mismatch. The old implementation's
-        // `get_block(...).is_final()` guard would see block 1 as final and
-        // skip aborting it, leaving a finalized block and a reservation leak.
-        // The new `abort_batch_write` aborts only the raw non-final
-        // generation; block 1 is final after the manual finalize, so it is
-        // skipped (a committed replica must not be deleted by rollback).
+        // Now open a 3-block batch over it: block 1 becomes a new Writing
+        // generation backed by a staging copy of the committed file.
+        open_batch(&mut handler)?;
+        assert!(!store.read()?.get_block(1).unwrap().is_final());
+        assert!(store.get_block(1)?.is_final());
+        // The rewrite reserves capacity for the new generation.
+        assert!(store.read()?.available() < available_before);
+
+        // Trigger rollback via req_id mismatch. The old implementation's
+        // `get_block(...).is_final()` guard read the readable view, which
+        // reports the committed generation during a rewrite, and skipped
+        // aborting block 1 — leaking the staging file and the reservation.
         let msg = commit_msg(&[1, 2, 3], 42);
         assert!(handler.complete_batch(&msg, true).is_err());
         assert!(handler.rolled_back);
         assert!(handler.context.is_none());
         assert!(handler.leases.is_empty());
 
-        // Block 1 was finalized to a committed generation, so it survives.
+        // The raw meta is the committed generation again (never deleted),
+        // and the rewrite reservation was released.
+        let raw = store
+            .read()?
+            .get_block(1)
+            .cloned()
+            .expect("block 1 meta must exist after rollback");
+        assert!(raw.is_final());
+        assert_eq!(store.read()?.available(), available_before);
         assert!(store.get_block(1)?.is_final());
         // Blocks 2/3 were never committed and must be aborted.
         assert!(store.get_block(2).is_err());

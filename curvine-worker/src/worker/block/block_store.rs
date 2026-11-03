@@ -343,12 +343,17 @@ impl BlockStore {
         self.with_dataset_write("abort", |state| state.abort_block(block))
     }
 
-    pub(crate) fn abort_replication_write(&self, block_id: i64) -> CommonResult<()> {
-        let _lock = self.block_lock(block_id, "abort_replication");
+    /// Aborts a block unless it is in the committed, finalized generation:
+    /// takes the block stripe lock, checks the replication owner, then aborts
+    /// the raw current generation only if `!is_final()`, all inside one
+    /// `with_dataset_write`. Complete/open error paths may already have rolled
+    /// back to an old committed generation — a second abort must not delete
+    /// that finalized replica — so this never goes through the readable view.
+    /// Missing blocks (already aborted) are fine and return `Ok(())`.
+    fn abort_unless_final(&self, block_id: i64, op: &str) -> CommonResult<()> {
+        let _lock = self.block_lock(block_id, op);
         self.check_replication_owner(block_id)?;
-        self.with_dataset_write("abort_replication", |state| {
-            // complete/open error paths may already have rolled back to an old committed
-            // generation. A second abort must not delete that finalized replica.
+        self.with_dataset_write(op, |state| {
             if state
                 .get_block(block_id)
                 .is_some_and(|meta| !meta.is_final())
@@ -359,31 +364,14 @@ impl BlockStore {
         })
     }
 
-    /// Aborts a batch-opened block unless it is still in the committed,
-    /// finalized generation. Unlike [`BlockStore::abort_block`], this does
-    /// NOT go through the readable view: during a file-backed rewrite the
-    /// dataset keeps the previous committed meta in `committed_rewrites`, so
-    /// `get_block`/`get_readable_block` would return that old meta and report
-    /// `is_final() == true`, leaking the new Writing generation's staging
-    /// file and reserved capacity. The raw `state.get_block(id)` reflects the
-    /// current Writing (or later) generation, and the check plus abort run
-    /// under the same block stripe lock inside one `with_dataset_write`,
-    /// mirroring `abort_replication_write`, so a concurrent finalize cannot
-    /// slip between them and get its committed replica deleted.
-    ///
-    /// Missing blocks (already aborted) are fine and return `Ok(())`.
+    pub(crate) fn abort_replication_write(&self, block_id: i64) -> CommonResult<()> {
+        self.abort_unless_final(block_id, "abort_replication")
+    }
+
+    /// Aborts a batch-opened block unless it is already finalized; see
+    /// [`BlockStore::abort_unless_final`] for the check-and-abort contract.
     pub(crate) fn abort_batch_write(&self, block_id: i64) -> CommonResult<()> {
-        let _lock = self.block_lock(block_id, "abort_batch");
-        self.check_replication_owner(block_id)?;
-        self.with_dataset_write("abort_batch", |state| {
-            if state
-                .get_block(block_id)
-                .is_some_and(|meta| !meta.is_final())
-            {
-                state.abort_block(&ExtendedBlock::with_id(block_id))?;
-            }
-            Ok(())
-        })
+        self.abort_unless_final(block_id, "abort_batch")
     }
 
     pub fn get_block(&self, id: i64) -> CommonResult<BlockMeta> {
