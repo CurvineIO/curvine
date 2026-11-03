@@ -73,6 +73,14 @@ impl FsmState {
         applied.index.saturating_sub(1)
     }
 
+    pub fn compact_upto(&self, min_commit: Option<u64>) -> u64 {
+        let compact = self.compact();
+        match min_commit {
+            Some(min_commit) => compact.min(min_commit),
+            None => compact,
+        }
+    }
+
     pub fn op_id(&self) -> u64 {
         self.applied.op_id.max(self.ufs_applied.op_id)
     }

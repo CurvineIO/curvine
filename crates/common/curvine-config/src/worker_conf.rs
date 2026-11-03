@@ -173,6 +173,27 @@ pub struct WorkerConf {
     pub enable_splice: bool,
     pub enable_send_file: bool,
 
+    /// Write block data checksums (#1921). Off by default.
+    ///
+    /// When enabled, finalizing a local file block writes a per-chunk CRC32C
+    /// sidecar next to it. Verification on read is controlled separately by
+    /// `block_checksum_verify`.
+    pub block_checksum: bool,
+
+    /// Verify block data checksums on read (#1921). Off by default.
+    ///
+    /// When enabled, worker reads of local file blocks check every chunk
+    /// against its sidecar and fail with an IO error on mismatch, so corrupted
+    /// bytes are never returned. Sendfile and short-circuit reads are not used
+    /// while this is on, because they bypass the check.
+    pub block_checksum_verify: bool,
+
+    /// With `block_checksum_verify`, whether a block without a sidecar is read
+    /// unverified (true, default) or rejected (false). Blocks written before
+    /// `block_checksum` was enabled, or while it is off, have no sidecar, so
+    /// rejecting them only makes sense once every block has one.
+    pub block_checksum_allow_missing: bool,
+
     // Pipe size
     pub pipe_buf_size: usize,
     // Number of cores of pipeline resource pool
@@ -217,20 +238,26 @@ impl Default for WorkerConf {
             dir_reserved: "0".to_string(),
             free_ratio: 0.0,
             data_dir: vec![],
-            io_slow_threshold: "300ms".to_string(),
+            io_slow_threshold: "100ms".to_string(),
             io_threads: 32,
             worker_threads: Utils::worker_threads(32),
             io_timeout: "10m".to_string(),
             io_close_idle: false,
 
             scheduler_threads: 2,
-            log: Default::default(),
+            log: LogConf {
+                file_name: "worker.log".to_string(),
+                ..Default::default()
+            },
 
             executor_threads: 10,
             executor_channel_size: 1000,
 
             enable_splice: false,
             enable_send_file: true,
+            block_checksum: false,
+            block_checksum_verify: false,
+            block_checksum_allow_missing: true,
 
             pipe_buf_size: 64 * 1024,
             pipe_pool_init_cap: 0,
@@ -258,6 +285,41 @@ mod tests {
     #[test]
     fn free_ratio_defaults_to_zero() {
         assert_eq!(WorkerConf::default().free_ratio, 0.0);
+    }
+
+    #[test]
+    fn io_slow_threshold_defaults_to_100ms() {
+        // 128KB write chunk at 100ms is ~1.25MB/s: clearly abnormal on any local
+        // disk, while 300ms would only fire on an almost hung device.
+        assert_eq!(WorkerConf::default().io_slow_us(), 100_000);
+    }
+
+    #[test]
+    fn block_checksum_defaults_to_off() {
+        assert!(!WorkerConf::default().block_checksum);
+        let conf: WorkerConf = toml::from_str(r#"data_dir = ["/data/data1"]"#).unwrap();
+        assert!(!conf.block_checksum);
+    }
+
+    #[test]
+    fn block_checksum_parses_from_toml() {
+        let conf: WorkerConf = toml::from_str("block_checksum = true").unwrap();
+        assert!(conf.block_checksum);
+        assert!(!conf.block_checksum_verify);
+    }
+
+    #[test]
+    fn block_checksum_verify_defaults_and_parses() {
+        let conf = WorkerConf::default();
+        assert!(!conf.block_checksum_verify);
+        assert!(conf.block_checksum_allow_missing);
+
+        let conf: WorkerConf =
+            toml::from_str("block_checksum_verify = true\nblock_checksum_allow_missing = false")
+                .unwrap();
+        assert!(conf.block_checksum_verify);
+        assert!(!conf.block_checksum_allow_missing);
+        assert!(!conf.block_checksum);
     }
 
     #[test]

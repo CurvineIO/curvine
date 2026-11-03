@@ -182,14 +182,25 @@ where
 
             let frame = RpcFrame::with_server(stream, &self.conf);
             let bind_addr = self.bind_addr().clone();
-            let mut handler = self
-                .service
-                .get_stream_handler(self.rt.clone(), frame, &self.conf);
-            self.rt.spawn(async move {
-                if let Err(e) = handler.run().await {
-                    error!("Connection[{} -> {}]: {}", bind_addr, client_addr, e);
-                }
-            });
+            if self.service.is_stream() {
+                let mut handler =
+                    self.service
+                        .get_stream_handler(self.rt.clone(), frame, &self.conf);
+                self.rt.spawn(async move {
+                    if let Err(e) = handler.run().await {
+                        error!("Connection[{} -> {}]: {}", bind_addr, client_addr, e);
+                    }
+                });
+            } else {
+                let mut handler =
+                    self.service
+                        .get_buffer_handler(self.rt.clone(), frame, &self.conf);
+                self.rt.spawn(async move {
+                    if let Err(e) = handler.run().await {
+                        error!("Connection[{} -> {}]: {}", bind_addr, client_addr, e);
+                    }
+                });
+            }
         }
     }
 

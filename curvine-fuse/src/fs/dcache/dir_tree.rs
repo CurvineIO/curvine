@@ -583,7 +583,7 @@ impl DirTree {
 
         let mut path = String::with_capacity(seg_bytes);
         for seg in segments.iter().rev() {
-            if !path.is_empty() && &path[path.len() - 1..] != FUSE_PATH_SEPARATOR {
+            if !path.is_empty() && !path.ends_with(FUSE_PATH_SEPARATOR) {
                 path.push_str(FUSE_PATH_SEPARATOR);
             }
             path.push_str(seg);
@@ -611,10 +611,17 @@ impl DirTree {
                 return Ok(());
             };
             inode.mark_delete = false;
+            inode.deferred_delete_path = None;
+            inode.deferred_delete_master_id = None;
             (inode.parent, inode.name.clone())
         };
-        let dir = self.get_dir_mut_check(parent)?;
-        dir.clear_deleted_child(&name);
+        // A missing parent directory means there is no deleted_children entry
+        // left to clear: the ancestor was evicted. Treat it as nothing to do
+        // (same convention as `clear_unlink_state`) instead of failing the
+        // whole successful deferred delete with ENOENT (#1395).
+        if let Ok(dir) = self.get_dir_mut_check(parent) {
+            dir.clear_deleted_child(&name);
+        }
         Ok(())
     }
 
@@ -642,6 +649,37 @@ impl DirTree {
             None => false,
             Some(inode) => inode.is_deleted(),
         }
+    }
+
+    /// Record the unlink-time Curvine path and master file id for a pending
+    /// deferred delete.
+    ///
+    /// `fs_unlink` calls this right after `unlink(.., true)` under `lock_path`,
+    /// so the stored path is exactly what the unlink resolved and the correct
+    /// backend deletion target for the release-time fallback (#1395). The
+    /// master id lets release verify the path still points at the same file
+    /// before deleting it (renames after unlink can reuse the name).
+    pub fn set_deferred_delete_path(&mut self, ino: u64, path: String) {
+        if let Some(inode) = self.inodes.get_mut(&ino) {
+            inode.deferred_delete_path = Some(path);
+            // The master file id captured when this inode was materialized
+            // (before `status.id` was re-stamped with the FUSE ino).
+            inode.deferred_delete_master_id = inode.master_id;
+        }
+    }
+
+    /// The recorded unlink-time path of a pending deferred delete, if any.
+    pub fn deferred_delete_path(&self, ino: u64) -> Option<String> {
+        self.get_inode(ino, None)
+            .filter(|inode| inode.is_deleted())
+            .and_then(|inode| inode.deferred_delete_path.clone())
+    }
+
+    /// The recorded master file id of a pending deferred delete, if any.
+    pub fn deferred_delete_master_id(&self, ino: u64) -> Option<i64> {
+        self.get_inode(ino, None)
+            .filter(|inode| inode.is_deleted())
+            .and_then(|inode| inode.deferred_delete_master_id)
     }
 
     pub fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
@@ -1076,6 +1114,41 @@ mod test {
         let b_ino = t.lookup(a_ino, "b", b, true).unwrap().ino;
         let p = t.try_get_path(b_ino, Some("c")).unwrap();
         assert_eq!(p.full_path(), "/a/b/c");
+    }
+
+    /// Segments ending in a multi-byte UTF-8 character must not be sliced at a byte index.
+    #[test]
+    fn try_get_path_multibyte_intermediate_dir() {
+        let mut t = DirTree::default();
+        let a_ino = t
+            .lookup(FUSE_ROOT_ID, "中文目录", dir_st("中文目录", 0), true)
+            .unwrap()
+            .ino;
+        let mut b = dir_st("子目录", 0);
+        b.path = "/中文目录/子目录".to_owned();
+        let b_ino = t.lookup(a_ino, "子目录", b, true).unwrap().ino;
+
+        let p = t.try_get_path(a_ino, Some("file.bin")).unwrap();
+        assert_eq!(p.full_path(), "/中文目录/file.bin");
+        let p = t.try_get_path(b_ino, Some("文件.bin")).unwrap();
+        assert_eq!(p.full_path(), "/中文目录/子目录/文件.bin");
+        let p = t.try_get_path(b_ino, None).unwrap();
+        assert_eq!(p.full_path(), "/中文目录/子目录");
+    }
+
+    #[test]
+    fn try_get_path_multibyte_fs_path_from_conf() {
+        let conf = FuseConf {
+            fs_path: "/数据".to_string(),
+            ..Default::default()
+        };
+        let mut t = DirTree::new(conf);
+        let d_ino = t
+            .lookup(FUSE_ROOT_ID, "sub", dir_st("sub", 0), true)
+            .unwrap()
+            .ino;
+        let p = t.try_get_path(d_ino, Some("x")).unwrap();
+        assert_eq!(p.full_path(), "/数据/sub/x");
     }
 
     #[test]

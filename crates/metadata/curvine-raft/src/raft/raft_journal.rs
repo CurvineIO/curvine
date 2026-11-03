@@ -87,26 +87,6 @@ where
         Self::start(server, node).await
     }
 
-    pub async fn run_follower(self) -> RaftResult<RoleStateListener> {
-        let mut server = RaftServer::with_rt(self.rt.clone(), &self.conf);
-        let receiver = server.take_receiver()?;
-        let sender = server.new_sender();
-
-        let node = RaftNode::new_follower(
-            self.rt,
-            &self.conf,
-            self.log_store,
-            self.app_store,
-            self.role_monitor,
-            receiver,
-            sender,
-            &self.logger,
-        )
-        .await?;
-
-        Self::start(server, node).await
-    }
-
     async fn start(server: RaftServer, node: RaftNode<A, B>) -> RaftResult<RoleStateListener> {
         // Start the tcp service and wait for it to be ready.
         let mut server_listener = server.start();

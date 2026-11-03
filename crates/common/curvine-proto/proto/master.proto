@@ -50,10 +50,15 @@ message CreateFileRequest {
     required string path = 1;
     required CreateFileOptsProto opts = 2;
     required uint32 flags = 3;
+    // When set, the master also allocates the first block of an empty file and
+    // returns it in `first_block`, saving the separate AddBlock round trip.
+    // Masters that predate this field ignore it and clients fall back to AddBlock.
+    optional ClientAddressProto first_block_client = 4;
 }
 
 message CreateFileResponse {
     required FileStatusProto file_status = 1;
+    optional LocatedBlockProto first_block = 2;
 }
 
 message CreateFilesBatchRequest {
@@ -76,10 +81,14 @@ message OpenFileRequest {
     required string path = 1;
     required CreateFileOptsProto opts = 2;
     required uint32 flags = 3;
+    // Same as CreateFileRequest.first_block_client. Only honoured when the open
+    // leaves the file empty (O_CREAT on a missing file, or O_TRUNC).
+    optional ClientAddressProto first_block_client = 4;
 }
 
 message OpenFileResponse {
     required FileBlocksProto file_blocks = 1;
+    optional LocatedBlockProto first_block = 2;
 }
 
 
@@ -101,8 +110,10 @@ message DeleteResponse {
     optional FreeResultProto res = 1;
     // True when the master moved the entry into /.Trash instead of purging it.
     optional bool trashed = 2 [default = false];
-    // True when the entry was staged for asynchronous reclamation, so the
-    // returned counts are zero and the space is freed after the purge runs.
+    // True when part or all of the entry is left for asynchronous reclamation,
+    // and the remaining space is freed after the purge runs. The returned
+    // counts are zero for an async delete, and cover only what was already
+    // reclaimed when a staged recursive delete stopped early.
     optional bool purge_pending = 3 [default = false];
 }
 
@@ -268,6 +279,9 @@ message CompleteFileRequest {
     optional SetAttrOptsProto set_attr_opts = 7;
     // Omitted by legacy clients to preserve the historical full snapshot response.
     optional bool return_file_blocks = 8 [default = true];
+    // A block pre-allocated by CreateFile/OpenFile that the client never wrote.
+    // The master drops it if it is still empty and uncommitted.
+    optional int64 release_block_id = 9;
 }
 
 message CompleteFileResponse {
@@ -418,6 +432,25 @@ message MetricsReportResponse {
 
 }
 
+// Client session lease heartbeat. The first heartbeat registers the session
+// keyed by client.client_name; later heartbeats renew it. Sessions are advisory
+// liveness only and are not an authentication boundary.
+message ClientHeartbeatRequest {
+    required ClientAddressProto client = 1;
+    // Client-side heartbeat interval, informational for the master.
+    required uint64 heartbeat_interval_ms = 2;
+    optional uint32 pid = 3;
+    optional string mount_point = 4;
+    optional string client_version = 5;
+}
+
+message ClientHeartbeatResponse {
+    // A session not renewed within this window is considered expired.
+    required uint64 session_timeout_ms = 1;
+    // True when this heartbeat registered a new session on the current leader.
+    required bool new_session = 2;
+}
+
 message FileResizeRequest {
     required string path = 1;
     required FileAllocOptsProto opts = 2;
@@ -484,4 +517,14 @@ message GetCvMetadataSnapshotPageResponse {
     repeated CvMetadataSnapshotEntryProto entries = 1;
     optional string next_page_token = 2;
     required uint64 epoch = 3;
+}
+
+message CreateLeaderSnapshotRequest {
+    // Create the checkpoint even if the previous one is inside snapshot_min_interval.
+    required bool force = 1;
+}
+
+message CreateLeaderSnapshotResponse {
+    required string dir = 1;
+    required uint64 cost_ms = 2;
 }

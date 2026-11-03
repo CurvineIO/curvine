@@ -52,7 +52,7 @@ public class FilesystemConf {
     // rpc requests retry policy.
     public long rpc_retry_max_duration_ms = 120 * 1000;
     public long rpc_retry_min_sleep_ms = 100;
-    public long rpc_retry_max_sleep_ms = 10 * 1000;
+    public long rpc_retry_max_sleep_ms = 3 * 1000;
 
     // Whether to close the idle rpc connection.
     public boolean rpc_close_idle = true;
@@ -61,6 +61,11 @@ public class FilesystemConf {
     public long conn_timeout_ms = 30 * 1000;
     public long rpc_timeout_ms = 120 * 1000;
     public long data_timeout_ms = 120 * 1000;
+
+    // Maximum time to wait for one write-buffer request/response handshake
+    // (data enqueue, flush, complete, cancel, seek, resize), in milliseconds.
+    // 0 keeps the native default (120s).
+    public long write_buffer_timeout_ms = 0;
 
     // Number of fs master connections.
     // Pool size 3 reaches the highest QPS. Pool size 1 supports the most clients, so the default is 1.
@@ -332,6 +337,7 @@ public class FilesystemConf {
                 ", conn_timeout_ms=" + conn_timeout_ms +
                 ", rpc_timeout_ms=" + rpc_timeout_ms +
                 ", data_timeout_ms=" + data_timeout_ms +
+                ", write_buffer_timeout_ms=" + write_buffer_timeout_ms +
                 ", master_conn_pool_size=" + master_conn_pool_size +
                 ", enable_read_ahead=" + enable_read_ahead +
                 ", read_ahead_len='" + read_ahead_len + '\'' +

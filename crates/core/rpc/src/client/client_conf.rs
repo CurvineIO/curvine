@@ -95,7 +95,7 @@ impl Default for ClientConf {
 
             io_retry_max_duration_ms: 120 * 1000,
             io_retry_min_sleep_ms: 100,
-            io_retry_max_sleep_ms: 10 * 1000,
+            io_retry_max_sleep_ms: 3 * 1000,
 
             conn_timeout_ms: 30 * 1000,
             rpc_timeout_ms: 2 * 60 * 1000,

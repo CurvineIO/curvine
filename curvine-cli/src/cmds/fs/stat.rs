@@ -76,10 +76,7 @@ impl StatCommand {
 
                         Ok(())
                     }
-                    Err(e) => {
-                        eprintln!("stat: Cannot stat '{}': {}", path.full_path(), e);
-                        Err(e.into())
-                    }
+                    Err(e) => Err(format!("Cannot stat '{}': {}", path.full_path(), e).into()),
                 }
             }
         }

@@ -65,6 +65,8 @@ pub fn skip_iov_bytes<'a>(
     result
 }
 
+mod nss_cache;
+
 mod sys_libc;
 pub use self::sys_libc::*;
 

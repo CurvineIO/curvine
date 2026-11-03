@@ -58,6 +58,17 @@ impl FileHandle {
         }
     }
 
+    /// Best-effort backend path recorded at open time, for logging only.
+    ///
+    /// This snapshot is NOT a deletion target: renames do not update it and on
+    /// cache-mode UFS mounts it can be a UFS URI. Close-time deferred deletes
+    /// use the unlink-time recorded Curvine path instead (#1395).
+    pub fn open_path(&self) -> String {
+        match self {
+            FileHandle::Backend(h) => h.open_path(),
+        }
+    }
+
     /// True when this handle can satisfy write-related side effects (backend writer).
     pub fn has_writer(&self) -> bool {
         match self {

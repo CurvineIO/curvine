@@ -86,12 +86,15 @@ pub enum RpcCode {
     ReconcileReplication = 57,
     SubmitFencedReplication = 58,
 
+    ClientHeartbeat = 59,
     MetricsReport = 60,
 
     // recycle bin.
     ListTrash = 61,
     RestoreTrash = 62,
     EmptyTrash = 63,
+
+    CreateLeaderSnapshot = 70,
 
     // block interface.
     WriteBlock = 80,

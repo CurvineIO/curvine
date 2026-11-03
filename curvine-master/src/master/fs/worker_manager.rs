@@ -168,6 +168,11 @@ impl WorkerManager {
     /// absent because the commit never re-reserved (`FsWriterBase` reopening
     /// an existing block, repeated flushes), settles nothing, so other
     /// blocks' reservations stay intact.
+    ///
+    /// Releasing an unwritten pre-allocated block (`release_block_id`) goes
+    /// through the same entries with `block_len = 0`: exactly the credit that
+    /// block still owns comes back, and credit a heartbeat already reclaimed
+    /// stays reclaimed.
     pub(crate) fn settle_committed_blocks(&mut self, settles: &[SettleEntry]) {
         for &(block_id, block_len, worker_id) in settles {
             if let Some(worker) = self.worker_map.workers.get_mut(&worker_id) {
@@ -193,6 +198,18 @@ impl WorkerManager {
                     .iter()
                     .filter(|loc| loc.storage_type != StorageType::SpdkDisk)
                     .map(move |loc| (commit.block_id, commit.block_len, loc.worker_id))
+            })
+            .collect()
+    }
+
+    /// Snapshots the chosen workers of a pre-allocated block, so a later
+    /// release can settle that block's credit on exactly those workers.
+    pub(crate) fn schedule_stamps(&self, workers: &[WorkerAddress]) -> Vec<(u32, u64)> {
+        workers
+            .iter()
+            .filter_map(|addr| {
+                let worker = self.worker_map.workers.get(&addr.worker_id)?;
+                Some((addr.worker_id, worker.scheduled_since_ms))
             })
             .collect()
     }

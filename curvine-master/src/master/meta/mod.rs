@@ -36,6 +36,7 @@ mod glob_utils;
 pub use glob_utils::*;
 
 mod lock_meta;
+pub(crate) use self::lock_meta::LegacyFileLock;
 pub use self::lock_meta::LockMeta;
 
 pub mod trash;

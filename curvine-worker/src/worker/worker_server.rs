@@ -159,7 +159,7 @@ impl Worker {
                 Ok(env) => {
                     info!(
                         "SPDK environment ready: {} bdev(s), total capacity {}",
-                        env.bdevs().len(),
+                        env.active_bdev_count(),
                         env.total_capacity()
                     );
                     // Validate: each data_dir needs one bdev (dir_id % num_bdevs)
@@ -173,7 +173,7 @@ impl Worker {
                                 .unwrap_or(false)
                         })
                         .count();
-                    let num_bdevs = env.bdevs().len();
+                    let num_bdevs = env.active_bdev_count();
                     if num_spdk_dirs > num_bdevs {
                         return curvine_core_error::err_box!(
                             "Configuration has {} SPDK data_dir entries but only {} bdev(s) \

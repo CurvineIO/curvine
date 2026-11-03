@@ -133,6 +133,22 @@ Resolve only threads where the fix is merged in the PR branch and reply is poste
 - [ ] Fixes committed and pushed
 - [ ] Each comment replied in English
 - [ ] Fixed threads resolved on GitHub
+- [ ] Wrap-up summary emitted per the Wrap-up Summary section, including its Chinese translation
+
+## Wrap-up Summary (required)
+
+Close every run with the block below, in the local chat, at the stage the run actually reached - the analysis table awaiting approval, every comment declined with no thread to resolve, or threads replied to and resolved. GitHub-facing text stays English; this block is for the user, and it ends with its Chinese translation.
+
+| Part | Content |
+| ---- | ------- |
+| PR | `#<n>` and URL, base and head SHAs, and the comment totals (processed / accepted / declined / already fixed) |
+| Comments | id plus `path:line`, severity, the decision, and the reply that was posted |
+| Problem solved | per accepted comment: the defect and the impact it removed |
+| Approach | the fix, the files and crates touched, the tests run, and the reply and resolve status of each thread |
+| Reason for the decision | why a comment was accepted or declined, citing the code or test evidence |
+| Open items | threads still open, work deferred to a follow-up issue, and anything the user must still confirm |
+
+Then append the same summary in Chinese under a `### Summary (Chinese)` heading: translate the conclusions and reasons, keep issue/PR numbers, paths, SHAs, commands and quoted output verbatim, and do not add claims that are absent above.
 
 ## Related
 

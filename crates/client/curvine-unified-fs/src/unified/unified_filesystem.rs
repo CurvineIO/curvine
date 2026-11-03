@@ -17,7 +17,7 @@ use crate::{
 };
 use bytes::BytesMut;
 use curvine_client_core::file::{
-    CurvineFileSystem, FsClient, FsContext, FsReader, MasterHandshake,
+    CurvineFileSystem, FsClient, FsContext, FsReader, FsWriter, MasterHandshake,
 };
 use curvine_client_core::ClientMetrics;
 use curvine_config::ClusterConf;
@@ -752,11 +752,49 @@ impl UnifiedFileSystem {
         self.open_with_opts(path, opts, flags).await
     }
 
-    pub async fn open_with_opts(
+    // The open path is boxed: in debug builds every nested async layer keeps
+    // its own copy of the inner future on the stack, and FUSE request tasks
+    // run on 2 MiB worker stacks.
+    pub fn open_with_opts<'a>(
+        &'a self,
+        path: &'a Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> impl Future<Output = FsResult<UnifiedWriter>> + 'a {
+        Box::pin(self.open_with_opts0(path, opts, flags, true))
+    }
+
+    /// `open_with_opts` without first-block pre-allocation on the Curvine
+    /// side, for a caller that completes the file without writing.
+    pub fn open_without_first_block<'a>(
+        &'a self,
+        path: &'a Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> impl Future<Output = FsResult<UnifiedWriter>> + 'a {
+        Box::pin(self.open_with_opts0(path, opts, flags, false))
+    }
+
+    async fn open_cv_writer(
         &self,
         path: &Path,
         opts: CreateFileOpts,
         flags: OpenFlags,
+        alloc_first_block: bool,
+    ) -> FsResult<FsWriter> {
+        if alloc_first_block {
+            self.cv.open_with_opts(path, opts, flags).await
+        } else {
+            self.cv.open_without_first_block(path, opts, flags).await
+        }
+    }
+
+    async fn open_with_opts0(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+        alloc_first_block: bool,
     ) -> FsResult<UnifiedWriter> {
         let time = TimeSpent::new();
         let mut write_path = path.path().to_owned();
@@ -769,13 +807,17 @@ impl UnifiedFileSystem {
             };
             match self.get_mount(path, rpc_code).await? {
                 None => {
-                    let writer = self.cv.open_with_opts(path, opts, flags).await?;
+                    let writer = self
+                        .open_cv_writer(path, opts, flags, alloc_first_block)
+                        .await?;
                     Ok(UnifiedWriter::Cv(writer))
                 }
 
                 Some((_, mount)) if mount.info.is_fs_mode() => {
                     let opts = mount.info.merge_create_opts(opts);
-                    let mut writer = self.cv.open_with_opts(path, opts.clone(), flags).await?;
+                    let mut writer = self
+                        .open_cv_writer(path, opts.clone(), flags, alloc_first_block)
+                        .await?;
                     if writer.file_blocks().data_exists() || flags.overwrite() {
                         Ok(UnifiedWriter::Cv(writer))
                     } else {

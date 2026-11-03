@@ -59,6 +59,12 @@ impl RoleMonitor {
         self.state() == RoleState::Leader
     }
 
+    pub fn step_down(&self) {
+        if self.is_leader() {
+            self.0.advance_state(RoleState::Follower, false);
+        }
+    }
+
     pub fn advance_exit(&self) {
         self.0.advance_state(RoleState::Exit, true);
     }

@@ -28,7 +28,7 @@ impl ProtoUtils {
         StorageInfoProto {
             dir_id: item.dir_id,
             storage_id: item.storage_id,
-            failed: false,
+            failed: item.failed,
             capacity: item.capacity,
             fs_used: item.fs_used,
             non_fs_used: item.non_fs_used,
@@ -44,7 +44,7 @@ impl ProtoUtils {
         StorageInfo {
             dir_id: item.dir_id,
             storage_id: item.storage_id,
-            failed: false,
+            failed: item.failed,
             capacity: item.capacity,
             fs_used: item.fs_used,
             non_fs_used: item.non_fs_used,
@@ -600,6 +600,7 @@ impl ProtoUtils {
                 status: BlockReportStatus::from(block.status),
                 storage_type: StorageType::from(block.storage_type),
                 block_size: block.block_size,
+                corrupted: block.corrupted.unwrap_or(false),
             };
             dst.blocks.push(dst_blocks);
         }
@@ -864,6 +865,7 @@ impl ProtoUtils {
             lock_flags: lock.lock_flags as i32,
             start: lock.start,
             end: lock.end,
+            session_owned: Some(lock.session_owned),
         }
     }
 
@@ -877,6 +879,7 @@ impl ProtoUtils {
             lock_flags: LockFlags::from(lock.lock_flags as u8),
             start: lock.start,
             end: lock.end,
+            session_owned: lock.session_owned.unwrap_or(false),
         }
     }
 
@@ -945,12 +948,31 @@ impl ProtoUtils {
 mod tests {
     use crate::proto::CompatibilityModeProto;
     use crate::state::{
-        AccessMode, FileStatus, MountInfo, MountOptions, RestoreTrashResult, TrashEntry,
-        INTERNAL_CTIME_XATTR,
+        AccessMode, FileStatus, MountInfo, MountOptions, RestoreTrashResult, StorageInfo,
+        TrashEntry, INTERNAL_CTIME_XATTR,
     };
     use crate::utils::ProtoUtils;
     use curvine_sys::version::ComponentVersion;
     use std::collections::HashMap;
+
+    #[test]
+    fn storage_info_failed_round_trip() {
+        let info = StorageInfo {
+            dir_id: 3,
+            storage_id: "v1-3".to_string(),
+            failed: true,
+            capacity: 1024,
+            dir_path: "/data/3".to_string(),
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::storage_info_to_pb(info.clone());
+        assert!(pb.failed);
+
+        let round_trip = ProtoUtils::storage_info_from_pb(pb);
+        assert!(round_trip.failed, "failed state must reach the master");
+        assert_eq!(round_trip.dir_id, info.dir_id);
+    }
 
     #[test]
     fn test_mount_info_proto_round_trip_auto_cache_and_access_mode() {

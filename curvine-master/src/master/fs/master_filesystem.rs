@@ -21,11 +21,12 @@ use crate::master::meta::{
     trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
 };
 
+use crate::master::fs::state::{SessionHeartbeat, SessionMap};
 use crate::master::fs::worker_manager::WorkerManager;
-use crate::master::fs::DeleteResult;
+use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
-use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
+use crate::master::{Master, MasterMonitor, SyncFsDir, SyncSessionMap, SyncWorkerManager};
 use curvine_config::{ClusterConf, MasterConf};
 use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
 use curvine_error::FsError;
@@ -53,6 +54,10 @@ pub enum DeleteMode {
     /// the background, regardless of `master.trash_enabled`. Falls back to a
     /// permanent delete for paths already inside the trash namespace.
     AsyncPurge,
+    /// Permanent delete of a mounted path. The client already removed the UFS
+    /// object, so the entry is never trashed or staged: a staging rename would
+    /// be replayed as a UFS rename.
+    Mounted,
 }
 
 pub struct CvMetadataSnapshotEntry {
@@ -66,10 +71,13 @@ pub struct CvMetadataSnapshotPage {
     pub epoch: u64,
 }
 
-struct CompleteFileOptions {
-    only_flush: bool,
-    return_file_blocks: bool,
-    set_attr_opts: Option<SetAttrOpts>,
+#[derive(Default)]
+pub struct CompleteFileOptions {
+    pub only_flush: bool,
+    pub return_file_blocks: bool,
+    pub set_attr_opts: Option<SetAttrOpts>,
+    /// Pre-allocated block the client never wrote; see `alloc_first_block`.
+    pub release_block_id: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -77,6 +85,8 @@ pub struct MasterFilesystem {
     pub fs_dir: SyncFsDir,
     pub worker_manager: SyncWorkerManager,
     pub master_monitor: MasterMonitor,
+    /// Leader-local client session leases (not journaled).
+    pub session_map: SyncSessionMap,
     pub conf: Arc<MasterConf>,
     full_report_tracker: FullReportTracker,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
@@ -87,10 +97,51 @@ pub struct MasterFilesystem {
     /// never reclaim the same entry and the blocking caller always reports the
     /// totals it actually reclaimed.
     pending_drain: Arc<Mutex<()>>,
+    /// Leader-local registry of blocks handed out by `alloc_first_block` that
+    /// only their creator may still release (not journaled). An entry is
+    /// dropped as soon as the block is committed or handed to any other
+    /// caller (OpenFile for write, AddBlock reuse, AssignWorker), so a stale
+    /// release can never remove a block another writer is using. Lock order:
+    /// always taken after `fs_dir`, never held while taking another lock.
+    pre_alloc: Arc<Mutex<HashMap<i64, PreAllocBlock>>>,
+    /// `/.Trash/.purging` entries a synchronous delete is still purging. Entries
+    /// are registered under the namespace write lock that stages them, so the
+    /// background purger, which scans under the read lock, never adopts an entry
+    /// whose caller is still reclaiming it.
+    purging_inflight: Arc<Mutex<HashSet<String>>>,
 }
+
+/// Unregisters an in-flight `.purging` entry, also on early return or panic.
+struct PurgingGuard<'a> {
+    set: &'a Mutex<HashSet<String>>,
+    path: &'a str,
+}
+
+impl Drop for PurgingGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().remove(self.path);
+    }
+}
+
+/// Reservation taken for a pre-allocated first block. The release settles the
+/// block's bound credit on these workers, so only the stamps' worker ids are
+/// consumed.
+struct PreAllocBlock {
+    /// `(worker_id, scheduled_since_ms)` right after the reservation.
+    stamps: Vec<(u32, u64)>,
+    alloc_ms: u64,
+}
+
+/// Above this many unreleased pre-allocations, entries older than the
+/// reservation timeout are pruned. Pruning only turns a later release into a
+/// no-op, which leaves the same empty block an unwritten AddBlock leaves.
+const PRE_ALLOC_PRUNE_THRESHOLD: usize = 65536;
 
 pub struct BlockReportResult {
     pub delete_blocks: Vec<i64>,
+    /// Blocks reported as removed for failing checksum verification and
+    /// queued for re-replication.
+    pub corrupt_blocks: Vec<i64>,
 }
 
 #[derive(Default)]
@@ -174,6 +225,7 @@ impl MasterFilesystem {
             fs_dir,
             worker_manager,
             master_monitor,
+            session_map: ArcRwLock::new(SessionMap::new(conf.master.client_session_timeout_ms())),
             conf: Arc::new(conf.master.clone()),
             full_report_tracker: Default::default(),
             full_block_reconciles: Default::default(),
@@ -183,6 +235,8 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
             pending_drain: Default::default(),
+            pre_alloc: Default::default(),
+            purging_inflight: Default::default(),
         }
     }
 
@@ -191,6 +245,9 @@ impl MasterFilesystem {
             fs_dir: js.fs().fs_dir.clone(),
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
+            // Share the journal system's registry: every handle on the same
+            // master must see one set of client sessions.
+            session_map: js.fs().session_map.clone(),
             conf: Arc::new(conf.master.clone()),
             full_report_tracker: Default::default(),
             full_block_reconciles: Default::default(),
@@ -200,7 +257,43 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
             pending_drain: Default::default(),
+            // Shared like `session_map`: CreateFile and CompleteFile may be
+            // served by different handles on the same master.
+            pre_alloc: js.fs().pre_alloc.clone(),
+            // Shared like `session_map`: every handle must agree on which
+            // `.purging` entries a synchronous delete still owns.
+            purging_inflight: js.fs().purging_inflight.clone(),
         }
+    }
+
+    /// Adopt the client-session lease epoch for the raft term this master is
+    /// serving (#1883 review).
+    ///
+    /// `SessionMap::created_at` is seeded when the process starts, but the grace
+    /// window it feeds (`#1879` lock validity, `#1884` reaper) must be measured
+    /// from election: a standby promoted hours later would otherwise find the
+    /// window already expired and could release a healthy client's locks. The term
+    /// is published by the journal loader, so no standby hook is needed - a
+    /// promotion always observes a higher term than the leadership it replaces.
+    ///
+    /// Every leader-side consumer of `created_at` must call this before reading
+    /// it. Callers that also write a session should use [`MasterFilesystem::heartbeat_in_epoch`]
+    /// so adoption and the write share one lock.
+    pub fn adopt_session_epoch(&self, now: u64) {
+        self.session_map
+            .write()
+            .adopt(self.master_monitor.term(), now);
+    }
+
+    /// Adopt the current term and register or renew `hb` under one lock.
+    ///
+    /// Returns `(new_session, session_timeout_ms)`, so a caller needs exactly one
+    /// session-map guard for both the epoch and the write.
+    pub(crate) fn heartbeat_in_epoch(&self, hb: SessionHeartbeat, now: u64) -> (bool, u64) {
+        let term = self.master_monitor.term();
+        let mut sessions = self.session_map.write();
+        let new_session = sessions.heartbeat_in_epoch(hb, term, now);
+        (new_session, sessions.session_timeout_ms())
     }
 
     pub fn check_parent(path: &InodePath) -> FsResult<()> {
@@ -283,11 +376,14 @@ impl MasterFilesystem {
         recursive: bool,
         mode: DeleteMode,
     ) -> FsResult<DeleteResult> {
-        let mut delete_res = {
+        let (mut delete_res, staged) = {
             let mut fs_dir = self.fs_dir.write();
             self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)?
         };
         self.release_deleted_blocks(&mut delete_res);
+        if let Some(staged) = staged {
+            self.finish_staged_delete(&staged, &mut delete_res);
+        }
 
         Ok(delete_res)
     }
@@ -302,7 +398,7 @@ impl MasterFilesystem {
         recursive: bool,
         mode: DeleteMode,
     ) -> FsResult<Option<DeleteResult>> {
-        let mut delete_res = {
+        let (mut delete_res, staged) = {
             let mut fs_dir = self.fs_dir.write();
             if !self.master_monitor.is_active() {
                 return Ok(None);
@@ -310,17 +406,23 @@ impl MasterFilesystem {
             self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)?
         };
         self.release_deleted_blocks(&mut delete_res);
+        if let Some(staged) = staged {
+            self.finish_staged_delete(&staged, &mut delete_res);
+        }
 
         Ok(Some(delete_res))
     }
 
+    /// Returns the delete result and, when the subtree was staged for a bounded
+    /// purge, the `/.Trash/.purging` path the caller must purge after releasing
+    /// the namespace lock.
     fn delete_locked(
         &self,
         fs_dir: &mut FsDir,
         path: &str,
         recursive: bool,
         mode: DeleteMode,
-    ) -> FsResult<DeleteResult> {
+    ) -> FsResult<(DeleteResult, Option<String>)> {
         let inp = Self::resolve_path(fs_dir, path)?;
 
         // Removing the root would orphan every trashed entry. Entries below it
@@ -335,10 +437,18 @@ impl MasterFilesystem {
         // bin cannot be used to hide data from a purge.
         let in_trash = trash::is_trash_path(inp.path());
         let soft_delete = match mode {
-            DeleteMode::SkipTrash => false,
+            DeleteMode::SkipTrash | DeleteMode::Mounted => false,
             DeleteMode::AsyncPurge => !in_trash,
             DeleteMode::Default => self.conf.trash_enabled && !in_trash,
         };
+
+        if !soft_delete && recursive && self.should_stage_delete(&inp, mode) {
+            let staged = fs_dir.stage_for_purge(&inp)?;
+            // Registered before the write lock is released; see
+            // `purging_inflight`.
+            self.purging_inflight.lock().insert(staged.clone());
+            return Ok((DeleteResult::new(), Some(staged)));
+        }
 
         // The callee reports how the delete was actually served: a shared inode
         // or an unresolved entry falls back to a permanent unlink even when the
@@ -348,7 +458,69 @@ impl MasterFilesystem {
             _ if soft_delete => fs_dir.trash(&inp, recursive)?,
             _ => fs_dir.delete(&inp, recursive)?,
         };
-        Ok(delete_res)
+        Ok((delete_res, None))
+    }
+
+    /// A permanent recursive delete is staged when the target is a directory
+    /// with at least `delete_stage_min_children` direct children (#1864).
+    /// Mounted paths and anything already inside a staging area are deleted
+    /// directly.
+    fn should_stage_delete(&self, inp: &InodePath, mode: DeleteMode) -> bool {
+        let min_children = self.conf.delete_stage_min_children;
+        if min_children == 0
+            || matches!(mode, DeleteMode::Mounted)
+            || inp.is_root()
+            || trash::is_staging_path(inp.path())
+        {
+            return false;
+        }
+        match inp.get_last_inode() {
+            Some(inode) => inode.is_dir() && inode.child_len() >= min_children,
+            None => false,
+        }
+    }
+
+    /// Purges a staged delete in bounded batches, releasing the namespace lock
+    /// between batches, and folds the reclaimed counts into `delete_res`.
+    ///
+    /// The namespace change is already committed and journaled, so the delete
+    /// itself has succeeded. If the purge stops early (lost leadership or a
+    /// failed batch) the entry stays in `/.Trash/.purging`, the result reports
+    /// `purge_pending` with the counts reclaimed so far, and the background
+    /// purger finishes it.
+    fn finish_staged_delete(&self, staged: &str, delete_res: &mut DeleteResult) {
+        let _guard = PurgingGuard {
+            set: &self.purging_inflight,
+            path: staged,
+        };
+        let purger = crate::master::fs::TrashPurger::new(self.clone(), self.master_monitor.clone());
+        // Batches applied before an early stop are already reclaimed, so they
+        // are reported even when the rest is left for the purger.
+        let (outcome, stop) = purger.purge_entry_partial(staged);
+        delete_res.inodes += outcome.inodes;
+        delete_res.bytes += outcome.bytes;
+        match stop {
+            None => {}
+            Some(PurgeStop::Demoted) => {
+                info!(
+                    "lost leadership while purging {}; left for the purger",
+                    staged
+                );
+                delete_res.purge_pending = true;
+            }
+            Some(PurgeStop::Failed(e)) => {
+                warn!(
+                    "purge of staged delete {} failed, left for the purger: {}",
+                    staged, e
+                );
+                delete_res.purge_pending = true;
+            }
+        }
+    }
+
+    /// True while a synchronous delete is still purging the `.purging` entry.
+    pub(crate) fn is_purge_inflight(&self, path: &str) -> bool {
+        self.purging_inflight.lock().contains(path)
     }
 
     pub(crate) fn release_deleted_blocks(&self, delete_res: &mut DeleteResult) {
@@ -458,6 +630,17 @@ impl MasterFilesystem {
     ) -> FsResult<TrashScanPage> {
         let fs_dir = self.fs_dir.read();
         fs_dir.scan_pending_trash(limit, start_after)
+    }
+
+    /// One bounded page of `/.Trash/.purging` entries, including the ones a
+    /// synchronous delete is still purging (see `is_purge_inflight`).
+    pub fn scan_purging_trash(
+        &self,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> FsResult<TrashScanPage> {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.scan_purging_trash(limit, start_after)
     }
 
     pub fn restore_trash<T: AsRef<str>>(
@@ -783,6 +966,10 @@ impl MasterFilesystem {
         let status = fs_dir.reopen_file(&inp, opts.client_name)?;
         let file = inode.as_file_ref()?;
         let blocks = if !file.blocks.is_empty() {
+            // The opener may write any returned block, including one still
+            // pre-allocated by its creator, so that creator may no longer
+            // release it.
+            self.forget_pre_alloc(file.blocks.iter().map(|v| v.id));
             self.get_block_locs(path, &fs_dir, file)?
         } else {
             vec![]
@@ -815,7 +1002,7 @@ impl MasterFilesystem {
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
         let fs_dir = self.fs_dir.read();
         let inp = Self::resolve_path_raw(&fs_dir, path.as_ref())?;
-        if trash::is_pending_path(inp.path()) {
+        if trash::is_staging_path(inp.path()) {
             return Ok(false);
         }
         Ok(inp.get_last_inode().is_some())
@@ -828,7 +1015,7 @@ impl MasterFilesystem {
             let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;
             let mut all_statuses = Vec::new();
             for path in &paths {
-                if trash::is_pending_path(path.path()) {
+                if trash::is_staging_path(path.path()) {
                     continue;
                 }
                 let statuses = fs_dir.list_status(path)?;
@@ -859,13 +1046,14 @@ impl MasterFilesystem {
         }
     }
 
-    /// Resolves a client-supplied path. `/.Trash/.pending` is master-owned
-    /// staging for async deletes and reclamation, so it resolves as missing:
-    /// clients can neither stat, list, open, rename nor synchronously delete it.
+    /// Resolves a client-supplied path. `/.Trash/.pending` and
+    /// `/.Trash/.purging` are master-owned staging for deletes and reclamation,
+    /// so they resolve as missing: clients can neither stat, list, open, rename
+    /// nor synchronously delete them.
     /// Internal reclamation goes through `FsDir` directly and is not affected.
     fn resolve_path(fs_dir: &FsDir, path: &str) -> FsResult<InodePath> {
         let inp = Self::resolve_path_raw(fs_dir, path)?;
-        Self::check_not_pending_path(inp.path())?;
+        Self::check_not_staging_path(inp.path())?;
         Ok(inp)
     }
 
@@ -873,17 +1061,19 @@ impl MasterFilesystem {
         InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
     }
 
-    fn check_not_pending_path(path: &str) -> FsResult<()> {
-        if trash::is_pending_path(path) {
+    fn check_not_staging_path(path: &str) -> FsResult<()> {
+        if trash::is_staging_path(path) {
             return err_ext!(FsError::file_not_found(path));
         }
         Ok(())
     }
 
-    /// Drops the `.pending` staging directory from a listing of `/.Trash`.
+    /// Drops the staging directories from a listing of `/.Trash`.
     fn hide_pending(dir_path: &str, mut statuses: Vec<FileStatus>) -> Vec<FileStatus> {
         if dir_path == trash::TRASH_ROOT {
-            statuses.retain(|status| status.name != trash::TRASH_PENDING_NAME);
+            statuses.retain(|status| {
+                status.name != trash::TRASH_PENDING_NAME && status.name != trash::TRASH_PURGING_NAME
+            });
         }
         statuses
     }
@@ -1009,6 +1199,85 @@ impl MasterFilesystem {
         }
     }
 
+    /// Allocates the first block of a file that is still empty, so a writer
+    /// can skip the AddBlock round trip after CreateFile/OpenFile.
+    ///
+    /// Best effort: returns `None` when the file already has blocks (another
+    /// writer, or a retried create) or no worker can take the block. The
+    /// client then falls back to a normal AddBlock, which is the old path.
+    ///
+    /// The emptiness check and the allocation run under one `fs_dir` write
+    /// lock, so two concurrent creates of one path cannot both get a block.
+    /// The returned block is registered in `pre_alloc`; only that registration
+    /// makes a later `release_block_id` effective.
+    pub fn alloc_first_block(
+        &self,
+        path: &str,
+        inode_id: i64,
+        client_addr: ClientAddress,
+    ) -> Option<LocatedBlock> {
+        let res = (|| -> FsResult<Option<LocatedBlock>> {
+            let mut fs_dir = self.fs_dir.write();
+            let inode = Self::resolve_file_inode(&fs_dir, path, Some(inode_id))?;
+            let file = inode.as_file_ref()?;
+            if !file.blocks.is_empty() || file.len != 0 {
+                return Ok(None);
+            }
+            let block =
+                self.allocate_block(&mut fs_dir, path, inode, client_addr, vec![], vec![], 0)?;
+            let stamps = self.worker_manager.read().schedule_stamps(&block.locs);
+            self.register_pre_alloc(
+                block.block.id,
+                PreAllocBlock {
+                    stamps,
+                    alloc_ms: LocalTime::mills(),
+                },
+            );
+            Ok(Some(block))
+        })();
+        match res {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "alloc_first_block {} (inode {}) skipped: {}",
+                    path, inode_id, e
+                );
+                None
+            }
+        }
+    }
+
+    fn register_pre_alloc(&self, block_id: i64, entry: PreAllocBlock) {
+        let mut map = self.pre_alloc.lock();
+        if map.len() >= PRE_ALLOC_PRUNE_THRESHOLD {
+            let ttl = self.conf.worker_lost_interval_ms();
+            let now = LocalTime::mills();
+            map.retain(|_, v| now.saturating_sub(v.alloc_ms) < ttl);
+        }
+        map.insert(block_id, entry);
+    }
+
+    /// Drops the release right of pre-allocated blocks that were committed or
+    /// handed to another caller.
+    fn forget_pre_alloc(&self, block_ids: impl IntoIterator<Item = i64>) {
+        let mut ids = block_ids.into_iter().peekable();
+        if ids.peek().is_none() {
+            return;
+        }
+        let mut map = self.pre_alloc.lock();
+        if map.is_empty() {
+            return;
+        }
+        for id in ids {
+            map.remove(&id);
+        }
+    }
+
+    #[cfg(test)]
+    fn has_pre_alloc(&self, block_id: i64) -> bool {
+        self.pre_alloc.lock().contains_key(&block_id)
+    }
+
     /// Document application to allocate a new block.
     #[allow(clippy::too_many_arguments)]
     pub fn add_block<T: AsRef<str>>(
@@ -1025,12 +1294,15 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
+        self.forget_pre_alloc(commit_blocks.iter().map(|v| v.block_id));
 
         // File allows concurrent writes, 'previous' is the previous block,
         // need to check if the next block has already been allocated。
         // If it has been allocated, return that block
         if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
-            let locs = fs_dir.get_block_locations(next.id)?;
+            // A pending block keeps its assigned workers in `meta.locs`; the
+            // location store only knows committed replicas.
+            let locs = fs_dir.get_locations(next)?;
             let extend_block = ExtendedBlock {
                 id: next.id,
                 len: next.len(),
@@ -1038,10 +1310,37 @@ impl MasterFilesystem {
                 file_type: file.file_type,
                 alloc_opts: next.alloc_opts.clone(),
             };
+            // The block now has a second writer: its creator may no longer
+            // release it.
+            self.forget_pre_alloc([next.id]);
 
             return self.create_locate_block(path, extend_block, &locs);
         }
 
+        self.allocate_block(
+            &mut fs_dir,
+            path,
+            inode,
+            client_addr,
+            commit_blocks,
+            exclude_workers,
+            file_len,
+        )
+    }
+
+    /// Chooses workers and appends a new block; the caller holds `fs_dir`.
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_block(
+        &self,
+        fs_dir: &mut FsDir,
+        path: &str,
+        inode: InodePtr,
+        client_addr: ClientAddress,
+        commit_blocks: Vec<CommitBlock>,
+        exclude_workers: Vec<u32>,
+        file_len: i64,
+    ) -> FsResult<LocatedBlock> {
+        let file = inode.as_file_ref()?;
         let block_size = file.block_size as i64;
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
         let has_spdk = {
@@ -1094,6 +1393,7 @@ impl MasterFilesystem {
                 only_flush,
                 return_file_blocks: true,
                 set_attr_opts,
+                release_block_id: None,
             },
         )
     }
@@ -1117,9 +1417,22 @@ impl MasterFilesystem {
                 only_flush: true,
                 return_file_blocks: false,
                 set_attr_opts: None,
+                release_block_id: None,
             },
         )
         .map(|_| ())
+    }
+
+    pub fn complete_file_with_opts<T: AsRef<str>>(
+        &self,
+        path: T,
+        inode_id: Option<i64>,
+        len: i64,
+        commit_blocks: Vec<CommitBlock>,
+        client_name: T,
+        options: CompleteFileOptions,
+    ) -> FsResult<Option<FileBlocks>> {
+        self.complete_file0(path, inode_id, len, commit_blocks, client_name, options)
     }
 
     fn complete_file0<T: AsRef<str>>(
@@ -1135,7 +1448,14 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
-        fs_dir.complete_file(
+        let committed: Vec<i64> = commit_blocks.iter().map(|v| v.block_id).collect();
+        // Only the creator of a still-registered pre-allocation may release
+        // it. Checked under `fs_dir`, which also serialises the hand-offs in
+        // AddBlock/AssignWorker that remove the registration.
+        let release_block_id = options
+            .release_block_id
+            .filter(|id| self.pre_alloc.lock().contains_key(id));
+        let released = fs_dir.complete_file(
             path,
             &mut inode,
             len,
@@ -1143,19 +1463,45 @@ impl MasterFilesystem {
             client_name,
             options.only_flush,
             options.set_attr_opts,
+            release_block_id,
         )?;
-        self.worker_manager
-            .write()
-            .settle_committed_blocks(&settle_blocks);
+        let released_entry = released.and_then(|b| {
+            let entry = self.pre_alloc.lock().remove(&b.id)?;
+            Some((b.id, entry))
+        });
+        self.forget_pre_alloc(committed);
 
-        if options.only_flush && options.return_file_blocks {
-            let file = inode.as_file_ref()?;
-            let locs = self.get_block_locs(path, &fs_dir, file)?;
-            let status = inode.to_file_status(path)?;
-            return Ok(Some(FileBlocks::new(status, locs)));
+        let res = if options.only_flush && options.return_file_blocks {
+            (|| {
+                let file = inode.as_file_ref()?;
+                let locs = self.get_block_locs(path, &fs_dir, file)?;
+                let status = inode.to_file_status(path)?;
+                Ok(Some(FileBlocks::new(status, locs)))
+            })()
+        } else {
+            Ok(None)
+        };
+        drop(fs_dir);
+
+        // Settle the committed blocks, and return an unwritten pre-allocated
+        // block's remaining credit, after the namespace lock is gone (same
+        // order as delete/free). Settling the released block to zero returns
+        // exactly the credit it still owns; credit a heartbeat already
+        // reclaimed stays reclaimed.
+        {
+            let mut wm = self.worker_manager.write();
+            wm.settle_committed_blocks(&settle_blocks);
+            if let Some((block_id, entry)) = released_entry {
+                let releases: Vec<_> = entry
+                    .stamps
+                    .iter()
+                    .map(|&(worker_id, _)| (block_id, 0, worker_id))
+                    .collect();
+                wm.settle_committed_blocks(&releases);
+            }
         }
 
-        Ok(None)
+        res
     }
 
     pub fn get_file_blocks(
@@ -1475,6 +1821,11 @@ impl MasterFilesystem {
         self.fs_dir.clone()
     }
 
+    pub fn create_leader_snapshot(&self, force: bool) -> FsResult<LeaderSnapshotInfo> {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.create_snapshot(force)
+    }
+
     // Add a test worker and unit tests will use it.
     pub fn add_test_worker(&self, worker: WorkerInfo) {
         let mut wm = self.worker_manager.write();
@@ -1599,6 +1950,7 @@ impl MasterFilesystem {
         if list.blocks.is_empty() && full_reported_blocks.is_none() {
             return Ok(BlockReportResult {
                 delete_blocks: Vec::new(),
+                corrupt_blocks: Vec::new(),
             });
         }
 
@@ -1656,6 +2008,7 @@ impl MasterFilesystem {
         }
 
         let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
+        let mut corrupt_blocks = Vec::new();
         let mut wm = self.worker_manager.write();
         for (item, exists) in checked {
             let loc = BlockLocation::new(list.worker_id, item.storage_type);
@@ -1681,6 +2034,9 @@ impl MasterFilesystem {
                     }
                 }
                 BlockReportStatus::Deleted => {
+                    if item.corrupted {
+                        corrupt_blocks.push(item.id);
+                    }
                     batch.push((false, item.id, loc));
                     wm.deleted_block(list.worker_id, item.id);
                 }
@@ -1690,6 +2046,11 @@ impl MasterFilesystem {
 
         // Keep the block ids of a completing batch so a failure can be retried.
         let retry_blocks = full_reported_blocks.clone();
+        let corrupt_handler = if corrupt_blocks.is_empty() {
+            None
+        } else {
+            replication_handler.clone()
+        };
         let applied = (|| -> FsResult<()> {
             if let Some(reported_blocks) = full_reported_blocks {
                 self.submit_full_block_reconcile(
@@ -1718,7 +2079,47 @@ impl MasterFilesystem {
         }
         applied?;
 
-        Ok(BlockReportResult { delete_blocks })
+        if !corrupt_blocks.is_empty() {
+            self.recover_corrupt_blocks(list.worker_id, &corrupt_blocks, corrupt_handler);
+        }
+
+        Ok(BlockReportResult {
+            delete_blocks,
+            corrupt_blocks,
+        })
+    }
+
+    /// A worker dropped these replicas because their data failed checksum
+    /// verification. Recover like a lost replica: invalidate cache files that
+    /// became unreadable, then queue the rest for re-replication.
+    fn recover_corrupt_blocks(
+        &self,
+        worker_id: u32,
+        block_ids: &[i64],
+        replication_handler: Option<MasterReplicationHandler>,
+    ) {
+        warn!(
+            "worker {} removed {} corrupt block replicas: {:?}",
+            worker_id,
+            block_ids.len(),
+            block_ids
+        );
+        let replication_block_ids = self.recover_removed_locations(worker_id, block_ids);
+        if replication_block_ids.is_empty() {
+            return;
+        }
+        let Some(replication_handler) = replication_handler else {
+            return;
+        };
+        let count = replication_block_ids.len();
+        if let Err(e) =
+            replication_handler.report_under_replicated_blocks(worker_id, replication_block_ids)
+        {
+            error!(
+                "Errors on reporting under-replicated {} corrupt blocks from worker {}. err: {:?}",
+                count, worker_id, e
+            );
+        }
     }
 
     fn submit_full_block_reconcile(
@@ -1899,6 +2300,18 @@ impl MasterFilesystem {
             let fs_dir = self.fs_dir.write();
             fs_dir.delete_locations(worker_id)?
         };
+        let replication_block_ids = self.recover_removed_locations(worker_id, &removed_block_ids);
+
+        Ok(LostWorkerLocationCleanup {
+            removed_block_ids,
+            replication_block_ids,
+        })
+    }
+
+    /// After `worker_id` lost the given block locations, invalidate cache
+    /// files that no replica can serve any more and schedule their surviving
+    /// replicas for deletion. Returns the blocks that still need repair.
+    fn recover_removed_locations(&self, worker_id: u32, removed_block_ids: &[i64]) -> Vec<i64> {
         let mut invalidated = CacheInvalidationResult::default();
 
         for chunk in removed_block_ids.chunks(Self::LOST_WORKER_INVALIDATION_CHUNK) {
@@ -1930,10 +2343,7 @@ impl MasterFilesystem {
                 .remove_blocks(&invalidated.delete_result);
         }
 
-        Ok(LostWorkerLocationCleanup {
-            removed_block_ids,
-            replication_block_ids,
-        })
+        replication_block_ids
     }
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
@@ -2064,6 +2474,9 @@ impl MasterFilesystem {
         };
         let block = match fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers) {
             Ok((block, assigned)) => {
+                // Another writer is now writing this block: a pending release
+                // from its creator must not drop it.
+                self.forget_pre_alloc([block.id]);
                 if assigned {
                     self.worker_manager.write().bind_scheduled_blocks(
                         &choose_workers,
@@ -2395,6 +2808,52 @@ mod tests {
         assert!(!fs_dir
             .add_replication_location_if_needed(old_block_id, BlockLocation::with_id(200))
             .unwrap());
+    }
+
+    #[test]
+    fn corrupted_deletion_queues_the_block_for_re_replication() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("corrupted-deletion-re-replication");
+        let block_id = replication_file(&fs, "/corrupted-re-replication.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+        let handler = || Some(MasterReplicationHandler::new(manager.clone()));
+        let report = |worker_id, corrupted| BlockReportList {
+            report_id: 0,
+            cluster_id: "curvine".into(),
+            worker_id,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo {
+                corrupted,
+                ..BlockReportInfo::with_deleted(block_id, 0)
+            }],
+        };
+
+        // A plain deletion does not ask for a new replica.
+        fs.block_report(report(200, false), handler()).unwrap();
+        assert!(!manager.has_pending_repair(block_id));
+
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        let result = fs.block_report(report(200, true), handler()).unwrap();
+        assert_eq!(result.corrupt_blocks, vec![block_id]);
+        assert!(manager.has_pending_repair(block_id));
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100]
+        );
     }
 
     #[test]
@@ -3935,5 +4394,510 @@ mod tests {
         fs.master_monitor
             .set_role_for_test(curvine_raft::raft::RoleState::Leader);
         assert_eq!(fs.drain_pending_trash().unwrap().unwrap().inodes, 1);
+    }
+
+    fn first_block_fs(name: &str) -> MasterFilesystem {
+        let fs = test_fs(name);
+        let capacity = 1 << 30;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+        fs
+    }
+
+    fn scheduled_bytes(fs: &MasterFilesystem) -> i64 {
+        fs.worker_manager
+            .read()
+            .get_worker(1)
+            .unwrap()
+            .scheduled_bytes
+    }
+
+    fn close_opts(release_block_id: Option<i64>) -> CompleteFileOptions {
+        CompleteFileOptions {
+            release_block_id,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unwritten_first_block_is_released_on_close() {
+        let fs = first_block_fs("first-block-release");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+
+        let block = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .expect("empty file gets a first block");
+        assert_eq!(block.block.len, 0);
+        assert_eq!(block.locs.len(), 1);
+        assert_eq!(scheduled_bytes(&fs), status.block_size);
+        // The file already has block 0, so a retried create gets nothing new.
+        assert!(fs.alloc_first_block("/a.log", status.id, client).is_none());
+
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(block.block.id)),
+        )
+        .unwrap();
+
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert!(blocks.block_locs.is_empty());
+        assert_eq!(blocks.status.len, 0);
+        assert!(blocks.status.is_complete);
+        assert_eq!(scheduled_bytes(&fs), 0, "reservation must be returned");
+    }
+
+    #[test]
+    fn written_first_block_survives_a_release_request() {
+        let fs = first_block_fs("first-block-written");
+        let status = fs.create("/a.log", true).unwrap();
+        let block = fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .unwrap();
+        let commit = CommitBlock {
+            block_id: block.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+
+        // The commit in the same request makes the block non-empty, so a
+        // stale release id must not drop it.
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            10,
+            vec![commit],
+            "",
+            close_opts(Some(block.block.id)),
+        )
+        .unwrap();
+
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert_eq!(blocks.status.len, 10);
+        assert_eq!(blocks.block_locs.len(), 1);
+        assert_eq!(blocks.block_locs[0].block.id, block.block.id);
+    }
+
+    #[test]
+    fn rejected_close_keeps_the_first_block() {
+        let fs = first_block_fs("first-block-rejected");
+        let status = fs.create("/a.log", true).unwrap();
+        let block = fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .unwrap();
+
+        // len 5 with no committed data fails the length check.
+        let err = fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            5,
+            vec![],
+            "",
+            close_opts(Some(block.block.id)),
+        );
+        assert!(err.is_err());
+
+        let fs_dir = fs.fs_dir.read();
+        let inode = MasterFilesystem::resolve_file_inode(&fs_dir, "/a.log", None).unwrap();
+        let file = inode.as_file_ref().unwrap();
+        assert_eq!(file.block_ids(), vec![block.block.id]);
+        drop(fs_dir);
+        assert_eq!(scheduled_bytes(&fs), status.block_size);
+    }
+
+    #[test]
+    fn first_block_is_not_allocated_for_a_file_with_data() {
+        let fs = first_block_fs("first-block-non-empty");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let block = fs
+            .add_block("/a.log", None, client.clone(), vec![], vec![], 0, None)
+            .unwrap();
+        let commit = CommitBlock {
+            block_id: block.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        fs.complete_file("/a.log", None, 10, vec![commit], "", false, None)
+            .unwrap();
+
+        assert!(fs.alloc_first_block("/a.log", status.id, client).is_none());
+    }
+
+    #[test]
+    fn first_block_without_workers_falls_back() {
+        let fs = test_fs("first-block-no-worker");
+        let status = fs.create("/a.log", true).unwrap();
+        assert!(fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .is_none());
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert!(blocks.block_locs.is_empty());
+    }
+
+    // A retried CreateFile (or a second creator) gets no first block and falls
+    // back to AddBlock; the reused pending block must carry its workers.
+    #[test]
+    fn add_block_after_pre_allocation_returns_pending_workers() {
+        let fs = first_block_fs("first-block-retry");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .unwrap();
+        assert!(fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .is_none());
+
+        let reused = fs
+            .add_block("/a.log", Some(status.id), client, vec![], vec![], 0, None)
+            .unwrap();
+        assert_eq!(reused.block.id, first.block.id);
+        assert_eq!(reused.locs.len(), 1, "pending block must keep its workers");
+        assert_eq!(reused.locs[0].worker_id, 1);
+        // Two writers now share the block, so the creator lost its release.
+        assert!(!fs.has_pre_alloc(first.block.id));
+    }
+
+    // Writer A pre-allocates and never writes; writer B reopens the file and
+    // takes block 0 through AssignWorker. A's close must not drop B's block.
+    #[test]
+    fn release_after_assign_worker_hand_off_keeps_the_block() {
+        let fs = first_block_fs("first-block-assign-hand-off");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .unwrap();
+
+        // B sees block 0 without committed locations and assigns workers.
+        fs.assign_worker_by_id(
+            "/a.log",
+            Some(status.id),
+            first.block.clone(),
+            client,
+            vec![],
+        )
+        .unwrap();
+        assert!(!fs.has_pre_alloc(first.block.id));
+
+        // A closes with its release id.
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(first.block.id)),
+        )
+        .unwrap();
+
+        // B commits its data into the same block.
+        let commit = CommitBlock {
+            block_id: first.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        fs.complete_file("/a.log", Some(status.id), 10, vec![commit], "", false, None)
+            .unwrap();
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert_eq!(blocks.status.len, 10);
+        assert_eq!(blocks.block_locs[0].block.id, first.block.id);
+    }
+
+    #[test]
+    fn release_after_add_block_hand_off_keeps_the_block() {
+        let fs = first_block_fs("first-block-add-hand-off");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .unwrap();
+        fs.add_block("/a.log", Some(status.id), client, vec![], vec![], 0, None)
+            .unwrap();
+
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(first.block.id)),
+        )
+        .unwrap();
+        let fs_dir = fs.fs_dir.read();
+        let inode = MasterFilesystem::resolve_file_inode(&fs_dir, "/a.log", None).unwrap();
+        assert_eq!(
+            inode.as_file_ref().unwrap().block_ids(),
+            vec![first.block.id]
+        );
+    }
+
+    // Block A's reservation expires, block B is reserved on the same worker,
+    // then A is released: B's reservation must stay.
+    #[test]
+    fn stale_release_does_not_subtract_a_newer_reservation() {
+        let fs = first_block_fs("first-block-expired-release");
+        let client = ClientAddress::default();
+        let a = fs.create("/a.log", true).unwrap();
+        let block_a = fs
+            .alloc_first_block("/a.log", a.id, client.clone())
+            .unwrap();
+
+        // Expiry (or a full heartbeat reclaim) clears the window, the block
+        // credits, and their running sum together.
+        {
+            let mut wm = fs.worker_manager.write();
+            let worker = wm.worker_map.workers.get_mut(&1).unwrap();
+            worker.scheduled_bytes = 0;
+            worker.scheduled_since_ms = 0;
+            worker.scheduled_blocks.clear();
+            worker.scheduled_block_bytes = 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let b = fs.create("/b.log", true).unwrap();
+        fs.alloc_first_block("/b.log", b.id, client).unwrap();
+        assert_eq!(scheduled_bytes(&fs), b.block_size);
+
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(a.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(block_a.block.id)),
+        )
+        .unwrap();
+        // A's metadata is still dropped, but B keeps its reservation.
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert!(blocks.block_locs.is_empty());
+        assert_eq!(scheduled_bytes(&fs), b.block_size);
+    }
+
+    // Writer B's OpenFile returns block 0 before B asks for its workers; A's
+    // release in between must not drop the block B already holds.
+    #[test]
+    fn release_after_open_file_hand_off_keeps_the_block() {
+        let fs = first_block_fs("first-block-open-hand-off");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .unwrap();
+        let opened = fs
+            .open_file(
+                "/a.log",
+                CreateFileOpts::with_create(false),
+                OpenFlags::new_write_only(),
+            )
+            .unwrap();
+        assert_eq!(opened.block_locs[0].block.id, first.block.id);
+        assert!(!fs.has_pre_alloc(first.block.id));
+
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(first.block.id)),
+        )
+        .unwrap();
+        let assigned = fs
+            .assign_worker_by_id(
+                "/a.log",
+                Some(status.id),
+                first.block.clone(),
+                client,
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(assigned.block.id, first.block.id);
+        assert_eq!(assigned.locs[0].worker_id, 1);
+    }
+
+    #[test]
+    fn commit_drops_the_release_registration() {
+        let fs = first_block_fs("first-block-commit-forget");
+        let status = fs.create("/a.log", true).unwrap();
+        let block = fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .unwrap();
+        let commit = CommitBlock {
+            block_id: block.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        fs.complete_file("/a.log", Some(status.id), 10, vec![commit], "", true, None)
+            .unwrap();
+        assert!(!fs.has_pre_alloc(block.block.id));
+    }
+
+    // #1864: the staging rename targets `.purging`, and the background purger
+    // leaves an entry alone while the synchronous delete still owns it.
+    #[test]
+    fn purging_entry_is_staged_by_rename_and_skipped_while_in_flight() {
+        use crate::master::fs::PendingTrashPurger;
+        use crate::master::journal::JournalEntry;
+
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.master.delete_stage_min_children = 2;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-fs-purging/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-fs-purging/journal-{}", Utils::rand_str(6)));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        fs.create("/victim/a", true).unwrap();
+        fs.create("/victim/b", true).unwrap();
+        fs.fs_dir.read().take_entries();
+
+        // Stage without purging, as `delete_with_mode` does under its lock.
+        let (_, staged) = {
+            let mut fs_dir = fs.fs_dir.write();
+            fs.delete_locked(&mut fs_dir, "/victim", true, DeleteMode::SkipTrash)
+                .unwrap()
+        };
+        let staged = staged.expect("a directory at the cutoff is staged");
+        assert!(trash::is_purging_entry_path(&staged), "got {}", staged);
+        assert!(fs.is_purge_inflight(&staged));
+
+        let entries = fs.fs_dir.read().take_entries();
+        let rename = entries
+            .iter()
+            .find_map(|e| match e {
+                JournalEntry::Rename(r) => Some(r),
+                _ => None,
+            })
+            .expect("staging is journaled as a rename");
+        assert_eq!(rename.src, "/victim");
+        assert_eq!(rename.dst, staged);
+
+        let purger = PendingTrashPurger::new(fs.clone(), fs.master_monitor.clone());
+        assert_eq!(purger.drain_purging().unwrap().unwrap().0, 0);
+        assert_eq!(
+            fs.scan_purging_trash(16, None).unwrap().paths,
+            vec![staged.clone()]
+        );
+
+        let mut res = DeleteResult::new();
+        fs.finish_staged_delete(&staged, &mut res);
+        assert_eq!(res.inodes, 2);
+        assert!(!res.purge_pending);
+        assert!(!fs.is_purge_inflight(&staged));
+        assert!(fs.scan_purging_trash(16, None).unwrap().paths.is_empty());
+    }
+
+    // #1864 review: `.purging` adoption runs outside the `pending_drain` guard,
+    // so a blocking empty-trash neither waits on nor skips a leftover staged
+    // delete, and the `.pending` drain still yields to it.
+    #[test]
+    fn purging_drain_does_not_take_the_empty_trash_guard() {
+        use crate::master::fs::PendingTrashPurger;
+
+        let fs = {
+            Master::init_test_metrics();
+            let mut conf = ClusterConf::format();
+            conf.testing = true;
+            conf.journal.enable = false;
+            conf.master.trash_enabled = true;
+            conf.master.delete_stage_min_children = 2;
+            conf.master.meta_dir = Utils::test_sub_dir(format!(
+                "master-fs-purging-unguarded/meta-{}",
+                Utils::rand_str(6)
+            ));
+            conf.journal.journal_dir = Utils::test_sub_dir(format!(
+                "master-fs-purging-unguarded/journal-{}",
+                Utils::rand_str(6)
+            ));
+            JournalSystem::fs_only_for_test(&conf).unwrap()
+        };
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        fs.create("/victim/a", true).unwrap();
+        fs.create("/victim/b", true).unwrap();
+        fs.create("/owned.log", true).unwrap();
+        fs.delete_with_mode("/owned.log", false, DeleteMode::Default)
+            .unwrap();
+
+        // A staged delete whose caller is gone: staged, then released without
+        // purging, as after lost leadership.
+        let (_, staged) = {
+            let mut fs_dir = fs.fs_dir.write();
+            fs.delete_locked(&mut fs_dir, "/victim", true, DeleteMode::SkipTrash)
+                .unwrap()
+        };
+        let staged = staged.expect("staged");
+        fs.purging_inflight.lock().remove(&staged);
+
+        let guard = fs.lock_pending_drain();
+        assert_eq!(fs.stage_trash_for_purge().unwrap(), 1);
+        let purger = PendingTrashPurger::new(fs.clone(), fs.master_monitor.clone());
+
+        assert_eq!(purger.drain_pending().unwrap(), Some((0, 0, 0)));
+        assert_eq!(purger.drain_purging().unwrap(), Some((1, 2, 0)));
+        assert!(fs.scan_purging_trash(16, None).unwrap().paths.is_empty());
+        assert_eq!(fs.scan_pending_trash(16, None).unwrap().paths.len(), 1);
+        drop(guard);
+    }
+
+    // #1864 review: every handle over one journal system must agree on which
+    // `.purging` entries a synchronous delete owns, or a purger on one handle
+    // could adopt an entry a delete on another handle is still reclaiming.
+    #[test]
+    fn with_js_shares_the_purging_inflight_set() {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.master.delete_stage_min_children = 2;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-fs-inflight/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-fs-inflight/journal-{}", Utils::rand_str(6)));
+        let js = JournalSystem::from_conf(&conf).unwrap();
+        let staging = MasterFilesystem::with_js(&conf, &js);
+        let observer = MasterFilesystem::with_js(&conf, &js);
+        staging
+            .master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        staging.create("/victim/a", true).unwrap();
+        staging.create("/victim/b", true).unwrap();
+
+        let (_, staged) = {
+            let mut fs_dir = staging.fs_dir.write();
+            staging
+                .delete_locked(&mut fs_dir, "/victim", true, DeleteMode::SkipTrash)
+                .unwrap()
+        };
+        let staged = staged.expect("a directory at the cutoff is staged");
+
+        assert!(observer.is_purge_inflight(&staged));
+        assert!(js.fs().is_purge_inflight(&staged));
+        let purger = crate::master::fs::PendingTrashPurger::new(
+            observer.clone(),
+            observer.master_monitor.clone(),
+        );
+        assert_eq!(purger.drain_purging().unwrap().unwrap().0, 0);
+
+        let mut res = DeleteResult::new();
+        staging.finish_staged_delete(&staged, &mut res);
+        assert_eq!(res.inodes, 2);
+        assert!(!observer.is_purge_inflight(&staged));
+
+        drop(staging);
+        drop(observer);
+        js.shutdown();
     }
 }

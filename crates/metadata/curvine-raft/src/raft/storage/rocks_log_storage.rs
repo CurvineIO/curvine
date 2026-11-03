@@ -199,10 +199,21 @@ impl Storage for RocksLogStorage {
                 raft::StorageError::SnapshotTemporarilyUnavailable,
             ))
         } else {
-            let mut snap = core.last_snapshot().map_err(Self::lib_error)?;
+            let snap = core.last_snapshot().map_err(Self::lib_error)?;
 
+            // A snapshot must describe the state machine at the index it
+            // advertises. The persisted payload still carries the state at
+            // `snapshot_metadata.index`, so relabelling it to a higher index
+            // would hand the receiver a (term, index) pair it trusts for commit
+            // and log matching while the entries in between were never applied.
+            // Report it as temporarily unavailable and let raft retry once a
+            // newer snapshot exists; raft-rs tolerates only
+            // SnapshotTemporarilyUnavailable here and treats anything else as
+            // fatal.
             if snap.get_metadata().index < request_index {
-                snap.mut_metadata().index = request_index;
+                return Err(raft::Error::Store(
+                    raft::StorageError::SnapshotTemporarilyUnavailable,
+                ));
             }
 
             Ok(snap)
@@ -275,5 +286,110 @@ mod tests {
         store.compact(70).unwrap();
         assert_eq!(store.first_index().unwrap(), 70);
         assert_eq!(store.last_index().unwrap(), 100);
+    }
+
+    fn snapshot_at(index: u64, term: u64) -> Snapshot {
+        let mut snap = Snapshot::default();
+        snap.mut_metadata().index = index;
+        snap.mut_metadata().term = term;
+        snap.mut_metadata().mut_conf_state().voters = vec![1, 2, 3];
+        snap
+    }
+
+    // A snapshot installed from a newer term invalidates any vote cast in the
+    // old term. Keeping the stale vote could let a crash-restart appear to vote
+    // twice in the higher term and break election safety.
+    #[test]
+    fn apply_snapshot_from_a_newer_term_clears_the_prior_vote() {
+        let store = test_store("vote-clear", 10, 1);
+        store.append(&indexed_entries(1, 5)).unwrap();
+        store
+            .set_hard_state(&HardState {
+                term: 5,
+                vote: 3,
+                commit: 5,
+            })
+            .unwrap();
+        assert_eq!(store.hard_state().vote, 3);
+
+        store.apply_snapshot(snapshot_at(4, 9)).unwrap();
+
+        let hard_state = store.hard_state();
+        assert_eq!(hard_state.term, 9);
+        assert_eq!(
+            hard_state.vote, 0,
+            "a newer-term snapshot must clear the stale vote"
+        );
+        assert_eq!(hard_state.commit, 5);
+    }
+
+    // The inverse guard: a snapshot at the same term must not discard a vote
+    // legitimately cast in that term.
+    #[test]
+    fn apply_snapshot_at_the_same_term_preserves_the_vote() {
+        let store = test_store("vote-keep", 10, 1);
+        store.append(&indexed_entries(1, 5)).unwrap();
+        store
+            .set_hard_state(&HardState {
+                term: 9,
+                vote: 3,
+                commit: 5,
+            })
+            .unwrap();
+
+        store.apply_snapshot(snapshot_at(4, 9)).unwrap();
+
+        let hard_state = store.hard_state();
+        assert_eq!(hard_state.term, 9);
+        assert_eq!(
+            hard_state.vote, 3,
+            "a same-term snapshot must preserve the vote"
+        );
+    }
+
+    // A snapshot must not be relabelled to a higher index: the persisted payload
+    // still carries the base index state, so advertising a newer (term, index)
+    // would let a peer commit past entries it never applied.
+    #[test]
+    fn snapshot_past_the_persisted_index_is_temporarily_unavailable() {
+        let store = test_store("relabel", 10, 1);
+        let entries: Vec<Entry> = (1..=10u64)
+            .map(|index| Entry {
+                index,
+                term: index,
+                ..Default::default()
+            })
+            .collect();
+        store.append(&entries).unwrap();
+        store
+            .set_hard_state(&HardState {
+                term: 10,
+                commit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        // Seed a base snapshot at index 3 (term 3); entries 4..=10 stay.
+        store.apply_snapshot(snapshot_at(3, 3)).unwrap();
+
+        // Requests at or below the persisted snapshot index are served as-is.
+        let base = store.snapshot(3, 0).unwrap();
+        assert_eq!(base.get_metadata().index, 3);
+        assert_eq!(base.get_metadata().term, 3);
+
+        let below = store.snapshot(0, 0).unwrap();
+        assert_eq!(below.get_metadata().index, 3);
+
+        // A higher request index cannot be satisfied without fabricating state.
+        for request_index in [7, 20] {
+            let err = store.snapshot(request_index, 0).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    raft::Error::Store(raft::StorageError::SnapshotTemporarilyUnavailable)
+                ),
+                "request {request_index} past the persisted snapshot must be temporarily \
+                 unavailable, got {err:?}"
+            );
+        }
     }
 }

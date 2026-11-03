@@ -67,6 +67,11 @@ impl CurvineBenchRunner {
                 self.chained_delete(&path, self.seed_file_size(execution))
                     .await
             }
+            BenchOp::DeleteAsync => {
+                let path = self.op_path("delete-async", worker_id, index);
+                self.chained_delete_async(&path, self.seed_file_size(execution))
+                    .await
+            }
             BenchOp::Mkdir => {
                 let path = self.op_path("mkdir", worker_id, index);
                 self.mkdir_one(&path).await
@@ -162,6 +167,15 @@ impl CurvineBenchRunner {
         let start = Instant::now();
         let write = self.write_one(path, file_size).await?;
         self.delete_one(path).await?;
+        Ok(Self::file_metric(write.bytes, start))
+    }
+
+    /// Same chain as [`Self::chained_delete`] but the delete goes through the
+    /// async lane, so the metric isolates the client-visible delete cost.
+    async fn chained_delete_async(&self, path: &str, file_size: usize) -> CommonResult<TaskMetric> {
+        let start = Instant::now();
+        let write = self.write_one(path, file_size).await?;
+        Self::timed_void_op(Instant::now(), self.io()?.delete_file_async(path).await)?;
         Ok(Self::file_metric(write.bytes, start))
     }
 

@@ -71,6 +71,9 @@ pub use self::file_status::{FileStatus, INTERNAL_CTIME_XATTR};
 mod filesystem_info;
 pub use self::filesystem_info::FilesystemInfo;
 
+mod leader_snapshot;
+pub use self::leader_snapshot::LeaderSnapshotInfo;
+
 mod worker_command;
 pub use self::worker_command::*;
 

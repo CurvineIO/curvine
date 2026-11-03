@@ -14,18 +14,22 @@
 
 use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{
-    BlockDataset, BlockLayout, BlockReadContext, BlockWriteContext, Dataset,
+    BlockDataset, BlockLayout, BlockReadContext, BlockWriteContext, ChecksumVerify, Dataset,
 };
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo};
+use dashmap::{DashMap, DashSet};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 const BLOCK_LOCK_STRIPES: usize = 256;
+
+/// Read size for the full re-check of a block reported corrupt.
+const REVERIFY_READ_LEN: i32 = 1024 * 1024;
 
 #[derive(Default)]
 struct BlockUse {
@@ -59,12 +63,32 @@ impl Drop for BlockWriteLease {
     }
 }
 
+/// Outcome of re-checking a block whose read failed checksum verification.
+#[derive(Debug)]
+pub enum CorruptCheck {
+    /// The second full verification failed too; block and sidecar are gone.
+    Removed(BlockMeta),
+    /// The block was kept for good: it is already gone, has no sidecar, or
+    /// the second verification did not confirm the corruption.
+    Kept(String),
+    /// The block cannot be checked yet because a writer holds it or it is
+    /// not finalized. The caller requeues it for a later heartbeat.
+    Retry(String),
+}
+
 #[derive(Clone)]
 pub struct BlockStore {
     state: Arc<RwLock<BlockDataset>>,
     block_locks: Arc<Vec<Mutex<()>>>,
     uses: Arc<Vec<Mutex<HashMap<i64, BlockUse>>>>,
     replication_owner: Option<String>,
+    /// Blocks whose read failed a chunk CRC, waiting to be re-checked, with
+    /// the number of re-checks that already failed with an error.
+    corrupt_blocks: Arc<DashMap<i64, u32>>,
+    /// Blocks removed as corrupt whose deletion master has not acknowledged.
+    /// `open_block` refuses them: a replacement finalized before the report
+    /// lands would otherwise lose its location to that stale report.
+    fenced_blocks: Arc<DashSet<i64>>,
 }
 
 impl BlockStore {
@@ -79,6 +103,8 @@ impl BlockStore {
             ),
             replication_owner: None,
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
+            corrupt_blocks: Arc::new(DashMap::new()),
+            fenced_blocks: Arc::new(DashSet::new()),
         };
 
         Ok(block_store)
@@ -132,6 +158,17 @@ impl BlockStore {
                 replication: true,
             },
         ))
+    }
+
+    /// True when more ordinary writers than the finalizing one hold a lease.
+    /// Leases are acquired under the block stripe lock, so a caller holding
+    /// that lock sees a stable count. A finalize without a lease (tests,
+    /// replication) counts as one writer.
+    fn has_other_ordinary_writers(&self, block_id: i64) -> bool {
+        self.block_uses(block_id)
+            .lock()
+            .get(&block_id)
+            .is_some_and(|entry| entry.ordinary_writers > 1)
     }
 
     // Called under the block stripe lock, so acquisition cannot race admission/removal.
@@ -234,6 +271,12 @@ impl BlockStore {
     pub fn open_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let _block_lock = self.block_lock(block.id, "open");
         self.check_replication_owner(block.id)?;
+        if self.fenced_blocks.contains(&block.id) {
+            return curvine_core_error::err_box!(
+                "block {} was removed as corrupt; waiting for master to acknowledge the deletion",
+                block.id
+            );
+        }
         let reservation =
             self.with_dataset_write("open", |state| state.reserve_file_open(block))?;
 
@@ -269,9 +312,20 @@ impl BlockStore {
         let reservation =
             self.with_dataset_write("finalize", |state| state.reserve_file_finalize(block))?;
 
-        let Some(reservation) = reservation else {
+        let Some(mut reservation) = reservation else {
             return self.with_dataset_write("finalize", |state| state.finalize_block(block));
         };
+        if self.has_other_ordinary_writers(block.id) {
+            // Another session holds an open handle on the same staging inode
+            // and may write after the checksum pass, including after publish;
+            // its own finalize then short-circuits on the already finalized
+            // block. A missing sidecar is safe, a stale one reads as corruption.
+            log::warn!(
+                "block {} finalized with concurrent writers, skipping checksum",
+                block.id
+            );
+            reservation.skip_checksum();
+        }
 
         let started = Instant::now();
         let plan = reservation.prepare(block.len);
@@ -381,12 +435,12 @@ impl BlockStore {
         off: i64,
         logical_len: i64,
     ) -> CommonResult<BlockReadContext> {
-        let (layout, dir) = {
-            let state = self.read()?;
-            state.layout_for(meta)?
-        };
+        // Hold the dataset read lock while opening, so a finalize publish
+        // cannot pair the block file with another generation's sidecar.
+        let state = self.read()?;
+        let (layout, dir) = state.layout_for(meta)?;
         layout
-            .open_reader(&dir, meta, off, logical_len)
+            .open_reader(&dir, meta, off, logical_len, state.checksum_verify())
             .map_err(Into::into)
     }
 
@@ -426,15 +480,20 @@ impl BlockStore {
             .clone();
         let logical_len = logical_len.unwrap_or_else(|| meta.len());
         let (layout, dir) = state.layout_for(&meta)?;
-        let reader = layout.open_reader(&dir, &meta, off, logical_len)?;
+        let reader = layout.open_reader(&dir, &meta, off, logical_len, state.checksum_verify())?;
         Ok((meta, reader))
     }
 
     /// Returns a local path only while no finalize publication is in progress.
     /// A finalizing file can be atomically renamed before a co-located client
     /// opens the returned path, so callers must use `open_reader_by_id` then.
+    /// Also `None` while checksum verification is on: a client reading the
+    /// file directly would bypass the check.
     pub fn short_circuit_by_id(&self, id: i64) -> CommonResult<Option<(BlockMeta, String, i64)>> {
         let state = self.read()?;
+        if state.checksum_verify().is_enabled() {
+            return Ok(None);
+        }
         if matches!(
             state.get_block(id).map(BlockMeta::state),
             Some(BlockState::Finalizing)
@@ -515,6 +574,114 @@ impl BlockStore {
 
         removed.release();
         Ok(Some(removed.meta))
+    }
+
+    /// Record that a read of `id` failed a chunk CRC. The heartbeat re-checks
+    /// the block later, so the read path never blocks on removal.
+    pub fn report_corrupt(&self, id: i64, path: &str) {
+        if self.corrupt_blocks.insert(id, 0).is_none() {
+            log::error!(
+                "block {} failed checksum verification, path {}; queued for invalidation",
+                id,
+                path
+            );
+        }
+    }
+
+    /// Drain the queued blocks with their count of failed re-checks.
+    pub fn take_corrupt_blocks(&self) -> Vec<(i64, u32)> {
+        let ids: Vec<i64> = self.corrupt_blocks.iter().map(|e| *e.key()).collect();
+        ids.into_iter()
+            .filter_map(|id| self.corrupt_blocks.remove(&id))
+            .collect()
+    }
+
+    /// Put a block back for the next heartbeat. A fresh read report that
+    /// arrived meanwhile keeps its lower count.
+    pub fn requeue_corrupt(&self, id: i64, failed_checks: u32) {
+        self.corrupt_blocks
+            .entry(id)
+            .and_modify(|n| *n = (*n).min(failed_checks))
+            .or_insert(failed_checks);
+    }
+
+    /// Master acknowledged the corrupted deletion of `id`; writers may
+    /// recreate it again.
+    pub fn unfence(&self, id: i64) {
+        self.fenced_blocks.remove(&id);
+    }
+
+    /// Re-verify a block reported corrupt and remove it with its sidecar only
+    /// when the whole block fails again. Holding the stripe lock keeps
+    /// finalize, abort and delete out while the block is read.
+    pub fn invalidate_corrupt_block(&self, id: i64) -> CommonResult<CorruptCheck> {
+        let _block_lock = self.block_lock(id, "invalidate");
+        if self.block_uses(id).lock().contains_key(&id) {
+            return Ok(CorruptCheck::Retry("block has an active writer".into()));
+        }
+        let (block_len, mut reader) = {
+            let state = self.read()?;
+            let Some(meta) = state.get_block(id).cloned() else {
+                return Ok(CorruptCheck::Kept("block no longer exists".into()));
+            };
+            if *meta.state() != BlockState::Finalized {
+                return Ok(CorruptCheck::Retry(format!(
+                    "block is {:?}, not finalized",
+                    meta.state()
+                )));
+            }
+            let (layout, dir) = state.layout_for(&meta)?;
+            let reader =
+                layout.open_reader(&dir, &meta, 0, meta.len(), ChecksumVerify::AllowMissing)?;
+            (meta.len(), reader)
+        };
+        if !reader.is_verified() {
+            return Ok(CorruptCheck::Kept("block has no checksum sidecar".into()));
+        }
+
+        let mut confirmed = false;
+        while reader.block_pos() < block_len {
+            if let Err(e) = reader.read_region(false, REVERIFY_READ_LEN) {
+                if !reader.checksum_mismatch() {
+                    return Err(e.into());
+                }
+                confirmed = true;
+                break;
+            }
+        }
+        if !confirmed {
+            return Ok(CorruptCheck::Kept(
+                "second verification found no mismatch".into(),
+            ));
+        }
+
+        let removed = self.with_dataset_write("invalidate", |state| {
+            match state.get_block(id).map(BlockMeta::state) {
+                Some(BlockState::Finalized) => state.remove_block_state_by_id(id).map(Some),
+                _ => Ok(None),
+            }
+        })?;
+        let Some(removed) = removed else {
+            return Ok(CorruptCheck::Kept("block changed during re-check".into()));
+        };
+        if let Err(e) = removed.deallocate() {
+            self.with_dataset_write("restore", |state| {
+                state.restore_removed_block(removed);
+                Ok(())
+            })?;
+            return Err(e);
+        }
+        removed.release();
+        // Still under the stripe lock, so no open_block slips in between.
+        self.fenced_blocks.insert(id);
+        if let Ok(metrics) = Worker::get_metrics() {
+            metrics.checksum_invalidated_count.inc();
+        }
+        log::error!(
+            "removed block {} after it failed checksum verification twice",
+            id
+        );
+        Ok(CorruptCheck::Removed(removed.meta))
     }
 
     // Get all storage information and check whether the storage directory is normal.
@@ -860,6 +1027,364 @@ mod tests {
 
         let (_, mut published_reader) = store.open_reader_by_id_at_stored_len(block.id, 0)?;
         assert_eq!(read_bytes(&mut published_reader, 4)?, b"new!");
+        Ok(())
+    }
+
+    fn create_checksum_store(name: &str) -> CommonResult<BlockStore> {
+        create_checksum_store_with(name, true, false)
+    }
+
+    fn create_checksum_store_with(
+        name: &str,
+        write: bool,
+        verify: bool,
+    ) -> CommonResult<BlockStore> {
+        create_checksum_store_with_policy(name, write, verify, true)
+    }
+
+    fn create_checksum_store_with_policy(
+        name: &str,
+        write: bool,
+        verify: bool,
+        allow_missing: bool,
+    ) -> CommonResult<BlockStore> {
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                dir_reserved: "0".to_string(),
+                data_dir: vec![format!("[MEM:16MB]../testing/block-store-{name}")],
+                block_checksum: write,
+                block_checksum_verify: verify,
+                block_checksum_allow_missing: allow_missing,
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        BlockStore::new("test", &conf)
+    }
+
+    /// Write `data` through a worker writer and finalize it.
+    fn finalize_with_data(store: &BlockStore, id: i64, data: &[u8]) -> CommonResult<BlockMeta> {
+        let mut block = ExtendedBlock::with_mem(id, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let mut writer = store.open_writer(&meta, 0)?;
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(data)))?;
+        writer.flush()?;
+        drop(writer);
+        block.len = data.len() as i64;
+        store.finalize_block(&block)
+    }
+
+    #[test]
+    fn verified_reads_detect_corruption_and_disable_short_circuit() -> CommonResult<()> {
+        let store = create_checksum_store_with("checksum-verify-read", true, true)?;
+        // Three 64 KiB chunks with a partial tail.
+        let len = 150 * 1024 + 17;
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let finalized = finalize_with_data(&store, 1, &data)?;
+        assert!(store.short_circuit_by_id(finalized.id)?.is_none());
+
+        let (_, mut reader) = store.open_reader_by_id(finalized.id, 100 * 1024, len as i64)?;
+        assert!(!reader.supports_send_file());
+        assert_eq!(
+            read_bytes(&mut reader, 1024)?,
+            &data[100 * 1024..101 * 1024]
+        );
+
+        // Flip one byte in chunk 1 [64 KiB, 128 KiB).
+        let path = store.short_circuit(&finalized)?.unwrap();
+        let mut corrupted = data.clone();
+        corrupted[90 * 1024] ^= 0xff;
+        std::fs::write(&path, &corrupted)?;
+
+        let (_, mut reader) = store.open_reader_by_id(finalized.id, 0, len as i64)?;
+        assert_eq!(read_bytes(&mut reader, 64 * 1024)?, &data[..64 * 1024]);
+        let err = reader.read_region(false, 1).unwrap_err().to_string();
+        assert!(err.contains("checksum mismatch at chunk 1"), "{err}");
+
+        // Replication reads the source at its stored length with send_file.
+        let (_, mut reader) = store.open_reader_by_id_at_stored_len(finalized.id, 64 * 1024)?;
+        assert!(reader.read_region(true, 64 * 1024).is_err());
+        Ok(())
+    }
+
+    /// Finalize a 3-chunk block with a checksum and return it with its path.
+    fn finalize_checksummed(store: &BlockStore, id: i64) -> CommonResult<(BlockMeta, Vec<u8>)> {
+        let len = 150 * 1024 + 17;
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let meta = finalize_with_data(store, id, &data)?;
+        Ok((meta, data))
+    }
+
+    #[test]
+    fn invalidate_removes_block_that_fails_again() -> CommonResult<()> {
+        let store = create_checksum_store_with("checksum-invalidate", true, true)?;
+        let (finalized, data) = finalize_checksummed(&store, 1)?;
+        let path = store.short_circuit(&finalized)?.unwrap();
+        let sidecar = FileLayout::checksum_path_of(std::path::Path::new(&path));
+        assert!(sidecar.exists());
+
+        let mut corrupted = data.clone();
+        corrupted[90 * 1024] ^= 0xff;
+        std::fs::write(&path, &corrupted)?;
+
+        // The read path only queues the block, once per id.
+        let (_, mut reader) =
+            store.open_reader_by_id(finalized.id, 64 * 1024, data.len() as i64)?;
+        assert!(reader.read_region(false, 1024).is_err());
+        assert!(reader.checksum_mismatch());
+        store.report_corrupt(finalized.id, reader.path());
+        store.report_corrupt(finalized.id, reader.path());
+        assert_eq!(store.take_corrupt_blocks(), vec![(finalized.id, 0)]);
+        assert!(store.take_corrupt_blocks().is_empty());
+        assert!(store.get_block(finalized.id).is_ok());
+
+        match store.invalidate_corrupt_block(finalized.id)? {
+            CorruptCheck::Removed(meta) => assert_eq!(meta.len, data.len() as i64),
+            other => panic!("expected removal, got {other:?}"),
+        }
+        assert!(store.get_block(finalized.id).is_err());
+        assert!(!std::path::Path::new(&path).exists());
+        assert!(!sidecar.exists());
+
+        // A second report for a block already removed is a no-op.
+        assert!(matches!(
+            store.invalidate_corrupt_block(finalized.id)?,
+            CorruptCheck::Kept(_)
+        ));
+
+        // Until master acknowledges the deletion, the id cannot be recreated.
+        let block = ExtendedBlock::with_mem(finalized.id, "1MB")?;
+        let err = store.open_block(&block).unwrap_err();
+        assert!(err.to_string().contains("removed as corrupt"), "{err}");
+        store.unfence(finalized.id);
+        store.open_block(&block)?;
+        Ok(())
+    }
+
+    #[test]
+    fn requeue_keeps_the_lower_failure_count() -> CommonResult<()> {
+        let store = create_checksum_store_with("checksum-requeue", true, true)?;
+        store.requeue_corrupt(5, 2);
+        assert_eq!(store.take_corrupt_blocks(), vec![(5, 2)]);
+
+        store.report_corrupt(5, "fresh read");
+        store.requeue_corrupt(5, 2);
+        assert_eq!(store.take_corrupt_blocks(), vec![(5, 0)]);
+        Ok(())
+    }
+
+    #[test]
+    fn invalidate_keeps_block_when_second_check_passes() -> CommonResult<()> {
+        let store = create_checksum_store_with("checksum-invalidate-pass", true, true)?;
+        let (finalized, data) = finalize_checksummed(&store, 1)?;
+        store.report_corrupt(finalized.id, "transient");
+
+        let reason = match store.invalidate_corrupt_block(finalized.id)? {
+            CorruptCheck::Kept(reason) => reason,
+            other => panic!("expected the block to be kept, got {other:?}"),
+        };
+        assert!(reason.contains("no mismatch"), "{reason}");
+        let (_, mut reader) = store.open_reader_by_id(finalized.id, 0, data.len() as i64)?;
+        assert_eq!(read_bytes(&mut reader, data.len() as i32)?, &data[..]);
+        Ok(())
+    }
+
+    #[test]
+    fn invalidate_keeps_blocks_it_cannot_confirm() -> CommonResult<()> {
+        let store = create_checksum_store_with("checksum-invalidate-skip", true, true)?;
+        let (finalized, data) = finalize_checksummed(&store, 1)?;
+        let path = store.short_circuit(&finalized)?.unwrap();
+        let mut corrupted = data.clone();
+        corrupted[0] ^= 0xff;
+        std::fs::write(&path, &corrupted)?;
+
+        // An active writer may be replacing the corrupt generation.
+        let lease = store.ordinary_write_lease(finalized.id)?;
+        assert!(matches!(
+            store.invalidate_corrupt_block(finalized.id)?,
+            CorruptCheck::Retry(_)
+        ));
+        drop(lease);
+        assert!(store.get_block(finalized.id).is_ok());
+
+        // A block that is still being written has no sidecar to check.
+        let writing = store.open_block(&ExtendedBlock::with_mem(2, "1MB")?)?;
+        assert!(matches!(
+            store.invalidate_corrupt_block(writing.id)?,
+            CorruptCheck::Retry(_)
+        ));
+
+        // Without a sidecar the corruption cannot be confirmed.
+        let plain = create_checksum_store_with("checksum-invalidate-nosidecar", false, true)?;
+        let (unsummed, data) = finalize_checksummed(&plain, 1)?;
+        let path = plain.short_circuit(&unsummed)?.unwrap();
+        let mut corrupted = data.clone();
+        corrupted[0] ^= 0xff;
+        std::fs::write(&path, &corrupted)?;
+        let reason = match plain.invalidate_corrupt_block(unsummed.id)? {
+            CorruptCheck::Kept(reason) => reason,
+            other => panic!("expected the block to be kept, got {other:?}"),
+        };
+        assert!(reason.contains("no checksum sidecar"), "{reason}");
+        assert!(plain.get_block(unsummed.id).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn unfinalized_blocks_are_read_without_verification() -> CommonResult<()> {
+        // RequireSidecar rejects finalized blocks without a sidecar, but a
+        // block that is still being written cannot have one yet.
+        let store =
+            create_checksum_store_with_policy("checksum-verify-staging", true, true, false)?;
+        let block = ExtendedBlock::with_mem(1, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let mut writer = store.open_writer(&meta, 0)?;
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&[3u8; 4096][..])))?;
+        writer.flush()?;
+        drop(writer);
+
+        let (read_meta, mut reader) = store.open_reader_by_id(block.id, 0, 4096)?;
+        assert_eq!(read_meta.state(), &BlockState::Writing);
+        assert!(!reader.is_verified());
+        assert_eq!(read_bytes(&mut reader, 4096)?, vec![3u8; 4096]);
+
+        // Finalize writes the staging sidecar outside the dataset lock; an
+        // empty file is what a reader can see right after `File::create`.
+        let staging_path = store.short_circuit(&meta)?.unwrap();
+        let staging_checksum = FileLayout::checksum_path_of(std::path::Path::new(&staging_path));
+        let reservation = store
+            .write()?
+            .reserve_file_finalize(&block)?
+            .expect("file block finalize must reserve");
+        std::fs::write(&staging_checksum, b"")?;
+        let (read_meta, mut reader) = store.open_reader_by_id(block.id, 0, 4096)?;
+        assert_eq!(read_meta.state(), &BlockState::Finalizing);
+        assert!(!reader.is_verified());
+        assert_eq!(read_bytes(&mut reader, 4096)?, vec![3u8; 4096]);
+        store.write()?.rollback_file_finalize(&reservation)?;
+        let _ = std::fs::remove_file(&staging_checksum);
+        Ok(())
+    }
+
+    #[test]
+    fn verify_off_keeps_short_circuit_and_send_file() -> CommonResult<()> {
+        let store = create_checksum_store_with("checksum-verify-off", true, false)?;
+        let finalized = finalize_with_data(&store, 1, &[7u8; 4096])?;
+        assert!(store.short_circuit_by_id(finalized.id)?.is_some());
+        let (_, reader) = store.open_reader_by_id(finalized.id, 0, 4096)?;
+        assert!(!reader.is_verified());
+        Ok(())
+    }
+
+    #[test]
+    fn verify_without_write_reads_blocks_without_sidecar() -> CommonResult<()> {
+        // Default policy allows blocks that have no sidecar.
+        let store = create_checksum_store_with("checksum-verify-only", false, true)?;
+        let finalized = finalize_with_data(&store, 1, &[5u8; 4096])?;
+        let (_, mut reader) = store.open_reader_by_id(finalized.id, 0, 4096)?;
+        assert!(!reader.is_verified());
+        assert_eq!(read_bytes(&mut reader, 4096)?, vec![5u8; 4096]);
+        Ok(())
+    }
+
+    fn assert_sidecar_matches(path: &str) -> CommonResult<()> {
+        use crate::worker::storage::{BlockChecksum, DEFAULT_CHECKSUM_CHUNK_SIZE};
+        let data = std::fs::read(path)?;
+        let sidecar = std::fs::read(FileLayout::checksum_path_of(std::path::Path::new(path)))?;
+        let expected = BlockChecksum::compute(DEFAULT_CHECKSUM_CHUNK_SIZE, &data)?;
+        assert_eq!(BlockChecksum::decode(&sidecar)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_checksums_worker_and_short_circuit_writes() -> CommonResult<()> {
+        let store = create_checksum_store("checksum-write-paths")?;
+        // More than two 64 KiB chunks with a partial tail.
+        let len = 150 * 1024 + 17;
+
+        // Worker write path with a seek back over already written bytes.
+        let mut block = ExtendedBlock::with_mem(1, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let mut writer = store.open_writer(&meta, 0)?;
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(
+            &vec![1u8; len][..],
+        )))?;
+        writer.seek_to(70 * 1024)?;
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&[9u8; 100][..])))?;
+        writer.flush()?;
+        drop(writer);
+        block.len = len as i64;
+        let finalized = store.finalize_block(&block)?;
+        let path = store.short_circuit(&finalized)?.unwrap();
+        assert_eq!(std::fs::read(&path)?[70 * 1024], 9);
+        assert_sidecar_matches(&path)?;
+
+        // Short-circuit path: the client writes the staging file directly.
+        let mut block = ExtendedBlock::with_mem(2, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let staging = store.short_circuit(&meta)?.unwrap();
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&staging, &data)?;
+        block.len = len as i64;
+        let finalized = store.finalize_block(&block)?;
+        let path = store.short_circuit(&finalized)?.unwrap();
+        assert_sidecar_matches(&path)?;
+
+        // Removing the block removes its sidecar.
+        store.remove_block(2)?;
+        assert!(!FileLayout::checksum_path_of(std::path::Path::new(&path)).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_writers_finalize_without_checksum() -> CommonResult<()> {
+        let store = create_checksum_store("checksum-concurrent-writers")?;
+        let mut block = ExtendedBlock::with_mem(1, "1MB")?;
+        let first = store.ordinary_write_lease(block.id)?;
+        let second = store.ordinary_write_lease(block.id)?;
+        let meta = store.open_block(&block)?;
+        let staging = store.short_circuit(&meta)?.unwrap();
+        std::fs::write(&staging, [1u8; 100])?;
+
+        // The second session still holds the staging inode open and may write
+        // after the checksum pass, so the first finalize must not publish one.
+        let mut late = std::fs::OpenOptions::new().write(true).open(&staging)?;
+        block.len = 100;
+        let finalized = store.finalize_block(&block)?;
+        let path = store.short_circuit(&finalized)?.unwrap();
+        let sidecar = FileLayout::checksum_path_of(std::path::Path::new(&path));
+        assert!(!sidecar.exists());
+        drop(first);
+
+        late.write_all(&[2u8; 100])?;
+        drop(late);
+        assert_eq!(store.finalize_block(&block)?.len(), 100);
+        assert!(!sidecar.exists());
+        drop(second);
+
+        // A single remaining writer gets a sidecar again on rewrite.
+        let _only = store.ordinary_write_lease(block.id)?;
+        let rewrite = store.open_block(&block)?;
+        std::fs::write(store.short_circuit(&rewrite)?.unwrap(), [3u8; 100])?;
+        store.finalize_block(&block)?;
+        assert_sidecar_matches(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn length_mismatch_abort_leaves_no_checksum_sidecar() -> CommonResult<()> {
+        let store = create_checksum_store("checksum-length-mismatch")?;
+        let mut block = ExtendedBlock::with_mem(1, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let staging = store.short_circuit(&meta)?.unwrap();
+        std::fs::write(&staging, [4u8; 100])?;
+
+        block.len = 101;
+        assert!(store.finalize_block(&block).is_err());
+        assert!(store.get_block(1).is_err());
+        assert!(!std::path::Path::new(&staging).exists());
+        assert!(!FileLayout::checksum_path_of(std::path::Path::new(&staging)).exists());
         Ok(())
     }
 

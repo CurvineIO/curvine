@@ -1839,6 +1839,9 @@ fn conditional_lock(owner_id: u64, lock_type: LockType) -> FileLock {
         lock_flags: LockFlags::Flock,
         start: 0,
         end: u64::MAX,
+        // The synthetic client id above never owns a master session lease, so
+        // this lock keeps the legacy `lock_expire_time` reclamation path.
+        session_owned: false,
     }
 }
 

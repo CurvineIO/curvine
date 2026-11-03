@@ -47,6 +47,16 @@ pub enum IoOp {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
         ack: mpsc::Sender<()>,
     },
+    /// Stop polling admin completions before a controller is detached.
+    UnregisterCtrlr {
+        ctrlr: CtrlHandle,
+        ack: mpsc::Sender<()>,
+    },
+    /// Resume admin polling after a detach attempt failed partway.
+    RegisterCtrlr {
+        ctrlr: CtrlHandle,
+        ack: mpsc::Sender<()>,
+    },
     /// Poll a retired qpair once before retrying free on the owner thread.
     PollRetiredQpair {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
@@ -75,6 +85,7 @@ fn poll_ack_error_to_outcome(err: RecvTimeoutError) -> RetiredQpairPollOutcome {
     }
 }
 
+// TODO(spdk): split ctrlr-retry logging from qpair logging (issue-spdk-ctrlr-unregister-ack-reconciliation.md).
 fn unregister_ack_error_to_result(err: RecvTimeoutError) -> UnregisterResult {
     match err {
         RecvTimeoutError::Timeout => {
@@ -102,6 +113,8 @@ pub struct IoCompletion {
 struct IoCompletionInner {
     done: bool,
     status: i32,
+    /// True if synthesized by the poller, not a genuine terminal completion.
+    forced: bool,
 }
 
 impl IoCompletion {
@@ -110,22 +123,41 @@ impl IoCompletion {
             inner: Mutex::new(IoCompletionInner {
                 done: false,
                 status: 0,
+                forced: false,
             }),
             cond: Condvar::new(),
         })
     }
 
-    /// Called by C callback on completion.
+    /// Called on a genuine, terminal completion (SPDK callback or
+    /// pre-submission rejection).
     /// Returns true if this call actually completed the I/O (first call wins).
     pub fn complete(&self, status: i32) -> bool {
+        self.complete_inner(status, false)
+    }
+
+    /// Like `complete`, but for a poller-synthesized status (e.g.
+    /// force_complete_qpair, handle_unregister); not confirmed terminal.
+    pub fn force_complete(&self, status: i32) -> bool {
+        self.complete_inner(status, true)
+    }
+
+    fn complete_inner(&self, status: i32, forced: bool) -> bool {
         let mut inner = self.inner.lock().unwrap();
         if inner.done {
             return false;
         }
         inner.done = true;
         inner.status = status;
+        inner.forced = forced;
         self.cond.notify_one();
         true
+    }
+
+    /// True if the completion was synthesized by the poller, not confirmed
+    /// terminal. Meaningful only after `wait()` returns done.
+    pub fn was_forced(&self) -> bool {
+        self.inner.lock().unwrap().forced
     }
 
     /// Block until complete or timeout. Returns NVMe status.
@@ -175,6 +207,7 @@ enum PollerState {
 
 /// SPDK NVMe controller handle — thread-safe.
 #[repr(transparent)]
+#[derive(Clone, Copy)]
 pub struct CtrlHandle(pub *mut spdk_ffi::spdk_nvme_ctrlr);
 
 // SAFETY: opaque SPDK handle; admin completion is thread-safe.
@@ -437,6 +470,49 @@ impl SpdkPoller {
         }
     }
 
+    /// Remove a controller from admin polling. An acknowledgement is the
+    /// barrier that makes a later `spdk_nvme_detach` safe.
+    pub(crate) fn unregister_ctrlr(&self, ctrlr: CtrlHandle) -> UnregisterResult {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let req = IoRequest {
+            op: IoOp::UnregisterCtrlr { ctrlr, ack: ack_tx },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+        let Some(tx) = &self.tx else {
+            return UnregisterResult::Disconnected;
+        };
+        if tx.send(req).is_err() {
+            return UnregisterResult::Disconnected;
+        }
+        let _ = self.eventfd.write(1);
+        match ack_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(()) => UnregisterResult::Acked,
+            Err(err) => unregister_ack_error_to_result(err),
+        }
+    }
+
+    /// Resume admin polling after a failed detach; counterpart to `unregister_ctrlr`.
+    pub(crate) fn register_ctrlr(&self, ctrlr: CtrlHandle) -> UnregisterResult {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let req = IoRequest {
+            op: IoOp::RegisterCtrlr { ctrlr, ack: ack_tx },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+        let Some(tx) = &self.tx else {
+            return UnregisterResult::Disconnected;
+        };
+        if tx.send(req).is_err() {
+            return UnregisterResult::Disconnected;
+        }
+        let _ = self.eventfd.write(1);
+        match ack_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(()) => UnregisterResult::Acked,
+            Err(err) => unregister_ack_error_to_result(err),
+        }
+    }
+
     pub(crate) fn poll_retired_qpair(
         &self,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
@@ -494,7 +570,7 @@ impl SpdkPoller {
         mut config: PollerConfig,
         retired: Arc<RetiredQpairRegistry>,
     ) {
-        let active_ctrlrs: Vec<CtrlHandle> = std::mem::take(&mut config.ctrlrs);
+        let mut active_ctrlrs: Vec<CtrlHandle> = std::mem::take(&mut config.ctrlrs);
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
         let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
@@ -525,6 +601,12 @@ impl SpdkPoller {
                     match &req.op {
                         IoOp::UnregisterQpair { .. } => {
                             Self::handle_unregister(&req, &mut qpair_state, &retired);
+                        }
+                        IoOp::UnregisterCtrlr { .. } => {
+                            Self::handle_unregister_ctrlr(&req, &mut active_ctrlrs);
+                        }
+                        IoOp::RegisterCtrlr { .. } => {
+                            Self::handle_register_ctrlr(&req, &mut active_ctrlrs);
                         }
                         IoOp::PollRetiredQpair { .. } => {
                             Self::handle_poll_retired(&req);
@@ -615,6 +697,12 @@ impl SpdkPoller {
                                 IoOp::UnregisterQpair { .. } => {
                                     Self::handle_unregister(&req, &mut qpair_state, &retired);
                                 }
+                                IoOp::UnregisterCtrlr { .. } => {
+                                    Self::handle_unregister_ctrlr(&req, &mut active_ctrlrs);
+                                }
+                                IoOp::RegisterCtrlr { .. } => {
+                                    Self::handle_register_ctrlr(&req, &mut active_ctrlrs);
+                                }
                                 IoOp::PollRetiredQpair { .. } => {
                                     Self::handle_poll_retired(&req);
                                 }
@@ -698,7 +786,7 @@ impl SpdkPoller {
                 qs.dead.store(true, Ordering::Release);
                 for &ptr in &qs.pending {
                     unsafe {
-                        (*ptr).completion.complete(-libc::ESHUTDOWN);
+                        (*ptr).completion.force_complete(-libc::ESHUTDOWN);
                     }
                 }
                 let pending = std::mem::take(&mut qs.pending);
@@ -707,6 +795,23 @@ impl SpdkPoller {
                 qs
             });
             retired.insert(key, state, false);
+            let _ = ack.send(());
+        }
+    }
+
+    fn handle_unregister_ctrlr(req: &IoRequest, active_ctrlrs: &mut Vec<CtrlHandle>) {
+        if let IoOp::UnregisterCtrlr { ctrlr, ack } = &req.op {
+            active_ctrlrs.retain(|active| active.0 != ctrlr.0);
+            let _ = ack.send(());
+        }
+    }
+
+    /// Dedup-guarded: a no-op if the controller is already registered.
+    fn handle_register_ctrlr(req: &IoRequest, active_ctrlrs: &mut Vec<CtrlHandle>) {
+        if let IoOp::RegisterCtrlr { ctrlr, ack } = &req.op {
+            if !active_ctrlrs.iter().any(|active| active.0 == ctrlr.0) {
+                active_ctrlrs.push(*ctrlr);
+            }
             let _ = ack.send(());
         }
     }
@@ -731,6 +836,12 @@ impl SpdkPoller {
             IoOp::Flush { qpair, .. } => *qpair,
             IoOp::UnregisterQpair { .. } | IoOp::PollRetiredQpair { .. } => {
                 unreachable!("control request handled before submit_one")
+            }
+            IoOp::UnregisterCtrlr { .. } => {
+                unreachable!("UnregisterCtrlr handled by handle_unregister_ctrlr")
+            }
+            IoOp::RegisterCtrlr { .. } => {
+                unreachable!("RegisterCtrlr handled by handle_register_ctrlr")
             }
         };
 
@@ -821,6 +932,12 @@ impl SpdkPoller {
             IoOp::PollRetiredQpair { .. } => {
                 unreachable!("control request handled before submit_one")
             }
+            IoOp::UnregisterCtrlr { .. } => {
+                unreachable!("UnregisterCtrlr handled by handle_unregister_ctrlr")
+            }
+            IoOp::RegisterCtrlr { .. } => {
+                unreachable!("RegisterCtrlr handled by handle_register_ctrlr")
+            }
         };
 
         if rc != 0 {
@@ -851,7 +968,7 @@ impl SpdkPoller {
                 // Signal but DON'T free - keep alive for late callbacks.
                 let ctx = *cb_ptr;
                 unsafe {
-                    (*ctx).completion.complete(-libc::EIO);
+                    (*ctx).completion.force_complete(-libc::EIO);
                 }
             }
             // Move to stale so reclaim_stale can free them later.
@@ -1189,6 +1306,9 @@ mod test {
         // Assert: DEAD entries completed with -EIO.
         assert_eq!(completion_1.wait(0), -libc::EIO);
         assert_eq!(completion_2.wait(0), -libc::EIO);
+        // Assert: provenance marks these as forced/nonterminal, not confirmed.
+        assert!(completion_1.was_forced());
+        assert!(completion_2.was_forced());
 
         // Assert: LIVE entry NOT completed (timeout with 1ms).
         assert_eq!(completion_3.wait(1000), -libc::ETIMEDOUT);
@@ -1294,6 +1414,29 @@ mod test {
 
         assert!(!completion.complete(99));
         assert_eq!(completion.wait(0), 42);
+    }
+
+    #[test]
+    fn complete_is_not_forced_but_force_complete_is() {
+        let completion = IoCompletion::new();
+        assert!(completion.complete(-libc::EIO));
+        assert_eq!(completion.wait(0), -libc::EIO);
+        assert!(
+            !completion.was_forced(),
+            "genuine completion must not be marked forced"
+        );
+
+        let forced = IoCompletion::new();
+        assert!(forced.force_complete(-libc::EIO));
+        assert_eq!(forced.wait(0), -libc::EIO);
+        assert!(
+            forced.was_forced(),
+            "force_complete must mark the completion as forced"
+        );
+
+        // First-call-wins applies across complete/force_complete too.
+        assert!(!forced.complete(0));
+        assert!(forced.was_forced(), "second caller must not clear forced");
     }
 
     #[test]
@@ -1774,6 +1917,14 @@ mod test {
         // 3: pending entries signaled with -ESHUTDOWN, DMA refs kept until reclaim
         assert_eq!(completion_1.wait(0), -libc::ESHUTDOWN);
         assert_eq!(completion_2.wait(0), -libc::ESHUTDOWN);
+        assert!(
+            completion_1.was_forced(),
+            "unregister-forced completion must be marked forced"
+        );
+        assert!(
+            completion_2.was_forced(),
+            "unregister-forced completion must be marked forced"
+        );
         assert_eq!(inflight_1.load(Ordering::Acquire), 1);
         assert_eq!(inflight_2.load(Ordering::Acquire), 1);
 
@@ -1936,6 +2087,82 @@ mod test {
 
         assert_eq!(retired.len(), 1);
         assert!(retired.take(qpair).unwrap().requires_free());
+    }
+
+    #[test]
+    fn unregister_ctrlr_removes_only_requested_controller() {
+        let ctrlr_a = CtrlHandle(0x1000usize as *mut _);
+        let ctrlr_b = CtrlHandle(0x2000usize as *mut _);
+        let mut active = vec![ctrlr_a, ctrlr_b];
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let req = IoRequest {
+            op: IoOp::UnregisterCtrlr {
+                ctrlr: ctrlr_a,
+                ack: ack_tx,
+            },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+
+        SpdkPoller::handle_unregister_ctrlr(&req, &mut active);
+
+        assert_eq!(ack_rx.try_recv(), Ok(()));
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0, ctrlr_b.0);
+    }
+
+    #[test]
+    fn unregister_absent_ctrlr_is_idempotent() {
+        let mut active = vec![CtrlHandle(0x2000usize as *mut _)];
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let req = IoRequest {
+            op: IoOp::UnregisterCtrlr {
+                ctrlr: CtrlHandle(0x1000usize as *mut _),
+                ack: ack_tx,
+            },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+
+        SpdkPoller::handle_unregister_ctrlr(&req, &mut active);
+
+        assert_eq!(ack_rx.try_recv(), Ok(()));
+        assert_eq!(active.len(), 1);
+    }
+
+    #[test]
+    fn unregister_ctrlr_real_round_trip_acks() {
+        let retired = RetiredQpairRegistry::new();
+        let config = PollerConfig {
+            poll_interval_ms: 10,
+            spin_iter: 10,
+            io_queue_depth: 8,
+            ctrlrs: Vec::new(),
+        };
+        let poller = SpdkPoller::start(config, retired);
+        let ctrlr = CtrlHandle(0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr);
+
+        let result = poller.unregister_ctrlr(ctrlr);
+
+        assert_eq!(result, UnregisterResult::Acked);
+    }
+
+    #[test]
+    fn unregister_ctrlr_after_stop_returns_disconnected() {
+        let retired = RetiredQpairRegistry::new();
+        let config = PollerConfig {
+            poll_interval_ms: 10,
+            spin_iter: 10,
+            io_queue_depth: 8,
+            ctrlrs: Vec::new(),
+        };
+        let mut poller = SpdkPoller::start(config, retired);
+        poller.stop();
+        let ctrlr = CtrlHandle(0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr);
+
+        let result = poller.unregister_ctrlr(ctrlr);
+
+        assert_eq!(result, UnregisterResult::Disconnected);
     }
 
     #[test]

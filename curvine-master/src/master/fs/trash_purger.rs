@@ -15,12 +15,13 @@
 use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::{InodePath, InodeView, PATH_SEPARATOR};
 use crate::master::meta::FsDir;
+use crate::master::Master;
 use crate::master::MasterMonitor;
 use curvine_error::{FsError, FsResult};
 use curvine_model::ListOptions;
 use curvine_runtime::runtime::LoopTask;
 use log::{debug, info, warn};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Bound on how many children one directory page examines per namespace lock
 // hold. Keeps a directory with millions of children from building the whole
@@ -71,6 +72,15 @@ pub struct PurgeOutcome {
     pub bytes: u64,
 }
 
+/// Why a purge stopped before reaching the end of its entry.
+#[derive(Debug)]
+pub enum PurgeStop {
+    /// This node is no longer the active master.
+    Demoted,
+    /// A walk or batch failed; nothing of that batch was applied.
+    Failed(FsError),
+}
+
 /// Reclaims trashed entries in bounded batches.
 ///
 /// Each batch removes at most `trash_purge_batch_inodes` inodes and carries at
@@ -116,15 +126,31 @@ impl TrashPurger {
     /// Purges `entry` completely. Returns `None` when this node lost leadership
     /// mid-purge; the entry then stays in the trash for the next active master.
     pub fn purge_entry(&self, entry: &str) -> FsResult<Option<PurgeOutcome>> {
+        match self.purge_entry_partial(entry) {
+            (outcome, None) => Ok(Some(outcome)),
+            (_, Some(PurgeStop::Demoted)) => Ok(None),
+            (_, Some(PurgeStop::Failed(e))) => Err(e),
+        }
+    }
+
+    /// Like [`Self::purge_entry`], but also reports what was reclaimed when the
+    /// purge stops early. Batches that applied before the stop are committed and
+    /// journaled, so their counts are real even though the entry is unfinished.
+    pub fn purge_entry_partial(&self, entry: &str) -> (PurgeOutcome, Option<PurgeStop>) {
+        let mut outcome = PurgeOutcome::default();
+        let stop = self.purge_entry_into(entry, &mut outcome).err();
+        (outcome, stop)
+    }
+
+    fn purge_entry_into(&self, entry: &str, outcome: &mut PurgeOutcome) -> Result<(), PurgeStop> {
         let mut frames = vec![Frame {
             path: entry.to_string(),
             after: None,
         }];
-        let mut outcome = PurgeOutcome::default();
 
         loop {
             if !self.monitor.is_active() {
-                return Ok(None);
+                return Err(PurgeStop::Demoted);
             }
 
             // The walk only reads metadata, and the batch it produces is bounded,
@@ -132,14 +158,28 @@ impl TrashPurger {
             let batch = {
                 let fs_dir = self.fs.fs_dir();
                 let fs_dir = fs_dir.read();
-                Self::next_batch(&fs_dir, &mut frames, self.batch_inodes, self.batch_bytes)?
+                Self::next_batch(&fs_dir, &mut frames, self.batch_inodes, self.batch_bytes)
+                    .map_err(PurgeStop::Failed)?
             };
             if batch.is_empty() {
-                return Ok(Some(outcome));
+                return Ok(());
             }
 
-            let Some((inodes, bytes)) = self.fs.purge_trash_batch(entry, &batch)? else {
-                return Ok(None);
+            let started = Instant::now();
+            let applied = self.fs.purge_trash_batch(entry, &batch);
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+
+            let (inodes, bytes) = match applied {
+                Ok(Some(applied)) => {
+                    Self::record_batch(elapsed_ms, applied.0, true);
+                    applied
+                }
+                // A demotion is not a purge failure: this node simply stopped.
+                Ok(None) => return Err(PurgeStop::Demoted),
+                Err(e) => {
+                    Self::record_batch(elapsed_ms, 0, false);
+                    return Err(PurgeStop::Failed(e));
+                }
             };
             outcome.batches += 1;
             outcome.inodes += inodes;
@@ -155,6 +195,23 @@ impl TrashPurger {
             if self.yield_ms > 0 {
                 std::thread::sleep(Duration::from_millis(self.yield_ms));
             }
+        }
+    }
+
+    /// Records one applied (or failed) batch. Metrics are best-effort: a missing
+    /// registry must never fail a purge.
+    fn record_batch(elapsed_ms: u64, inodes: u64, applied: bool) {
+        let Ok(metrics) = Master::get_metrics() else {
+            return;
+        };
+        metrics.trash_purge_batches.inc();
+        metrics
+            .trash_purge_batch_duration_ms
+            .inc_by(elapsed_ms as i64);
+        if applied {
+            metrics.trash_purge_inodes.inc_by(inodes as i64);
+        } else {
+            metrics.trash_purge_errors.inc();
         }
     }
 
@@ -281,7 +338,8 @@ impl TrashPurger {
 // Bound on how many pending entries one drain cycle dequeues per scan page.
 const PENDING_SCAN_BATCH: usize = 64;
 
-/// Drains `/.Trash/.pending`, the staging directory written by `async_delete`.
+/// Drains `/.Trash/.pending`, the staging directory written by `async_delete`,
+/// and adopts entries a synchronous delete left in `/.Trash/.purging` (#1864).
 ///
 /// This runs regardless of `trash_enabled` and of `trash_retention`: an async
 /// delete promises reclamation without a retention window, so its entries are
@@ -313,8 +371,9 @@ impl PendingTrashPurger {
         self
     }
 
-    /// Purges every currently staged entry, page by page. Returns the number of
-    /// entries reclaimed, or `None` when the master was demoted mid-cycle.
+    /// Purges every entry staged in `/.Trash/.pending`, page by page. Returns
+    /// `(entries, inodes, bytes)` reclaimed, or `None` when the master was
+    /// demoted mid-cycle.
     ///
     /// The drain is skipped when a blocking empty-trash call owns the pending
     /// directory: both walk the same entries, and only the blocking caller has
@@ -328,42 +387,90 @@ impl PendingTrashPurger {
             return Ok(Some((0, 0, 0)));
         };
 
-        let mut entries = 0u64;
-        let mut inodes = 0u64;
-        let mut bytes = 0u64;
-        let mut start_after = None;
+        let mut totals = (0u64, 0u64, 0u64);
 
+        // Sample the queue depth once per cycle. The probe is one bounded page,
+        // so a backlog larger than the page reports the page size.
+        if let Ok(probe) = self.fs.scan_pending_trash(self.scan_batch, None) {
+            if let Ok(metrics) = Master::get_metrics() {
+                metrics.trash_pending_entries.set(probe.paths.len() as i64);
+            }
+        }
+
+        let pending = |limit: usize, after: Option<&str>| self.fs.scan_pending_trash(limit, after);
+        if !self.drain_dir(pending, &mut totals)? {
+            return Ok(None);
+        }
+
+        Ok(Some(totals))
+    }
+
+    /// Adopts entries left in `/.Trash/.purging` by a synchronous delete that
+    /// stopped early (lost leadership, a failed batch, a restart), page by page.
+    /// Returns `(entries, inodes, bytes)` reclaimed, or `None` when the master
+    /// was demoted mid-cycle.
+    ///
+    /// Runs outside the `pending_drain` guard: `EmptyTrash` never touches
+    /// `.purging`, and an entry a delete still owns is skipped through the
+    /// in-flight set, so a large leftover never blocks an empty-trash call.
+    pub fn drain_purging(&self) -> FsResult<Option<(u64, u64, u64)>> {
+        let mut totals = (0u64, 0u64, 0u64);
+
+        // Sampled like the pending probe: one bounded page per cycle.
+        if let Ok(probe) = self.fs.scan_purging_trash(self.scan_batch, None) {
+            if let Ok(metrics) = Master::get_metrics() {
+                metrics.trash_purging_entries.set(probe.paths.len() as i64);
+            }
+        }
+
+        let purging = |limit: usize, after: Option<&str>| self.fs.scan_purging_trash(limit, after);
+        if !self.drain_dir(purging, &mut totals)? {
+            return Ok(None);
+        }
+
+        Ok(Some(totals))
+    }
+
+    /// Purges one staging directory page by page, adding to `totals`. Returns
+    /// `false` when the master was demoted mid-drain.
+    fn drain_dir<F>(&self, scan: F, totals: &mut (u64, u64, u64)) -> FsResult<bool>
+    where
+        F: Fn(usize, Option<&str>) -> FsResult<crate::master::meta::TrashScanPage>,
+    {
+        let mut start_after = None;
         loop {
             if !self.monitor.is_active() {
-                return Ok(None);
+                return Ok(false);
             }
 
-            let page = self
-                .fs
-                .scan_pending_trash(self.scan_batch, start_after.as_deref())?;
+            let page = scan(self.scan_batch, start_after.as_deref())?;
             for path in page.paths {
+                if self.fs.is_purge_inflight(&path) {
+                    continue;
+                }
                 // An entry staged after this page was scanned is picked up by the
                 // next cycle; a restored or already purged one resolves to a
                 // no-op inside the purger.
-                match self.purger.purge_entry(&path) {
-                    Ok(Some(outcome)) => {
-                        entries += 1;
-                        inodes += outcome.inodes;
-                        bytes += outcome.bytes;
+                // Batches applied before a stop are committed, so their counts
+                // are reported; only a finished entry counts as an entry.
+                let (outcome, stop) = self.purger.purge_entry_partial(&path);
+                totals.1 += outcome.inodes;
+                totals.2 += outcome.bytes;
+                match stop {
+                    None => totals.0 += 1,
+                    Some(PurgeStop::Demoted) => return Ok(false),
+                    Some(PurgeStop::Failed(FsError::FileNotFound(_))) => {}
+                    Some(PurgeStop::Failed(e)) => {
+                        warn!("failed to purge staged trash entry {}: {}", path, e)
                     }
-                    Ok(None) => return Ok(None),
-                    Err(FsError::FileNotFound(_)) => {}
-                    Err(e) => warn!("failed to purge pending trash entry {}: {}", path, e),
                 }
             }
 
             match page.next_after {
                 Some(next) => start_after = Some(next),
-                None => break,
+                None => return Ok(true),
             }
         }
-
-        Ok(Some((entries, inodes, bytes)))
     }
 }
 
@@ -383,10 +490,57 @@ impl LoopTask for PendingTrashPurger {
                 );
             }
         }
+
+        if let Some((entries, inodes, bytes)) = self.drain_purging()? {
+            if entries > 0 {
+                info!(
+                    "trash purger adopted {} abandoned staged deletes ({} inodes, {} bytes)",
+                    entries, inodes, bytes
+                );
+            }
+        }
         Ok(())
     }
 
     fn terminate(&self) -> bool {
         self.monitor.is_stop()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrashPurger;
+    use crate::master::Master;
+
+    // Counters only increase, so delta assertions stay valid even when other
+    // tests in this binary purge concurrently and add their own increments.
+    #[test]
+    fn records_batch_metrics() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let batches = metrics.trash_purge_batches.get();
+        let duration = metrics.trash_purge_batch_duration_ms.get();
+        let inodes = metrics.trash_purge_inodes.get();
+        let errors = metrics.trash_purge_errors.get();
+
+        TrashPurger::record_batch(7, 3, true);
+        TrashPurger::record_batch(5, 4, false);
+
+        assert!(
+            metrics.trash_purge_batches.get() >= batches + 2,
+            "every batch must be counted"
+        );
+        assert!(
+            metrics.trash_purge_batch_duration_ms.get() >= duration + 12,
+            "batch durations must be summed"
+        );
+        assert!(
+            metrics.trash_purge_inodes.get() >= inodes + 3,
+            "only applied batches contribute inodes"
+        );
+        assert!(
+            metrics.trash_purge_errors.get() > errors,
+            "failed batches are counted separately"
+        );
     }
 }

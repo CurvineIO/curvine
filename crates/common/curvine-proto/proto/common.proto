@@ -215,6 +215,11 @@ message FileLockProto {
     required LockFlagsProto lock_flags = 6 [default = LOCK_FLAGS_PROTO_PLOCK];
     required uint64 start = 7;
     required uint64 end = 8;
+    // The owner holds a client session lease (it sends ClientHeartbeat), so lock
+    // validity follows session liveness instead of `lock_expire_time`. Additive:
+    // a master that predates this field ignores it and keeps the legacy TTL path,
+    // and a client that predates it leaves it false.
+    optional bool session_owned = 9 [default = false];
 }
 
 message FreeResultProto {

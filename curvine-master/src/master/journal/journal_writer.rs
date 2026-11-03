@@ -20,13 +20,15 @@ use crate::master::meta::FsDir;
 use crate::master::{Master, MasterMetrics};
 use curvine_config::JournalConf;
 use curvine_core_error::err_box;
-use curvine_error::FsResult;
-use curvine_model::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
+use curvine_error::{FsError, FsResult};
+use curvine_model::{
+    CommitBlock, FileLock, LeaderSnapshotInfo, MountInfo, RenameFlags, SetAttrOpts,
+};
 use curvine_raft::conf::JournalConfExt;
 use curvine_raft::raft::RaftClient;
-use curvine_runtime::common::{FileUtils, LocalTime};
+use curvine_runtime::common::{FileUtils, LocalTime, TimeSpent};
 use curvine_runtime::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
-use curvine_runtime::sync::AtomicCounter;
+use curvine_runtime::sync::{AtomicBool, AtomicCounter};
 use log::{debug, info, warn};
 use std::sync::Mutex;
 
@@ -37,6 +39,8 @@ pub struct JournalWriter {
     sender: BlockingSender<JournalEntry>,
     metrics: &'static MasterMetrics,
     receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
+
+    snapshot_in_flight: AtomicBool,
 
     leader_create_snapshot: bool,
     snapshot_entries: u64,
@@ -66,6 +70,7 @@ impl JournalWriter {
             sender,
             metrics,
             receiver,
+            snapshot_in_flight: AtomicBool::new(false),
             leader_create_snapshot: conf.leader_creates_snapshot(),
             snapshot_entries: conf.snapshot_entries,
             snapshot_min_interval_ms: conf.snapshot_min_interval.as_millis(),
@@ -108,26 +113,33 @@ impl JournalWriter {
             return Ok(());
         }
 
-        self.entries_since_snapshot.set(0);
-        self.last_snapshot_ms.set(now);
+        self.emit_snapshot(fs_dir, "periodic", entries)?;
 
-        let dir = match fs_dir.store.create_checkpoint(now) {
-            Ok(d) => d,
-            Err(e) => {
-                // Restore the consumed entry count as well, so a failed
-                // snapshot retries without waiting for another full batch.
-                self.entries_since_snapshot.set(entries);
-                self.last_snapshot_ms.set(last);
-                return err_box!("leaderSnapshot: create_checkpoint failed: {}", e);
-            }
-        };
+        Ok(())
+    }
+
+    fn emit_snapshot(
+        &self,
+        fs_dir: &FsDir,
+        source: &str,
+        entries: u64,
+    ) -> FsResult<LeaderSnapshotInfo> {
+        let now = LocalTime::mills();
+        let checkpoint_id = self.next_checkpoint_id(fs_dir);
+        let spend = TimeSpent::new();
+
+        let dir = fs_dir.create_checkpoint(checkpoint_id).map_err(|e| {
+            FsError::common(format!(
+                "leaderSnapshot[{}]: create_checkpoint failed: {}",
+                source, e
+            ))
+        })?;
+
+        let cost_ms = spend.used_ms();
 
         info!(
-            "create leader snapshot, dir {}, entries {}, cost {} ms, inode_id {}",
-            dir,
-            entries,
-            LocalTime::mills() - now,
-            fs_dir.inode_id.current()
+            "create leader snapshot, source {}, dir {}, entries {}, cost {} ms",
+            source, dir, entries, cost_ms
         );
 
         let snapshot_entry = JournalEntry::Snapshot(SnapshotEntry {
@@ -138,18 +150,58 @@ impl JournalWriter {
         });
 
         if let Err(send_error) = self.send_inner(snapshot_entry) {
-            self.entries_since_snapshot.set(entries);
-            self.last_snapshot_ms.set(last);
             if let Err(cleanup_error) = FileUtils::delete_path(&dir, true) {
                 warn!(
                     "failed to remove checkpoint {} after snapshot entry send failure: {}",
                     dir, cleanup_error
                 );
             }
-
             return Err(send_error);
         }
-        Ok(())
+
+        self.entries_since_snapshot.set(0);
+        self.last_snapshot_ms.set(now);
+
+        Ok(LeaderSnapshotInfo { dir, cost_ms })
+    }
+
+    fn next_checkpoint_id(&self, fs_dir: &FsDir) -> u64 {
+        let mut id = LocalTime::mills();
+        while FileUtils::exists(fs_dir.get_checkpoint_path(id)) {
+            id += 1;
+        }
+        id
+    }
+
+    pub fn create_snapshot(&self, fs_dir: &FsDir, force: bool) -> FsResult<LeaderSnapshotInfo> {
+        if !self.enable {
+            return err_box!("leader snapshot requires journal.enable = true");
+        }
+
+        if !force && self.inside_snapshot_interval() {
+            return err_box!(
+                "the last leader snapshot was {} ms ago, snapshot_min_interval is {} ms; retry later or pass --force",
+                self.last_snapshot_age_ms(),
+                self.snapshot_min_interval_ms
+            );
+        }
+
+        if !self.snapshot_in_flight.compare_and_set(false, true) {
+            return err_box!("a leader snapshot is already in progress");
+        }
+
+        let info = self.emit_snapshot(fs_dir, "operator", self.entries_since_snapshot.get());
+        self.snapshot_in_flight.set(false);
+        info
+    }
+
+    fn inside_snapshot_interval(&self) -> bool {
+        let last = self.last_snapshot_ms.get();
+        last > 0 && self.last_snapshot_age_ms() < self.snapshot_min_interval_ms
+    }
+
+    fn last_snapshot_age_ms(&self) -> u64 {
+        LocalTime::mills().saturating_sub(self.last_snapshot_ms.get())
     }
 
     pub fn log_mkdir(&self, fs_dir: &FsDir, path: impl AsRef<str>, dir: &InodeDir) -> FsResult<()> {
@@ -684,6 +736,145 @@ mod tests {
         writer.maybe_emit_snapshot(&fs_dir)?;
         assert_eq!(checkpoint_dirs(&conf).len(), 2);
 
+        Ok(())
+    }
+
+    #[test]
+    fn create_snapshot_creates_checkpoint_and_enqueues_snapshot_entry() -> FsResult<()> {
+        let conf = test_conf("snapshot_operator_create");
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        let info = writer.create_snapshot(&fs_dir, false)?;
+
+        assert!(Path::new(&info.dir).exists(), "checkpoint should be kept");
+        let entry = writer
+            .receiver
+            .as_ref()
+            .expect("testing writer should retain its receiver")
+            .lock()
+            .expect("testing receiver lock should not be poisoned")
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot entry should be enqueued");
+
+        match entry {
+            JournalEntry::Snapshot(entry) => {
+                assert_eq!(entry.dir, info.dir);
+                assert_eq!(entry.node_id, conf.journal.node_id()?);
+            }
+            other => panic!("expected snapshot entry, got {:?}", other),
+        }
+
+        assert_eq!(writer.entries_since_snapshot.get(), 0);
+        assert!(writer.last_snapshot_ms.get() > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn create_snapshot_rejects_concurrent_requests() -> FsResult<()> {
+        let conf = test_conf("snapshot_operator_busy");
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        writer.snapshot_in_flight.set(true);
+
+        let err = writer
+            .create_snapshot(&fs_dir, false)
+            .expect_err("a concurrent snapshot must be rejected");
+        assert!(err.to_string().contains("already in progress"));
+        Ok(())
+    }
+
+    #[test]
+    fn create_snapshot_respects_the_min_interval_unless_forced() -> FsResult<()> {
+        let mut conf = test_conf("snapshot_operator_min_interval");
+        conf.journal.writer_channel_size = 8;
+        conf.journal.snapshot_min_interval = DurationUnit::new(10 * DurationUnit::MINUTE);
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        writer.create_snapshot(&fs_dir, false)?;
+
+        let err = writer
+            .create_snapshot(&fs_dir, false)
+            .expect_err("a second call inside the interval must be rejected");
+        assert!(
+            err.to_string().contains("snapshot_min_interval"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(checkpoint_dirs(&conf).len(), 1);
+
+        writer.create_snapshot(&fs_dir, true)?;
+        assert_eq!(checkpoint_dirs(&conf).len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn create_snapshot_never_reuses_a_checkpoint_id() -> FsResult<()> {
+        let mut conf = test_conf("snapshot_operator_unique_id");
+        conf.journal.writer_channel_size = 8;
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        let first = writer.create_snapshot(&fs_dir, true)?;
+        let second = writer.create_snapshot(&fs_dir, true)?;
+
+        assert_ne!(first.dir, second.dir);
+        assert!(
+            Path::new(&first.dir).exists(),
+            "a second snapshot must not delete the registered checkpoint"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn create_snapshot_requires_journal() -> FsResult<()> {
+        let mut conf = test_conf("snapshot_operator_no_journal");
+        conf.journal.enable = false;
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        let err = writer
+            .create_snapshot(&fs_dir, false)
+            .expect_err("journal disabled must reject operator snapshots");
+        assert!(err.to_string().contains("journal.enable"));
+        Ok(())
+    }
+
+    #[test]
+    fn next_checkpoint_id_steps_over_existing_directories() -> FsResult<()> {
+        let conf = test_conf("snapshot_operator_existing_id");
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        let first = writer.next_checkpoint_id(&fs_dir);
+        fs::create_dir_all(fs_dir.get_checkpoint_path(first))?;
+
+        let second = writer.next_checkpoint_id(&fs_dir);
+
+        assert!(second > first, "an existing checkpoint id must be skipped");
+        assert!(
+            !Path::new(&fs_dir.get_checkpoint_path(second)).exists(),
+            "the picked id must be free on disk"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn create_snapshot_keeps_the_throttle_clock_in_real_time() -> FsResult<()> {
+        let conf = test_conf("snapshot_operator_throttle_clock");
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        let before = LocalTime::mills();
+        writer.create_snapshot(&fs_dir, false)?;
+
+        assert!(writer.last_snapshot_ms.get() >= before);
+        assert!(
+            writer.last_snapshot_ms.get() <= LocalTime::mills(),
+            "a snapshot must never push the throttle clock into the future"
+        );
         Ok(())
     }
 }

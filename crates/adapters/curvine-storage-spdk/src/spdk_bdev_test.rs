@@ -193,7 +193,8 @@ fn spdk_full_lifecycle() {
     // Phase 7c: qpair pool - release frees when pool is full
     {
         let env = get_spdk_env();
-        let bdev = env.bdevs().first().expect("no bdevs");
+        let bdevs = env.bdevs();
+        let bdev = bdevs.first().expect("no bdevs");
         let ctrlr = bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr;
 
         let p = QpairPool {
@@ -237,7 +238,8 @@ fn spdk_full_lifecycle() {
     // Phase 7d: acquire rolls back active count on contention
     {
         let env = get_spdk_env();
-        let bdev = env.bdevs().first().expect("no bdevs");
+        let bdevs = env.bdevs();
+        let bdev = bdevs.first().expect("no bdevs");
         let ctrlr = bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr;
 
         let p = Arc::new(QpairPool {

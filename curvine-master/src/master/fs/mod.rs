@@ -22,7 +22,7 @@ mod fs_dir_watchdog;
 pub use self::fs_dir_watchdog::FsDirWatchdog;
 
 mod trash_purger;
-pub use self::trash_purger::{PendingTrashPurger, PurgeOutcome, TrashPurger};
+pub use self::trash_purger::{PendingTrashPurger, PurgeOutcome, PurgeStop, TrashPurger};
 
 mod trash_expunger;
 pub use self::trash_expunger::{TrashExpungeResult, TrashExpunger};
@@ -37,7 +37,9 @@ mod full_block_report;
 
 mod master_filesystem;
 pub(crate) use self::master_filesystem::BlockInodeState;
-pub use self::master_filesystem::{BlockReportResult, DeleteMode, MasterFilesystem};
+pub use self::master_filesystem::{
+    BlockReportResult, CompleteFileOptions, DeleteMode, MasterFilesystem,
+};
 
 mod delete_result;
 pub use self::delete_result::DeleteResult;

@@ -14,7 +14,7 @@
 
 use crate::state::{StorageType, TtlAction};
 use curvine_common_macros::ClientCliArgs;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_net::net::InetAddr;
 use curvine_rpc::client::ClientConf as RpcConf;
 use curvine_runtime::common::{ByteUnit, DurationUnit, Utils};
@@ -84,6 +84,11 @@ pub struct ClientConf {
 
     #[client_cli]
     pub short_circuit: bool,
+
+    // Ask the master to allocate the first block in CreateFile/OpenFile, so a
+    // small file needs one RPC fewer. Masters without support ignore it.
+    #[client_cli]
+    pub alloc_first_block_on_create: bool,
 
     #[serde(skip)]
     pub storage_type: StorageType,
@@ -204,8 +209,31 @@ pub struct ClientConf {
     #[client_cli]
     pub clean_task_interval_ms: u64,
 
+    // Client session lease heartbeat interval, in milliseconds.
+    //
+    // Every client sends a `ClientHeartbeat` on this cadence so the master can
+    // tell a live client from a crashed one and reclaim what it owns (file locks,
+    // writer markers). Keep `master.client_session_timeout` at about 5x this
+    // value; the master enforces its own window and warns on a mismatch.
+    //
+    // 0 disables the heartbeat: this client then keeps the legacy
+    // `lock_expire_time` behaviour for its locks and nothing it owns is reclaimed
+    // when it crashes.
+    #[serde(alias = "heartbeat_interval")]
+    #[client_cli]
+    pub heartbeat_interval_ms: u64,
+
     #[client_cli]
     pub close_timeout_secs: u64,
+
+    // Maximum time to wait for one request/response handshake with the write
+    // buffer background task (data enqueue, flush, complete, cancel, seek,
+    // resize), in milliseconds. Bounds how long a writer (and e.g. the Java
+    // SDK closeWriter) can block when the background task stops responding.
+    // Keep it above the slowest expected single data write.
+    #[serde(alias = "write_buffer_timeout")]
+    #[client_cli]
+    pub write_buffer_timeout_ms: u64,
 
     #[client_cli(skip)]
     pub metadata_operation_buckets: Vec<f64>,
@@ -289,7 +317,19 @@ impl ClientConf {
 
     pub const DEFAULT_CLEAN_TASK_INTERVAL_MS: u64 = 60 * 1000;
 
+    /// Default client session heartbeat cadence: `master.client_session_timeout`
+    /// defaults to 60s, i.e. 5 missed heartbeats before a session expires.
+    pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 12 * 1000;
+
+    /// Lowest accepted heartbeat cadence; 0 means "disabled" rather than "as fast
+    /// as possible".
+    pub const MIN_HEARTBEAT_INTERVAL_MS: u64 = 100;
+
     pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
+
+    // Extra margin added on top of the budgets one handshake can legitimately
+    // wait on (see DEFAULT_WRITE_BUFFER_TIMEOUT_MARGIN_MS).
+    pub const DEFAULT_WRITE_BUFFER_TIMEOUT_MARGIN_MS: u64 = 60 * 1000;
 
     pub const DEFAULT_READ_PARALLEL: i64 = 1;
 
@@ -336,6 +376,22 @@ impl ClientConf {
         self.seek_absorb_window =
             ByteUnit::from_str(&self.seek_absorb_window_str)?.as_byte() as i64;
 
+        // 0 means "unset" (e.g. the SDK FilesystemConf omits it): derive the
+        // default from the budgets one handshake legitimately waits on. One
+        // master RPC is a leader attempt bounded by rpc_timeout_ms followed
+        // by polling bounded by rpc_retry_max_duration_ms (~240s during a
+        // master failover), and a Complete also drains up to write_chunk_num
+        // queued chunks each bounded by data_timeout_ms. The deadline must
+        // exceed those budgets, otherwise slow-but-healthy closes get
+        // reported as failed (see #1908 review). A fixed margin covers the
+        // queue drain; strictly larger total budgets keep the derivation
+        // sound.
+        if self.write_buffer_timeout_ms == 0 {
+            self.write_buffer_timeout_ms = self.rpc_timeout_ms
+                + self.rpc_retry_max_duration_ms
+                + Self::DEFAULT_WRITE_BUFFER_TIMEOUT_MARGIN_MS;
+        }
+
         self.small_file_size = ByteUnit::from_str(&self.small_file_size_str)?.as_byte() as i64;
 
         self.ttl_ms = DurationUnit::from_str(&self.ttl_ms_str)?.as_millis() as i64;
@@ -344,6 +400,18 @@ impl ClientConf {
 
         // Process smart prefetch configuration
         self.large_file_size = ByteUnit::from_str(&self.large_file_size_str)?.as_byte() as i64;
+
+        // Keep 0 as the explicit "disabled" value instead of clamping it, but
+        // refuse a cadence that can only hammer the master.
+        if self.heartbeat_interval_ms > 0
+            && self.heartbeat_interval_ms < Self::MIN_HEARTBEAT_INTERVAL_MS
+        {
+            return err_box!(
+                "client.heartbeat_interval_ms must be 0 (disabled) or at least {}, got {}",
+                Self::MIN_HEARTBEAT_INTERVAL_MS,
+                self.heartbeat_interval_ms
+            );
+        }
 
         Ok(())
     }
@@ -405,6 +473,7 @@ impl Default for ClientConf {
             max_cache_block_handles: 10,
 
             short_circuit: true,
+            alloc_first_block_on_create: true,
 
             storage_type: StorageType::Disk,
             storage_type_str: "disk".to_string(),
@@ -423,7 +492,7 @@ impl Default for ClientConf {
 
             rpc_retry_max_duration_ms: 120 * 1000,
             rpc_retry_min_sleep_ms: 100,
-            rpc_retry_max_sleep_ms: 10 * 1000,
+            rpc_retry_max_sleep_ms: 3 * 1000,
 
             rpc_close_idle: true,
             conn_timeout_ms: 30 * 1000,
@@ -453,7 +522,13 @@ impl Default for ClientConf {
 
             clean_task_interval_ms: Self::DEFAULT_CLEAN_TASK_INTERVAL_MS,
 
+            heartbeat_interval_ms: Self::DEFAULT_HEARTBEAT_INTERVAL_MS,
+
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
+
+            // Placeholder; init() derives the real default from the RPC
+            // budgets when this stays 0 (unset).
+            write_buffer_timeout_ms: 0,
 
             metadata_operation_buckets: vec![
                 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
@@ -492,6 +567,41 @@ impl Default for ClientConf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_interval_defaults_to_five_missed_beats_per_minute() {
+        let conf = ClientConf::default();
+        assert_eq!(conf.heartbeat_interval_ms, 12_000);
+        // Five heartbeats must fit in the default master window (60s), otherwise
+        // every default client would flap between alive and expired.
+        assert_eq!(conf.heartbeat_interval_ms * 5, 60_000);
+    }
+
+    #[test]
+    fn heartbeat_interval_zero_disables_the_lease() {
+        let conf = ClientConf {
+            heartbeat_interval_ms: 0,
+            ..Default::default()
+        };
+        conf.clone().init().unwrap();
+        assert_eq!(
+            conf.heartbeat_interval_ms, 0,
+            "0 must stay 0 (disabled), never be clamped into a live heartbeat"
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_rejects_a_hot_loop() {
+        let mut conf = ClientConf {
+            heartbeat_interval_ms: 1,
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("a sub-100ms cadence can only hammer the master");
+        assert!(error.to_string().contains("heartbeat_interval_ms"));
+    }
 
     #[test]
     fn test_seek_absorb_window_default_off() {

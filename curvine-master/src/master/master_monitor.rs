@@ -15,6 +15,8 @@
 use curvine_raft::raft::RoleState;
 use curvine_runtime::sync::StateCtl;
 use num_enum::{FromPrimitive, IntoPrimitive};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 // master state controller
 #[repr(i8)]
@@ -37,14 +39,36 @@ pub enum MasterState {
 pub struct MasterMonitor {
     pub(crate) journal_ctl: StateCtl,
     pub fs_ctl: StateCtl,
+    /// Raft term of the last persisted hard state, published by the journal
+    /// loader. Client-session lease
+    /// epochs are keyed on it: a promotion always carries a higher term than the
+    /// previous leadership, while a standby can still observe it (#1883 review).
+    term: Arc<AtomicU64>,
 }
 
 impl MasterMonitor {
     pub fn new(journal_ctl: StateCtl, fs_ctl: StateCtl) -> Self {
+        Self::with_term(journal_ctl, fs_ctl, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Build a monitor that shares its term handle with the journal loader.
+    pub fn with_term(journal_ctl: StateCtl, fs_ctl: StateCtl, term: Arc<AtomicU64>) -> Self {
         Self {
             journal_ctl,
             fs_ctl,
+            term,
         }
+    }
+
+    /// Raft term of the last persisted hard state; 0 before the first one.
+    pub fn term(&self) -> u64 {
+        self.term.load(Ordering::Acquire)
+    }
+
+    /// Test-only term bump, mirroring [`MasterMonitor::set_role_for_test`].
+    #[doc(hidden)]
+    pub fn set_term_for_test(&self, term: u64) {
+        self.term.store(term, Ordering::Release);
     }
 
     // Determine whether the current node is an active node.

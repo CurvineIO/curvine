@@ -71,6 +71,10 @@ pub enum Commands {
     #[command(name = "node")]
     Node(NodeCommand),
 
+    /// Master metadata snapshot command
+    #[command(name = "snapshot")]
+    Snapshot(SnapshotCommand),
+
     /// show cli version
     #[command(name = "version")]
     Version,

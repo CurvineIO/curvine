@@ -31,6 +31,18 @@ pub const TRASH_PENDING_ROOT: &str = "/.Trash/.pending";
 
 const TRASH_PENDING_PREFIX: &str = ".Trash/.pending/";
 
+// Staging directory for large synchronous permanent deletes (#1864). The delete
+// renames the subtree here and then purges it in bounded batches before it
+// answers, so the namespace lock is never held for the whole subtree. It is kept
+// apart from `.pending` so an `EmptyTrash` drain never waits on, or races with,
+// a delete the caller is still waiting for. Like `.pending` its names carry no
+// trash xattrs, so listing, restore and the retention sweep ignore it.
+pub const TRASH_PURGING_NAME: &str = ".purging";
+
+pub const TRASH_PURGING_ROOT: &str = "/.Trash/.purging";
+
+const TRASH_PURGING_PREFIX: &str = ".Trash/.purging/";
+
 // Internal xattr keys. The NUL prefix keeps them out of client-visible
 // xattr listings, matching the convention used for \0curvine.ctime.
 pub const TRASH_XATTR_ORIGIN: &str = "\0curvine.trash.origin";
@@ -79,6 +91,32 @@ pub fn is_pending_entry_path(path: &str) -> bool {
 
 pub fn pending_entry_path(entry_name: &str) -> String {
     format!("{}{}{}", TRASH_PENDING_ROOT, PATH_SEPARATOR, entry_name)
+}
+
+// True for the purging staging root itself and every path below it.
+pub fn is_purging_path(path: &str) -> bool {
+    match path.strip_prefix(TRASH_PURGING_ROOT) {
+        Some(rest) => rest.is_empty() || rest.starts_with(PATH_SEPARATOR),
+        None => false,
+    }
+}
+
+// Purging entries are always direct children of the purging root.
+pub fn is_purging_entry_path(path: &str) -> bool {
+    let path = path.trim_start_matches(PATH_SEPARATOR);
+    match path.strip_prefix(TRASH_PURGING_PREFIX) {
+        Some(name) => !name.is_empty() && !name.contains(PATH_SEPARATOR),
+        None => false,
+    }
+}
+
+pub fn purging_entry_path(entry_name: &str) -> String {
+    format!("{}{}{}", TRASH_PURGING_ROOT, PATH_SEPARATOR, entry_name)
+}
+
+// Internal staging areas that clients must never see or modify.
+pub fn is_staging_path(path: &str) -> bool {
+    is_pending_path(path) || is_purging_path(path)
 }
 
 // Trash entries are always direct children of the trash root.
@@ -171,6 +209,28 @@ mod tests {
         assert!(!is_trash_entry_path("/.Trash/a/b"));
         assert!(!is_trash_entry_path("/plain.log"));
         assert!(!is_trash_entry_path("/a/.Trash/entry"));
+    }
+
+    #[test]
+    fn identifies_purging_paths() {
+        assert!(is_purging_path("/.Trash/.purging"));
+        assert!(is_purging_path("/.Trash/.purging/1700000000000-42/a"));
+        assert!(!is_purging_path("/.Trash/.purgingx"));
+        assert!(!is_purging_path("/.Trash/.pending/1700000000000-42"));
+
+        assert!(is_purging_entry_path("/.Trash/.purging/1700000000000-42"));
+        assert!(!is_purging_entry_path("/.Trash/.purging"));
+        assert!(!is_purging_entry_path("/.Trash/.purging/a/b"));
+        assert_eq!(
+            purging_entry_path("1700000000000-42"),
+            "/.Trash/.purging/1700000000000-42"
+        );
+        // Staging names never parse as listable trash entries.
+        assert_eq!(parse_entry_delete_ms(TRASH_PURGING_NAME), None);
+
+        assert!(is_staging_path("/.Trash/.pending/x"));
+        assert!(is_staging_path("/.Trash/.purging/x"));
+        assert!(!is_staging_path("/.Trash/1700000000000-42"));
     }
 
     #[test]

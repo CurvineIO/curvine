@@ -19,7 +19,7 @@ pub use self::bdev_layout::BdevLayout;
 pub(crate) use self::file_layout::FileFinalizePlan;
 pub use self::file_layout::FileLayout;
 
-use crate::BlockMeta;
+use crate::{BlockMeta, ChecksumVerify};
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::IOResult;
@@ -48,11 +48,14 @@ pub trait BlockLayout {
         block: &ExtendedBlock,
     ) -> CommonResult<BlockMeta>;
 
+    /// Finalize in one step under the dataset lock. `checksum` asks layouts
+    /// that support checksum sidecars to write one; others ignore it.
     fn finalize(
         &self,
         dir: &VfsDir,
         meta: &BlockMeta,
         committed_len: i64,
+        checksum: bool,
     ) -> CommonResult<BlockMeta>;
 
     fn scan(&self, dir: &VfsDir) -> CommonResult<Vec<BlockMeta>>;
@@ -65,12 +68,15 @@ pub trait BlockLayout {
 
     fn open_writer(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext>;
 
+    /// `verify` asks layouts with checksum sidecars to verify reads; others
+    /// ignore it.
     fn open_reader(
         &self,
         dir: &VfsDir,
         meta: &BlockMeta,
         off: i64,
         logical_len: i64,
+        verify: ChecksumVerify,
     ) -> IOResult<BlockReadContext>;
 
     /// Local path a co-located client can open directly, `Ok(None)` if the
@@ -149,10 +155,11 @@ impl BlockLayout for BlockLayoutKind {
         dir: &VfsDir,
         meta: &BlockMeta,
         committed_len: i64,
+        checksum: bool,
     ) -> CommonResult<BlockMeta> {
         match self {
-            Self::File(layout) => layout.finalize(dir, meta, committed_len),
-            Self::Bdev(layout) => layout.finalize(dir, meta, committed_len),
+            Self::File(layout) => layout.finalize(dir, meta, committed_len, checksum),
+            Self::Bdev(layout) => layout.finalize(dir, meta, committed_len, checksum),
         }
     }
 
@@ -190,10 +197,11 @@ impl BlockLayout for BlockLayoutKind {
         meta: &BlockMeta,
         off: i64,
         logical_len: i64,
+        verify: ChecksumVerify,
     ) -> IOResult<BlockReadContext> {
         match self {
-            Self::File(layout) => layout.open_reader(dir, meta, off, logical_len),
-            Self::Bdev(layout) => layout.open_reader(dir, meta, off, logical_len),
+            Self::File(layout) => layout.open_reader(dir, meta, off, logical_len, verify),
+            Self::Bdev(layout) => layout.open_reader(dir, meta, off, logical_len, verify),
         }
     }
 

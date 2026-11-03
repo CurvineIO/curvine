@@ -13,18 +13,38 @@
 // limitations under the License.
 
 use super::*;
-use crate::raft::storage::{HashAppStorage, MemLogStorage, RocksLogStorage};
+use crate::raft::storage::{ApplyMsg, HashAppStorage, MemLogStorage, RocksLogStorage};
 use curvine_config::RaftPeer;
 use curvine_net::net::NetUtils;
-use raft::eraftpb::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2, HardState};
-use raft::Storage;
+use curvine_runtime::sync::StateCtl;
+use raft::eraftpb::{
+    ConfChangeSingle, ConfChangeTransition, ConfChangeV2, HardState, Message, Snapshot,
+};
+use raft::{StateRole, Storage};
 use std::time::Instant;
 
 fn test_node(rt: Arc<Runtime>, id: u64) -> RaftNode<MemLogStorage, HashAppStorage<String, String>> {
+    test_node_with_voters(rt, id, vec![1, 2, 3])
+}
+
+fn test_node_with_voters(
+    rt: Arc<Runtime>,
+    id: u64,
+    peer_ids: Vec<u64>,
+) -> RaftNode<MemLogStorage, HashAppStorage<String, String>> {
+    test_node_with_app(rt, id, peer_ids, HashAppStorage::new(), RoleMonitor::new())
+}
+
+fn test_node_with_app<B: AppStorage>(
+    rt: Arc<Runtime>,
+    id: u64,
+    mut peer_ids: Vec<u64>,
+    app_store: B,
+    role_monitor: RoleMonitor,
+) -> RaftNode<MemLogStorage, B> {
     let mut conf = JournalConf::with_test();
     conf.rpc_retry_max_duration_ms = 0;
     conf.conn_retry_max_duration_ms = 0;
-    let mut peer_ids = vec![1, 2, 3];
     if !peer_ids.contains(&id) {
         peer_ids.push(id);
     }
@@ -55,7 +75,7 @@ fn test_node(rt: Arc<Runtime>, id: u64) -> RaftNode<MemLogStorage, HashAppStorag
         rt.clone(),
         node_id,
         log_store,
-        HashAppStorage::new(),
+        app_store,
         client.clone(),
         &conf,
     );
@@ -84,7 +104,7 @@ fn test_node(rt: Arc<Runtime>, id: u64) -> RaftNode<MemLogStorage, HashAppStorag
         receiver,
         sender,
         group,
-        role_monitor: RoleMonitor::new(),
+        role_monitor,
         tick_interval: Duration::from_millis(conf.raft_tick_interval_ms),
         max_batch_size: conf.raft_batch_size.max(1),
         snapshot_interval_ms: 0,
@@ -92,6 +112,57 @@ fn test_node(rt: Arc<Runtime>, id: u64) -> RaftNode<MemLogStorage, HashAppStorag
         snapshot_entries: conf.snapshot_entries,
         last_snapshot_ms: 0,
         last_snapshot_op_id: 0,
+    }
+}
+
+#[derive(Clone)]
+struct RoleRecordingAppStorage {
+    inner: HashAppStorage<String, String>,
+    ctl: StateCtl,
+    replayed_as_leader: Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+impl RoleRecordingAppStorage {
+    fn new(inner: HashAppStorage<String, String>, ctl: StateCtl) -> Self {
+        Self {
+            inner,
+            ctl,
+            replayed_as_leader: Arc::new(std::sync::Mutex::new(vec![])),
+        }
+    }
+
+    fn replayed_as_leader(&self) -> Vec<bool> {
+        self.replayed_as_leader.lock().unwrap().clone()
+    }
+}
+
+impl AppStorage for RoleRecordingAppStorage {
+    async fn apply(&self, wait: bool, msg: ApplyMsg) -> RaftResult<()> {
+        if matches!(msg, ApplyMsg::Scan(_)) {
+            let leader = self.ctl.state::<RoleState>() == RoleState::Leader;
+            self.replayed_as_leader.lock().unwrap().push(leader);
+        }
+        self.inner.apply(wait, msg).await
+    }
+
+    fn get_fsm_state(&self) -> FsmState {
+        self.inner.get_fsm_state()
+    }
+
+    async fn role_change(&self, role: StateRole) -> RaftResult<()> {
+        self.inner.role_change(role).await
+    }
+
+    async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
+        self.inner.create_snapshot().await
+    }
+
+    async fn apply_snapshot(&self, snapshot: SnapshotData) -> RaftResult<()> {
+        self.inner.apply_snapshot(snapshot).await
+    }
+
+    fn snapshot_dir(&self, snapshot_id: u64) -> RaftResult<String> {
+        self.inner.snapshot_dir(snapshot_id)
     }
 }
 
@@ -103,6 +174,25 @@ fn test_rocks_node(
     JournalConf,
 ) {
     let mut conf = JournalConf::with_test();
+    let node = test_rocks_node_with_conf(rt, id, &mut conf);
+    (node, conf)
+}
+
+fn test_rocks_node_with_conf(
+    rt: Arc<Runtime>,
+    id: u64,
+    conf: &mut JournalConf,
+) -> RaftNode<RocksLogStorage, HashAppStorage<String, String>> {
+    test_rocks_node_with_app(rt, id, conf, HashAppStorage::new(), RoleMonitor::new())
+}
+
+fn test_rocks_node_with_app<B: AppStorage>(
+    rt: Arc<Runtime>,
+    id: u64,
+    conf: &mut JournalConf,
+    app_store: B,
+    role_monitor: RoleMonitor,
+) -> RaftNode<RocksLogStorage, B> {
     conf.rpc_retry_max_duration_ms = 0;
     conf.conn_retry_max_duration_ms = 0;
     let root = std::env::temp_dir().join(format!(
@@ -131,11 +221,11 @@ fn test_rocks_node(
             RaftPeer::new(peer_id, &conf.hostname, port)
         })
         .collect();
-    let group = RaftGroup::from_conf(&conf);
+    let group = RaftGroup::from_conf(conf);
     let node_id = group.get_node_id(&conf.local_addr()).unwrap();
     assert_eq!(node_id, id);
     let client = RaftClient::new(rt.clone(), &group, conf.new_client_conf());
-    let log_store = RocksLogStorage::from_conf(&conf, true);
+    let log_store = RocksLogStorage::from_conf(conf, true);
     log_store
         .set_conf_state(&raft::eraftpb::ConfState {
             voters: group.voters(),
@@ -146,9 +236,9 @@ fn test_rocks_node(
         rt.clone(),
         node_id,
         log_store,
-        HashAppStorage::new(),
+        app_store,
         client.clone(),
-        &conf,
+        conf,
     );
     let raw = RawNode::new(
         &conf.new_raft_conf(node_id, 0),
@@ -159,7 +249,7 @@ fn test_rocks_node(
     let (sender, receiver) = mpsc::channel(conf.message_size);
     let (session_sender, session_receiver) = mpsc::unbounded_channel();
 
-    let node = RaftNode {
+    RaftNode {
         rt,
         raw,
         client,
@@ -168,14 +258,14 @@ fn test_rocks_node(
         heartbeat_sequence: 0,
         session_sender,
         session_receiver,
-        recovery: Recovery::load(&conf, node_id).unwrap(),
+        recovery: Recovery::load(conf, node_id).unwrap(),
         pending_ready: None,
         snapshot_done: None,
         storage,
         receiver,
         sender,
         group,
-        role_monitor: RoleMonitor::new(),
+        role_monitor,
         tick_interval: Duration::from_millis(conf.raft_tick_interval_ms),
         max_batch_size: conf.raft_batch_size.max(1),
         snapshot_interval_ms: 0,
@@ -183,11 +273,10 @@ fn test_rocks_node(
         snapshot_entries: conf.snapshot_entries,
         last_snapshot_ms: 0,
         last_snapshot_op_id: 0,
-    };
-    (node, conf)
+    }
 }
 
-fn become_leader_and_fence(node: &mut RaftNode<MemLogStorage, HashAppStorage<String, String>>) {
+fn become_leader_and_fence<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>) {
     node.raw.raft.become_candidate();
     node.raw.raft.become_leader();
     let term = node.raw.raft.term;
@@ -206,6 +295,30 @@ fn become_leader_and_fence(node: &mut RaftNode<MemLogStorage, HashAppStorage<Str
         },
     );
     assert_eq!(node.peer_sessions.get(3), Some(301));
+}
+
+/// Freeze the app store at `index` so the compaction ceiling derived from the
+/// fsm state is predictable.
+fn freeze_applied_index<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>, index: u64) {
+    let applied = AppliedIndex {
+        term: 1,
+        index,
+        op_id: 0,
+        rpc_id: 0,
+    };
+    node.rt
+        .block_on(node.storage.app_store.apply_snapshot(SnapshotData {
+            snapshot_id: index,
+            node_id: 1,
+            create_time: LocalTime::mills(),
+            bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
+            files_data: None,
+            fsm_state: FsmState {
+                applied: applied.clone(),
+                ufs_applied: applied,
+            },
+        }))
+        .unwrap();
 }
 
 fn remove_entry(id: u64) -> Entry {
@@ -251,7 +364,7 @@ fn rejected_remove_node_keeps_the_existing_session_fence() {
     assert!(node.raw.raft.prs().get(3).is_some());
 }
 
-fn hold_current_ready(node: &mut RaftNode<MemLogStorage, HashAppStorage<String, String>>) {
+fn hold_current_ready<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>) {
     if !node.raw.has_ready() {
         node.raw.raft.become_candidate();
     }
@@ -260,6 +373,7 @@ fn hold_current_ready(node: &mut RaftNode<MemLogStorage, HashAppStorage<String, 
     node.pending_ready = Some(PendingReady {
         ready,
         soft_state: None,
+        demoted: false,
     });
 }
 
@@ -309,11 +423,27 @@ fn pending_ready_keeps_ping_available_and_rejects_raft_mutation() {
 fn snapshot_completion_advances_the_held_ready_exactly_once() {
     let rt = JournalConf::with_test().create_runtime();
     let mut node = test_node(rt.clone(), 1);
+    seed_applied_state(&node, 100);
     hold_current_ready(&mut node);
+    node.last_snapshot_op_id = 0;
+    node.last_snapshot_ms = 0;
+    // Isolate the re-anchor: the create-snapshot branch must not fire, so only
+    // `anchor_snapshot_markers()` can move the counters.
+    node.snapshot_interval_ms = u64::MAX;
+    node.snapshot_entries = u64::MAX;
     let mut promise = HashMap::new();
 
     rt.block_on(node.complete_pending_snapshot(Ok(()), &mut promise))
         .unwrap();
+    assert!(
+        node.storage.can_generate_snapshot(),
+        "completing a snapshot must not schedule a create job"
+    );
+    assert_eq!(
+        node.last_snapshot_op_id, 100,
+        "completing a snapshot must re-anchor the entry counter at the applied state"
+    );
+    assert!(node.last_snapshot_ms > 0);
     assert!(node.pending_ready.is_none());
     let error = rt
         .block_on(node.complete_pending_snapshot(Ok(()), &mut promise))
@@ -348,6 +478,441 @@ fn wait_for_snapshot_job(node: &RaftNode<MemLogStorage, HashAppStorage<String, S
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn wait_for_first_index<A: LogStorage, B: AppStorage>(node: &RaftNode<A, B>, expected: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let first_index = node.storage.log_store.first_index().unwrap();
+        if first_index == expected {
+            return first_index;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the journal first index settled at {} instead of {}",
+            first_index,
+            expected
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn reported_snapshot(node_id: u64, index: u64) -> SnapshotData {
+    let applied = AppliedIndex {
+        term: 1,
+        index,
+        op_id: index,
+        rpc_id: 0,
+    };
+    SnapshotData {
+        snapshot_id: 1,
+        node_id,
+        create_time: LocalTime::mills(),
+        bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
+        files_data: None,
+        fsm_state: FsmState {
+            applied: applied.clone(),
+            ufs_applied: applied,
+        },
+    }
+}
+
+fn applied_state(node_id: u64, op_id: u64) -> SnapshotData {
+    SnapshotData {
+        snapshot_id: 1,
+        node_id,
+        create_time: LocalTime::mills(),
+        bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
+        files_data: None,
+        fsm_state: FsmState {
+            applied: AppliedIndex {
+                term: 1,
+                index: 1,
+                op_id,
+                rpc_id: 0,
+            },
+            ..Default::default()
+        },
+    }
+}
+
+fn seed_applied_state<A: LogStorage, B: AppStorage>(node: &RaftNode<A, B>, op_id: u64) {
+    node.rt
+        .block_on(
+            node.storage
+                .app_store
+                .apply_snapshot(applied_state(node.id(), op_id)),
+        )
+        .unwrap();
+}
+
+#[test]
+fn restarted_node_does_not_create_a_snapshot_from_restored_state() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone(), 1);
+
+    // A restarted or newly joined node restores op_id 100 from its snapshot or
+    // from journal replay, but this process has never created a snapshot.
+    seed_applied_state(&node, 100);
+    node.storage
+        .append(&[Entry {
+            index: 1,
+            term: 1,
+            ..Default::default()
+        }])
+        .unwrap();
+    node.storage
+        .set_hard_state(&HardState {
+            term: 1,
+            commit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+    node.snapshot_interval_ms = 6 * 60 * 60 * 1000;
+    node.snapshot_min_interval_ms = 0;
+    node.snapshot_entries = 10;
+    node.anchor_snapshot_markers();
+    let anchored_ms = node.last_snapshot_ms;
+
+    // Counting from op_id 0 would make the restored state look like a full
+    // batch of unsnapshotted entries and create a snapshot on every start.
+    node.apply_create_snapshot().unwrap();
+    assert_eq!(node.last_snapshot_op_id, 100);
+    assert_eq!(node.last_snapshot_ms, anchored_ms);
+    assert!(
+        node.storage.can_generate_snapshot(),
+        "startup must not schedule a snapshot job"
+    );
+
+    // Entries applied after the anchor still trigger a snapshot.
+    seed_applied_state(&node, 120);
+    node.apply_create_snapshot().unwrap();
+    assert_eq!(node.last_snapshot_op_id, 120);
+    wait_for_snapshot_job(&node);
+}
+
+#[test]
+fn zero_snapshot_entries_disables_follower_snapshots() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone(), 1);
+
+    seed_applied_state(&node, 100);
+    node.storage
+        .append(&[Entry {
+            index: 1,
+            term: 1,
+            ..Default::default()
+        }])
+        .unwrap();
+    node.storage
+        .set_hard_state(&HardState {
+            term: 1,
+            commit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+    node.snapshot_interval_ms = 0;
+    node.snapshot_min_interval_ms = 0;
+    node.snapshot_entries = 0;
+    node.anchor_snapshot_markers();
+    let anchored_op_id = node.last_snapshot_op_id;
+
+    seed_applied_state(&node, 200);
+    node.apply_create_snapshot().unwrap();
+
+    assert_eq!(
+        node.last_snapshot_op_id, anchored_op_id,
+        "snapshot_entries = 0 must not create a snapshot for every entry"
+    );
+    assert!(
+        node.storage.can_generate_snapshot(),
+        "no snapshot job may be scheduled when snapshot creation is disabled"
+    );
+}
+
+// Drive the real startup path: the counter must come from the restored state
+// through `new_candidate`, not from test scaffolding.
+#[test]
+fn a_restarting_candidate_anchors_the_snapshot_marker_at_the_restored_state() {
+    let mut conf = JournalConf::with_test();
+    conf.rpc_retry_max_duration_ms = 0;
+    conf.conn_retry_max_duration_ms = 0;
+    conf.journal_dir = std::env::temp_dir()
+        .join(format!("curvine-raft-anchor-{}", Utils::rand_id()))
+        .to_str()
+        .unwrap()
+        .to_string();
+    conf.journal_addrs = vec![1, 2, 3]
+        .into_iter()
+        .map(|peer_id| {
+            let port = if peer_id == 1 {
+                conf.rpc_port
+            } else {
+                NetUtils::get_available_port()
+            };
+            RaftPeer::new(peer_id, &conf.hostname, port)
+        })
+        .collect();
+    let group = RaftGroup::from_conf(&conf);
+    let node_id = group.get_node_id(&conf.local_addr()).unwrap();
+    assert_eq!(node_id, 1);
+    let journal_dir = conf.journal_dir.clone();
+
+    // A restarted node restores op_id 100 from its journal before it applies
+    // anything new, and no raft snapshot exists yet.
+    let log_store = RocksLogStorage::from_conf(&conf, true);
+    log_store
+        .set_conf_state(&raft::eraftpb::ConfState {
+            voters: group.voters(),
+            ..Default::default()
+        })
+        .unwrap();
+    log_store
+        .append(&[Entry {
+            index: 1,
+            term: 1,
+            ..Default::default()
+        }])
+        .unwrap();
+    log_store
+        .set_hard_state(&HardState {
+            term: 1,
+            commit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let app_store: HashAppStorage<String, String> = HashAppStorage::new();
+    let rt = Arc::new(Runtime::new("test-snapshot-anchor", 2, 2));
+    rt.block_on(app_store.apply_snapshot(applied_state(node_id, 100)))
+        .unwrap();
+
+    let (sender, receiver) = mpsc::channel(conf.message_size);
+    let mut node = rt
+        .block_on(RaftNode::new_candidate(
+            rt.clone(),
+            &conf,
+            log_store,
+            app_store,
+            RoleMonitor::new(),
+            receiver,
+            sender,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        ))
+        .unwrap();
+
+    assert_eq!(node.storage.get_fsm_state().op_id(), 100);
+    assert_eq!(
+        node.last_snapshot_op_id, 100,
+        "the constructor must count the restored entries as already snapshotted"
+    );
+
+    // The restored state is the anchor, not a batch of unsnapshotted entries.
+    // `finish_ready` calls this for a Ready without a role change, so it covers
+    // the first Ready after startup.
+    node.snapshot_interval_ms = 0;
+    node.snapshot_min_interval_ms = 0;
+    node.snapshot_entries = 10;
+    let anchored_ms = node.last_snapshot_ms;
+    node.apply_create_snapshot().unwrap();
+    assert_eq!(node.last_snapshot_op_id, 100);
+    assert_eq!(node.last_snapshot_ms, anchored_ms);
+    assert!(
+        node.storage.can_generate_snapshot(),
+        "startup must not schedule a snapshot job"
+    );
+
+    drop(node);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+// Stepping down reinstalls the local snapshot; the counters must move with it
+// instead of counting the reinstalled state as new work.
+#[test]
+fn leader_step_down_reinstalls_the_local_snapshot_and_reanchors_the_markers() {
+    let rt = Arc::new(Runtime::new("test-step-down-anchor", 2, 2));
+    let (mut node, conf) = test_rocks_node(rt.clone(), 1);
+    let journal_dir = conf.journal_dir.clone();
+
+    seed_applied_state(&node, 100);
+    node.last_snapshot_op_id = 0;
+    node.last_snapshot_ms = 0;
+    hold_current_ready(&mut node);
+    let pending = node.pending_ready.take().unwrap();
+
+    // The role monitor still reports leader while raft has stepped down, which
+    // is the transition that reinstalls the local snapshot.
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: 1,
+        raft_state: raft::StateRole::Leader,
+    });
+    assert!(node.role_monitor.is_leader());
+    assert!(!node.is_leader());
+
+    let mut promise = HashMap::new();
+    rt.block_on(node.finish_ready(
+        pending.ready,
+        Some(SoftState {
+            leader_id: 2,
+            raft_state: raft::StateRole::Follower,
+        }),
+        &mut promise,
+        false,
+    ))
+    .unwrap();
+
+    assert!(
+        !node.role_monitor.is_leader(),
+        "the step-down must be published before the local snapshot is reinstalled"
+    );
+
+    assert_eq!(
+        node.last_snapshot_op_id, 100,
+        "the local snapshot reinstall must re-anchor the entry counter"
+    );
+    assert!(node.last_snapshot_ms > 0);
+
+    drop(node);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+// The reinstall is the only follower-mode replay of the committed tail, so the
+// step-down has to be visible from inside it. A post-completion role check
+// would also pass with the old ordering.
+#[test]
+fn finish_ready_publishes_the_step_down_before_the_snapshot_reinstall() {
+    let rt = Arc::new(Runtime::new("test-step-down-role", 2, 2));
+    let monitor = RoleMonitor::new();
+    let app = RoleRecordingAppStorage::new(HashAppStorage::new(), monitor.read_ctl());
+    let mut conf = JournalConf::with_test();
+    let mut node = test_rocks_node_with_app(rt.clone(), 1, &mut conf, app.clone(), monitor);
+    let journal_dir = conf.journal_dir.clone();
+
+    seed_applied_state(&node, 100);
+    node.last_snapshot_op_id = 0;
+    node.last_snapshot_ms = 0;
+    hold_current_ready(&mut node);
+    let pending = node.pending_ready.take().unwrap();
+
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: 1,
+        raft_state: StateRole::Leader,
+    });
+    assert!(node.role_monitor.is_leader());
+    assert!(!node.is_leader());
+
+    let mut promise = HashMap::new();
+    rt.block_on(node.finish_ready(
+        pending.ready,
+        Some(SoftState {
+            leader_id: 2,
+            raft_state: StateRole::Follower,
+        }),
+        &mut promise,
+        false,
+    ))
+    .unwrap();
+
+    let replayed = app.replayed_as_leader();
+    assert!(!replayed.is_empty(), "the reinstall must replay the tail");
+    assert!(
+        !replayed.iter().any(|leader| *leader),
+        "the follower-mode replay must observe the published Follower role"
+    );
+
+    drop(node);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+// `on_ready` parks a snapshot-bearing Ready; the business role must already be
+// follower while the snapshot is still pending.
+#[test]
+fn pending_snapshot_publishes_the_step_down_before_parking_the_ready() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone(), 1);
+    node.recovery.active = false;
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: 1,
+        raft_state: StateRole::Leader,
+    });
+    assert!(node.role_monitor.is_leader());
+
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 5;
+    snapshot.mut_metadata().term = 3;
+    snapshot.mut_metadata().mut_conf_state().voters = vec![1, 2, 3];
+
+    let mut message = Message::default();
+    message.set_msg_type(MessageType::MsgSnapshot);
+    message.from = 2;
+    message.to = 1;
+    message.term = 3;
+    message.set_snapshot(snapshot);
+
+    node.raw.step(message).unwrap();
+    assert!(node.raw.has_ready());
+
+    let mut promise = HashMap::new();
+    rt.block_on(node.on_ready(&mut promise)).unwrap();
+
+    assert!(
+        node.pending_ready.is_some(),
+        "the snapshot Ready must be parked"
+    );
+    assert!(
+        !node.role_monitor.is_leader(),
+        "on_ready must publish the step-down while the snapshot is pending"
+    );
+}
+
+// `on_ready` already published the step-down before parking the Ready, so when
+// the snapshot completes the monitor no longer reports leader and only the
+// recorded transition keeps the follower-mode reinstall alive.
+#[test]
+fn pending_snapshot_completion_keeps_the_follower_mode_reinstall() {
+    let rt = Arc::new(Runtime::new("test-pending-step-down-role", 2, 2));
+    let monitor = RoleMonitor::new();
+    let app = RoleRecordingAppStorage::new(HashAppStorage::new(), monitor.read_ctl());
+    let mut conf = JournalConf::with_test();
+    let mut node = test_rocks_node_with_app(rt.clone(), 1, &mut conf, app.clone(), monitor);
+    let journal_dir = conf.journal_dir.clone();
+
+    seed_applied_state(&node, 100);
+    hold_current_ready(&mut node);
+    let mut pending = node.pending_ready.take().unwrap();
+    pending.soft_state = Some(SoftState {
+        leader_id: 2,
+        raft_state: StateRole::Follower,
+    });
+    pending.demoted = true;
+
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: 1,
+        raft_state: StateRole::Leader,
+    });
+    assert!(node.role_monitor.is_leader());
+    node.role_monitor.step_down();
+    assert!(!node.role_monitor.is_leader());
+    node.pending_ready = Some(pending);
+
+    let mut promise = HashMap::new();
+    rt.block_on(node.complete_pending_snapshot(Ok(()), &mut promise))
+        .unwrap();
+
+    let replayed = app.replayed_as_leader();
+    assert!(
+        !replayed.is_empty(),
+        "resuming a parked snapshot must still reinstall it and replay the tail"
+    );
+    assert!(
+        !replayed.iter().any(|leader| *leader),
+        "the reinstall must replay as a follower"
+    );
+
+    drop(node);
+    let _ = std::fs::remove_dir_all(&journal_dir);
 }
 
 #[test]
@@ -396,8 +961,9 @@ fn follower_snapshot_is_throttled_by_min_interval() {
     node.snapshot_interval_ms = 0;
     node.snapshot_min_interval_ms = 10 * 60 * 1000;
     node.snapshot_entries = 1;
-    // Match the production constructors, which anchor `last_snapshot_ms` to
-    // process start; the throttle must not treat that anchor as a snapshot.
+    // Freeze the markers as if no snapshot had been recorded for the restored
+    // state: the restored op_id then counts as pending work and only the min
+    // interval can hold the next snapshot back.
     node.last_snapshot_ms = LocalTime::mills();
     node.last_snapshot_op_id = 0;
 
@@ -457,6 +1023,197 @@ fn follower_snapshot_is_throttled_by_min_interval() {
     );
     assert_eq!(node.last_snapshot_op_id, 4);
     wait_for_snapshot_job(&node);
+}
+
+#[test]
+fn min_commit_is_unbounded_on_a_follower() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    freeze_applied_index(&mut node, 100);
+
+    // A follower trims only its own log, so no peer bounds it and the applied
+    // index caps it where the snapshot itself is trimmed.
+    assert_eq!(node.min_commit(), None);
+}
+
+#[test]
+fn min_commit_on_a_leader_follows_the_slowest_live_voter() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+        pr.recent_active = true;
+    }
+
+    assert_eq!(node.min_commit(), Some(50));
+}
+
+#[test]
+fn min_commit_drops_a_voter_that_stopped_responding() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+    }
+    node.raw.raft.mut_prs().get_mut(2).unwrap().recent_active = true;
+    // Voter 3 has been silent for longer than an election timeout, so its last
+    // reported commit must not hold the ceiling back.
+
+    assert_eq!(node.min_commit(), Some(80));
+}
+
+#[test]
+fn min_commit_holds_at_a_voter_installing_a_snapshot() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+    }
+    node.raw.raft.mut_prs().get_mut(2).unwrap().recent_active = true;
+    // Voter 3 is installing a snapshot at 60 and still reports 50. It cannot
+    // answer heartbeats while the snapshot is applied, so the quorum check has
+    // cleared its liveness flag; the ceiling must still stay at 50 instead of
+    // jumping to the healthy voter or to the local applied index.
+    let pr = node.raw.raft.mut_prs().get_mut(3).unwrap();
+    pr.become_snapshot(60);
+    assert!(!pr.recent_active);
+
+    assert_eq!(node.min_commit(), Some(50));
+}
+
+#[test]
+fn min_commit_without_a_live_voter_uses_the_last_known_commit() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+    }
+    // The periodic quorum check resets liveness, so no voter is marked active
+    // right now; the ceiling must not jump to the local applied index.
+
+    assert_eq!(node.min_commit(), Some(50));
+}
+
+#[test]
+fn min_commit_is_unbounded_on_a_single_voter_leader() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node_with_voters(rt, 1, vec![1]);
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+    freeze_applied_index(&mut node, 100);
+
+    // A single-voter group has nobody to hold the trim back, so the local
+    // applied index is the only limit.
+    assert_eq!(node.min_commit(), None);
+}
+
+#[test]
+fn min_commit_with_unreported_voters_trims_nothing() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt, 1);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    // Voters that never reported keep `Progress::new()`'s zero commit, so the
+    // ceiling stays at 0 and the trim is a no-op instead of falling back to the
+    // local applied index.
+    for voter in [2, 3] {
+        node.raw
+            .raft
+            .mut_prs()
+            .get_mut(voter)
+            .unwrap()
+            .recent_active = true;
+    }
+
+    assert_eq!(node.min_commit(), Some(0));
+}
+
+#[test]
+fn reported_snapshot_trims_the_journal_up_to_the_peer_watermark() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut conf = JournalConf::with_test();
+    // An empty retention window keeps the trim right at the bound.
+    conf.snapshot_entries = 0;
+    let mut node = test_rocks_node_with_conf(rt, 1, &mut conf);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    let entries: Vec<Entry> = (1..=100)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            ..Default::default()
+        })
+        .collect();
+    node.storage.append(&entries).unwrap();
+    node.storage.set_hard_state_commit(100).unwrap();
+
+    for (voter, committed) in [(2, 80), (3, 50)] {
+        let pr = node.raw.raft.mut_prs().get_mut(voter).unwrap();
+        pr.committed_index = committed;
+        pr.recent_active = true;
+    }
+
+    // The reporter has applied up to 90, but voter 3 still needs 51 onwards.
+    node.storage
+        .register_snapshot(reported_snapshot(2, 90), node.min_commit())
+        .unwrap();
+
+    assert_eq!(wait_for_first_index(&node, 50), 50);
+}
+
+#[test]
+fn reported_snapshot_with_unreported_voters_trims_nothing() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut conf = JournalConf::with_test();
+    conf.snapshot_entries = 0;
+    let mut node = test_rocks_node_with_conf(rt, 1, &mut conf);
+    become_leader_and_fence(&mut node);
+    freeze_applied_index(&mut node, 100);
+
+    let entries: Vec<Entry> = (1..=100)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            ..Default::default()
+        })
+        .collect();
+    node.storage.append(&entries).unwrap();
+    node.storage.set_hard_state_commit(100).unwrap();
+
+    // Voters that never reported keep `Progress::new()`'s zero commit, so the
+    // trim must be a no-op instead of falling back to the local applied index.
+    for voter in [2, 3] {
+        node.raw
+            .raft
+            .mut_prs()
+            .get_mut(voter)
+            .unwrap()
+            .recent_active = true;
+    }
+
+    node.storage
+        .register_snapshot(reported_snapshot(2, 90), node.min_commit())
+        .unwrap();
+
+    assert_eq!(wait_for_first_index(&node, 1), 1);
 }
 
 #[test]
@@ -1475,4 +2232,123 @@ fn injected_storage_clear_failure_keeps_node_in_quarantine_and_retries_safely() 
 
     drop(node);
     let _ = std::fs::remove_dir_all(&journal_dir);
+}
+
+// Send one message through the driver channel and let the real loop run one
+// round. The ping makes the `select!` return at once instead of waiting for
+// the ticker, and the timeout bounds a loop that never returns on its own.
+fn drive_one_driver_round<A, B>(
+    rt: &Runtime,
+    node: &mut RaftNode<A, B>,
+    promise: &mut PendingPromises,
+) where
+    A: crate::raft::storage::LogStorage,
+    B: crate::raft::storage::AppStorage,
+{
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let ping = Builder::new_rpc(RaftCode::Ping).req_id(987_654).build();
+
+    rt.block_on(async {
+        node.sender.send(Envelope::new(ping, tx)).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), node.run0(promise)).await;
+    });
+}
+
+// A step-down used to drop the callbacks of proposals still waiting for their
+// entry. Dropping them is not a no-op: the server side is parked on
+// `rx.await`, so the client saw neither a response nor an error until the
+// connection broke. Every pending callback must be answered instead.
+#[test]
+fn pending_propose_callbacks_are_answered_when_the_leader_steps_down() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone(), 1);
+    let mut promise: PendingPromises = HashMap::new();
+
+    // Lead term 1 so the proposal is accepted and parked by the driver.
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+    let leader_term = node.raw.raft.term;
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: node.id(),
+        raft_state: raft::StateRole::Leader,
+    });
+    assert!(node.is_leader());
+
+    let req_id = 4242;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let msg = Builder::new_rpc(RaftCode::Propose)
+        .req_id(req_id)
+        .proto_header(ProposeRequest {
+            data: b"payload".to_vec(),
+        })
+        .build();
+    node.handle_propose(Envelope::new(msg, tx), &mut promise)
+        .unwrap();
+    assert!(
+        promise.contains_key(&req_id),
+        "the proposal must be parked until its entry applies"
+    );
+
+    // A higher term demotes this node before the entry can be applied.
+    node.raw.raft.become_follower(leader_term + 1, 2);
+    assert!(!node.is_leader());
+
+    drive_one_driver_round(&rt, &mut node, &mut promise);
+
+    assert!(
+        promise.is_empty(),
+        "a demoted node must answer its callbacks, not keep them"
+    );
+    let response = rt
+        .block_on(rx)
+        .expect("the callback must be answered")
+        .expect("the answer must be a response message");
+    assert_eq!(
+        response.response_status(),
+        ResponseStatus::Error,
+        "a caller whose entry will never apply must be told, not left waiting"
+    );
+    let error = response
+        .check_error_ext::<RaftError>()
+        .expect_err("the answer must carry the retryable reason");
+    assert!(
+        matches!(error, RaftError::LeaderNotReady(_)),
+        "expected LeaderNotReady, got {:?}",
+        error
+    );
+}
+
+// The step-down drain only fires on a role change, and an idle follower
+// produces no Ready at all. A callback left over from an older term must still
+// be answered by the loop-level drain.
+#[test]
+fn idle_follower_answers_a_callback_left_over_from_an_older_term() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone(), 1);
+    let mut promise: PendingPromises = HashMap::new();
+
+    // This node never led, so no Ready will ever carry a role change.
+    assert!(!node.is_leader());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    promise.insert(777, tx);
+
+    drive_one_driver_round(&rt, &mut node, &mut promise);
+
+    assert!(
+        promise.is_empty(),
+        "the loop-level drain must answer callbacks no Ready will reach"
+    );
+    let response = rt
+        .block_on(rx)
+        .expect("the callback must be answered")
+        .expect("the answer must be a response message");
+    assert_eq!(response.response_status(), ResponseStatus::Error);
+    let error = response
+        .check_error_ext::<RaftError>()
+        .expect_err("a non-leader must report a retryable error");
+    assert!(
+        matches!(error, RaftError::LeaderNotReady(_)),
+        "expected LeaderNotReady, got {:?}",
+        error
+    );
 }

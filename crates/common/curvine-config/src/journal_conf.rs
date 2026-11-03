@@ -50,7 +50,8 @@ pub struct JournalConf {
 
     // Follower time trigger for creating a snapshot. Entry count can also
     // request one, but `snapshot_min_interval` still allows only one snapshot
-    // inside that window.
+    // inside that window. The follower timer never fires while
+    // `snapshot_entries` is zero, since that value disables follower snapshots.
     pub snapshot_interval: String,
 
     // Minimum gap between snapshots on the leader and on followers.
@@ -65,16 +66,31 @@ pub struct JournalConf {
     /// back to: a snapshot is created only when the raft group has a single
     /// node. Set `true` or `false` to override that for every group size.
     ///
-    /// When the leader does not create snapshots, the leader raft log has no
-    /// compaction path until the follower snapshot reporting path lands, so a
-    /// multi-node group must not rely on this default in production yet. A
-    /// running master logs an error every few minutes while it is disabled.
+    /// This switch only gates the periodic trigger. `curvine snapshot create`
+    /// still checkpoints the active master and enqueues a snapshot entry, so an
+    /// operator can compact the leader raft log while the periodic path stays
+    /// off; a multi-node group must not rely on this default in production yet.
+    /// A running master logs an error every few minutes while it is disabled.
+    ///
+    /// A checkpoint flushes RocksDB and copies the metadata store while the
+    /// metadata read lock is held, so metadata writes stall for its duration.
+    /// That write stall is the cost this switch opts out of, and the operator
+    /// path pays it on every call.
     pub leader_create_snapshot: Option<bool>,
 
     // How many entries are created after creating snapshots.
+    // Zero disables snapshot creation: the leader stops counting entries and a
+    // follower skips both this trigger and the `snapshot_interval` timer.
     pub snapshot_entries: u64,
 
     pub snapshot_read_chunk_size: usize,
+
+    // How many snapshot files are transferred at the same time when this node
+    // downloads a snapshot from its owner. Each file uses its own connection,
+    // so the value also bounds the number of download connections. 1 keeps the
+    // transfer serial; raising it speeds up large snapshots at the cost of more
+    // concurrent reads on the owner.
+    pub snapshot_download_parallel: usize,
 
     // Network configuration between raft node communications.
     // Set the client service connection timeout and retry policy.
@@ -313,6 +329,7 @@ impl Default for JournalConf {
             leader_create_snapshot: None,
             snapshot_entries: 1_000_000,
             snapshot_read_chunk_size: 1024 * 1024,
+            snapshot_download_parallel: 8,
 
             conn_retry_max_duration_ms: 0,
             conn_retry_min_sleep_ms: 10 * 1000,
@@ -320,8 +337,8 @@ impl Default for JournalConf {
 
             rpc_close_idle: false,
             rpc_retry_max_duration_ms: 60 * 1000,
-            rpc_retry_min_sleep_ms: 20 * 1000,
-            rpc_retry_max_sleep_ms: 20 * 1000,
+            rpc_retry_min_sleep_ms: 100,
+            rpc_retry_max_sleep_ms: 3 * 1000,
 
             conn_timeout_ms: 30 * 1000,
             io_timeout_ms: 60 * 1000,

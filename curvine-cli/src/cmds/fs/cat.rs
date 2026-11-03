@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use super::common::copy_to;
 use clap::Subcommand;
 use curvine_core_error::CommonResult;
 use curvine_fs_api::{CurvineURI, FileSystem, Reader};
@@ -23,53 +23,46 @@ impl CatCommand {
                 match client.get_status(&path).await {
                     Ok(status) => {
                         if status.is_dir {
-                            eprintln!("cat: Cannot display '{}': Is a directory", path.full_path());
-                            return Ok(());
+                            return Err(format!(
+                                "Cannot display '{}': Is a directory",
+                                path.full_path()
+                            )
+                            .into());
                         }
 
                         // Open the file for reading
                         match client.open(&path).await {
                             Ok(mut reader) => {
-                                let total_size = reader.len();
                                 let chunk_size = client.conf().client.read_chunk_size;
-                                let mut buffer = BytesMut::zeroed(chunk_size);
-                                let mut bytes_read: i64 = 0;
-
-                                // Read in chunks and print to stdout
-                                while bytes_read < total_size {
-                                    let remaining = total_size - bytes_read;
-                                    let to_read = std::cmp::min(remaining as usize, chunk_size);
-                                    let buf_slice = &mut buffer[..to_read];
-
-                                    if let Err(e) = reader.read_full(buf_slice).await {
-                                        eprintln!("Error reading from file: {}", e);
-                                        return Err(e.into());
-                                    }
-
-                                    // Convert bytes to string and print
-                                    print!("{}", String::from_utf8_lossy(buf_slice));
-
-                                    bytes_read += to_read as i64;
+                                let mut stdout = tokio::io::stdout();
+                                if let Err(e) = copy_to(&mut reader, &mut stdout, chunk_size).await
+                                {
+                                    return Err(format!(
+                                        "Cannot display '{}': {}",
+                                        path.full_path(),
+                                        e
+                                    )
+                                    .into());
                                 }
 
                                 // Complete the read
                                 if let Err(e) = reader.complete().await {
-                                    eprintln!("Error completing read: {}", e);
-                                    return Err(e.into());
+                                    return Err(format!(
+                                        "Cannot complete read of '{}': {}",
+                                        path.full_path(),
+                                        e
+                                    )
+                                    .into());
                                 }
 
                                 Ok(())
                             }
                             Err(e) => {
-                                eprintln!("Error opening file: {}", e);
-                                Err(e.into())
+                                Err(format!("Cannot open '{}': {}", path.full_path(), e).into())
                             }
                         }
                     }
-                    Err(e) => {
-                        eprintln!("cat: Cannot access '{}': {}", path.full_path(), e);
-                        Err(e.into())
-                    }
+                    Err(e) => Err(format!("Cannot access '{}': {}", path.full_path(), e).into()),
                 }
             }
         }

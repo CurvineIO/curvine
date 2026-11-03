@@ -15,17 +15,20 @@
 use crate::conf::JournalConf;
 use crate::proto::raft::{SnapshotDownloadResponse, SnapshotFileInfo, SnapshotFileList};
 use crate::raft::snapshot::{FileWriter, SnapshotClient};
-use crate::raft::{NodeId, RaftClient, RaftResult};
+use crate::raft::{NodeId, RaftClient, RaftError, RaftResult};
 use curvine_core_error::err_box;
 use curvine_io::DataSlice;
 use curvine_runtime::common::{ByteUnit, FileUtils, TimeSpent};
 use log::{debug, error, info};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
-// @todo Consider developing concurrent download snapshot files.
 pub struct DownloadJob {
     node_id: NodeId,
     chunk_size: usize,
+    parallel: usize,
     snapshot_dir: String,
     files: SnapshotFileList,
     client: RaftClient,
@@ -43,6 +46,7 @@ impl DownloadJob {
         Self {
             node_id,
             chunk_size,
+            parallel: conf.snapshot_download_parallel,
             snapshot_dir,
             files,
             client,
@@ -75,20 +79,71 @@ impl DownloadJob {
         Ok(format!("{}", path.display()))
     }
 
-    // @todo Will parallel download be considered in the later stage?
+    fn effective_parallel(parallel: usize, total: usize) -> usize {
+        parallel.max(1).min(total.max(1))
+    }
+
     async fn run0(&mut self) -> RaftResult<()> {
-        for file in &self.files.files {
-            // Create writer
-            let path = self.get_write_path(file)?;
-            let writer = FileWriter::from_file(path, self.chunk_size)?;
+        let total = self.files.files.len();
+        let parallel = Self::effective_parallel(self.parallel, total);
+        let spend = TimeSpent::new();
+        info!(
+            "Snapshot {} download start, files {}, parallel {}, owner node {}",
+            self.files.dir, total, parallel, self.node_id
+        );
 
-            let client = self.client.create_snapshot_client(self.node_id).await?;
-            let client = SnapshotClient::new(&self.files.dir, file.clone(), client);
+        let semaphore = Arc::new(Semaphore::new(parallel));
+        let mut tasks: JoinSet<RaftResult<()>> = JoinSet::new();
 
-            Self::download_file(client, 0, writer).await?;
+        for file in self.files.files.iter().cloned() {
+            let path = self.get_write_path(&file)?;
+
+            let semaphore = semaphore.clone();
+            let client = self.client.clone();
+            let dir = self.files.dir.clone();
+            let node_id = self.node_id;
+            let chunk_size = self.chunk_size;
+
+            tasks.spawn(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| RaftError::from(format!("Snapshot download cancelled: {}", e)))?;
+
+                let writer = FileWriter::from_file(&path, chunk_size)?;
+                let client = client.create_snapshot_client(node_id).await?;
+                let client = SnapshotClient::new(dir, file, client);
+
+                Self::download_file(client, 0, writer).await
+            });
         }
 
-        Ok(())
+        let mut failure: Option<RaftError> = None;
+        while let Some(joined) = tasks.join_next().await {
+            let err = match joined {
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => e,
+                Err(e) => RaftError::from(e),
+            };
+
+            tasks.abort_all();
+            if failure.is_none() {
+                failure = Some(err);
+            }
+        }
+
+        match failure {
+            Some(e) => Err(e),
+            None => {
+                info!(
+                    "Snapshot {} download complete, files {}, cost {} ms",
+                    self.files.dir,
+                    total,
+                    spend.used_ms()
+                );
+                Ok(())
+            }
+        }
     }
 
     pub async fn download_file(
@@ -185,5 +240,23 @@ impl DownloadJob {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DownloadJob;
+
+    #[test]
+    fn effective_parallel_is_bounded_by_the_file_count() {
+        assert_eq!(DownloadJob::effective_parallel(8, 3), 3);
+        assert_eq!(DownloadJob::effective_parallel(8, 100), 8);
+    }
+
+    #[test]
+    fn effective_parallel_never_drops_to_zero() {
+        // A zero would create an empty semaphore and block every transfer.
+        assert_eq!(DownloadJob::effective_parallel(0, 4), 1);
+        assert_eq!(DownloadJob::effective_parallel(8, 0), 1);
     }
 }
