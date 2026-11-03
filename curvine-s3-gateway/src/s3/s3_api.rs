@@ -688,13 +688,14 @@ pub use crate::s3::dto::{
     ChecksumAlgorithm, ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectOption, RequestPayer,
 };
 pub trait PutObjectHandler: Send + Sync {
+    /// Writes the object and returns its ETag, which the S3 response echoes.
     fn handle(
         &self,
         opt: PutObjectOption,
         bucket: String,
         object: String,
         body: crate::utils::io::PollReaderEnum,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    ) -> impl std::future::Future<Output = Result<String, String>> + Send;
 
     /// Get the temporary directory path for storing temporary files during PUT operations
     fn get_temp_dir(&self) -> String;
@@ -861,7 +862,7 @@ pub async fn handle_put_object<
             return;
         }
     };
-    let ret: Result<(), String> = match content_sha256 {
+    let ret: Result<String, String> = match content_sha256 {
         ContentSha256::Hash(cs) => {
             let content_length = match opt.content_length {
                 Some(val) => val as usize,
@@ -1165,9 +1166,9 @@ pub async fn handle_put_object<
             }
         }
     };
-    //
     match ret {
-        Ok(_) => {
+        Ok(etag) => {
+            resp.set_header("etag", &etag);
             resp.set_status(200);
             resp.send_header();
         }
@@ -1712,6 +1713,51 @@ pub async fn handle_multipart_complete_session<
     } else {
         resp.set_status(400);
         resp.send_header();
+    }
+}
+
+/// Handles `DELETE /{bucket}/{key}?uploadId=...` (AbortMultipartUpload).
+///
+/// SDKs abort an upload after any part failure, so this must remove the staged
+/// parts instead of leaving them behind until manual cleanup.
+pub async fn handle_abort_multipart_upload<
+    T: VRequest,
+    F: VResponse,
+    H: MultiUploadObjectHandler + Send + Sync,
+>(
+    req: T,
+    resp: &mut F,
+    handler: &H,
+) {
+    let url_path = req.url_path();
+    let path = url_path.trim_matches('/');
+    let (bucket, key) = match path.split_once('/') {
+        Some((b, k)) if !b.is_empty() && !k.is_empty() => (b.to_string(), k.to_string()),
+        _ => {
+            resp.set_status(400);
+            resp.send_header();
+            return;
+        }
+    };
+
+    let upload_id = match req.get_query("uploadId") {
+        Some(id) if !id.is_empty() => id.as_str().to_string(),
+        _ => {
+            resp.set_status(400);
+            resp.send_header();
+            return;
+        }
+    };
+
+    match handler.handle_abort(bucket, key, upload_id).await {
+        Ok(()) => {
+            resp.set_status(204);
+            resp.send_header();
+        }
+        Err(()) => {
+            resp.set_status(500);
+            resp.send_header();
+        }
     }
 }
 

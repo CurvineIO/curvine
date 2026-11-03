@@ -169,10 +169,16 @@ impl S3Router {
         let rr_len = rr.len();
 
         if rr_len == 1 || (rr_len == 2 && rr[1].is_empty()) {
-            Self::handle_delete_bucket_request(Request::from(req), &handlers).await
-        } else {
-            Self::handle_delete_object_request(Request::from(req), &handlers).await
+            return Self::handle_delete_bucket_request(Request::from(req), &handlers).await;
         }
+
+        let req = Request::from(req);
+        // `DELETE /{bucket}/{key}?uploadId=...` is AbortMultipartUpload, not a
+        // plain object delete: SDKs abort after any part failure.
+        if req.get_query("uploadId").is_some() {
+            return Self::handle_multipart_abort_request(req, &handlers).await;
+        }
+        Self::handle_delete_object_request(req, &handlers).await
     }
 
     async fn handle_head_request(
@@ -462,6 +468,15 @@ impl S3Router {
     ) -> axum::response::Response {
         let mut resp = Response::default();
         handle_multipart_complete_session(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
+    async fn handle_multipart_abort_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let mut resp = Response::default();
+        crate::s3::s3_api::handle_abort_multipart_upload(req, &mut resp, handlers.as_ref()).await;
         resp.into()
     }
 }

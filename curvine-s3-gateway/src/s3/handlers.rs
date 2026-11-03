@@ -399,7 +399,9 @@ impl PutObjectHandler for S3Handlers {
         bucket: String,
         object: String,
         mut body: crate::utils::io::PollReaderEnum,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+        let fs = self.fs.clone();
+        let path = self.cv_object_path(&bucket, &object);
         let context = PutContext::new(
             self.fs.clone(),
             self.rt.clone(),
@@ -408,7 +410,17 @@ impl PutObjectHandler for S3Handlers {
             self.cv_object_path(&bucket, &object),
         );
 
-        async move { PutOperation::execute(context, &mut body).await }
+        async move {
+            PutOperation::execute(context, &mut body).await?;
+            // The ETag mirrors what HEAD/GET report for the same object, so a
+            // client that validates the upload's ETag sees a consistent value.
+            let path = path.map_err(|e| e.to_string())?;
+            let status = fs
+                .get_status(&path)
+                .await
+                .map_err(|e| format!("Failed to read object status for ETag: {e}"))?;
+            Ok(crate::utils::s3_utils::generate_etag(&status))
+        }
     }
 
     fn get_temp_dir(&self) -> String {

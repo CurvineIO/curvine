@@ -294,6 +294,11 @@ impl Range {
     }
 
     pub fn to_byte_range(&self, file_size: u64) -> Option<(u64, u64)> {
+        // A range request against an empty object is always unsatisfiable.
+        if file_size == 0 {
+            return None;
+        }
+
         match *self {
             Range::Int { first, last } => {
                 if first >= file_size {
@@ -331,5 +336,59 @@ impl Range {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::Range;
+
+    fn byte_range(header: &str, size: u64) -> Option<(u64, u64)> {
+        Range::parse(header).ok()?.to_byte_range(size)
+    }
+
+    #[test]
+    fn resolves_open_and_closed_ranges() {
+        assert_eq!(byte_range("bytes=0-9", 100), Some((0, 10)));
+        assert_eq!(byte_range("bytes=90-", 100), Some((90, 10)));
+        assert_eq!(byte_range("bytes=95-200", 100), Some((95, 5)));
+    }
+
+    #[test]
+    fn resolves_suffix_ranges() {
+        assert_eq!(byte_range("bytes=-10", 100), Some((90, 10)));
+        // A suffix longer than the object returns the whole object.
+        assert_eq!(byte_range("bytes=-500", 100), Some((0, 100)));
+    }
+
+    #[test]
+    fn unsatisfiable_ranges_are_none_not_underflowed() {
+        // Every case that used to wrap `end - start + 1` / `size - start`.
+        assert_eq!(byte_range("bytes=50-10", 100), None, "start > end");
+        assert_eq!(byte_range("bytes=100-", 100), None, "start == size");
+        assert_eq!(byte_range("bytes=200-", 100), None, "start > size");
+        assert_eq!(byte_range("bytes=0-", 0), None, "empty object");
+        assert_eq!(byte_range("bytes=-1", 0), None, "empty object suffix");
+    }
+
+    #[test]
+    fn rejects_malformed_range_headers() {
+        assert!(Range::parse("items=0-1").is_err());
+        assert!(Range::parse("bytes=abc").is_err());
+        assert!(Range::parse("bytes=-0").is_err());
+        assert!(Range::parse("bytes=5-1").is_err());
+    }
+
+    #[test]
+    fn content_range_matches_the_resolved_length() {
+        let range = Range::parse("bytes=10-19").unwrap();
+        assert_eq!(
+            range.to_content_range(100).as_deref(),
+            Some("bytes 10-19/100")
+        );
+        assert_eq!(
+            Range::parse("bytes=500-").unwrap().to_content_range(100),
+            None
+        );
     }
 }

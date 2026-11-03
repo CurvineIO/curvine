@@ -242,10 +242,14 @@ impl CurvineTempStorage {
         Ok(())
     }
 
-    /// Remove entire upload session directory (cleanup after complete/abort)
+    /// Remove entire upload session directory (cleanup after complete/abort).
+    ///
+    /// Multipart staging is internal state, never user data, so it is purged
+    /// permanently: a soft delete would move every part into `/.Trash` and
+    /// retain a full copy of each upload for `trash_retention` (7d default).
     pub async fn cleanup(&self, upload_id: &str) -> Result<(), String> {
         let path = self.dir_path(upload_id)?;
-        match self.fs.delete(&path, true).await {
+        match self.fs.delete_with_opts(&path, true, true).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 let msg = e.to_string();

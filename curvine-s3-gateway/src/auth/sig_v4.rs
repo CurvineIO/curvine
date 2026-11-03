@@ -387,3 +387,56 @@ impl V4Head {
         &mut self.circle_hasher
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn stamp(offset_secs: i64) -> String {
+        let now = Utc::now() + chrono::Duration::seconds(offset_secs);
+        now.format("%Y%m%dT%H%M%SZ").to_string()
+    }
+
+    #[test]
+    fn accepts_a_current_signature_date() {
+        assert!(validate_xamz_date(&stamp(0)).is_ok());
+        assert!(validate_xamz_date(&stamp(-60)).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_stale_signature_date() {
+        // A captured request replayed after the skew window must be rejected.
+        let err = validate_xamz_date(&stamp(-(MAX_CLOCK_SKEW_SECS + 60))).unwrap_err();
+        assert!(err.contains("skew"), "{err}");
+        assert!(validate_xamz_date(&stamp(MAX_CLOCK_SKEW_SECS + 60)).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_signature_dates_without_panicking() {
+        for bad in [
+            "",
+            "short",
+            "2025",
+            "20250101",
+            "20250101T0000Z",
+            "20250101T000000",
+            "2025-01-01T00:00:00Z",
+            "20251301T000000Z",
+            "20250101T999999Z",
+        ] {
+            assert!(
+                validate_xamz_date(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn hasher_tolerates_a_short_date_header() {
+        // Reached after only an access-key match, so it must not panic.
+        let hasher =
+            HmacSha256CircleHasher::new([0u8; 32], "sig".into(), "short".into(), "r".into());
+        assert_eq!(hasher.date, "");
+    }
+}

@@ -80,6 +80,44 @@ async fn init_s3_authentication(
     let cache_refresh_interval =
         std::time::Duration::from_secs(s3_conf.cache_refresh_interval_secs);
 
+    // Configured keys take precedence over the credential stores, so an
+    // operator-set `access_key`/`secret_key` pair is actually honoured (it was
+    // previously parsed and ignored).
+    if let (Some(access_key), Some(secret_key)) =
+        (s3_conf.access_key.as_deref(), s3_conf.secret_key.as_deref())
+    {
+        if access_key.is_empty() || secret_key.is_empty() {
+            return curvine_core_error::err_box!(
+                "s3_gateway.access_key and s3_gateway.secret_key must both be non-empty"
+            );
+        }
+        let store = LocalAccessKeyStore::new(None, Some(cache_refresh_interval)).map_err(|e| {
+            format!(
+                "Failed to create credential store for configured keys: {}",
+                e
+            )
+        })?;
+        let store_enum = AccessKeyStoreEnum::Local(Arc::new(store));
+        store_enum
+            .initialize()
+            .await
+            .map_err(|e| format!("Failed to initialize configured credential store: {}", e))?;
+        store_enum
+            .add_credential(CredentialEntry::new(
+                access_key.to_string(),
+                secret_key.to_string(),
+                Some("Config s3_gateway keys".to_string()),
+            ))
+            .await
+            .map_err(|e| format!("Failed to register configured credential: {}", e))?;
+        start_cache_refresh_task(&store_enum, rt);
+        tracing::info!(
+            "S3 Gateway using the access key configured in [s3_gateway] (access_key: {})",
+            &access_key[..4.min(access_key.len())]
+        );
+        return Ok(store_enum);
+    }
+
     let initialize_result = if s3_conf.enable_distributed_auth {
         let store =
             CurvineAccessKeyStore::new(ufs.clone(), credentials_path, cache_refresh_interval)
