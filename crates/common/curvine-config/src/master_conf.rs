@@ -279,6 +279,13 @@ impl MasterConf {
             use_bloom_filter: true,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks_in_cache: true,
+            // Production baseline for a 10-50M inode master (32-64GB memory).
+            block_cache_size: ByteUnit::gb(4),
+            max_background_jobs: 6,
+            max_subcompactions: 2,
+            compression_type: DBConf::COMPRESSION_LZ4.to_string(),
+            max_bytes_for_level_base: ByteUnit::gb(2),
+            enable_statistics: true,
             ..Default::default()
         }
     }
@@ -490,6 +497,20 @@ impl Default for MasterConf {
 #[cfg(test)]
 mod tests {
     use super::MasterConf;
+    use crate::DBConf;
+    use curvine_runtime::common::ByteUnit;
+
+    #[test]
+    fn rocksdb_defaults_match_production_baseline() {
+        let rocksdb = MasterConf::default().rocksdb;
+
+        assert_eq!(rocksdb.block_cache_size, ByteUnit::gb(4));
+        assert_eq!(rocksdb.max_background_jobs, 6);
+        assert_eq!(rocksdb.max_subcompactions, 2);
+        assert_eq!(rocksdb.compression_type, DBConf::COMPRESSION_LZ4);
+        assert_eq!(rocksdb.max_bytes_for_level_base, ByteUnit::gb(2));
+        assert!(rocksdb.enable_statistics);
+    }
 
     #[test]
     fn replication_submit_timeout_must_be_positive() {
