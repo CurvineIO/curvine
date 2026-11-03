@@ -13,15 +13,14 @@
 // limitations under the License.
 
 use crate::handler::{Frame, FrameBuf, ReadFrame, RpcCodec, WriteFrame};
-use crate::message;
 use crate::message::{Message, Protocol, RefMessage};
+use crate::IOUtils;
 use crate::ServerConf;
 use bytes::BytesMut;
 use curvine_io::{DataSlice, IOResult};
 use curvine_net::net::ConnState;
 use curvine_sys as sys;
 use curvine_sys::RawIOSlice;
-use std::io;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
@@ -241,22 +240,14 @@ impl Frame for RpcFrame {
 
     async fn receive(&mut self) -> IOResult<Message> {
         let mut state = FrameSate::Head;
+        let mut partial = false;
         loop {
             match state {
                 FrameSate::Head => {
-                    let mut buf = match self.read_full(message::PROTOCOL_SIZE).await {
-                        Ok(v) => v,
-                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                            return Ok(Message::empty());
-                        }
-                        Err(e) => return Err(e),
-                    };
-
-                    let (protocol, header_size, data_size) = Message::decode_protocol(&mut buf)?;
-                    let _ = mem::replace(
-                        &mut state,
-                        FrameSate::Data(protocol, header_size, data_size),
-                    );
+                    match IOUtils::read_head(&mut self.io, &mut self.buf, &mut partial).await? {
+                        FrameSate::Head => return Ok(Message::empty()),
+                        next => state = next,
+                    }
                 }
 
                 FrameSate::Data(protocol, header_size, data_size) => {

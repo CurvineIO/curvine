@@ -17,6 +17,7 @@ use crate::client::raw_client::RawClient;
 use crate::client::{ClientConf, ClientState};
 use crate::handler::{Frame, ReadFrame, WriteFrame};
 use crate::message::{BoxMessage, Message, RefMessage};
+use crate::IOUtils;
 use curvine_io::{IOError, IOResult};
 use curvine_net::net::InetAddr;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
@@ -87,6 +88,10 @@ impl BufferClient {
         call_map: Arc<CallMap>,
     ) -> IOResult<()> {
         loop {
+            if client_state.is_closed() {
+                break;
+            }
+
             let res = timeout(dur, receiver.recv()).await;
             let opt_env = match res {
                 Ok(v) => v,
@@ -100,13 +105,12 @@ impl BufferClient {
                     } else {
                         // Maintain heartbeat.
                         let msg = BoxMessage::Msg(Message::heartbeat());
-                        if let Err(e) = write_frame.send(&msg).await {
+                        if let Err(e) = write_frame.send_timeout(&msg, dur).await {
                             let err = IOError::with_msg(e.into_raw(), "heartbeat sending failed");
                             client_state.set_error(err);
                             break;
-                        } else {
-                            continue;
                         }
+                        continue;
                     }
                 }
             };
@@ -127,10 +131,17 @@ impl BufferClient {
                 continue;
             }
 
+            if client_state.is_closed() {
+                let error: IOResult<Message> =
+                    err_box!("connection {} closed", client_state.conn_info());
+                let _ = env.send(error);
+                break;
+            }
+
             // Set the callback.
             call_map.insert(req_id, env.cb);
 
-            if let Err(e) = write_frame.send(&env.msg).await {
+            if let Err(e) = write_frame.send_timeout(&env.msg, dur).await {
                 // send failed, send a failed callback notification directly.
                 match call_map.remove(req_id) {
                     None => {
@@ -179,22 +190,16 @@ impl BufferClient {
         call_map: Arc<CallMap>,
     ) -> IOResult<()> {
         loop {
-            let res = timeout(dur, read_frame.receive()).await;
-            let read_res = match res {
-                Ok(v) => v,
+            let msg = match read_frame.receive_timeout(dur).await {
+                Ok(msg) => msg,
 
-                Err(_) => {
-                    // If an error occurs in the network channel, the future ends.
+                Err(e) if IOUtils::is_timeout(&e) => {
                     if client_state.has_error() {
                         break;
-                    } else {
-                        continue;
                     }
+                    continue;
                 }
-            };
 
-            let msg = match read_res {
-                Ok(v) => v,
                 Err(e) => {
                     client_state.set_error(e);
                     break;
@@ -202,6 +207,7 @@ impl BufferClient {
             };
 
             if msg.is_empty() {
+                client_state.set_closed();
                 break;
             }
 
@@ -237,11 +243,10 @@ impl BufferClient {
         let inflight = map.clear();
         let len = inflight.len();
 
-        let err_msg = err_msg!(
-            "connection {}: {:?}",
-            client_state.conn_info(),
-            client_state.take_error()
-        );
+        let err_msg = match client_state.take_error() {
+            Some(err) => err_msg!("connection {}: {}", client_state.conn_info(), err),
+            None => err_msg!("connection {} closed", client_state.conn_info()),
+        };
         for (id, cb) in inflight {
             let error: IOResult<Message> = Err(err_msg.clone().into());
             if let Err(e) = cb.send(error) {
@@ -263,5 +268,221 @@ impl BufferClient {
                 client_state.conn_info()
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BufferClient;
+    use crate::client::dispatch::{CallMap, Envelope};
+    use crate::client::ClientState;
+    use crate::handler::{FrameBuf, ReadFrame, WriteFrame};
+    use crate::message::{Builder, Message, ResponseStatus};
+    use bytes::BytesMut;
+    use curvine_io::IOResult;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::timeout;
+
+    /// #1908: a peer close must mark the client state closed, otherwise the
+    /// dead connection is reused and every request burns a full rpc timeout.
+    #[tokio::test]
+    async fn peer_close_must_mark_client_state_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        // Keep the write half alive so only the peer's FIN drives EOF.
+        let (read_half, _write_half) = tokio::io::split(client);
+        let read_frame = ReadFrame::new(read_half, FrameBuf::new(0));
+
+        let state = Arc::new(ClientState::new(addr.into(), addr.into()));
+        let call_map = Arc::new(CallMap::new());
+
+        // Peer closes an idle connection.
+        drop(server);
+
+        let outcome = timeout(
+            Duration::from_secs(5),
+            BufferClient::response_future(
+                state.clone(),
+                Duration::from_millis(200),
+                read_frame,
+                call_map,
+            ),
+        )
+        .await
+        .expect("response_future did not return after the peer closed the connection");
+        outcome.expect("response_future should exit cleanly on EOF");
+
+        assert!(
+            state.is_closed(),
+            "peer closed the connection but client_state is still Normal; \
+             the dead connection stays active and is reused, so every later \
+             request waits a full rpc timeout instead of failing fast"
+        );
+    }
+
+    /// #1908: a timeout inside a frame cannot be resumed (the consumed bytes are
+    /// gone), so the connection must be dropped instead of reused.
+    #[tokio::test]
+    async fn mid_frame_timeout_closes_the_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        let (read_half, _write_half) = tokio::io::split(client);
+        let read_frame = ReadFrame::new(read_half, FrameBuf::new(0));
+
+        let state = Arc::new(ClientState::new(addr.into(), addr.into()));
+        let call_map = Arc::new(CallMap::new());
+
+        // Part of a frame head, then silence: the deadline fires mid-frame.
+        server.write_all(&[1, 2, 3, 4]).await.unwrap();
+
+        let res = timeout(
+            Duration::from_secs(5),
+            BufferClient::response_future(
+                state.clone(),
+                Duration::from_millis(200),
+                read_frame,
+                call_map,
+            ),
+        )
+        .await
+        .expect("response_future did not return after a mid-frame timeout");
+
+        res.expect("the mid-frame timeout must end the response task cleanly");
+        assert!(
+            state.has_error(),
+            "half a frame was consumed, the stream is desynced, but the \
+             connection was kept alive"
+        );
+    }
+
+    /// #1908: once the read side has given up on a connection, a request that
+    /// arrives afterwards must fail fast. Writing it into the dead socket makes
+    /// the caller burn a full rpc timeout before it learns nobody will answer.
+    #[tokio::test]
+    async fn request_on_a_dead_connection_fails_fast() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (_server, _peer) = listener.accept().await.unwrap();
+
+        let (_read_half, write_half) = tokio::io::split(client);
+        let write_frame = WriteFrame::new(write_half, FrameBuf::new(0));
+
+        let state = Arc::new(ClientState::new(addr.into(), addr.into()));
+        let call_map = Arc::new(CallMap::new());
+        let (sender, receiver) = mpsc::channel(8);
+
+        // Far beyond the assertion window: a pass must not be the idle tick
+        // doing the work.
+        let dur = Duration::from_secs(30);
+
+        let task = tokio::spawn(BufferClient::request_future(
+            state.clone(),
+            dur,
+            false,
+            receiver,
+            write_frame,
+            call_map,
+        ));
+
+        // Let the request side settle into its receive loop while the
+        // connection still looks healthy.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The read side gives up: EOF, a desynced stream, an IO error.
+        state.set_closed();
+
+        let (cb, promise) = oneshot::channel::<IOResult<Message>>();
+        let env = Envelope::new(Builder::new_rpc(1i8).build(), cb);
+
+        // Either the queue is already closed, or the request is dequeued and
+        // rejected: both mean the caller learns immediately.
+        if sender.send(env).await.is_ok() {
+            let res = timeout(Duration::from_secs(2), promise)
+                .await
+                .expect("a request sent to a closed connection never got an answer")
+                .expect("the callback was dropped");
+            assert!(
+                res.is_err(),
+                "a request on a closed connection must not be accepted"
+            );
+        }
+
+        timeout(Duration::from_secs(5), task)
+            .await
+            .expect("request_future kept running on a closed connection")
+            .expect("request_future must exit cleanly");
+    }
+
+    /// A quiet peer is not a dead peer: the idle tick exists to send heartbeats
+    /// and must not tear a live connection down. A peer that answers after
+    /// several idle ticks must still get its response delivered.
+    #[tokio::test]
+    async fn idle_ticks_do_not_kill_a_live_connection() {
+        const REQ_ID: i64 = 7;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        let (read_half, _write_half) = tokio::io::split(client);
+        let read_frame = ReadFrame::new(read_half, FrameBuf::new(0));
+
+        let state = Arc::new(ClientState::new(addr.into(), addr.into()));
+        let call_map = Arc::new(CallMap::new());
+
+        // A caller waiting for REQ_ID.
+        let (cb, promise) = oneshot::channel::<IOResult<Message>>();
+        call_map.insert(REQ_ID, cb);
+
+        let task = tokio::spawn(BufferClient::response_future(
+            state.clone(),
+            Duration::from_millis(100),
+            read_frame,
+            call_map.clone(),
+        ));
+
+        // Stay silent across several idle ticks, then answer.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        let mut frame = BytesMut::new();
+        // `new_rpc` keeps a non-undefined request status: the packed status
+        // byte is `req | resp << 4`, so a frame built from `Builder::new()`
+        // (request status `Undefined` = -1) decodes back as an empty message.
+        Builder::new_rpc(1i8)
+            .response(ResponseStatus::Success)
+            .req_id(REQ_ID)
+            .build()
+            .encode(&mut frame)
+            .unwrap();
+        server.write_all(&frame).await.unwrap();
+
+        let msg = timeout(Duration::from_secs(5), promise)
+            .await
+            .expect("the response was never delivered: an idle tick killed a live connection")
+            .expect("the callback was dropped")
+            .expect("the response must decode");
+        assert_eq!(msg.req_id(), REQ_ID);
+        assert!(
+            !state.is_closed(),
+            "idle ticks must not mark a live connection closed"
+        );
+
+        task.abort();
     }
 }
