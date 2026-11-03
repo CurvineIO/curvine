@@ -22,7 +22,7 @@ use curvine_core_error::CommonResult;
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_s3_gateway::auth::{
     AccessKeyStoreEnum, CredentialEntry, CredentialStore, CurvineAccessKeyStore,
-    LocalAccessKeyStore,
+    LocalAccessKeyStore, SecretKey,
 };
 use curvine_sys::version;
 use rand::Rng;
@@ -243,7 +243,8 @@ async fn handle_credential_action(
             println!("Generating new random credential...");
             let (access_key, secret_key) = generate_random_credentials();
             let entry = CredentialEntry::new(access_key.clone(), secret_key.clone(), description);
-            add_generated(store, entry, &access_key, &secret_key).await?
+            let secret = SecretKey::from(secret_key);
+            add_generated(store, entry, &access_key, &secret).await?
         }
 
         CredentialAction::List { show_secrets } => {
@@ -301,13 +302,15 @@ async fn add_generated(
     store: &(impl CredentialStore + ?Sized),
     entry: CredentialEntry,
     access_key: &str,
-    secret_key: &str,
+    secret_key: &SecretKey,
 ) -> CommonResult<()> {
     match store.add_credential(entry).await {
         Ok(()) => {
+            // The generated secret is shown exactly once so the operator can
+            // store it; after this point only the masked form is available.
             println!("✓ Successfully generated and added new credential:");
             println!("  Access Key: {}", access_key);
-            println!("  Secret Key: {}", secret_key);
+            println!("  Secret Key: {}", secret_key.expose());
             println!("\n⚠️  Please save these credentials securely. The secret key will not be shown again.");
             Ok(())
         }
@@ -339,7 +342,7 @@ async fn list_entries(
                 if show_secrets {
                     println!("  Secret Key: {}", entry.secret_key.expose());
                 } else {
-                    println!("  Secret Key: [HIDDEN - use --show-secrets to reveal]");
+                    println!("  Secret Key: {}", entry.secret_key.masked());
                 }
 
                 println!(

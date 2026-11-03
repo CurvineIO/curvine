@@ -106,6 +106,9 @@ pub enum BodyParseError {
 
     #[error("Invalid content encoding: {0}")]
     InvalidEncoding(String),
+
+    #[error("Unsupported request body framing: {0}")]
+    Unsupported(String),
 }
 
 #[derive(Debug, Error)]

@@ -29,6 +29,19 @@ impl SecretKey {
         &self.0
     }
 
+    /// Masked rendering for human-facing output (CLI listings). Keeps enough
+    /// of the key to distinguish entries without disclosing the secret.
+    #[must_use]
+    pub fn masked(&self) -> String {
+        let n = self.0.chars().count();
+        if n <= 8 {
+            return "*".repeat(n);
+        }
+        let head: String = self.0.chars().take(4).collect();
+        let tail: String = self.0.chars().skip(n - 4).collect();
+        format!("{}{}{}", head, "*".repeat(n - 8), tail)
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
@@ -138,6 +151,19 @@ mod tests {
         assert_eq!(secret.expose(), "test-secret");
         assert_eq!(secret.len(), 11);
         assert!(!secret.is_empty());
+    }
+
+    #[test]
+    fn test_masked_keeps_only_the_edges() {
+        let secret = SecretKey::from("AKIAsecretkey0123456789");
+        let masked = secret.masked();
+        assert_eq!(masked, "AKIA***************6789");
+        assert_eq!(masked.len(), secret.len());
+        assert!(!masked.contains("secretkey"));
+
+        // Short keys are fully masked so no fragment is disclosed.
+        assert_eq!(SecretKey::from("short").masked(), "*****");
+        assert_eq!(SecretKey::from("").masked(), "");
     }
 
     #[test]

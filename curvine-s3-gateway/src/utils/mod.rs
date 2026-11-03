@@ -249,9 +249,10 @@ async fn parse_buff<W: tokio::io::AsyncWrite + Send + Unpin>(
             ParseProcessState::Head => {
                 if let Some(pos) = content.windows(2).position(|x| x == b"\r\n") {
                     *head = Some(parse_chunk_line(&content[0..pos]).map_err(|_| {
-                        log::warn!("parse content line error\n{}", unsafe {
-                            std::str::from_utf8_unchecked(&content[0..pos])
-                        });
+                        log::warn!(
+                            "parse content line error\n{}",
+                            String::from_utf8_lossy(&content[0..pos])
+                        );
                         ChunkParseError::IllegalContent
                     })?);
                     if let Some(hdr) = head {
@@ -281,11 +282,12 @@ async fn parse_buff<W: tokio::io::AsyncWrite + Send + Unpin>(
                     let content_len = content.len();
                     if content_len >= hdr.content_size + 2 {
                         if &content[hdr.content_size..hdr.content_size + 2] != b"\r\n" {
-                            log::warn!("content end is not chunk split symbol [{}]", unsafe {
-                                std::str::from_utf8_unchecked(
-                                    &content[hdr.content_size..hdr.content_size + 2],
+                            log::warn!(
+                                "content end is not chunk split symbol [{}]",
+                                String::from_utf8_lossy(
+                                    &content[hdr.content_size..hdr.content_size + 2]
                                 )
-                            });
+                            );
                             return Err(ChunkParseError::IllegalContent);
                         }
                         let mut hsh = sha2::Sha256::new();
@@ -296,11 +298,6 @@ async fn parse_buff<W: tokio::io::AsyncWrite + Send + Unpin>(
                             log::warn!("chunk hash not match, return error");
                             return Err(ChunkParseError::HashNoMatch);
                         }
-                        // log::info!(
-                        //     "chunk signature verify pass {curr_hash} content length {}\n{}",
-                        //     content.len(),
-                        //     unsafe { std::str::from_utf8_unchecked(content) }
-                        // );
                         dst.write_all(&content[0..hdr.content_size])
                             .await
                             .map_err(|err| {
@@ -308,7 +305,6 @@ async fn parse_buff<W: tokio::io::AsyncWrite + Send + Unpin>(
                             })?;
                         *total_size += hdr.content_size;
                         let _ = content.split_to(hdr.content_size + 2);
-                        // log::info!("{}", unsafe { std::str::from_utf8_unchecked(content) });
                         *head = None;
                         state = ParseProcessState::Head;
                     } else {
@@ -323,34 +319,29 @@ async fn parse_buff<W: tokio::io::AsyncWrite + Send + Unpin>(
 }
 
 fn parse_chunk_line(src: &[u8]) -> Result<ChunkHead, ()> {
-    let ret = src
-        .windows(1)
-        .position(|r| r == b";")
-        .and_then(|p1: usize| {
-            let raw = &src[..p1];
-            usize::from_str_radix(unsafe { std::str::from_utf8_unchecked(raw) }.trim(), 16)
-                .ok()
-                .and_then(|size| {
-                    let raw = &src[p1 + 1..];
-                    let raw = raw.splitn(2, |x| *x == b'=').collect::<Vec<&[u8]>>();
-                    if raw.len() != 2 {
-                        None
-                    } else {
-                        let ext = raw[0];
-                        let signature = raw[1];
-                        Some(ChunkHead {
-                            content_size: size,
-                            ext: unsafe { std::str::from_utf8_unchecked(ext) }.to_string(),
-                            signature: unsafe { std::str::from_utf8_unchecked(signature) }
-                                .to_string(),
-                        })
-                    }
-                })
-        });
-    ret.ok_or(())
+    // Every field below comes straight from the request body, so decode with
+    // validation instead of `from_utf8_unchecked`: invalid UTF-8 must be a
+    // recoverable parse error, not undefined behavior.
+    let p1 = src.windows(1).position(|r| r == b";").ok_or(())?;
+    let size = std::str::from_utf8(&src[..p1]).map_err(|_| ())?.trim();
+    let content_size = usize::from_str_radix(size, 16).map_err(|_| ())?;
+
+    let rest = &src[p1 + 1..];
+    let mut parts = rest.splitn(2, |x| *x == b'=');
+    let ext = parts.next().ok_or(())?;
+    let signature = parts.next().ok_or(())?;
+
+    Ok(ChunkHead {
+        content_size,
+        ext: std::str::from_utf8(ext).map_err(|_| ())?.to_string(),
+        signature: std::str::from_utf8(signature).map_err(|_| ())?.to_string(),
+    })
 }
 
 #[allow(dead_code)]
 fn parse_chunk_content<'a>(_src: &'a [u8], _ext: &str, _signature: &str) -> Result<&'a [u8], ()> {
-    todo!()
+    // Placeholder for the aws-chunked content decoders; unused today because
+    // chunked bodies are rejected at `get_body_stream`. Returning an error
+    // keeps the crate panic-free under `panic = "abort"`.
+    Err(())
 }

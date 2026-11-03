@@ -167,12 +167,18 @@ pub trait ListObjectVersionsHandler: Send + Sync {
     ) -> impl std::future::Future<Output = Result<ListObjectVersionsResult, String>> + Send;
 }
 
+/// Legacy generic entry point, superseded by `S3Router::handle_head_object_request`.
+///
+/// Kept for API compatibility only: the live HEAD route reads metadata through
+/// `S3Handlers::lookup`. Aborts instead of panicking so a mis-wired caller
+/// cannot take the gateway down in a `panic = "abort"` build.
 pub fn handle_head_object<T: VRequest, F: VResponse, E: HeadHandler>(
     _req: &T,
-    _resp: &mut F,
+    resp: &mut F,
     _handler: &E,
 ) {
-    todo!()
+    resp.set_status(501);
+    resp.send_header();
 }
 
 /// Handle S3 GET Object requests with streaming support and range capabilities
@@ -921,6 +927,18 @@ pub async fn handle_put_object<
                                 resp.send_header();
                                 return;
                             }
+                            BodyParseError::Unsupported(_) => {
+                                log::warn!(
+                                    "{}",
+                                    curvine_core_error::err_msg!(
+                                        "Unsupported body framing: {}",
+                                        err
+                                    )
+                                );
+                                resp.set_status(400);
+                                resp.send_header();
+                                return;
+                            }
                         }
                     }
                 }
@@ -972,6 +990,12 @@ pub async fn handle_put_object<
                             }
                             ParseBodyError::InvalidEncoding(err) => {
                                 log::error!("invalid content encoding: {err}");
+                                resp.set_status(400);
+                                resp.send_header();
+                                return;
+                            }
+                            ParseBodyError::Unsupported(err) => {
+                                log::warn!("unsupported body framing: {err}");
                                 resp.set_status(400);
                                 resp.send_header();
                                 return;
@@ -1234,9 +1258,17 @@ pub async fn handle_post_delete_objects<
         }
     };
 
-    // Parse XML
-    let parsed: Result<DeleteObjectsRequest, _> =
-        quick_xml::de::from_str(unsafe { std::str::from_utf8_unchecked(&body) });
+    // Parse XML. The body is client-controlled, so decode it with validation
+    // rather than fabricating a `&str` from unchecked memory.
+    let parsed: Result<DeleteObjectsRequest, _> = match std::str::from_utf8(&body) {
+        Ok(xml) => quick_xml::de::from_str(xml),
+        Err(e) => {
+            log::error!("DeleteObjects body is not valid UTF-8: {e}");
+            resp.set_status(400);
+            resp.send_header();
+            return;
+        }
+    };
     let req_obj = match parsed {
         Ok(v) => v,
         Err(e) => {
@@ -1584,9 +1616,16 @@ pub async fn handle_multipart_complete_session<
 
         match req.body().await {
             Ok(body) => {
-                match quick_xml::de::from_str::<CompleteMultiPartUploadRequest>(unsafe {
-                    std::str::from_utf8_unchecked(&body)
-                }) {
+                let parsed = match std::str::from_utf8(&body) {
+                    Ok(xml) => quick_xml::de::from_str::<CompleteMultiPartUploadRequest>(xml),
+                    Err(e) => {
+                        log::error!("CompleteMultipartUpload body is not valid UTF-8: {e}");
+                        resp.set_status(400);
+                        resp.send_header();
+                        return;
+                    }
+                };
+                match parsed {
                     Ok(upload_request) => {
                         let data = upload_request
                             .parts
@@ -1676,17 +1715,21 @@ pub async fn handle_multipart_complete_session<
     }
 }
 
-/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
+/// Legacy generic entry point, superseded by `S3Router::handle_multipart_abort_request`.
+///
+/// Responds 501 rather than panicking: this crate is built with `panic = "abort"`,
+/// so an unimplemented protocol path must never be able to terminate the process.
 pub async fn handle_multipart_abort_session<
     T: VRequest,
     F: VResponse,
     H: MultiUploadObjectHandler + Send + Sync,
 >(
     _req: T,
-    _resp: &mut F,
+    resp: &mut F,
     _handler: &H,
 ) {
-    todo!()
+    resp.set_status(501);
+    resp.send_header();
 }
 pub struct CreateBucketOption {
     pub grant_full_control: Option<String>,
@@ -2078,6 +2121,7 @@ async fn get_body_stream<T: crate::utils::io::PollRead + Send, H: crate::auth::s
     ParseBodyError,
 > {
     let cl = header.get_header("content-length");
+    let has_content_length = cl.is_some();
     let acs = header
         .get_header("x-amz-content-sha256")
         .ok_or(ParseBodyError::HashMismatch)?;
@@ -2158,8 +2202,16 @@ async fn get_body_stream<T: crate::utils::io::PollRead + Send, H: crate::auth::s
             }
         }
     }
-    //chunk
-    todo!()
+
+    // Chunked (aws-chunked / SigV4 streaming) and unknown-length bodies reach
+    // here. This build does not decode them: the workspace sets
+    // `panic = "abort"`, so an unimplemented body must be rejected with a
+    // client error instead of aborting the whole gateway process.
+    Err(ParseBodyError::Unsupported(format!(
+        "chunked request bodies are not supported (content-sha256: {}, content-length: {})",
+        acs.as_str(),
+        has_content_length
+    )))
 }
 
 async fn parse_body<

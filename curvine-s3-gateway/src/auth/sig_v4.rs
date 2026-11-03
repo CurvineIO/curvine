@@ -137,6 +137,34 @@ pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, AuthError> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Maximum accepted clock skew between the client and this gateway.
+/// Matches the AWS SigV4 guidance (15 minutes).
+pub const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
+
+/// Validates the `x-amz-date` header (`YYYYMMDD'T'HHMMSS'Z'`).
+///
+/// Returns an error for a malformed value or one outside
+/// [`MAX_CLOCK_SKEW_SECS`], so a captured request cannot be replayed
+/// indefinitely and no caller slices a too-short string.
+fn validate_xamz_date(xamz_date: &str) -> GenericResult<()> {
+    let bytes = xamz_date.as_bytes();
+    // `20250101T000000Z`
+    if bytes.len() != 16 || bytes[8] != b'T' || bytes[15] != b'Z' {
+        return Err(format!("invalid x-amz-date format: {xamz_date}"));
+    }
+    let date = chrono::NaiveDate::parse_from_str(&xamz_date[..8], "%Y%m%d")
+        .map_err(|e| format!("invalid x-amz-date: {e}"))?;
+    let time = chrono::NaiveTime::parse_from_str(&xamz_date[9..15], "%H%M%S")
+        .map_err(|e| format!("invalid x-amz-date: {e}"))?;
+    let signed_at = date.and_time(time).and_utc().timestamp();
+    let skew = chrono::Utc::now().timestamp() - signed_at;
+    if skew.abs() > MAX_CLOCK_SKEW_SECS {
+        return Err(format!("x-amz-date outside the accepted skew: {skew}s"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn get_v4_signature<T: VHeader, S: ToString>(
     req: &T,
     method: &str,
@@ -153,6 +181,10 @@ pub fn get_v4_signature<T: VHeader, S: ToString>(
         return Err(Error::Illegal.to_string());
     }
     let xamz_date = xamz_date.unwrap();
+    // Reject stale or malformed timestamps before any HMAC work: without this
+    // a captured signed request replays forever, and slicing `[..8]` below
+    // would panic (process abort) on a short header.
+    validate_xamz_date(&xamz_date)?;
 
     // Build canonical headers
     let ans: Vec<String> = signed_headers
@@ -283,12 +315,15 @@ pub struct HmacSha256CircleHasher {
 
 impl HmacSha256CircleHasher {
     pub fn new(ksigning: [u8; 32], lasthash: String, xamz_date: String, region: String) -> Self {
+        // Callers pass a header value that may be malformed; take a checked
+        // prefix so a short date cannot panic in a `panic = "abort"` build.
+        let date = xamz_date.get(..8).unwrap_or_default().to_string();
         Self {
             ksigning,
             last_hash: lasthash,
             region,
-            xamz_date: xamz_date.clone(),
-            date: xamz_date[..8].to_string(),
+            xamz_date,
+            date,
         }
     }
     pub fn next(&mut self, curr_hsh: &str) -> Result<String, Error> {

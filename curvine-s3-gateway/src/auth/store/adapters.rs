@@ -187,7 +187,9 @@ impl FileSystemAdapter for LocalFileSystemAdapter {
     }
 
     async fn write_file(&self, path: &Self::PathType, content: &[u8]) -> Result<(), String> {
-        let mut file = File::create(path)
+        // The credentials file holds long-lived secret keys: create it 0600
+        // and tighten an existing file before overwriting it.
+        let mut file = open_private(path, true)
             .await
             .map_err(|e| format!("Failed to create file: {}", e))?;
 
@@ -203,10 +205,7 @@ impl FileSystemAdapter for LocalFileSystemAdapter {
     }
 
     async fn append_file(&self, path: &Self::PathType, content: &[u8]) -> Result<(), String> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
+        let mut file = open_private(path, false)
             .await
             .map_err(|e| format!("Failed to open file for append: {}", e))?;
 
@@ -232,10 +231,16 @@ impl FileSystemAdapter for LocalFileSystemAdapter {
     }
 
     async fn ensure_parent_dir(&self, path: &Self::PathType) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+            // The directory holds the credentials file, so keep it owner-only.
+            tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .await
+                .map_err(|e| format!("Failed to restrict directory permissions: {}", e))?;
         }
         Ok(())
     }
@@ -245,11 +250,37 @@ impl FileSystemAdapter for LocalFileSystemAdapter {
     }
 
     async fn create_empty_file(&self, path: &Self::PathType) -> Result<(), String> {
-        File::create(path)
+        open_private(path, true)
             .await
             .map_err(|e| format!("Failed to create empty file: {}", e))?;
         Ok(())
     }
+}
+
+/// Opens a credentials file for writing with owner-only permissions.
+///
+/// `File::create` uses `0666 & ~umask` (typically `0644`), which would expose
+/// every stored secret key to all local users. The file is created `0600` and
+/// an existing file is tightened to `0600` before it is opened, so a
+/// pre-existing loose file cannot keep its permissions.
+async fn open_private(path: &PathBuf, truncate: bool) -> std::io::Result<File> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const PRIVATE: u32 = 0o600;
+
+    if let Ok(meta) = tokio::fs::metadata(path).await {
+        if meta.permissions().mode() & 0o077 != 0 {
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE)).await?;
+        }
+    }
+
+    let mut opts = OpenOptions::new();
+    opts.write(true)
+        .create(true)
+        .append(!truncate)
+        .truncate(truncate)
+        .mode(PRIVATE);
+    opts.open(path).await
 }
 
 pub fn expand_path(path: &str) -> Result<PathBuf, String> {

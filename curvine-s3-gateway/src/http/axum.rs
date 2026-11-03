@@ -91,9 +91,14 @@ impl sig_v4::VHeader for Request {
 
     fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
         for (k, v) in self.request.headers().iter() {
-            if !cb(k.as_str(), unsafe {
-                std::str::from_utf8_unchecked(v.as_bytes())
-            }) {
+            // Header values are raw bytes; skip the non-UTF-8 ones instead of
+            // producing a `&str` from unchecked memory (UB, and a panic-abort
+            // build turns it into a process crash).
+            let Ok(value) = v.to_str() else {
+                log::warn!("skip header {} with non-UTF-8 value", k.as_str());
+                continue;
+            };
+            if !cb(k.as_str(), value) {
                 return;
             }
         }
@@ -205,9 +210,11 @@ impl sig_v4::VHeader for HeaderWarp {
 
     fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
         for (k, v) in self.0.iter() {
-            if !cb(k.as_str(), unsafe {
-                std::str::from_utf8_unchecked(v.as_bytes())
-            }) {
+            let Ok(value) = v.to_str() else {
+                log::warn!("skip header {} with non-UTF-8 value", k.as_str());
+                continue;
+            };
+            if !cb(k.as_str(), value) {
                 return;
             }
         }
@@ -267,9 +274,11 @@ impl sig_v4::VHeader for Response {
 
     fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
         self.headers.iter().all(|(k, v)| {
-            cb(k.as_str(), unsafe {
-                std::str::from_utf8_unchecked(v.as_bytes())
-            })
+            let Ok(value) = v.to_str() else {
+                log::warn!("skip header {} with non-UTF-8 value", k.as_str());
+                return true;
+            };
+            cb(k.as_str(), value)
         });
     }
 }
