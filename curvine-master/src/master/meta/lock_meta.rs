@@ -81,14 +81,17 @@ pub(crate) fn decode_persisted_locks(bytes: &[u8]) -> CommonResult<Vec<FileLock>
 /// * legacy lock (`session_owned == false`) -> historical `lock_expire_time`
 ///   from `acquire_time`, unchanged, so pre-#1878 clients and their persisted
 ///   locks keep working.
-#[derive(Debug, Clone, Default)]
+///
+/// There is deliberately no `Default`: a zero TTL would expire every lock at
+/// once. Build it with [`LockValidity::new`] from the master configuration.
+#[derive(Debug, Clone)]
 pub struct LockValidity {
     /// TTL applied to legacy (non session-owned) locks and to every lock while
     /// `session_lock_lease` is off.
-    pub legacy_expire_ms: u64,
+    legacy_expire_ms: u64,
     /// `master.client_session_lock_lease`: exempt session-owned locks from the
     /// legacy TTL. Off by default until the session reaper (#1884) exists.
-    pub session_lock_lease: bool,
+    session_lock_lease: bool,
 }
 
 impl LockValidity {
@@ -360,6 +363,10 @@ impl LockMeta {
         }
 
         if let Some(owner_locks) = self.plock.get_mut(&key) {
+            // A re-lock never clears the owner's session exemption: the client
+            // stamps the flag from its instantaneous lease state, which drops
+            // after a single failed renewal (e.g. NotLeader during failover).
+            lock.session_owned |= owner_locks.iter().any(|l| l.session_owned);
             Self::subtract_owner_regions(owner_locks, lock.start, lock.end);
         }
 
@@ -390,6 +397,11 @@ impl LockMeta {
 
         if let Some(conflict) = self.find_flock_conflict(&lock, validity, now) {
             return (Some(conflict), changed);
+        }
+
+        // Same rule as `set_plock`: a re-lock keeps the owner's session exemption.
+        if let Some(existing) = self.flock.get(&key) {
+            lock.session_owned |= existing.session_owned;
         }
 
         lock.acquire_time = now;
@@ -1006,6 +1018,69 @@ mod tests {
         );
         assert_eq!(meta.to_vec().len(), 1);
         assert_eq!(meta.to_vec()[0].client_id, "session-client");
+    }
+
+    /// #1879 regression: one failed renewal makes the client stamp
+    /// `session_owned = false`; a same-owner re-lock must not drop the exemption.
+    #[test]
+    fn same_owner_relock_keeps_the_session_exemption_with_the_lease_policy_on() {
+        let validity = LockValidity::new(1_000, true);
+        for flock in [false, true] {
+            let mk = |client: &str, owner: u64| {
+                if flock {
+                    create_flock(client, owner, LockType::WriteLock)
+                } else {
+                    plock(client, owner, LockType::WriteLock)
+                }
+            };
+            let mut meta = LockMeta::default();
+
+            let mut lock = mk("session-client", 1);
+            lock.session_owned = true;
+            assert!(meta.set_lock(lock, &validity, 1_000).is_none());
+
+            let relock = mk("session-client", 1);
+            assert!(!relock.session_owned);
+            assert!(meta.set_lock(relock, &validity, 1_500).is_none());
+
+            let locks = meta.to_vec();
+            assert_eq!(locks.len(), 1, "flock={flock}");
+            assert!(locks[0].session_owned, "flock={flock}: exemption dropped");
+
+            let query = mk("other-client", 2);
+            assert!(
+                meta.find_conflict(&query, &validity, 1_500 + 10_000)
+                    .is_some(),
+                "flock={flock}: re-locked range must survive the legacy TTL"
+            );
+        }
+    }
+
+    #[test]
+    fn session_exemption_is_not_inherited_by_another_owner() {
+        let validity = LockValidity::new(1_000, true);
+        let mut meta = LockMeta::default();
+
+        let mut held = create_plock("session-client", 1, LockType::ReadLock, 0, 100);
+        held.session_owned = true;
+        assert!(meta.set_lock(held, &validity, 1_000).is_none());
+
+        let other = create_plock("other-client", 2, LockType::ReadLock, 0, 100);
+        assert!(meta.set_lock(other, &validity, 1_000).is_none());
+
+        let other_lock = meta
+            .to_vec()
+            .into_iter()
+            .find(|l| l.client_id == "other-client")
+            .unwrap();
+        assert!(!other_lock.session_owned);
+
+        let query = create_plock("third-client", 3, LockType::WriteLock, 0, 100);
+        let conflict = meta.find_conflict(&query, &validity, 1_000 + 1_001);
+        assert_eq!(
+            conflict.map(|l| l.client_id).as_deref(),
+            Some("session-client")
+        );
     }
 
     #[test]
