@@ -15,7 +15,8 @@
 use crate::master::meta::glob_utils::parse_glob_pattern;
 use crate::master::meta::inode::InodeView::{self, Dir, File, FileEntry};
 use crate::master::meta::inode::{
-    InodeDir, InodeFile, InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR, ROOT_INODE_ID,
+    DirectoryChildrenSharedVersion, InodeDir, InodeFile, InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR,
+    ROOT_INODE_ID,
 };
 use crate::master::meta::store::InodeStore;
 use curvine_core_error::{err_box, try_option, CommonResult};
@@ -27,9 +28,92 @@ pub struct InodePath {
     name: String,
     pub components: Vec<String>,
     pub inodes: Vec<InodePtr>,
+    /// Captured (handle, version) per resolved directory level, for callers
+    /// that walk shared handles and must validate after reading.
+    versions: Vec<crate::master::meta::inode::DirectoryChildrenSharedVersion>,
 }
 
 impl InodePath {
+    /// Versioned walk over shared directory handles. Returns the path plus
+    /// the per-level version tokens; the caller re-checks them with
+    /// [`Self::walk_is_current`] and retries on invalidation instead of
+    /// taking a global lock.
+    pub fn resolve_shared<T: AsRef<str>>(
+        root_view: &InodeView,
+        path: T,
+        store: &InodeStore,
+    ) -> CommonResult<Self> {
+        let components = InodeView::path_components(path.as_ref())?;
+        let name = try_option!(
+            components.last(),
+            "Path {} has no components",
+            path.as_ref()
+        );
+        if name.is_empty() {
+            return err_box!("Path {} is invalid", path.as_ref());
+        }
+
+        let mut inodes: Vec<InodePtr> = Vec::with_capacity(components.len());
+        let mut versions: Vec<DirectoryChildrenSharedVersion> = Vec::new();
+        let mut directory = match root_view.children_handle() {
+            Some(handle) => handle,
+            None => return err_box!("root inode is not a directory"),
+        };
+
+        // Root level: the version token proves the root index stayed
+        // quiescent for every edge resolved below it. The root view clone
+        // keeps its real persisted fields and shares the live child index.
+        versions.push(directory.shared_version());
+        let mut root_view = root_view.clone();
+        root_view.change_name(components[0].clone());
+        inodes.push(InodePtr::from_owned(root_view));
+
+        for component in components.iter().skip(1) {
+            let (child, _child_version) = directory.read_child_view(component);
+            match child {
+                None => break,
+                Some(child) => {
+                    // A shared dir child carries its live child index; a file
+                    // edge resolves to the owned inode from the store.
+                    let resolved = match child {
+                        InodeView::FileEntry(entry) => {
+                            let full = store.get_inode(entry.id(), Some(entry.name()))?;
+                            InodePtr::from_owned(try_option!(
+                                full,
+                                "Failed to load inode {} from store",
+                                entry.id()
+                            ))
+                        }
+                        other => InodePtr::from_owned(other),
+                    };
+                    let next_directory = resolved.as_ref().children_handle();
+                    inodes.push(resolved);
+                    match next_directory {
+                        Some(next) => {
+                            versions.push(next.shared_version());
+                            directory = next;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            path: path.as_ref().to_string(),
+            name: name.to_string(),
+            components,
+            inodes,
+            versions,
+        })
+    }
+
+    /// Whether every directory level captured by a shared walk is still
+    /// quiescent at its recorded version. Cheap atomic re-reads only.
+    pub fn walk_is_current(&self) -> bool {
+        self.versions.iter().all(|version| version.is_current())
+    }
+
     pub fn resolve<T: AsRef<str>>(
         root: InodePtr,
         path: T,
@@ -91,6 +175,7 @@ impl InodePath {
             name: name.to_string(),
             components,
             inodes,
+            versions: Vec::new(),
         };
 
         Ok(inode_path)
@@ -169,6 +254,7 @@ impl InodePath {
         }
 
         Ok(Self {
+            versions: Vec::new(),
             path: path_str,
             name: components_result.last().cloned().unwrap_or_else(|| {
                 format!(

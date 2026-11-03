@@ -30,7 +30,7 @@ mod inodes_children;
 pub use self::inodes_children::*;
 
 mod directory_children;
-pub use self::directory_children::DirectoryChildren;
+pub use self::directory_children::{DirectoryChildren, DirectoryChildrenSharedVersion};
 
 pub(crate) mod sharded_children;
 

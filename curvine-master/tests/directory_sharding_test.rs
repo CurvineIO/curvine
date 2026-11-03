@@ -123,3 +123,71 @@ fn dir_views_move_between_containers_with_their_own_children() {
     let view = found.as_ref().clone();
     assert!(matches!(view, InodeView::Dir(_)));
 }
+
+#[test]
+fn opposite_cross_shard_renames_both_complete() {
+    use std::sync::Barrier;
+    let children = Arc::new(seeded(ChildrenContainer::Map, 512));
+    // Promote first via a contended mutation.
+    {
+        let _guard = children.begin_mutation("f1");
+    }
+    children
+        .add_child(InodeView::new_file("x-aaa".into(), InodeFile::new(800, 1)))
+        .unwrap();
+    children
+        .add_child(InodeView::new_file("x-zzz".into(), InodeFile::new(801, 1)))
+        .unwrap();
+
+    let start = Arc::new(Barrier::new(2));
+    let a_children = children.clone();
+    let a_start = start.clone();
+    let rename_a = std::thread::spawn(move || {
+        a_start.wait();
+        let mut mutation = a_children.begin_rename_mutation("x-aaa", "x-renamed-a");
+        let view = mutation.child_view("x-aaa").unwrap();
+        let mut moved = view;
+        moved.change_name("x-renamed-a".into());
+        mutation.rename_child(800, "x-aaa", None, moved).unwrap();
+    });
+    let b_children = children.clone();
+    let b_start = start.clone();
+    let rename_b = std::thread::spawn(move || {
+        b_start.wait();
+        let mut mutation = b_children.begin_rename_mutation("x-zzz", "x-renamed-b");
+        let view = mutation.child_view("x-zzz").unwrap();
+        let mut moved = view;
+        moved.change_name("x-renamed-b".into());
+        mutation.rename_child(801, "x-zzz", None, moved).unwrap();
+    });
+
+    rename_a.join().unwrap();
+    rename_b.join().unwrap();
+    assert!(children.get_child_ptr("x-aaa").is_none());
+    assert!(children.get_child_ptr("x-zzz").is_none());
+    assert_eq!(children.get_child_ptr("x-renamed-a").unwrap().id(), 800);
+    assert_eq!(children.get_child_ptr("x-renamed-b").unwrap().id(), 801);
+    assert_eq!(children.iter_len(), 512 + 2);
+}
+
+#[test]
+fn same_shard_rename_replaces_target_atomically() {
+    let children = Arc::new(seeded(ChildrenContainer::Map, 4));
+    {
+        let _guard = children.begin_mutation("f1");
+    }
+    let mut mutation = children.begin_rename_mutation("f1", "f2");
+    let view = mutation.child_view("f1").unwrap();
+    let mut moved = view;
+    moved.change_name("f8".into());
+    // Replace f2 with the moved f1 (renamed f8).
+    mutation
+        .rename_child(1, "f1", Some((2, "f2")), moved)
+        .unwrap();
+    drop(mutation);
+    assert!(children.get_child_ptr("f1").is_none());
+    assert!(children.get_child_ptr("f2").is_none());
+    assert_eq!(children.get_child_ptr("f8").unwrap().id(), 1);
+    // f1..f4 seeded (4) minus f1, minus replaced f2, plus f8 = 3 entries.
+    assert_eq!(children.iter_len(), 3);
+}

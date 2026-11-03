@@ -27,13 +27,12 @@ use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 const MIN_SHARDED_CHILDREN: usize = 256;
 
 pub(crate) struct DirectoryShard {
     pub(crate) children: RwLock<InodeChildren>,
-    pub(crate) sequence: Arc<super::directory_children::SequenceState>,
 }
 
 pub(crate) struct ShardedChildren {
@@ -69,7 +68,6 @@ impl ShardedChildren {
             };
             let _ = shard.set(DirectoryShard {
                 children: RwLock::new(container),
-                sequence: Arc::new(super::directory_children::SequenceState::default()),
             });
         }
     }
@@ -93,7 +91,6 @@ impl ShardedChildren {
     pub(crate) fn shard_at(&self, index: usize) -> &DirectoryShard {
         self.shards[index].get_or_init(|| DirectoryShard {
             children: RwLock::new(super::InodeChildren::new_map()),
-            sequence: Arc::new(super::directory_children::SequenceState::default()),
         })
     }
 

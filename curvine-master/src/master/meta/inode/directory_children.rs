@@ -107,6 +107,20 @@ enum MutationGuard<'a> {
     Shard(RwLockWriteGuard<'a, InodeChildren>),
 }
 
+enum RenameMutationGuard<'a> {
+    Single(RwLockWriteGuard<'a, InodeChildren>),
+    Shards {
+        first: RwLockWriteGuard<'a, InodeChildren>,
+        second: Option<RwLockWriteGuard<'a, InodeChildren>>,
+        shard_count: usize,
+        first_index: usize,
+    },
+}
+
+/// Write window for a same-directory rename. Same-shard renames take one
+/// lock; cross-shard renames take both in shard-index ascending order, so
+/// two opposite renames can never form an ABBA cycle.
+
 /// Write window over one directory's child index: holds the index write lock
 /// plus the sequence bump for the whole mutation.
 pub struct DirectoryMutation<'a> {
@@ -191,6 +205,65 @@ impl DirectoryChildren {
         DirectoryMutation {
             children: MutationGuard::Single(children),
             _sequence: WriteSequence::begin(&self.sequence),
+        }
+    }
+
+    /// Begin a same-directory rename of `source_name` to `destination_name`.
+    /// Cross-shard locks are taken in shard-index ascending order (Astra's
+    /// rename protocol); single-index directories behave like a normal
+    /// mutation.
+    pub fn begin_rename_mutation(
+        &self,
+        source_name: &str,
+        destination_name: &str,
+    ) -> DirectoryRenameMutation<'_> {
+        if let Some(shards) = self.sharded() {
+            let source_index = shards.shard_index(source_name);
+            let destination_index = shards.shard_index(destination_name);
+            let (first_index, second_index) = if source_index <= destination_index {
+                (source_index, destination_index)
+            } else {
+                (destination_index, source_index)
+            };
+            let first = shards.shard_at(first_index).children.write();
+            let second = if second_index == first_index {
+                None
+            } else {
+                Some(shards.shard_at(second_index).children.write())
+            };
+            return DirectoryRenameMutation {
+                children: RenameMutationGuard::Shards {
+                    first,
+                    second,
+                    shard_count: shards.shards.len(),
+                    first_index,
+                },
+                _sequence: WriteSequence::begin(&self.sequence),
+            };
+        }
+
+        let (mut children, contended) = self.lock_children_for_mutation();
+        if self.sharded().is_some() {
+            drop(children);
+            return self.begin_rename_mutation(source_name, destination_name);
+        }
+        if self.should_promote_to_shards(children.len(), contended) {
+            self.promote_to_shards(&mut children);
+            drop(children);
+            return self.begin_rename_mutation(source_name, destination_name);
+        }
+
+        DirectoryRenameMutation {
+            children: RenameMutationGuard::Single(children),
+            _sequence: WriteSequence::begin(&self.sequence),
+        }
+    }
+
+    /// Owned version token for readers that must validate after the walk.
+    pub fn shared_version(self: &std::sync::Arc<Self>) -> DirectoryChildrenSharedVersion {
+        DirectoryChildrenSharedVersion {
+            children: self.clone(),
+            version: self.sequence.version(),
         }
     }
 
@@ -314,6 +387,112 @@ impl DirectoryMutation<'_> {
     }
 }
 
+/// Write window over one or two shards of the same directory.
+pub struct DirectoryRenameMutation<'a> {
+    children: RenameMutationGuard<'a>,
+    _sequence: WriteSequence<'a>,
+}
+
+impl DirectoryRenameMutation<'_> {
+    pub fn child_view(&self, name: &str) -> Option<InodeView> {
+        match &self.children {
+            RenameMutationGuard::Single(children) => {
+                children.get_child(name).map(|ptr| ptr.as_ref().clone())
+            }
+            RenameMutationGuard::Shards { first, second, .. } => first
+                .get_child(name)
+                .or_else(|| {
+                    second
+                        .as_ref()
+                        .and_then(|children| children.get_child(name))
+                })
+                .map(|ptr| ptr.as_ref().clone()),
+        }
+    }
+
+    /// Moves `source_name` to `destination_name` inside this directory.
+    /// `replaced` deletes the overwrite target first, mirroring the store
+    /// batch order of `apply_rename`. Each touched name routes to its own
+    /// shard; the guards exist so concurrent opposite renames serialize in
+    /// shard-index order rather than for name lookup.
+    pub fn rename_child(
+        &mut self,
+        source_id: i64,
+        source_name: &str,
+        replaced: Option<(i64, &str)>,
+        destination: InodeView,
+    ) -> CommonResult<()> {
+        match &mut self.children {
+            RenameMutationGuard::Single(children) => {
+                Self::apply_rename(children, source_id, source_name, replaced, destination)
+            }
+            RenameMutationGuard::Shards {
+                first,
+                second,
+                shard_count,
+                first_index,
+            } => {
+                // Route each touched name to the shard guard this mutation
+                // already owns; reads use the same hash, so the routing is
+                // consistent with them.
+                let source_index = super::sharded_children::shard_index(source_name, *shard_count);
+                let destination_index =
+                    super::sharded_children::shard_index(destination.name(), *shard_count);
+
+                // Sequential scoped borrows: each shard guard is borrowed for
+                // exactly one operation, so the borrow checker sees disjoint
+                // lifetimes.
+                if let Some((replaced_id, replaced_name)) = replaced {
+                    let replaced_index =
+                        super::sharded_children::shard_index(replaced_name, *shard_count);
+                    let replaced_shard: &mut InodeChildren = if replaced_index == *first_index {
+                        first
+                    } else {
+                        second
+                            .as_mut()
+                            .expect("cross-shard rename must own both shard guards")
+                    };
+                    let _ = replaced_shard.delete_child(replaced_id, replaced_name)?;
+                }
+
+                let source_shard: &mut InodeChildren = if source_index == *first_index {
+                    first
+                } else {
+                    second
+                        .as_mut()
+                        .expect("cross-shard rename must own both shard guards")
+                };
+                let _ = source_shard.delete_child(source_id, source_name)?;
+
+                let destination_shard: &mut InodeChildren = if destination_index == *first_index {
+                    first
+                } else {
+                    second
+                        .as_mut()
+                        .expect("cross-shard rename must own both shard guards")
+                };
+                let _ = destination_shard.add_child(destination)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_rename(
+        children: &mut InodeChildren,
+        source_id: i64,
+        source_name: &str,
+        replaced: Option<(i64, &str)>,
+        destination: InodeView,
+    ) -> CommonResult<()> {
+        if let Some((replaced_id, replaced_name)) = replaced {
+            let _ = children.delete_child(replaced_id, replaced_name)?;
+        }
+        let _ = children.delete_child(source_id, source_name)?;
+        let _ = children.add_child(destination)?;
+        Ok(())
+    }
+}
+
 /// Version token captured by a directory read. Borrows the handle so the
 /// reader cannot validate against a different directory's sequence.
 pub struct DirectoryReadVersion<'a> {
@@ -324,5 +503,24 @@ pub struct DirectoryReadVersion<'a> {
 impl DirectoryReadVersion<'_> {
     pub fn is_current(&self) -> bool {
         self.children.sequence.is_current(self.version)
+    }
+}
+
+/// Owned version record for path-walk readers: the handle captured at read
+/// time plus its sequence version. `is_current()` re-checks against the same
+/// handle, so a walk result can be validated long after the read.
+#[derive(Clone)]
+pub struct DirectoryChildrenSharedVersion {
+    children: std::sync::Arc<DirectoryChildren>,
+    version: u64,
+}
+
+impl DirectoryChildrenSharedVersion {
+    pub fn is_current(&self) -> bool {
+        self.children.sequence.is_current(self.version)
+    }
+
+    pub fn handle(&self) -> &std::sync::Arc<DirectoryChildren> {
+        &self.children
     }
 }

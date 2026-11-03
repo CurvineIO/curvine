@@ -403,6 +403,17 @@ impl InodeView {
         }
     }
 
+    /// Shared child-index handle for versioned directory reads; `None` for
+    /// non-directory views.
+    pub fn children_handle(
+        &self,
+    ) -> Option<std::sync::Arc<crate::master::meta::inode::DirectoryChildren>> {
+        match self {
+            Dir(d) => Some(d.children_handle()),
+            _ => None,
+        }
+    }
+
     pub fn as_file_ref(&self) -> CommonResult<&InodeFile> {
         match self {
             File(f) => Ok(f),
