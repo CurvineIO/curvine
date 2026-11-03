@@ -858,6 +858,49 @@ mod tests {
     }
 
     #[test]
+    fn bound_credit_survives_heartbeat_reinsert_and_settles() {
+        let mut manager = robin_manager();
+        let available = 1 << 30;
+        let block_size = 128 << 20;
+        let mut worker = worker_with_available(1, available);
+        worker.capacity = available;
+        let addr = worker.address.clone();
+        manager.add_test_worker(worker);
+
+        let chosen = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&chosen, 1, block_size);
+
+        // The heartbeat re-insert replaces the WorkerInfo; the credit map
+        // must be carried over (carry_scheduled_from), not reset.
+        let cluster_id = manager.cluster_id.clone();
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                String::new(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![storage(available, available)],
+                None,
+            )
+            .unwrap();
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+
+        let commit = CommitBlock {
+            block_id: 1,
+            block_len: 4096,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 4096);
+    }
+
+    #[test]
     fn heartbeat_reclaims_scheduled_bytes_by_available_delta() {
         let mut manager = robin_manager();
         let available = 1 << 30;

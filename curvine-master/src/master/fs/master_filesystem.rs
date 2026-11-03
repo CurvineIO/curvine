@@ -3297,6 +3297,66 @@ mod tests {
     }
 
     #[test]
+    fn assign_worker_commit_settles_through_entry_path() {
+        let fs = test_fs("assign-worker-settle");
+        let capacity = 1 << 40;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/assign/settle.log", true).unwrap();
+        let blocks = fs
+            .resize(
+                "/assign/settle.log",
+                FileAllocOpts::with_alloc(created.block_size, FileAllocMode::DEFAULT),
+            )
+            .unwrap();
+        let block = blocks.block_locs[0].block.clone();
+        let located = fs
+            .assign_worker(
+                "/assign/settle.log",
+                block,
+                ClientAddress::default(),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size
+        );
+
+        // The commit settles the credit bound by assign_worker: removing that
+        // bind call leaves the full block reserved and fails this assertion.
+        let mut commit = CommitBlock::from(&located);
+        commit.block_len = 4096;
+        fs.complete_file(
+            "/assign/settle.log",
+            None,
+            4096,
+            vec![commit],
+            "client",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            4096
+        );
+    }
+
+    #[test]
     fn soft_delete_moves_file_into_trash_with_origin_metadata() {
         let fs = test_fs_with_trash("soft-file");
         fs.create("/data/a.log", true).unwrap();
