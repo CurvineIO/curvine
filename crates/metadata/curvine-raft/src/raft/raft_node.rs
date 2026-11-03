@@ -17,6 +17,7 @@
 use crate::conf::{JournalConf, JournalConfExt};
 use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
+use crate::raft::raft_server::RetryState;
 use crate::raft::recovery::{PeerSessions, Recovery, SessionEvent};
 use crate::raft::storage::{AppStorage, ApplyMsg, LogStorage, PeerStorage};
 use crate::raft::*;
@@ -99,6 +100,11 @@ where
     last_snapshot_ms: u64,
 
     last_snapshot_op_id: u64,
+
+    // Dedup cache shared with the rpc handlers. Entries are inserted as
+    // `RetryState::InFlight` when the request reaches the node and flipped to
+    // `RetryState::Committed` once the entry is applied.
+    retry_cache: RetryCache,
 }
 
 impl<A, B> RaftNode<A, B>
@@ -115,6 +121,7 @@ where
         role_monitor: RoleMonitor,
         receiver: mpsc::Receiver<Envelope>,
         sender: mpsc::Sender<Envelope>,
+        retry_cache: RetryCache,
         logger: &slog::Logger,
     ) -> RaftResult<Self> {
         let group = RaftGroup::from_conf(conf);
@@ -168,6 +175,7 @@ where
             snapshot_entries,
             last_snapshot_ms: LocalTime::mills(),
             last_snapshot_op_id,
+            retry_cache,
         };
 
         Ok(node)
@@ -1024,11 +1032,21 @@ where
                 self.storage
                     .apply_propose(false, ApplyMsg::new_entry(entry))
                     .await?;
+                if let Some(context) = &entry_context {
+                    if let Ok(req_id) = SerdeUtils::deserialize::<i64>(context) {
+                        self.mark_retry_committed(req_id);
+                    }
+                }
                 Builder::new_rpc(RaftCode::ConfChange)
                     .response(ResponseStatus::Success)
                     .proto_header(rep)
             } else {
                 let apply = self.apply_propose(entry, should_respond).await?;
+                if let Some(context) = &entry_context {
+                    if let Ok(req_id) = SerdeUtils::deserialize::<i64>(context) {
+                        self.mark_retry_committed(req_id);
+                    }
+                }
                 if should_respond {
                     let Some(entry_context) = entry_context else {
                         continue;
@@ -1093,6 +1111,13 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Flip the dedup cache entry of `req_id` to committed after its log entry
+    /// was applied successfully. Only a committed state may be acknowledged as
+    /// a duplicate success to a retrying caller.
+    fn mark_retry_committed(&self, req_id: i64) {
+        self.retry_cache.insert(req_id, RetryState::Committed);
     }
 }
 

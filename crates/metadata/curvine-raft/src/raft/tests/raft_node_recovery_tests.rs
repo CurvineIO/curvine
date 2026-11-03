@@ -15,12 +15,15 @@
 use super::*;
 use crate::raft::storage::{ApplyMsg, HashAppStorage, MemLogStorage, RocksLogStorage};
 use curvine_config::RaftPeer;
-use curvine_net::net::NetUtils;
+use curvine_net::net::{InetAddr, NetUtils};
 use curvine_runtime::sync::StateCtl;
+use mini_moka::sync::CacheBuilder;
 use raft::eraftpb::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeV2, HardState, Message, Snapshot,
 };
 use raft::{StateRole, Storage};
+use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 fn test_node(rt: Arc<Runtime>, id: u64) -> RaftNode<MemLogStorage, HashAppStorage<String, String>> {
@@ -112,6 +115,11 @@ fn test_node_with_app<B: AppStorage>(
         snapshot_entries: conf.snapshot_entries,
         last_snapshot_ms: 0,
         last_snapshot_op_id: 0,
+        retry_cache: Arc::new(
+            CacheBuilder::new(1024)
+                .time_to_live(Duration::from_secs(600))
+                .build(),
+        ),
     }
 }
 
@@ -273,6 +281,11 @@ fn test_rocks_node_with_app<B: AppStorage>(
         snapshot_entries: conf.snapshot_entries,
         last_snapshot_ms: 0,
         last_snapshot_op_id: 0,
+        retry_cache: Arc::new(
+            CacheBuilder::new(1024)
+                .time_to_live(Duration::from_secs(600))
+                .build(),
+        ),
     }
 }
 
@@ -699,6 +712,11 @@ fn a_restarting_candidate_anchors_the_snapshot_marker_at_the_restored_state() {
             RoleMonitor::new(),
             receiver,
             sender,
+            Arc::new(
+                CacheBuilder::new(1024)
+                    .time_to_live(Duration::from_secs(600))
+                    .build(),
+            ),
             &slog::Logger::root(slog::Discard, slog::o!()),
         ))
         .unwrap();
@@ -2350,5 +2368,123 @@ fn idle_follower_answers_a_callback_left_over_from_an_older_term() {
         matches!(error, RaftError::LeaderNotReady(_)),
         "expected LeaderNotReady, got {:?}",
         error
+    );
+}
+
+// A propose that was parked by the leader must not flip the dedup cache to
+// committed when the leader steps down: the entry may never commit. Only the
+// real apply path may mark the request committed (issue #1906).
+#[test]
+fn step_down_does_not_mark_a_parked_propose_committed() {
+    let rt = JournalConf::with_test().create_runtime();
+    // A single-voter group lets the entry commit locally without real peers.
+    let mut node = test_node_with_voters(rt.clone(), 1, vec![1]);
+    let mut promise: PendingPromises = HashMap::new();
+    let retry_cache = node.retry_cache.clone();
+
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+
+    let req_id = 4242;
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let msg = Builder::new_rpc(RaftCode::Propose)
+        .req_id(req_id)
+        .proto_header(ProposeRequest {
+            data: b"payload".to_vec(),
+        })
+        .build();
+    node.handle_propose(Envelope::new(msg, tx), &mut promise)
+        .unwrap();
+    assert_eq!(retry_cache.get(&req_id), None);
+
+    // Step down without applying anything: the cache must stay in-flight-free.
+    node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
+    drive_one_driver_round(&rt, &mut node, &mut promise);
+
+    assert_eq!(
+        retry_cache.get(&req_id),
+        None,
+        "an unapplied proposal must never be marked committed"
+    );
+}
+
+// Once the entry really applies, the dedup cache must record it as committed so
+// a retrying caller gets the dedup success instead of a re-propose.
+#[test]
+fn applied_propose_marks_the_retry_cache_committed() {
+    let rt = JournalConf::with_test().create_runtime();
+    // A single-voter group lets the entry commit locally without real peers.
+    let mut node = test_node_with_voters(rt.clone(), 1, vec![1]);
+    let mut promise: PendingPromises = HashMap::new();
+    let retry_cache = node.retry_cache.clone();
+
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: node.id(),
+        raft_state: raft::StateRole::Leader,
+    });
+
+    let req_id = 4343;
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let msg = Builder::new_rpc(RaftCode::Propose)
+        .req_id(req_id)
+        .proto_header(ProposeRequest {
+            data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+        })
+        .build();
+    node.handle_propose(Envelope::new(msg, tx), &mut promise)
+        .unwrap();
+    assert_eq!(retry_cache.get(&req_id), None);
+
+    // Drive the ready loop until the entry is applied.
+    drive_one_driver_round(&rt, &mut node, &mut promise);
+
+    assert_eq!(
+        retry_cache.get(&req_id),
+        Some(RetryState::Committed),
+        "the applied proposal must be recorded as committed"
+    );
+}
+
+// A conf change is deduplicated by the same cache and must only be applied once:
+// the first apply marks the req_id committed, so a repeat gets the cached
+// success instead of applying a second time.
+#[test]
+fn applied_conf_change_marks_the_retry_cache_committed() {
+    let rt = JournalConf::with_test().create_runtime();
+    // A single-voter group lets the entry commit locally without real peers.
+    let mut node = test_node_with_voters(rt.clone(), 1, vec![1]);
+    let mut promise: PendingPromises = HashMap::new();
+    let retry_cache = node.retry_cache.clone();
+
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+
+    let req_id = 4444;
+    let change = ConfChange {
+        change_type: ConfChangeType::AddNode.into(),
+        node_id: 4,
+        context: SerdeUtils::serialize(&InetAddr::new("127.0.0.1", 9104)).unwrap(),
+        ..Default::default()
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let msg = Builder::new_rpc(RaftCode::ConfChange)
+        .req_id(req_id)
+        .proto_header(ConfChangeRequest { change })
+        .build();
+    node.handle_available(Envelope::new(msg, tx), &mut promise)
+        .unwrap();
+    assert!(promise.contains_key(&req_id));
+    assert_eq!(retry_cache.get(&req_id), None);
+
+    // Drive the ready loop until the conf change is applied.
+    drive_one_driver_round(&rt, &mut node, &mut promise);
+    let response = rt.block_on(rx).unwrap().unwrap();
+    assert!(response.is_success());
+    assert_eq!(
+        retry_cache.get(&req_id),
+        Some(RetryState::Committed),
+        "the applied conf change must be recorded as committed"
     );
 }
