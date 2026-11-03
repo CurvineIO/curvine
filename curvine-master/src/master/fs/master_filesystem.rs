@@ -22,6 +22,7 @@ use crate::master::meta::{
 };
 
 use crate::master::fs::state::{SessionHeartbeat, SessionMap};
+use crate::master::fs::worker_manager::WorkerManager;
 use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
@@ -122,9 +123,10 @@ impl Drop for PurgingGuard<'_> {
     }
 }
 
-/// Reservation taken for a pre-allocated first block.
+/// Reservation taken for a pre-allocated first block. The release settles the
+/// block's bound credit on these workers, so only the stamps' worker ids are
+/// consumed.
 struct PreAllocBlock {
-    block_size: i64,
     /// `(worker_id, scheduled_since_ms)` right after the reservation.
     stamps: Vec<(u32, u64)>,
     alloc_ms: u64,
@@ -1221,14 +1223,12 @@ impl MasterFilesystem {
             if !file.blocks.is_empty() || file.len != 0 {
                 return Ok(None);
             }
-            let block_size = file.block_size as i64;
             let block =
                 self.allocate_block(&mut fs_dir, path, inode, client_addr, vec![], vec![], 0)?;
             let stamps = self.worker_manager.read().schedule_stamps(&block.locs);
             self.register_pre_alloc(
                 block.block.id,
                 PreAllocBlock {
-                    block_size,
                     stamps,
                     alloc_ms: LocalTime::mills(),
                 },
@@ -1347,6 +1347,7 @@ impl MasterFilesystem {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
+        let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         let block =
             match fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len) {
                 Ok(block) => block,
@@ -1357,6 +1358,11 @@ impl MasterFilesystem {
                     return Err(e);
                 }
             };
+        {
+            let mut wm = self.worker_manager.write();
+            wm.settle_committed_blocks(&settle_blocks);
+            wm.bind_scheduled_blocks(&choose_workers, block.id, block_size);
+        }
         let located = LocatedBlock {
             block,
             locs: choose_workers,
@@ -1441,6 +1447,7 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         let committed: Vec<i64> = commit_blocks.iter().map(|v| v.block_id).collect();
         // Only the creator of a still-registered pre-allocation may release
         // it. Checked under `fs_dir`, which also serialises the hand-offs in
@@ -1458,7 +1465,10 @@ impl MasterFilesystem {
             options.set_attr_opts,
             release_block_id,
         )?;
-        let released_entry = released.and_then(|b| self.pre_alloc.lock().remove(&b.id));
+        let released_entry = released.and_then(|b| {
+            let entry = self.pre_alloc.lock().remove(&b.id)?;
+            Some((b.id, entry))
+        });
         self.forget_pre_alloc(committed);
 
         let res = if options.only_flush && options.return_file_blocks {
@@ -1473,12 +1483,22 @@ impl MasterFilesystem {
         };
         drop(fs_dir);
 
-        // Return the capacity reserved when the block was chosen, after the
-        // namespace lock is gone (same order as delete/free).
-        if let Some(entry) = released_entry {
-            self.worker_manager
-                .write()
-                .unschedule_stamped(&entry.stamps, entry.block_size);
+        // Settle the committed blocks, and return an unwritten pre-allocated
+        // block's remaining credit, after the namespace lock is gone (same
+        // order as delete/free). Settling the released block to zero returns
+        // exactly the credit it still owns; credit a heartbeat already
+        // reclaimed stays reclaimed.
+        {
+            let mut wm = self.worker_manager.write();
+            wm.settle_committed_blocks(&settle_blocks);
+            if let Some((block_id, entry)) = released_entry {
+                let releases: Vec<_> = entry
+                    .stamps
+                    .iter()
+                    .map(|&(worker_id, _)| (block_id, 0, worker_id))
+                    .collect();
+                wm.settle_committed_blocks(&releases);
+            }
         }
 
         res
@@ -2457,7 +2477,13 @@ impl MasterFilesystem {
                 // Another writer is now writing this block: a pending release
                 // from its creator must not drop it.
                 self.forget_pre_alloc([block.id]);
-                if !assigned {
+                if assigned {
+                    self.worker_manager.write().bind_scheduled_blocks(
+                        &choose_workers,
+                        block.id,
+                        block_size,
+                    );
+                } else {
                     self.worker_manager
                         .write()
                         .unschedule_chosen_workers(&choose_workers, block_size);
@@ -3271,6 +3297,66 @@ mod tests {
     }
 
     #[test]
+    fn assign_worker_commit_settles_through_entry_path() {
+        let fs = test_fs("assign-worker-settle");
+        let capacity = 1 << 40;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/assign/settle.log", true).unwrap();
+        let blocks = fs
+            .resize(
+                "/assign/settle.log",
+                FileAllocOpts::with_alloc(created.block_size, FileAllocMode::DEFAULT),
+            )
+            .unwrap();
+        let block = blocks.block_locs[0].block.clone();
+        let located = fs
+            .assign_worker(
+                "/assign/settle.log",
+                block,
+                ClientAddress::default(),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size
+        );
+
+        // The commit settles the credit bound by assign_worker: removing that
+        // bind call leaves the full block reserved and fails this assertion.
+        let mut commit = CommitBlock::from(&located);
+        commit.block_len = 4096;
+        fs.complete_file(
+            "/assign/settle.log",
+            None,
+            4096,
+            vec![commit],
+            "client",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            4096
+        );
+    }
+
+    #[test]
     fn soft_delete_moves_file_into_trash_with_origin_metadata() {
         let fs = test_fs_with_trash("soft-file");
         fs.create("/data/a.log", true).unwrap();
@@ -4035,6 +4121,114 @@ mod tests {
             .unwrap();
         assert_eq!(blocks.status.len, 128);
     }
+    #[test]
+    fn complete_file_settles_commit_reservation_through_entry_path() {
+        let fs = test_fs("complete-file-settles");
+        let capacity = 1 << 40;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/settle/small.log", true).unwrap();
+        let located = fs
+            .add_block(
+                "/settle/small.log",
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size
+        );
+
+        let mut commit = CommitBlock::from(&located);
+        commit.block_len = 4096;
+        fs.complete_file(
+            "/settle/small.log",
+            None,
+            4096,
+            vec![commit],
+            "client",
+            false,
+            None,
+        )
+        .unwrap();
+
+        // The unused remainder is released on commit; only the written bytes
+        // stay reserved until the heartbeat delta reclaims them.
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            4096
+        );
+    }
+
+    #[test]
+    fn add_block_settles_previous_commit_through_entry_path() {
+        let fs = test_fs("add-block-settles");
+        let capacity = 1 << 40;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/settle/grow.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .add_block(
+                "/settle/grow.log",
+                None,
+                client.clone(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+
+        let mut commit = CommitBlock::from(&first);
+        commit.block_len = 4096;
+        let second = fs
+            .add_block(
+                "/settle/grow.log",
+                None,
+                client,
+                vec![commit],
+                vec![],
+                4096,
+                Some(first.block.clone()),
+            )
+            .unwrap();
+        assert_ne!(second.block.id, first.block.id);
+
+        // The first block's reservation settles to its committed 4 KiB while
+        // the new block holds a fresh full reservation.
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size + 4096
+        );
+    }
 
     // Journal enabled in testing mode: entries stay on the writer's channel and
     // every journaled mutation emits a leader checkpoint.
@@ -4518,12 +4712,15 @@ mod tests {
             .alloc_first_block("/a.log", a.id, client.clone())
             .unwrap();
 
-        // Expiry (or a full heartbeat reclaim) clears the window.
+        // Expiry (or a full heartbeat reclaim) clears the window, the block
+        // credits, and their running sum together.
         {
             let mut wm = fs.worker_manager.write();
             let worker = wm.worker_map.workers.get_mut(&1).unwrap();
             worker.scheduled_bytes = 0;
             worker.scheduled_since_ms = 0;
+            worker.scheduled_blocks.clear();
+            worker.scheduled_block_bytes = 0;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
 
