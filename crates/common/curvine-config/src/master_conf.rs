@@ -279,7 +279,12 @@ impl MasterConf {
             use_bloom_filter: true,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks_in_cache: true,
-            // Production baseline for a 10-50M inode master (32-64GB memory).
+            // Production baseline for a 10-50M inode master with 32-64GB memory
+            // and at least 6 cores. Smaller masters should lower
+            // `block_cache_size` and `max_background_jobs`. A `[master.rocksdb]`
+            // table replaces these defaults (unset keys fall back to
+            // `DBConf::default()`), so copy the full block from
+            // etc/curvine-cluster.toml and keep it in sync with this function.
             block_cache_size: ByteUnit::gb(4),
             max_background_jobs: 6,
             max_subcompactions: 2,
