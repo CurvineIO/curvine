@@ -17,7 +17,7 @@ use crate::worker::handler::{DirWriteMetrics, WriteContext};
 use crate::worker::storage::BlockWriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_core_error::{err_box, ternary, try_option_mut, CommonResult};
-use curvine_error::{FsError, FsResult};
+use curvine_error::{ErrorKind, FsError, FsResult};
 use curvine_model::{ExtendedBlock, FileAllocMode};
 use curvine_proto::{BlockWriteResponse, DataHeaderProto};
 use curvine_rpc::message::{Builder, Message, RequestStatus};
@@ -52,8 +52,18 @@ pub(crate) struct PendingAbort {
     pub(crate) block: ExtendedBlock,
     /// Retry with abort_block_uncertain() instead of abort_block().
     pub(crate) uncertain: bool,
-    /// The original failure, re-reported on every retry.
+    /// The original failure, re-returned with the same kind on every retry.
+    pub(crate) kind: ErrorKind,
     pub(crate) error: String,
+}
+
+impl PendingAbort {
+    fn to_error(&self) -> FsError {
+        match self.kind {
+            ErrorKind::IO => FsError::io(std::io::Error::other(self.error.clone())),
+            _ => FsError::common(&self.error),
+        }
+    }
 }
 
 pub struct WriteHandler {
@@ -357,7 +367,7 @@ impl WriteHandler {
     /// Abort the block, then either latch is_commit (terminal) or record a
     /// PendingAbort so the next Complete/Cancel retries this exact abort
     /// instead of reaching commit_block() with the flush context lost.
-    fn abort_or_defer(&mut self, block: &ExtendedBlock, uncertain: bool, error: &str) {
+    fn abort_or_defer(&mut self, block: &ExtendedBlock, uncertain: bool, error: &FsError) {
         let abort_result = if uncertain {
             self.store.abort_block_uncertain(block)
         } else {
@@ -379,6 +389,7 @@ impl WriteHandler {
             self.pending_abort = Some(PendingAbort {
                 block: block.clone(),
                 uncertain,
+                kind: error.kind(),
                 error: error.to_string(),
             });
         }
@@ -396,8 +407,9 @@ impl WriteHandler {
         // A prior abort failed non-terminally: self.file is already gone, so
         // retry only that abort. Never fall through to commit_block().
         if let Some(pending) = self.pending_abort.take() {
-            self.abort_or_defer(&pending.block, pending.uncertain, &pending.error);
-            return err_box!("{}", pending.error);
+            let error = pending.to_error();
+            self.abort_or_defer(&pending.block, pending.uncertain, &error);
+            return Err(error);
         }
 
         let write_dir_id = self.context.as_ref().map(|c| c.dir_id);
@@ -415,19 +427,20 @@ impl WriteHandler {
                 if let Some(dir_id) = write_dir_id {
                     Self::record_write_error(self.metrics, dir_id, &flush_err);
                 }
-                self.abort_or_defer(&context.block, uncertain, &flush_err.to_string());
-                return Err(flush_err.into());
+                let error: FsError = flush_err.into();
+                self.abort_or_defer(&context.block, uncertain, &error);
+                return Err(error);
             }
             drop(file);
         }
 
         if context.block.len > context.block_size {
-            let error = format!(
+            let error = FsError::common(format!(
                 "Invalid block length: {}, block size: {}",
                 context.block.len, context.block_size
-            );
+            ));
             self.abort_or_defer(&context.block, false, &error);
-            return err_box!("{}", error);
+            return Err(error);
         }
 
         if let Err(commit_err) = self.commit_block(&context.block, commit) {
@@ -486,7 +499,7 @@ mod tests {
     use crate::worker::storage::{BlockWriteContext, Dataset};
     use crate::worker::Worker;
     use curvine_config::{ClusterConf, WorkerConf};
-    use curvine_error::{FsError, FsResult};
+    use curvine_error::{ErrorKind, FsError, FsResult};
     use curvine_io::{BlockIO, DataSlice};
     use curvine_model::{ExtendedBlock, FileType, StorageType};
     use curvine_proto::DataHeaderProto;
@@ -1981,10 +1994,11 @@ mod tests {
 
         // RPC 1: flush fails, abort fails too.
         store.set_force_transient_abort_failure_for_test(true);
-        let err = handler
+        let first = handler
             .complete(&complete_msg(&block, block_size, 1), true)
             .unwrap_err();
-        assert!(err.to_string().contains("flush failed"), "{err}");
+        assert!(first.to_string().contains("flush failed"), "{first}");
+        assert!(matches!(first.kind(), ErrorKind::IO), "{:?}", first.kind());
         assert!(!handler.is_commit, "must stay retryable");
         assert!(
             handler.pending_abort.is_some(),
@@ -1999,6 +2013,16 @@ mod tests {
         assert!(
             err.to_string().contains("flush failed"),
             "retry must re-report the original flush error, not succeed: {err}"
+        );
+        assert_eq!(
+            err.kind() as i32,
+            first.kind() as i32,
+            "retry must keep the original error kind"
+        );
+        assert_eq!(
+            err.to_string().matches("ERROR:").count(),
+            first.to_string().matches("ERROR:").count(),
+            "retry must not re-wrap the message: {err}"
         );
         assert!(handler.is_commit, "removed block is terminal: must latch");
         assert!(
