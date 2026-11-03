@@ -34,13 +34,24 @@ impl WriteFrame {
     }
 
     pub async fn send(&mut self, msg: &Message) -> IOResult<()> {
-        let mut tail: Option<&[u8]> = None;
-
-        let start = self.buf.len();
+        let mut start = self.buf.len();
         msg.encode_protocol(&mut self.buf);
 
+        // Coalescing bound applies to header and data alike: streaming an
+        // oversized section straight from the message avoids a full extra
+        // memcpy and keeps the connection's write buffer from pinning the
+        // largest header ever sent (master responses are header-only, e.g.
+        // big ListStatus replies).
         if let Some(h) = &msg.header {
-            self.buf.extend_from_slice(h);
+            if h.len() <= Self::MAX_COALESCE {
+                self.buf.extend_from_slice(h);
+            } else {
+                if self.buf.len() > start {
+                    self.io.write_all(&self.buf.split()).await?;
+                }
+                self.io.write_all(h).await?;
+                start = self.buf.len();
+            }
         }
 
         let slice = msg.data.as_slice();
@@ -48,16 +59,16 @@ impl WriteFrame {
             if slice.len() <= Self::MAX_COALESCE {
                 self.buf.extend_from_slice(slice);
             } else {
-                tail = Some(slice);
+                if self.buf.len() > start {
+                    self.io.write_all(&self.buf.split()).await?;
+                }
+                self.io.write_all(slice).await?;
+                start = self.buf.len();
             }
         }
 
         if self.buf.len() > start {
             self.io.write_all(&self.buf.split()).await?;
-        }
-
-        if let Some(slice) = tail {
-            self.io.write_all(slice).await?;
         }
 
         Ok(())
@@ -77,9 +88,10 @@ impl WriteFrame {
         let before = self.buf.len();
         for (i, msg) in msgs.iter().enumerate() {
             let slice = msg.data.as_slice();
-            if slice.len() > Self::MAX_COALESCE {
+            let header_len = msg.header.as_ref().map_or(0, |h| h.len());
+            if header_len + slice.len() > Self::MAX_COALESCE {
                 // Flush the coalesced prefix, then stream the rest (including
-                // the large message) with the per-message path.
+                // the oversized message) with the per-message path.
                 if self.buf.len() > before {
                     self.io.write_all(&self.buf.split()).await?;
                 }
@@ -133,7 +145,7 @@ mod tests {
         let small1 = Builder::new_rpc(1i8).build();
         let large = Builder::new_rpc(2i8)
             .data(DataSlice::Buffer(BytesMut::zeroed(
-                WriteFrame::MAX_COALESCE as usize + 1024,
+                WriteFrame::MAX_COALESCE + 1024,
             )))
             .build();
         let small2 = Builder::new_rpc(3i8).build();
@@ -146,7 +158,7 @@ mod tests {
         let m3 = read_frame.receive().await.unwrap();
         assert_eq!(m1.protocol.code, 1);
         assert_eq!(m2.protocol.code, 2);
-        assert_eq!(m2.data.len(), WriteFrame::MAX_COALESCE as usize + 1024);
+        assert_eq!(m2.data.len(), WriteFrame::MAX_COALESCE + 1024);
         assert_eq!(m3.protocol.code, 3);
     }
 }

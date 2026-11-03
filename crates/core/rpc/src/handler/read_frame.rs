@@ -60,7 +60,9 @@ impl ReadFrame {
         loop {
             match self.pending.take() {
                 Some((protocol, header_size, data_size)) => {
-                    let need = (header_size + data_size) as usize;
+                    // Both are validated non-negative i32; summing in usize
+                    // cannot wrap, unlike the i32 add.
+                    let need = header_size as usize + data_size as usize;
                     if self.buf.len() < need {
                         self.pending = Some((protocol, header_size, data_size));
                     } else {
@@ -93,17 +95,16 @@ impl ReadFrame {
                         let (protocol, header_size, data_size) =
                             Message::decode_protocol(self.buf.deref_mut())?;
                         // decode_protocol only bounds data_size; header_size is
-                        // attacker-controlled on a server, and a negative value
-                        // would wrap `(header_size + data_size) as usize` into a
-                        // target the buffer can never reach, stalling the
-                        // connection while it grows without bound.
-                        if header_size < 0
-                            || header_size as i64 + data_size as i64 > message::MAX_DATE_SIZE as i64
-                        {
+                        // unbounded (large header-only responses such as
+                        // ListStatus are legitimate). A negative header_size
+                        // would wrap the usize fill target computed below into
+                        // something the buffer can never reach, stalling the
+                        // connection while it grows without bound, so reject it
+                        // here. With header_size >= 0 the usize sum cannot wrap.
+                        if header_size < 0 {
                             return err_box!(
-                                "invalid frame head: header_size={}, data_size={}",
-                                header_size,
-                                data_size
+                                "invalid frame head: negative header_size={}",
+                                header_size
                             );
                         }
                         self.pending = Some((protocol, header_size, data_size));
@@ -257,5 +258,31 @@ mod tests {
 
         let res = read_frame.receive().await;
         assert!(res.is_err(), "negative header_size must be rejected");
+    }
+
+    #[tokio::test]
+    async fn receive_accepts_header_above_max_date_size() {
+        // Master responses are header-only protobuf, and ListStatus is
+        // unpaginated, so headers larger than MAX_DATE_SIZE (the data-section
+        // cap) are legitimate and must not be rejected.
+        let (mut read_frame, mut client_write) = setup_pair().await;
+
+        let mut msg = Builder::new_rpc(1i8).build();
+        msg.header = Some(BytesMut::zeroed(
+            message::MAX_DATE_SIZE as usize + 1024 * 1024,
+        ));
+        let mut frame = BytesMut::new();
+        msg.encode(&mut frame).unwrap();
+
+        // Write concurrently: an 18 MiB frame overflows the socket buffers,
+        // so the writer must make progress while receive() drains.
+        let writer = tokio::spawn(async move {
+            client_write.write_all(&frame).await.unwrap();
+        });
+
+        let got = read_frame.receive().await.unwrap();
+        writer.await.unwrap();
+        let header = got.header.expect("header must round-trip");
+        assert_eq!(header.len(), message::MAX_DATE_SIZE as usize + 1024 * 1024);
     }
 }
