@@ -1039,27 +1039,20 @@ impl MasterFilesystem {
         inode_id: Option<i64>,
     ) -> FsResult<FileStatus> {
         let path = path.as_ref();
+        // Stable shared-lock resolve: the directory sequence only covers
+        // namespace structure, not per-inode content or attribute changes
+        // (complete_file / set_attr bump neither), so an optimistic walk
+        // could publish a stale size or mode. The per-inode version that
+        // Astra pairs with its file-status cache is a phase-3B component.
+        let fs_dir = self.fs_dir.read();
         if inode_id.is_none_or(|id| id <= 0) {
-            // Optimistic walk: shared directory handles + version re-check,
-            // falling back to the stable shared-lock resolve on starvation.
-            // The fallback keeps the pending-path rejection for clients.
-            let inp = match self.resolve_shared_retry(path)? {
-                Some(inp) if !trash::is_pending_path(inp.path()) => Some(inp),
-                Some(_) => None,
-                None => {
-                    let fs_dir = self.fs_dir.read();
-                    Self::resolve_path(&fs_dir, path).ok()
-                }
-            };
-            return match inp.as_ref().and_then(|inp| inp.get_last_inode()) {
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            return match inp.get_last_inode() {
                 Some(inode) => Ok(inode.to_file_status(path)?),
                 None => err_ext!(FsError::file_not_found(path)),
             };
         }
-        let inode = {
-            let fs_dir = self.fs_dir.read();
-            Self::resolve_file_inode(&fs_dir, path, inode_id)?
-        };
+        let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         Ok(inode.to_file_status(path)?)
     }
 
@@ -1103,9 +1096,11 @@ impl MasterFilesystem {
     }
 
     pub fn list_status<T: AsRef<str>>(&self, path: T) -> FsResult<Vec<FileStatus>> {
+        // Stable shared-lock read: listing returns inode content (sizes,
+        // mtimes), which the directory sequence alone cannot vouch for.
+        let fs_dir = self.fs_dir.read();
         let (is_glob_pattern, _) = parse_glob_pattern(path.as_ref());
         if is_glob_pattern {
-            let fs_dir = self.fs_dir.read();
             let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;
             let mut all_statuses = Vec::new();
             for path in &paths {
@@ -1115,20 +1110,12 @@ impl MasterFilesystem {
                 let statuses = fs_dir.list_status(path)?;
                 all_statuses.extend(Self::hide_pending(path.path(), statuses));
             }
-            return Ok(all_statuses);
+            Ok(all_statuses)
+        } else {
+            let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+            let statuses = fs_dir.list_status(&inp)?;
+            Ok(Self::hide_pending(inp.path(), statuses))
         }
-
-        // Versioned walk validates the listing snapshot; the listing itself
-        // only borrows the store, so no global lock is needed on this path.
-        let inp = match self.resolve_shared_retry(path.as_ref())? {
-            Some(inp) if !trash::is_pending_path(inp.path()) => inp,
-            _ => {
-                let fs_dir = self.fs_dir.read();
-                Self::resolve_path(&fs_dir, path.as_ref())?
-            }
-        };
-        let statuses = self.fs_dir.read().list_status(&inp)?;
-        Ok(Self::hide_pending(inp.path(), statuses))
     }
 
     pub fn list_options<T: AsRef<str>>(
@@ -1137,18 +1124,14 @@ impl MasterFilesystem {
         opts: ListOptions,
     ) -> FsResult<Vec<FileStatus>> {
         let path = path.as_ref();
-        if parse_glob_pattern(path).0 {
+        // Stable shared-lock read, same consistency reasoning as list_status.
+        let fs_dir = self.fs_dir.read();
+        let (is_glob_pattern, _) = parse_glob_pattern(path);
+        if is_glob_pattern {
             return err_box!("list_options does not support glob pattern, path {}", path);
         }
-
-        let inp = match self.resolve_shared_retry(path)? {
-            Some(inp) if !trash::is_pending_path(inp.path()) => inp,
-            _ => {
-                let fs_dir = self.fs_dir.read();
-                Self::resolve_path(&fs_dir, path)?
-            }
-        };
-        let statuses = self.fs_dir.read().list_options(&inp, &opts)?;
+        let inp = Self::resolve_path(&fs_dir, path)?;
+        let statuses = fs_dir.list_options(&inp, &opts)?;
         Ok(Self::hide_pending(inp.path(), statuses))
     }
 
@@ -1497,14 +1480,11 @@ impl MasterFilesystem {
     }
 
     pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
+        // Stable shared-lock read: blocks and status must reflect completed
+        // writes, which the directory sequence alone cannot vouch for.
+        let fs_dir = self.fs_dir.read();
         let path = path.as_ref();
-        let inp = match self.resolve_shared_retry(path)? {
-            Some(inp) if !trash::is_pending_path(inp.path()) => inp,
-            _ => {
-                let fs_dir = self.fs_dir.read();
-                Self::resolve_path(&fs_dir, path)?
-            }
-        };
+        let inp = Self::resolve_path(&fs_dir, path)?;
 
         let inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -1517,15 +1497,14 @@ impl MasterFilesystem {
         let needs_touch = inode.is_file() && Self::atime_refresh_due(&inode);
 
         let file = inode.as_file_ref()?;
-        // Short shared-lock window for the store/evictor lookup; the versioned
-        // walk above already validated the inode snapshot.
-        let block_locs = self.get_block_locs(path, &self.fs_dir.read(), file)?;
+        let block_locs = self.get_block_locs(path, &fs_dir, file)?;
         let locate_blocks = FileBlocks {
             status: inode.to_file_status(path)?,
             block_locs,
         };
 
         if needs_touch {
+            drop(fs_dir);
             // Best-effort refresh: a concurrent delete (or any re-resolve
             // failure) between the read and write locks must not turn an
             // already-successful locate into an error, so both failures are
