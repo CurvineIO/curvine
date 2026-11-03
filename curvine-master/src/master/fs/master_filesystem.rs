@@ -1048,8 +1048,33 @@ impl MasterFilesystem {
     }
 
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
+        // Optimistic protocol: walk shared directory handles, re-validate the
+        // captured versions, retry on invalidation. Never takes the global
+        // fs_dir lock; bounded retries fall back below.
+        let path = path.as_ref();
+        for _ in 0..8 {
+            // The read guard only fetches the root view; the walk itself runs
+            // on shared Arc handles plus the store reference.
+            let root = self.fs_dir.read().root_dir().clone();
+            let store_ref = {
+                let fs_dir = self.fs_dir.read();
+                // Cheap clone of the store Arc-shaped wrapper is not
+                // available; borrow within this scope instead.
+                InodePath::resolve_shared(&root, path, &fs_dir.store)
+            };
+            let inp = store_ref?;
+            if inp.walk_is_current() {
+                if trash::is_pending_path(inp.path()) {
+                    return Ok(false);
+                }
+                return Ok(inp.get_last_inode().is_some());
+            }
+            std::thread::yield_now();
+        }
+        // Progress fallback: stable read under the shared lock (reads are
+        // cheap; this is not the global write lock).
         let fs_dir = self.fs_dir.read();
-        let inp = Self::resolve_path_raw(&fs_dir, path.as_ref())?;
+        let inp = Self::resolve_path_raw(&fs_dir, path)?;
         if trash::is_pending_path(inp.path()) {
             return Ok(false);
         }
