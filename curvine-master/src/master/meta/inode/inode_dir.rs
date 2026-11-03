@@ -13,15 +13,14 @@
 // limitations under the License.
 
 use crate::master::meta::feature::{AclFeature, DirFeature};
-use crate::master::meta::inode::InodeChildren;
-use crate::master::meta::inode::{
-    ChildrenIter, Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID,
-};
+use crate::master::meta::inode::DirectoryChildren;
+use crate::master::meta::inode::{Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID};
 use curvine_codec::{CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::CommonResult;
 use curvine_model::{ListOptions, MkdirOpts, StoragePolicy, INTERNAL_CTIME_XATTR};
 use glob::Pattern;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeDir {
@@ -35,11 +34,13 @@ pub struct InodeDir {
     pub(crate) features: DirFeature,
 
     #[serde(skip)]
-    children: InodeChildren,
+    children: Arc<DirectoryChildren>,
 }
 
 impl InodeDir {
-    /// Copy persisted directory fields without cloning the in-memory subtree.
+    /// Copy persisted directory fields. The copy gets a fresh, empty child
+    /// index: children live in the edges, not the inode record, and the
+    /// caller must adopt the live handle before publishing the copy.
     pub(crate) fn clone_metadata(&self) -> Self {
         let Self {
             id,
@@ -59,7 +60,7 @@ impl InodeDir {
             nlink: *nlink,
             storage_policy: storage_policy.clone(),
             features: features.clone(),
-            children: InodeChildren::default(),
+            children: Arc::new(DirectoryChildren::new()),
         }
     }
 
@@ -67,15 +68,14 @@ impl InodeDir {
     /// The caller owns the detached directory and still holds the namespace lock.
     pub(crate) fn adopt_children(&mut self, detached: Self) {
         debug_assert_eq!(self.id, detached.id);
-        debug_assert_eq!(self.children_len(), 0);
         self.children = detached.children;
     }
 
     pub fn new(id: i64, time: i64) -> Self {
-        Self::with_children(id, time, InodeChildren::default())
+        Self::with_children(id, time, Arc::new(DirectoryChildren::new()))
     }
 
-    pub fn with_children(id: i64, time: i64, children: InodeChildren) -> Self {
+    pub fn with_children(id: i64, time: i64, children: Arc<DirectoryChildren>) -> Self {
         Self {
             id,
             parent_id: EMPTY_PARENT_ID,
@@ -104,7 +104,7 @@ impl InodeDir {
                 },
                 x_attr: opts.x_attr,
             },
-            children: InodeChildren::default(),
+            children: Arc::new(DirectoryChildren::new()),
         }
     }
 
@@ -115,7 +115,7 @@ impl InodeDir {
     }
 
     pub fn get_child(&self, name: &str) -> Option<InodePtr> {
-        self.children.get_child(name)
+        self.children.get_child_ptr(name)
     }
 
     pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodePtr> {
@@ -142,16 +142,21 @@ impl InodeDir {
         self.children.delete_child(child_id, child_name)
     }
 
+    /// Shared child index handle for versioned readers.
+    pub fn children_handle(&self) -> Arc<DirectoryChildren> {
+        self.children.clone()
+    }
+
     pub fn print_child(&self) {
-        for child in self.children.iter() {
+        for child in self.children_vec() {
             let t = if child.is_dir() { "dir" } else { "file" };
 
             println!("{} {} {}", t, child.id(), child.name());
         }
     }
 
-    pub fn children_iter(&self) -> ChildrenIter<'_> {
-        self.children.iter()
+    pub fn children_iter(&self) -> impl Iterator<Item = InodeView> {
+        self.children_vec().into_iter()
     }
 
     pub fn list_options(&self, options: &ListOptions) -> Vec<InodePtr> {
@@ -159,14 +164,12 @@ impl InodeDir {
     }
 
     pub fn children_vec(&self) -> Vec<InodeView> {
-        self.children
-            .iter()
-            .map(|item| item.as_ref().clone())
-            .collect()
+        let children = self.children.read_all();
+        children.iter().map(|item| item.as_ref().clone()).collect()
     }
 
     pub fn children_len(&self) -> usize {
-        self.children.len()
+        self.children.iter_len()
     }
 
     pub fn add_file_child(&mut self, name: &str, file: InodeFile) -> CommonResult<InodePtr> {
@@ -244,7 +247,7 @@ impl Decode for InodeDir {
             storage_policy: StoragePolicy::decode(reader)?,
             features: DirFeature::decode(reader)?,
             // Children are persisted as edges, not inside the inode record.
-            children: InodeChildren::default(),
+            children: Arc::new(DirectoryChildren::new()),
         })
     }
 }
@@ -278,7 +281,7 @@ mod tests {
                     mode: 0o755,
                 },
             },
-            children: InodeChildren::default(),
+            children: Arc::new(DirectoryChildren::new()),
         };
 
         let mut writer = Writer::new(1).unwrap();

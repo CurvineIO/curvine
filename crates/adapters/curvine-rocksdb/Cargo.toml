@@ -11,6 +11,7 @@ curvine-runtime = { workspace = true }
 curvine-io = { workspace = true }
 byteorder = { workspace = true }
 curvine-config = { workspace = true }
+curvine-model = { workspace = true }
 log = { workspace = true }
 prost = { workspace = true }
 rocksdb = { workspace = true }

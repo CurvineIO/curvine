@@ -220,8 +220,14 @@ impl JournalLoader {
         // recorded by the replay coordinator, not by this apply path.
         let mut state = self.fsm_state()?;
         state.applied = applied;
+        let applied_index = state.applied.index;
         self.refresh_fsm_metrics(&state);
         drop(state);
+        if is_leader {
+            self.journal_writer.advance_metadata_applied(applied_index);
+        } else {
+            self.journal_writer.advance_metadata_catch_up(applied_index);
+        }
         self.hard_state_changed(&self.log_store.hard_state());
         if is_leader {
             self.ufs_wake.notify_one();
@@ -476,6 +482,8 @@ impl JournalLoader {
     async fn catch_up_committed_metadata(&self) -> RaftResult<()> {
         let committed = self.log_store.hard_state().commit;
         let applied = self.fsm_state_snapshot()?.applied;
+        self.journal_writer
+            .begin_metadata_catch_up(applied.index, committed);
         self.apply_msg(false, &ApplyMsg::new_scan(applied), false)
             .await?;
 

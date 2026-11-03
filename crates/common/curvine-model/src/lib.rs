@@ -37,6 +37,9 @@ pub trait CurvinePath: Sized + std::fmt::Display {
     fn from_str(path: impl AsRef<str>) -> curvine_core_error::CommonResult<Self>;
 }
 
+mod directory_attributes;
+pub use self::directory_attributes::{DirectoryAttributeDelta, DirectoryAttributes};
+
 mod storage_info;
 pub use self::storage_info::*;
 

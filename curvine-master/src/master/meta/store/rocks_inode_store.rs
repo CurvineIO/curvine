@@ -15,8 +15,10 @@
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::LockMeta;
 use crate::master::MetadataCodec;
-use curvine_core_error::CommonResult;
-use curvine_model::{BlockLocation, FileLock, MountInfo};
+use curvine_core_error::{err_box, CommonResult};
+use curvine_model::{
+    BlockLocation, DirectoryAttributeDelta, DirectoryAttributes, FileLock, MountInfo,
+};
 use curvine_rocksdb::{
     DBConf, DBEngine, DbReadSnapshot as DBReadSnapshot, ReadOptions, RocksIterator, RocksUtils,
 };
@@ -40,6 +42,7 @@ impl RocksInodeStore {
     pub const CF_BLOCK: &'static str = "block";
     pub const CF_LOCATION: &'static str = "location";
     pub const CF_COMMON: &'static str = "common";
+    pub const CF_DIR_ATTRS: &'static str = "dir_attrs";
 
     pub const PREFIX_MOUNT: u8 = 0x01;
     pub const PREFIX_LOCK: u8 = 0x02;
@@ -163,9 +166,35 @@ impl RocksInodeStore {
         self.db.scan(Self::CF_INODES)
     }
 
+    /// Best-effort scan of the optional dir_attrs column family.
+    /// Returns an error while the database has not opted into it.
+    pub fn scan_directory_attributes(&self) -> CommonResult<RocksIterator<'_>> {
+        self.db.scan(Self::CF_DIR_ATTRS)
+    }
+
     pub fn edges_iter(&self, id: i64) -> CommonResult<RocksIterator<'_>> {
         self.db
             .prefix_scan(Self::CF_EDGES, RocksUtils::i64_to_bytes(id))
+    }
+
+    pub fn get_directory_attributes(&self, id: i64) -> CommonResult<Option<DirectoryAttributes>> {
+        let value = self
+            .db
+            .get_cf(Self::CF_DIR_ATTRS, RocksUtils::i64_to_bytes(id))?;
+        Self::decode_directory_attributes(id, value)
+    }
+
+    pub(super) fn decode_directory_attributes(
+        id: i64,
+        value: Option<Vec<u8>>,
+    ) -> CommonResult<Option<DirectoryAttributes>> {
+        match value {
+            Some(value) => match DirectoryAttributes::decode(&value) {
+                Some(attributes) => Ok(Some(attributes)),
+                None => err_box!("invalid directory attributes for inode {}", id),
+            },
+            None => Ok(None),
+        }
     }
 
     pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
@@ -442,6 +471,33 @@ impl<'a> InodeWriteBatch<'a> {
         let key = RocksUtils::u32_i64_to_bytes(loc.worker_id, id);
         let value = MetadataCodec::encode(&id)?;
         self.put_cf(RocksInodeStore::CF_LOCATION, key, value)
+    }
+
+    pub fn write_directory_attributes(
+        &mut self,
+        id: i64,
+        attributes: DirectoryAttributes,
+    ) -> CommonResult<()> {
+        self.put_cf(
+            RocksInodeStore::CF_DIR_ATTRS,
+            RocksUtils::i64_to_bytes(id),
+            attributes.encode(),
+        )
+    }
+
+    pub fn merge_directory_attributes(
+        &mut self,
+        id: i64,
+        delta: DirectoryAttributeDelta,
+    ) -> CommonResult<()> {
+        let cf = self.db.cf(RocksInodeStore::CF_DIR_ATTRS)?;
+        self.batch
+            .merge_cf(cf, RocksUtils::i64_to_bytes(id), delta.encode());
+        Ok(())
+    }
+
+    pub fn delete_directory_attributes(&mut self, id: i64) -> CommonResult<()> {
+        self.delete_cf(RocksInodeStore::CF_DIR_ATTRS, RocksUtils::i64_to_bytes(id))
     }
 
     // Add an inode.

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::journal::recovery::{classify_apply_error, ApplyDisposition, RecoveryGate};
-use crate::master::journal::{JournalBatch, JournalEntry};
+use crate::master::journal::{JournalBatch, JournalEntry, QueuedJournalEntry};
 use crate::master::{Master, MasterMetrics};
 use curvine_config::JournalConf;
 use curvine_core_error::CommonResult;
@@ -21,7 +21,8 @@ use curvine_error::FsResult;
 use curvine_raft::raft::RaftClient;
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::channel::BlockingReceiver;
-use std::sync::mpsc::RecvTimeoutError;
+use std::mem;
+use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::Duration;
 
@@ -33,6 +34,8 @@ pub struct SenderTask {
     pub(crate) flush_batch_size: u64,
     pub(crate) last_flush_ms: u64,
     pub(crate) metrics: &'static MasterMetrics,
+    /// Notified once the batch carrying their entries is committed by Raft.
+    completions: Vec<SyncSender<()>>,
 }
 
 impl SenderTask {
@@ -50,13 +53,14 @@ impl SenderTask {
             flush_batch_size: conf.writer_flush_batch_size,
             last_flush_ms: LocalTime::mills(),
             metrics: Master::get_metrics()?,
+            completions: vec![],
         };
 
         Ok(sender)
     }
 
     // Start a thread to execute sender task
-    pub fn spawn(self, receiver: BlockingReceiver<JournalEntry>) -> FsResult<()> {
+    pub fn spawn(self, receiver: BlockingReceiver<QueuedJournalEntry>) -> FsResult<()> {
         let poll = Duration::from_millis(self.flush_batch_ms);
         let name = "journal-writer".to_string();
         let task = self;
@@ -66,7 +70,7 @@ impl SenderTask {
         Ok(())
     }
 
-    fn loop0(receiver: BlockingReceiver<JournalEntry>, poll: Duration, mut task: SenderTask) {
+    fn loop0(receiver: BlockingReceiver<QueuedJournalEntry>, poll: Duration, mut task: SenderTask) {
         // The thread stays up. Transient Raft errors keep the current batch and
         // retry. Serialization or metadata damage enters safe mode instead of
         // aborting the process.
@@ -115,14 +119,19 @@ impl SenderTask {
         }
     }
 
-    pub fn handle(&mut self, entry: Option<JournalEntry>) -> FsResult<()> {
-        let force = if let Some(v) = entry {
-            let force = matches!(v, JournalEntry::Snapshot(_));
-            self.batch.push(v);
-            self.metrics.journal_queue_len.dec();
-            force
-        } else {
-            false
+    pub fn handle(&mut self, entry: Option<QueuedJournalEntry>) -> FsResult<()> {
+        let (force, wait_for_commit) = match entry {
+            Some(queued) => {
+                let force = matches!(queued.entry, JournalEntry::Snapshot(_));
+                let wait_for_commit = queued.completion.is_some();
+                self.batch.push(queued.entry);
+                if let Some(completion) = queued.completion {
+                    self.completions.push(completion);
+                }
+                self.metrics.journal_queue_len.dec();
+                (force, wait_for_commit)
+            }
+            None => (false, false),
         };
 
         let len = self.batch.len() as u64;
@@ -130,7 +139,8 @@ impl SenderTask {
             return Ok(());
         }
 
-        if force || len >= self.flush_batch_size || self.flush_interval_elapsed() {
+        if force || wait_for_commit || len >= self.flush_batch_size || self.flush_interval_elapsed()
+        {
             self.flush_pending()?;
         }
 
@@ -143,6 +153,11 @@ impl SenderTask {
 
     fn flush_pending(&mut self) -> FsResult<()> {
         if self.batch.is_empty() {
+            // Completions can only exist with a batched entry, but clear the
+            // channel defensively so a caller never waits on a stale flush.
+            for completion in mem::take(&mut self.completions) {
+                let _ = completion.send(());
+            }
             return Ok(());
         }
 
@@ -154,6 +169,9 @@ impl SenderTask {
         let bytes = JournalBatch::encode(&mut staging)?;
         self.client.block_on_send_propose(bytes)?;
         self.batch.batch.clear();
+        for completion in mem::take(&mut self.completions) {
+            let _ = completion.send(());
+        }
 
         self.metrics.journal_flush_count.inc();
         self.metrics
@@ -170,7 +188,7 @@ impl SenderTask {
 
 /// Entries still in this process have not been proposed. Safe mode must not
 /// flush them later and must not apply them to local metadata.
-fn discard_unproposed(batch: &mut JournalBatch, receiver: &BlockingReceiver<JournalEntry>) {
+fn discard_unproposed(batch: &mut JournalBatch, receiver: &BlockingReceiver<QueuedJournalEntry>) {
     if !batch.is_empty() {
         log::warn!(
             "journal-writer dropping unproposed batch in safe mode, seq={}",
@@ -215,13 +233,14 @@ mod tests {
         let recovery = RecoveryGate::new();
         let mut task = SenderTask::new(client, &conf, 7, recovery).expect("sender");
         let error = task
-            .handle(Some(JournalEntry::CacheInvalidation(
-                CacheInvalidationEntry {
+            .handle(Some(QueuedJournalEntry {
+                entry: JournalEntry::CacheInvalidation(CacheInvalidationEntry {
                     op_id: 3,
                     rpc_id: 1,
                     inodes: vec![],
-                },
-            )))
+                }),
+                completion: None,
+            }))
             .expect_err("propose to a closed port must fail");
 
         assert!(
@@ -245,11 +264,14 @@ mod tests {
             inodes: vec![],
         }));
         sender
-            .send(JournalEntry::CacheInvalidation(CacheInvalidationEntry {
-                op_id: 2,
-                rpc_id: 2,
-                inodes: vec![],
-            }))
+            .send(QueuedJournalEntry {
+                entry: JournalEntry::CacheInvalidation(CacheInvalidationEntry {
+                    op_id: 2,
+                    rpc_id: 2,
+                    inodes: vec![],
+                }),
+                completion: None,
+            })
             .expect("enqueue");
 
         discard_unproposed(&mut batch, &receiver);

@@ -53,6 +53,8 @@ serde_json = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }
 parking_lot = { workspace = true }
+smallvec = { workspace = true }
+fxhash = { workspace = true }
 lru = { workspace = true }
 thiserror = { workspace = true }
 

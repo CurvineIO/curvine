@@ -15,6 +15,9 @@
 mod journal_writer;
 pub use self::journal_writer::JournalWriter;
 
+mod queued_entry;
+pub use self::queued_entry::QueuedJournalEntry;
+
 mod journal_loader;
 pub use self::journal_loader::JournalLoader;
 
@@ -25,7 +28,10 @@ mod journal_system;
 pub use self::journal_system::JournalSystem;
 
 mod recovery;
-pub(crate) use self::recovery::RecoveryGate;
+pub use self::recovery::RecoveryGate;
+
+mod read_barrier;
+pub use self::read_barrier::JournalReadBarrier;
 
 mod sender_task;
 pub use self::sender_task::SenderTask;

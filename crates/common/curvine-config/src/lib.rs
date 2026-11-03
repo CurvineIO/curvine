@@ -17,7 +17,7 @@ pub use curvine_error::{FsError, FsResult};
 pub const DEFAULT_HOSTNAME: &str = "localhost";
 
 mod db_conf;
-pub use self::db_conf::DBConf;
+pub use self::db_conf::{CfMergeOperator, DBConf};
 
 mod raft_peer;
 pub use self::raft_peer::RaftPeer;

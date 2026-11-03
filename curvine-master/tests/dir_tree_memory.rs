@@ -26,11 +26,12 @@
 
 use curvine_config::ChildrenContainer;
 use curvine_master::master::meta::inode::{
-    InodeChildren, InodeDir, InodeFile, InodePtr, InodeView, NamedDir, NamedEntry, ROOT_INODE_ID,
-    ROOT_INODE_NAME,
+    DirectoryChildren, InodeChildren, InodeDir, InodeFile, InodePtr, InodeView, NamedDir,
+    NamedEntry, ROOT_INODE_ID, ROOT_INODE_NAME,
 };
 use curvine_sys::SysUtils;
 use std::mem::size_of;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DIR_COUNT: usize = 100_000;
@@ -54,8 +55,10 @@ fn label(container: ChildrenContainer) -> &'static str {
     }
 }
 
-fn children(container: ChildrenContainer) -> InodeChildren {
-    InodeChildren::new(container)
+fn children(container: ChildrenContainer) -> Arc<DirectoryChildren> {
+    Arc::new(DirectoryChildren::with_container(InodeChildren::new(
+        container,
+    )))
 }
 
 fn dir_name(i: usize) -> String {
@@ -102,9 +105,9 @@ fn account_tree(root: &InodeView, container: ChildrenContainer) -> Accounting {
         let InodeView::Dir(dir) = node.as_ref() else {
             continue;
         };
-        for child in dir.children_iter() {
-            let is_dir = child.as_ref().is_dir();
-            match child.as_ref() {
+        for child in dir.children_vec() {
+            let is_dir = child.is_dir();
+            match &child {
                 InodeView::Dir(d) => {
                     acc.dirs += 1;
                     acc.name_bytes += d.name.len();
@@ -134,7 +137,7 @@ fn account_tree(root: &InodeView, container: ChildrenContainer) -> Accounting {
                 InodeView::File(_) => unreachable!("files are compacted to FileEntry"),
             }
             if is_dir {
-                stack.push(child);
+                stack.push(InodePtr::from_owned(child));
             }
         }
     }

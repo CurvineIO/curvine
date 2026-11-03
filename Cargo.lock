@@ -2702,6 +2702,7 @@ dependencies = [
  "curvine-web",
  "dashmap 5.5.3",
  "futures",
+ "fxhash",
  "glob",
  "indexmap 2.14.0",
  "log",
@@ -2716,6 +2717,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "smallvec",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -2847,6 +2849,7 @@ dependencies = [
  "curvine-config",
  "curvine-core-error",
  "curvine-io",
+ "curvine-model",
  "curvine-runtime",
  "log",
  "prost 0.11.9",

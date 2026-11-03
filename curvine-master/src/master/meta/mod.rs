@@ -15,6 +15,19 @@
 pub mod feature;
 pub mod inode;
 
+mod object_lock_pool;
+
+mod namespace_commit_gate;
+pub use self::namespace_commit_gate::CommitGate;
+
+mod inode_lock_manager;
+pub use self::inode_lock_manager::{
+    InodeLockManager, InodeLockMode, InodeLockRequest, InodeLockSet,
+};
+
+mod block_location_lock_manager;
+pub use self::block_location_lock_manager::{BlockLocationLockManager, BlockLocationLockSet};
+
 mod fs_dir;
 pub use self::fs_dir::FsDir;
 pub(crate) use self::fs_dir::{

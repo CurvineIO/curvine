@@ -39,6 +39,16 @@ impl<'a> WriteBatch<'a> {
         Ok(())
     }
 
+    pub fn merge_cf<K, V>(&mut self, cf: &str, key: K, value: V) -> CommonResult<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let cf = self.db.cf(cf)?;
+        self.batch.merge_cf(cf, key, value);
+        Ok(())
+    }
+
     pub fn delete_cf<K>(&mut self, cf: &str, key: K) -> CommonResult<()>
     where
         K: AsRef<[u8]>,

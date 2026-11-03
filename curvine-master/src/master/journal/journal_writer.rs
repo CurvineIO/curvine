@@ -14,6 +14,7 @@
 
 #![allow(clippy::result_large_err)]
 
+use crate::master::journal::read_barrier::JournalReadBarrier;
 use crate::master::journal::recovery::RecoveryGate;
 use crate::master::journal::*;
 use crate::master::meta::inode::{InodeDir, InodeFile, InodePath};
@@ -31,16 +32,74 @@ use curvine_runtime::common::{FileUtils, LocalTime, TimeSpent};
 use curvine_runtime::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
 use curvine_runtime::sync::{AtomicBool, AtomicCounter};
 use log::{debug, info, warn};
-use std::sync::Mutex;
+use std::cell::RefCell;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+
+thread_local! {
+    /// Commit waiters accumulated inside one `JournalCommitScope`. Entries
+    /// enqueued in the same scope share one notification round instead of one
+    /// blocking wait per entry.
+    static JOURNAL_COMMIT_SCOPES: RefCell<Vec<Vec<mpsc::Receiver<()>>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Waits for every journal entry enqueued inside the scope to be committed.
+/// A scope that never waits (journal disabled or no waiter recorded) is a
+/// no-op; dropping without `wait` discards the waiters so a lost confirmation
+/// cannot block an unrelated future scope.
+pub struct JournalCommitScope {
+    active: bool,
+    completed: bool,
+}
+
+impl JournalCommitScope {
+    pub fn wait(mut self) -> FsResult<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let waiters = JOURNAL_COMMIT_SCOPES
+            .with(|scopes| scopes.borrow_mut().pop())
+            .unwrap_or_default();
+        self.completed = true;
+        for waiter in waiters {
+            Self::wait_for_commit(waiter)?;
+        }
+        Ok(())
+    }
+
+    fn wait_for_commit(waiter: mpsc::Receiver<()>) -> FsResult<()> {
+        if waiter.recv().is_err() {
+            return err_box!("journal commit failed after metadata commit");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for JournalCommitScope {
+    fn drop(&mut self) {
+        if self.active && !self.completed {
+            JOURNAL_COMMIT_SCOPES.with(|scopes| {
+                scopes.borrow_mut().pop();
+            });
+        }
+    }
+}
 
 // Write metadata operation logs.
 pub struct JournalWriter {
     enable: bool,
+    /// Testing mode has no SenderTask, so no commit receipt can ever arrive;
+    /// enqueue_and_wait must not block in that mode (matches Astra).
+    require_raft_commit: bool,
     node_id: u64,
     recovery: RecoveryGate,
-    sender: BlockingSender<JournalEntry>,
+    sender: BlockingSender<QueuedJournalEntry>,
+    /// Read barrier over Raft metadata catch-up; defaults to current so
+    /// single-node and testing writers are never fenced off.
+    read_barrier: Arc<JournalReadBarrier>,
     metrics: &'static MasterMetrics,
-    receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
+    receiver: Option<Mutex<BlockingReceiver<QueuedJournalEntry>>>,
 
     snapshot_in_flight: AtomicBool,
 
@@ -52,7 +111,7 @@ pub struct JournalWriter {
 }
 
 impl JournalWriter {
-    pub(crate) fn new(
+    pub fn new(
         testing: bool,
         client: RaftClient,
         conf: &JournalConf,
@@ -73,8 +132,10 @@ impl JournalWriter {
 
         Ok(Self {
             enable: conf.enable,
+            require_raft_commit: !testing,
             node_id,
             recovery,
+            read_barrier: Arc::new(JournalReadBarrier::new()),
             sender,
             metrics,
             receiver,
@@ -94,9 +155,95 @@ impl JournalWriter {
             ));
         }
         debug!("send_entry {:?}", entry);
-        self.sender.send(entry)?;
+        self.sender.send(QueuedJournalEntry {
+            entry,
+            completion: None,
+        })?;
         self.metrics.journal_queue_len.inc();
         Ok(())
+    }
+
+    /// Enqueues the entry and waits for its Raft commit. Inside a
+    /// `JournalCommitScope` the waiter is parked and drained together when the
+    /// scope waits; journal disabled treats metadata as local-only committed.
+    fn enqueue_and_wait(&self, entry: JournalEntry) -> FsResult<()> {
+        if !self.enable {
+            return Ok(());
+        }
+        if !self.require_raft_commit {
+            // Testing writer: entries stay in the retained receiver for direct
+            // assertions and no commit notification is ever produced.
+            return self.send_inner(entry);
+        }
+        if self.recovery.rejects_writes() {
+            return Err(FsError::journal_unavailable(
+                "journal writer is not accepting writes",
+            ));
+        }
+        debug!("send_entry_wait {:?}", entry);
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender.send(QueuedJournalEntry {
+            entry,
+            completion: Some(tx),
+        })?;
+        self.metrics.journal_queue_len.inc();
+        let scoped = JOURNAL_COMMIT_SCOPES.with(|scopes| scopes.borrow_mut().last_mut().is_some());
+        if scoped {
+            JOURNAL_COMMIT_SCOPES.with(|scopes| {
+                scopes
+                    .borrow_mut()
+                    .last_mut()
+                    .expect("scope vanished while enqueueing")
+                    .push(rx);
+            });
+        } else {
+            JournalCommitScope::wait_for_commit(rx)?;
+        }
+        Ok(())
+    }
+
+    /// Opens a commit scope so every journal entry enqueued inside it shares
+    /// one Raft-commit wait. The caller must invoke `wait` after its metadata
+    /// work completes.
+    pub fn begin_commit_scope(&self) -> JournalCommitScope {
+        if !self.enable || !self.require_raft_commit {
+            return JournalCommitScope {
+                active: false,
+                completed: true,
+            };
+        }
+        JOURNAL_COMMIT_SCOPES.with(|scopes| scopes.borrow_mut().push(vec![]));
+        JournalCommitScope {
+            active: true,
+            completed: false,
+        }
+    }
+
+    /// Read-barrier API for the catch-up coordinator (see JournalLoader) and
+    /// the namespace write path. Defaults keep single-node/testing current.
+    pub fn begin_metadata_catch_up(&self, applied_index: u64, required_index: u64) {
+        self.read_barrier
+            .begin_catch_up(applied_index, required_index);
+    }
+
+    pub fn require_metadata_catch_up(&self, required_index: u64) {
+        self.read_barrier.require_catch_up(required_index);
+    }
+
+    pub fn advance_metadata_applied(&self, applied_index: u64) {
+        self.read_barrier.advance_applied(applied_index);
+    }
+
+    pub fn advance_metadata_catch_up(&self, applied_index: u64) {
+        self.read_barrier.advance_catch_up(applied_index);
+    }
+
+    pub fn ensure_metadata_current(&self) -> FsResult<()> {
+        self.read_barrier.ensure_current()
+    }
+
+    pub fn is_metadata_current(&self) -> bool {
+        self.read_barrier.is_current()
     }
 
     fn send(&self, fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
@@ -105,6 +252,14 @@ impl JournalWriter {
             self.maybe_emit_snapshot(fs_dir)?;
         }
         Ok(())
+    }
+
+    /// Sends the entry and waits for Raft to commit the batch carrying it.
+    /// Namespace mutations that must not become visible ahead of their journal
+    /// route through here; inside a commit scope the wait defers to the scope.
+    pub(crate) fn send_and_wait(&self, fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
+        self.enqueue_and_wait(entry)?;
+        self.maybe_emit_snapshot(fs_dir)
     }
 
     fn maybe_emit_snapshot(&self, fs_dir: &FsDir) -> FsResult<()> {
@@ -465,7 +620,10 @@ impl JournalWriter {
             index,
         };
         self.metrics.journal_queue_len.inc();
-        self.sender.send(JournalEntry::UfsApplied(entry))?;
+        self.sender.send(QueuedJournalEntry {
+            entry: JournalEntry::UfsApplied(entry),
+            completion: None,
+        })?;
 
         Ok(())
     }
@@ -480,7 +638,10 @@ impl JournalWriter {
             ));
         }
         self.metrics.journal_queue_len.inc();
-        self.sender.send(JournalEntry::UfsDeferred(entry))?;
+        self.sender.send(QueuedJournalEntry {
+            entry: JournalEntry::UfsDeferred(entry),
+            completion: None,
+        })?;
         Ok(())
     }
 
@@ -508,7 +669,7 @@ impl JournalWriter {
             }
         };
         while let Ok(v) = receiver.try_recv() {
-            entries.push(v);
+            entries.push(v.entry);
         }
         entries
     }
@@ -633,7 +794,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("snapshot entry should be enqueued");
 
-        match entry {
+        match entry.entry {
             JournalEntry::Snapshot(entry) => {
                 assert!(
                     Path::new(&entry.dir).exists(),
@@ -806,7 +967,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("snapshot entry should be enqueued");
 
-        match entry {
+        match entry.entry {
             JournalEntry::Snapshot(entry) => {
                 assert_eq!(entry.dir, info.dir);
                 assert_eq!(entry.node_id, conf.journal.node_id()?);

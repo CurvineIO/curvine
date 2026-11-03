@@ -14,6 +14,12 @@
 
 use curvine_runtime::common::{ByteUnit, FileUtils, Utils};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CfMergeOperator {
+    DirectoryAttributes,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -22,6 +28,7 @@ pub struct DBConf {
     pub data_dir: String,
     pub checkpoint_dir: String,
     pub family_list: Vec<String>,
+    pub cf_merge_operators: BTreeMap<String, CfMergeOperator>,
 
     // Whether to disable wal, default to false, enable wal.
     pub disable_wal: bool,
@@ -118,6 +125,12 @@ impl DBConf {
         if !self.family_list.contains(&cf) {
             self.family_list.push(cf);
         }
+        self
+    }
+
+    pub fn set_cf_merge_operator(mut self, cf: impl AsRef<str>, operator: CfMergeOperator) -> Self {
+        self.cf_merge_operators
+            .insert(cf.as_ref().to_owned(), operator);
         self
     }
 
@@ -333,6 +346,7 @@ impl Default for DBConf {
             data_dir: FileUtils::join_path(base_dir, Self::DATA_DIR),
             checkpoint_dir: FileUtils::join_path(base_dir, Self::CHECKPOINT_DIR),
             family_list: vec![Self::DEFAULT_FAMILY.to_string()],
+            cf_merge_operators: BTreeMap::new(),
             disable_wal: false,
             compression_type: Self::COMPRESSION_NONE.to_string(),
             db_write_buffer_size: ByteUnit::new(0),

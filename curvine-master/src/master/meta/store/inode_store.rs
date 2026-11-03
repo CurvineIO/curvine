@@ -22,7 +22,9 @@ use crate::master::space::scan_lease::{
 };
 use crate::master::MetadataCodec;
 use curvine_core_error::{err_box, try_err, try_option, CommonResult};
-use curvine_model::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
+use curvine_model::{
+    BlockLocation, CommitBlock, DirectoryAttributes, FileLock, FileStatus, MountInfo,
+};
 use curvine_rocksdb::{DBConf, DbReadSnapshot as DBReadSnapshot, RocksIterator, RocksUtils};
 use curvine_runtime::common::{FileUtils, Utils};
 use log::info;
@@ -39,6 +41,8 @@ struct SnapshotData {
     edges: HashMap<i64, Vec<(String, i64)>>,
     /// inode_id -> deserialized InodeView
     inodes: HashMap<i64, InodeView>,
+    /// inode_id -> directory attributes; absent when the record does not exist.
+    dir_attrs: HashMap<i64, DirectoryAttributes>,
 }
 
 /// Lightweight phase-timing / counter collector for create_tree restore.
@@ -292,8 +296,12 @@ impl InodeStore {
                     if dir.id != ROOT_INODE_ID {
                         deleted_dirs += 1;
                     }
-                    for child in dir.children_iter() {
-                        stack.push_back((inode_id, child.name().to_string(), child));
+                    for child in dir.children_vec() {
+                        stack.push_back((
+                            inode_id,
+                            child.name().to_string(),
+                            InodePtr::from_owned(child),
+                        ));
                     }
                 }
 
@@ -724,6 +732,21 @@ impl InodeStore {
         }
         timer.mark("scan_edges");
 
+        // --- 1a2. Scan dir_attrs CF when the column family exists ---
+        let mut dir_attrs: HashMap<i64, DirectoryAttributes> = HashMap::new();
+        if let Ok(attrs_iter) = self.store.scan_directory_attributes() {
+            for item in attrs_iter {
+                let (key, value) = try_err!(item);
+                let id = RocksUtils::i64_from_bytes(&key)?;
+                let attributes =
+                    RocksInodeStore::decode_directory_attributes(id, Some(value.to_vec()))?;
+                if let Some(attributes) = attributes {
+                    dir_attrs.insert(id, attributes);
+                }
+            }
+        }
+        timer.mark("scan_dir_attrs");
+
         // --- 1b. Scan inodes CF → collect raw bytes ---
         let mut raw_inodes: Vec<(i64, Vec<u8>)> = Vec::new();
         let inodes_iter = self.store.bulk_scan_inodes()?;
@@ -739,7 +762,11 @@ impl InodeStore {
         let inodes = Self::parallel_deserialize_inodes(raw_inodes)?;
         timer.mark("deserialize_inodes");
 
-        Ok(SnapshotData { edges, inodes })
+        Ok(SnapshotData {
+            edges,
+            inodes,
+            dir_attrs,
+        })
     }
 
     /// Parallel-deserialize raw inode bytes into a HashMap using std::thread::scope.
@@ -894,6 +921,14 @@ impl InodeStore {
                     InodeView::Dir(_) => {
                         let mut store_inode = store_inode;
                         dir_edges.insert(*child_id, (parent_id, edge_name.clone()));
+                        if let Some(attributes) = data.dir_attrs.get(child_id) {
+                            log::debug!(
+                                "create_tree: directory {} has persisted attributes mtime={}, version={}",
+                                child_id,
+                                attributes.mtime,
+                                attributes.version
+                            );
+                        }
 
                         // Name / parent_id mismatch repair
                         if store_inode.name() != edge_name.as_str()
@@ -1200,6 +1235,36 @@ impl<'a> InodeStoreSnapshot<'a> {
                 Ok(Some(inode))
             }
         }
+    }
+
+    /// Point read of directory attributes from the same snapshot as inode and edge reads.
+    pub fn get_directory_attributes(&self, id: i64) -> CommonResult<Option<DirectoryAttributes>> {
+        let value = self
+            .snapshot
+            .get_cf(RocksInodeStore::CF_DIR_ATTRS, RocksUtils::i64_to_bytes(id))?;
+        RocksInodeStore::decode_directory_attributes(id, value)
+    }
+
+    /// Read a child inode ID from the same snapshot without exposing an in-memory pointer.
+    pub fn get_child_id(&self, parent_id: i64, name: &str) -> CommonResult<Option<i64>> {
+        let key = RocksUtils::i64_str_to_bytes(parent_id, name);
+        self.snapshot
+            .get_cf(RocksInodeStore::CF_EDGES, key)?
+            .map(|value| RocksUtils::i64_from_bytes(&value))
+            .transpose()
+    }
+
+    /// Resolve an edge and its inode from one snapshot, returning owned metadata.
+    /// A returned directory does not contain its in-memory children.
+    pub fn get_child(&self, parent_id: i64, name: &str) -> CommonResult<Option<InodeView>> {
+        let Some(id) = self.get_child_id(parent_id, name)? else {
+            return Ok(None);
+        };
+        let Some(mut inode) = self.get_inode(id)? else {
+            return err_box!("directory edge references missing inode {}", id);
+        };
+        inode.change_name(name.to_owned());
+        Ok(Some(inode))
     }
 
     /// Scan the child edges of one parent directory within the snapshot.

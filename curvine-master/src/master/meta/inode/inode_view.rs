@@ -23,7 +23,7 @@ use crate::master::MetadataCodec;
 use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{
-    FileGen, FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction, TtlType,
+    FileGen, FileStatus, FileType, ListOptions, SetAttrOpts, StoragePolicy, TtlAction, TtlType,
     INTERNAL_CTIME_XATTR, INTERNAL_TTL_TYPE_XATTR,
 };
 use curvine_runtime::common::{LocalTime, Utils};
@@ -268,18 +268,16 @@ impl InodeView {
 
     // Test and print for use.
     pub fn children(&self) -> Vec<InodePtr> {
-        let mut vec = Vec::with_capacity(8);
         if let Dir(d) = self {
-            vec.extend(d.children_iter());
+            return d.children_handle().list_options(&ListOptions::default());
         }
-
-        vec
+        Vec::with_capacity(8)
     }
 
     pub fn child_len(&self) -> usize {
         match self {
             File(_) => 0,
-            Dir(d) => d.children_iter().len(),
+            Dir(d) => d.children_len(),
             FileEntry(..) => 0,
         }
     }

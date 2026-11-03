@@ -18,7 +18,8 @@ use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::{FsModeReleaser, JournalSystem};
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
 use crate::master::meta::{
-    trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
+    trash, CacheInvalidationResult, CommitGate, FsDir, RestoredTrashEntry, TrashListing,
+    TrashScanPage,
 };
 
 use crate::master::fs::DeleteResult;
@@ -80,6 +81,9 @@ pub struct MasterFilesystem {
     pub worker_manager: SyncWorkerManager,
     pub master_monitor: MasterMonitor,
     pub conf: Arc<MasterConf>,
+    /// Serialises namespace mutations across the commit boundary so a snapshot
+    /// or role fence can drain in-flight writers before reading metadata.
+    metadata_commit_gate: Arc<CommitGate>,
     full_report_tracker: FullReportTracker,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
@@ -216,7 +220,13 @@ impl MasterFilesystem {
             ),
             pending_drain: Default::default(),
             fs_mode_releaser: Default::default(),
+            metadata_commit_gate: Default::default(),
         }
+    }
+
+    /// The gate serialises namespace mutations against snapshots and role fences.
+    pub fn metadata_commit_gate(&self) -> Arc<CommitGate> {
+        self.metadata_commit_gate.clone()
     }
 
     /// Install the fs_mode release gate. Called once at startup when transfer is
@@ -250,6 +260,7 @@ impl MasterFilesystem {
             ),
             pending_drain: Default::default(),
             fs_mode_releaser: Default::default(),
+            metadata_commit_gate: Default::default(),
         }
     }
 
@@ -278,41 +289,71 @@ impl MasterFilesystem {
         fs_dir.print_tree();
     }
 
+    /// Read-barrier precheck before the commit gate. Re-run inside the gate so
+    /// a role change cannot slip between the check and the mutation.
+    pub(crate) fn ensure_metadata_current(&self) -> FsResult<()> {
+        let writer = self.fs_dir.read().journal_writer.clone();
+        writer.ensure_metadata_current()
+    }
+
+    /// Runs a namespace mutation inside the commit gate: the writer enters
+    /// before mutating and the journal scope waits for Raft commit afterwards,
+    /// so a snapshot or role fence can never observe a half-published change.
+    /// The gate is re-checked inside the boundary so an old request cannot
+    /// write after a follower catch-up has started.
+    fn run_metadata_write<R>(&self, f: impl FnOnce() -> FsResult<R>) -> FsResult<R> {
+        self.ensure_metadata_current()?;
+        let _commit_guard = self.metadata_commit_gate.enter();
+        self.ensure_metadata_current()?;
+        let writer = self.fs_dir.read().journal_writer.clone();
+        let scope = writer.begin_commit_scope();
+        let result = f();
+        scope.wait()?;
+        result
+    }
+
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
-        let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
-        Self::check_not_reserved_path(inp.path())?;
+        let inp = self.run_metadata_write(|| {
+            let mut fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+            Self::check_not_reserved_path(inp.path())?;
 
-        // Creation of root directory is not allowed
-        if inp.is_root() {
-            return err_box!("Not allowed to create existing root path: {}", inp.path());
-        }
+            // Creation of root directory is not allowed
+            if inp.is_root() {
+                return err_box!("Not allowed to create existing root path: {}", inp.path());
+            }
 
-        if inp.is_full() {
-            if opts.create_parent {
-                if let Some(last_inode) = inp.get_last_inode() {
-                    if last_inode.is_dir() {
-                        let status = last_inode.to_file_status(inp.path())?;
-                        return Ok(status);
+            if inp.is_full() {
+                if opts.create_parent {
+                    if let Some(last_inode) = inp.get_last_inode() {
+                        if last_inode.is_dir() {
+                            let status = last_inode.to_file_status(inp.path())?;
+                            return Ok(Some(status));
+                        }
                     }
                 }
+                return err_ext!(FsError::file_exists(inp.path()));
             }
-            return err_ext!(FsError::file_exists(inp.path()));
-        }
 
-        // Check whether the directory can be created recursively.
-        if !opts.create_parent {
-            Self::check_parent(&inp)?;
-        }
+            // Check whether the directory can be created recursively.
+            if !opts.create_parent {
+                Self::check_parent(&inp)?;
+            }
 
-        let inp = fs_dir.mkdir(inp, opts)?;
-        let last = try_option!(
-            inp.get_last_inode(),
-            "Path {} has no inode after mkdir",
-            inp.path()
-        );
-        let status = last.to_file_status(inp.path())?;
-        Ok(status)
+            let inp = fs_dir.mkdir(inp, opts)?;
+            let last = try_option!(
+                inp.get_last_inode(),
+                "Path {} has no inode after mkdir",
+                inp.path()
+            );
+            let status = last.to_file_status(inp.path())?;
+            Ok(Some(status))
+        })?;
+        Ok(try_option!(
+            inp,
+            "mkdir {} produced no status after the commit gate",
+            path.as_ref()
+        ))
     }
 
     pub fn mkdir<T: AsRef<str>>(&self, path: T, create_parent: bool) -> FsResult<FileStatus> {
@@ -333,10 +374,10 @@ impl MasterFilesystem {
         recursive: bool,
         mode: DeleteMode,
     ) -> FsResult<DeleteResult> {
-        let mut delete_res = {
+        let mut delete_res = self.run_metadata_write(|| {
             let mut fs_dir = self.fs_dir.write();
-            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)?
-        };
+            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)
+        })?;
         self.release_deleted_blocks(&mut delete_res);
 
         Ok(delete_res)
@@ -771,7 +812,7 @@ impl MasterFilesystem {
                     }
                 }
                 InodeView::Dir(dir) if recursive => {
-                    stack.extend(dir.children_iter());
+                    stack.extend(dir.children_vec().into_iter().map(InodePtr::from_owned));
                 }
                 _ => {}
             }
@@ -782,21 +823,6 @@ impl MasterFilesystem {
     pub fn rename<T: AsRef<str>>(&self, src: T, dst: T, flags: RenameFlags) -> FsResult<bool> {
         let src = src.as_ref();
         let dst = dst.as_ref();
-
-        let mut fs_dir = self.fs_dir.write();
-        let src_inp = Self::resolve_path(&fs_dir, src)?;
-        let dst_inp = Self::resolve_path(&fs_dir, dst)?;
-
-        Self::check_not_reserved_path(src_inp.path())?;
-        Self::check_not_reserved_path(dst_inp.path())?;
-
-        if src_inp.is_root() {
-            return err_box!("Cannot rename root path");
-        }
-
-        if src == dst {
-            return Ok(false);
-        }
 
         // dst cannot be in the src directory, /a/b -> /a/b/c is not allowed (POSIX EINVAL).
         if let Some(rest) = dst.strip_prefix(src) {
@@ -820,12 +846,29 @@ impl MasterFilesystem {
             }
         }
 
-        if let Some(del_res) = fs_dir.rename(&src_inp, &dst_inp, flags)? {
-            let mut worker_manager = self.worker_manager.write();
-            worker_manager.remove_blocks(&del_res);
-        }
+        self.run_metadata_write(|| {
+            let mut fs_dir = self.fs_dir.write();
+            let src_inp = Self::resolve_path(&fs_dir, src)?;
+            let dst_inp = Self::resolve_path(&fs_dir, dst)?;
 
-        Ok(true)
+            Self::check_not_reserved_path(src_inp.path())?;
+            Self::check_not_reserved_path(dst_inp.path())?;
+
+            if src_inp.is_root() {
+                return err_box!("Cannot rename root path");
+            }
+
+            if src == dst {
+                return Ok(false);
+            }
+
+            if let Some(del_res) = fs_dir.rename(&src_inp, &dst_inp, flags)? {
+                let mut worker_manager = self.worker_manager.write();
+                worker_manager.remove_blocks(&del_res);
+            }
+
+            Ok(true)
+        })
     }
 
     pub fn create<T: AsRef<str>>(&self, path: T, create_parent: bool) -> FsResult<FileStatus> {
@@ -874,39 +917,41 @@ impl MasterFilesystem {
             );
         }
 
-        let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-        Self::check_not_reserved_path(inp.path())?;
+        self.run_metadata_write(|| {
+            let mut fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            Self::check_not_reserved_path(inp.path())?;
 
-        let last_inode = inp.get_last_inode();
-        if let Some(inode) = &last_inode {
-            if inode.is_dir() {
-                return err_box!("{}  already exists as a dir", inp.path());
+            let last_inode = inp.get_last_inode();
+            if let Some(inode) = &last_inode {
+                if inode.is_dir() {
+                    return err_box!("{}  already exists as a dir", inp.path());
+                }
+
+                if flags.exclusive() {
+                    return err_ext!(FsError::file_exists(inp.path()));
+                }
             }
 
-            if flags.exclusive() {
-                return err_ext!(FsError::file_exists(inp.path()));
+            if !opts.create_parent {
+                Self::check_parent(&inp)?;
             }
-        }
 
-        if !opts.create_parent {
-            Self::check_parent(&inp)?;
-        }
-
-        let inp = if last_inode.is_some() {
-            if flags.overwrite() {
-                self.truncate(&mut fs_dir, &inp, opts)?;
+            let inp = if last_inode.is_some() {
+                if flags.overwrite() {
+                    self.truncate(&mut fs_dir, &inp, opts)?;
+                } else {
+                    return err_ext!(FsError::file_exists(inp.path()));
+                }
+                inp
             } else {
-                return err_ext!(FsError::file_exists(inp.path()));
-            }
-            inp
-        } else {
-            fs_dir.create_file(inp, opts)?
-        };
+                fs_dir.create_file(inp, opts)?
+            };
 
-        let status = fs_dir.file_status(&inp)?;
+            let status = fs_dir.file_status(&inp)?;
 
-        Ok(status)
+            Ok(status)
+        })
     }
 
     pub fn open_file<T: AsRef<str>>(
@@ -1624,11 +1669,11 @@ impl MasterFilesystem {
         }
 
         if let InodeView::Dir(dir) = resolved.as_ref() {
-            for child in dir.children_iter() {
+            for child in dir.children_vec() {
                 let child_path = child_snapshot_path(path, child.name());
                 self.collect_cv_metadata_snapshot_page(
                     fs_dir,
-                    child.as_ref(),
+                    &child,
                     &child_path,
                     start_after,
                     limit,
@@ -1717,6 +1762,11 @@ impl MasterFilesystem {
     }
 
     pub fn create_leader_snapshot(&self, force: bool) -> FsResult<LeaderSnapshotInfo> {
+        // The exclusive gate drains in-flight namespace writes before the
+        // checkpoint reads the tree, and blocks new writes until it finishes.
+        let Some(_snapshot_guard) = self.metadata_commit_gate.close_and_enter_if_open() else {
+            return err_box!("metadata commit gate is already closed");
+        };
         let fs_dir = self.fs_dir.read();
         fs_dir.create_snapshot(force)
     }

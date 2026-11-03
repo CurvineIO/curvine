@@ -252,7 +252,7 @@ crossbeam = "0.8.4"
 dashmap = "5.5.3"
 linked-hash-map = "0.5.6"
 fxhash = "0.2.1"
-parking_lot = "0.12.3"
+parking_lot = { version = "0.12.3", features = ["arc_lock"] }
 linkme = "0.3.35"
 anyhow = "1.0.97"
 percent-encoding = "2.3.1"

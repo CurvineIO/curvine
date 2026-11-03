@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use curvine_config::DBConf;
+use super::configure_directory_attributes_merge;
+pub use curvine_config::{CfMergeOperator, DBConf};
 
 use rocksdb::*;
 use std::ffi::c_int;
@@ -166,7 +167,15 @@ impl DBConfExt for DBConf {
 
         let mut cfs = Vec::new();
         for family_name in &self.family_list {
-            cfs.push((family_name.to_string(), opts.clone()));
+            let mut cf_opts = opts.clone();
+            if let Some(operator) = self.cf_merge_operators.get(family_name) {
+                match operator {
+                    CfMergeOperator::DirectoryAttributes => {
+                        configure_directory_attributes_merge(&mut cf_opts);
+                    }
+                }
+            }
+            cfs.push((family_name.to_string(), cf_opts));
         }
         cfs
     }

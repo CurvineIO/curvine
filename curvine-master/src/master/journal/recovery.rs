@@ -82,7 +82,7 @@ pub(crate) fn should_defer_ufs(message: &str, failures: u64, max_retry_num: u64)
 /// Shared recovery flags for the journal apply loop, UFS coordinator, writer,
 /// and HTTP probes. Clone shares the same atomics.
 #[derive(Clone)]
-pub(crate) struct RecoveryGate {
+pub struct RecoveryGate {
     inner: Arc<RecoveryInner>,
 }
 
@@ -96,7 +96,7 @@ struct RecoveryInner {
 }
 
 impl RecoveryGate {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(RecoveryInner {
                 safe_mode: AtomicBool::new(false),

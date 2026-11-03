@@ -18,6 +18,9 @@ pub use self::db_conf::{DBConf, DBConfExt};
 mod db_engine;
 pub use self::db_engine::*;
 
+mod directory_attributes_merge;
+pub use self::directory_attributes_merge::configure_directory_attributes_merge;
+
 mod rocks_utils;
 pub use self::rocks_utils::RocksUtils;
 

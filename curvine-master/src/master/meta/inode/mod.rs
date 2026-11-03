@@ -29,6 +29,11 @@ pub use self::inode_path::InodePath;
 mod inodes_children;
 pub use self::inodes_children::*;
 
+mod directory_children;
+pub use self::directory_children::DirectoryChildren;
+
+pub(crate) mod sharded_children;
+
 mod child_item;
 pub use self::child_item::ChildItem;
 

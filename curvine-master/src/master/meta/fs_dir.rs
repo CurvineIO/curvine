@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::master::fs::{BlockInodeState, DeleteResult};
-use crate::master::journal::{JournalEntry, JournalWriter};
+use crate::master::journal::{
+    CreateFileEntry, DeleteEntry, JournalEntry, JournalWriter, MkdirEntry, RenameEntry,
+};
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
@@ -271,7 +273,15 @@ impl FsDir {
         inp = self.add_last_inode(inp, InodeView::new_dir(name.clone(), dir.clone()))?;
 
         let parent_path = inp.get_valid_parent_path();
-        self.journal_writer.log_mkdir(self, &parent_path, &dir)?;
+        self.journal_writer.send_and_wait(
+            self,
+            JournalEntry::Mkdir(MkdirEntry {
+                op_id: self.next_op_id(),
+                rpc_id: 0,
+                path: parent_path,
+                dir,
+            }),
+        )?;
 
         Ok(inp)
     }
@@ -346,8 +356,15 @@ impl FsDir {
         }
 
         let del_res = self.unprotected_delete(inp, op_ms as i64)?;
-        self.journal_writer
-            .log_delete(self, inp.path(), op_ms as i64)?;
+        self.journal_writer.send_and_wait(
+            self,
+            JournalEntry::Delete(DeleteEntry {
+                op_id: self.next_op_id(),
+                rpc_id: 0,
+                path: inp.path().to_string(),
+                mtime: op_ms as i64,
+            }),
+        )?;
 
         Ok(del_res)
     }
@@ -1231,8 +1248,8 @@ impl FsDir {
 
                 Dir(d) => {
                     if recursive {
-                        for child in d.children_iter() {
-                            stack.push_back(child);
+                        for child in d.children_vec() {
+                            stack.push_back(InodePtr::from_owned(child));
                         }
                     }
                 }
@@ -1286,13 +1303,19 @@ impl FsDir {
             None
         };
         let res = self.unprotected_rename(src_inp, dst_inp, op_ms, flags, exchange_pre_swap_ids)?;
-        self.journal_writer.log_rename(
+        let (src_inode_id, dst_inode_id) = exchange_pre_swap_ids.unwrap_or((0, 0));
+        self.journal_writer.send_and_wait(
             self,
-            src_inp.path(),
-            dst_inp.path(),
-            op_ms,
-            flags,
-            exchange_pre_swap_ids,
+            JournalEntry::Rename(RenameEntry {
+                op_id: self.next_op_id(),
+                rpc_id: 0,
+                src: src_inp.path().to_string(),
+                dst: dst_inp.path().to_string(),
+                mtime: op_ms,
+                flags: flags.value(),
+                src_inode_id,
+                dst_inode_id,
+            }),
         )?;
         Ok(res)
     }
@@ -1530,7 +1553,15 @@ impl FsDir {
         // Create an inode file node.
         let file = InodeFile::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
         inp = self.add_last_inode(inp, InodeView::new_file(name, file))?;
-        self.journal_writer.log_create_file(self, &inp)?;
+        self.journal_writer.send_and_wait(
+            self,
+            JournalEntry::CreateFile(CreateFileEntry {
+                op_id: self.next_op_id(),
+                rpc_id: 0,
+                path: inp.path().to_string(),
+                file: inp.clone_last_file()?,
+            }),
+        )?;
 
         Ok(inp)
     }
@@ -1598,7 +1629,7 @@ impl FsDir {
             File(_) => Ok(vec![inode.to_file_status(inp.path())?]),
 
             Dir(d) => {
-                let iter = d.children_iter().collect();
+                let iter = d.children_handle().list_options(&ListOptions::default());
                 let res = self.store.batched_get_inodes(inp, iter)?;
                 Ok(res)
             }
@@ -2293,8 +2324,8 @@ impl FsDir {
 
             match cur_inode.as_mut() {
                 Dir(dir) if opts.recursive => {
-                    for child in dir.children_iter() {
-                        stack.push_back(child);
+                    for child in dir.children_vec() {
+                        stack.push_back(InodePtr::from_owned(child));
                     }
                 }
 
