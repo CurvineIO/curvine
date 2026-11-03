@@ -18,7 +18,8 @@ use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
 use crate::master::meta::{
-    trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
+    trash, CacheInvalidationResult, FsDir, LockValidity, RestoredTrashEntry, TrashListing,
+    TrashScanPage,
 };
 
 use crate::master::fs::state::{SessionHeartbeat, SessionMap};
@@ -2508,20 +2509,33 @@ impl MasterFilesystem {
     pub fn get_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
+        let validity = self.lock_validity();
         let fs_dir = self.fs_dir.read();
         let inp = Self::resolve_path(&fs_dir, path)?;
-        let expire_ms = self.conf.lock_expire_time_ms();
 
-        fs_dir.get_lock(inp, &lock, expire_ms)
+        fs_dir.get_lock(inp, &lock, &validity)
     }
 
     pub fn set_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
+        let validity = self.lock_validity();
         let fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
-        fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms())
+        fs_dir.set_lock(inp, lock, &validity)
+    }
+
+    /// Lock lifetime policy for this request (#1879).
+    ///
+    /// Config-only: session-owned locks are exempted from the legacy TTL while
+    /// `client_session_lock_lease` is on, and nothing here consults liveness, so
+    /// no session snapshot can go stale between this and `fs_dir`.
+    fn lock_validity(&self) -> LockValidity {
+        LockValidity::new(
+            self.conf.lock_expire_time_ms(),
+            self.conf.client_session_lock_lease,
+        )
     }
 }
 
@@ -4959,5 +4973,139 @@ mod tests {
         drop(staging);
         drop(observer);
         js.shutdown();
+    }
+
+    /// Filesystem with a 1ms legacy lock TTL, so "older than the TTL" needs no
+    /// sleeping for minutes. `session_lock_lease` is the #1879 rollout gate.
+    fn lock_test_fs(name: &str, session_lock_lease: bool) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.lock_expire_time = "1ms".to_string();
+        conf.master.client_session_lock_lease = session_lock_lease;
+        conf.master.meta_dir = Utils::test_sub_dir(format!(
+            "master-fs-lock-test/meta-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-lock-test/journal-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.master.init().unwrap();
+        assert_eq!(conf.master.lock_expire_time_ms(), 1);
+        assert_eq!(
+            conf.master.client_session_lock_lease, session_lock_lease,
+            "the test must run with the gate it asked for"
+        );
+        JournalSystem::fs_only_for_test(&conf).unwrap()
+    }
+
+    fn lock_for(client_id: &str, owner_id: u64, session_owned: bool) -> FileLock {
+        FileLock {
+            client_id: client_id.to_string(),
+            owner_id,
+            pid: 1,
+            acquire_time: 0,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Plock,
+            start: 0,
+            end: 100,
+            session_owned,
+        }
+    }
+
+    #[test]
+    fn session_owned_lock_survives_the_legacy_ttl_with_the_lease_policy_on() {
+        let fs = lock_test_fs("session-lock-live", true);
+        fs.create("/live-lock.log", true).unwrap();
+        fs.set_lock("/live-lock.log", lock_for("session-client", 1, true))
+            .unwrap();
+
+        // Well past the 1ms legacy TTL.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Both the query and the mutating path must agree: the lock is still owned.
+        let queried = fs
+            .get_lock("/live-lock.log", lock_for("other-client", 2, true))
+            .unwrap();
+        assert_eq!(
+            queried.map(|lock| lock.client_id),
+            Some("session-client".to_string())
+        );
+
+        let conflict = fs
+            .set_lock("/live-lock.log", lock_for("other-client", 2, true))
+            .unwrap();
+        let conflict = conflict.expect("a session-owned lock must not be stolen");
+        assert_eq!(conflict.client_id, "session-client");
+    }
+
+    #[test]
+    fn session_owned_lock_keeps_the_ttl_with_the_lease_policy_off() {
+        let fs = lock_test_fs("session-lock-off", false);
+        fs.create("/ttl-lock.log", true).unwrap();
+        fs.set_lock("/ttl-lock.log", lock_for("session-client", 1, true))
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        assert!(
+            fs.set_lock("/ttl-lock.log", lock_for("other-client", 2, true))
+                .unwrap()
+                .is_none(),
+            "with the gate off, session ownership must not change lock lifetime"
+        );
+    }
+
+    #[test]
+    fn legacy_lock_keeps_the_ttl_with_the_lease_policy_on() {
+        let fs = lock_test_fs("legacy-lock-on", true);
+        fs.create("/legacy-lock.log", true).unwrap();
+        fs.set_lock("/legacy-lock.log", lock_for("legacy-client", 1, false))
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        assert!(
+            fs.set_lock("/legacy-lock.log", lock_for("other-client", 2, false))
+                .unwrap()
+                .is_none(),
+            "pre-#1878 locks must keep the lock_expire_time behaviour"
+        );
+    }
+
+    #[test]
+    fn get_lock_does_not_reclaim_the_lock_it_reports_stale() {
+        let fs = lock_test_fs("session-lock-getlk", true);
+        fs.create("/getlk.log", true).unwrap();
+        fs.set_lock("/getlk.log", lock_for("legacy-client", 1, false))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let conflict = fs
+            .get_lock("/getlk.log", lock_for("other-client", 2, false))
+            .unwrap();
+        assert!(conflict.is_none(), "an expired lock is not a conflict");
+
+        // F_GETLK must not have written: the stale entry is still stored, so the
+        // next set_lock is the call that reclaims and journals it.
+        let stored = {
+            let fs_dir = fs.fs_dir.read();
+            let inode_id = MasterFilesystem::resolve_path(&fs_dir, "/getlk.log")
+                .unwrap()
+                .get_last_inode()
+                .unwrap()
+                .id();
+            fs_dir.store.get_locks(inode_id).unwrap()
+        };
+        assert_eq!(stored.to_vec().len(), 1, "a query must not write");
+
+        assert!(fs
+            .set_lock("/getlk.log", lock_for("other-client", 2, false))
+            .unwrap()
+            .is_none());
     }
 }
