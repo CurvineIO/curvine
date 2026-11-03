@@ -76,27 +76,37 @@ impl BatchWriteHandler {
         Ok(())
     }
 
-    /// Rolls back every block opened by this batch after a fatal
-    /// `complete_batch` failure: triggered block and all siblings. Each abort
-    /// is best-effort — a failure is logged and never replaces the original
+    /// Rolls back the batch's not-yet-committed blocks after a fatal
+    /// `complete_batch` failure: blocks from `start` onward. Blocks before
+    /// `start` were already committed (their finalize succeeded) and are
+    /// left untouched — aborting them could delete a new generation another
+    /// writer opened on the same block id after their commit. Each abort is
+    /// best-effort — a failure is logged and never replaces the original
     /// error that caused the batch to fail.
     ///
-    /// A block still in the committed, finalized generation is skipped (it is
-    /// committed state, not batch staging), and a block being rewritten is
-    /// handled atomically — the check and abort run under the same block
-    /// stripe lock, so a concurrent finalize cannot slip between them and get
-    /// its committed replica deleted. Missing blocks were already aborted and
-    /// are fine too.
+    /// A block still in the committed, finalized generation is skipped (it
+    /// is committed state, not batch staging), and a block being rewritten
+    /// is handled atomically — the check and abort run under the same block
+    /// stripe lock, so a concurrent finalize cannot slip between them and
+    /// get its committed replica deleted. Missing blocks were already
+    /// aborted and are fine too.
+    ///
+    /// The batch's write handles are dropped before any abort, matching the
+    /// other abort paths (`open_batch` error, `WriteHandler::complete`):
+    /// on SPDK the writer's Drop waits for in-flight I/O to drain, while
+    /// `abort_block` returns the extent to the allocator, so freeing
+    /// extents while writers are still alive could let a new allocation
+    /// overwrite data still being written. Leases are kept until after the
+    /// aborts so write fencing stays in place while blocks are aborted.
     ///
     /// State is reset (`context` / `file` / `leases` cleared, `is_commit =
-    /// true`) so a stale batch cannot be replayed on this handler and the
-    /// next `open_batch` starts clean instead of hitting "previous batch
-    /// write is still active". Once rolled back, `complete_batch` rejects
-    /// retried Complete requests (misreporting success would let the client
-    /// treat an aborted batch as committed); Cancel stays idempotent.
-    fn rollback_batch(&mut self) {
+    /// true`, `rolled_back = true`) so retried Complete/Cancel requests on
+    /// this handler observe the rollback instead of misreporting the batch
+    /// as committed.
+    fn rollback_batch_from(&mut self, start: usize) {
+        self.file.take();
         if let Some(contexts) = self.context.take() {
-            for context in &contexts {
+            for context in contexts.iter().skip(start) {
                 if let Err(e) = self.store.abort_batch_write(context.block.id) {
                     log::warn!(
                         "failed to abort batch block {} after batch failure: {}",
@@ -106,10 +116,13 @@ impl BatchWriteHandler {
                 }
             }
         }
-        self.file.take();
         self.leases.clear();
         self.is_commit = true;
         self.rolled_back = true;
+    }
+
+    fn rollback_batch(&mut self) {
+        self.rollback_batch_from(0);
     }
 
     fn abort_open_contexts(store: &BlockStore, contexts: &[WriteContext]) {
@@ -260,13 +273,18 @@ impl BatchWriteHandler {
 
     pub fn complete_batch(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
         // Parse the flattened batch request. A malformed header must not be
-        // returned before the opened batch is rolled back: the blocks would
-        // stay in Writing and the staging allocations would never be
-        // reclaimed.
+        // returned before an OPEN batch is rolled back: the blocks would stay
+        // in Writing and the staging allocations would never be reclaimed.
+        // After a successful commit (`is_commit`) there is nothing left to
+        // reclaim — every block is finalized — and rolling back would mark a
+        // committed batch as rolled back and could abort a new generation
+        // another writer opened on the same block ids.
         let header: BlocksBatchCommitRequest = match msg.parse_header() {
             Ok(header) => header,
             Err(e) => {
-                self.rollback_batch();
+                if !self.is_commit {
+                    self.rollback_batch();
+                }
                 return Err(e.into());
             }
         };
@@ -318,14 +336,19 @@ impl BatchWriteHandler {
             file.take();
         }
 
-        for block in commit_blocks {
+        for (i, block) in commit_blocks.into_iter().enumerate() {
             let result = if commit {
                 self.store.finalize_block(&block).map(|_| ())
             } else {
                 self.store.abort_block(&block)
             };
             if let Err(e) = result {
-                self.rollback_batch();
+                // Blocks 0..i were already committed; a full rollback could
+                // abort a new generation another writer opened on them since
+                // their commit, so only the contexts from the failing index
+                // onward are reclaimed. This still covers every block that
+                // was never committed.
+                self.rollback_batch_from(i);
                 return Err(e.into());
             }
             results.push(true);
@@ -808,6 +831,45 @@ mod tests {
         for id in 1..=3 {
             assert!(store.get_block(id).is_err(), "block {} must be aborted", id);
         }
+        Ok(())
+    }
+
+    // Regression test (solarAI00): after a successful commit, a malformed
+    // Complete/Cancel header must NOT trigger a rollback. Every block is
+    // already finalized, so rolling back would mark a committed batch as
+    // rolled back and could abort a new Writing generation another writer
+    // opened on the same block ids.
+    #[test]
+    fn malformed_header_after_success_does_not_rollback() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+
+        let msg = commit_msg(&[1, 2, 3], 7);
+        handler.complete_batch(&msg, true)?;
+        assert!(handler.is_commit);
+        assert!(!handler.rolled_back);
+
+        // Malformed header on the committed handler: rejected, but the
+        // committed state is untouched.
+        let bad = Builder::new()
+            .code(RpcCode::WriteBlocksBatch)
+            .request(RequestStatus::Complete)
+            .req_id(7)
+            .data(DataSlice::Bytes(vec![0xFF, 0xFF, 0xFF, 0xFF].into()))
+            .build();
+        assert!(handler.complete_batch(&bad, true).is_err());
+        assert!(handler.complete_batch(&bad, false).is_err());
+        assert!(
+            !handler.rolled_back,
+            "committed batch must not be rolled back"
+        );
+        assert!(handler.is_commit);
+        for id in 1..=3 {
+            assert!(store.get_block(id)?.is_final(), "block {} stays final", id);
+        }
+        // Idempotent success is still reported after the malformed requests.
+        handler.complete_batch(&msg, true)?;
         Ok(())
     }
 
