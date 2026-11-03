@@ -20,6 +20,7 @@ use crate::master::Master;
 use curvine_core_error::CommonResult;
 use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
 use curvine_model::{MetricValue, WorkerInfo};
+use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::sync::FastDashMap;
 use curvine_sys::version::ReleaseVersion;
 use dashmap::DashMap;
@@ -135,7 +136,20 @@ pub struct MasterMetrics {
     pub(crate) journal_applied: Gauge,
     pub(crate) journal_ufs_applied: Gauge,
 
+    // Metadata DB keys as produced by `DBEngine::get_rocksdb_metrics`; journal
+    // DB keys carry an extra `journal_` prefix.
     pub(crate) rocksdb_metrics: GaugeVec,
+
+    // Metadata checkpoints, created by leader and follower snapshots. The leader's
+    // periodic snapshot runs under the fs_dir write lock, so a slow checkpoint
+    // stalls every metadata RPC. `checkpoint_count` counts
+    // every attempt, including the failed ones in `checkpoint_fail_count`.
+    // `checkpoint_flush_time` is the memtable flush part of `checkpoint_time`.
+    pub(crate) checkpoint_count: Counter,
+    pub(crate) checkpoint_fail_count: Counter,
+    pub(crate) checkpoint_time: Counter,
+    pub(crate) checkpoint_flush_time: Counter,
+    pub(crate) checkpoint_last_duration_ms: Gauge,
 
     pub(crate) inode_dir_num: Gauge,
     pub(crate) inode_file_num: Gauge,
@@ -279,6 +293,27 @@ impl MasterMetrics {
 
             rocksdb_metrics: m::new_gauge_vec("rocksdb_metrics", "RocksDB metrics", &["tag"])?,
 
+            checkpoint_count: m::new_counter(
+                "checkpoint_count",
+                "Number of metadata checkpoint attempts, including failed ones",
+            )?,
+            checkpoint_fail_count: m::new_counter(
+                "checkpoint_fail_count",
+                "Number of failed metadata checkpoint attempts",
+            )?,
+            checkpoint_time: m::new_counter(
+                "checkpoint_time",
+                "Total time spent creating metadata checkpoints (ms); divide by checkpoint_count for the average",
+            )?,
+            checkpoint_flush_time: m::new_counter(
+                "checkpoint_flush_time",
+                "Part of checkpoint_time spent flushing memtables before the checkpoint (ms)",
+            )?,
+            checkpoint_last_duration_ms: m::new_gauge(
+                "checkpoint_last_duration_ms",
+                "Duration of the last metadata checkpoint attempt (ms)",
+            )?,
+
             inode_dir_num: m::new_gauge("inode_dir_num", "Total dir")?,
 
             inode_file_num: m::new_gauge("inode_file_num", "Total file")?,
@@ -405,6 +440,14 @@ impl MasterMetrics {
         Ok(wm)
     }
 
+    fn refresh_rocksdb_metrics(metric: &GaugeVec, prefix: &str, values: HashMap<String, u64>) {
+        for (key, value) in values {
+            metric
+                .with_label_values(&[&format!("{}{}", prefix, key)])
+                .set(value as i64);
+        }
+    }
+
     fn refresh_scheduled_bytes(metric: &GaugeVec, workers: &[WorkerInfo]) {
         metric.reset();
         for worker in workers {
@@ -444,7 +487,26 @@ impl MasterMetrics {
         }
     }
 
-    pub fn text_output(&self, fs: MasterFilesystem) -> CommonResult<String> {
+    /// Records one metadata checkpoint attempt. `total_ms` covers the memtable
+    /// flush (`flush_ms`) and the checkpoint creation; a failed attempt records
+    /// the time spent until it failed.
+    pub(crate) fn record_checkpoint(&self, flush_ms: u64, total_ms: u64, succeeded: bool) {
+        self.checkpoint_count.inc();
+        if !succeeded {
+            self.checkpoint_fail_count.inc();
+        }
+        self.checkpoint_time.inc_by(total_ms as i64);
+        self.checkpoint_flush_time.inc_by(flush_ms as i64);
+        self.checkpoint_last_duration_ms.set(total_ms as i64);
+    }
+
+    /// Renders all metrics. `journal_store` adds the journal DB RocksDB metrics;
+    /// `None` skips them, e.g. for a filesystem built without a journal system.
+    pub fn text_output(
+        &self,
+        fs: MasterFilesystem,
+        journal_store: Option<&RocksLogStorage>,
+    ) -> CommonResult<String> {
         let filesystem_info = fs.filesystem_info()?;
         self.refresh_client_verdicts();
         self.capacity.set(filesystem_info.capacity);
@@ -464,16 +526,18 @@ impl MasterMetrics {
 
         let fs_dir = fs.fs_dir.read();
         let rocksdb_metrics = fs_dir.get_rocks_store().get_rocksdb_metrics()?;
-        for (key, value) in rocksdb_metrics {
-            self.rocksdb_metrics
-                .with_label_values(&[&key])
-                .set(value as i64);
-        }
+        Self::refresh_rocksdb_metrics(&self.rocksdb_metrics, "", rocksdb_metrics);
 
         let ttl_list = fs_dir.get_ttl_bucket_list();
         drop(fs_dir);
         self.ttl_bucket_len.set(ttl_list.buckets_len() as i64);
         self.ttl_total_inodes.set(ttl_list.total_inodes() as i64);
+
+        // Read after releasing fs_dir: the journal DB has its own lock.
+        if let Some(journal_store) = journal_store {
+            let journal_metrics = journal_store.get_rocksdb_metrics()?;
+            Self::refresh_rocksdb_metrics(&self.rocksdb_metrics, "journal_", journal_metrics);
+        }
 
         self.worker_num
             .with_label_values(&["live"])
@@ -530,7 +594,9 @@ impl Debug for MasterMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use curvine_config::JournalConf;
     use curvine_model::WorkerAddress;
+    use curvine_runtime::common::Utils;
 
     fn count(
         counts: &HashMap<(String, &'static str), i64>,
@@ -629,6 +695,55 @@ mod tests {
         let later = start + ClientCompatTracker::TTL + Duration::from_secs(1);
         assert_eq!(count(&tracker.counts(later), "0.3.0", "compatible"), 1);
         assert!(tracker.counts(later + ClientCompatTracker::TTL).is_empty());
+    }
+
+    #[test]
+    fn journal_rocksdb_metrics_are_exported_with_a_journal_prefix() {
+        let metric_name = "test_journal_rocksdb_metrics_are_exported_with_a_journal_prefix";
+        let metric = m::new_gauge_vec(metric_name, metric_name, &["tag"]).unwrap();
+        let conf = JournalConf {
+            journal_dir: Utils::test_sub_dir(format!("journal-metrics-{}", Utils::rand_str(6))),
+            ..Default::default()
+        };
+        let journal_store = RocksLogStorage::from_conf(&conf, true);
+
+        let values = journal_store.get_rocksdb_metrics().unwrap();
+        MasterMetrics::refresh_rocksdb_metrics(&metric, "journal_", values);
+
+        let output = Metrics::text_output().unwrap();
+        for cf in ["default", "meta"] {
+            let tag = format!("journal_cf_{cf}_rocksdb_num-files-at-level0");
+            assert!(
+                output.contains(&format!("{metric_name}{{tag=\"{tag}\"}}")),
+                "{output}"
+            );
+        }
+        assert!(
+            output.contains(&format!(
+                "{metric_name}{{tag=\"journal_db_rocksdb_is-write-stopped\"}} 0"
+            )),
+            "{output}"
+        );
+    }
+
+    // Counters only increase, so delta assertions stay valid even when other
+    // tests in this binary create checkpoints concurrently.
+    #[test]
+    fn record_checkpoint_counts_attempts_failures_and_durations() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let count = metrics.checkpoint_count.get();
+        let fail_count = metrics.checkpoint_fail_count.get();
+        let time = metrics.checkpoint_time.get();
+        let flush_time = metrics.checkpoint_flush_time.get();
+
+        metrics.record_checkpoint(3, 10, true);
+        metrics.record_checkpoint(4, 5, false);
+
+        assert!(metrics.checkpoint_count.get() >= count + 2);
+        assert!(metrics.checkpoint_fail_count.get() > fail_count);
+        assert!(metrics.checkpoint_time.get() >= time + 15);
+        assert!(metrics.checkpoint_flush_time.get() >= flush_time + 7);
     }
 
     fn live_worker(ip: &str, rpc_port: u32, scheduled_bytes: i64) -> WorkerInfo {
