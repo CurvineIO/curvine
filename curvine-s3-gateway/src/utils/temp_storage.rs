@@ -157,7 +157,20 @@ impl LocalTempStorage {
         let mut memory_buf = BytesMut::with_capacity(threshold.min(buffer_size));
         let mut staged: usize = 0;
 
-        while let Some(chunk) = body.poll_read().await? {
+        loop {
+            // A read error (dropped connection, timed-out client) must not leave
+            // a partial part at its final path: `CompleteMultipartUpload`
+            // streams whatever a part file holds, so it would publish a
+            // truncated object and report success.
+            let chunk = match body.poll_read().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(e) => {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&path).await;
+                    return Err(format!("Failed to read from body: {}", e));
+                }
+            };
             staged += chunk.len();
             sha256.update(&chunk);
             hasher.consume(&chunk);
@@ -391,7 +404,18 @@ impl CurvineTempStorage {
         let mut memory_buf = BytesMut::with_capacity(threshold.min(buffer_size));
         let mut staged: usize = 0;
 
-        while let Some(chunk) = body.poll_read().await? {
+        loop {
+            // Same contract as the local backend: a read error removes the
+            // staged part, so `CompleteMultipartUpload` cannot assemble a
+            // truncated object from it.
+            let chunk = match body.poll_read().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = self.fs.delete_with_opts(&path, true, true).await;
+                    return Err(format!("Failed to read from body: {}", e));
+                }
+            };
             staged += chunk.len();
             sha256.update(&chunk);
             hasher.consume(&chunk);
@@ -840,6 +864,56 @@ mod tests {
         let result = storage.cleanup(upload_id).await;
         assert!(result.is_ok());
         assert!(!expected_dir.exists());
+        let _ = std::fs::remove_dir_all(&temp_path);
+    }
+
+    /// A reader that yields one chunk and then fails, standing in for a client
+    /// that drops the connection mid-part.
+    struct FailingBody {
+        sent: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::utils::io::PollRead for FailingBody {
+        async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
+            if self.sent {
+                return Err("connection reset".to_string());
+            }
+            self.sent = true;
+            Ok(Some(vec![9u8; 1024]))
+        }
+    }
+
+    /// A body that fails mid-read must not leave a partial part behind:
+    /// `CompleteMultipartUpload` streams whatever a part file holds, so a
+    /// truncated part would be published as a successful object.
+    #[tokio::test]
+    async fn test_local_write_part_stream_removes_a_partial_part() {
+        use std::env;
+
+        let temp_path = env::temp_dir()
+            .join(format!("curvine-test-{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let config = TempStorageConfig::new(temp_path.clone(), 1024, 4096);
+        let storage = LocalTempStorage::new(config);
+        storage.create_dir("upload-partial").await.unwrap();
+
+        let mut body = FailingBody { sent: false };
+        let err = storage
+            .write_part_stream("upload-partial", 1, &mut body, StageExpect::default())
+            .await
+            .expect_err("a broken body must fail the part");
+        assert!(err.contains("connection reset"), "{err}");
+
+        let part = storage.part_path("upload-partial", 1);
+        assert!(
+            !std::path::Path::new(&part).exists(),
+            "a partially read part must not survive: {part}"
+        );
+
+        storage.cleanup("upload-partial").await.unwrap();
         let _ = std::fs::remove_dir_all(&temp_path);
     }
 

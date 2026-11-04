@@ -1467,9 +1467,11 @@ pub async fn handle_multipart_upload_part<
 /// them would store a corrupt part. `Content-Length` is also only an estimate
 /// for that framing, which makes the length check meaningless.
 fn reject_streaming_part<H: crate::auth::sig_v4::VHeader>(header: &H) -> Result<(), u16> {
+    // The whole `STREAMING-...` family (including the `-TRAILER` variants) is
+    // aws-chunked framing, so match the prefix rather than one exact value.
     if header
         .get_header("x-amz-content-sha256")
-        .is_some_and(|value| value == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+        .is_some_and(|value| value.starts_with("STREAMING-"))
     {
         return Err(400);
     }
@@ -2320,6 +2322,32 @@ mod tests {
 
     fn storage_part_path(dir: &std::path::Path, upload_id: &str, part: u32) -> std::path::PathBuf {
         dir.join(upload_id).join(part.to_string())
+    }
+
+    /// Staging an undecoded aws-chunked body would store chunk framing as part
+    /// data, so the whole `STREAMING-` family must be refused, not just the one
+    /// value that was matched before.
+    #[test]
+    fn rejects_the_undecoded_streaming_framing() {
+        for framing in [
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        ] {
+            assert_eq!(
+                reject_streaming_part(&part_header("64", Some(framing))),
+                Err(400),
+                "{framing} is aws-chunked framing and must not be staged"
+            );
+        }
+        for verifiable in ["UNSIGNED-PAYLOAD", "abc"] {
+            assert_eq!(
+                reject_streaming_part(&part_header("64", Some(verifiable))),
+                Ok(()),
+                "{verifiable} is a real payload and must be accepted"
+            );
+        }
+        assert_eq!(reject_streaming_part(&part_header("64", None)), Ok(()));
     }
 
     #[test]
