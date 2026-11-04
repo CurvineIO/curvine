@@ -14,7 +14,6 @@
 
 use std::ops::DerefMut;
 
-use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, ReadHalf};
 use tokio::net::TcpStream;
 
@@ -38,19 +37,6 @@ impl ReadFrame {
             buf,
             pending: None,
         }
-    }
-
-    // Read data of the specified length.
-    pub async fn read_full(&mut self, len: i32) -> IOResult<BytesMut> {
-        if len == 0 {
-            return Ok(BytesMut::new());
-        } else if len < 0 {
-            return err_box!("Invalid length {}", len);
-        }
-
-        let mut buf = self.buf.take_exact(len as usize);
-        self.io.read_exact(&mut buf).await?;
-        Ok(buf)
     }
 
     /// Receives the next complete message. Bytes read from the socket are
@@ -113,10 +99,16 @@ impl ReadFrame {
                 }
             }
 
-            // Need more bytes from the socket. Reserve explicitly so read_buf
-            // can never report a zero-byte read that would be mistaken for EOF
-            // when the buffer happens to be full.
-            self.buf.reserve(1);
+            // Need more bytes from the socket. Reserve the exact shortfall so
+            // read_buf never reports a zero-byte read (mistaken for EOF) and
+            // does not grow the buffer one read at a time.
+            let want = match self.pending {
+                Some((_, header_size, data_size)) => {
+                    header_size as usize + data_size as usize - self.buf.len()
+                }
+                None => message::PROTOCOL_SIZE as usize - self.buf.len(),
+            };
+            self.buf.reserve(want.max(1));
             let n = self.io.read_buf(self.buf.deref_mut()).await?;
             if n == 0 {
                 // Peer EOF before any frame body: clean close, matches the
@@ -137,7 +129,7 @@ impl ReadFrame {
 mod tests {
     use super::*;
     use crate::message::Builder;
-    use bytes::BufMut;
+    use bytes::{BufMut, BytesMut};
     use curvine_io::DataSlice;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;

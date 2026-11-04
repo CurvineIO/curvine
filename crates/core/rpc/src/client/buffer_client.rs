@@ -118,8 +118,11 @@ impl BufferClient {
 
             // Drain whatever else is already queued so one write can carry
             // several requests; metadata workloads arrive in bursts, so this
-            // turns N writer wakeups + N syscalls into one.
+            // turns N writer wakeups + N syscalls into one. Cancelled
+            // envelopes count toward the limit too: callers may time out in
+            // bulk, and those must not keep this loop running unbounded.
             let mut batch: Vec<Envelope> = Vec::with_capacity(8);
+            let mut dequeued = 1;
             if env.is_canceled() {
                 info!(
                     "Request({},{}) has been canceled",
@@ -129,7 +132,8 @@ impl BufferClient {
             } else {
                 batch.push(env);
             }
-            while batch.len() < 8 {
+            while dequeued < 8 {
+                dequeued += 1;
                 match receiver.try_recv() {
                     Ok(next) => {
                         if next.is_canceled() {
