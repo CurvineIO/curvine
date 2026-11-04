@@ -539,7 +539,7 @@ impl CurvineFileSystem {
                 entry.attr.ino = inode.ino;
                 // A dirty inode keeps its local status; report that instead.
                 if inode.is_dirty() {
-                    entry.dirty = Some(Box::new(inode.status.clone()));
+                    entry.dirty = Some(Box::new(inode.clone_status()));
                 }
             }
         }
@@ -2238,7 +2238,12 @@ impl fs::FileSystem for CurvineFileSystem {
 
         // Check if it's actually a symlink
         if status.file_type != FileType::Link {
-            return err_fuse!(libc::EINVAL, "Not a symbolic link: {}", status.path);
+            let path = self
+                .state
+                .get_path(op.header.nodeid)
+                .map(|path| path.to_string())
+                .unwrap_or_default();
+            return err_fuse!(libc::EINVAL, "Not a symbolic link: {}", path);
         }
 
         // fs.protected_symlinks (LTP prot_hsymlinks): VFS may_follow_link is not
@@ -2264,11 +2269,12 @@ impl fs::FileSystem for CurvineFileSystem {
         let curvine_target = match status.target {
             Some(target) => target,
             None => {
-                return err_fuse!(
-                    libc::ENODATA,
-                    "Symbolic link has no target: {}",
-                    status.path
-                );
+                let path = self
+                    .state
+                    .get_path(op.header.nodeid)
+                    .map(|path| path.to_string())
+                    .unwrap_or_default();
+                return err_fuse!(libc::ENODATA, "Symbolic link has no target: {}", path);
             }
         };
 
