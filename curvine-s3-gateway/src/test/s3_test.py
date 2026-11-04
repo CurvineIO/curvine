@@ -160,6 +160,42 @@ class S3BasicOperationsTest:
             self._record_test(f"Put Object ({key})", False)
             return False
     
+    def test_failed_overwrite_preserves_the_old_object(self, key: str) -> bool:
+        """A PUT that dies mid-body must leave the previous object readable.
+
+        Writing in place would make the master drop the existing blocks when the
+        upload starts, so a disconnect at any point would destroy the object.
+        """
+        original = b"original body that must survive"
+        if not self.test_put_object(key, original):
+            return False
+
+        # Declare more bytes than are sent, then close the socket, so the
+        # gateway sees a body that ends early.
+        try:
+            import http.client
+            conn = http.client.HTTPConnection(
+                self.config.endpoint_url.split("//")[-1].split(":")[0],
+                int(self.config.endpoint_url.rstrip("/").split(":")[-1]),
+                timeout=5,
+            )
+            conn.putrequest("PUT", f"/{self.config.test_bucket}/{key}")
+            conn.putheader("Host", self.config.endpoint_url.split("//")[-1])
+            conn.putheader("Content-Length", "1048576")
+            conn.putheader("Authorization", "AWS4-HMAC-SHA256 broken")
+            conn.putheader("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            conn.endheaders()
+            conn.send(b"partial")
+            conn.close()
+        except OSError:
+            pass
+
+        ok, body = self.test_get_object(key)
+        if not ok or body != original:
+            print(f"  FAIL: previous object changed after a failed overwrite (got {None if body is None else len(body)} bytes)")
+            return False
+        return True
+
     def test_get_object(self, key: str) -> Tuple[bool, Optional[bytes]]:
         """Test getting an object"""
         try:
@@ -629,6 +665,12 @@ class ComprehensiveS3TestSuite:
                 print(f"Data mismatch for {key}")
                 return False
         
+        # A failed overwrite must not destroy the existing object
+        if not basic_test.test_failed_overwrite_preserves_the_old_object(
+            "failed-overwrite-object"
+        ):
+            return False
+
         # Test list operations
         success, objects = basic_test.test_list_objects()
         if not success or len(objects) != len(test_data):

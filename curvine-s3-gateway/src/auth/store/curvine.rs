@@ -31,6 +31,11 @@ pub struct CurvineAccessKeyStore {
 }
 
 impl CurvineAccessKeyStore {
+    /// Number of cached credentials; see `CredentialStoreCore`.
+    pub fn credential_count_hint(&self) -> usize {
+        self.core.credential_count_hint()
+    }
+
     pub fn new(
         fs: UnifiedFileSystem,
         credentials_path: Option<&str>,

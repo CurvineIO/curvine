@@ -29,6 +29,11 @@ pub struct LocalAccessKeyStore {
 }
 
 impl LocalAccessKeyStore {
+    /// Number of cached credentials; see `CredentialStoreCore`.
+    pub fn credential_count_hint(&self) -> usize {
+        self.core.credential_count_hint()
+    }
+
     pub fn new(
         credentials_path: Option<&str>,
         cache_refresh_interval: Option<Duration>,

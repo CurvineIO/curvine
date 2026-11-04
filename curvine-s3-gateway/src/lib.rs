@@ -153,6 +153,19 @@ async fn init_s3_authentication(
                         "No credentials found in primary store or environment variables"
                     );
                     log_credential_configuration_warning(s3_conf);
+                    // Refuse to serve rather than start a gateway that answers
+                    // every S3 request with 403: that looks like an outage to
+                    // clients and is harder to diagnose than a failed start.
+                    // An operator who wants the old behaviour can set
+                    // CURVINE_S3_ALLOW_EMPTY_CREDENTIALS=1.
+                    if std::env::var("CURVINE_S3_ALLOW_EMPTY_CREDENTIALS").as_deref() != Ok("1") {
+                        return curvine_core_error::err_box!(
+                            "Refusing to start the S3 gateway with no credentials: every request would fail with 403. Configure s3_gateway.access_key/secret_key, add a credential with `curvine-s3-gateway credential add`, or set CURVINE_S3_ALLOW_EMPTY_CREDENTIALS=1 to start anyway."
+                        );
+                    }
+                    tracing::warn!(
+                        "CURVINE_S3_ALLOW_EMPTY_CREDENTIALS=1: starting with an empty credential store; S3 requests will fail until credentials are added"
+                    );
                     create_empty_store(s3_conf, rt.clone()).await
                 }
             }
@@ -389,8 +402,13 @@ pub async fn start_gateway(
             crate::http::handle_authorization_middleware,
         ))
         .layer(axum::middleware::from_fn(http_performance_middleware))
-        .layer(axum::Extension(ak_store))
-        .route("/healthz", axum::routing::get(|| async { "ok" }));
+        .layer(axum::Extension(ak_store.clone()))
+        .route("/healthz", axum::routing::get(health_handler));
+
+    // The handler needs to answer "can this instance serve requests at all",
+    // which a static "ok" could not: a gateway with no usable credential
+    // rejects every S3 call with 403 while still looking healthy to a probe.
+    let app = app.with_state(AuthState::from(&ak_store));
 
     let app = register_s3_handlers(app, handlers);
 
@@ -405,8 +423,79 @@ pub async fn start_gateway(
         tracing::info!("S3 Gateway started successfully on {}", socket);
     }
 
-    axum::serve(listener, app).await?;
+    // A plain `serve` is killed outright by systemd's SIGTERM, dropping
+    // in-flight uploads mid-body. Shut down gracefully so a request that is
+    // already streaming can finish and its staging cleanup still runs.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// Whether this instance can serve S3 requests, for the health endpoint.
+#[derive(Clone)]
+pub struct AuthState {
+    store: AccessKeyStoreEnum,
+}
+
+impl From<&AccessKeyStoreEnum> for AuthState {
+    fn from(store: &AccessKeyStoreEnum) -> Self {
+        // Holds the store rather than a startup count: credentials added later
+        // through the CLI (the documented way to provision a gateway that
+        // started empty) must flip the probe back to healthy.
+        Self {
+            store: store.clone(),
+        }
+    }
+}
+
+/// Health probe.
+///
+/// Returns 503 when no credential is configured, because such a gateway
+/// rejects every S3 request with 403 and must not be considered ready.
+async fn health_handler(
+    axum::extract::State(state): axum::extract::State<AuthState>,
+) -> (axum::http::StatusCode, &'static str) {
+    if state.store.credential_count_hint() == 0 {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no credentials configured",
+        );
+    }
+    (axum::http::StatusCode::OK, "ok")
+}
+
+/// Resolves on SIGTERM or Ctrl-C.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("Failed to listen for Ctrl-C: {e}");
+            // Never resolve: a missing signal handler must not trigger a
+            // shutdown that nobody asked for.
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("Shutdown signal received, finishing in-flight requests"),
+        _ = terminate => tracing::info!("SIGTERM received, finishing in-flight requests"),
+    }
 }
 
 async fn http_performance_middleware(

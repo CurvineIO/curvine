@@ -34,6 +34,18 @@ pub struct CredentialStoreCore<T: FileSystemAdapter> {
 }
 
 impl<T: FileSystemAdapter> CredentialStoreCore<T> {
+    /// Number of credentials in the in-memory cache, without a file read.
+    ///
+    /// `try_read` keeps a health probe from blocking behind a refresh that is
+    /// rewriting the cache. A miss reports 0, which only makes the probe
+    /// conservative during a refresh.
+    pub fn credential_count_hint(&self) -> usize {
+        self.cache
+            .try_read()
+            .map(|cache| cache.credentials.len())
+            .unwrap_or(0)
+    }
+
     pub fn new(
         fs_adapter: T,
         credentials_path: T::PathType,

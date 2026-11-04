@@ -46,6 +46,19 @@ impl UploadStats {
     }
 }
 
+/// Path a PUT body is staged at before it is published to `object`.
+///
+/// A sibling of the object, so publishing stays a same-directory rename, and
+/// unique per upload so two concurrent writers cannot reuse one staging object.
+fn staging_path_for(object: &Path, staging_id: &str) -> Result<Path, String> {
+    let parent = object
+        .parent()
+        .map_err(|e| format!("object path {object} has no parent: {e}"))?
+        .ok_or_else(|| format!("object path {object} has no parent"))?;
+    Path::from_str(format!("{parent}/.curvine-s3-staging-{staging_id}"))
+        .map_err(|e| format!("Invalid staging path: {e}"))
+}
+
 pub struct PutContext {
     pub fs: UnifiedFileSystem,
     pub rt: Arc<AsyncRuntime>,
@@ -96,9 +109,27 @@ impl PutContext {
         })
     }
 
+    /// Write to a staging path instead of the object itself.
+    ///
+    /// `UnifiedFileSystem::create` with `overwrite = true` makes the master
+    /// clear the existing inode's blocks and reset its length immediately
+    /// (`inode_file.rs::overwrite`). Writing in place therefore destroys the
+    /// previous object before the new body is known to be complete: a client
+    /// that disconnects half way leaves a truncated object, and the old data is
+    /// already gone. Staging keeps the published object untouched until the
+    /// whole body has been written and verified.
+    pub fn staging_path(&self, staging_id: &str) -> Result<Path, String> {
+        staging_path_for(&self.get_validated_path()?, staging_id)
+    }
+
     pub async fn create_writer(&self) -> Result<UnifiedWriter, String> {
-        let path = self.get_validated_path()?;
-        self.fs.create(&path, true).await.map_err(|e| {
+        self.create_writer_at(&self.get_validated_path()?).await
+    }
+
+    pub async fn create_writer_at(&self, path: &Path) -> Result<UnifiedWriter, String> {
+        // `create_parent` is the second argument; overwrite stays false so a
+        // pre-existing staging entry is refused rather than silently reused.
+        self.fs.create(path, true).await.map_err(|e| {
             tracing::error!("Failed to create file at path {}: {}", path, e);
             e.to_string()
         })
@@ -114,19 +145,10 @@ impl ChunkProcessor {
         }
 
         let n = chunk.len();
+        // Length only. Dumping the first bytes of every chunk put object data
+        // into the log on the upload hot path, so enabling debug logging leaked
+        // user payloads.
         log::debug!("POLLREAD-CHUNK: {n} bytes");
-
-        if n > 0 {
-            log::debug!(
-                "POLLREAD-HEX: {}",
-                chunk
-                    .iter()
-                    .take(30)
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-        }
 
         if stats.should_log_first_chunk() {
             log::debug!("PUT DEBUG - First chunk: {n} bytes");
@@ -191,28 +213,77 @@ impl WriterHelper {
 pub struct PutOperation;
 
 impl PutOperation {
+    /// Write the object without ever exposing a partial body under its key.
+    ///
+    /// The previous implementation wrote straight to the object path. Because
+    /// the master drops the old blocks and length on `create(overwrite)`, a
+    /// failed or disconnected upload destroyed the existing object and left a
+    /// truncated one. The body is now staged and only published by a rename
+    /// once it is complete, so any failure leaves the previous object intact.
     pub async fn execute(
         context: PutContext,
         body: &mut crate::utils::io::PollReaderEnum,
     ) -> Result<(), String> {
         context.log_start();
 
-        let mut writer = context.create_writer().await?;
+        let staging_id = uuid::Uuid::new_v4().to_string();
+        let staging = context.staging_path(&staging_id)?;
+        let object = context.get_validated_path()?;
+
         let mut stats = UploadStats::new();
+        let result = Self::stage_and_publish(&context, body, &staging, &object, &mut stats).await;
 
-        loop {
-            let chunk = match body.poll_read().await? {
-                Some(data) => data,
-                None => break,
-            };
-
-            ChunkProcessor::process_chunk(&chunk, &mut stats)?;
-            WriterHelper::write_chunk(&mut writer, &chunk).await?;
+        if result.is_err() {
+            // Best effort: the staging object may not exist if create failed.
+            if let Err(e) = context.fs.delete(&staging, false).await {
+                tracing::warn!("Failed to remove staging object {staging}: {e}");
+            }
         }
 
-        WriterHelper::complete_write(&mut writer).await?;
-        context.log_completion(&stats);
+        result.map(|()| context.log_completion(&stats))
+    }
 
+    async fn stage_and_publish(
+        context: &PutContext,
+        body: &mut crate::utils::io::PollReaderEnum,
+        staging: &Path,
+        object: &Path,
+        stats: &mut UploadStats,
+    ) -> Result<(), String> {
+        let mut writer = context.create_writer_at(staging).await?;
+
+        loop {
+            let chunk = match body.poll_read().await {
+                Ok(Some(data)) => data,
+                Ok(None) => break,
+                Err(e) => {
+                    // Drop the half-written staging object: publishing it would
+                    // replace a good object with a truncated one.
+                    let _ = writer.cancel().await;
+                    return Err(e);
+                }
+            };
+
+            ChunkProcessor::process_chunk(&chunk, stats)?;
+            if let Err(e) = WriterHelper::write_chunk(&mut writer, &chunk).await {
+                let _ = writer.cancel().await;
+                return Err(e);
+            }
+        }
+
+        if let Err(e) = WriterHelper::complete_write(&mut writer).await {
+            let _ = writer.cancel().await;
+            return Err(e);
+        }
+
+        // Publish. `rename` replaces the destination in this filesystem, so the
+        // object only ever holds either the previous body or the complete new
+        // one.
+        context
+            .fs
+            .rename(staging, object)
+            .await
+            .map_err(|e| format!("Failed to publish staged object: {e}"))?;
         Ok(())
     }
 
@@ -389,6 +460,62 @@ mod range_tests {
         assert_eq!(
             Range::parse("bytes=500-").unwrap().to_content_range(100),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The staging object must live beside the published object so publishing
+    /// is a same-directory rename, and it must never be the object path.
+    #[test]
+    fn staging_path_is_a_sibling_of_the_object() {
+        let object = Path::from_str("/bucket/a/b/object.bin").unwrap();
+        let staging = staging_path_for(&object, "deadbeef").expect("valid staging path");
+
+        assert_ne!(staging, object);
+        assert_eq!(
+            staging.parent().unwrap().unwrap(),
+            object.parent().unwrap().unwrap(),
+            "staging must be a sibling of the object"
+        );
+        assert!(
+            staging.full_path().contains("deadbeef"),
+            "staging path must be unique per upload: {staging}"
+        );
+    }
+
+    /// A failed PUT must never write under the object path. If it did, the
+    /// master would clear the existing inode's blocks on create and the old
+    /// object would be lost before the new body is complete.
+    #[test]
+    fn staging_path_never_equals_the_published_path() {
+        for object in ["/b/key", "/b/a/b/c/obj.bin", "/b/.hidden"] {
+            let object = Path::from_str(object).unwrap();
+            let staging = staging_path_for(&object, "abc123").unwrap();
+            assert_ne!(
+                staging, object,
+                "a failed upload must not touch the object path: {staging}"
+            );
+            assert!(
+                !staging.full_path().ends_with("/key")
+                    && !staging.full_path().ends_with("/obj.bin")
+                    && !staging.full_path().ends_with("/.hidden"),
+                "staging must carry the upload id, got {staging}"
+            );
+        }
+    }
+
+    /// Two concurrent uploads of the same key must not share a staging object,
+    /// or one would publish the other's partial body.
+    #[test]
+    fn staging_paths_differ_per_upload() {
+        let object = Path::from_str("/bucket/key").unwrap();
+        assert_ne!(
+            staging_path_for(&object, "id-one").unwrap(),
+            staging_path_for(&object, "id-two").unwrap()
         );
     }
 }

@@ -114,6 +114,17 @@ impl AccessKeyStoreEnum {
         }
     }
 
+    /// Number of credentials currently cached.
+    ///
+    /// Used by the health probe: a gateway with no credential rejects every S3
+    /// request, so it must not report itself ready.
+    pub fn credential_count_hint(&self) -> usize {
+        match self {
+            AccessKeyStoreEnum::Local(store) => store.credential_count_hint(),
+            AccessKeyStoreEnum::Curvine(store) => store.credential_count_hint(),
+        }
+    }
+
     pub fn start_cache_refresh_task(
         &self,
         runtime: Arc<curvine_runtime::runtime::AsyncRuntime>,
