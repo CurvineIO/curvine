@@ -167,6 +167,9 @@ impl GrpcBlockClient {
             .endpoint(uri, tls)
             .map_err(|e| FsError::common(e.to_string()))?;
         let channel = endpoint
+            // Advertise larger response DATA frames for block reads without
+            // changing the number of outstanding read requests.
+            .max_frame_size(256 * 1024)
             .connect()
             .await
             .map_err(|e| FsError::common(e.to_string()))?;
