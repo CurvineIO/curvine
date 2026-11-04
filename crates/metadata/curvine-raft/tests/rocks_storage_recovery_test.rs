@@ -16,7 +16,7 @@ use curvine_core_error::CommonResult;
 use curvine_raft::raft::{storage::RocksStorageCore, RaftError};
 use curvine_raft::rocksdb::{DBConf, DBEngine, RocksUtils};
 use curvine_runtime::common::{FileUtils, Utils};
-use prost::Message;
+use prost_legacy::Message;
 use raft::eraftpb::{Entry, HardState, Snapshot};
 
 fn test_conf(name: &str) -> DBConf {

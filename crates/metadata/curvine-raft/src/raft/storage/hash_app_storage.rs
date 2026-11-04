@@ -117,7 +117,7 @@ where
     }
 
     fn get_fsm_state(&self) -> FsmState {
-        self.fsm_state.lock().unwrap().clone()
+        *self.fsm_state.lock().unwrap()
     }
 
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
@@ -235,7 +235,7 @@ where
     }
 
     fn get_fsm_state(&self) -> FsmState {
-        self.fsm_state.lock().unwrap().clone()
+        *self.fsm_state.lock().unwrap()
     }
 
     async fn role_change(&self, _role: StateRole) -> RaftResult<()> {

@@ -24,6 +24,7 @@ use std::vec;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JournalConf {
+    pub grpc: curvine_rpc::grpc::GrpcConfig,
     // If you enable raft log synchronization, logs will not be synchronized,
     // which is equivalent to a stand-alone system.
     pub enable: bool,
@@ -282,6 +283,7 @@ impl JournalConf {
 
     pub fn new_client_conf(&self) -> ClientConf {
         ClientConf {
+            grpc: self.grpc.clone(),
             io_threads: self.io_threads,
             worker_threads: self.worker_threads,
             message_size: self.message_size,
@@ -319,6 +321,7 @@ impl Default for JournalConf {
 
         let rocksdb = Self::rocksdb_default().set_dir(journal_dir.as_str());
         Self {
+            grpc: Default::default(),
             enable: true,
             group_name: "raft-group".to_string(),
             hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),

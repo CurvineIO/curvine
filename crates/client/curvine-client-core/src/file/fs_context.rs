@@ -24,7 +24,7 @@ use curvine_model::ProtoUtils;
 use curvine_model::{ClientAddress, WorkerAddress, WorkerInfo};
 use curvine_net::net::NetUtils;
 use curvine_proto::{ClientAddressProto, ClientHeartbeatRequest, ClientHeartbeatResponse};
-use curvine_rpc::client::{ClientConf, ClusterConnector};
+use curvine_rpc::client::ClientConf;
 use curvine_runtime::common::{TimeSpent, Utils};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::FastRwLock;
@@ -48,7 +48,9 @@ static CLIENT_METRICS: OnceCell<ClientMetrics> = OnceCell::new();
 // 3. Perceive master switching.
 pub struct FsContext {
     pub(crate) conf: ClusterConf,
-    pub(crate) connector: Arc<ClusterConnector>,
+    rt: Arc<Runtime>,
+    rpc_conf: ClientConf,
+    pub(crate) grpc_master: super::grpc_master_client::GrpcMasterClient,
     pub(crate) client_addr: ClientAddress,
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
@@ -108,10 +110,8 @@ impl FsContext {
         CLIENT_METRICS
             .get_or_init(|| ClientMetrics::new(&conf.client.metadata_operation_buckets).unwrap());
 
-        let connector = ClusterConnector::with_rt(conf.client_rpc_conf(), rt.clone());
-        for node in conf.master_nodes() {
-            connector.add_node(node)?;
-        }
+        let rpc_conf = conf.client_rpc_conf();
+        let grpc_master = super::grpc_master_client::GrpcMasterClient::new(&conf, rt.clone())?;
 
         let os_cache = CacheManager::new(
             conf.client.enable_read_ahead,
@@ -133,7 +133,9 @@ impl FsContext {
 
         let context = Self {
             conf,
-            connector: Arc::new(connector),
+            rt,
+            rpc_conf,
+            grpc_master,
             client_addr,
             os_cache,
             failed_workers: exclude_workers,
@@ -214,11 +216,11 @@ impl FsContext {
     }
 
     pub fn clone_runtime(&self) -> Arc<Runtime> {
-        self.connector.clone_runtime()
+        self.rt.clone()
     }
 
     pub fn rt(&self) -> &Runtime {
-        self.connector.rt()
+        &self.rt
     }
 
     pub fn is_local_worker(&self, addr: &WorkerAddress) -> bool {
@@ -255,11 +257,39 @@ impl FsContext {
         // T10: pre-check the worker's version/protocol before opening a data
         // connection (diagnose-only; logs mismatches, never refuses).
         self.precheck_worker(addr);
-        let client = self
-            .connector
-            .create_client(&addr.inet_addr(), false)
-            .await?;
-        Ok(BlockClient::new(client, addr.clone(), self))
+        let grpc = &self.conf.client.grpc;
+        let uri = grpc.uri(&addr.ip_addr, addr.rpc_port as u16);
+        let tls_name = if addr.hostname.is_empty() {
+            &addr.ip_addr
+        } else {
+            &addr.hostname
+        };
+        let tls = grpc.client_tls(tls_name)?;
+        let timeout = Duration::from_millis(self.conf.client.data_timeout_ms);
+        let read_window = self.conf.client.read_pipeline_window;
+        // Tonic's channel background tasks must live on the filesystem runtime,
+        // not whichever short-lived runtime happens to make the first request.
+        let grpc = self
+            .rt
+            .spawn(async move {
+                crate::block::grpc_block_client::GrpcBlockClient::connect_with_tls(
+                    uri,
+                    timeout,
+                    tls.as_ref(),
+                )
+                .await
+                .map(|client| {
+                    if read_window == 0 {
+                        client.with_adaptive_read_window()
+                    } else {
+                        client.with_read_window(read_window)
+                    }
+                })
+            })
+            .await
+            .map_err(curvine_io::IOError::create)?
+            .map_err(curvine_io::IOError::create)?;
+        Ok(BlockClient::new_grpc(grpc, addr.clone(), self))
     }
 
     pub async fn acquire_write(&self, addr: &WorkerAddress) -> IOResult<BlockClient> {
@@ -303,7 +333,7 @@ impl FsContext {
     }
 
     pub fn rpc_conf(&self) -> &ClientConf {
-        self.connector.factory().conf()
+        &self.rpc_conf
     }
 
     pub fn clone_os_cache(&self) -> CacheManager {

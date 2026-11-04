@@ -20,6 +20,7 @@ pub struct BatchBlockWriterLocal {
     block_size: i64,
     pos: i64,
     req_id: i64,
+    seq_id: i32,
     actual_storage_types: Vec<StorageType>,
 }
 
@@ -31,6 +32,7 @@ impl BatchBlockWriterLocal {
         pos: i64,
     ) -> FsResult<Self> {
         let req_id = Utils::req_id();
+        let seq_id = 0;
         let block_size = fs_context.block_size();
         let client = fs_context.block_client(&worker_address).await?;
 
@@ -41,7 +43,7 @@ impl BatchBlockWriterLocal {
                 0,
                 block_size,
                 req_id,
-                0_i32,
+                seq_id,
                 fs_context.write_chunk_size() as i32,
                 true,
             )
@@ -50,7 +52,7 @@ impl BatchBlockWriterLocal {
         // the response violates the client-side ordering contract.
         if let Err(error) = validate_batch_contexts(&blocks, &write_context.contexts) {
             let _ = client
-                .write_commit_batch(&blocks, pos, block_size, req_id, 0, true)
+                .write_commit_batch(&blocks, pos, block_size, req_id, seq_id + 1, true)
                 .await;
             return Err(error);
         }
@@ -69,7 +71,14 @@ impl BatchBlockWriterLocal {
                         Ok(file) => file,
                         Err(error) => {
                             let _ = client
-                                .write_commit_batch(&blocks, pos, block_size, req_id, 0, true)
+                                .write_commit_batch(
+                                    &blocks,
+                                    pos,
+                                    block_size,
+                                    req_id,
+                                    seq_id + 1,
+                                    true,
+                                )
                                 .await;
                             return Err(error.into());
                         }
@@ -80,7 +89,7 @@ impl BatchBlockWriterLocal {
                     // No local path available (e.g. SPDK bdev without filesystem path).
                     // Abort all blocks on the server before returning so state is clean.
                     let _ = client
-                        .write_commit_batch(&blocks, pos, block_size, req_id, 0, true)
+                        .write_commit_batch(&blocks, pos, block_size, req_id, seq_id + 1, true)
                         .await;
                     return Err(FsError::no_local_path(format!(
                         "no local path for batch block {} (storage type {:?})",
@@ -100,34 +109,42 @@ impl BatchBlockWriterLocal {
             block_size,
             pos: 0,
             req_id,
+            seq_id,
             actual_storage_types,
         })
+    }
+
+    fn next_seq_id(&mut self) -> i32 {
+        self.seq_id += 1;
+        self.seq_id
     }
 
     // SINGLE RPC call to complete all blocks
     pub async fn complete(&mut self) -> FsResult<()> {
         // flush before commit
         self.flush().await?;
+        let next_seq_id = self.next_seq_id();
         self.client
             .write_commit_batch(
                 &self.blocks,
                 self.pos,
                 self.block_size,
                 self.req_id,
-                0,
+                next_seq_id,
                 false,
             )
             .await
     }
 
     pub async fn cancel(&mut self) -> FsResult<()> {
+        let next_seq_id = self.next_seq_id();
         self.client
             .write_commit_batch(
                 &self.blocks,
                 self.pos,
                 self.block_size,
                 self.req_id,
-                0,
+                next_seq_id,
                 true,
             )
             .await

@@ -253,6 +253,32 @@ mod tests {
     }
 
     #[test]
+    fn grpc_sections_are_recognized_and_deserialized() {
+        let raw = r#"
+            [worker.grpc]
+            tls_enabled = true
+            server_cert_path = "/tls/server.crt"
+            server_key_path = "/tls/server.key"
+            require_client_auth = true
+            client_ca_cert_path = "/tls/client-ca.crt"
+            enable_reflection = true
+            [client.grpc]
+            tls_enabled = true
+            ca_cert_path = "/tls/server-ca.crt"
+            domain_name = "server.example"
+            [journal.grpc]
+            tls_enabled = true
+        "#;
+        assert!(audit_unknown_keys(raw).unwrap().is_empty());
+        let conf: crate::ClusterConf = toml::from_str(raw).unwrap();
+        assert!(conf.worker.grpc.require_client_auth);
+        assert!(conf.worker.grpc.enable_reflection);
+        assert_eq!(conf.worker.grpc.client_ca_cert_path, "/tls/client-ca.crt");
+        assert_eq!(conf.client.grpc.domain_name, "server.example");
+        assert!(conf.journal.grpc.tls_enabled);
+    }
+
+    #[test]
     fn typoed_keys_are_reported_with_dotted_paths() {
         let raw = r#"
             [fuse]

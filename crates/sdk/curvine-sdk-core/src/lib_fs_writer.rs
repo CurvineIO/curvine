@@ -20,14 +20,14 @@ use curvine_error::FsResult;
 use curvine_fs_api::{Path, Writer};
 use curvine_io::DataSlice;
 use curvine_model::FileStatus;
-use curvine_rpc::handler::FrameBuf;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 
 pub struct LibFsWriter {
     pub(crate) rt: Arc<Runtime>,
     pub(crate) inner: UnifiedWriter,
-    pub(crate) buf: FrameBuf,
+    pub(crate) buf: BytesMut,
+    pub(crate) buffer_limit: usize,
     pub(crate) chunk_size: usize,
     pub(crate) cur_chunk: Option<BytesMut>,
 }
@@ -37,7 +37,13 @@ impl LibFsWriter {
         Self {
             rt,
             inner: writer,
-            buf: FrameBuf::new(conf.client.write_chunk_size * conf.client.write_chunk_num),
+            buf: BytesMut::new(),
+            buffer_limit: conf
+                .client
+                .write_chunk_size
+                .saturating_mul(conf.client.write_chunk_num)
+                .max(8192)
+                .saturating_mul(4),
             chunk_size: conf.client.write_chunk_size,
             cur_chunk: None,
         }
@@ -51,7 +57,12 @@ impl LibFsWriter {
         if self.cur_chunk.is_some() {
             return err_box!("chunk already allocated");
         }
-        let chunk = self.buf.take_exact(self.chunk_size);
+        self.buf.reserve(self.chunk_size);
+        self.buf.resize(self.chunk_size, 0);
+        let chunk = self.buf.split_to(self.chunk_size);
+        if self.buf.capacity() > self.buffer_limit {
+            self.buf = BytesMut::new();
+        }
         Ok(self.cur_chunk.insert(chunk))
     }
 

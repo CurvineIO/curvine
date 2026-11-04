@@ -12,6 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-include!(concat!(env!("OUT_DIR"), "/protos/proto.rs"));
+// Generated tonic signatures must return Status by value.
+#[allow(clippy::result_large_err)]
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/protos/proto.rs"));
+}
+pub use generated::*;
+
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/protos/descriptor.bin"));
 
 mod display;

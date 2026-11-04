@@ -15,25 +15,4 @@
 mod client_conf;
 pub use self::client_conf::ClientConf;
 
-mod raw_client;
-pub use self::raw_client::RawClient;
-
-mod rpc_client;
-pub use self::rpc_client::RpcClient;
-
-mod buffer_client;
-pub use self::buffer_client::BufferClient;
-
-mod sync_client;
-pub use self::sync_client::SyncClient;
-
-mod client_factory;
-pub use self::client_factory::ClientFactory;
-
 pub mod dispatch;
-
-mod client_state;
-pub use self::client_state::ClientState;
-
-mod cluster_connector;
-pub use self::cluster_connector::ClusterConnector;

@@ -21,9 +21,11 @@ use curvine_net::net::InetAddr;
 use curvine_runtime::common::LogConf;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FilesystemConf {
+    /// gRPC client TLS identity and certificate settings.
+    pub grpc: curvine_rpc::grpc::GrpcConfig,
     pub master_addrs: String,
     pub client_hostname: String,
     pub io_threads: usize,
@@ -34,6 +36,10 @@ pub struct FilesystemConf {
 
     pub write_chunk_size: String,
     pub write_chunk_num: usize,
+    /// Number of unacknowledged data chunks; zero selects the client default.
+    pub write_pipeline_window: usize,
+    /// Zero enables the experimental automatic window; the default is one.
+    pub read_pipeline_window: usize,
 
     pub read_chunk_size: String,
     pub read_chunk_num: usize,
@@ -133,6 +139,75 @@ pub struct FilesystemConf {
     pub seek_absorb_window: String,
 }
 
+impl Default for FilesystemConf {
+    fn default() -> Self {
+        Self {
+            grpc: Default::default(),
+            master_addrs: Default::default(),
+            client_hostname: Default::default(),
+            io_threads: Default::default(),
+            worker_threads: Default::default(),
+            replicas: Default::default(),
+            block_size: Default::default(),
+            short_circuit: Default::default(),
+            write_chunk_size: Default::default(),
+            write_chunk_num: Default::default(),
+            write_pipeline_window: Default::default(),
+            read_pipeline_window: ClientConf::default().read_pipeline_window,
+            read_chunk_size: Default::default(),
+            read_chunk_num: Default::default(),
+            read_parallel: Default::default(),
+            read_slice_size: Default::default(),
+            max_cache_block_handles: Default::default(),
+            storage_type: Default::default(),
+            ttl_ms: Default::default(),
+            ttl_action: Default::default(),
+            auto_cache_enabled: Default::default(),
+            auto_cache_ttl: Default::default(),
+            default_cache_ttl: Default::default(),
+            conn_retry_max_duration_ms: Default::default(),
+            conn_retry_min_sleep_ms: Default::default(),
+            conn_retry_max_sleep_ms: Default::default(),
+            rpc_retry_max_duration_ms: Default::default(),
+            rpc_retry_min_sleep_ms: Default::default(),
+            rpc_retry_max_sleep_ms: Default::default(),
+            rpc_close_idle: Default::default(),
+            conn_timeout_ms: Default::default(),
+            rpc_timeout_ms: Default::default(),
+            data_timeout_ms: Default::default(),
+            write_buffer_timeout_ms: Default::default(),
+            master_conn_pool_size: Default::default(),
+            enable_read_ahead: Default::default(),
+            read_ahead_len: Default::default(),
+            drop_cache_len: Default::default(),
+            log_level: Default::default(),
+            log_dir: Default::default(),
+            log_file_name: Default::default(),
+            max_log_files: Default::default(),
+            display_thread: Default::default(),
+            display_position: Default::default(),
+            failed_worker_ttl_ms: Default::default(),
+            enable_unified_fs: Default::default(),
+            enable_rust_read_ufs: Default::default(),
+            mount_update_ttl_ms: Default::default(),
+            sync_check_interval_min_ms: Default::default(),
+            sync_check_interval_max_ms: Default::default(),
+            max_sync_wait_timeout_ms: Default::default(),
+            sync_check_log_tick: Default::default(),
+            enable_block_conn_pool: Default::default(),
+            block_conn_idle_size: Default::default(),
+            block_conn_idle_time_ms: Default::default(),
+            small_file_size: Default::default(),
+            enable_smart_prefetch: Default::default(),
+            large_file_size: Default::default(),
+            max_read_parallel: Default::default(),
+            sequential_read_threshold: Default::default(),
+            transfer: Default::default(),
+            seek_absorb_window: Default::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransferClientConf {
@@ -228,6 +303,7 @@ impl FilesystemConf {
         };
 
         let client = ClientConf {
+            grpc: self.grpc,
             master_addrs,
             hostname: self.client_hostname.trim().to_string(),
             io_threads: self.io_threads,
@@ -240,7 +316,13 @@ impl FilesystemConf {
             write_chunk_size: 0,
             write_chunk_size_str: self.write_chunk_size,
             write_chunk_num: self.write_chunk_num,
+            write_pipeline_window: if self.write_pipeline_window == 0 {
+                ClientConf::default().write_pipeline_window
+            } else {
+                self.write_pipeline_window
+            },
 
+            read_pipeline_window: self.read_pipeline_window,
             read_chunk_size: 0,
             read_chunk_size_str: self.read_chunk_size,
             read_chunk_num: self.read_chunk_num,
@@ -303,7 +385,7 @@ impl FilesystemConf {
             max_read_parallel: self.max_read_parallel,
             sequential_read_threshold: self.sequential_read_threshold,
 
-            // The derived FilesystemConf::default() leaves the string empty,
+            // FilesystemConf::default() leaves the string empty,
             // which ClientConf::init() rejects; treat empty as "disabled".
             seek_absorb_window_str: if self.seek_absorb_window.trim().is_empty() {
                 "0".to_string()
@@ -346,6 +428,61 @@ impl FilesystemConf {
 mod tests {
     use super::{FilesystemConf, TransferClientConf};
     use curvine_config::ClientConf;
+
+    #[test]
+    fn read_pipeline_auto_is_explicit_and_survives_sdk_conversion() {
+        assert_eq!(FilesystemConf::default().read_pipeline_window, 1);
+        let omitted = FilesystemConf::from_str("").unwrap();
+        assert_eq!(omitted.read_pipeline_window, 1);
+        let mut auto = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        assert_eq!(auto.read_pipeline_window, 1);
+        auto.read_pipeline_window = 0;
+        assert_eq!(
+            auto.into_cluster_conf()
+                .unwrap()
+                .client
+                .read_pipeline_window,
+            0
+        );
+        let explicit = FilesystemConf::from_str("read_pipeline_window = 0").unwrap();
+        assert_eq!(explicit.read_pipeline_window, 0);
+        let mut invalid = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        invalid.read_pipeline_window = 33;
+        assert!(invalid.into_cluster_conf().is_err());
+    }
+
+    #[test]
+    fn grpc_tls_and_write_pipeline_settings_survive_sdk_conversion() {
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.grpc.tls_enabled = true;
+        conf.grpc.ca_cert_path = "/test/ca.pem".into();
+        conf.grpc.domain_name = "worker.example".into();
+        conf.write_pipeline_window = 32;
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.write_pipeline_window, 32);
+        assert!(cluster.client.grpc.tls_enabled);
+        assert_eq!(cluster.client.grpc.ca_cert_path, "/test/ca.pem");
+        assert_eq!(cluster.client.grpc.domain_name, "worker.example");
+    }
+
+    #[test]
+    fn parses_grpc_tls_and_write_pipeline_settings() {
+        let conf = FilesystemConf::from_str(
+            r#"
+            master_addrs = "master-0:8995"
+            write_pipeline_window = 16
+            [grpc]
+            tls_enabled = true
+            ca_cert_path = "/test/ca.pem"
+            domain_name = "worker.example"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(conf.write_pipeline_window, 16);
+        assert!(conf.grpc.tls_enabled);
+        assert_eq!(conf.grpc.ca_cert_path, "/test/ca.pem");
+        assert_eq!(conf.grpc.domain_name, "worker.example");
+    }
 
     #[test]
     fn default_master_conn_pool_size_is_one() {

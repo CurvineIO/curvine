@@ -1,0 +1,373 @@
+{
+  "audited_utc": "2026-11-04T08:07:52.549721+00:00",
+  "status": "pass",
+  "archive_sha256": "761727a02ca0a46215b92d0b121d600352148fc4a8b344964413e5d6cb662d1b",
+  "trial_count": 30,
+  "total_bytes": 128849018880,
+  "latency_sample_count": 122880,
+  "stable_server_process_snapshots": 90,
+  "zero_drop_shaped_sides": 60,
+  "candidate_parent": "887c2584a59f7207e4d14f0425c31d71650842ba",
+  "candidate_revision": "5a9ba44494216e89be151c561c8afa0844e1919d",
+  "candidate_diff_numstat": "3\t0\tcrates/client/curvine-client-core/src/block/grpc_block_client.rs",
+  "candidate_added_lines": [
+    "            // Advertise larger response DATA frames for block reads without",
+    "            // changing the number of outstanding read requests.",
+    "            .max_frame_size(256 * 1024)"
+  ],
+  "capture_diagnostics": {
+    "control": {
+      "diagnostic_only": true,
+      "capture_packets": 11189,
+      "kernel_drops": 0,
+      "snaplen_truncated_packets": 0,
+      "client_advertised_max_frame_bytes": 16384,
+      "server_data_frames_at_full_size": 8444,
+      "server_data_frames_above_16384": 0,
+      "server_partial_tail_warnings": [],
+      "pcap_sha256": "0fff0e626d63047796920012c12e893f361478fa91372530c0ad7f59ca69538d",
+      "compressed_pcap_sha256": "ab77d47f3e783c928ae4f605702b24343971983458e02c17ac22d54df2367ff4",
+      "capture_result_client_sha256": "fb3905d1931bf77bd70d44bbfeb0ff84f9d9852b879882bab77a2a15a4774a55",
+      "capture_result_server_hash_is_wrapper": true,
+      "server_revision_prefix_in_log": "887c2584"
+    },
+    "candidate": {
+      "diagnostic_only": true,
+      "capture_packets": 5576,
+      "kernel_drops": 0,
+      "snaplen_truncated_packets": 0,
+      "client_advertised_max_frame_bytes": 262144,
+      "server_data_frames_at_full_size": 527,
+      "server_data_frames_above_16384": 527,
+      "server_partial_tail_warnings": [
+        "partial frame at end of captured prefix (need 262144 payload bytes)"
+      ],
+      "pcap_sha256": "9c5b9d7399d426d1b7bb439cbd62b829d0a77ec8eac07fdf64f3ac8c8f6231c7",
+      "compressed_pcap_sha256": "c8bc65be87283019843630361e5f55346a0f903e16af5f1b52a93152c5621a43",
+      "capture_result_client_sha256": "b8b70421430032ab80e6d8d1e2278cd4638a79fcfe549b268ac41943747eb634",
+      "capture_result_server_hash_is_wrapper": true,
+      "server_revision_prefix_in_log": "5a9ba444"
+    }
+  },
+  "source_sha256": "3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac",
+  "source_hash_verified_in_committed_grpc_sources": true,
+  "source_hash_embedded_in_all_clients": true,
+  "manifest": {
+    "orpc": {
+      "revision": "c31606c9e08c0e30639409ab28db69a9158f758b",
+      "transport": "orpc",
+      "source_sha256": "3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac",
+      "read_window": null,
+      "tonic_version": null
+    },
+    "previous": {
+      "revision": "887c2584a59f7207e4d14f0425c31d71650842ba",
+      "transport": "grpc",
+      "source_sha256": "3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac",
+      "read_window": null,
+      "compiled_default_read_window": 1,
+      "tonic_version": "0.14.9",
+      "prost_version": "0.14.4",
+      "description": "Tonic 0.14.9 upgrade control, unchanged 16 KiB receive-frame limit"
+    },
+    "grpc": {
+      "revision": "5a9ba44494216e89be151c561c8afa0844e1919d",
+      "transport": "grpc",
+      "source_sha256": "3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac",
+      "read_window": null,
+      "compiled_default_read_window": 1,
+      "tonic_version": "0.14.9",
+      "prost_version": "0.14.4",
+      "client_receive_frame_bytes": 262144,
+      "description": "Only block client Endpoint.max_frame_size changes to 256 KiB"
+    }
+  },
+  "binary_sha256": {
+    "orpc": {
+      "server_sha256": "3ef6a2ebe40cc00be1f4c2e506cd2147f01e49c0880fdb06a5d3c816467d9709",
+      "client_sha256": "3f2a43c8d1687e349dd0c3979842ae43e2162aa16780b535724b04d4264a69cd"
+    },
+    "previous": {
+      "server_sha256": "3e05a8f7595c444964d07a43e2d873e409e510159c4c17c2b43298fc312aceb2",
+      "client_sha256": "fb3905d1931bf77bd70d44bbfeb0ff84f9d9852b879882bab77a2a15a4774a55"
+    },
+    "grpc": {
+      "server_sha256": "6d78a2753692001150b24f1364ea9dcee0acd25d5e13395a46dbdbdbc3e208a3",
+      "client_sha256": "b8b70421430032ab80e6d8d1e2278cd4638a79fcfe549b268ac41943747eb634"
+    }
+  },
+  "compiled_default_read_window": {
+    "previous": 1,
+    "grpc": 1
+  },
+  "configured_read_window": "unset for all 30 trials",
+  "production_retention_both_profiles": true,
+  "orpc_gate_both_profiles": false,
+  "profiles": {
+    "1gbit": {
+      "summary": {
+        "orpc": {
+          "throughput": {
+            "median": 119385013.10585229,
+            "min": 119342140.18485638,
+            "max": 119440927.12538056
+          },
+          "p99": {
+            "median": 72.465547,
+            "min": 62.204377,
+            "max": 82.212091
+          },
+          "client_cpu_per_gib": {
+            "median": 0.955,
+            "min": 0.9,
+            "max": 0.98
+          },
+          "server_cpu_per_gib": {
+            "median": 0.275,
+            "min": 0.2725,
+            "max": 0.2825
+          },
+          "cpu_per_gib": {
+            "median": 1.23,
+            "min": 1.1775,
+            "max": 1.26
+          },
+          "timed_rss_mib": {
+            "median": 110.3125,
+            "min": 109.38671875,
+            "max": 117.1328125
+          }
+        },
+        "previous": {
+          "throughput": {
+            "median": 118959824.19028643,
+            "min": 117956731.52270004,
+            "max": 119079361.82242192
+          },
+          "p99": {
+            "median": 86.796081,
+            "min": 61.707425,
+            "max": 98.073992
+          },
+          "client_cpu_per_gib": {
+            "median": 1.425,
+            "min": 1.405,
+            "max": 1.4975
+          },
+          "server_cpu_per_gib": {
+            "median": 1.36,
+            "min": 1.3275,
+            "max": 1.425
+          },
+          "cpu_per_gib": {
+            "median": 2.785,
+            "min": 2.7325,
+            "max": 2.9225000000000003
+          },
+          "timed_rss_mib": {
+            "median": 130.17578125,
+            "min": 129.8046875,
+            "max": 130.60546875
+          }
+        },
+        "grpc": {
+          "throughput": {
+            "median": 119349491.42934602,
+            "min": 118494479.58801033,
+            "max": 119426116.66834871
+          },
+          "p99": {
+            "median": 83.98323,
+            "min": 70.419242,
+            "max": 101.843373
+          },
+          "client_cpu_per_gib": {
+            "median": 1.01,
+            "min": 0.97,
+            "max": 1.025
+          },
+          "server_cpu_per_gib": {
+            "median": 1.105,
+            "min": 1.09,
+            "max": 1.1825
+          },
+          "cpu_per_gib": {
+            "median": 2.1100000000000003,
+            "min": 2.0700000000000003,
+            "max": 2.2075
+          },
+          "timed_rss_mib": {
+            "median": 131.90625,
+            "min": 131.16015625,
+            "max": 133.58203125
+          }
+        }
+      },
+      "comparisons": {
+        "orpc": {
+          "ratios": {
+            "throughput": 0.9997024611751328,
+            "p99": 1.1589401236424808,
+            "cpu_per_gib": 1.715447154471545
+          },
+          "checks": {
+            "throughput": true,
+            "p99": false,
+            "cpu_per_gib": false
+          },
+          "pass": false,
+          "comparator_exit": 1
+        },
+        "checkpoint": {
+          "ratios": {
+            "throughput": 1.0032756205022317,
+            "p99": 0.9675924192936776,
+            "cpu_per_gib": 0.7576301615798924
+          },
+          "checks": {
+            "throughput": true,
+            "p99": true,
+            "cpu_per_gib": true
+          },
+          "pass": true,
+          "comparator_exit": 0
+        }
+      }
+    },
+    "10gbit": {
+      "summary": {
+        "orpc": {
+          "throughput": {
+            "median": 1158633245.002194,
+            "min": 1137613151.65659,
+            "max": 1170068806.1544507
+          },
+          "p99": {
+            "median": 6.070962,
+            "min": 5.243852,
+            "max": 6.44376
+          },
+          "client_cpu_per_gib": {
+            "median": 0.7675,
+            "min": 0.7525,
+            "max": 0.8375
+          },
+          "server_cpu_per_gib": {
+            "median": 0.21,
+            "min": 0.2025,
+            "max": 0.2125
+          },
+          "cpu_per_gib": {
+            "median": 0.98,
+            "min": 0.955,
+            "max": 1.0475
+          },
+          "timed_rss_mib": {
+            "median": 110.54296875,
+            "min": 107.625,
+            "max": 114.48046875
+          }
+        },
+        "previous": {
+          "throughput": {
+            "median": 769716343.6344578,
+            "min": 743614420.7268558,
+            "max": 800236164.1412925
+          },
+          "p99": {
+            "median": 7.873589,
+            "min": 7.272121,
+            "max": 8.385988
+          },
+          "client_cpu_per_gib": {
+            "median": 1.6675,
+            "min": 1.5825,
+            "max": 1.7375
+          },
+          "server_cpu_per_gib": {
+            "median": 1.99,
+            "min": 1.955,
+            "max": 2.0225
+          },
+          "cpu_per_gib": {
+            "median": 3.6574999999999998,
+            "min": 3.5375,
+            "max": 3.7350000000000003
+          },
+          "timed_rss_mib": {
+            "median": 134.30078125,
+            "min": 132.8203125,
+            "max": 136.73828125
+          }
+        },
+        "grpc": {
+          "throughput": {
+            "median": 998710916.2188718,
+            "min": 979647019.9167225,
+            "max": 1010936082.173783
+          },
+          "p99": {
+            "median": 6.415817,
+            "min": 5.883641,
+            "max": 6.7375
+          },
+          "client_cpu_per_gib": {
+            "median": 0.945,
+            "min": 0.915,
+            "max": 0.97
+          },
+          "server_cpu_per_gib": {
+            "median": 1.19,
+            "min": 1.155,
+            "max": 1.2075
+          },
+          "cpu_per_gib": {
+            "median": 2.1125,
+            "min": 2.08,
+            "max": 2.1775
+          },
+          "timed_rss_mib": {
+            "median": 132.12109375,
+            "min": 131.23046875,
+            "max": 133.90234375
+          }
+        }
+      },
+      "comparisons": {
+        "orpc": {
+          "ratios": {
+            "throughput": 0.8619732952829096,
+            "p99": 1.0568040122800966,
+            "cpu_per_gib": 2.155612244897959
+          },
+          "checks": {
+            "throughput": true,
+            "p99": true,
+            "cpu_per_gib": false
+          },
+          "pass": false,
+          "comparator_exit": 1
+        },
+        "checkpoint": {
+          "ratios": {
+            "throughput": 1.2975051452112139,
+            "p99": 0.8148529215837911,
+            "cpu_per_gib": 0.5775803144224196
+          },
+          "checks": {
+            "throughput": true,
+            "p99": true,
+            "cpu_per_gib": true
+          },
+          "pass": true,
+          "comparator_exit": 0
+        }
+      }
+    }
+  },
+  "limitations": [
+    "Linux tc does not establish physical network performance.",
+    "Five trials per profile/label and observed ranges do not rule out host noise.",
+    "Compiled default is checked against the pinned source; runtime config omits an override."
+  ]
+}

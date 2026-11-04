@@ -14,25 +14,24 @@
 
 //! Integration wiring test for `BlockWriter::new` (issue #1648).
 //!
-//! Each test owns an isolated RPC server whose handler accepts the
-//! `WriteBlock` Open of the first replica and records every `WriteBlock`
-//! request status afterwards. The second replica points at an unreachable
+//! Each test owns an isolated gRPC server whose handler accepts the
+//! first replica's open and records subsequent write lifecycle operations. The second replica points at an unreachable
 //! address so its open fails after the first replica opened fully. One test
 //! pins that a fresh-block open failure sends exactly one cancel commit;
 //! the other pins that a committed-block reopen failure sends none (the
 //! rollback gate in `BlockWriter::new`).
 
-use curvine_client_core::block::BlockWriter;
+use curvine_client_core::block::{BlockWriter, BlockWriterLocal};
 use curvine_client_core::file::FsContext;
 use curvine_config::ClusterConf;
-use curvine_fs_api::RpcCode;
-use curvine_io::DataSlice;
 use curvine_model::{ExtendedBlock, FileType, LocatedBlock, StorageType, WorkerAddress};
-use curvine_net::net::ConnState;
-use curvine_proto::BlockWriteResponse;
-use curvine_rpc::handler::{HandlerService, MessageHandler};
-use curvine_rpc::message::{Message, RequestStatus};
-use curvine_rpc::server::{RpcServer, ServerConf};
+use curvine_proto::block_data_request::Operation;
+use curvine_proto::block_data_response::Result as OperationResult;
+use curvine_proto::block_data_service_server::{BlockDataService, BlockDataServiceServer};
+use curvine_proto::{BlockDataRequest, BlockDataResponse, BlockWriteResponse};
+use curvine_rpc::message::RequestStatus;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,70 +40,51 @@ struct RecordingService {
     echo_mismatched_block_size: bool,
 }
 
-impl HandlerService for RecordingService {
-    type Item = RecordingHandler;
+#[tonic::async_trait]
+impl BlockDataService for RecordingService {
+    type ExchangeStream =
+        Pin<Box<dyn futures::Stream<Item = Result<BlockDataResponse, tonic::Status>> + Send>>;
 
-    fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
-        RecordingHandler::new(self.observed.clone(), self.echo_mismatched_block_size)
-    }
-}
-
-struct RecordingHandler {
-    observed: Arc<Mutex<Vec<(i64, RequestStatus)>>>,
-    // When set, the Open reply echoes a block_size different from the one
-    // the client requested, driving the constructor's block-size mismatch
-    // branch (and its gated abort) under test.
-    echo_mismatched_block_size: bool,
-}
-
-impl RecordingHandler {
-    fn new(
-        observed: Arc<Mutex<Vec<(i64, RequestStatus)>>>,
-        echo_mismatched_block_size: bool,
-    ) -> Self {
-        Self {
-            observed,
-            echo_mismatched_block_size,
-        }
-    }
-}
-
-impl MessageHandler for RecordingHandler {
-    type Error = curvine_core_error::CommonErrorExt;
-
-    fn handle(&self, msg: &Message) -> Result<Message, Self::Error> {
-        let code = RpcCode::from(msg.code());
-        let status = msg.request_status();
-        if code == RpcCode::WriteBlock {
-            self.observed.lock().unwrap().push((msg.req_id(), status));
-        }
-
-        if code == RpcCode::WriteBlock && status == RequestStatus::Open {
-            // Respond with a writable block context so the first replica
-            // opens fully. The echoed block_size is off by one so the
-            // constructor's block-size mismatch branch fires: `BlockWriter::new`
-            // calls with block_size = 65, the mismatch triggers the abort
-            // path under test in the block-size-mismatch tests below. For
-            // the other tests (block_size = 64) the echo matches and the
-            // open succeeds cleanly.
-            let rep = BlockWriteResponse {
-                id: 1,
-                path: Some("/tmp/curvine-test-block".to_string()),
-                off: 0,
-                block_size: if self.echo_mismatched_block_size {
-                    64
-                } else {
-                    65
-                },
-                storage_type: StorageType::Disk.into(),
-                pipeline_status: None,
-            };
-            use prost::Message as _;
-            let header = bytes::BytesMut::from(&rep.encode_to_vec()[..]);
-            return Ok(msg.success_with_data(Some(header), DataSlice::empty()));
-        }
-
-        Ok(msg.success_with_data(None, DataSlice::empty()))
+    async fn exchange(
+        &self,
+        request: tonic::Request<tonic::Streaming<BlockDataRequest>>,
+    ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+        let mut input = request.into_inner();
+        let observed = self.observed.clone();
+        let mismatch = self.echo_mismatched_block_size;
+        let output = async_stream::try_stream! {
+            let mut next_seq = 0;
+            while let Some(frame) = input.message().await? {
+                if frame.seq_id != next_seq {
+                    Err(tonic::Status::invalid_argument("unexpected write sequence"))?;
+                }
+                next_seq += 1;
+                let (status, result) = match frame.operation {
+                    Some(Operation::OpenWrite(open)) => (
+                        RequestStatus::Open,
+                        OperationResult::OpenedWrite(BlockWriteResponse {
+                            id: open.block.id,
+                            // An empty local path deliberately fails LocalFile::open.
+                            path: Some(String::new()),
+                            off: open.off,
+                            block_size: if mismatch { open.block_size - 1 } else { open.block_size },
+                            storage_type: StorageType::Disk.into(),
+                            pipeline_status: None,
+                        }),
+                    ),
+                    Some(Operation::CancelWrite(_)) => (RequestStatus::Cancel, OperationResult::Ack(true)),
+                    Some(Operation::CompleteWrite(_)) => (RequestStatus::Complete, OperationResult::Ack(true)),
+                    _ => Err(tonic::Status::invalid_argument("unexpected write operation"))?,
+                };
+                observed.lock().unwrap().push((frame.req_id, status));
+                yield BlockDataResponse {
+                    req_id: frame.req_id,
+                    seq_id: frame.seq_id,
+                    result: Some(result),
+                };
+            }
+        };
+        Ok(tonic::Response::new(Box::pin(output)))
     }
 }
 
@@ -114,6 +94,13 @@ struct TestEnv {
     context: Arc<FsContext>,
     worker: WorkerAddress,
     observed: Arc<Mutex<Vec<(i64, RequestStatus)>>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
 }
 
 impl TestEnv {
@@ -121,22 +108,24 @@ impl TestEnv {
         Self::with_echo_mismatch(false)
     }
 
-    /// `echo_mismatched_block_size` makes the handler's Open reply report a
-    /// block_size differing from the client's request, which drives the
-    /// constructor block-size-mismatch branch (and its gated abort).
+    /// A mismatched response drives the constructor's gated abort branch.
     fn with_echo_mismatch(echo_mismatched_block_size: bool) -> Self {
         let observed: Arc<Mutex<Vec<(i64, RequestStatus)>>> = Arc::new(Mutex::new(Vec::new()));
-        let port = curvine_net::net::NetUtils::hold_available_port();
-        let conf = ServerConf::with_hostname("127.0.0.1", port);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
         let service = RecordingService {
             observed: observed.clone(),
             echo_mismatched_block_size,
         };
-        let server = RpcServer::new(conf, service);
-        let rt = server.clone_rt();
-        let port = server.bind_addr().port;
-        std::thread::spawn(move || {
-            server.block_on_start();
+        let rt = Arc::new(Runtime::single());
+        let server = rt.spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            tonic::transport::Server::builder()
+                .add_service(BlockDataServiceServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
         });
         let worker = WorkerAddress {
             worker_id: 1,
@@ -164,6 +153,7 @@ impl TestEnv {
             context,
             worker,
             observed,
+            server,
         }
     }
 
@@ -323,4 +313,19 @@ async fn remote_constructor_mismatch_spares_committed_block() {
         "the mismatch abort must not fire for a committed reopen, observed: {:?}",
         env.observed()
     );
+}
+
+#[tokio::test]
+async fn local_constructor_file_open_failure_aborts_in_sequence() {
+    let env = TestEnv::new();
+    env.wait_ready().await;
+    let block = ExtendedBlock::new(1, 0, StorageType::Ssd, FileType::File);
+    let result = BlockWriterLocal::new(env.context.clone(), block, env.worker.clone(), 0, 64).await;
+    assert!(result.is_err(), "an empty local path must fail to open");
+    let statuses: Vec<_> = env
+        .observed()
+        .into_iter()
+        .map(|(_, status)| status)
+        .collect();
+    assert_eq!(statuses, [RequestStatus::Open, RequestStatus::Cancel]);
 }

@@ -27,6 +27,7 @@ fn main() {
         "transfer.proto",
         "mount.proto",
         "replication.proto",
+        "rpc.proto",
     ];
 
     for name in &proto_files {
@@ -38,9 +39,18 @@ fn main() {
     fs::create_dir_all(&output).unwrap();
 
     let mut build = prost_build::Config::new();
+    // Retain reference-counted payload buffers across protobuf decoding.
+    build.bytes([
+        ".proto.BlockDataResponse.data",
+        ".proto.WriteBlockChunk.data",
+    ]);
     build.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
-    build
+    // Runtime crates construct channels; API crates need no HTTP server stack.
+    let proto_paths = proto_files.map(|name| proto_dir.join(name));
+    tonic_prost_build::configure()
+        .build_transport(false)
         .out_dir(&output)
-        .compile_protos(&proto_files, &[proto_dir])
+        .file_descriptor_set_path(PathBuf::from(&output).join("descriptor.bin"))
+        .compile_with_config(build, &proto_paths, &[proto_dir])
         .unwrap();
 }

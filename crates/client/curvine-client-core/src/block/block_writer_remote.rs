@@ -81,7 +81,7 @@ impl BlockWriterRemote {
             // references (see rollback_on_failure in block_writer.rs).
             if rollback_on_failure(&block, pos) {
                 let _ = client
-                    .write_commit(&block, pos, block_size, req_id, 0, true)
+                    .write_commit(&block, pos, block_size, req_id, seq_id + 1, true)
                     .await;
             }
             return err_box!(
@@ -204,6 +204,9 @@ impl BlockWriterRemote {
                 self.block_size
             );
         }
+
+        // Surface failed queued writes before changing the logical position.
+        self.client.drain_writes().await?;
 
         // Set new position and pending header
         self.pos = pos;

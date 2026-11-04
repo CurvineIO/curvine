@@ -247,7 +247,7 @@ impl BatchWriteHandler {
             let expected_req_id = req_id + i as i64;
             Self::check_context(context, expected_req_id)?;
 
-            let block = ProtoUtils::extend_block_from_pb(block_proto.clone());
+            let block = ProtoUtils::extend_block_from_pb(*block_proto);
             if block.id != context.block.id
                 || block.storage_type != context.block.storage_type
                 || block.file_type != context.block.file_type

@@ -1,0 +1,67 @@
+{
+  "recorded_utc": "2026-11-02T18:02:02.543322+00:00",
+  "build_metadata": "baseline_revision=503ed7f87c2468a2012d621b647f473ed2ef9dab\ncandidate_revision=0eeb5054f92afe1457318525d109bc3e323b2312\nworkload_sha256=3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac\nRUSTFLAGS=-Cdebuginfo=line-tables-only -Clink-arg=-fuse-ld=mold\nCXXFLAGS=-include cstdint -g1\nRUSTC_WRAPPER=/usr/bin/sccache\nCARGO_PROFILE_RELEASE_DEBUG=line-tables-only\nCARGO_PROFILE_RELEASE_STRIP=none\nrustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8\ncargo 1.98.1 (797e8a9bc 2026-08-05)\nmold 2.40.4 (compatible with GNU ld)\ngcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0\nLinux 7.0.0-38-generic\n",
+  "workload_sha256": "3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac",
+  "builds": {
+    "orpc": {
+      "revision": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+      "binary_sha256": {
+        "server": "6b2bb860b29166c9cfb17edd467461b9c17b91feea2cc143dcd0c7a3fd4106b2",
+        "client": "5e1bbc7be19c24bb3b847b96ff17f3be180de341354a8ebfcb1e80f89302b149"
+      },
+      "server_version": {
+        "component": "server",
+        "release_version": "0.2.2",
+        "git_commit": "503ed7f8",
+        "git_tag": "",
+        "git_branch": "",
+        "protocol_version": 1,
+        "min_protocol_version": 1,
+        "capabilities": []
+      },
+      "source_status": "?? crates/client/curvine-client-core/examples/\n",
+      "tracked_source_patch": ""
+    },
+    "grpc": {
+      "revision": "0eeb5054f92afe1457318525d109bc3e323b2312",
+      "binary_sha256": {
+        "server": "729082778a6a7593ab86208cb5bd87ea9a6d74f69724a179c2874863cb2a5da1",
+        "client": "82a554806a23dbe8fee5df1ab39bb26e242a1d83adc95221a1ef8e80fa9d7499"
+      },
+      "server_version": {
+        "component": "server",
+        "release_version": "0.2.2",
+        "git_commit": "0eeb5054",
+        "git_tag": "",
+        "git_branch": "",
+        "protocol_version": 1,
+        "min_protocol_version": 1,
+        "capabilities": []
+      },
+      "source_status": "",
+      "tracked_source_patch": ""
+    }
+  },
+  "host": {
+    "kernel": "7.0.0-38-generic",
+    "architecture": "x86_64",
+    "cpu_model": "AMD EPYC-Rome Processor",
+    "available_logical_cpus": 16,
+    "memory_total_mib": 15983.9296875
+  },
+  "settings": {
+    "file_bytes": 67108864,
+    "chunk_bytes": 1048576,
+    "reads": 1024,
+    "warmup_reads": 16,
+    "concurrency": 4,
+    "delay_per_direction": "1ms",
+    "repetitions": 5,
+    "read_window": "compiled defaults (gRPC=1)"
+  },
+  "compile_cache_stats": "Compile requests                    1940\nCompile requests executed           1694\nCache hits                           802\nCache hits (Assembler)                30\nCache hits (C/C++)                   768\nCache hits (Rust)                      4\nCache misses                         880\nCache misses (Rust)                  880\nCache hits rate                    47.68 %\nCache hits rate (Assembler)       100.00 %\nCache hits rate (C/C++)           100.00 %\nCache hits rate (Rust)              0.45 %\nCache timeouts                         0\nCache read errors                      0\nForced recaches                        0\nCache write errors                     0\nCache errors                           0\nCompilations                         880\nCompilation failures                  12\nNon-cacheable compilations             0\nNon-cacheable calls                  229\nNon-compilation calls                 17\nUnsupported compiler calls             0\nAverage cache write                0.001 s\nAverage compiler                   1.113 s\nAverage cache read hit             0.001 s\nFailed distributed compilations        0\n\nNon-cacheable reasons:\ncrate-type                           203\n-                                     14\n-o                                     6\nmissing input                          4\n-E                                     2\n\nCache location                  Local disk: \"/home/ubuntu/.cache/sccache\"\nUse direct/preprocessor mode?   yes\nVersion (client)                0.13.0\nCache size                             6 GiB\nMax cache size                        10 GiB\n",
+  "scripts_sha256": {
+    "build-matched.sh": "f970800fd36716640c090086565980dde81aa80671e6bb9fd6af80434ca339e6",
+    "run-experiment.py": "1831f8d26fe4d0443f5bd13585bd756bee5b9555795cf4356f02d3d0ee000779"
+  }
+}

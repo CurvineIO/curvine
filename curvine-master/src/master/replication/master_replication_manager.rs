@@ -20,6 +20,7 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::{Master, MasterMetrics, SyncWorkerManager};
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
+use curvine_data_transfer::JobWorkerClient;
 use curvine_fs_api::RpcCode;
 use curvine_model::{BlockLocation, ProtoUtils, WorkerAddress};
 use curvine_proto::{
@@ -27,8 +28,6 @@ use curvine_proto::{
     ReconcileReplicationResponse, ReportBlockReplicationRequest, SubmitBlockReplicationRequest,
     SubmitBlockReplicationResponse,
 };
-use curvine_rpc::client::ClientFactory;
-use curvine_rpc::message::{Builder, RequestStatus};
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_runtime::sync::FastMutex;
@@ -55,8 +54,8 @@ pub struct MasterReplicationManager {
     replication_semaphore: Arc<Semaphore>,
     staging_queue_sender: Arc<Sender<BlockId>>,
     tracker: Arc<ReplicationTracker>,
+    grpc: curvine_rpc::grpc::GrpcConfig,
 
-    worker_client_factory: Arc<ClientFactory>,
     replication_enabled: bool,
     submit_timeout: Duration,
     job_timeout_ms: u64,
@@ -123,7 +122,7 @@ impl MasterReplicationManager {
             tracker: Arc::new(ReplicationTracker::new(
                 conf.master.block_replication_job_timeout_ms(),
             )),
-            worker_client_factory: Arc::new(Default::default()),
+            grpc: conf.client.grpc.clone(),
             replication_enabled: conf.master.block_replication_enabled,
             submit_timeout: Duration::from_millis(
                 conf.master.block_replication_submit_timeout_ms(),
@@ -144,6 +143,19 @@ impl MasterReplicationManager {
 
         info!("Master replication manager is initialized");
         Ok(manager)
+    }
+
+    async fn worker_client(
+        &self,
+        address: &curvine_net::net::InetAddr,
+    ) -> curvine_error::FsResult<JobWorkerClient> {
+        JobWorkerClient::connect_grpc_with_config(
+            &address.hostname,
+            address.port,
+            self.submit_timeout,
+            &self.grpc,
+        )
+        .await
     }
 
     fn handle(async_runtime: Arc<AsyncRuntime>, me: Arc<Self>, mut recv: Receiver<BlockId>) {
@@ -415,20 +427,9 @@ impl MasterReplicationManager {
         };
         let response: ReconcileReplicationResponse = timeout(self.submit_timeout, async {
             let client = self
-                .worker_client_factory
-                .create_raw(&attempt.target_worker.inet_addr())
+                .worker_client(&attempt.target_worker.inet_addr())
                 .await?;
-            let response = client
-                .rpc(
-                    Builder::new()
-                        .code(RpcCode::ReconcileReplication)
-                        .request(RequestStatus::Rpc)
-                        .proto_header(req)
-                        .build(),
-                )
-                .await?;
-            response.check_error_ext::<curvine_error::FsError>()?;
-            response.parse_header::<ReconcileReplicationResponse>()
+            client.rpc(RpcCode::ReconcileReplication, req).await
         })
         .await??;
         if let Some(storage_type) = response.storage_type {
@@ -490,29 +491,25 @@ impl MasterReplicationManager {
         let submit_deadline = Instant::now() + self.submit_timeout;
         let source_addr = target_duration(submit_deadline)?;
         let source_worker_addr = source.address.inet_addr();
-        let source_worker_client = match timeout(
-            source_addr,
-            self.worker_client_factory.create_raw(&source_worker_addr),
-        )
-        .await
-        {
-            Ok(Ok(client)) => client,
-            Ok(Err(e)) => {
-                return err_box!(
-                    "Errors on connecting to replication source {}, err: {:?}",
-                    source_worker_addr,
-                    e
-                );
-            }
-            Err(e) => {
-                self.metrics.replication_timeout_count.inc();
-                return err_box!(
-                    "Timed out connecting to replication source {}: {}",
-                    source_worker_addr,
-                    e
-                );
-            }
-        };
+        let source_worker_client =
+            match timeout(source_addr, self.worker_client(&source_worker_addr)).await {
+                Ok(Ok(client)) => client,
+                Ok(Err(e)) => {
+                    return err_box!(
+                        "Errors on connecting to replication source {}, err: {:?}",
+                        source_worker_addr,
+                        e
+                    );
+                }
+                Err(e) => {
+                    self.metrics.replication_timeout_count.inc();
+                    return err_box!(
+                        "Timed out connecting to replication source {}: {}",
+                        source_worker_addr,
+                        e
+                    );
+                }
+            };
 
         let attempt_id = Utils::uuid();
         let attempt = ReplicationAttempt::new(
@@ -537,10 +534,7 @@ impl MasterReplicationManager {
             }
         };
         let prepared = timeout(remaining, async {
-            let client = self
-                .worker_client_factory
-                .create_raw(&target.address.inet_addr())
-                .await?;
+            let client = self.worker_client(&target.address.inet_addr()).await?;
             let request = PrepareReplicationRequest {
                 block_id,
                 attempt_id: attempt_id.clone(),
@@ -550,17 +544,9 @@ impl MasterReplicationManager {
                     .saturating_add(self.submit_timeout.as_millis() as u64)
                     .saturating_mul(2),
             };
-            let response = client
-                .rpc(
-                    Builder::new()
-                        .code(RpcCode::PrepareReplication)
-                        .request(RequestStatus::Rpc)
-                        .proto_header(request)
-                        .build(),
-                )
-                .await?;
-            response.check_error_ext::<curvine_error::FsError>()?;
-            response.parse_header::<PrepareReplicationResponse>()
+            client
+                .rpc::<_, PrepareReplicationResponse>(RpcCode::PrepareReplication, request)
+                .await
         })
         .await;
         let prepared = match prepared {
@@ -589,11 +575,6 @@ impl MasterReplicationManager {
             target_token: Some(prepared.token),
             job_timeout_ms: Some(self.job_timeout_ms),
         };
-        let msg = Builder::new_rpc(RpcCode::SubmitFencedReplication)
-            .request(RequestStatus::Rpc)
-            .proto_header(request)
-            .build();
-
         let remaining = match target_duration(submit_deadline) {
             Ok(duration) => duration,
             Err(e) => {
@@ -608,27 +589,16 @@ impl MasterReplicationManager {
                 return Err(e);
             }
         };
-        match timeout(remaining, source_worker_client.rpc(msg)).await {
+        match timeout(
+            remaining,
+            source_worker_client.rpc::<_, SubmitBlockReplicationResponse>(
+                RpcCode::SubmitFencedReplication,
+                request,
+            ),
+        )
+        .await
+        {
             Ok(Ok(response)) => {
-                if let Err(e) = response.check_error_ext::<curvine_error::FsError>() {
-                    self.transition_to_uncertain(
-                        block_id,
-                        &attempt_id,
-                        "source returned RPC error",
-                    );
-                    return Err(e.into());
-                }
-                let response: SubmitBlockReplicationResponse = match response.parse_header() {
-                    Ok(response) => response,
-                    Err(e) => {
-                        self.transition_to_uncertain(
-                            block_id,
-                            &attempt_id,
-                            "submit response could not be decoded",
-                        );
-                        return Err(e);
-                    }
-                };
                 let ack =
                     self.tracker
                         .acknowledge(block_id, &attempt_id, response.attempt_id.as_deref());
@@ -863,25 +833,19 @@ impl MasterReplicationManager {
         self.runtime.spawn(async move {
             let _permit = permit;
             let result = timeout(me.submit_timeout, async {
-                let client = me
-                    .worker_client_factory
-                    .create_raw(&attempt.target_worker.inet_addr())
-                    .await?;
-                let response = client
+                let client = me.worker_client(&attempt.target_worker.inet_addr()).await?;
+                let _: ReconcileReplicationResponse = client
                     .rpc(
-                        Builder::new()
-                            .code(RpcCode::ReconcileReplication)
-                            .request(RequestStatus::Rpc)
-                            .proto_header(ReconcileReplicationRequest {
-                                block_id,
-                                attempt_id: attempt.attempt_id,
-                                target_session_id: attempt.target_worker_session_id,
-                                release: true,
-                            })
-                            .build(),
+                        RpcCode::ReconcileReplication,
+                        ReconcileReplicationRequest {
+                            block_id,
+                            attempt_id: attempt.attempt_id,
+                            target_session_id: attempt.target_worker_session_id,
+                            release: true,
+                        },
                     )
                     .await?;
-                response.check_error_ext::<curvine_error::FsError>()
+                Ok::<(), curvine_error::FsError>(())
             })
             .await;
             if !matches!(result, Ok(Ok(()))) {

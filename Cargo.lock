@@ -863,7 +863,7 @@ dependencies = [
  "http 1.3.1",
  "http-body 0.4.6",
  "hyper 0.14.32",
- "hyper 1.7.0",
+ "hyper 1.12.0",
  "hyper-rustls 0.24.2",
  "hyper-rustls 0.27.7",
  "hyper-util",
@@ -1010,7 +1010,7 @@ dependencies = [
  "http 1.3.1",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.7.0",
+ "hyper 1.12.0",
  "hyper-util",
  "itoa",
  "matchit 0.7.3",
@@ -1480,6 +1480,9 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bytes-utils"
@@ -2196,17 +2199,19 @@ dependencies = [
  "dashmap 5.5.3",
  "futures",
  "fxhash",
- "hyper 1.7.0",
+ "hyper 1.12.0",
  "linked-hash-map",
  "log",
  "moka",
  "once_cell",
  "pin-project-lite",
- "prost 0.11.9",
+ "prost 0.14.4",
  "rand 0.8.5",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -2292,13 +2297,14 @@ dependencies = [
  "percent-encoding",
  "postgres",
  "postgres-native-tls",
- "prost 0.11.9",
+ "prost 0.14.4",
  "r2d2",
  "r2d2_postgres",
  "rusqlite",
  "serde",
  "serde_json",
  "tokio",
+ "tonic",
  "url",
  "uuid",
 ]
@@ -2310,11 +2316,13 @@ dependencies = [
  "axum 0.7.9",
  "curvine-core-error",
  "curvine-io",
+ "curvine-proto",
  "num_enum",
- "prost 0.11.9",
+ "prost 0.14.4",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -2345,10 +2353,10 @@ dependencies = [
  "curvine-proto",
  "curvine-runtime",
  "futures",
- "hyper 1.7.0",
+ "hyper 1.12.0",
  "num_enum",
  "once_cell",
- "prost 0.11.9",
+ "prost 0.14.4",
  "regex",
  "serde",
  "serde_json",
@@ -2436,10 +2444,12 @@ dependencies = [
  "curvine-proto",
  "curvine-rpc",
  "curvine-runtime",
+ "futures",
  "log",
  "serde",
  "serde_json",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -2497,7 +2507,7 @@ dependencies = [
  "curvine-sdk-core",
  "curvine-sys",
  "jni",
- "prost 0.11.9",
+ "prost 0.14.4",
 ]
 
 [[package]]
@@ -2548,13 +2558,14 @@ dependencies = [
  "num_enum",
  "once_cell",
  "parking_lot",
- "prost 0.11.9",
+ "prost 0.14.4",
  "raft",
  "rand 0.8.5",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -2603,7 +2614,7 @@ dependencies = [
  "indexmap 2.14.0",
  "log",
  "num_enum",
- "prost 0.11.9",
+ "prost 0.14.4",
  "serde",
  "serde_json",
 ]
@@ -2624,9 +2635,13 @@ dependencies = [
 name = "curvine-proto"
 version = "0.2.2"
 dependencies = [
- "prost 0.11.9",
- "prost-build 0.11.9",
+ "bytes",
+ "prost 0.14.4",
+ "prost-build 0.14.4",
  "serde",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
@@ -2645,11 +2660,13 @@ dependencies = [
  "curvine-rpc",
  "curvine-runtime",
  "flate2",
+ "futures",
  "log",
  "mini-moka",
  "num_enum",
  "prost 0.11.9",
- "prost-build 0.11.9",
+ "prost 0.14.4",
+ "prost-build 0.14.4",
  "raft",
  "serde",
  "serde_json",
@@ -2657,6 +2674,9 @@ dependencies = [
  "slog-stdlog",
  "thiserror 1.0.69",
  "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
@@ -2669,7 +2689,7 @@ dependencies = [
  "curvine-io",
  "curvine-runtime",
  "log",
- "prost 0.11.9",
+ "prost 0.14.4",
  "rocksdb",
  "serde",
 ]
@@ -2682,15 +2702,23 @@ dependencies = [
  "curvine-core-error",
  "curvine-io",
  "curvine-net",
+ "curvine-proto",
  "curvine-runtime",
  "curvine-sys",
  "futures",
+ "http-body 1.0.1",
+ "http-body-util",
  "log",
  "num_enum",
- "prost 0.11.9",
+ "prost 0.14.4",
+ "rustls 0.23.35",
+ "serde",
  "socket2 0.5.10",
  "tokio",
- "tokio-util",
+ "tonic",
+ "tonic-health",
+ "tonic-prost",
+ "tonic-reflection",
 ]
 
 [[package]]
@@ -2786,12 +2814,13 @@ dependencies = [
  "mysql",
  "once_cell",
  "parking_lot",
- "prost 0.11.9",
+ "prost 0.14.4",
  "raft",
  "rusqlite",
  "serde",
  "serde_json",
  "tokio",
+ "tonic",
  "uuid",
 ]
 
@@ -2897,6 +2926,7 @@ dependencies = [
  "curvine-lancedb",
  "curvine-model",
  "curvine-net",
+ "curvine-proto",
  "curvine-rpc",
  "curvine-runtime",
  "curvine-server",
@@ -2909,6 +2939,7 @@ dependencies = [
  "once_cell",
  "tempfile",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -3046,12 +3077,15 @@ dependencies = [
  "curvine-sys",
  "curvine-web",
  "dashmap 5.5.3",
+ "futures",
  "log",
  "once_cell",
  "parking_lot",
- "prost 0.11.9",
+ "prost 0.14.4",
  "serde_json",
  "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
@@ -3854,7 +3888,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3990,7 +4024,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "778e2ac28f6c47af28e4907f13ffd1e1ddbd400980a9abd7c8df189bf578a5ad"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4018,7 +4052,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef5da6e9a6ae89f4a91f80ba1caae45a5a924397a19947e18f5121a43285e9bc"
 dependencies = [
  "http 1.3.1",
- "prost 0.14.1",
+ "prost 0.14.4",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -4893,8 +4927,8 @@ dependencies = [
  "md-5 0.10.6",
  "num-traits",
  "once_cell",
- "prost 0.14.1",
- "prost-types 0.14.1",
+ "prost 0.14.4",
+ "prost-types 0.14.4",
  "rand 0.9.2",
  "regex",
  "roxmltree",
@@ -5125,9 +5159,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.7.0"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb3aa54a13a0dfe7fbe3a59e0c76093041720fdc77b110cc0fc260fafb4dc51e"
+checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -5140,7 +5174,6 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "pin-utils",
  "smallvec",
  "tokio",
  "want",
@@ -5168,7 +5201,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3c93eb611681b207e1fe55d5a71ecf91572ec8a6705cdb6857f7d8d5242cf58"
 dependencies = [
  "http 1.3.1",
- "hyper 1.7.0",
+ "hyper 1.12.0",
  "hyper-util",
  "rustls 0.23.35",
  "rustls-native-certs",
@@ -5185,7 +5218,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b90d566bffbce6a75bd8b09a05aa8c2cb1fabb6cb348f8840c9e4c90a0d83b0"
 dependencies = [
- "hyper 1.7.0",
+ "hyper 1.12.0",
  "hyper-util",
  "pin-project-lite",
  "tokio",
@@ -5205,12 +5238,12 @@ dependencies = [
  "futures-util",
  "http 1.3.1",
  "http-body 1.0.1",
- "hyper 1.7.0",
+ "hyper 1.12.0",
  "ipnet",
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "system-configuration 0.6.1",
  "tokio",
  "tower-service",
@@ -5550,7 +5583,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5710,8 +5743,8 @@ dependencies = [
  "object_store",
  "permutation",
  "pin-project",
- "prost 0.14.1",
- "prost-types 0.14.1",
+ "prost 0.14.4",
+ "prost-types 0.14.4",
  "rand 0.9.2",
  "roaring",
  "semver",
@@ -5786,7 +5819,7 @@ dependencies = [
  "num_cpus",
  "object_store",
  "pin-project",
- "prost 0.14.1",
+ "prost 0.14.4",
  "rand 0.9.2",
  "roaring",
  "serde_json",
@@ -5824,8 +5857,8 @@ dependencies = [
  "lance-datagen",
  "log",
  "pin-project",
- "prost 0.14.1",
- "prost-build 0.14.1",
+ "prost 0.14.4",
+ "prost-build 0.14.4",
  "snafu 0.9.0",
  "tokio",
  "tracing",
@@ -5878,9 +5911,9 @@ dependencies = [
  "log",
  "lz4",
  "num-traits",
- "prost 0.14.1",
- "prost-build 0.14.1",
- "prost-types 0.14.1",
+ "prost 0.14.4",
+ "prost-build 0.14.4",
+ "prost-types 0.14.4",
  "rand 0.9.2",
  "snafu 0.9.0",
  "strum",
@@ -5916,9 +5949,9 @@ dependencies = [
  "log",
  "num-traits",
  "object_store",
- "prost 0.14.1",
- "prost-build 0.14.1",
- "prost-types 0.14.1",
+ "prost 0.14.4",
+ "prost-build 0.14.4",
+ "prost-types 0.14.4",
  "snafu 0.9.0",
  "tokio",
  "tracing",
@@ -5970,9 +6003,9 @@ dependencies = [
  "ndarray",
  "num-traits",
  "object_store",
- "prost 0.14.1",
- "prost-build 0.14.1",
- "prost-types 0.14.1",
+ "prost 0.14.4",
+ "prost-build 0.14.4",
+ "prost-types 0.14.4",
  "rand 0.9.2",
  "rand_distr 0.5.1",
  "rangemap",
@@ -6023,7 +6056,7 @@ dependencies = [
  "opendal",
  "path_abs",
  "pin-project",
- "prost 0.14.1",
+ "prost 0.14.4",
  "rand 0.9.2",
  "serde",
  "snafu 0.9.0",
@@ -6137,9 +6170,9 @@ dependencies = [
  "lance-io",
  "log",
  "object_store",
- "prost 0.14.1",
- "prost-build 0.14.1",
- "prost-types 0.14.1",
+ "prost 0.14.4",
+ "prost-build 0.14.4",
+ "prost-types 0.14.4",
  "rand 0.9.2",
  "rangemap",
  "roaring",
@@ -6346,7 +6379,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.53.3",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -6881,7 +6914,7 @@ checksum = "478b0ff3f7d67b79da2b96f56f334431aef65e15ba4b29dd74a4236e29582bdc"
 dependencies = [
  "base64 0.21.7",
  "bigdecimal",
- "bindgen 0.69.5",
+ "bindgen 0.70.1",
  "bitflags 2.10.0",
  "bitvec",
  "btoi",
@@ -7165,7 +7198,7 @@ dependencies = [
  "http-body-util",
  "httparse",
  "humantime",
- "hyper 1.7.0",
+ "hyper 1.12.0",
  "itertools 0.14.0",
  "md-5 0.10.6",
  "parking_lot",
@@ -8221,12 +8254,12 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.14.1"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7231bd9b3d3d33c86b58adbac74b5ec0ad9f496b19d22801d773636feaa95f3d"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
 dependencies = [
  "bytes",
- "prost-derive 0.14.1",
+ "prost-derive 0.14.4",
 ]
 
 [[package]]
@@ -8253,19 +8286,18 @@ dependencies = [
 
 [[package]]
 name = "prost-build"
-version = "0.14.1"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac6c3320f9abac597dcbc668774ef006702672474aad53c6d596b62e487b40b1"
+checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
- "once_cell",
- "petgraph 0.6.5",
+ "petgraph 0.8.3",
  "prettyplease 0.2.37",
- "prost 0.14.1",
- "prost-types 0.14.1",
+ "prost 0.14.4",
+ "prost-types 0.14.4",
  "pulldown-cmark 0.13.4",
  "pulldown-cmark-to-cmark",
  "regex",
@@ -8288,12 +8320,12 @@ dependencies = [
 
 [[package]]
 name = "prost-derive"
-version = "0.14.1"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9120690fafc389a67ba3803df527d0ec9cbbc9cc45e4cc20b332996dfb672425"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -8310,11 +8342,11 @@ dependencies = [
 
 [[package]]
 name = "prost-types"
-version = "0.14.1"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9b4db3d6da204ed77bb26ba83b6122a73aeb2e87e25fbf7ad2e84c4ccbf8f72"
+checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
- "prost 0.14.1",
+ "prost 0.14.4",
 ]
 
 [[package]]
@@ -8390,9 +8422,9 @@ dependencies = [
 
 [[package]]
 name = "pulldown-cmark-to-cmark"
-version = "21.1.0"
+version = "22.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8246feae3db61428fd0bb94285c690b460e4517d83152377543ca802357785f1"
+checksum = "84bbb29c624230c4bd1047bbdb2aa47e41c860e9665ce62ba9504eebe91bf867"
 dependencies = [
  "pulldown-cmark 0.13.4",
 ]
@@ -8529,7 +8561,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.35",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "thiserror 2.0.16",
  "tokio",
  "tracing",
@@ -8566,9 +8598,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9038,7 +9070,7 @@ dependencies = [
  "http 1.3.1",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.7.0",
+ "hyper 1.12.0",
  "hyper-rustls 0.27.7",
  "hyper-util",
  "js-sys",
@@ -9270,7 +9302,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9283,7 +9315,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.9.4",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9877,7 +9909,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -9889,7 +9921,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54254b8531cafa275c5e096f62d48c81435d1015405a91198ddb11e967301d40"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -10000,7 +10032,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10415,7 +10447,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix 1.0.8",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10695,6 +10727,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -10754,9 +10787,9 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tonic"
-version = "0.14.6"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
+checksum = "e2cdfc673aabd30fe8fee92e65837b644c37c5d47f0f97ae6d5e0f1237d15e1b"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -10766,7 +10799,7 @@ dependencies = [
  "http 1.3.1",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.7.0",
+ "hyper 1.12.0",
  "hyper-timeout",
  "hyper-util",
  "percent-encoding",
@@ -10774,7 +10807,9 @@ dependencies = [
  "socket2 0.6.0",
  "sync_wrapper 1.0.2",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tokio-stream",
+ "tokio-util",
  "tower 0.5.2",
  "tower-layer",
  "tower-service",
@@ -10783,9 +10818,9 @@ dependencies = [
 
 [[package]]
 name = "tonic-build"
-version = "0.14.6"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c68f61875ac5293cf72e6c8cf0158086428c82c37229e98c840878f1706b0322"
+checksum = "ac6d916d206ed7bdda1778ddff9bda43303789c258877e7bc22fb44ee5c984b4"
 dependencies = [
  "prettyplease 0.2.37",
  "proc-macro2",
@@ -10794,30 +10829,57 @@ dependencies = [
 ]
 
 [[package]]
-name = "tonic-prost"
-version = "0.14.6"
+name = "tonic-health"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
+checksum = "bc97d645691d64d96db1afe386d0d2918ac84ab56e2c91e153f22f6349a378cd"
+dependencies = [
+ "prost 0.14.4",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
+name = "tonic-prost"
+version = "0.14.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eba464054e2226f182a34489b8b079bf4c6e3e7ab5fd7fc30e024f24aa92a484"
 dependencies = [
  "bytes",
- "prost 0.14.1",
+ "prost 0.14.4",
  "tonic",
 ]
 
 [[package]]
 name = "tonic-prost-build"
-version = "0.14.6"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "654e5643eff75d7f8c99197ce1440ed19a3474eada74c12bbac488b2cafdae27"
+checksum = "2ea216ddc448e08e7839ab09e20e60b06b6a1c32745ccb212c0ebd161c199f1b"
 dependencies = [
  "prettyplease 0.2.37",
  "proc-macro2",
- "prost-build 0.14.1",
- "prost-types 0.14.1",
+ "prost-build 0.14.4",
+ "prost-types 0.14.4",
  "quote",
  "syn 2.0.117",
  "tempfile",
  "tonic-build",
+]
+
+[[package]]
+name = "tonic-reflection"
+version = "0.14.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7eb4700e220803efd45baf3babaa1958c79adc9e0fe6fbd4422f9188d1e57d26"
+dependencies = [
+ "prost 0.14.4",
+ "prost-types 0.14.4",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]
@@ -11243,9 +11305,9 @@ dependencies = [
 
 [[package]]
 name = "want"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfa7760aed19e106de2c7c0b581b509f2f25d3dacaf737cb82ac61bc6d760b0e"
+checksum = "ec4cdd0dd910afe868b7ef477227d8d538b46b3075031afee8a9f2acb0a2ed0b"
 dependencies = [
  "try-lock",
 ]
@@ -11503,7 +11565,7 @@ version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0978bf7171b3d90bac376700cb56d606feb40f251a475a5d6634613564460b22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

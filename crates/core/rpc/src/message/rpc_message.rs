@@ -13,23 +13,14 @@
 // limitations under the License.
 
 use crate::message::{BoxMessage, Builder, RefMessage};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::BytesMut;
 use curvine_core_error::{CommonError, CommonResult, ErrorExt};
-use curvine_io::{DataSlice, IOResult};
+use curvine_io::DataSlice;
 use curvine_runtime::common::Utils;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use prost::Message as PMessage;
 use std::fmt::Debug;
 use std::time::Instant;
-
-/// RPC message communication format
-// Message header fixed byte length
-// header length (4 bytes) + body length (4 bytes) + code (1 byte) + status (1 byte) + req_id (8 bytes) + seqId (4 bytes)
-// If an error is returned, the error message is saved in data as a byte array.
-pub const PROTOCOL_SIZE: i32 = 22;
-
-// Head length
-pub const HEAD_SIZE: i32 = PROTOCOL_SIZE - 4;
 
 pub const INIT_SEQ_ID: i32 = -1;
 
@@ -69,19 +60,8 @@ pub enum ResponseStatus {
 pub struct Status(pub RequestStatus, pub ResponseStatus);
 
 impl Status {
-    pub fn encode(&self) -> i8 {
-        self.0 as i8 | ((self.1 as i8) << 4)
-    }
-
     pub fn new_request(s: RequestStatus) -> Status {
         Status(s, ResponseStatus::Undefined)
-    }
-
-    pub fn from(v: i8) -> Status {
-        let req = RequestStatus::from(v & 0x0f);
-        let rep = ResponseStatus::from(v >> 4);
-
-        Status(req, rep)
     }
 }
 
@@ -113,25 +93,15 @@ impl Protocol {
             seq_id,
         }
     }
-
-    pub fn create(buf: &mut BytesMut) -> Self {
-        Protocol {
-            code: buf.get_i8(),
-            status: Status::from(buf.get_i8()),
-            req_id: buf.get_i64(),
-            seq_id: buf.get_i32(),
-        }
-    }
 }
 
-// Network message.A one-time and continuous request protocol is uniformly defined.
+// Internal request and response shared by the gRPC adapters and handlers.
 #[derive(Debug)]
 pub struct RpcMessage {
     pub protocol: Protocol,
     pub header: Option<BytesMut>,
     pub data: DataSlice,
-    /// Receipt time, stamped only by the wire-decode paths
-    /// (`RpcFrame::receive`, `ReadFrame::receive`) for non-heartbeat messages.
+    /// Receipt time stamped by adapters that track request queue delay.
     /// Locally built messages leave it `None`; new read paths must preserve
     /// this invariant because the queue-delay metric and the audit `queueUs`
     /// field derive from it.
@@ -251,10 +221,6 @@ impl RpcMessage {
         self.protocol.code
     }
 
-    pub fn encode_status(&self) -> i8 {
-        self.protocol.status.encode()
-    }
-
     pub fn request_status(&self) -> RequestStatus {
         self.protocol.status.0
     }
@@ -270,6 +236,7 @@ impl RpcMessage {
     pub fn data_bytes(&self) -> Option<&[u8]> {
         match &self.data {
             DataSlice::Buffer(buf) => Some(buf),
+            DataSlice::Bytes(buf) => Some(buf),
             _ => None,
         }
     }
@@ -298,81 +265,6 @@ impl RpcMessage {
             }
             None => Ok(T::default()),
         }
-    }
-
-    pub fn encode_protocol(&self, buf: &mut BytesMut) {
-        let header_len = self.header_len();
-        let data_len = self.data_len();
-
-        buf.put_i32((header_len + data_len) as i32 + HEAD_SIZE);
-        buf.put_i32(header_len as i32);
-        buf.put_i8(self.protocol.code);
-        buf.put_i8(self.protocol.status.encode());
-        buf.put_i64(self.protocol.req_id);
-        buf.put_i32(self.protocol.seq_id);
-    }
-
-    /// Decode protocol data
-    ///
-    /// Parse the protocol header information from the byte buffer, including the total size, header size, and data size.
-    /// Create a protocol object.
-    ///
-    /// # Parameters
-    /// * `buf` - A mutable reference to the byte buffer containing the protocol data to be parsed
-    ///
-    /// # Return value
-    /// Returns an IOResult-wrapped tuple containing:
-    /// * Protocol - The protocol object created by parsing
-    /// * i32 - Header size
-    /// * i32 - Data size
-    pub fn decode_protocol(buf: &mut BytesMut) -> IOResult<(Protocol, i32, i32)> {
-        let total_size = buf.get_i32();
-        let header_size = buf.get_i32();
-        let data_size = total_size - header_size - HEAD_SIZE;
-        if data_size < 0 {
-            return err_box!("data length is negative");
-        } else if data_size > MAX_DATE_SIZE {
-            return err_box!("Data exceeds maximum size: {}", MAX_DATE_SIZE);
-        }
-
-        let protocol = Protocol::create(buf);
-        Ok((protocol, header_size, data_size))
-    }
-
-    pub fn encode(&self, buf: &mut BytesMut) -> IOResult<()> {
-        self.encode_protocol(buf);
-
-        if let Some(header) = &self.header {
-            buf.put_slice(header);
-        }
-
-        let slice = self.data.as_slice();
-        if !slice.is_empty() {
-            buf.put_slice(slice);
-        }
-
-        Ok(())
-    }
-
-    pub fn decode(buf: &mut BytesMut) -> IOResult<Self> {
-        // The BytesMut returned by tokio does not contain the first length byte.
-        let header_size = buf.get_u32() as usize;
-
-        let protocol = Protocol::create(buf);
-
-        let header = if header_size > 0 {
-            Some(buf.split_to(header_size))
-        } else {
-            None
-        };
-
-        let data = if buf.has_remaining() {
-            DataSlice::Buffer(buf.split())
-        } else {
-            DataSlice::Empty
-        };
-
-        Ok(Self::new(protocol, header, data))
     }
 
     pub fn into_arc(self) -> BoxMessage {

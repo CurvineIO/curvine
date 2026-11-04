@@ -1,0 +1,18 @@
+{
+  "revision": "887c2584a59f7207e4d14f0425c31d71650842ba",
+  "codec_and_tls": 7,
+  "raft_unit": 93,
+  "raft_storage": 9,
+  "raft_snapshot_files": 2,
+  "raft_three_process_recovery_modes": 2,
+  "protobuf_compatibility": 46,
+  "client_unit_and_wiring": 109,
+  "storage_backed_grpc_integrations": 6,
+  "worker_security": 1,
+  "total_passed": 275,
+  "ignored_child_entrypoints": 2,
+  "strict_clippy": "pass",
+  "formatting": "pass",
+  "dependency_guards": "pass",
+  "notes": "Redundant Clone calls changed to Copy after test execution; all-target strict Clippy revalidated final source."
+}

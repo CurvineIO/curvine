@@ -19,6 +19,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 mod common;
+#[path = "common/grpc_test_client.rs"]
+mod grpc_test_client;
 
 static WORKER_CONF: OnceLock<ClusterConf> = OnceLock::new();
 const DEFAULT_CHUNK_SIZE: i32 = 4096; // NVMe-aligned chunk size
@@ -95,7 +97,7 @@ fn write_block(
         component_info: None,
     };
 
-    let client = conf.worker_sync_client()?;
+    let client = grpc_test_client::worker_client(&conf)?;
 
     let req_id = Utils::req_id();
     let msg = Builder::new()
@@ -181,7 +183,7 @@ fn read_block(
         .proto_header(open_req)
         .build();
 
-    let client = conf.worker_sync_client()?;
+    let client = grpc_test_client::worker_client(&conf)?;
     let response: BlockReadResponse = client.rpc_check(msg)?.parse_header()?;
 
     let mut checksum: u64 = 0;

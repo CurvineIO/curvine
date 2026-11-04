@@ -16,8 +16,7 @@ use curvine_client_core::block::BlockClientPool;
 use curvine_client_core::file::FsContext;
 use curvine_config::ClusterConf;
 use curvine_model::WorkerAddress;
-use curvine_rpc::test::SimpleServer;
-use curvine_runtime::runtime::Runtime;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use once_cell::sync::Lazy;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,17 +24,26 @@ use std::time::Duration;
 // Global test server address, shared across all tests
 // Server is started once and kept running in background thread
 static TEST_SERVER: Lazy<(WorkerAddress, Arc<Runtime>)> = Lazy::new(|| {
-    let server = SimpleServer::default(); // Uses random port
-    let bind_addr = server.bind_addr();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let bind_addr = listener.local_addr().unwrap();
     let worker_addr = WorkerAddress {
         worker_id: 1,
-        hostname: bind_addr.hostname.clone(),
-        ip_addr: bind_addr.hostname.clone(),
-        rpc_port: bind_addr.port as u32,
+        hostname: bind_addr.ip().to_string(),
+        ip_addr: bind_addr.ip().to_string(),
+        rpc_port: bind_addr.port() as u32,
         web_port: 8000,
     };
-    let rt = server.new_rt();
-    server.start(0); // Start server immediately (consumes server)
+    let rt = Arc::new(Runtime::single());
+    rt.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let (_, service) = curvine_rpc::grpc::health_reporter();
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
     (worker_addr, rt)
 });
 
@@ -67,6 +75,53 @@ async fn wait_for_test_server_ready() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("Server failed to start within 5 seconds");
+}
+
+#[tokio::test]
+async fn channel_survives_the_runtime_that_acquired_it() {
+    let address = get_test_server_addr();
+    let context = create_test_context();
+    let client = tokio::task::spawn_blocking(move || {
+        let temporary = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        temporary.block_on(context.block_client(&address)).unwrap()
+    })
+    .await
+    .unwrap();
+
+    // The fixture exposes health only. A live channel reaches the server and
+    // receives Unimplemented; a channel tied to the dropped runtime fails at
+    // the transport layer instead.
+    let request = curvine_rpc::message::Builder::new()
+        .code(curvine_fs_api::RpcCode::ReadBlock)
+        .request(curvine_rpc::message::RequestStatus::Open)
+        .req_id(1)
+        .seq_id(0)
+        .proto_header(curvine_proto::BlockReadRequest::default())
+        .build();
+    let error = tokio::time::timeout(Duration::from_secs(5), client.rpc(request))
+        .await
+        .expect("channel stopped with the acquisition runtime")
+        .unwrap_err();
+    assert!(error.to_string().contains("Unimplemented"), "{error}");
+}
+
+#[tokio::test]
+async fn checked_out_client_keeps_filesystem_runtime_alive() {
+    let runtime = Arc::new(Runtime::single());
+    let weak = Arc::downgrade(&runtime);
+    let context = FsContext::with_rt(ClusterConf::default(), runtime.clone()).unwrap();
+    let client = context.block_client(&get_test_server_addr()).await.unwrap();
+    drop(context);
+    drop(runtime);
+    assert!(weak.upgrade().is_some(), "client lost its channel runtime");
+    drop(client);
+    assert!(
+        weak.upgrade().is_none(),
+        "client leaked its channel runtime"
+    );
 }
 
 #[tokio::test]

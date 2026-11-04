@@ -48,7 +48,7 @@ curvine-config = { workspace = true }
 curvine-sys = { workspace = true }
 curvine-alloc = { workspace = true }
 curvine-model = { workspace = true }
-curvine-rpc = { workspace = true }
+curvine-rpc = { workspace = true, features = ["transport"] }
 curvine-runtime = { workspace = true }
 curvine-client-core = { workspace = true }
 curvine-job-client = { workspace = true }
@@ -58,6 +58,7 @@ curvine-ufs-api = { workspace = true }
 curvine-fault = { workspace = true }
 curvine-web = { workspace = true, optional = true }
 prost = { workspace = true }
+tonic = "0.14.9"
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

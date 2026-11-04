@@ -31,6 +31,7 @@ pub enum TransferStoreType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransferConf {
+    pub grpc: curvine_rpc::grpc::GrpcConfig,
     pub enabled: bool,
     // Deprecated compatibility inputs normalize into store_url during init.
     #[serde(skip_serializing)]
@@ -363,6 +364,7 @@ impl TransferConf {
 
     pub fn server_conf(&self, cluster_id: &str) -> ServerConf {
         let mut conf = ServerConf::with_hostname(&self.hostname, self.rpc_port);
+        conf.grpc = self.grpc.clone();
         conf.name = format!("{}-transfer", cluster_id);
         conf.io_threads = self.io_threads;
         conf.worker_threads = self.worker_threads;
@@ -373,6 +375,7 @@ impl TransferConf {
 impl Default for TransferConf {
     fn default() -> Self {
         Self {
+            grpc: Default::default(),
             enabled: false,
             store_type: TransferStoreType::Auto,
             store_url: String::new(),

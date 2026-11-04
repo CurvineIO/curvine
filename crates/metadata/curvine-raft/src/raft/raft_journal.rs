@@ -89,8 +89,8 @@ where
 
     async fn start(server: RaftServer, node: RaftNode<A, B>) -> RaftResult<RoleStateListener> {
         // Start the tcp service and wait for it to be ready.
-        let mut server_listener = server.start();
-        server_listener.wait_running().await?;
+        let mut server_listener = server.start().await?;
+        server_listener.wait_startup().await?;
 
         Ok(node.start())
     }

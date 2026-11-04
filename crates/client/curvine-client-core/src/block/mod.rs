@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod adaptive_read;
 mod block_client;
 pub use self::block_client::BlockClient;
 
@@ -50,3 +51,4 @@ pub use self::batch_block_writer_local::BatchBlockWriterLocal;
 
 mod block_client_pool;
 pub use self::block_client_pool::BlockClientPool;
+pub mod grpc_block_client;

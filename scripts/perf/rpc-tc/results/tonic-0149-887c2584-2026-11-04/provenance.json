@@ -1,0 +1,129 @@
+{
+  "generated_utc": "2026-11-04T07:32:17.212324+00:00",
+  "manifest": {
+    "orpc": {
+      "revision": "c31606c9e08c0e30639409ab28db69a9158f758b",
+      "transport": "orpc",
+      "source_sha256": "3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac",
+      "read_window": null,
+      "tonic_version": null
+    },
+    "previous": {
+      "revision": "6a6654cdfeb600e4fa3bd618ae9f131b4344c888",
+      "transport": "grpc",
+      "source_sha256": "3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac",
+      "read_window": null,
+      "compiled_default_read_window": 1,
+      "tonic_version": "0.9.2"
+    },
+    "grpc": {
+      "revision": "887c2584a59f7207e4d14f0425c31d71650842ba",
+      "transport": "grpc",
+      "source_sha256": "3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac",
+      "read_window": null,
+      "compiled_default_read_window": 1,
+      "tonic_version": "0.14.9",
+      "prost_version": "0.14.4",
+      "description": "Tonic upgrade only; unchanged transport settings"
+    }
+  },
+  "binary_sha256": {
+    "orpc": {
+      "server_sha256": "3ef6a2ebe40cc00be1f4c2e506cd2147f01e49c0880fdb06a5d3c816467d9709",
+      "client_sha256": "3f2a43c8d1687e349dd0c3979842ae43e2162aa16780b535724b04d4264a69cd"
+    },
+    "previous": {
+      "server_sha256": "0b52bc105f9c9872b98b4d155387dc56ed7a2074279df0d3ca6e8015d544424f",
+      "client_sha256": "b7d5f7005f6a765737b94cda8ff77e26cf3285bc4c8077be4e5c7f5c6d2e57e1"
+    },
+    "grpc": {
+      "server_sha256": "3e05a8f7595c444964d07a43e2d873e409e510159c4c17c2b43298fc312aceb2",
+      "client_sha256": "fb3905d1931bf77bd70d44bbfeb0ff84f9d9852b879882bab77a2a15a4774a55"
+    }
+  },
+  "server_versions": {
+    "orpc": {
+      "component": "server",
+      "release_version": "0.2.2",
+      "git_commit": "c31606c9",
+      "git_tag": "",
+      "git_branch": "",
+      "protocol_version": 1,
+      "min_protocol_version": 1,
+      "capabilities": []
+    },
+    "previous": {
+      "component": "server",
+      "release_version": "0.2.2",
+      "git_commit": "6a6654cd",
+      "git_tag": "",
+      "git_branch": "",
+      "protocol_version": 1,
+      "min_protocol_version": 1,
+      "capabilities": []
+    },
+    "grpc": {
+      "component": "server",
+      "release_version": "0.2.2",
+      "git_commit": "887c2584",
+      "git_tag": "",
+      "git_branch": "perf/tonic-0149",
+      "protocol_version": 1,
+      "min_protocol_version": 1,
+      "capabilities": []
+    }
+  },
+  "workload_sha256": "3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac",
+  "settings": {
+    "file_bytes": 67108864,
+    "chunk_bytes": 1048576,
+    "reads": 1024,
+    "warmup_reads": 16,
+    "concurrency": 4,
+    "delay_per_direction": "1ms",
+    "repetitions": 5,
+    "read_window": {
+      "orpc": "compiled default",
+      "previous": "compiled default",
+      "grpc": "compiled default"
+    }
+  },
+  "experiment_signature": {
+    "manifest_sha256": "7db07ad270a61b90053ebe920324b056cea8cd116cb7cc4d96dbd3bff1f44c12",
+    "harness_sha256": "458242ce4922a49967cb460edc22c266a0b36e3e35500b236bdea96ceb165ccb",
+    "criteria_sha256": "252ae66f3cdb29f6cc013a4819557a5fffe2be4a51250abe035a0326758b642f",
+    "controller_sha256": "a30ec6e593872a5bc8ac6a9c1242bd223feb303b0a0f632589664eea7f5405f4"
+  },
+  "evidence_sha256": {
+    "run-experiment.py": "a30ec6e593872a5bc8ac6a9c1242bd223feb303b0a0f632589664eea7f5405f4",
+    "write-report.py": "d312ff6371bff77c414ce8fb5e5edd5e90ad85b539a93a39cfcb66855106134b",
+    "build-baselines.sh": "ea4997a6f47cff3b126bcfbc135b07a152cbbfcfc3f7113103d3eeeb75e7e2aa",
+    "env.sh": "1f699e5a89795c7bfa91a0261ce86d769980e163eac3ed48729f3cd20cb6a210",
+    "build-metadata.txt": "fbab27e33b161da34511b92724c42dabd17e6373d0ed3281d2724e0eea41e894",
+    "workload/rpc_tc_read.rs": "3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac",
+    "seal-binaries.sh": "b11236b33fecfac4577946a67c4b2670b631e094564d6cb86e0aca4585e0e5dc",
+    "sealing.log": "2e54581bf261d3d1027d2526bac7f9bd54ae6aeda17e368eb4ea734f4fef2e7f",
+    "build-candidate.sh": "db2a50cd24d8e715d2e04b08f8172abe6076988fd245c96773fcc1431a0cee2d",
+    "harness/bench.sh": "4f15e71513065111a40ad8659ee31f52c7bf26376cc852ecff5ae11c4d0a492f",
+    "harness/run.sh": "92aa1bc72522b60c25b9d75daddc1a021d7951c36cbb95491fb6cdeeef608cea",
+    "harness/measure.py": "adbbba36af1f1af8a4ac1e776e49fec21116ce610a28e36e6f842d551d4721e3",
+    "harness/server.sh": "ca720951f268fded1204aa15e03a88e2aa13c12717b382bcf667640d282135bc",
+    "harness/compare.py": "62381e6e6e2d3840c8a4ee502929dcec554ed543fb8430cb510b670ec52355dc",
+    "orpc/version.json": "a0560321dba2f6fa19541ae8a54f3adf6aae459b504fabc2d51d50e5ce61a82d",
+    "orpc/binaries.sha256": "e7a55baadafa51af7e53ff4d3e7b2054dcba81864785d26c576afe7cc47726c8",
+    "orpc/source-status.txt": "4e2f30ed4378cdb818668a82ab86a2e6153989c2e814a51ff9167599283f4d58",
+    "orpc/source.patch": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "orpc/build-completed.txt": "00cd7f2038edaf4c4f7b5393a41ccabb5e6293f561db473f6ef84d44f51ef0ca",
+    "previous/version.json": "5a6dcc340a92de7dca266c816fc9ca634950ff4c9d751f44dc8caf6b8944f44a",
+    "previous/binaries.sha256": "14878bd6adf6c6b88e1edbc11f1b2e671d7e201aea52b463230ef70082b78c22",
+    "previous/source-status.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "previous/source.patch": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "previous/build-completed.txt": "4490d08e20784218e99adbd491a748819f0e2669bc2ed3b052d9312cb0868115",
+    "grpc/version.json": "71cd4b3de1cb6bf51fd3431340ef8af58ef61757230b0c7f19456722c1f5115b",
+    "grpc/binaries.sha256": "09cc471284d5e32838eb20acbfcef2019878124f3035a902f3795e9f5592b5d4",
+    "grpc/source-status.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "grpc/source.patch": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "grpc/build-completed.txt": "ab060800a5db27f750dc234c270fee17c9df5b6cc30214d0de1a082aa702390f",
+    "grpc/build-metadata.txt": "3cd62ef3e740fb766ca90fdf89c3d7e064770e179cbda730043441b713e56cec"
+  }
+}

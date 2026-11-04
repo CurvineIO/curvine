@@ -19,6 +19,7 @@ use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct ClientConf {
+    pub grpc: crate::grpc::GrpcConfig,
     pub io_threads: usize,
     pub worker_threads: usize,
     pub buffer_size: usize,
@@ -83,6 +84,7 @@ impl ClientConf {
 impl Default for ClientConf {
     fn default() -> Self {
         ClientConf {
+            grpc: Default::default(),
             io_threads: 16,
             worker_threads: Utils::worker_threads(16),
             buffer_size: 128 * 1024,

@@ -17,6 +17,7 @@ use raft::eraftpb;
 
 mod raft_node;
 mod recovery;
+mod wire;
 pub use self::raft_node::RaftNode;
 
 mod raft_client;
@@ -94,3 +95,5 @@ impl SnapshotData {
         }
     }
 }
+pub mod grpc_error;
+pub mod grpc_server;

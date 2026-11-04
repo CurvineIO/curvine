@@ -1,0 +1,134 @@
+syntax = "proto2";
+package proto;
+
+import "worker.proto";
+import "common.proto";
+import "master.proto";
+import "job.proto";
+import "mount.proto";
+import "replication.proto";
+import "transfer.proto";
+
+option java_package = "io.curvine.proto";
+option java_multiple_files = true;
+option java_outer_classname = "RpcProto";
+
+// Carried in gRPC status details for domain failures. The kind and message
+// are language-neutral; legacy_error preserves existing Rust error context.
+message FsErrorDetail {
+  required string type = 1;
+  required int32 kind = 2;
+  required string message = 3;
+  optional bytes legacy_error = 4;
+}
+
+// Clients supply the same logical request ID on retries via request metadata.
+service MasterService {
+  rpc Mkdir(MkdirRequest) returns (MkdirResponse);
+  rpc CreateFile(CreateFileRequest) returns (CreateFileResponse);
+  rpc OpenFile(OpenFileRequest) returns (OpenFileResponse);
+  rpc FileStatus(GetFileStatusRequest) returns (GetFileStatusResponse);
+  rpc AddBlock(AddBlockRequest) returns (LocatedBlockProto);
+  rpc CompleteFile(CompleteFileRequest) returns (CompleteFileResponse);
+  rpc CreateFilesBatch(CreateFilesBatchRequest) returns (CreateFilesBatchResponse);
+  rpc AddBlocksBatch(AddBlocksBatchRequest) returns (AddBlocksBatchResponse);
+  rpc CompleteFilesBatch(CompleteFilesBatchRequest) returns (CompleteFilesBatchResponse);
+  rpc Exists(ExistsRequest) returns (ExistsResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc ListTrash(ListTrashRequest) returns (ListTrashResponse);
+  rpc RestoreTrash(RestoreTrashRequest) returns (RestoreTrashResponse);
+  rpc EmptyTrash(EmptyTrashRequest) returns (EmptyTrashResponse);
+  rpc Free(FreeRequest) returns (FreeResponse);
+  rpc Rename(RenameRequest) returns (RenameResponse);
+  rpc ListStatus(ListStatusRequest) returns (ListStatusResponse);
+  rpc ListOptions(ListOptionsRequest) returns (ListOptionsResponse);
+  rpc GetBlockLocations(GetBlockLocationsRequest) returns (GetBlockLocationsResponse);
+  rpc GetFileBlockDetails(GetFileBlockDetailsRequest) returns (GetFileBlockDetailsResponse);
+  rpc GetFilesystemInfo(GetFilesystemInfoRequest) returns (GetFilesystemInfoResponse);
+  rpc SetAttr(SetAttrRequest) returns (SetAttrResponse);
+  rpc Symlink(SymlinkRequest) returns (SymlinkResponse);
+  rpc Link(LinkRequest) returns (LinkResponse);
+  rpc ResizeFile(FileResizeRequest) returns (FileResizeResponse);
+  rpc AssignWorker(AssignWorkerRequest) returns (AssignWorkerResponse);
+  rpc GetLock(GetLockRequest) returns (GetLockResponse);
+  rpc SetLock(SetLockRequest) returns (SetLockResponse);
+  rpc Mount(MountRequest) returns (MountResponse);
+  rpc UnMount(UnMountRequest) returns (UnMountResponse);
+  rpc GetMountTable(GetMountTableRequest) returns (GetMountTableResponse);
+  rpc GetMountInfo(GetMountInfoRequest) returns (GetMountInfoResponse);
+  rpc MetricsReport(MetricsReportRequest) returns (MetricsReportResponse);
+  rpc ClientHeartbeat(ClientHeartbeatRequest) returns (ClientHeartbeatResponse);
+  rpc CreateLeaderSnapshot(CreateLeaderSnapshotRequest) returns (CreateLeaderSnapshotResponse);
+  rpc WorkerHeartbeat(WorkerHeartbeatRequest) returns (WorkerHeartbeatResponse);
+  rpc WorkerBlockReport(BlockReportListRequest) returns (BlockReportListResponse);
+  rpc ReportBlockReplicationResult(ReportBlockReplicationRequest) returns (ReportBlockReplicationResponse);
+  rpc RequestReplacementWorker(RequestReplacementWorkerRequest) returns (RequestReplacementWorkerResponse);
+  rpc ReportUnderReplicatedBlocks(ReportUnderReplicatedBlocksRequest) returns (ReportUnderReplicatedBlocksResponse);
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+  rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse);
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+  rpc ReportTask(TaskReportRequest) returns (TaskReportResponse);
+  rpc GetCvMetadataSnapshotPage(GetCvMetadataSnapshotPageRequest) returns (GetCvMetadataSnapshotPageResponse);
+}
+
+service WorkerControlService {
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+  rpc QueryTransferTask(QueryTransferTaskRequest) returns (QueryTransferTaskResponse);
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+  rpc SubmitBlockReplicationJob(SubmitBlockReplicationRequest) returns (SubmitBlockReplicationResponse);
+  rpc SubmitFencedReplication(SubmitBlockReplicationRequest) returns (SubmitBlockReplicationResponse);
+  rpc PrepareReplication(PrepareReplicationRequest) returns (PrepareReplicationResponse);
+  rpc ReconcileReplication(ReconcileReplicationRequest) returns (ReconcileReplicationResponse);
+}
+
+message ReadBlockChunk {
+  // Bounded sequential burst; responses use consecutive wire sequence IDs.
+  optional uint32 chunks = 2 [default = 1];
+  optional DataHeaderProto header = 1;
+}
+
+message WriteBlockChunk {
+  optional DataHeaderProto header = 1;
+  optional bytes data = 2;
+}
+
+// Operations are processed in wire sequence order on each stream. Writes may
+// be pipelined and reads may request bounded bursts. Request identity remains
+// stable across the lifecycle, including a fenced replication write.
+message BlockDataRequest {
+  required int64 req_id = 1;
+  required int32 seq_id = 2;
+  optional string replication_token = 3;
+  oneof operation {
+    BlockReadRequest open_read = 4;
+    BlockWriteRequest open_write = 5;
+    ReadBlockChunk read_chunk = 6;
+    WriteBlockChunk write_chunk = 7;
+    BlockReadRequest complete_read = 8;
+    BlockWriteRequest complete_write = 9;
+    BlockWriteRequest cancel_write = 10;
+    BlocksBatchWriteRequest open_batch = 11;
+    FilesBatchWriteRequest write_batch = 12;
+    BlocksBatchCommitRequest complete_batch = 13;
+    BlocksBatchCommitRequest cancel_batch = 14;
+  }
+}
+
+message BlockDataResponse {
+  required int64 req_id = 1;
+  required int32 seq_id = 2;
+  oneof result {
+    BlockReadResponse opened_read = 3;
+    BlockWriteResponse opened_write = 4;
+    BlocksBatchWriteResponse opened_batch = 5;
+    bytes data = 6;
+    bool ack = 7;
+    FsErrorDetail error = 8;
+    BlocksBatchCommitResponse committed_batch = 9;
+    FilesBatchWriteResponse written_batch = 10;
+  }
+}
+
+service BlockDataService {
+  rpc Exchange(stream BlockDataRequest) returns (stream BlockDataResponse);
+}

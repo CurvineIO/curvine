@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 #[client_cli(prefix = "client", strip_suffix = "_str", opt_in)]
 #[serde(default)]
 pub struct ClientConf {
+    #[client_cli(skip)]
+    pub grpc: curvine_rpc::grpc::GrpcConfig,
     // List of master addresses
     #[client_cli(skip)]
     pub master_addrs: Vec<InetAddr>,
@@ -53,6 +55,14 @@ pub struct ClientConf {
     pub write_chunk_size_str: String,
     #[client_cli]
     pub write_chunk_num: usize,
+
+    /// Maximum unacknowledged data chunks per remote block writer. A value of
+    /// one waits for each acknowledgement; larger values overlap network RTTs.
+    #[client_cli]
+    pub write_pipeline_window: usize,
+    /// Maximum sequential read chunks requested in one gRPC burst. Zero
+    /// selects the experimental automatic window; the default is one.
+    pub read_pipeline_window: usize,
 
     #[serde(skip)]
     pub read_chunk_size: usize,
@@ -336,6 +346,12 @@ impl ClientConf {
     pub const DEFAULT_MAX_READ_PARALLEL: i64 = 8;
 
     pub fn init(&mut self) -> CommonResult<()> {
+        if self.read_pipeline_window > 32 {
+            return err_box!("client.read_pipeline_window must be in 0..=32");
+        }
+        if !(1..=1024).contains(&self.write_pipeline_window) {
+            return err_box!("client.write_pipeline_window must be in 1..=1024");
+        }
         self.hostname = self.hostname.trim().to_string();
         for addr in &mut self.master_addrs {
             addr.hostname = addr.hostname.trim().to_string();
@@ -419,6 +435,7 @@ impl ClientConf {
     pub fn client_rpc_conf(&self) -> RpcConf {
         let conf = self;
         RpcConf {
+            grpc: self.grpc.clone(),
             io_threads: conf.io_threads,
             worker_threads: conf.worker_threads,
 
@@ -451,6 +468,7 @@ impl ClientConf {
 impl Default for ClientConf {
     fn default() -> Self {
         let mut conf = Self {
+            grpc: Default::default(),
             master_addrs: vec![],
             hostname: crate::DEFAULT_HOSTNAME.to_string(),
             io_threads: 16,
@@ -463,6 +481,8 @@ impl Default for ClientConf {
             write_chunk_size: 0,
             write_chunk_size_str: "128KB".to_owned(),
             write_chunk_num: 8,
+            write_pipeline_window: 8,
+            read_pipeline_window: 1,
 
             read_chunk_size: 0,
             read_chunk_size_str: "128KB".to_owned(),
@@ -567,6 +587,42 @@ impl Default for ClientConf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_pipeline_window_accepts_auto_and_bounded_fixed_values() {
+        for window in [33, usize::MAX] {
+            let mut conf = ClientConf {
+                read_pipeline_window: window,
+                ..Default::default()
+            };
+            assert!(conf.init().is_err());
+        }
+        for window in [0, 1, 4, 8, 32] {
+            let mut conf = ClientConf {
+                read_pipeline_window: window,
+                ..Default::default()
+            };
+            conf.init().unwrap();
+        }
+    }
+
+    #[test]
+    fn write_pipeline_window_requires_a_bounded_positive_value() {
+        for window in [0, 1025] {
+            let mut conf = ClientConf {
+                write_pipeline_window: window,
+                ..Default::default()
+            };
+            assert!(conf.init().is_err());
+        }
+        for window in [1, 8, 16, 32, 1024] {
+            let mut conf = ClientConf {
+                write_pipeline_window: window,
+                ..Default::default()
+            };
+            conf.init().unwrap();
+        }
+    }
 
     #[test]
     fn heartbeat_interval_defaults_to_five_missed_beats_per_minute() {

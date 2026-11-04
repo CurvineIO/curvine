@@ -16,7 +16,8 @@
 //! committed-log invariants. A process incarnation is learned only from a
 //! correlated heartbeat RPC, never from an unsolicited Raft response.
 use crate::conf::JournalConf;
-use crate::proto::raft::{RaftRequest, RaftResponse};
+use crate::proto::raft::RaftResponse;
+use crate::raft::wire::RuntimeRaftRequest as RaftRequest;
 use crate::raft::{RaftError, RaftResult};
 use curvine_runtime::common::Utils;
 use raft::eraftpb::MessageType;

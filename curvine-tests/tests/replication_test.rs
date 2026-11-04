@@ -74,6 +74,12 @@ fn test_block_replication_e2e() -> CommonResult<()> {
             conf.master.min_replication = 1;
             conf.master.max_replication = 3;
             conf.master.block_replication_enabled = true;
+            // Exercise several in-flight chunks during both client fan-out
+            // and the worker-to-worker repair stream.
+            conf.client.short_circuit = false;
+            conf.client.write_chunk_size_str = "4KB".to_string();
+            conf.client.write_pipeline_window = 8;
+            conf.worker.block_replication_chunk_size = 4096;
         })
         .build()?;
     let cluster = testing.start_cluster()?;

@@ -20,6 +20,7 @@ use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
+use curvine_io::DataSlice;
 use curvine_model::{CompatibilityPolicy, CompatibilityVerdict, LoadTaskInfo};
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
@@ -75,23 +76,15 @@ pub struct WorkerHandler {
     /// without explicit configuration.
     pub compatibility_policy: Arc<CompatibilityPolicy>,
     pub client_addr: String,
+    /// gRPC encodes payloads in memory and cannot transmit a file descriptor.
+    pub(crate) buffered_reads: bool,
 }
 
 impl MessageHandler for WorkerHandler {
     type Error = FsError;
 
     fn handle(&self, msg: &Message) -> FsResult<Message> {
-        crate::fault_point! {
-            sync,
-            name: "worker.rpc.before_dispatch",
-            description: "Before a Worker RPC is dispatched to its business handler",
-            context: {
-                "req_id" => msg.req_id(),
-                "rpc_code" => msg.code() as i32,
-                "request_status" => i8::from(msg.request_status()),
-            },
-            return_error: |fault| Err(FsError::common(fault.message)),
-        }
+        self.before_dispatch(msg.req_id(), msg.code(), msg.request_status())?;
 
         let code = RpcCode::from(msg.code());
         // Record the client's component info on this connection (best-effort;
@@ -136,6 +129,47 @@ impl MessageHandler for WorkerHandler {
 }
 
 impl WorkerHandler {
+    fn before_dispatch(&self, _req_id: i64, _code: i8, _status: RequestStatus) -> FsResult<()> {
+        crate::fault_point! {
+            sync,
+            name: "worker.rpc.before_dispatch",
+            description: "Before a Worker RPC is dispatched to its business handler",
+            context: {
+                "req_id" => _req_id,
+                "rpc_code" => _code as i32,
+                "request_status" => i8::from(_status),
+            },
+            return_error: |fault| Err(FsError::common(fault.message)),
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn read_chunk(
+        &self,
+        req_id: i64,
+        header: Option<DataHeaderProto>,
+    ) -> FsResult<DataSlice> {
+        self.before_dispatch(req_id, RpcCode::ReadBlock as i8, RequestStatus::Running)?;
+        match self.handler.lock().as_mut() {
+            Some(BlockHandler::Reader(reader)) => reader.read_chunk(req_id, header),
+            _ => err_box!("read stream is not initialized"),
+        }
+    }
+
+    pub(crate) fn write_chunk(
+        &self,
+        req_id: i64,
+        header: Option<DataHeaderProto>,
+        data: &DataSlice,
+    ) -> FsResult<()> {
+        self.before_dispatch(req_id, RpcCode::WriteBlock as i8, RequestStatus::Running)?;
+        match self.handler.lock().as_mut() {
+            Some(BlockHandler::Writer(writer)) => writer.write_chunk(req_id, header, data),
+            _ => err_box!("write stream is not initialized"),
+        }
+    }
+
     /// Whether the RPC code belongs to the block data plane (the only codes
     /// whose open frames carry peer metadata). Transfer/task control RPCs are
     /// excluded so they never resolve the connection peer.
@@ -342,11 +376,14 @@ impl WorkerHandler {
         };
 
         if need_new_handler {
-            let _ = handler.replace(BlockHandler::new(
-                code,
-                self.store.clone(),
-                self.client_addr.clone(),
-            )?);
+            let mut new_handler =
+                BlockHandler::new(code, self.store.clone(), self.client_addr.clone())?;
+            if self.buffered_reads {
+                if let BlockHandler::Reader(reader) = &mut new_handler {
+                    reader.enable_send_file = false;
+                }
+            }
+            let _ = handler.replace(new_handler);
         }
 
         match handler.as_mut() {

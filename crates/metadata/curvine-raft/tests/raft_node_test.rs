@@ -23,15 +23,13 @@ use curvine_raft::raft::storage::{
     RocksLogStorage,
 };
 use curvine_raft::raft::{
-    RaftClient, RaftCode, RaftError, RaftGroup, RaftJournal, RaftNode, RaftResult, RoleMonitor,
+    RaftClient, RaftError, RaftGroup, RaftJournal, RaftNode, RaftResult, RoleMonitor,
 };
 use curvine_raft::utils::SerdeUtils;
-use curvine_rpc::client::{ClientConf, RpcClient};
-use curvine_rpc::message::{Builder, ResponseStatus};
 use curvine_runtime::common::{FileUtils, Logger, Utils};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime, Runtime};
-use prost::bytes::BytesMut;
 use prost::Message;
+use prost_legacy::Message as LegacyMessage;
 use raft::eraftpb::{
     ConfChange, ConfState, Entry, EntryType, HardState, Message as RaftMessage, MessageType,
     Snapshot,
@@ -208,7 +206,7 @@ impl AppStorage for TestKvAppStorage {
     }
 
     fn get_fsm_state(&self) -> FsmState {
-        self.fsm_state.lock().unwrap().clone()
+        *self.fsm_state.lock().unwrap()
     }
 
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
@@ -333,7 +331,7 @@ impl AppStorage for BlockingApplyAppStorage {
     }
 
     fn get_fsm_state(&self) -> FsmState {
-        self.fsm_state.lock().unwrap().clone()
+        *self.fsm_state.lock().unwrap()
     }
 
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
@@ -454,19 +452,68 @@ fn malformed_propose_request_does_not_stop_raft_node() -> CommonResult<()> {
     let mut listener = rt.block_on(raft.run())?;
     rt.block_on(listener.wait_leader())?;
 
-    let client = RaftClient::from_conf(rt.clone(), &conf);
-    let malformed_header = SerdeUtils::serialize(&("bad".to_string(), "payload".to_string()))?;
-    let malformed_req = Builder::new_rpc(RaftCode::Propose)
-        .header(BytesMut::from(&malformed_header[..]))
-        .build();
-    let raw_client = rt.block_on(RpcClient::new(
-        false,
-        rt.clone(),
-        &conf.local_addr(),
-        &ClientConf::default(),
-    ))?;
-    let malformed_rep = rt.block_on(raw_client.rpc(malformed_req))?;
-    assert_eq!(malformed_rep.response_status(), ResponseStatus::Error);
+    // Send an invalid protobuf body through the real gRPC listener. A typed
+    // client cannot construct this invalid message, so use a raw codec.
+    #[derive(Default)]
+    struct RawCodec;
+    struct RawEncoder;
+    struct RawDecoder;
+    impl tonic::codec::Codec for RawCodec {
+        type Encode = Vec<u8>;
+        type Decode = curvine_raft::proto::raft::ProposeResponse;
+        type Encoder = RawEncoder;
+        type Decoder = RawDecoder;
+        fn encoder(&mut self) -> Self::Encoder {
+            RawEncoder
+        }
+        fn decoder(&mut self) -> Self::Decoder {
+            RawDecoder
+        }
+    }
+    impl tonic::codec::Encoder for RawEncoder {
+        type Item = Vec<u8>;
+        type Error = tonic::Status;
+        fn encode(
+            &mut self,
+            item: Self::Item,
+            dst: &mut tonic::codec::EncodeBuf<'_>,
+        ) -> Result<(), Self::Error> {
+            use prost::bytes::BufMut;
+            dst.put_slice(&item);
+            Ok(())
+        }
+    }
+    impl tonic::codec::Decoder for RawDecoder {
+        type Item = curvine_raft::proto::raft::ProposeResponse;
+        type Error = tonic::Status;
+        fn decode(
+            &mut self,
+            src: &mut tonic::codec::DecodeBuf<'_>,
+        ) -> Result<Option<Self::Item>, Self::Error> {
+            Ok(Some(
+                Self::Item::decode(src).map_err(|e| tonic::Status::internal(e.to_string()))?,
+            ))
+        }
+    }
+    let status = rt.block_on(async {
+        let endpoint = tonic::transport::Endpoint::from_shared(format!(
+            "http://{}:{}",
+            conf.hostname, conf.rpc_port
+        ))
+        .unwrap();
+        let channel = endpoint.connect().await.unwrap();
+        let mut grpc = tonic::client::Grpc::new(channel);
+        grpc.ready().await.unwrap();
+        let mut request = tonic::Request::new(vec![0xff]);
+        curvine_rpc::grpc::set_request_id(&mut request, Utils::req_id());
+        grpc.unary(
+            request,
+            tonic::codegen::http::uri::PathAndQuery::from_static("/raft.RaftService/Propose"),
+            RawCodec,
+        )
+        .await
+    });
+    assert!(status.is_err());
 
     rt.block_on(send_pair(rt.clone(), &conf, "name", "curvine"))?;
     Utils::sleep(1000);
@@ -546,7 +593,7 @@ impl AppStorage for PopulatedRefuseEmptySnapshotAppStorage {
     }
 
     fn get_fsm_state(&self) -> FsmState {
-        self.fsm_state.lock().unwrap().clone()
+        *self.fsm_state.lock().unwrap()
     }
 
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
@@ -668,7 +715,7 @@ fn kv_app_storages_accept_non_data_entries() -> CommonResult<()> {
     };
 
     let hash: HashAppStorage<String, String> = HashAppStorage::new();
-    rt.block_on(hash.apply(true, ApplyMsg::new_scan(applied.clone())))?;
+    rt.block_on(hash.apply(true, ApplyMsg::new_scan(applied)))?;
     rt.block_on(hash.apply(
         true,
         ApplyMsg::new_entry(Entry {
@@ -1122,7 +1169,7 @@ impl AppStorage for RecordingSnapshotAppStorage {
     }
 
     fn get_fsm_state(&self) -> FsmState {
-        self.fsm_state.lock().unwrap().clone()
+        *self.fsm_state.lock().unwrap()
     }
 
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
@@ -1142,7 +1189,7 @@ impl AppStorage for RecordingSnapshotAppStorage {
     }
 
     async fn apply_snapshot(&self, data: SnapshotData) -> RaftResult<()> {
-        *self.fsm_state.lock().unwrap() = data.fsm_state.clone();
+        *self.fsm_state.lock().unwrap() = data.fsm_state;
         self.applied_snapshots.lock().unwrap().push(data);
         Ok(())
     }

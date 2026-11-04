@@ -13,8 +13,6 @@
 // limitations under the License.
 
 use crate::message::{BoxMessage, Message};
-use bytes::BytesMut;
-use curvine_io::IOResult;
 
 /// This is to solve the rust ownership problem.
 /// For example, when the exception is retrying, Message has moved, Message cannot be used, and Message needs to be wrapped in Arc or Rc to solve the problem.
@@ -25,14 +23,6 @@ pub trait RefMessage {
     fn as_mut(&mut self) -> &mut Message;
 
     fn into_box(self) -> BoxMessage;
-
-    fn encode(&self, buf: &mut BytesMut) -> IOResult<()> {
-        self.as_ref().encode(buf)
-    }
-
-    fn decode(buf: &mut BytesMut) -> IOResult<Message> {
-        Message::decode(buf)
-    }
 
     fn req_id(&self) -> i64 {
         self.as_ref().protocol.req_id

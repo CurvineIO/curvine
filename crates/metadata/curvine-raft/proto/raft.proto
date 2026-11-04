@@ -129,3 +129,33 @@ message ReportSnapshotRequest {
 message ReportSnapshotResponse {
     required bool accepted = 1;
 }
+
+// Error details preserve redirection and leader-readiness semantics across
+// languages. Request metadata carries the logical ID unchanged across retries.
+message RaftErrorDetail {
+    required string type = 1;
+    required int32 kind = 2;
+    required string message = 3;
+    optional uint64 leader_id = 4;
+    repeated RaftPeerProto group = 5;
+    optional string group_name = 6;
+}
+
+// A download ends with a checksum trailer; clients verify both the advertised
+// byte count and checksum before installing the snapshot.
+message SnapshotDownloadChunk {
+    oneof value {
+        // Independently zlib-compressed chunk; checksum covers raw bytes.
+        bytes data = 1;
+        SnapshotDownloadResponse trailer = 2;
+    }
+}
+
+service RaftService {
+    rpc Ping(PingRequest) returns (PingResponse);
+    rpc ConfChange(ConfChangeRequest) returns (ConfChangeResponse);
+    rpc Propose(ProposeRequest) returns (ProposeResponse);
+    rpc SendRaft(RaftRequest) returns (RaftResponse);
+    rpc ReportSnapshot(ReportSnapshotRequest) returns (ReportSnapshotResponse);
+    rpc DownloadSnapshot(SnapshotDownloadRequest) returns (stream SnapshotDownloadChunk);
+}

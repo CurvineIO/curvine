@@ -13,19 +13,22 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockActor, BlockStore};
+use crate::worker::grpc_data::{GrpcBlockDataService, StreamTracker};
 use crate::worker::handler::{ConnectionPeer, WorkerHandler, WorkerRouterHandler};
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use crate::worker::task::TaskManager;
-use crate::worker::WorkerMetrics;
+use crate::worker::{WorkerControlGrpcHandler, WorkerMetrics};
 use curvine_config::ClusterConf;
 use curvine_core_error::StringError;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
 use curvine_model::{CompatibilityPolicy, HeartbeatStatus, WorkerAddress};
-use curvine_net::net::ConnState;
+use curvine_net::net::{ConnState, NetUtils};
+use curvine_proto::block_data_service_server::BlockDataServiceServer;
+use curvine_proto::worker_control_service_server::WorkerControlServiceServer;
 use curvine_rpc::handler::HandlerService;
-use curvine_rpc::server::{RpcServer, ServerStateListener};
+use curvine_rpc::server::{ServerMonitor, ServerStateListener};
 use curvine_runtime::common::Utils;
 use curvine_runtime::common::{LocalTime, Logger};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
@@ -35,8 +38,8 @@ use curvine_storage_spdk::SpdkEnv;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use once_cell::sync::OnceCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
 
 static CLUSTER_CONF: OnceCell<ClusterConf> = OnceCell::new();
 
@@ -118,6 +121,7 @@ impl HandlerService for WorkerService {
             replication_handler: WorkerReplicationHandler::new(&self.replication_manager),
             compatibility_policy: self.compatibility_policy.clone(),
             client_addr,
+            buffered_reads: false,
         }
     }
 }
@@ -137,7 +141,12 @@ pub struct Worker {
     pub start_ms: u64,
     pub worker_id: u32,
     pub addr: WorkerAddress,
-    rpc_server: Option<RpcServer<WorkerService>>,
+    rt: Arc<Runtime>,
+    service: WorkerService,
+    monitor: Arc<ServerMonitor>,
+    tracker: StreamTracker,
+    registered: Arc<AtomicBool>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     web_server: Option<WebServer<WorkerService>>,
     block_actor: BlockActor,
 }
@@ -223,16 +232,15 @@ impl Worker {
         conf.print();
 
         let block_store = service.store.clone();
-        let rpc_server = RpcServer::with_rt(rt.clone(), conf.worker_server_conf(), service.clone());
+        let monitor = Arc::new(ServerMonitor::new());
 
         let web_server = WebServer::with_rt(rt.clone(), conf.worker_web_conf(), service.clone());
 
-        let net_addr = rpc_server.bind_addr();
         let addr = WorkerAddress {
             worker_id,
-            hostname: net_addr.hostname.to_owned(),
-            ip_addr: net_addr.hostname.to_owned(),
-            rpc_port: net_addr.port as u32,
+            hostname: conf.worker.hostname.clone(),
+            ip_addr: conf.worker.hostname.clone(),
+            rpc_port: conf.worker.rpc_port as u32,
             web_port: conf.worker.web_port as u32,
         };
         let start_ms = LocalTime::mills();
@@ -242,7 +250,7 @@ impl Worker {
             addr.clone(),
             worker_session_id,
             block_store.clone(),
-            rpc_server.new_state_ctl(),
+            monitor.read_ctl(),
             start_ms,
         )?;
 
@@ -251,23 +259,16 @@ impl Worker {
             .replication_manager
             .with_master_client(master_client.clone());
 
-        let spdk_enabled = conf.worker.spdk_disk.enabled;
-        rpc_server.add_shutdown_hook(move || {
-            if let Err(e) = master_client.heartbeat(HeartbeatStatus::End, vec![]) {
-                info!("error unregister {}", e)
-            }
-            if spdk_enabled {
-                info!("Shutting down SPDK environment");
-                #[cfg(feature = "spdk")]
-                curvine_storage_spdk::SpdkEnv::shutdown_global();
-            }
-        });
-
         let worker = Self {
             start_ms,
             worker_id,
             addr,
-            rpc_server: Some(rpc_server),
+            rt,
+            service,
+            monitor,
+            tracker: StreamTracker::default(),
+            registered: Arc::new(AtomicBool::new(false)),
+            shutdown: None,
             web_server: Some(web_server),
             block_actor,
         };
@@ -275,56 +276,192 @@ impl Worker {
         Ok(worker)
     }
 
-    pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
-        // step 3: Start rpc server
-        let rpc_server = self
-            .rpc_server
-            .take()
-            .expect("worker rpc server must be initialized before startup");
-        let mut rpc_status = rpc_server.start();
-        rpc_status.wait_running().await?;
-
-        // step 4: Start the web server
-        let web_server = self
-            .web_server
-            .take()
-            .expect("worker web server must be initialized before startup");
-        let web_name = web_server.server_name().to_string();
-        let bind_addr = web_server.resolve_bind_addr();
-        let mut web_status = web_server.start();
-        WebServer::<WorkerService>::wait_bind(&mut web_status, &web_name, &bind_addr).await?;
-
-        // step 5: Start block heartbeat check service
-        let block_actor = self.block_actor.clone();
-        thread::spawn(move || block_actor.start())
-            .join()
-            .map_err(|_| {
-                CommonError::from(StringError::from(
-                    "worker block actor startup thread panicked",
-                ))
+    /// Bind the advertised RPC port and start the tonic worker services.
+    async fn start_tonic(&mut self, unregister: bool) -> CommonResult<ServerStateListener> {
+        if self.shutdown.is_some() {
+            return curvine_core_error::err_box!("worker server already started");
+        }
+        let grpc_config = &self.service.conf.worker.grpc;
+        let tls = grpc_config.server_tls()?;
+        let transport = curvine_rpc::grpc::TransportConfig::default();
+        let mut grpc_server = transport.server(tls.as_ref())?;
+        let reflection = if grpc_config.enable_reflection {
+            Some(
+                curvine_rpc::grpc::reflection::server::Builder::configure()
+                    .register_encoded_file_descriptor_set(curvine_proto::FILE_DESCRIPTOR_SET)
+                    .with_service_name("proto.WorkerControlService")
+                    .with_service_name("proto.BlockDataService")
+                    .build_v1alpha()?,
+            )
+        } else {
+            None
+        };
+        let port = self.addr.rpc_port as u16;
+        let hostname =
+            std::env::var("ORPC_BIND_HOSTNAME").unwrap_or_else(|_| self.addr.hostname.clone());
+        let held_listener = NetUtils::take_held_listener(port);
+        let listener = self
+            .rt
+            .spawn(async move {
+                if let Some(listener) = held_listener {
+                    listener.set_nonblocking(true)?;
+                    tokio::net::TcpListener::from_std(listener)
+                } else {
+                    tokio::net::TcpListener::bind((hostname.as_str(), port)).await
+                }
             })
-            .and_then(|result| result)?;
+            .await
+            .map_err(|error| CommonError::from(error.to_string()))??;
+        let address = listener.local_addr()?;
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        self.shutdown = Some(stop_tx);
+        let status = self.monitor.new_listener();
+        let monitor = self.monitor.clone();
+        let tracker = self.tracker.clone();
+        let service = self.service.clone();
+        let master_client = self.block_actor.client.clone();
+        let registered = self.registered.clone();
+        let spdk_enabled = self.service.conf.worker.spdk_disk.enabled;
+        let (health, health_service) = curvine_rpc::grpc::health_reporter();
+        health
+            .set_serving::<BlockDataServiceServer<GrpcBlockDataService>>()
+            .await;
+        health
+            .set_serving::<WorkerControlServiceServer<WorkerControlGrpcHandler>>()
+            .await;
+        let data_service = BlockDataServiceServer::new(GrpcBlockDataService::new(
+            service.clone(),
+            tracker.clone(),
+        ))
+        .max_decoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES);
+        let control_service = WorkerControlServiceServer::new(WorkerControlGrpcHandler::new(
+            service,
+            tracker.clone(),
+        ))
+        .max_decoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES);
+        let shutdown_monitor = monitor.clone();
+        let shutdown_tracker = tracker.clone();
+        self.rt.spawn(async move {
+            let incoming = futures::stream::unfold(
+                (listener, transport),
+                |(listener, transport)| async move {
+                    let accepted = listener.accept().await.and_then(|(stream, _)| {
+                        transport.configure_socket(&stream)?;
+                        Ok(stream)
+                    });
+                    Some((accepted, (listener, transport)))
+                },
+            );
+            let shutdown = async move {
+                #[cfg(unix)]
+                {
+                    let mut terminate =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                            .expect("register SIGTERM");
+                    tokio::select! {
+                        _ = stop_rx => {},
+                        _ = tokio::signal::ctrl_c() => {},
+                        _ = terminate.recv() => {},
+                    }
+                }
+                #[cfg(not(unix))]
+                tokio::select! {
+                    _ = stop_rx => {},
+                    _ = tokio::signal::ctrl_c() => {},
+                }
+                shutdown_monitor.advance_shutdown();
+                shutdown_tracker.shutdown();
+                health
+                    .set_not_serving::<BlockDataServiceServer<GrpcBlockDataService>>()
+                    .await;
+                health
+                    .set_not_serving::<WorkerControlServiceServer<WorkerControlGrpcHandler>>()
+                    .await;
+            };
+            let result = grpc_server
+                .add_service(health_service)
+                .add_optional_service(reflection)
+                .add_service(data_service)
+                .add_service(control_service)
+                .serve_with_incoming_shutdown(incoming, shutdown)
+                .await;
+            if let Err(error) = result {
+                log::error!("worker gRPC server failed: {}", error);
+            }
+            monitor.advance_shutdown();
+            tracker.shutdown();
+            tracker.wait_drained().await;
+            // Keep synchronous heartbeat and storage shutdown off the I/O runtime.
+            let _ = tokio::task::spawn_blocking(move || {
+                if unregister && registered.load(Ordering::Acquire) {
+                    if let Err(error) = master_client.heartbeat(HeartbeatStatus::End, vec![]) {
+                        info!("error unregister {}", error);
+                    }
+                }
+                if spdk_enabled {
+                    info!("Shutting down SPDK environment");
+                    #[cfg(feature = "spdk")]
+                    curvine_storage_spdk::SpdkEnv::shutdown_global();
+                }
+            })
+            .await;
+            monitor.advance_stop();
+        });
+        self.monitor.advance_running();
+        info!("worker gRPC listener started on {}", address);
+        Ok(status)
+    }
 
-        Ok(rpc_status)
+    pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
+        let mut status = self.start_tonic(true).await?;
+        let result = async {
+            let web_server = self
+                .web_server
+                .take()
+                .expect("worker web server must be initialized before startup");
+            let web_name = web_server.server_name().to_string();
+            let bind_addr = web_server.resolve_bind_addr();
+            let mut web_status = web_server.start();
+            WebServer::<WorkerService>::wait_bind(&mut web_status, &web_name, &bind_addr).await?;
+
+            let block_actor = self.block_actor.clone();
+            tokio::task::spawn_blocking(move || block_actor.start())
+                .await
+                .map_err(|_| {
+                    CommonError::from(StringError::from(
+                        "worker block actor startup thread panicked",
+                    ))
+                })
+                .and_then(|result| result)?;
+            self.registered.store(true, Ordering::Release);
+            Ok::<_, CommonError>(())
+        }
+        .await;
+        if let Err(error) = result {
+            self.shutdown.take();
+            let _ = status.wait_stop().await;
+            return Err(error);
+        }
+        Ok(status)
     }
 
     pub fn block_on_start(mut self) -> CommonResult<()> {
-        let rt = self
-            .rpc_server
-            .as_ref()
-            .expect("worker rpc server must be initialized before startup")
-            .clone_rt();
-
-        let mut rpc_status = rt.block_on(async { self.start().await })?;
-        rt.block_on(async { rpc_status.wait_stop().await })
+        let rt = self.rt.clone();
+        let mut status = rt.block_on(async { self.start().await })?;
+        rt.block_on(async { status.wait_stop().await })
     }
 
-    // Start a standalone worker.
-    pub fn start_standalone(&self) {
-        self.rpc_server
-            .as_ref()
-            .expect("worker rpc server must be initialized")
-            .block_on_start();
+    /// Start only the worker RPC listener, without registration or the web server.
+    pub fn start_standalone(mut self) {
+        let rt = self.rt.clone();
+        match rt.block_on(async { self.start_tonic(false).await }) {
+            Ok(mut status) => {
+                let _ = rt.block_on(async { status.wait_stop().await });
+            }
+            Err(error) => log::error!("worker gRPC startup failed: {}", error),
+        }
     }
 
     pub fn get_conf<'a>() -> CommonResult<&'a ClusterConf> {
@@ -340,9 +477,6 @@ impl Worker {
     }
 
     pub fn service(&self) -> &WorkerService {
-        self.rpc_server
-            .as_ref()
-            .expect("worker rpc server must be initialized")
-            .service()
+        &self.service
     }
 }

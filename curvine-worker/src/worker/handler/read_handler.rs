@@ -20,7 +20,7 @@ use curvine_core_error::ErrorExt;
 use curvine_core_error::{err_box, ternary, try_option_mut, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_io::{CacheManager, ReadAheadTask};
+use curvine_io::{CacheManager, DataSlice, ReadAheadTask};
 use curvine_proto::{BlockReadResponse, DataHeaderProto};
 use curvine_rpc::message::{Builder, Message, RequestStatus};
 use curvine_runtime::common::{ByteUnit, TimeSpent};
@@ -194,11 +194,26 @@ impl ReadHandler {
     }
 
     pub fn read(&mut self, msg: &Message) -> FsResult<Message> {
+        let header = if msg.header_len() > 0 {
+            Some(msg.parse_header()?)
+        } else {
+            None
+        };
+        let data = self.read_chunk(msg.req_id(), header)?;
+        Ok(msg.success_with_data(None, data))
+    }
+
+    pub(crate) fn read_chunk(
+        &mut self,
+        req_id: i64,
+        header: Option<DataHeaderProto>,
+    ) -> FsResult<DataSlice> {
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
-
-        if msg.header_len() > 0 {
-            let header: DataHeaderProto = msg.parse_header()?;
+        if context.req_id != req_id {
+            return err_box!("Read request identity mismatch");
+        }
+        if let Some(header) = header {
             file.seek_to(header.offset)?;
         }
 
@@ -232,7 +247,7 @@ impl ReadHandler {
         self.metrics.read_time_us.inc_by(used as i64);
         self.metrics.read_count.inc();
 
-        Ok(msg.success_with_data(None, region))
+        Ok(region)
     }
 
     pub fn complete(&mut self, msg: &Message) -> FsResult<Message> {

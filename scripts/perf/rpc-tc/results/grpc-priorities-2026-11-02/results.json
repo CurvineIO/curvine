@@ -1,0 +1,1413 @@
+{
+  "date": "2026-11-02",
+  "compiler": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "backend": "LLVM",
+  "linker": "mold",
+  "rustflags": "-Cdebuginfo=line-tables-only -Clink-arg=-fuse-ld=mold",
+  "cxxflags": "-include cstdint -g1",
+  "profile": "release, line-tables-only, no LTO override",
+  "workload": {
+    "1gbit": {
+      "file_bytes": 67108864,
+      "chunk_bytes": 1048576,
+      "reads": 256,
+      "warmup_reads": 16,
+      "concurrency": 4,
+      "source_sha256": "3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac",
+      "short_circuit": false,
+      "read_ahead": false,
+      "rate": "1gbit",
+      "delay_per_direction": "1ms"
+    },
+    "10gbit": {
+      "file_bytes": 67108864,
+      "chunk_bytes": 1048576,
+      "reads": 256,
+      "warmup_reads": 16,
+      "concurrency": 4,
+      "source_sha256": "3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac",
+      "short_circuit": false,
+      "read_ahead": false,
+      "rate": "10gbit",
+      "delay_per_direction": "1ms"
+    }
+  },
+  "stages": {
+    "p0-baseline": {
+      "label": "Baseline",
+      "note": "Serial reads",
+      "tuning": {
+        "read_pipeline_window": 1,
+        "blocking_batching": false,
+        "typed_payload_dispatch": false
+      },
+      "source_commit": "f13c9693598ee20eed2607bcb43ec5f94079dd66",
+      "profiles": {
+        "1gbit": {
+          "median": {
+            "throughput_mb_s": 118.83421250246201,
+            "p99_ms": 71.845953,
+            "cpu_s_gib": 3.66,
+            "client_cpu_s_gib": 2.04,
+            "server_cpu_s_gib": 1.59,
+            "sampled_peak_rss_mib": 157.90234375
+          },
+          "range": {
+            "throughput_mb_s": [
+              118.55849432664859,
+              118.87391186339241
+            ],
+            "p99_ms": [
+              70.182138,
+              72.803255
+            ],
+            "cpu_s_gib": [
+              3.58,
+              3.6900000000000004
+            ],
+            "client_cpu_s_gib": [
+              2.02,
+              2.1
+            ],
+            "server_cpu_s_gib": [
+              1.56,
+              1.62
+            ],
+            "sampled_peak_rss_mib": [
+              156.3984375,
+              160.26953125
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 118.87391186339241,
+              "p99_ms": 70.182138,
+              "cpu_s_gib": 3.66,
+              "client_cpu_s_gib": 2.04,
+              "server_cpu_s_gib": 1.62,
+              "sampled_peak_rss_mib": 157.90234375,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "6118ee11ed3cb48b8a719353df2207b2a2594527f855c6294f8a67df9f6e8df2",
+                "client_sha256": "73e063e3de6af27784835f455f742ecc6bb0a03bee8d511f57e6c7f4b2a14ec5"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 118.55849432664859,
+              "p99_ms": 71.845953,
+              "cpu_s_gib": 3.58,
+              "client_cpu_s_gib": 2.02,
+              "server_cpu_s_gib": 1.56,
+              "sampled_peak_rss_mib": 156.3984375,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "6118ee11ed3cb48b8a719353df2207b2a2594527f855c6294f8a67df9f6e8df2",
+                "client_sha256": "73e063e3de6af27784835f455f742ecc6bb0a03bee8d511f57e6c7f4b2a14ec5"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 118.83421250246201,
+              "p99_ms": 72.803255,
+              "cpu_s_gib": 3.6900000000000004,
+              "client_cpu_s_gib": 2.1,
+              "server_cpu_s_gib": 1.59,
+              "sampled_peak_rss_mib": 160.26953125,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "6118ee11ed3cb48b8a719353df2207b2a2594527f855c6294f8a67df9f6e8df2",
+                "client_sha256": "73e063e3de6af27784835f455f742ecc6bb0a03bee8d511f57e6c7f4b2a14ec5"
+              }
+            }
+          ]
+        },
+        "10gbit": {
+          "median": {
+            "throughput_mb_s": 614.8054578249191,
+            "p99_ms": 10.472186,
+            "cpu_s_gib": 4.54,
+            "client_cpu_s_gib": 2.25,
+            "server_cpu_s_gib": 2.29,
+            "sampled_peak_rss_mib": 160.36328125
+          },
+          "range": {
+            "throughput_mb_s": [
+              594.2305245061832,
+              657.6223650314289
+            ],
+            "p99_ms": [
+              9.32654,
+              10.997043
+            ],
+            "cpu_s_gib": [
+              4.34,
+              4.76
+            ],
+            "client_cpu_s_gib": [
+              2.22,
+              2.42
+            ],
+            "server_cpu_s_gib": [
+              2.12,
+              2.34
+            ],
+            "sampled_peak_rss_mib": [
+              159.4375,
+              161.9140625
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 594.2305245061832,
+              "p99_ms": 10.997043,
+              "cpu_s_gib": 4.76,
+              "client_cpu_s_gib": 2.42,
+              "server_cpu_s_gib": 2.34,
+              "sampled_peak_rss_mib": 159.4375,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "6118ee11ed3cb48b8a719353df2207b2a2594527f855c6294f8a67df9f6e8df2",
+                "client_sha256": "73e063e3de6af27784835f455f742ecc6bb0a03bee8d511f57e6c7f4b2a14ec5"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 657.6223650314289,
+              "p99_ms": 10.472186,
+              "cpu_s_gib": 4.54,
+              "client_cpu_s_gib": 2.25,
+              "server_cpu_s_gib": 2.29,
+              "sampled_peak_rss_mib": 160.36328125,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "6118ee11ed3cb48b8a719353df2207b2a2594527f855c6294f8a67df9f6e8df2",
+                "client_sha256": "73e063e3de6af27784835f455f742ecc6bb0a03bee8d511f57e6c7f4b2a14ec5"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 614.8054578249191,
+              "p99_ms": 9.32654,
+              "cpu_s_gib": 4.34,
+              "client_cpu_s_gib": 2.22,
+              "server_cpu_s_gib": 2.12,
+              "sampled_peak_rss_mib": 161.9140625,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "6118ee11ed3cb48b8a719353df2207b2a2594527f855c6294f8a67df9f6e8df2",
+                "client_sha256": "73e063e3de6af27784835f455f742ecc6bb0a03bee8d511f57e6c7f4b2a14ec5"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "p1-bytes": {
+      "label": "1. Payload buffers",
+      "note": "Bytes instead of forced Vec/BytesMut copies",
+      "tuning": {
+        "read_pipeline_window": 1,
+        "blocking_batching": false,
+        "typed_payload_dispatch": false
+      },
+      "source_commit": "d48fc737ec6478ce77044280ac2d4dca43007fa2",
+      "profiles": {
+        "1gbit": {
+          "median": {
+            "throughput_mb_s": 118.83231235673402,
+            "p99_ms": 79.437468,
+            "cpu_s_gib": 3.26,
+            "client_cpu_s_gib": 1.66,
+            "server_cpu_s_gib": 1.6,
+            "sampled_peak_rss_mib": 145.7109375
+          },
+          "range": {
+            "throughput_mb_s": [
+              118.79676956420488,
+              118.92474154853535
+            ],
+            "p99_ms": [
+              77.878002,
+              82.467852
+            ],
+            "cpu_s_gib": [
+              3.09,
+              3.33
+            ],
+            "client_cpu_s_gib": [
+              1.59,
+              1.67
+            ],
+            "server_cpu_s_gib": [
+              1.5,
+              1.66
+            ],
+            "sampled_peak_rss_mib": [
+              144.9765625,
+              152.2265625
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 118.79676956420488,
+              "p99_ms": 77.878002,
+              "cpu_s_gib": 3.09,
+              "client_cpu_s_gib": 1.59,
+              "server_cpu_s_gib": 1.5,
+              "sampled_peak_rss_mib": 145.7109375,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "8dd2925d1f80be16c93500178191e177e701f4521649c8a62e1636d3142e1a58",
+                "client_sha256": "a18f3c9c99952d3f6e3e1362f6095b8bb7c1a8582f33e70c6978883caa012964"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 118.83231235673402,
+              "p99_ms": 79.437468,
+              "cpu_s_gib": 3.26,
+              "client_cpu_s_gib": 1.66,
+              "server_cpu_s_gib": 1.6,
+              "sampled_peak_rss_mib": 152.2265625,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "8dd2925d1f80be16c93500178191e177e701f4521649c8a62e1636d3142e1a58",
+                "client_sha256": "a18f3c9c99952d3f6e3e1362f6095b8bb7c1a8582f33e70c6978883caa012964"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 118.92474154853535,
+              "p99_ms": 82.467852,
+              "cpu_s_gib": 3.33,
+              "client_cpu_s_gib": 1.67,
+              "server_cpu_s_gib": 1.66,
+              "sampled_peak_rss_mib": 144.9765625,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "8dd2925d1f80be16c93500178191e177e701f4521649c8a62e1636d3142e1a58",
+                "client_sha256": "a18f3c9c99952d3f6e3e1362f6095b8bb7c1a8582f33e70c6978883caa012964"
+              }
+            }
+          ]
+        },
+        "10gbit": {
+          "median": {
+            "throughput_mb_s": 669.5348295979885,
+            "p99_ms": 8.664533,
+            "cpu_s_gib": 4.2,
+            "client_cpu_s_gib": 1.9,
+            "server_cpu_s_gib": 2.29,
+            "sampled_peak_rss_mib": 151.875
+          },
+          "range": {
+            "throughput_mb_s": [
+              643.6137640046813,
+              720.680654559029
+            ],
+            "p99_ms": [
+              8.18936,
+              8.740693
+            ],
+            "cpu_s_gib": [
+              4.1899999999999995,
+              4.25
+            ],
+            "client_cpu_s_gib": [
+              1.85,
+              1.91
+            ],
+            "server_cpu_s_gib": [
+              2.29,
+              2.4
+            ],
+            "sampled_peak_rss_mib": [
+              151.24609375,
+              152.44921875
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 643.6137640046813,
+              "p99_ms": 8.664533,
+              "cpu_s_gib": 4.25,
+              "client_cpu_s_gib": 1.85,
+              "server_cpu_s_gib": 2.4,
+              "sampled_peak_rss_mib": 151.875,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "8dd2925d1f80be16c93500178191e177e701f4521649c8a62e1636d3142e1a58",
+                "client_sha256": "a18f3c9c99952d3f6e3e1362f6095b8bb7c1a8582f33e70c6978883caa012964"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 720.680654559029,
+              "p99_ms": 8.18936,
+              "cpu_s_gib": 4.2,
+              "client_cpu_s_gib": 1.91,
+              "server_cpu_s_gib": 2.29,
+              "sampled_peak_rss_mib": 151.24609375,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "8dd2925d1f80be16c93500178191e177e701f4521649c8a62e1636d3142e1a58",
+                "client_sha256": "a18f3c9c99952d3f6e3e1362f6095b8bb7c1a8582f33e70c6978883caa012964"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 669.5348295979885,
+              "p99_ms": 8.740693,
+              "cpu_s_gib": 4.1899999999999995,
+              "client_cpu_s_gib": 1.9,
+              "server_cpu_s_gib": 2.29,
+              "sampled_peak_rss_mib": 152.44921875,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "8dd2925d1f80be16c93500178191e177e701f4521649c8a62e1636d3142e1a58",
+                "client_sha256": "a18f3c9c99952d3f6e3e1362f6095b8bb7c1a8582f33e70c6978883caa012964"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "p2-windows": {
+      "label": "2. HTTP/2 windows",
+      "note": "4 MiB stream / 16 MiB connection receive credit",
+      "tuning": {
+        "read_pipeline_window": 1,
+        "blocking_batching": false,
+        "typed_payload_dispatch": false
+      },
+      "source_commit": "7777d84e8b125209217bec90fd36d0818a3565f3",
+      "profiles": {
+        "1gbit": {
+          "median": {
+            "throughput_mb_s": 118.8819968584059,
+            "p99_ms": 78.128977,
+            "cpu_s_gib": 3.21,
+            "client_cpu_s_gib": 1.63,
+            "server_cpu_s_gib": 1.58,
+            "sampled_peak_rss_mib": 145.38671875
+          },
+          "range": {
+            "throughput_mb_s": [
+              116.84810412007964,
+              118.97144711038958
+            ],
+            "p99_ms": [
+              67.657158,
+              79.613467
+            ],
+            "cpu_s_gib": [
+              3.18,
+              3.37
+            ],
+            "client_cpu_s_gib": [
+              1.6,
+              1.74
+            ],
+            "server_cpu_s_gib": [
+              1.58,
+              1.63
+            ],
+            "sampled_peak_rss_mib": [
+              144.96484375,
+              145.40234375
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 118.8819968584059,
+              "p99_ms": 79.613467,
+              "cpu_s_gib": 3.21,
+              "client_cpu_s_gib": 1.63,
+              "server_cpu_s_gib": 1.58,
+              "sampled_peak_rss_mib": 145.40234375,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "0f85a49dfe30e66922dc757f36df459bbfc35a009e4b9f05e6f7e99a08b0a4fc",
+                "client_sha256": "8d2082136909fe6e020e134da936c067b776092acc66c219c461ffd94885f1b2"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 116.84810412007964,
+              "p99_ms": 78.128977,
+              "cpu_s_gib": 3.37,
+              "client_cpu_s_gib": 1.74,
+              "server_cpu_s_gib": 1.63,
+              "sampled_peak_rss_mib": 144.96484375,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "0f85a49dfe30e66922dc757f36df459bbfc35a009e4b9f05e6f7e99a08b0a4fc",
+                "client_sha256": "8d2082136909fe6e020e134da936c067b776092acc66c219c461ffd94885f1b2"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 118.97144711038958,
+              "p99_ms": 67.657158,
+              "cpu_s_gib": 3.18,
+              "client_cpu_s_gib": 1.6,
+              "server_cpu_s_gib": 1.58,
+              "sampled_peak_rss_mib": 145.38671875,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "0f85a49dfe30e66922dc757f36df459bbfc35a009e4b9f05e6f7e99a08b0a4fc",
+                "client_sha256": "8d2082136909fe6e020e134da936c067b776092acc66c219c461ffd94885f1b2"
+              }
+            }
+          ]
+        },
+        "10gbit": {
+          "median": {
+            "throughput_mb_s": 651.546418166514,
+            "p99_ms": 8.828619,
+            "cpu_s_gib": 4.07,
+            "client_cpu_s_gib": 1.82,
+            "server_cpu_s_gib": 2.25,
+            "sampled_peak_rss_mib": 151.2265625
+          },
+          "range": {
+            "throughput_mb_s": [
+              633.2979735192885,
+              714.5624502087179
+            ],
+            "p99_ms": [
+              8.575047,
+              9.615456
+            ],
+            "cpu_s_gib": [
+              3.97,
+              4.1899999999999995
+            ],
+            "client_cpu_s_gib": [
+              1.79,
+              1.85
+            ],
+            "server_cpu_s_gib": [
+              2.18,
+              2.34
+            ],
+            "sampled_peak_rss_mib": [
+              150.41015625,
+              153.13671875
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 651.546418166514,
+              "p99_ms": 8.575047,
+              "cpu_s_gib": 3.97,
+              "client_cpu_s_gib": 1.79,
+              "server_cpu_s_gib": 2.18,
+              "sampled_peak_rss_mib": 150.41015625,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "0f85a49dfe30e66922dc757f36df459bbfc35a009e4b9f05e6f7e99a08b0a4fc",
+                "client_sha256": "8d2082136909fe6e020e134da936c067b776092acc66c219c461ffd94885f1b2"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 714.5624502087179,
+              "p99_ms": 9.615456,
+              "cpu_s_gib": 4.1899999999999995,
+              "client_cpu_s_gib": 1.85,
+              "server_cpu_s_gib": 2.34,
+              "sampled_peak_rss_mib": 151.2265625,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "0f85a49dfe30e66922dc757f36df459bbfc35a009e4b9f05e6f7e99a08b0a4fc",
+                "client_sha256": "8d2082136909fe6e020e134da936c067b776092acc66c219c461ffd94885f1b2"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 633.2979735192885,
+              "p99_ms": 8.828619,
+              "cpu_s_gib": 4.07,
+              "client_cpu_s_gib": 1.82,
+              "server_cpu_s_gib": 2.25,
+              "sampled_peak_rss_mib": 153.13671875,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "0f85a49dfe30e66922dc757f36df459bbfc35a009e4b9f05e6f7e99a08b0a4fc",
+                "client_sha256": "8d2082136909fe6e020e134da936c067b776092acc66c219c461ffd94885f1b2"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "p3-read-window": {
+      "label": "3. Read window = 4",
+      "note": "Sliding sequential read prefetch, opt-in in final code",
+      "tuning": {
+        "read_pipeline_window": 4,
+        "blocking_batching": false,
+        "typed_payload_dispatch": false
+      },
+      "source_commit": "84e6b97445764860fd72879d019194201429f498",
+      "profiles": {
+        "1gbit": {
+          "median": {
+            "throughput_mb_s": 113.74562675747045,
+            "p99_ms": 218.645507,
+            "cpu_s_gib": 2.71,
+            "client_cpu_s_gib": 1.39,
+            "server_cpu_s_gib": 1.32,
+            "sampled_peak_rss_mib": 197.98046875
+          },
+          "range": {
+            "throughput_mb_s": [
+              113.69137240510537,
+              113.83404461856331
+            ],
+            "p99_ms": [
+              196.806753,
+              268.642958
+            ],
+            "cpu_s_gib": [
+              2.44,
+              2.75
+            ],
+            "client_cpu_s_gib": [
+              1.3,
+              1.43
+            ],
+            "server_cpu_s_gib": [
+              1.14,
+              1.32
+            ],
+            "sampled_peak_rss_mib": [
+              193.828125,
+              210.41796875
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 113.83404461856331,
+              "p99_ms": 268.642958,
+              "cpu_s_gib": 2.75,
+              "client_cpu_s_gib": 1.43,
+              "server_cpu_s_gib": 1.32,
+              "sampled_peak_rss_mib": 197.98046875,
+              "netem_drops_whole_run": 20,
+              "binaries": {
+                "server_sha256": "b4892ffc1f17f4396f645513bfcae40044f3324c1d0483d1324d231d57e799fc",
+                "client_sha256": "dc216c57e609072193f2a1094d150f77d4d01cfc98a25af68be491bf6866aab0"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 113.74562675747045,
+              "p99_ms": 196.806753,
+              "cpu_s_gib": 2.44,
+              "client_cpu_s_gib": 1.3,
+              "server_cpu_s_gib": 1.14,
+              "sampled_peak_rss_mib": 210.41796875,
+              "netem_drops_whole_run": 153,
+              "binaries": {
+                "server_sha256": "b4892ffc1f17f4396f645513bfcae40044f3324c1d0483d1324d231d57e799fc",
+                "client_sha256": "dc216c57e609072193f2a1094d150f77d4d01cfc98a25af68be491bf6866aab0"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 113.69137240510537,
+              "p99_ms": 218.645507,
+              "cpu_s_gib": 2.71,
+              "client_cpu_s_gib": 1.39,
+              "server_cpu_s_gib": 1.32,
+              "sampled_peak_rss_mib": 193.828125,
+              "netem_drops_whole_run": 60,
+              "binaries": {
+                "server_sha256": "b4892ffc1f17f4396f645513bfcae40044f3324c1d0483d1324d231d57e799fc",
+                "client_sha256": "dc216c57e609072193f2a1094d150f77d4d01cfc98a25af68be491bf6866aab0"
+              }
+            }
+          ]
+        },
+        "10gbit": {
+          "median": {
+            "throughput_mb_s": 935.1142885965188,
+            "p99_ms": 11.879614,
+            "cpu_s_gib": 3.8899999999999997,
+            "client_cpu_s_gib": 1.72,
+            "server_cpu_s_gib": 2.12,
+            "sampled_peak_rss_mib": 209.3125
+          },
+          "range": {
+            "throughput_mb_s": [
+              912.3498862446735,
+              1028.8051135515104
+            ],
+            "p99_ms": [
+              11.7124,
+              12.688821
+            ],
+            "cpu_s_gib": [
+              3.39,
+              3.95
+            ],
+            "client_cpu_s_gib": [
+              1.57,
+              1.83
+            ],
+            "server_cpu_s_gib": [
+              1.82,
+              2.17
+            ],
+            "sampled_peak_rss_mib": [
+              206.76953125,
+              213.62109375
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 912.3498862446735,
+              "p99_ms": 11.879614,
+              "cpu_s_gib": 3.8899999999999997,
+              "client_cpu_s_gib": 1.72,
+              "server_cpu_s_gib": 2.17,
+              "sampled_peak_rss_mib": 206.76953125,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "b4892ffc1f17f4396f645513bfcae40044f3324c1d0483d1324d231d57e799fc",
+                "client_sha256": "dc216c57e609072193f2a1094d150f77d4d01cfc98a25af68be491bf6866aab0"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 1028.8051135515104,
+              "p99_ms": 12.688821,
+              "cpu_s_gib": 3.95,
+              "client_cpu_s_gib": 1.83,
+              "server_cpu_s_gib": 2.12,
+              "sampled_peak_rss_mib": 209.3125,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "b4892ffc1f17f4396f645513bfcae40044f3324c1d0483d1324d231d57e799fc",
+                "client_sha256": "dc216c57e609072193f2a1094d150f77d4d01cfc98a25af68be491bf6866aab0"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 935.1142885965188,
+              "p99_ms": 11.7124,
+              "cpu_s_gib": 3.39,
+              "client_cpu_s_gib": 1.57,
+              "server_cpu_s_gib": 1.82,
+              "sampled_peak_rss_mib": 213.62109375,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "b4892ffc1f17f4396f645513bfcae40044f3324c1d0483d1324d231d57e799fc",
+                "client_sha256": "dc216c57e609072193f2a1094d150f77d4d01cfc98a25af68be491bf6866aab0"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "p4-batching": {
+      "label": "4. Blocking batches",
+      "note": "Experiment; not retained",
+      "tuning": {
+        "read_pipeline_window": 4,
+        "blocking_batching": true,
+        "typed_payload_dispatch": false
+      },
+      "source_commit": "a6baa364c3e9c888bcb1e87d3017f15ecec2462a",
+      "profiles": {
+        "1gbit": {
+          "median": {
+            "throughput_mb_s": 113.88676355979018,
+            "p99_ms": 178.561531,
+            "cpu_s_gib": 2.6,
+            "client_cpu_s_gib": 1.36,
+            "server_cpu_s_gib": 1.24,
+            "sampled_peak_rss_mib": 197.11328125
+          },
+          "range": {
+            "throughput_mb_s": [
+              113.86376601246945,
+              113.89081353984994
+            ],
+            "p99_ms": [
+              114.345183,
+              222.398256
+            ],
+            "cpu_s_gib": [
+              2.55,
+              2.71
+            ],
+            "client_cpu_s_gib": [
+              1.34,
+              1.39
+            ],
+            "server_cpu_s_gib": [
+              1.21,
+              1.32
+            ],
+            "sampled_peak_rss_mib": [
+              196.96484375,
+              205.4921875
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 113.88676355979018,
+              "p99_ms": 178.561531,
+              "cpu_s_gib": 2.6,
+              "client_cpu_s_gib": 1.36,
+              "server_cpu_s_gib": 1.24,
+              "sampled_peak_rss_mib": 197.11328125,
+              "netem_drops_whole_run": 136,
+              "binaries": {
+                "server_sha256": "af72ba8ed0d9def30e27b5ae5475dafd83328c7cfe7ffce795244844286296e7",
+                "client_sha256": "9c130d04ae8568cde9189266c9952293461688fde0cfe6b4e80640d5c004004d"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 113.86376601246945,
+              "p99_ms": 222.398256,
+              "cpu_s_gib": 2.71,
+              "client_cpu_s_gib": 1.39,
+              "server_cpu_s_gib": 1.32,
+              "sampled_peak_rss_mib": 196.96484375,
+              "netem_drops_whole_run": 102,
+              "binaries": {
+                "server_sha256": "af72ba8ed0d9def30e27b5ae5475dafd83328c7cfe7ffce795244844286296e7",
+                "client_sha256": "9c130d04ae8568cde9189266c9952293461688fde0cfe6b4e80640d5c004004d"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 113.89081353984994,
+              "p99_ms": 114.345183,
+              "cpu_s_gib": 2.55,
+              "client_cpu_s_gib": 1.34,
+              "server_cpu_s_gib": 1.21,
+              "sampled_peak_rss_mib": 205.4921875,
+              "netem_drops_whole_run": 125,
+              "binaries": {
+                "server_sha256": "af72ba8ed0d9def30e27b5ae5475dafd83328c7cfe7ffce795244844286296e7",
+                "client_sha256": "9c130d04ae8568cde9189266c9952293461688fde0cfe6b4e80640d5c004004d"
+              }
+            }
+          ]
+        },
+        "10gbit": {
+          "median": {
+            "throughput_mb_s": 933.2936587576379,
+            "p99_ms": 12.842038,
+            "cpu_s_gib": 4.08,
+            "client_cpu_s_gib": 1.77,
+            "server_cpu_s_gib": 2.31,
+            "sampled_peak_rss_mib": 215.1796875
+          },
+          "range": {
+            "throughput_mb_s": [
+              932.1097869255373,
+              939.7182759780694
+            ],
+            "p99_ms": [
+              11.90518,
+              13.105881
+            ],
+            "cpu_s_gib": [
+              4.05,
+              4.62
+            ],
+            "client_cpu_s_gib": [
+              1.76,
+              1.9
+            ],
+            "server_cpu_s_gib": [
+              2.29,
+              2.72
+            ],
+            "sampled_peak_rss_mib": [
+              202.8828125,
+              218.55078125
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 939.7182759780694,
+              "p99_ms": 12.842038,
+              "cpu_s_gib": 4.08,
+              "client_cpu_s_gib": 1.77,
+              "server_cpu_s_gib": 2.31,
+              "sampled_peak_rss_mib": 215.1796875,
+              "netem_drops_whole_run": 15,
+              "binaries": {
+                "server_sha256": "af72ba8ed0d9def30e27b5ae5475dafd83328c7cfe7ffce795244844286296e7",
+                "client_sha256": "9c130d04ae8568cde9189266c9952293461688fde0cfe6b4e80640d5c004004d"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 933.2936587576379,
+              "p99_ms": 13.105881,
+              "cpu_s_gib": 4.62,
+              "client_cpu_s_gib": 1.9,
+              "server_cpu_s_gib": 2.72,
+              "sampled_peak_rss_mib": 218.55078125,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "af72ba8ed0d9def30e27b5ae5475dafd83328c7cfe7ffce795244844286296e7",
+                "client_sha256": "9c130d04ae8568cde9189266c9952293461688fde0cfe6b4e80640d5c004004d"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 932.1097869255373,
+              "p99_ms": 11.90518,
+              "cpu_s_gib": 4.05,
+              "client_cpu_s_gib": 1.76,
+              "server_cpu_s_gib": 2.29,
+              "sampled_peak_rss_mib": 202.8828125,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "af72ba8ed0d9def30e27b5ae5475dafd83328c7cfe7ffce795244844286296e7",
+                "client_sha256": "9c130d04ae8568cde9189266c9952293461688fde0cfe6b4e80640d5c004004d"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "p5-typed-hotpath": {
+      "label": "5. Typed payload dispatch",
+      "note": "Typed running reads and ordinary writes; measured on top of P4",
+      "tuning": {
+        "read_pipeline_window": 4,
+        "blocking_batching": true,
+        "typed_payload_dispatch": true
+      },
+      "source_commit": "55d357ce2b17c420e9b5076250a0cd9493cbe75a",
+      "profiles": {
+        "1gbit": {
+          "median": {
+            "throughput_mb_s": 113.84194840174523,
+            "p99_ms": 141.220338,
+            "cpu_s_gib": 2.62,
+            "client_cpu_s_gib": 1.4,
+            "server_cpu_s_gib": 1.24,
+            "sampled_peak_rss_mib": 200.765625
+          },
+          "range": {
+            "throughput_mb_s": [
+              113.81302052197645,
+              113.85202999181328
+            ],
+            "p99_ms": [
+              115.354674,
+              202.13374
+            ],
+            "cpu_s_gib": [
+              2.59,
+              2.6399999999999997
+            ],
+            "client_cpu_s_gib": [
+              1.34,
+              1.4
+            ],
+            "server_cpu_s_gib": [
+              1.22,
+              1.25
+            ],
+            "sampled_peak_rss_mib": [
+              197.3671875,
+              207.0234375
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 113.85202999181328,
+              "p99_ms": 115.354674,
+              "cpu_s_gib": 2.6399999999999997,
+              "client_cpu_s_gib": 1.4,
+              "server_cpu_s_gib": 1.24,
+              "sampled_peak_rss_mib": 207.0234375,
+              "netem_drops_whole_run": 58,
+              "binaries": {
+                "server_sha256": "84231a89fc2d988c9dc1b86ae8bacae92862c9886e2ee505f243e243db2247bc",
+                "client_sha256": "1c969328dbd0c64a5b9c31fcd3d4493829af2f572b232725bb3c78f26a3a9e91"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 113.81302052197645,
+              "p99_ms": 141.220338,
+              "cpu_s_gib": 2.62,
+              "client_cpu_s_gib": 1.4,
+              "server_cpu_s_gib": 1.22,
+              "sampled_peak_rss_mib": 197.3671875,
+              "netem_drops_whole_run": 74,
+              "binaries": {
+                "server_sha256": "84231a89fc2d988c9dc1b86ae8bacae92862c9886e2ee505f243e243db2247bc",
+                "client_sha256": "1c969328dbd0c64a5b9c31fcd3d4493829af2f572b232725bb3c78f26a3a9e91"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 113.84194840174523,
+              "p99_ms": 202.13374,
+              "cpu_s_gib": 2.59,
+              "client_cpu_s_gib": 1.34,
+              "server_cpu_s_gib": 1.25,
+              "sampled_peak_rss_mib": 200.765625,
+              "netem_drops_whole_run": 73,
+              "binaries": {
+                "server_sha256": "84231a89fc2d988c9dc1b86ae8bacae92862c9886e2ee505f243e243db2247bc",
+                "client_sha256": "1c969328dbd0c64a5b9c31fcd3d4493829af2f572b232725bb3c78f26a3a9e91"
+              }
+            }
+          ]
+        },
+        "10gbit": {
+          "median": {
+            "throughput_mb_s": 1064.2304737938707,
+            "p99_ms": 13.214705,
+            "cpu_s_gib": 3.79,
+            "client_cpu_s_gib": 1.71,
+            "server_cpu_s_gib": 2.09,
+            "sampled_peak_rss_mib": 215.72265625
+          },
+          "range": {
+            "throughput_mb_s": [
+              1017.2726990847248,
+              1086.8462124503756
+            ],
+            "p99_ms": [
+              12.153356,
+              13.68207
+            ],
+            "cpu_s_gib": [
+              3.67,
+              4.17
+            ],
+            "client_cpu_s_gib": [
+              1.7,
+              1.8
+            ],
+            "server_cpu_s_gib": [
+              1.96,
+              2.37
+            ],
+            "sampled_peak_rss_mib": [
+              214.23046875,
+              220.375
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 1064.2304737938707,
+              "p99_ms": 13.214705,
+              "cpu_s_gib": 3.79,
+              "client_cpu_s_gib": 1.7,
+              "server_cpu_s_gib": 2.09,
+              "sampled_peak_rss_mib": 215.72265625,
+              "netem_drops_whole_run": 4,
+              "binaries": {
+                "server_sha256": "84231a89fc2d988c9dc1b86ae8bacae92862c9886e2ee505f243e243db2247bc",
+                "client_sha256": "1c969328dbd0c64a5b9c31fcd3d4493829af2f572b232725bb3c78f26a3a9e91"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 1086.8462124503756,
+              "p99_ms": 13.68207,
+              "cpu_s_gib": 3.67,
+              "client_cpu_s_gib": 1.71,
+              "server_cpu_s_gib": 1.96,
+              "sampled_peak_rss_mib": 220.375,
+              "netem_drops_whole_run": 28,
+              "binaries": {
+                "server_sha256": "84231a89fc2d988c9dc1b86ae8bacae92862c9886e2ee505f243e243db2247bc",
+                "client_sha256": "1c969328dbd0c64a5b9c31fcd3d4493829af2f572b232725bb3c78f26a3a9e91"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 1017.2726990847248,
+              "p99_ms": 12.153356,
+              "cpu_s_gib": 4.17,
+              "client_cpu_s_gib": 1.8,
+              "server_cpu_s_gib": 2.37,
+              "sampled_peak_rss_mib": 214.23046875,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "84231a89fc2d988c9dc1b86ae8bacae92862c9886e2ee505f243e243db2247bc",
+                "client_sha256": "1c969328dbd0c64a5b9c31fcd3d4493829af2f572b232725bb3c78f26a3a9e91"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "p6-retained": {
+      "label": "Final retained defaults",
+      "note": "P1 + P2 + P5, no P4 batching, read window = 1",
+      "tuning": {
+        "read_pipeline_window": 1,
+        "blocking_batching": false,
+        "typed_payload_dispatch": true
+      },
+      "source_commit": "16bb16bb1f61e3261a0749579b3a11f014901ef7",
+      "profiles": {
+        "1gbit": {
+          "median": {
+            "throughput_mb_s": 118.62850265979489,
+            "p99_ms": 74.628754,
+            "cpu_s_gib": 3.2,
+            "client_cpu_s_gib": 1.64,
+            "server_cpu_s_gib": 1.55,
+            "sampled_peak_rss_mib": 148.5
+          },
+          "range": {
+            "throughput_mb_s": [
+              117.26111135284404,
+              118.77530428745386
+            ],
+            "p99_ms": [
+              68.647252,
+              85.257886
+            ],
+            "cpu_s_gib": [
+              3.16,
+              3.2
+            ],
+            "client_cpu_s_gib": [
+              1.61,
+              1.68
+            ],
+            "server_cpu_s_gib": [
+              1.52,
+              1.56
+            ],
+            "sampled_peak_rss_mib": [
+              147.01953125,
+              150.86328125
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 118.62850265979489,
+              "p99_ms": 74.628754,
+              "cpu_s_gib": 3.2,
+              "client_cpu_s_gib": 1.64,
+              "server_cpu_s_gib": 1.56,
+              "sampled_peak_rss_mib": 148.5,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "de835e6d34f60124b79675d1736b8bc18a0080b3d9590093ce74fa23b3785216",
+                "client_sha256": "d58eb0e82abab37180ab4b48b9b469bfcac100c9ad1d48129fc61f782020a9eb"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 118.77530428745386,
+              "p99_ms": 85.257886,
+              "cpu_s_gib": 3.16,
+              "client_cpu_s_gib": 1.61,
+              "server_cpu_s_gib": 1.55,
+              "sampled_peak_rss_mib": 150.86328125,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "de835e6d34f60124b79675d1736b8bc18a0080b3d9590093ce74fa23b3785216",
+                "client_sha256": "d58eb0e82abab37180ab4b48b9b469bfcac100c9ad1d48129fc61f782020a9eb"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 117.26111135284404,
+              "p99_ms": 68.647252,
+              "cpu_s_gib": 3.2,
+              "client_cpu_s_gib": 1.68,
+              "server_cpu_s_gib": 1.52,
+              "sampled_peak_rss_mib": 147.01953125,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "de835e6d34f60124b79675d1736b8bc18a0080b3d9590093ce74fa23b3785216",
+                "client_sha256": "d58eb0e82abab37180ab4b48b9b469bfcac100c9ad1d48129fc61f782020a9eb"
+              }
+            }
+          ]
+        },
+        "10gbit": {
+          "median": {
+            "throughput_mb_s": 652.4171578066504,
+            "p99_ms": 9.476956,
+            "cpu_s_gib": 4.09,
+            "client_cpu_s_gib": 1.82,
+            "server_cpu_s_gib": 2.27,
+            "sampled_peak_rss_mib": 152.5
+          },
+          "range": {
+            "throughput_mb_s": [
+              641.2858121457572,
+              713.5530944297072
+            ],
+            "p99_ms": [
+              9.075575,
+              10.088708
+            ],
+            "cpu_s_gib": [
+              4.0200000000000005,
+              4.21
+            ],
+            "client_cpu_s_gib": [
+              1.8,
+              1.94
+            ],
+            "server_cpu_s_gib": [
+              2.22,
+              2.27
+            ],
+            "sampled_peak_rss_mib": [
+              151.5546875,
+              153.24609375
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 713.5530944297072,
+              "p99_ms": 9.476956,
+              "cpu_s_gib": 4.09,
+              "client_cpu_s_gib": 1.82,
+              "server_cpu_s_gib": 2.27,
+              "sampled_peak_rss_mib": 153.24609375,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "de835e6d34f60124b79675d1736b8bc18a0080b3d9590093ce74fa23b3785216",
+                "client_sha256": "d58eb0e82abab37180ab4b48b9b469bfcac100c9ad1d48129fc61f782020a9eb"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 652.4171578066504,
+              "p99_ms": 9.075575,
+              "cpu_s_gib": 4.0200000000000005,
+              "client_cpu_s_gib": 1.8,
+              "server_cpu_s_gib": 2.22,
+              "sampled_peak_rss_mib": 152.5,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "de835e6d34f60124b79675d1736b8bc18a0080b3d9590093ce74fa23b3785216",
+                "client_sha256": "d58eb0e82abab37180ab4b48b9b469bfcac100c9ad1d48129fc61f782020a9eb"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 641.2858121457572,
+              "p99_ms": 10.088708,
+              "cpu_s_gib": 4.21,
+              "client_cpu_s_gib": 1.94,
+              "server_cpu_s_gib": 2.27,
+              "sampled_peak_rss_mib": 151.5546875,
+              "netem_drops_whole_run": 0,
+              "binaries": {
+                "server_sha256": "de835e6d34f60124b79675d1736b8bc18a0080b3d9590093ce74fa23b3785216",
+                "client_sha256": "d58eb0e82abab37180ab4b48b9b469bfcac100c9ad1d48129fc61f782020a9eb"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "p7-final-opt-in": {
+      "label": "Final, opt-in read window = 4",
+      "note": "Same retained source and binaries as P6; read window set to four in configuration",
+      "tuning": {
+        "read_pipeline_window": 4,
+        "blocking_batching": false,
+        "typed_payload_dispatch": true
+      },
+      "source_commit": "16bb16bb1f61e3261a0749579b3a11f014901ef7",
+      "profiles": {
+        "1gbit": {
+          "median": {
+            "throughput_mb_s": 113.88455191853025,
+            "p99_ms": 184.890272,
+            "cpu_s_gib": 2.8200000000000003,
+            "client_cpu_s_gib": 1.47,
+            "server_cpu_s_gib": 1.3,
+            "sampled_peak_rss_mib": 197.6171875
+          },
+          "range": {
+            "throughput_mb_s": [
+              113.8562229928789,
+              113.89788414023892
+            ],
+            "p99_ms": [
+              168.119657,
+              186.867134
+            ],
+            "cpu_s_gib": [
+              2.66,
+              2.87
+            ],
+            "client_cpu_s_gib": [
+              1.39,
+              1.52
+            ],
+            "server_cpu_s_gib": [
+              1.27,
+              1.4
+            ],
+            "sampled_peak_rss_mib": [
+              180.171875,
+              199.66015625
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 113.8562229928789,
+              "p99_ms": 184.890272,
+              "cpu_s_gib": 2.87,
+              "client_cpu_s_gib": 1.47,
+              "server_cpu_s_gib": 1.4,
+              "sampled_peak_rss_mib": 197.6171875,
+              "netem_drops_whole_run": 87,
+              "binaries": {
+                "server_sha256": "de835e6d34f60124b79675d1736b8bc18a0080b3d9590093ce74fa23b3785216",
+                "client_sha256": "d58eb0e82abab37180ab4b48b9b469bfcac100c9ad1d48129fc61f782020a9eb"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 113.89788414023892,
+              "p99_ms": 186.867134,
+              "cpu_s_gib": 2.8200000000000003,
+              "client_cpu_s_gib": 1.52,
+              "server_cpu_s_gib": 1.3,
+              "sampled_peak_rss_mib": 180.171875,
+              "netem_drops_whole_run": 92,
+              "binaries": {
+                "server_sha256": "de835e6d34f60124b79675d1736b8bc18a0080b3d9590093ce74fa23b3785216",
+                "client_sha256": "d58eb0e82abab37180ab4b48b9b469bfcac100c9ad1d48129fc61f782020a9eb"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 113.88455191853025,
+              "p99_ms": 168.119657,
+              "cpu_s_gib": 2.66,
+              "client_cpu_s_gib": 1.39,
+              "server_cpu_s_gib": 1.27,
+              "sampled_peak_rss_mib": 199.66015625,
+              "netem_drops_whole_run": 66,
+              "binaries": {
+                "server_sha256": "de835e6d34f60124b79675d1736b8bc18a0080b3d9590093ce74fa23b3785216",
+                "client_sha256": "d58eb0e82abab37180ab4b48b9b469bfcac100c9ad1d48129fc61f782020a9eb"
+              }
+            }
+          ]
+        },
+        "10gbit": {
+          "median": {
+            "throughput_mb_s": 1070.10215722946,
+            "p99_ms": 12.675883,
+            "cpu_s_gib": 3.6799999999999997,
+            "client_cpu_s_gib": 1.69,
+            "server_cpu_s_gib": 1.99,
+            "sampled_peak_rss_mib": 212.9921875
+          },
+          "range": {
+            "throughput_mb_s": [
+              894.02372697839,
+              1081.9603929811642
+            ],
+            "p99_ms": [
+              12.16592,
+              15.58313
+            ],
+            "cpu_s_gib": [
+              3.32,
+              4.1
+            ],
+            "client_cpu_s_gib": [
+              1.65,
+              1.78
+            ],
+            "server_cpu_s_gib": [
+              1.67,
+              2.32
+            ],
+            "sampled_peak_rss_mib": [
+              210.078125,
+              219.89453125
+            ]
+          },
+          "runs": [
+            {
+              "iteration": 1,
+              "throughput_mb_s": 1081.9603929811642,
+              "p99_ms": 15.58313,
+              "cpu_s_gib": 3.6799999999999997,
+              "client_cpu_s_gib": 1.69,
+              "server_cpu_s_gib": 1.99,
+              "sampled_peak_rss_mib": 212.9921875,
+              "netem_drops_whole_run": 29,
+              "binaries": {
+                "server_sha256": "de835e6d34f60124b79675d1736b8bc18a0080b3d9590093ce74fa23b3785216",
+                "client_sha256": "d58eb0e82abab37180ab4b48b9b469bfcac100c9ad1d48129fc61f782020a9eb"
+              }
+            },
+            {
+              "iteration": 2,
+              "throughput_mb_s": 894.02372697839,
+              "p99_ms": 12.675883,
+              "cpu_s_gib": 4.1,
+              "client_cpu_s_gib": 1.78,
+              "server_cpu_s_gib": 2.32,
+              "sampled_peak_rss_mib": 219.89453125,
+              "netem_drops_whole_run": 6,
+              "binaries": {
+                "server_sha256": "de835e6d34f60124b79675d1736b8bc18a0080b3d9590093ce74fa23b3785216",
+                "client_sha256": "d58eb0e82abab37180ab4b48b9b469bfcac100c9ad1d48129fc61f782020a9eb"
+              }
+            },
+            {
+              "iteration": 3,
+              "throughput_mb_s": 1070.10215722946,
+              "p99_ms": 12.16592,
+              "cpu_s_gib": 3.32,
+              "client_cpu_s_gib": 1.65,
+              "server_cpu_s_gib": 1.67,
+              "sampled_peak_rss_mib": 210.078125,
+              "netem_drops_whole_run": 89,
+              "binaries": {
+                "server_sha256": "de835e6d34f60124b79675d1736b8bc18a0080b3d9590093ce74fa23b3785216",
+                "client_sha256": "d58eb0e82abab37180ab4b48b9b469bfcac100c9ad1d48129fc61f782020a9eb"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

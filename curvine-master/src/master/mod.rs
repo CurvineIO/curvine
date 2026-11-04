@@ -32,6 +32,9 @@ pub use self::master_server::*;
 mod master_handler;
 pub use self::master_handler::*;
 
+mod grpc_handler;
+pub(crate) use self::grpc_handler::MasterGrpcHandler;
+
 pub mod fs;
 
 pub mod journal;

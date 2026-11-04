@@ -216,7 +216,7 @@ fn leader_promotion_advances_over_committed_configuration_entry() -> CommonResul
         term: 1,
         index: 1,
         entry_type: EntryType::EntryConfChange as i32,
-        data: ConfChange::default().encode_to_vec(),
+        data: curvine_raft::proto::eraftpb::ConfChange::from(ConfChange::default()).encode_to_vec(),
         ..Default::default()
     })?;
 

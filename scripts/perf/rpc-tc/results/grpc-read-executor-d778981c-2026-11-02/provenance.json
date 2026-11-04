@@ -1,0 +1,93 @@
+{
+  "generated_utc": "2026-11-02T19:01:56.942504+00:00",
+  "workload_sha256": "3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac",
+  "builds": {
+    "orpc": {
+      "revision": "503ed7f87c2468a2012d621b647f473ed2ef9dab",
+      "transport": "orpc",
+      "binary_sha256": {
+        "server": "6b2bb860b29166c9cfb17edd467461b9c17b91feea2cc143dcd0c7a3fd4106b2",
+        "client": "5e1bbc7be19c24bb3b847b96ff17f3be180de341354a8ebfcb1e80f89302b149"
+      },
+      "server_version": {
+        "component": "server",
+        "release_version": "0.2.2",
+        "git_commit": "503ed7f8",
+        "git_tag": "",
+        "git_branch": "",
+        "protocol_version": 1,
+        "min_protocol_version": 1,
+        "capabilities": []
+      },
+      "manifest_read_window": null
+    },
+    "previous": {
+      "revision": "0eeb5054f92afe1457318525d109bc3e323b2312",
+      "transport": "grpc",
+      "binary_sha256": {
+        "server": "729082778a6a7593ab86208cb5bd87ea9a6d74f69724a179c2874863cb2a5da1",
+        "client": "82a554806a23dbe8fee5df1ab39bb26e242a1d83adc95221a1ef8e80fa9d7499"
+      },
+      "server_version": {
+        "component": "server",
+        "release_version": "0.2.2",
+        "git_commit": "0eeb5054",
+        "git_tag": "",
+        "git_branch": "",
+        "protocol_version": 1,
+        "min_protocol_version": 1,
+        "capabilities": []
+      },
+      "manifest_read_window": null
+    },
+    "grpc": {
+      "revision": "d778981c99ecb203e4e0ce03223d3f059c439de0",
+      "transport": "grpc",
+      "binary_sha256": {
+        "server": "49ff23fa7f7f8b564fd3dda4fe6012939cd41d91f1f84da8d3b99b616115e580",
+        "client": "7e6a1a92d5732c410aae69e266359b86e5cee9562f5aab03018b86825b42de7a"
+      },
+      "server_version": {
+        "component": "server",
+        "release_version": "0.2.2",
+        "git_commit": "d778981c",
+        "git_tag": "",
+        "git_branch": "",
+        "protocol_version": 1,
+        "min_protocol_version": 1,
+        "capabilities": []
+      },
+      "manifest_read_window": null
+    }
+  },
+  "settings": {
+    "file_bytes": 67108864,
+    "chunk_bytes": 1048576,
+    "reads": 1024,
+    "warmup_reads": 16,
+    "concurrency": 4,
+    "delay_per_direction": "1ms",
+    "repetitions": 5,
+    "read_window": {
+      "orpc": "compiled default",
+      "previous": "compiled default",
+      "grpc": "compiled default"
+    }
+  },
+  "executed_script_sha256": {
+    "run-experiment.py": "ba045f36e0be600fa53e70a53a4f423edb2cc591d63e624a1cb383f770d53192",
+    "build-checkpoint.sh": "24b38afcebf0934707f9cab190be4ab3ab0e5eeb0cec265976205a276de6ee71",
+    "env.sh": "1f699e5a89795c7bfa91a0261ce86d769980e163eac3ed48729f3cd20cb6a210",
+    "harness/bench.sh": "4f15e71513065111a40ad8659ee31f52c7bf26376cc852ecff5ae11c4d0a492f",
+    "harness/run.sh": "92aa1bc72522b60c25b9d75daddc1a021d7951c36cbb95491fb6cdeeef608cea",
+    "harness/measure.py": "adbbba36af1f1af8a4ac1e776e49fec21116ce610a28e36e6f842d551d4721e3",
+    "harness/server.sh": "ca720951f268fded1204aa15e03a88e2aa13c12717b382bcf667640d282135bc",
+    "harness/compare.py": "62381e6e6e2d3840c8a4ee502929dcec554ed543fb8430cb510b670ec52355dc"
+  },
+  "matched_control_build_metadata": "baseline_revision=503ed7f87c2468a2012d621b647f473ed2ef9dab\ncandidate_revision=0eeb5054f92afe1457318525d109bc3e323b2312\nworkload_sha256=3ae691331ef44d52c5441d3066ef2094af0f3ad375e746832aa588bd7f31f3ac\nRUSTFLAGS=-Cdebuginfo=line-tables-only -Clink-arg=-fuse-ld=mold\nCXXFLAGS=-include cstdint -g1\nRUSTC_WRAPPER=/usr/bin/sccache\nCARGO_PROFILE_RELEASE_DEBUG=line-tables-only\nCARGO_PROFILE_RELEASE_STRIP=none\nrustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8\ncargo 1.98.1 (797e8a9bc 2026-08-05)\nmold 2.40.4 (compatible with GNU ld)\ngcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0\nLinux 7.0.0-38-generic\n",
+  "candidate_build_environment": "export RUSTC_WRAPPER=/usr/bin/sccache CC=/usr/bin/gcc CXX=/usr/bin/g++\nexport CXXFLAGS='-include cstdint -g1' LIBCLANG_PATH=/usr/lib/llvm-21/lib\nexport CARGO_BUILD_JOBS=6 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=\"$out/target\"\nexport RUSTFLAGS='-Cdebuginfo=line-tables-only -Clink-arg=-fuse-ld=mold'\nexport CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=none\nRPC_TC_SOURCE_SHA256=$(sha256sum crates/client/curvine-client-core/examples/rpc_tc_read.rs | cut -d' ' -f1)\nexport RPC_TC_SOURCE_SHA256\n",
+  "candidate_recorded_source_status": {
+    "clean": true,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

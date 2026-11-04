@@ -14,13 +14,14 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use crate::block::grpc_block_client::GrpcBlockClient;
 use crate::block::{
     BlockClientPool, BlockReadContext, CreateBatchBlockContext, CreateBlockContext,
 };
 use crate::file::FsContext;
 use curvine_config::ClientConf;
+use curvine_core_error::CommonResult;
 use curvine_core_error::ErrorExt;
-use curvine_core_error::{try_option_ref, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
@@ -33,17 +34,18 @@ use curvine_proto::{
     BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse,
     ComponentInfoProto, DataHeaderProto, FileWriteData, FilesBatchWriteRequest,
 };
-use curvine_rpc::client::RpcClient;
 use curvine_rpc::message::{Builder, Message, RequestStatus};
 use curvine_runtime::common::LocalTime;
+use curvine_runtime::runtime::Runtime;
 use std::sync::Arc;
-use std::time::Duration;
 
 pub struct BlockClient {
     replication_token: Option<(i64, String)>,
-    client: Option<RpcClient>,
+    client: Option<GrpcBlockClient>,
+    // Keep the channel's executor alive while a block client is checked out.
+    _runtime: Arc<Runtime>,
+    write_pipeline_window: usize,
     client_name: String,
-    timeout: Duration,
     pool: Option<Arc<BlockClientPool>>,
     worker_addr: WorkerAddress,
     uptime: u64,
@@ -55,12 +57,17 @@ pub struct BlockClient {
 }
 
 impl BlockClient {
-    pub fn new(client: RpcClient, worker_addr: WorkerAddress, context: &FsContext) -> Self {
+    pub(crate) fn new_grpc(
+        client: GrpcBlockClient,
+        worker_addr: WorkerAddress,
+        context: &FsContext,
+    ) -> Self {
         Self {
             replication_token: None,
             client: Some(client),
+            _runtime: context.clone_runtime(),
+            write_pipeline_window: context.conf.client.write_pipeline_window,
             client_name: context.clone_client_name(),
-            timeout: Duration::from_millis(context.conf.client.data_timeout_ms),
             pool: None,
             worker_addr,
             uptime: LocalTime::mills(),
@@ -96,9 +103,7 @@ impl BlockClient {
     }
 
     pub fn is_active(&self) -> bool {
-        self.client
-            .as_ref()
-            .is_some_and(|client| client.is_active())
+        self.client.is_some()
     }
 
     pub fn with_replication_token(mut self, block_id: i64, token: String) -> Self {
@@ -106,33 +111,24 @@ impl BlockClient {
         self
     }
 
-    pub async fn rpc(&self, mut msg: Message) -> FsResult<Message> {
-        if let Some((block_id, token)) = &self.replication_token {
-            if RpcCode::from(msg.code()) == RpcCode::WriteBlock {
-                let envelope = curvine_proto::ReplicationWriteRequest {
-                    block_id: *block_id,
-                    token: token.clone(),
-                    header: msg.header.take().map(|h| h.to_vec()).unwrap_or_default(),
-                };
-                msg.protocol.code = RpcCode::WriteReplicationBlock.into();
-                msg = Builder::protocol(msg.protocol)
-                    .proto_header(envelope)
-                    .data(msg.data)
-                    .build();
-            }
-        }
-        let client = try_option_ref!(self.client);
-        let rep_msg = match client.timeout_rpc(self.timeout, msg).await {
-            Ok(rep_msg) => rep_msg,
-            Err(err) => {
-                client.set_closed();
-                return Err(FsError::from(err));
-            }
-        };
-        match rep_msg.check_error_ext::<FsError>() {
-            Ok(_) => Ok(rep_msg),
-            Err(e) => Err(e.ctx(format!("rpc failed to worker {}", self.worker_addr))),
-        }
+    pub async fn rpc(&self, msg: Message) -> FsResult<Message> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| FsError::common("block client closed"))?;
+        let response = client
+            .rpc(
+                msg,
+                self.replication_token
+                    .as_ref()
+                    .map(|(_, token)| token.as_str()),
+            )
+            .await
+            .map_err(|error| error.ctx(format!("rpc failed to worker {}", self.worker_addr)))?;
+        response
+            .check_error_ext::<FsError>()
+            .map_err(|error| error.ctx(format!("rpc failed to worker {}", self.worker_addr)))?;
+        Ok(response)
     }
 
     pub async fn write_block(
@@ -189,7 +185,7 @@ impl BlockClient {
         req_id: i64,
         seq_id: i32,
         header: Option<DataHeaderProto>,
-    ) -> CommonResult<()> {
+    ) -> FsResult<()> {
         let mut builder = Builder::new()
             .code(RpcCode::WriteBlock)
             .request(RequestStatus::Running)
@@ -202,11 +198,35 @@ impl BlockClient {
         }
 
         let msg = builder.build();
-        let _ = self.rpc(msg).await?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| FsError::common("block client closed"))?;
+        client
+            .write_pipelined(
+                msg,
+                self.replication_token
+                    .as_ref()
+                    .map(|(_, token)| token.as_str()),
+                self.write_pipeline_window,
+            )
+            .await
+            .map_err(|error| error.ctx(format!("rpc failed to worker {}", self.worker_addr)))?;
         Ok(())
     }
 
-    pub async fn write_flush(&self, pos: i64, req_id: i64, seq_id: i32) -> CommonResult<()> {
+    pub(crate) async fn drain_writes(&self) -> FsResult<()> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| FsError::common("block client closed"))?;
+        client
+            .drain_writes()
+            .await
+            .map_err(|error| error.ctx(format!("rpc failed to worker {}", self.worker_addr)))
+    }
+
+    pub async fn write_flush(&self, pos: i64, req_id: i64, seq_id: i32) -> FsResult<()> {
         let header = DataHeaderProto {
             offset: pos,
             flush: true,
@@ -478,13 +498,18 @@ impl BlockClient {
 
 impl Drop for BlockClient {
     fn drop(&mut self) {
+        if let Some(client) = &self.client {
+            client.reset();
+        }
         if let Some(pool) = self.pool.take() {
-            if let Some(moved_client) = self.client.take() {
+            let moved_client = self.client.take();
+            if moved_client.is_some() {
                 let client = BlockClient {
                     replication_token: None,
-                    client: Some(moved_client),
+                    client: moved_client,
+                    _runtime: self._runtime.clone(),
+                    write_pipeline_window: self.write_pipeline_window,
                     client_name: std::mem::take(&mut self.client_name),
-                    timeout: self.timeout,
                     pool: Some(pool.clone()),
                     worker_addr: std::mem::take(&mut self.worker_addr),
                     uptime: self.uptime,
