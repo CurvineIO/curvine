@@ -116,10 +116,42 @@ impl MountManager {
         let Some(existing) = self.get_mount_info(&path)? else {
             return err_box!("mount point {} not found for update", cv_path);
         };
-        let mut merged = existing.merge_with(mnt_opt.clone());
+        let update = Self::canonicalize_update_options(&existing.ufs_path, mnt_opt)?;
+        let mut merged = existing.merge_with(update);
         Self::normalize_mount_config(&mut merged)?;
 
         self.mount_table.update_mount(merged)
+    }
+
+    /// Canonicalize the incoming property spellings before they are merged into the stored mount.
+    ///
+    /// A stored `MountInfo` already holds canonical keys, so an update that names a key by a legacy
+    /// alias — for example rotating a session token through `s3.session_token`, or a role ARN
+    /// through `s3.role_arn` — would otherwise leave the old canonical key and the new alias side by
+    /// side, and normalization would reject the pair as a conflict although the caller supplied
+    /// only one spelling. Conflicts *within* the update are still detected by
+    /// `canonicalize_properties`.
+    fn canonicalize_update_options(
+        ufs_path: &str,
+        mnt_opt: &MountOptions,
+    ) -> FsResult<MountOptions> {
+        let path = Path::from_str(ufs_path)?;
+        if !matches!(path.scheme(), Some("s3" | "s3a")) {
+            return Ok(mnt_opt.clone());
+        }
+
+        let mut update = mnt_opt.clone();
+        let properties = std::mem::take(&mut update.add_properties);
+        update.add_properties = S3Conf::canonicalize_properties(properties).map_err(|err| {
+            FsError::common(format!("Invalid mount update for {}: {}", ufs_path, err))
+        })?;
+        update.remove_properties = update
+            .remove_properties
+            .iter()
+            .map(|key| S3Conf::canonical_key(key).to_string())
+            .collect();
+
+        Ok(update)
     }
 
     /// same baseuri of ufs can only mount once

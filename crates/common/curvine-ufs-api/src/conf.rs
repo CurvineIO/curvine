@@ -214,12 +214,76 @@ impl S3Conf {
     pub const CONNECT_TIMEOUT: &'static str = "s3.connect_timeout";
     pub const READ_TIMEOUT: &'static str = "s3.read_timeout";
 
+    /// Canonical credential keys. Everything else under `s3.credentials.` is rejected: a typo, or
+    /// a field the caller expected to be used, must not be dropped on the floor (a silently ignored
+    /// `..._token` looks exactly like "STS is configured").
+    pub const SUPPORTED_CREDENTIAL_KEYS: [&'static str; 9] = [
+        Self::CRED_TYPE,
+        Self::ACCESS_KEY,
+        Self::SECRET_KEY,
+        Self::CRED_TOKEN,
+        Self::CRED_ROLE_ARN,
+        Self::CRED_ROLE_SESSION_NAME,
+        Self::CRED_EXTERNAL_ID,
+        Self::CRED_DISABLE_CONFIG_LOAD,
+        Self::CRED_DISABLE_EC2_METADATA,
+    ];
+
     pub const DEFAULT_RETRY_TIMES: u32 = 3;
     pub const DEFAULT_CONNECT_TIMEOUT: &'static str = "30s";
     pub const DEFAULT_READ_TIMEOUT: &'static str = "120s";
 
+    /// Legacy property spellings and their canonical names.
+    const LEGACY_ALIASES: [(&'static str, &'static str); 8] = [
+        (Self::LEGACY_ACCESS_KEY, Self::ACCESS_KEY),
+        (Self::LEGACY_SECRET_KEY, Self::SECRET_KEY),
+        (Self::LEGACY_REGION_NAME, Self::REGION_NAME),
+        (Self::LEGACY_SESSION_TOKEN, Self::CRED_TOKEN),
+        (Self::LEGACY_SECURITY_TOKEN, Self::CRED_TOKEN),
+        (Self::LEGACY_ROLE_ARN, Self::CRED_ROLE_ARN),
+        (Self::LEGACY_ROLE_SESSION_NAME, Self::CRED_ROLE_SESSION_NAME),
+        (Self::LEGACY_EXTERNAL_ID, Self::CRED_EXTERNAL_ID),
+    ];
+
+    /// Map a legacy property spelling to its canonical name; unknown keys are returned unchanged.
+    ///
+    /// Callers that merge properties into an existing mount (or remove one of them) need this: the
+    /// stored mount holds canonical keys, so an update that names a key by an alias has to be
+    /// translated *before* the merge, otherwise both spellings coexist and look like a conflict.
+    pub fn canonical_key(key: &str) -> &str {
+        for (legacy, canonical) in Self::LEGACY_ALIASES {
+            if key == legacy {
+                return canonical;
+            }
+        }
+        key
+    }
+
     pub fn validate_region(properties: &HashMap<String, String>) -> CommonResult<()> {
         Self::required_property(properties, Self::REGION_NAME)
+    }
+
+    /// Reject any `s3.credentials.*` key the schema does not understand.
+    fn reject_unknown_credential_keys(properties: &HashMap<String, String>) -> CommonResult<()> {
+        const PREFIX: &str = "s3.credentials.";
+
+        for key in properties.keys() {
+            if !key.starts_with(PREFIX) {
+                continue;
+            }
+            if Self::SUPPORTED_CREDENTIAL_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+
+            let mut supported = Self::SUPPORTED_CREDENTIAL_KEYS.to_vec();
+            supported.sort_unstable();
+            return err_box!(
+                "{} is not a supported S3 credential key; supported keys: {}",
+                key,
+                supported.join(", ")
+            );
+        }
+        Ok(())
     }
 
     pub fn validate(properties: &HashMap<String, String>) -> CommonResult<()> {
@@ -233,16 +297,7 @@ impl S3Conf {
     pub fn canonicalize_properties(
         mut properties: HashMap<String, String>,
     ) -> CommonResult<HashMap<String, String>> {
-        for (legacy, canonical) in [
-            (Self::LEGACY_ACCESS_KEY, Self::ACCESS_KEY),
-            (Self::LEGACY_SECRET_KEY, Self::SECRET_KEY),
-            (Self::LEGACY_REGION_NAME, Self::REGION_NAME),
-            (Self::LEGACY_SESSION_TOKEN, Self::CRED_TOKEN),
-            (Self::LEGACY_SECURITY_TOKEN, Self::CRED_TOKEN),
-            (Self::LEGACY_ROLE_ARN, Self::CRED_ROLE_ARN),
-            (Self::LEGACY_ROLE_SESSION_NAME, Self::CRED_ROLE_SESSION_NAME),
-            (Self::LEGACY_EXTERNAL_ID, Self::CRED_EXTERNAL_ID),
-        ] {
+        for (legacy, canonical) in Self::LEGACY_ALIASES {
             let Some(value) = properties.remove(legacy) else {
                 continue;
             };
@@ -311,6 +366,7 @@ impl S3Conf {
     /// fixed IMDS address).
     pub fn credential_plan(properties: &HashMap<String, String>) -> CommonResult<S3CredentialPlan> {
         let properties = Self::canonicalize_properties(properties.clone())?;
+        Self::reject_unknown_credential_keys(&properties)?;
 
         let kind = match Self::optional_property(&properties, Self::CRED_TYPE) {
             Some(raw) => S3CredentialKind::parse(&raw)?,
@@ -1008,6 +1064,67 @@ mod s3_conf_tests {
             S3Conf::with_map(with(&[(S3Conf::CRED_TYPE, "auto")])).expect("auto mount must parse");
         assert_eq!(conf.credential.kind, S3CredentialKind::Auto);
         assert!(S3Conf::validate(&conf.properties).is_ok());
+    }
+
+    #[test]
+    fn static_without_a_key_pair_is_rejected() {
+        // Pins the backward-compat anchor: `static` must never silently fall back to the
+        // environment when the key pair is missing.
+        let err = S3Conf::credential_plan(&with(&[])).expect_err("no credential field must fail");
+        assert!(err.to_string().contains(S3Conf::ACCESS_KEY), "{err}");
+
+        let err = S3Conf::credential_plan(&with(&[(S3Conf::CRED_TYPE, "static")]))
+            .expect_err("explicit static without keys must fail");
+        assert!(err.to_string().contains(S3Conf::ACCESS_KEY), "{err}");
+    }
+
+    #[test]
+    fn rejects_unknown_credential_keys() {
+        // A token spelled outside the schema must not be accepted as `static` and dropped.
+        let err = S3Conf::credential_plan(&with(&[
+            (S3Conf::ACCESS_KEY, "ak"),
+            (S3Conf::SECRET_KEY, "sk"),
+            ("s3.credentials.session_token", "token"),
+        ]))
+        .expect_err("an unknown credential key must be rejected");
+        assert!(
+            err.to_string().contains("s3.credentials.session_token"),
+            "{err}"
+        );
+
+        // `auto` must not accept fields it does not understand either.
+        let err = S3Conf::credential_plan(&with(&[
+            (S3Conf::CRED_TYPE, "auto"),
+            ("s3.credentials.some_future_field", "x"),
+        ]))
+        .expect_err("auto with an unknown field must be rejected");
+        assert!(err.to_string().contains("some_future_field"), "{err}");
+
+        // A typo in a supported key is rejected too, instead of silently keeping the default.
+        let err = S3Conf::credential_plan(&with(&[
+            (S3Conf::CRED_TYPE, "auto"),
+            ("s3.credentials.disable_ec2_metadataa", "true"),
+        ]))
+        .expect_err("a typo in a supported key must be rejected");
+        assert!(err.to_string().contains("disable_ec2_metadataa"), "{err}");
+    }
+
+    #[test]
+    fn canonical_key_maps_legacy_spellings() {
+        assert_eq!(
+            S3Conf::canonical_key(S3Conf::LEGACY_SESSION_TOKEN),
+            S3Conf::CRED_TOKEN
+        );
+        assert_eq!(
+            S3Conf::canonical_key(S3Conf::LEGACY_SECURITY_TOKEN),
+            S3Conf::CRED_TOKEN
+        );
+        assert_eq!(
+            S3Conf::canonical_key(S3Conf::LEGACY_ROLE_ARN),
+            S3Conf::CRED_ROLE_ARN
+        );
+        assert_eq!(S3Conf::canonical_key(S3Conf::CRED_TYPE), S3Conf::CRED_TYPE);
+        assert_eq!(S3Conf::canonical_key("s3.other"), "s3.other");
     }
 
     #[test]

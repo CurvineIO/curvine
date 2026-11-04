@@ -3455,6 +3455,109 @@ fn test_reject_s3_mount_auto_with_static_credentials_before_persist() -> CommonR
 }
 
 #[test]
+fn test_s3_mount_update_rotates_session_token_through_legacy_alias() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (_fs, js, _loader, _js2, _fs2) = setup_pair("s3-mount-update-token-alias");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "sts")
+        .add_property("s3.credentials.access", "access-key")
+        .add_property("s3.credentials.secret", "secret-key")
+        .add_property("s3.credentials.token", "old-token")
+        .build();
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    // Rotating through the legacy spelling must overwrite the stored canonical key instead of
+    // colliding with it. The update names the key exactly once.
+    let update = MountOptions::builder()
+        .update(true)
+        .add_property("s3.session_token", "new-token")
+        .build();
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &update)?;
+
+    let properties = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("mount must still be stored")
+        .properties;
+    assert_eq!(
+        properties.get("s3.credentials.token").map(String::as_str),
+        Some("new-token")
+    );
+    assert!(!properties.contains_key("s3.session_token"));
+    assert_eq!(
+        properties.get("s3.credentials.type").map(String::as_str),
+        Some("sts")
+    );
+    Ok(())
+}
+
+#[test]
+fn test_s3_mount_update_rotates_role_arn_through_legacy_alias() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (_fs, js, _loader, _js2, _fs2) = setup_pair("s3-mount-update-role-alias");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "role")
+        .add_property("s3.credentials.role_arn", "arn:aws:iam::1:role/old")
+        .build();
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    let update = MountOptions::builder()
+        .update(true)
+        .add_property("s3.role_arn", "arn:aws:iam::1:role/new")
+        .build();
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &update)?;
+
+    let properties = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("mount must still be stored")
+        .properties;
+    assert_eq!(
+        properties
+            .get("s3.credentials.role_arn")
+            .map(String::as_str),
+        Some("arn:aws:iam::1:role/new")
+    );
+    assert!(!properties.contains_key("s3.role_arn"));
+    Ok(())
+}
+
+#[test]
+fn test_reject_s3_mount_static_without_credentials_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-s3-mount-static-without-keys");
+    let mnt_mgr = js.mount_manager();
+    let mount = Path::from_str("/mnt/s3")?;
+
+    for (index, credential_type) in [None, Some("static")].into_iter().enumerate() {
+        let mount_path = format!("/mnt/s3-{index}");
+        let mut builder = MountOptions::builder()
+            .add_property("s3.endpoint_url", "http://s3.example.com")
+            .add_property("s3.region_name", "cn-test-1");
+        if let Some(credential_type) = credential_type {
+            builder = builder.add_property("s3.credentials.type", credential_type);
+        }
+
+        let err = mnt_mgr
+            .mount(None, &mount_path, "s3://bucket/path", &builder.build())
+            .expect_err("a static mount without a key pair must be rejected");
+
+        assert!(err.to_string().contains("s3.credentials.access"));
+        assert!(mnt_mgr.get_mount_info(&mount)?.is_none());
+        assert!(!fs.exists(&mount_path)?);
+    }
+    Ok(())
+}
+
+#[test]
 fn test_inode_file_num_stays_non_negative_for_symlink_create_delete() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "inode-file-num-symlink");
