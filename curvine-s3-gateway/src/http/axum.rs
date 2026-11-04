@@ -385,6 +385,28 @@ pub async fn stream_get_object(
 
     let file_size = reader.remaining().max(0) as u64;
 
+    // Conditional request evaluation. S3 clients use If-Match / If-None-Match
+    // for optimistic concurrency and cache validation; ignoring them silently
+    // acknowledged writes against a stale ETag.
+    // Conditional request evaluation (If-Match / If-None-Match).
+    if let Some(status) = handlers
+        .evaluate_preconditions(
+            &cv_path,
+            req.get_header("if-match"),
+            req.get_header("if-none-match"),
+        )
+        .await
+    {
+        return axum::response::Response::builder()
+            .status(status)
+            .header(
+                "x-amz-request-id",
+                crate::utils::s3_utils::generate_request_id(),
+            )
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
+
     // `to_byte_range` clamps the end, validates the start and returns `None`
     // for a range that cannot be satisfied, so no subtraction below can
     // underflow (the previous arithmetic wrapped to ~2^64 in release builds).

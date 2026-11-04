@@ -846,6 +846,22 @@ pub async fn handle_put_object<
         write_offset_bytes: req
             .get_header("x-amz-write-offset-bytes")
             .and_then(|v| v.parse::<i64>().ok()),
+        metadata: {
+            // S3 user metadata travels as `x-amz-meta-<name>`; keep the name
+            // without the prefix so HEAD can emit it back unchanged.
+            let mut map = std::collections::HashMap::new();
+            req.rng_header(|k, v| {
+                if let Some(name) = k.strip_prefix("x-amz-meta-") {
+                    map.insert(name.to_string(), v.to_string());
+                }
+                true
+            });
+            if map.is_empty() {
+                None
+            } else {
+                Some(map)
+            }
+        },
     };
 
     enum ContentSha256 {

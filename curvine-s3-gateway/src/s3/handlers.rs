@@ -75,6 +75,100 @@ impl S3Handlers {
         }
     }
 
+    /// Evaluate `If-Match` / `If-None-Match` for one object.
+    ///
+    /// Returns the status a conditional GET must answer with (412 or 304), or
+    /// `None` when the request should be served normally. S3 clients rely on
+    /// these for optimistic concurrency and cache validation; ignoring them
+    /// silently served stale reads.
+    pub async fn evaluate_preconditions(
+        &self,
+        path: &Path,
+        if_match: Option<String>,
+        if_none_match: Option<String>,
+    ) -> Option<u16> {
+        if if_match.is_none() && if_none_match.is_none() {
+            return None;
+        }
+        let status = self.fs.get_status(path).await.ok()?;
+        let etag = crate::utils::s3_utils::generate_etag(&status);
+
+        let normalise = |value: &str| {
+            value
+                .trim()
+                .trim_start_matches("W/")
+                .trim_matches('"')
+                .to_ascii_lowercase()
+        };
+        let current = normalise(&etag);
+        let matches = |header: &str| {
+            header
+                .split(',')
+                .map(normalise)
+                .any(|part| part == "*" || part == current)
+        };
+
+        if if_match.as_deref().is_some_and(|h| !matches(h)) {
+            return Some(412);
+        }
+        if if_none_match.as_deref().is_some_and(matches) {
+            return Some(304);
+        }
+        None
+    }
+
+    /// Record the ETag of a completed multipart upload so HEAD and GET report
+    /// it back.
+    async fn store_multipart_metadata(
+        fs: &UnifiedFileSystem,
+        path: &Path,
+        etag: &str,
+    ) -> Result<(), String> {
+        use crate::utils::s3_utils::XATTR_S3_ETAG;
+        use curvine_model::SetAttrOptsBuilder;
+
+        let opts = SetAttrOptsBuilder::new()
+            .add_x_attr(XATTR_S3_ETAG, etag.trim_matches('"').as_bytes().to_vec())
+            .build();
+        fs.set_attr(path, opts)
+            .await
+            .map_err(|e| format!("Failed to store multipart etag for {path}: {e}"))
+    }
+
+    /// Record the S3 metadata a PUT carries in the object's extended
+    /// attributes.
+    ///
+    /// Extended attributes are the only per-object key/value store that
+    /// survives the commit, so ETag, Content-Type and user metadata live there
+    /// instead of being discarded after the response.
+    async fn store_s3_metadata(
+        fs: &UnifiedFileSystem,
+        path: &Path,
+        opt: &PutObjectOption,
+        md5: &str,
+    ) -> Result<(), String> {
+        use crate::utils::s3_utils::{XATTR_S3_CONTENT_TYPE, XATTR_S3_ETAG, XATTR_S3_META_PREFIX};
+        use curvine_model::SetAttrOptsBuilder;
+
+        let mut builder =
+            SetAttrOptsBuilder::new().add_x_attr(XATTR_S3_ETAG, md5.as_bytes().to_vec());
+        if let Some(content_type) = opt.content_type.as_deref() {
+            builder = builder.add_x_attr(XATTR_S3_CONTENT_TYPE, content_type.as_bytes().to_vec());
+        }
+        if let Some(metadata) = &opt.metadata {
+            for (name, value) in metadata {
+                builder = builder.add_x_attr(
+                    format!("{XATTR_S3_META_PREFIX}{name}"),
+                    value.as_bytes().to_vec(),
+                );
+            }
+        }
+
+        fs.set_attr(path, builder.build())
+            .await
+            .map_err(|e| format!("Failed to store S3 metadata for {path}: {e}"))
+    }
+
     #[inline]
     pub async fn handle_list_buckets(
         &self,
@@ -395,7 +489,7 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
 impl PutObjectHandler for S3Handlers {
     fn handle(
         &self,
-        _opt: PutObjectOption,
+        opt: PutObjectOption,
         bucket: String,
         object: String,
         mut body: crate::utils::io::PollReaderEnum,
@@ -411,15 +505,16 @@ impl PutObjectHandler for S3Handlers {
         );
 
         async move {
-            PutOperation::execute(context, &mut body).await?;
-            // The ETag mirrors what HEAD/GET report for the same object, so a
-            // client that validates the upload's ETag sees a consistent value.
+            let md5 = PutOperation::execute(context, &mut body).await?;
             let path = path.map_err(|e| e.to_string())?;
-            let status = fs
-                .get_status(&path)
-                .await
-                .map_err(|e| format!("Failed to read object status for ETag: {e}"))?;
-            Ok(crate::utils::s3_utils::generate_etag(&status))
+
+            // Persist the S3-visible metadata. Without it the ETag was not a
+            // content hash, and Content-Type plus every `x-amz-meta-*` entry
+            // were dropped on upload and lost to later HEAD/GET calls.
+            Self::store_s3_metadata(&fs, &path, &opt, &md5).await?;
+
+            // Report what HEAD/GET will report for the same object.
+            Ok(format!("\"{md5}\""))
         }
     }
 
@@ -606,10 +701,11 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
 
         // Stream each part directly to final file (memory-efficient)
         // This avoids loading entire parts into memory
-        for (etag, part_num) in part_list {
+        let mut part_etags: Vec<String> = Vec::with_capacity(part_list.len());
+        for (etag, part_num) in part_list.iter() {
             if let Err(e) = self
                 .temp_storage
-                .read_part_stream(&upload_id, part_num, &etag, &mut writer)
+                .read_part_stream(&upload_id, *part_num, etag, &mut writer)
                 .await
             {
                 tracing::error!(
@@ -622,6 +718,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                 let _ = self.temp_storage.cleanup(&upload_id).await;
                 return Err(());
             }
+            part_etags.push(etag.trim_matches('"').to_ascii_lowercase());
         }
 
         if let Err(e) = writer.complete().await {
@@ -640,14 +737,27 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             );
         }
 
+        // S3 multipart ETag: md5 of the concatenated part MD5s, plus `-N`.
+        // The response used to be the literal "etag-not-computed", so no client
+        // could validate a multipart upload.
+        let multipart_etag = multipart_etag(&part_etags);
+
+        // Record it, plus the content type carried by the create request, so
+        // HEAD/GET report the same value the client was given.
+        if let Err(e) = Self::store_multipart_metadata(&self.fs, &final_path, &multipart_etag).await
+        {
+            tracing::warn!("Failed to store multipart metadata for {final_path}: {e}");
+        }
+
         tracing::info!(
-            "Completed multipart upload for s3://{}/{} (upload_id: {})",
+            "Completed multipart upload for s3://{}/{} (upload_id: {}, parts: {})",
             bucket,
             key,
-            upload_id
+            upload_id,
+            part_etags.len()
         );
 
-        Ok("etag-not-computed".to_string())
+        Ok(multipart_etag)
     }
 
     async fn handle_abort(
@@ -837,5 +947,55 @@ impl ListObjectVersionsHandler for S3Handlers {
 
             Ok(result)
         }
+    }
+}
+
+/// S3 multipart ETag: `hex(md5(concat(part-md5-bytes)))-<part count>`.
+///
+/// Each part's ETag is already the hex MD5 of that part, so the digest is
+/// computed over the decoded bytes of those hex strings, exactly as S3 does.
+fn multipart_etag(part_etags: &[String]) -> String {
+    let mut ctx = md5::Context::new();
+    for etag in part_etags {
+        match hex::decode(etag) {
+            Ok(bytes) => ctx.consume(&bytes),
+            // A part ETag that is not a hex MD5 cannot be part of a spec ETag;
+            // hashing its text keeps the value deterministic.
+            Err(_) => ctx.consume(etag.as_bytes()),
+        }
+    }
+    format!("\"{:x}-{}\"", ctx.compute(), part_etags.len())
+}
+
+#[cfg(test)]
+mod multipart_etag_tests {
+    use super::multipart_etag;
+
+    /// S3 defines a multipart ETag as md5 over the part MD5 bytes, suffixed
+    /// with the part count. Two uploads of identical parts must agree.
+    #[test]
+    fn multipart_etag_is_spec_shaped_and_deterministic() {
+        let parts = vec!["d41d8cd98f00b204e9800998ecf8427e".to_string()];
+        let etag = multipart_etag(&parts);
+        // Shaped like "<32 hex>-<count>", wrapped in quotes.
+        assert!(etag.starts_with('"'), "{etag}");
+        assert!(etag.ends_with("-1\""), "{etag}");
+        assert_eq!(etag, multipart_etag(&parts));
+    }
+
+    #[test]
+    fn multipart_etag_changes_with_content_and_count() {
+        let a = multipart_etag(&["aaaa".to_string(), "bbbb".to_string()]);
+        let b = multipart_etag(&["aaaa".to_string(), "cccc".to_string()]);
+        let c = multipart_etag(&["aaaa".to_string()]);
+        assert_ne!(a, b, "different part digests must differ");
+        assert_ne!(a, c, "different part counts must differ");
+    }
+
+    /// A completed upload used to return the literal "etag-not-computed".
+    #[test]
+    fn multipart_etag_is_not_a_placeholder() {
+        let etag = multipart_etag(&["d41d8cd98f00b204e9800998ecf8427e".to_string()]);
+        assert!(!etag.contains("not-computed"), "{etag}");
     }
 }

@@ -127,6 +127,8 @@ pub struct PutObjectOption {
     pub request_payer: Option<RequestPayer>,
     pub storage_class: Option<String>,
     pub write_offset_bytes: Option<i64>,
+    /// User metadata from `x-amz-meta-*`, without that prefix.
+    pub metadata: Option<HashMap<String, String>>,
 }
 
 impl PutObjectOption {

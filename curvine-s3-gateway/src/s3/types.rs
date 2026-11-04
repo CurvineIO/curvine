@@ -25,6 +25,11 @@ pub struct UploadStats {
     pub total_written: u64,
     pub chunks_processed: u32,
     pub first_chunk_logged: bool,
+    /// MD5 of everything written, which becomes the object's ETag.
+    ///
+    /// Computed while streaming so the read path never has to re-read an object
+    /// to answer a HEAD.
+    pub md5: Option<String>,
 }
 
 impl UploadStats {
@@ -223,7 +228,7 @@ impl PutOperation {
     pub async fn execute(
         context: PutContext,
         body: &mut crate::utils::io::PollReaderEnum,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         context.log_start();
 
         let staging_id = uuid::Uuid::new_v4().to_string();
@@ -240,7 +245,10 @@ impl PutOperation {
             }
         }
 
-        result.map(|()| context.log_completion(&stats))
+        result.map(|()| {
+            context.log_completion(&stats);
+            stats.md5.unwrap_or_default()
+        })
     }
 
     async fn stage_and_publish(
@@ -251,6 +259,8 @@ impl PutOperation {
         stats: &mut UploadStats,
     ) -> Result<(), String> {
         let mut writer = context.create_writer_at(staging).await?;
+
+        let mut md5 = md5::Context::new();
 
         loop {
             let chunk = match body.poll_read().await {
@@ -264,6 +274,7 @@ impl PutOperation {
                 }
             };
 
+            md5.consume(&chunk);
             ChunkProcessor::process_chunk(&chunk, stats)?;
             if let Err(e) = WriterHelper::write_chunk(&mut writer, &chunk).await {
                 let _ = writer.cancel().await;
@@ -275,6 +286,8 @@ impl PutOperation {
             let _ = writer.cancel().await;
             return Err(e);
         }
+
+        stats.md5 = Some(format!("{:x}", md5.compute()));
 
         // Publish. `rename` replaces the destination in this filesystem, so the
         // object only ever holds either the previous body or the complete new

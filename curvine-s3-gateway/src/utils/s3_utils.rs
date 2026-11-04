@@ -65,8 +65,51 @@ pub fn infer_content_type(object_name: &str) -> String {
 }
 
 /// Generate ETag from file status
+/// S3 ETag for an object.
+///
+/// S3 clients treat the ETag as a content identifier: two objects with equal
+/// bytes must share one, and changing the bytes must change it. The previous
+/// value was `"{id:x}-{mtime:x}"`, which broke both properties (`s3fs`,
+/// `rclone` and incremental sync all rely on it).
+///
+/// A multipart ETag is `md5(concat(part-md5s))-N`, which cannot be derived from
+/// a completed object without its part boundaries, so the stored digest is used
+/// verbatim when present. Otherwise the ETag falls back to the object id, which
+/// is at least stable for a given object.
 pub fn generate_etag(file_status: &FileStatus) -> String {
-    format!("\"{:x}-{:x}\"", file_status.id, file_status.mtime)
+    match file_status.x_attr.get(XATTR_S3_ETAG) {
+        Some(digest) => format!("\"{}\"", String::from_utf8_lossy(digest)),
+        None => format!("\"{:x}\"", file_status.id),
+    }
+}
+
+/// S3 metadata keys stored in the object's extended attributes.
+///
+/// Extended attributes are the only per-object key/value store that survives a
+/// commit without a proto change, so the gateway keeps the S3-visible metadata
+/// there instead of dropping it.
+pub const XATTR_S3_ETAG: &str = "s3.etag";
+pub const XATTR_S3_CONTENT_TYPE: &str = "s3.content_type";
+/// User metadata is stored one key per attribute with this prefix.
+pub const XATTR_S3_META_PREFIX: &str = "s3.meta.";
+
+/// Content type recorded by the upload, or a guess from the key.
+pub fn effective_content_type(file_status: &FileStatus, object_name: &str) -> String {
+    match file_status.x_attr.get(XATTR_S3_CONTENT_TYPE) {
+        Some(value) => String::from_utf8_lossy(value).to_string(),
+        None => infer_content_type(object_name),
+    }
+}
+
+/// User metadata supplied on upload, in S3 `x-amz-meta-*` form.
+pub fn user_metadata(file_status: &FileStatus) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for (key, value) in &file_status.x_attr {
+        if let Some(name) = key.strip_prefix(XATTR_S3_META_PREFIX) {
+            out.insert(name.to_string(), String::from_utf8_lossy(value).to_string());
+        }
+    }
+    out
 }
 
 /// Create owner information from file status
@@ -121,13 +164,15 @@ pub fn create_metadata_map(file_status: &FileStatus) -> HashMap<String, String> 
         }
     }
 
-    // Add custom attributes from x_attr
+    // Internal attributes the gateway writes for its own bookkeeping must not
+    // leak into the response: they are not user metadata, and emitting them
+    // duplicated every `s3.meta.*` entry under two different names.
     for (key, value) in &file_status.x_attr {
+        if key.starts_with("s3.") || key.starts_with('\0') {
+            continue;
+        }
         if let Ok(value_str) = String::from_utf8(value.clone()) {
-            metadata.insert(
-                format!("{}{}", "x-amz-meta-", key.to_lowercase()),
-                value_str,
-            );
+            metadata.insert(key.to_lowercase(), value_str);
         }
     }
 
@@ -166,7 +211,7 @@ pub fn file_status_to_head_object_result(
         accept_ranges: Some("bytes".to_string()),
         etag: Some(generate_etag(file_status)),
         storage_class: Some(map_storage_class(&file_status.storage_policy.storage_type)),
-        content_type: Some(infer_content_type(object_name)),
+        content_type: Some(effective_content_type(file_status, object_name)),
         ..Default::default()
     };
 
@@ -174,7 +219,12 @@ pub fn file_status_to_head_object_result(
     fill_ttl_info(&mut head, file_status);
 
     // Metadata from file attributes and properties
-    head.metadata = Some(create_metadata_map(file_status));
+    // User metadata must stay visible alongside the internal Curvine keys.
+    let mut metadata = create_metadata_map(file_status);
+    for (name, value) in user_metadata(file_status) {
+        metadata.insert(name, value);
+    }
+    head.metadata = Some(metadata);
 
     head
 }
@@ -272,5 +322,93 @@ pub fn set_error_response<F: crate::s3::s3_api::VResponse>(resp: &mut F, status:
     resp.set_header("x-amz-id-2", &generate_host_id());
     if status >= 400 {
         resp.set_header("content-type", "application/xml");
+    }
+}
+
+#[cfg(test)]
+mod etag_tests {
+    use super::*;
+
+    fn status_with(id: i64, mtime: i64, x_attr: Vec<(&str, &str)>) -> FileStatus {
+        let mut s = FileStatus {
+            id,
+            mtime,
+            ..Default::default()
+        };
+        for (k, v) in x_attr {
+            s.x_attr.insert(k.to_string(), v.as_bytes().to_vec());
+        }
+        s
+    }
+
+    /// Two objects with the same bytes must share an ETag, which is what S3
+    /// clients use to decide whether a transfer is needed.
+    #[test]
+    fn equal_content_yields_equal_etag() {
+        let a = status_with(100, 1_700_000_000, vec![(XATTR_S3_ETAG, "abc123")]);
+        let b = status_with(200, 1_700_000_999, vec![(XATTR_S3_ETAG, "abc123")]);
+        assert_eq!(generate_etag(&a), generate_etag(&b));
+        assert_eq!(generate_etag(&a), "\"abc123\"");
+    }
+
+    /// Changing the bytes must change the ETag. The old id+mtime form changed
+    /// on every write regardless of content, and could also collide.
+    #[test]
+    fn different_content_yields_different_etag() {
+        let a = status_with(100, 1_700_000_000, vec![(XATTR_S3_ETAG, "aaaa")]);
+        let b = status_with(100, 1_700_000_000, vec![(XATTR_S3_ETAG, "bbbb")]);
+        assert_ne!(generate_etag(&a), generate_etag(&b));
+    }
+
+    /// Content-Type must survive the upload instead of falling back to the
+    /// extension guess.
+    #[test]
+    fn recorded_content_type_wins() {
+        let s = status_with(1, 0, vec![(XATTR_S3_CONTENT_TYPE, "text/html")]);
+        assert_eq!(effective_content_type(&s, "page.bin"), "text/html");
+    }
+
+    #[test]
+    fn user_metadata_is_returned_without_its_prefix() {
+        let s = status_with(
+            1,
+            0,
+            vec![
+                ("s3.meta.foo", "bar"),
+                ("s3.meta.baz", "qux"),
+                (XATTR_S3_ETAG, "ignored"),
+            ],
+        );
+        let meta = user_metadata(&s);
+        assert_eq!(meta.get("foo").map(String::as_str), Some("bar"));
+        assert_eq!(meta.get("baz").map(String::as_str), Some("qux"));
+        assert!(!meta.contains_key("etag"));
+    }
+}
+
+#[cfg(test)]
+mod metadata_visibility_tests {
+    use super::*;
+
+    /// Internal bookkeeping attributes must not surface as user metadata, and
+    /// must not be duplicated under their raw key.
+    #[test]
+    fn internal_attributes_are_not_exposed_as_metadata() {
+        let mut status = FileStatus::default();
+        status
+            .x_attr
+            .insert("s3.etag".to_string(), b"deadbeef".to_vec());
+        status
+            .x_attr
+            .insert("s3.meta.foo".to_string(), b"bar".to_vec());
+        status
+            .x_attr
+            .insert("legacy-key".to_string(), b"kept".to_vec());
+
+        let meta = create_metadata_map(&status);
+        assert!(!meta.contains_key("s3.etag"), "{meta:?}");
+        assert!(!meta.contains_key("s3.meta.foo"), "{meta:?}");
+        assert!(!meta.keys().any(|k| k.starts_with("s3.")), "{meta:?}");
+        assert_eq!(meta.get("legacy-key").map(String::as_str), Some("kept"));
     }
 }
