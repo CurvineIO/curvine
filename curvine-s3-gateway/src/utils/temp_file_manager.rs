@@ -52,7 +52,12 @@ impl TempFileManager {
         content_length: Option<usize>,
         prefix: &str,
     ) -> Result<TempStorage, std::io::Error> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Owner-only: this directory holds in-flight object bodies, and the
+        // default is under /tmp.
         tokio::fs::create_dir_all(&self.temp_dir).await?;
+        tokio::fs::set_permissions(&self.temp_dir, std::fs::Permissions::from_mode(0o700)).await?;
 
         if let Some(size) = content_length {
             if self.use_memory_optimization
@@ -76,7 +81,8 @@ impl TempFileManager {
             .create_new(true)
             .write(true)
             .read(true)
-            .mode(0o644)
+            // Owner-only: a part body is user data.
+            .mode(0o600)
             .open(&file_name)
             .await?;
 
@@ -152,5 +158,36 @@ impl Drop for TempStorage {
                 tracing::debug!("Cleaned up temp file: {}", path);
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// In-flight object bodies must not be readable by other local users, and
+    /// the staging directory must not be world-listable.
+    #[tokio::test]
+    async fn temp_files_are_owner_only() {
+        let temp_path = std::env::temp_dir().join(format!("curvine-tmp-{}", uuid::Uuid::new_v4()));
+        let manager = TempFileManager::new(temp_path.to_str().unwrap().to_string(), 1024, 1024);
+
+        // A body above the memory threshold is written to a file.
+        let storage = manager
+            .create_temp_storage(Some(4096), "obj")
+            .await
+            .unwrap();
+        let file_path = match &storage {
+            TempStorage::File(_, path) => path.clone(),
+            TempStorage::Memory(_) => panic!("a 4 KiB body must spill to a file"),
+        };
+        let file_mode = std::fs::metadata(&file_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "staged body mode {file_mode:o}");
+
+        let dir_mode = std::fs::metadata(&temp_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "staging dir mode {dir_mode:o}");
+
+        let _ = std::fs::remove_dir_all(&temp_path);
     }
 }

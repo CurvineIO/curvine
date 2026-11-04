@@ -290,7 +290,9 @@ pub fn canonicalize_amz_headers<R: VHeader>(headers: &R) -> String {
 }
 
 /// Compare two byte strings without an early exit.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+///
+/// Shared with the V4 path so both signature schemes are compared the same way.
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     left.ct_eq(right).into()
 }

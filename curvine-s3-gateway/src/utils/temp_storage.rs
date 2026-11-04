@@ -52,6 +52,56 @@ impl StageExpect<'_> {
     }
 }
 
+/// Modes for staged upload data.
+///
+/// `File::create` and `create_dir_all` use `0666 & ~umask` / `0777 & ~umask`,
+/// which is typically `0644` / `0755`: on the default `/tmp/curvine-temp`
+/// staging directory any local user could read in-flight object bodies. The
+/// credentials store in this crate solves the same problem with the same
+/// modes.
+const PRIVATE_FILE_MODE: u32 = 0o600;
+const PRIVATE_DIR_MODE: u32 = 0o700;
+
+/// Create a staging directory readable only by its owner.
+async fn create_private_dir(dir: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| format!("Failed to create temp dir {}: {}", dir, e))?;
+
+    // Tighten an existing directory too, so a directory left by an earlier
+    // version does not keep its looser mode.
+    tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+        .await
+        .map_err(|e| format!("Failed to restrict temp dir {}: {}", dir, e))
+}
+
+/// Open a staging file readable only by its owner.
+///
+/// `exclusive` keeps the original per-caller semantics: a part is rewritten in
+/// place, while a single-object staging body must not already exist.
+async fn open_private_writer(path: &str, exclusive: bool) -> std::io::Result<tokio::fs::File> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).mode(PRIVATE_FILE_MODE);
+    if exclusive {
+        opts.create_new(true);
+    } else {
+        opts.create(true).truncate(true);
+    }
+    let file = opts.open(path).await?;
+    // An existing file keeps its mode across open, so tighten it explicitly.
+    // Best effort: a freshly created file already has PRIVATE_FILE_MODE from
+    // `mode()`, so a failure here only leaves a pre-existing file as it was and
+    // must not fail the upload.
+    let _ = file
+        .set_permissions(std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+        .await;
+    Ok(file)
+}
+
 /// Compare the MD5 recomputed while reading a part with the ETag the client
 /// listed in `CompleteMultipartUpload`.
 ///
@@ -132,12 +182,10 @@ impl LocalTempStorage {
         &self.config
     }
 
-    /// Create directory for upload session
+    /// Create directory for upload session, readable only by its owner.
     pub async fn create_dir(&self, upload_id: &str) -> Result<(), String> {
         let dir = self.dir_path(upload_id);
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| format!("Failed to create temp dir {}: {}", dir, e))
+        create_private_dir(&dir).await
     }
 
     /// Remove entire upload session directory (cleanup after complete/abort)
@@ -168,15 +216,9 @@ impl LocalTempStorage {
 
         let path = self.part_path(upload_id, part_number);
         let dir = self.dir_path(upload_id);
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| format!("Failed to create temp dir {}: {}", dir, e))?;
+        create_private_dir(&dir).await?;
 
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)
+        let mut file = open_private_writer(&path, false)
             .await
             .map_err(|e| format!("Failed to create part file {}: {}", path, e))?;
 
@@ -253,15 +295,9 @@ impl LocalTempStorage {
 
         let dir = format!("{}/{}", self.config.temp_dir, staging_id);
         let path = format!("{}/body", dir);
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| format!("Failed to create staging dir {}: {}", dir, e))?;
+        create_private_dir(&dir).await?;
 
-        let mut file = tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .read(true)
-            .open(&path)
+        let mut file = open_private_writer(&path, true)
             .await
             .map_err(|e| format!("Failed to create staging file {}: {}", path, e))?;
 
@@ -1009,6 +1045,58 @@ mod tests {
             .expect_err("a part that does not match its etag must be rejected");
         assert!(err.contains("part 2"), "{err}");
         assert!(err.contains("etag"), "{err}");
+    }
+
+    /// With the default `/tmp/curvine-temp` staging dir, default modes let any
+    /// local user read in-flight object bodies.
+    #[tokio::test]
+    async fn test_local_staging_data_is_owner_only() {
+        use std::env;
+        use std::io::Cursor;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_path = env::temp_dir()
+            .join(format!("curvine-test-{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let storage = LocalTempStorage::new(TempStorageConfig::new(temp_path.clone(), 1024, 4096));
+        storage.create_dir("upload-perm").await.unwrap();
+
+        let part_dir = storage.dir_path("upload-perm");
+        let part_dir_mode = std::fs::metadata(&part_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(part_dir_mode, 0o700, "part dir mode {part_dir_mode:o}");
+
+        let mut body = tokio::io::BufReader::new(Cursor::new(vec![1u8; 2048]));
+        storage
+            .write_part_stream("upload-perm", 1, &mut body, StageExpect::default())
+            .await
+            .unwrap();
+        let part = storage.part_path("upload-perm", 1);
+        let part_mode = std::fs::metadata(&part).unwrap().permissions().mode() & 0o777;
+        assert_eq!(part_mode, 0o600, "part file mode {part_mode:o}");
+
+        // The single-object staging body is the same kind of data.
+        let mut src = tokio::io::BufReader::new(Cursor::new(vec![2u8; 64]));
+        storage
+            .stage_object("stage-perm", &mut src, StageExpect::default())
+            .await
+            .unwrap();
+        let staged = format!("{}/stage-perm/body", temp_path);
+        let staged_mode = std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+        assert_eq!(staged_mode, 0o600, "staged body mode {staged_mode:o}");
+        let staging_dir_mode = std::fs::metadata(format!("{}/stage-perm", temp_path))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            staging_dir_mode, 0o700,
+            "staging dir mode {staging_dir_mode:o}"
+        );
+
+        storage.cleanup("upload-perm").await.unwrap();
+        let _ = std::fs::remove_dir_all(&temp_path);
     }
 
     #[tokio::test]

@@ -628,7 +628,10 @@ pub async fn handle_authorization_middleware(
 
     let circle_hasher = match ret {
         Ok((sig, circle_hasher)) => {
-            if sig != base_arg.signature {
+            // Constant-time, like the V2 path: a byte-wise early exit leaks how
+            // much of a guess was correct.
+            if !crate::auth::sig_v2::constant_time_eq(sig.as_bytes(), base_arg.signature.as_bytes())
+            {
                 return (axum::http::StatusCode::FORBIDDEN, b"").into_response();
             }
             circle_hasher
