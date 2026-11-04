@@ -324,8 +324,9 @@ impl S3Router {
             return (StatusCode::BAD_REQUEST, b"").into_response();
         }
 
+        let source_conditions = crate::s3::handlers::Preconditions::from_headers(&req, true);
         match handlers
-            .copy_object(src_bucket, src_key, dest[0], dest[1])
+            .copy_object(src_bucket, src_key, dest[0], dest[1], &source_conditions)
             .await
         {
             Ok(etag) => {
@@ -345,9 +346,12 @@ impl S3Router {
                     .into_response()
             }
             Err(e) => {
+                // Map every protocol status the handler may report; a missing
+                // arm silently degraded 412 to 500.
                 let status = match crate::s3::s3_api::status_for_error(&e) {
                     404 => StatusCode::NOT_FOUND,
                     409 => StatusCode::CONFLICT,
+                    412 => StatusCode::PRECONDITION_FAILED,
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
                 log::warn!("copy object failed ({status}): {e}");

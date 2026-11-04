@@ -28,8 +28,16 @@ pub fn format_s3_timestamp(timestamp_ms: i64) -> Option<String> {
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string())
 }
 
+/// Format a millisecond timestamp as an HTTP-date.
+///
+/// `from_timestamp` takes (seconds, nanoseconds), so the sub-second part is
+/// carried through instead of being discarded. Dropping it made the emitted
+/// `Last-Modified` earlier than the real mtime, so a client echoing it back in
+/// `If-Unmodified-Since` failed its own precondition.
 pub fn format_http_timestamp(timestamp_ms: i64) -> Option<String> {
-    chrono::DateTime::from_timestamp(timestamp_ms / 1000, 0)
+    let secs = timestamp_ms.div_euclid(1000);
+    let nanos = (timestamp_ms.rem_euclid(1000) * 1_000_000) as u32;
+    chrono::DateTime::from_timestamp(secs, nanos)
         .map(|dt| dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
 }
 

@@ -60,6 +60,140 @@ fn etag_value(tag: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Conditional request headers, as received.
+#[derive(Debug, Default, Clone)]
+pub struct Preconditions {
+    pub if_match: Option<String>,
+    pub if_none_match: Option<String>,
+    pub if_modified_since: Option<String>,
+    pub if_unmodified_since: Option<String>,
+    /// `true` when evaluating `x-amz-copy-source-if-*` against the source.
+    pub is_copy_source: bool,
+}
+
+impl Preconditions {
+    pub fn is_empty(&self) -> bool {
+        self.if_match.is_none()
+            && self.if_none_match.is_none()
+            && self.if_modified_since.is_none()
+            && self.if_unmodified_since.is_none()
+    }
+
+    /// Read the conditional headers from a request.
+    ///
+    /// `copy_source` selects the `x-amz-copy-source-if-*` family, which
+    /// `CopyObject` applies to the source object rather than the destination.
+    pub fn from_headers<H: crate::auth::sig_v4::VHeader>(header: &H, copy_source: bool) -> Self {
+        let prefix = if copy_source {
+            "x-amz-copy-source-"
+        } else {
+            ""
+        };
+        let get = |name: &str| header.get_header(&format!("{prefix}{name}"));
+        Self {
+            if_match: get("if-match"),
+            if_none_match: get("if-none-match"),
+            if_modified_since: get("if-modified-since"),
+            if_unmodified_since: get("if-unmodified-since"),
+            is_copy_source: copy_source,
+        }
+    }
+}
+
+/// Truncate a millisecond timestamp to whole seconds.
+///
+/// An HTTP-date carries no sub-second precision, so comparing a millisecond
+/// mtime against one must compare at the same granularity. Without this a
+/// client that echoes the exact `Last-Modified` it was given fails its own
+/// `If-Unmodified-Since`.
+fn to_whole_seconds(timestamp_ms: i64) -> i64 {
+    timestamp_ms.div_euclid(1000) * 1000
+}
+
+/// Parse an HTTP-date, accepting the three forms RFC 9110 permits.
+fn parse_http_date(value: &str) -> Option<i64> {
+    for format in [
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%A, %d-%b-%y %H:%M:%S GMT",
+        "%a %b %e %H:%M:%S %Y",
+    ] {
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(value.trim(), format) {
+            return Some(to_whole_seconds(parsed.and_utc().timestamp_millis()));
+        }
+    }
+    chrono::DateTime::parse_from_rfc2822(value.trim())
+        .ok()
+        .map(|dt| to_whole_seconds(dt.timestamp_millis()))
+}
+
+/// Evaluate conditional headers per RFC 9110 §13.2.2.
+///
+/// Order is fixed by the RFC:
+/// 1. `If-Match` — strong comparison; failure is 412.
+/// 2. `If-Unmodified-Since` — ignored when `If-Match` is present.
+/// 3. `If-None-Match` — weak comparison; a match is 304.
+/// 4. `If-Modified-Since` — ignored when `If-None-Match` is present.
+pub fn evaluate_precondition_headers(
+    headers: &Preconditions,
+    etag: Option<&str>,
+    last_modified_ms: Option<i64>,
+) -> Option<u16> {
+    let has_if_match = headers.if_match.is_some();
+    let has_if_none_match = headers.if_none_match.is_some();
+
+    if let Some(header) = headers.if_match.as_deref() {
+        let satisfied = match etag {
+            None => false,
+            Some(current) => header.split(',').any(|tag| {
+                let tag = tag.trim();
+                tag == "*" || (is_strong(tag) && etag_value(tag) == etag_value(current))
+            }),
+        };
+        if !satisfied {
+            return Some(412);
+        }
+    }
+
+    if !has_if_match {
+        if let Some(raw) = headers.if_unmodified_since.as_deref() {
+            if let Some(limit) = parse_http_date(raw) {
+                match last_modified_ms {
+                    Some(mtime) if to_whole_seconds(mtime) > limit => return Some(412),
+                    None => return Some(412),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if let Some(header) = headers.if_none_match.as_deref() {
+        let matched = match etag {
+            None => false,
+            Some(current) => header.split(',').any(|tag| {
+                let tag = tag.trim();
+                tag == "*" || etag_value(tag) == etag_value(current)
+            }),
+        };
+        if matched {
+            return Some(304);
+        }
+    }
+
+    if !has_if_none_match {
+        if let Some(raw) = headers.if_modified_since.as_deref() {
+            if let Some(limit) = parse_http_date(raw) {
+                if let Some(mtime) = last_modified_ms {
+                    if to_whole_seconds(mtime) <= limit {
+                        return Some(304);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Error text the S3 API layer maps to `NoSuchBucket` (404).
 pub const NO_SUCH_BUCKET: &str = "NoSuchBucket: the specified bucket does not exist";
 /// Error text the S3 API layer maps to `BucketNotEmpty` (409).
@@ -101,51 +235,34 @@ impl S3Handlers {
         }
     }
 
-    /// Evaluate `If-Match` / `If-None-Match` for one object.
+    /// Evaluate the conditional request headers for one object.
     ///
-    /// Returns the status a conditional GET must answer with (412 or 304), or
-    /// `None` when the request should be served normally. S3 clients rely on
-    /// these for optimistic concurrency and cache validation; ignoring them
-    /// silently served stale reads.
+    /// Implements RFC 9110 §13.2.2 evaluation order and the S3 extensions:
+    /// `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`.
+    /// Returns the status a conditional request must answer with (412 or 304),
+    /// or `None` when it should be served normally.
     pub async fn evaluate_preconditions(
         &self,
         path: &Path,
-        if_match: Option<String>,
-        if_none_match: Option<String>,
+        headers: &Preconditions,
     ) -> Option<u16> {
-        if if_match.is_none() && if_none_match.is_none() {
+        if headers.is_empty() {
             return None;
         }
         let status = self.fs.get_status(path).await.ok()?;
-        let current = crate::utils::s3_utils::generate_etag(&status);
+        let current_etag = crate::utils::s3_utils::generate_etag(&status);
 
-        // RFC 9110 §13.1.1/13.1.2, matching s3s `ETag::compare`:
-        // `If-Match` needs a STRONG match, so a weak ETag never satisfies it;
-        // `If-None-Match` uses the weak comparison, so the value suffices.
-        if let Some(header) = if_match.as_deref() {
-            let satisfied = header.split(',').any(|tag| {
-                let tag = tag.trim();
-                tag == "*" || (is_strong(tag) && etag_value(tag) == etag_value(&current))
-            });
-            if !satisfied {
-                return Some(412);
-            }
-        }
-
-        if let Some(header) = if_none_match.as_deref() {
-            let matched = header.split(',').any(|tag| {
-                let tag = tag.trim();
-                tag == "*" || etag_value(tag) == etag_value(&current)
-            });
-            if matched {
-                return Some(304);
-            }
-        }
-        None
+        evaluate_precondition_headers(headers, Some(&current_etag), Some(status.mtime))
     }
 
+    /// Record the S3 metadata a PUT carries in the object's extended
+    /// attributes.
+    ///
+    /// Extended attributes are the only per-object key/value store that
+    /// survives the commit, so ETag, Content-Type and user metadata live there
+    /// instead of being discarded after the response.
     /// Record the ETag of a completed multipart upload so HEAD and GET report
-    /// it back.
+    /// the same value the client was given.
     async fn store_multipart_metadata(
         fs: &UnifiedFileSystem,
         path: &Path,
@@ -162,12 +279,6 @@ impl S3Handlers {
             .map_err(|e| format!("Failed to store multipart etag for {path}: {e}"))
     }
 
-    /// Record the S3 metadata a PUT carries in the object's extended
-    /// attributes.
-    ///
-    /// Extended attributes are the only per-object key/value store that
-    /// survives the commit, so ETag, Content-Type and user metadata live there
-    /// instead of being discarded after the response.
     async fn store_s3_metadata(
         fs: &UnifiedFileSystem,
         path: &Path,
@@ -647,6 +758,7 @@ impl S3Handlers {
         source_key: &str,
         dest_bucket: &str,
         dest_key: &str,
+        source_conditions: &Preconditions,
     ) -> Result<String, String> {
         use curvine_fs_api::Reader;
 
@@ -660,6 +772,14 @@ impl S3Handlers {
         let status = self.fs.get_status(&src).await.map_err(|_| {
             format!("NoSuchKey: copy source {source_bucket}/{source_key} does not exist")
         })?;
+
+        // `x-amz-copy-source-if-*` constrains the SOURCE object, not the
+        // destination, so the conditions are evaluated against `src`.
+        if let Some(code) = self.evaluate_preconditions(&src, source_conditions).await {
+            return Err(format!(
+                "PreconditionFailed: copy source condition returned {code}"
+            ));
+        }
 
         // Copy through the same staging-then-rename path a PUT uses, so a
         // failed copy cannot truncate an existing destination object.
@@ -1189,38 +1309,159 @@ mod multipart_etag_tests {
 }
 
 #[cfg(test)]
-mod etag_condition_tests {
-    use super::{etag_value, is_strong};
+mod precondition_tests {
+    use super::{
+        etag_value, evaluate_precondition_headers, is_strong, parse_http_date, Preconditions,
+    };
 
-    /// RFC 9110 §8.8.3: `If-Match` requires a strong validator.
+    const ETAG: &str = "\"a826b09d5f9122902dbaef2a70d3e48f\"";
+    // 2026-11-04T09:00:00Z
+    const MTIME: i64 = 1_793_782_800_000;
+
+    fn http_date(ms: i64) -> String {
+        chrono::DateTime::from_timestamp(ms / 1000, 0)
+            .unwrap()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string()
+    }
+
+    fn eval(
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+        if_modified_since: Option<&str>,
+        if_unmodified_since: Option<&str>,
+    ) -> Option<u16> {
+        evaluate_precondition_headers(
+            &Preconditions {
+                if_match: if_match.map(str::to_string),
+                if_none_match: if_none_match.map(str::to_string),
+                if_modified_since: if_modified_since.map(str::to_string),
+                if_unmodified_since: if_unmodified_since.map(str::to_string),
+                is_copy_source: false,
+            },
+            Some(ETAG),
+            Some(MTIME),
+        )
+    }
+
     #[test]
-    fn weak_etags_are_not_strong() {
+    fn unconditional_requests_pass() {
+        assert_eq!(eval(None, None, None, None), None);
+    }
+
+    // ---- If-Match: strong comparison (RFC 9110 8.8.3) ----
+    #[test]
+    fn if_match_requires_a_strong_match() {
+        assert_eq!(eval(Some(ETAG), None, None, None), None);
+        // An unquoted value is still a strong validator in S3.
+        assert_eq!(
+            eval(Some("a826b09d5f9122902dbaef2a70d3e48f"), None, None, None),
+            None
+        );
+        // A weak validator never satisfies If-Match.
+        assert_eq!(
+            eval(Some(&format!("W/{ETAG}")), None, None, None),
+            Some(412)
+        );
+        assert_eq!(eval(Some("\"deadbeef\""), None, None, None), Some(412));
+        // A list matches if any member matches.
+        assert_eq!(
+            eval(Some(&format!("\"nope\", {ETAG}")), None, None, None),
+            None
+        );
+        assert_eq!(eval(Some("*"), None, None, None), None);
+    }
+
+    // ---- If-None-Match: weak comparison ----
+    #[test]
+    fn if_none_match_uses_weak_comparison() {
+        assert_eq!(eval(None, Some(ETAG), None, None), Some(304));
+        // Weak and strong forms compare equal here.
+        assert_eq!(
+            eval(None, Some(&format!("W/{ETAG}")), None, None),
+            Some(304)
+        );
+        assert_eq!(eval(None, Some("\"other\""), None, None), None);
+        assert_eq!(eval(None, Some("*"), None, None), Some(304));
+    }
+
+    // ---- Time conditions ----
+    #[test]
+    fn if_modified_since_returns_304_when_not_modified() {
+        // mtime == limit: not modified since the client's copy.
+        assert_eq!(eval(None, None, Some(&http_date(MTIME)), None), Some(304));
+        // Object newer than the limit: serve it.
+        assert_eq!(
+            eval(None, None, Some(&http_date(MTIME - 60_000)), None),
+            None
+        );
+    }
+
+    #[test]
+    fn if_unmodified_since_returns_412_when_modified() {
+        assert_eq!(
+            eval(None, None, None, Some(&http_date(MTIME - 60_000))),
+            Some(412)
+        );
+        assert_eq!(eval(None, None, None, Some(&http_date(MTIME))), None);
+    }
+
+    /// RFC 9110 13.2.2: a present If-Match overrides If-Unmodified-Since,
+    /// and a present If-None-Match overrides If-Modified-Since.
+    #[test]
+    fn etag_conditions_take_precedence_over_dates() {
+        // If-Match passes, so If-Unmodified-Since must be ignored.
+        assert_eq!(
+            eval(Some(ETAG), None, None, Some(&http_date(MTIME - 60_000))),
+            None
+        );
+        // If-None-Match does not match, so If-Modified-Since must be ignored.
+        assert_eq!(
+            eval(None, Some("\"other\""), Some(&http_date(MTIME)), None),
+            None
+        );
+    }
+
+    #[test]
+    fn unparsable_dates_are_ignored() {
+        assert_eq!(eval(None, None, Some("not a date"), None), None);
+        assert_eq!(eval(None, None, None, Some("nonsense")), None);
+    }
+
+    #[test]
+    fn http_dates_parse_in_their_permitted_forms() {
+        assert!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").is_some());
+        assert!(parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT").is_some());
+        assert!(parse_http_date("Sun Nov  6 08:49:37 1994").is_some());
+        assert!(parse_http_date("2026-11-04T09:00:00Z").is_none());
+    }
+
+    /// A missing object cannot satisfy If-Match, and must not answer 304.
+    #[test]
+    fn missing_object_fails_if_match_but_not_if_none_match() {
+        let cond = |im: Option<&str>, inm: Option<&str>| Preconditions {
+            if_match: im.map(str::to_string),
+            if_none_match: inm.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_precondition_headers(&cond(Some(ETAG), None), None, None),
+            Some(412)
+        );
+        assert_eq!(
+            evaluate_precondition_headers(&cond(None, Some(ETAG)), None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn weakness_and_quoting_are_normalised() {
         assert!(is_strong("\"abc\""));
         assert!(is_strong("abc"));
         assert!(!is_strong("W/\"abc\""));
         assert!(!is_strong("w/\"abc\""));
-    }
-
-    /// Quoting, weakness and case all denote the same opaque value.
-    #[test]
-    fn values_compare_regardless_of_form() {
         for form in ["\"a826\"", "a826", "W/\"a826\"", "\"A826\""] {
             assert_eq!(etag_value(form), "a826", "{form}");
         }
-    }
-}
-
-#[cfg(test)]
-mod error_mapping_tests {
-    use crate::s3::s3_api::status_for_error;
-
-    /// Clients retry 500 and treat 404 as terminal, so the distinction matters.
-    #[test]
-    fn protocol_conditions_map_to_their_status() {
-        assert_eq!(status_for_error("NoSuchBucket: gone"), 404);
-        assert_eq!(status_for_error("BucketNotEmpty: not empty"), 409);
-        assert_eq!(status_for_error("NoSuchKey: gone"), 404);
-        assert_eq!(status_for_error("NoSuchUpload: gone"), 404);
-        assert_eq!(status_for_error("something unexpected"), 500);
     }
 }

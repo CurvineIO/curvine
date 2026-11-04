@@ -2123,6 +2123,8 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         409
     } else if err.starts_with("NoSuchKey") || err.starts_with("NoSuchUpload") {
         404
+    } else if err.starts_with("PreconditionFailed") {
+        412
     } else {
         500
     }

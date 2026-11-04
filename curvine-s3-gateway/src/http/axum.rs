@@ -388,13 +388,10 @@ pub async fn stream_get_object(
     // Conditional request evaluation. S3 clients use If-Match / If-None-Match
     // for optimistic concurrency and cache validation; ignoring them silently
     // acknowledged writes against a stale ETag.
-    // Conditional request evaluation (If-Match / If-None-Match).
+    // Conditional request evaluation: all four RFC 9110 headers.
+    let preconditions = crate::s3::handlers::Preconditions::from_headers(&req, false);
     if let Some(status) = handlers
-        .evaluate_preconditions(
-            &cv_path,
-            req.get_header("if-match"),
-            req.get_header("if-none-match"),
-        )
+        .evaluate_preconditions(&cv_path, &preconditions)
         .await
     {
         return axum::response::Response::builder()
