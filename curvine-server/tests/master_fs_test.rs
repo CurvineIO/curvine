@@ -3388,6 +3388,46 @@ fn test_s3_mount_accepts_a_role_credential_without_any_key() -> CommonResult<()>
     Ok(())
 }
 
+// A `role` mount that carries its own source key pair uses the caller's credential, not the node
+// identity, so it must persist on a master with the default `s3_allow_env_credentials = false`.
+#[test]
+fn test_s3_mount_accepts_a_role_credential_with_a_source_key_without_opt_in() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("s3-mount-role-source-key");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let role_arn = "arn:aws:iam::123456789012:role/curvine-ufs";
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "role")
+        .add_property("s3.credentials.role_arn", role_arn)
+        .add_property("s3.credentials.access", "source-access-key")
+        .add_property("s3.credentials.secret", "source-secret-key")
+        .build();
+
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    let info = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("a role mount with a source key pair must be stored");
+    assert_eq!(
+        info.properties
+            .get("s3.credentials.role_arn")
+            .map(String::as_str),
+        Some(role_arn)
+    );
+    assert_eq!(
+        info.properties
+            .get("s3.credentials.access")
+            .map(String::as_str),
+        Some("source-access-key")
+    );
+    assert!(fs.exists(mount_path)?);
+    Ok(())
+}
+
 #[test]
 fn test_s3_mount_accepts_an_auto_credential() -> CommonResult<()> {
     let _serial = master_fs_test_serial();

@@ -318,6 +318,34 @@ mod tests {
             .expect("a static key pair needs no opt-in");
     }
 
+    // A `role` mount carrying its own source key pair uses the caller's credential, not the node
+    // identity, so it passes the gate like static/sts; a bare `role` stays gated.
+    #[test]
+    fn normalize_mount_config_allows_role_with_a_source_key_without_opt_in() {
+        let props = [
+            ("s3.endpoint_url", "http://s3.example.com"),
+            ("s3.region_name", "cn-test-1"),
+            ("s3.credentials.type", "role"),
+            ("s3.credentials.role_arn", "arn:aws:iam::1:role/ufs"),
+        ];
+
+        let mut keyed = s3_mount_info(&props);
+        keyed.properties.insert(
+            "s3.credentials.access".to_string(),
+            "access-key".to_string(),
+        );
+        keyed.properties.insert(
+            "s3.credentials.secret".to_string(),
+            "secret-key".to_string(),
+        );
+        MountManager::normalize_mount_config(&mut keyed, false)
+            .expect("a role mount with a source key pair needs no opt-in");
+
+        let mut bare = s3_mount_info(&props);
+        let err = MountManager::normalize_mount_config(&mut bare, false).unwrap_err();
+        assert!(err.to_string().contains("master.s3_allow_env_credentials"));
+    }
+
     #[test]
     fn normalize_mount_config_accepts_disabled_write_cache() {
         let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadOnly, false);

@@ -241,4 +241,34 @@ mod sts_wire_tests {
         );
         Ok(())
     }
+
+    /// #1972 test plan: an `auto` mount on a host without source credentials must fail its first
+    /// data access with a credential error rather than a panic.
+    #[test]
+    fn auto_mount_without_source_credentials_fails_with_a_credential_error() -> CommonResult<()> {
+        let mock = MockS3::start();
+        let path = Path::new("s3://bucket/key").expect("valid path");
+        let fs = OpendalFileSystem::new(
+            &path,
+            conf(
+                &mock.endpoint,
+                &[
+                    ("s3.credentials.type", "auto"),
+                    // Isolate every ambient source so the result never depends on the host identity.
+                    ("s3.credentials.disable_config_load", "true"),
+                    ("s3.credentials.disable_ec2_metadata", "true"),
+                ],
+            ),
+        )
+        .expect("operator must build");
+
+        let rt = AsyncRuntime::single();
+        let status = rt.block_on(async { fs.get_status(&path).await });
+        let err = status.expect_err("first data access without any credential must fail");
+        assert!(
+            err.to_string().to_lowercase().contains("credential"),
+            "the failure must point at the missing credential: {err}"
+        );
+        Ok(())
+    }
 }

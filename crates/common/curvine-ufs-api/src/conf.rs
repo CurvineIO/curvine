@@ -151,9 +151,15 @@ pub struct S3CredentialPlan {
 
 impl S3CredentialPlan {
     /// True when the plan carries no long-lived secret, i.e. the credential is resolved per
-    /// process from the runtime environment.
+    /// process from the runtime environment. A `role` mount that carries its own source key pair
+    /// is *not* environment-resolved: the AssumeRole source is the caller's key, so the mount
+    /// needs no `master.s3_allow_env_credentials` opt-in.
     pub fn is_environment_resolved(&self) -> bool {
-        matches!(self.kind, S3CredentialKind::Role | S3CredentialKind::Auto)
+        match self.kind {
+            S3CredentialKind::Auto => true,
+            S3CredentialKind::Role => self.access_key.is_none() && self.secret_key.is_none(),
+            S3CredentialKind::Static | S3CredentialKind::Sts => false,
+        }
     }
 }
 
@@ -953,6 +959,36 @@ mod s3_conf_tests {
 
         assert_eq!(plan.kind, S3CredentialKind::Role);
         assert_eq!(plan.access_key.as_deref(), Some("ak"));
+        assert!(!plan.is_environment_resolved());
+    }
+
+    #[test]
+    fn role_with_a_source_key_is_not_environment_resolved() {
+        // The AssumeRole source is the caller's own key, so the mount needs no
+        // master.s3_allow_env_credentials opt-in; a role without any key stays environment-resolved.
+        let keyed = S3Conf::credential_plan(&with(&[
+            (S3Conf::CRED_TYPE, "role"),
+            (S3Conf::ACCESS_KEY, "ak"),
+            (S3Conf::SECRET_KEY, "sk"),
+            (S3Conf::CRED_ROLE_ARN, "arn:role"),
+        ]))
+        .expect("a role mount with a source key pair must validate");
+        assert!(!keyed.is_environment_resolved());
+
+        let bare = S3Conf::credential_plan(&with(&[
+            (S3Conf::CRED_TYPE, "role"),
+            (S3Conf::CRED_ROLE_ARN, "arn:role"),
+        ]))
+        .expect("a role mount without any key must validate");
+        assert!(bare.is_environment_resolved());
+
+        let half = S3Conf::credential_plan(&with(&[
+            (S3Conf::CRED_TYPE, "role"),
+            (S3Conf::ACCESS_KEY, "ak"),
+            (S3Conf::CRED_ROLE_ARN, "arn:role"),
+        ]))
+        .expect_err("a half-configured source key pair must be rejected");
+        assert!(half.to_string().contains(S3Conf::SECRET_KEY), "{half}");
     }
 
     #[test]
