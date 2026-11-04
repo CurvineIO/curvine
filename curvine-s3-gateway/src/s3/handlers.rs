@@ -606,10 +606,10 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
 
         // Stream each part directly to final file (memory-efficient)
         // This avoids loading entire parts into memory
-        for (_, part_num) in part_list {
+        for (etag, part_num) in part_list {
             if let Err(e) = self
                 .temp_storage
-                .read_part_stream(&upload_id, part_num, &mut writer)
+                .read_part_stream(&upload_id, part_num, &etag, &mut writer)
                 .await
             {
                 tracing::error!(

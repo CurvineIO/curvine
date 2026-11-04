@@ -52,6 +52,36 @@ impl StageExpect<'_> {
     }
 }
 
+/// Compare the MD5 recomputed while reading a part with the ETag the client
+/// listed in `CompleteMultipartUpload`.
+///
+/// The ETag is client supplied and is only a string, so a mismatch means the
+/// staged bytes are not the ones the client believes it uploaded. Refusing it
+/// here is what stops `Complete` from publishing a shorter object and
+/// returning success. An empty or absent ETag cannot match a digest, so it is
+/// rejected rather than treated as "nothing to check".
+fn verify_part_etag(
+    part_number: u32,
+    expected_etag: &str,
+    digest: &md5::Digest,
+) -> Result<(), String> {
+    let actual = format!("{:x}", digest);
+    // Clients may quote the ETag, may omit the quotes, or may send it weak
+    // (`W/"..."`); all three denote the same MD5.
+    let expected = expected_etag
+        .trim()
+        .trim_start_matches("W/")
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    if expected != actual {
+        return Err(format!(
+            "part {} etag {} does not match the staged part ({})",
+            part_number, expected_etag, actual
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct TempStorageConfig {
     pub temp_dir: String,
@@ -269,11 +299,18 @@ impl LocalTempStorage {
         }
     }
 
-    /// Stream read part data to Writer
+    /// Copy a staged part into the destination, verifying it on the way out.
+    ///
+    /// The MD5 is recomputed while streaming and compared with the ETag the
+    /// client listed in `CompleteMultipartUpload`. Staging already refuses a
+    /// part whose write failed, so this is the second line of defence: a part
+    /// file that was truncated or altered after staging is caught here instead
+    /// of being published as a shorter object with a success response.
     pub async fn read_part_stream<W: Writer>(
         &self,
         upload_id: &str,
         part_number: u32,
+        expected_etag: &str,
         writer: &mut W,
     ) -> Result<(), String> {
         use tokio::io::AsyncReadExt;
@@ -286,6 +323,7 @@ impl LocalTempStorage {
         let buffer_size = self.config.buffer_size();
         let mut buf = BytesMut::with_capacity(buffer_size);
         buf.resize(buffer_size, 0);
+        let mut hasher = md5::Context::new();
 
         loop {
             let n = file
@@ -296,12 +334,14 @@ impl LocalTempStorage {
                 break;
             }
 
+            hasher.consume(&buf[..n]);
             writer
                 .write(&buf[..n])
                 .await
                 .map_err(|e| format!("Failed to write to destination: {}", e))?;
         }
 
+        verify_part_etag(part_number, expected_etag, &hasher.compute())?;
         Ok(())
     }
 }
@@ -519,11 +559,15 @@ impl CurvineTempStorage {
         }
     }
 
-    /// Stream read part data to Writer
+    /// Copy a staged part into the destination, verifying it on the way out.
+    ///
+    /// Same contract as the local backend: the MD5 is recomputed while
+    /// streaming and compared with the ETag from `CompleteMultipartUpload`.
     pub async fn read_part_stream<W: Writer>(
         &self,
         upload_id: &str,
         part_number: u32,
+        expected_etag: &str,
         writer: &mut W,
     ) -> Result<(), String> {
         let path = self.part_path(upload_id, part_number)?;
@@ -536,6 +580,7 @@ impl CurvineTempStorage {
         let buffer_size = self.config.buffer_size();
         let mut buf = BytesMut::with_capacity(buffer_size);
         buf.resize(buffer_size, 0);
+        let mut hasher = md5::Context::new();
 
         loop {
             let n = reader
@@ -546,11 +591,14 @@ impl CurvineTempStorage {
                 break;
             }
 
+            hasher.consume(&buf[..n]);
             writer
                 .write(&buf[..n])
                 .await
                 .map_err(|e| format!("Failed to write to destination: {}", e))?;
         }
+
+        verify_part_etag(part_number, expected_etag, &hasher.compute())?;
 
         reader
             .complete()
@@ -713,16 +761,23 @@ impl TempStorageEnum {
         }
     }
 
-    /// Stream read part data to Writer
+    /// Copy a staged part into the destination, verifying its ETag.
     pub async fn read_part_stream<W: Writer>(
         &self,
         upload_id: &str,
         part_number: u32,
+        expected_etag: &str,
         writer: &mut W,
     ) -> Result<(), String> {
         match self {
-            TempStorageEnum::Local(s) => s.read_part_stream(upload_id, part_number, writer).await,
-            TempStorageEnum::Curvine(s) => s.read_part_stream(upload_id, part_number, writer).await,
+            TempStorageEnum::Local(s) => {
+                s.read_part_stream(upload_id, part_number, expected_etag, writer)
+                    .await
+            }
+            TempStorageEnum::Curvine(s) => {
+                s.read_part_stream(upload_id, part_number, expected_etag, writer)
+                    .await
+            }
         }
     }
 }
@@ -915,6 +970,45 @@ mod tests {
 
         storage.cleanup("upload-partial").await.unwrap();
         let _ = std::fs::remove_dir_all(&temp_path);
+    }
+
+    /// The ETag listed in `CompleteMultipartUpload` is the only statement about
+    /// what the client uploaded, so it is compared with the MD5 recomputed
+    /// while reading. Quotes, `W/` prefixes and case all denote the same MD5.
+    #[test]
+    fn part_etag_matches_the_staged_digest() {
+        let data = b"part body";
+        let mut hasher = md5::Context::new();
+        hasher.consume(data);
+        let digest = hasher.compute();
+        let hex = format!("{:x}", digest);
+
+        for accepted in [
+            hex.clone(),
+            format!("\"{hex}\""),
+            format!("W/\"{hex}\""),
+            hex.to_uppercase(),
+            format!(" \"{hex}\" "),
+        ] {
+            assert!(
+                verify_part_etag(1, &accepted, &digest).is_ok(),
+                "expected {accepted} to be accepted"
+            );
+        }
+
+        // An empty ETag is not "skip the check": it cannot match a digest.
+        assert!(verify_part_etag(1, "", &digest).is_err());
+        assert!(verify_part_etag(1, "   ", &digest).is_err());
+        assert!(verify_part_etag(1, "deadbeef", &digest).is_err());
+
+        // A part truncated after staging hashes differently, which is exactly
+        // what a mid-write failure used to leave behind.
+        let mut short = md5::Context::new();
+        short.consume(&data[..4]);
+        let err = verify_part_etag(2, &hex, &short.compute())
+            .expect_err("a part that does not match its etag must be rejected");
+        assert!(err.contains("part 2"), "{err}");
+        assert!(err.contains("etag"), "{err}");
     }
 
     #[tokio::test]
