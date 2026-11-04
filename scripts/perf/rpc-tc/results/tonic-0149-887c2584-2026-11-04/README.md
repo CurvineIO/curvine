@@ -29,7 +29,7 @@ Both-profile production retention: **PASS**. Both-profile ORPC gate: **FAIL**.
 
 ## Per-profile variation and CPU endpoints
 
-Ranges show minimum–maximum across the five runs. Throughput is MB/s; CPU is seconds per GiB. Timed RSS is the sampled combined peak of master, worker, and client, excluding page cache and the supervisor.
+CPU totals are medians of per-run sums; they need not equal the sum of the endpoint medians. Ranges show minimum–maximum across the five runs. Throughput is MB/s; CPU is seconds per GiB. Timed RSS is the sampled combined peak of master, worker, and client, excluding page cache and the supervisor.
 
 | Profile | Label | Throughput median (range) | P99 ms median (range) | Client CPU median (range) | Server CPU median (range) | Total CPU median (range) | Timed RSS MiB median (range) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |

@@ -1,0 +1,34 @@
+{
+  "default": {
+    "compressed_pcap_sha256": "ab77d47f3e783c928ae4f605702b24343971983458e02c17ac22d54df2367ff4",
+    "original_pcap_sha256": "0fff0e626d63047796920012c12e893f361478fa91372530c0ad7f59ca69538d",
+    "actual_server_sha256": "3e05a8f7595c444964d07a43e2d873e409e510159c4c17c2b43298fc312aceb2",
+    "actual_client_sha256": "fb3905d1931bf77bd70d44bbfeb0ff84f9d9852b879882bab77a2a15a4774a55",
+    "revision": "887c2584",
+    "settings": {
+      "file_bytes": 1048576,
+      "chunk_bytes": 1048576,
+      "reads": 128,
+      "warmup_reads": 4,
+      "concurrency": 1,
+      "rate": "10gbit",
+      "delay_per_direction": "1ms"
+    }
+  },
+  "larger": {
+    "compressed_pcap_sha256": "c8bc65be87283019843630361e5f55346a0f903e16af5f1b52a93152c5621a43",
+    "original_pcap_sha256": "9c5b9d7399d426d1b7bb439cbd62b829d0a77ec8eac07fdf64f3ac8c8f6231c7",
+    "actual_server_sha256": "6d78a2753692001150b24f1364ea9dcee0acd25d5e13395a46dbdbdbc3e208a3",
+    "actual_client_sha256": "b8b70421430032ab80e6d8d1e2278cd4638a79fcfe549b268ac41943747eb634",
+    "revision": "5a9ba444",
+    "settings": {
+      "file_bytes": 1048576,
+      "chunk_bytes": 1048576,
+      "reads": 128,
+      "warmup_reads": 4,
+      "concurrency": 1,
+      "rate": "10gbit",
+      "delay_per_direction": "1ms"
+    }
+  }
+}

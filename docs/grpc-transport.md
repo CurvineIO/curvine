@@ -1,5 +1,18 @@
 # gRPC transport
 
+## Block response frames
+
+Block clients advertise a 256 KiB HTTP/2 receive-frame limit. Peers can send
+smaller frames. This limit does not change the read chunk size, message-size
+limit or number of outstanding read requests; the default read window remains
+one. The setting reduces framing overhead independently of read pipelining.
+
+The transport uses tonic 0.14.9 and prost 0.14.4. Raft keeps its existing
+prost 0.11 runtime and storage types, with explicit conversions at the gRPC
+boundary. The [matched benchmark reports](../scripts/perf/rpc-tc/CPU-INVESTIGATION.md)
+record the upgrade and frame-size changes separately; the ORPC performance
+gate remains open.
+
 ## Remote read pipelining
 
 The client can overlap requests for sequential chunks on a remote gRPC block
@@ -72,3 +85,8 @@ can also contain related message and service definitions, so turn reflection on
 only where clients need access. Reflection uses the same listener and TLS
 policy as the other gRPC services. Files are read when the server or client
 endpoint is constructed; restart the component to load rotated certificates.
+
+Server TLS preserves an application's already installed rustls crypto
+provider. If none is installed, it selects ring before constructing the
+server, including when dependencies enable multiple providers. Reflection
+continues to use the v1alpha service.

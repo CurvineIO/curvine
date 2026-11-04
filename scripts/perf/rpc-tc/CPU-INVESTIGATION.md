@@ -1,5 +1,39 @@
 # Remaining gRPC CPU cost
 
+## Implemented follow-ups
+
+Both recommended experiments are complete and retained. Each used 30 fresh
+Linux `tc` trials (five per variant/rate), identical LLVM release flags,
+separate pinned worktrees, and the default read window of one. All 60 trials
+had zero queue drops; their raw evidence and comparator results were
+independently audited.
+
+| Change | Profile | CPU/GiB change | Throughput change | P99 change |
+| --- | --- | ---: | ---: | ---: |
+| Tonic 0.14.9 / prost 0.14.4 upgrade | 1 Gbit/s | -21.4% | -0.2% | -5.8% |
+| Tonic 0.14.9 / prost 0.14.4 upgrade | 10 Gbit/s | -14.9% | +12.4% | -11.1% |
+| 256 KiB block response frames | 1 Gbit/s | -24.2% | +0.3% | -3.2% |
+| 256 KiB block response frames | 10 Gbit/s | -42.2% | +29.8% | -18.5% |
+
+Each row compares against that experiment's fresh preceding gRPC control;
+the percentages are not additive or a matched cumulative comparison.
+See the [upgrade report](results/tonic-0149-887c2584-2026-11-04/README.md)
+and [frame-size report](results/grpc-frame-256k-5a9ba444-2026-11-04/README.md)
+for absolute metrics, ranges, endpoint CPU, RSS and evidence. Separate packet
+captures confirm actual 256 KiB DATA frames; captures are excluded from timing.
+
+The final 10 Gbit/s checkpoint reaches 998.7 MB/s at 2.1125 CPU s/GiB. Its
+throughput and P99 pass the provisional ORPC thresholds, but CPU is still
+215.6% of ORPC against a 115% target. At 1 Gbit/s, CPU is 171.5% and P99 is
+115.9% of ORPC, so both fail. Auto remains opt-in. Maintainer acceptance and
+owned hardware-validation/fallback follow-up are still not supplied by these
+results.
+
+## Earlier source audit
+
+The remainder preserves the investigation at `6a6654cd`, before the measured
+upgrade above. Its tonic 0.9 observations and control numbers are historical.
+
 Follow-up to [review 5747067746](https://github.com/CurvineIO/curvine/pull/1957#pullrequestreview-5747067746), audited on 2026-11-04. This is a source audit, not a new benchmark result. Existing reports describe their pinned revisions; merging newer upstream changes does not make those measurements current-head results.
 
 ## Acceptance remains open
