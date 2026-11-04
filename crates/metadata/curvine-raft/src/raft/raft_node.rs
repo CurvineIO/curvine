@@ -476,8 +476,31 @@ where
         if !self.is_leader() {
             Self::send_not_leader(self.leader(), env, &self.group)?;
         } else {
+            let req_id = env.msg.req_id();
+            // Driver-side in-flight dedup, same rationale as handle_propose.
+            if Self::is_req_id_in_flight(&self.retry_cache, promise, req_id) {
+                return Self::send_request_error(
+                    env,
+                    RaftError::leader_not_ready().ctx(format!(
+                        "request {req_id} is still in flight on this node, please retry"
+                    )),
+                );
+            }
+
             if change.get_node_id() == 0 {
                 change.set_node_id(self.id())
+            }
+
+            // raft-rs silently converts a conf change proposed while another
+            // conf change is still pending (unapplied) into an empty normal
+            // entry and still appends it, so the caller would park on a change
+            // that is never applied as a conf change and end up with a phantom
+            // success. Reject it up front instead.
+            if self.raw.raft.has_pending_conf() {
+                return Self::send_request_error(
+                    env,
+                    RaftError::other("another conf change is still pending, please retry".into()),
+                );
             }
 
             let context = SerdeUtils::serialize(&env.msg.req_id())?;
@@ -545,6 +568,24 @@ where
     fn handle_propose(&mut self, env: Envelope, promise: &mut PendingPromises) -> RaftResult<()> {
         if !self.is_leader() {
             return Self::send_not_leader(self.leader(), env, &self.group);
+        }
+
+        let req_id = env.msg.req_id();
+        // Driver-side in-flight dedup. A caller may re-send the same req_id
+        // while a previous attempt is still parked here (e.g. the client rpc
+        // timeout expired while the driver was stalled on RocksDB compaction
+        // or apply-worker backpressure). Appending a second entry for the
+        // same req_id would commit it twice, and a non-idempotent apply
+        // failure on the leader ends in process abort, so a duplicate must
+        // never be appended. The driver is single-threaded, so this check has
+        // no race with the append below.
+        if Self::is_req_id_in_flight(&self.retry_cache, promise, req_id) {
+            return Self::send_request_error(
+                env,
+                RaftError::leader_not_ready().ctx(format!(
+                    "request {req_id} is still in flight on this node, please retry"
+                )),
+            );
         }
 
         let before_index = self.raw.raft.raft_log.last_index() + 1;
@@ -974,6 +1015,16 @@ where
         }
     }
 
+    /// Whether `req_id` already has an appended-but-unanswered entry parked in
+    /// this driver: either a pending callback or an in-flight reservation.
+    fn is_req_id_in_flight(
+        retry_cache: &RetryCache,
+        promise: &PendingPromises,
+        req_id: i64,
+    ) -> bool {
+        promise.contains_key(&req_id) || retry_cache.get(&req_id) == Some(RetryState::InFlight)
+    }
+
     fn fail_pending_promises(promise: &mut PendingPromises, reason: &str) {
         if promise.is_empty() {
             return;
@@ -1106,9 +1157,12 @@ where
                         }
                     };
                 } else if let Some(req_id) = req_id {
-                    // Follower replay has no caller waiting. The app store
-                    // applies the entry inline for wait=false messages, so the
-                    // apply result is already known here.
+                    // Follower replay has no caller waiting. The entry is
+                    // already quorum-committed at this point; a follower whose
+                    // apply fails aborts the node, so no false success can
+                    // survive the apply. Publishing here just records that
+                    // known outcome instead of waiting for an ack that would
+                    // never be observed by a retry.
                     self.mark_retry_committed(req_id);
                 }
                 continue;

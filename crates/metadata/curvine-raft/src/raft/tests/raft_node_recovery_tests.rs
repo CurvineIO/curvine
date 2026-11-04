@@ -2615,3 +2615,129 @@ fn retry_after_leadership_change_is_proposed_and_succeeds() {
         "the applied retry must be recorded as committed"
     );
 }
+
+// A duplicate req_id must never be appended twice: if the driver stalls past
+// the client rpc timeout, ClusterConnector::rpc re-sends the same req_id, and
+// appending the retry would commit the request twice (a non-idempotent apply
+// failure then aborts the master). The driver must answer the duplicate with a
+// retryable error instead.
+#[test]
+fn duplicate_req_id_while_in_flight_is_rejected_not_double_appended() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node_with_voters(rt.clone(), 1, vec![1]);
+    let mut promise: PendingPromises = HashMap::new();
+    let data = SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap();
+
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+
+    let req_id = 4646;
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let msg = Builder::new_rpc(RaftCode::Propose)
+        .req_id(req_id)
+        .proto_header(ProposeRequest { data })
+        .build();
+    node.handle_propose(Envelope::new(msg, tx), &mut promise)
+        .unwrap();
+    let before = node.raw.raft.raft_log.last_index();
+    assert!(promise.contains_key(&req_id));
+
+    // The stalled-driver replay of the same req_id: still parked in promise
+    // and cache, so it must not append a second entry.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let dup = Builder::new_rpc(RaftCode::Propose)
+        .req_id(req_id)
+        .proto_header(ProposeRequest {
+            data: SerdeUtils::serialize(&("k".to_string(), "v2".to_string())).unwrap(),
+        })
+        .build();
+    node.handle_propose(Envelope::new(dup, tx), &mut promise)
+        .unwrap();
+
+    assert_eq!(
+        node.raw.raft.raft_log.last_index(),
+        before,
+        "a duplicate req_id must not append a second entry"
+    );
+    let response = rt.block_on(rx).unwrap().unwrap();
+    assert_eq!(response.response_status(), ResponseStatus::Error);
+    let error = response
+        .check_error_ext::<RaftError>()
+        .expect_err("the duplicate must be answered, not parked");
+    assert!(
+        matches!(error, RaftError::LeaderNotReady(_)),
+        "the duplicate must get a retryable error, got {:?}",
+        error
+    );
+    assert!(error.retry_leader());
+
+    // The same guard covers a duplicate parked only in the retry cache (the
+    // original caller is gone but the entry is not applied yet).
+    promise.remove(&req_id);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let dup = Builder::new_rpc(RaftCode::Propose)
+        .req_id(req_id)
+        .proto_header(ProposeRequest {
+            data: SerdeUtils::serialize(&("k".to_string(), "v3".to_string())).unwrap(),
+        })
+        .build();
+    node.handle_propose(Envelope::new(dup, tx), &mut promise)
+        .unwrap();
+    assert_eq!(
+        node.raw.raft.raft_log.last_index(),
+        before,
+        "an in-flight cache reservation must also block a re-append"
+    );
+    let response = rt.block_on(rx).unwrap().unwrap();
+    assert_eq!(response.response_status(), ResponseStatus::Error);
+}
+
+// A conf change proposed while another conf change is still pending is
+// silently turned into an empty normal entry by raft-rs and still returns Ok;
+// the caller would park forever on a change that never applies as a conf
+// change and finally get a phantom success. The pending guard must answer a
+// retryable error instead.
+#[test]
+fn conf_change_while_another_is_pending_is_rejected() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node_with_voters(rt.clone(), 1, vec![1]);
+    let mut promise: PendingPromises = HashMap::new();
+    let retry_cache = node.retry_cache.clone();
+
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+
+    let make_change = |node_id: u64, port: u16, req_id: i64| {
+        let change = ConfChange {
+            change_type: ConfChangeType::AddNode.into(),
+            node_id,
+            context: SerdeUtils::serialize(&InetAddr::new("127.0.0.1", port)).unwrap(),
+            ..Default::default()
+        };
+        Builder::new_rpc(RaftCode::ConfChange)
+            .req_id(req_id)
+            .proto_header(ConfChangeRequest { change })
+            .build()
+    };
+
+    // The first conf change is appended and stays pending (no quorum to apply).
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    node.handle_conf_change(Envelope::new(make_change(4, 9104, 4747), tx), &mut promise)
+        .unwrap();
+    assert!(node.raw.raft.has_pending_conf());
+
+    let before = node.raw.raft.raft_log.last_index();
+    // The second conf change while the first is pending must be rejected.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    node.handle_conf_change(Envelope::new(make_change(5, 9105, 4848), tx), &mut promise)
+        .unwrap();
+
+    assert_eq!(
+        node.raw.raft.raft_log.last_index(),
+        before,
+        "the dropped conf change must not append an empty normal entry"
+    );
+    assert_eq!(retry_cache.get(&4848), None);
+    let response = rt.block_on(rx).unwrap().unwrap();
+    assert_eq!(response.response_status(), ResponseStatus::Error);
+}
