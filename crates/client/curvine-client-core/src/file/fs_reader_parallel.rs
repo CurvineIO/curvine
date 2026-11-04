@@ -18,6 +18,7 @@ use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::FileBlocks;
+use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
 // Shards read data
@@ -58,6 +59,7 @@ impl FsReaderParallel {
         read_parallel: i64,
         slice_size: i64,
         chunk_size: usize,
+        read_end: Arc<AtomicI64>,
     ) -> FsResult<Vec<Self>> {
         // Check the alignment
         if !chunk_size.is_multiple_of(FILE_MIN_ALIGN_SIZE) || chunk_size < FILE_MIN_ALIGN_SIZE {
@@ -80,7 +82,12 @@ impl FsReaderParallel {
                 continue;
             }
 
-            let mut base = FsReaderBase::new(path.clone(), fs_context.clone(), file_blocks.clone());
+            let mut base = FsReaderBase::new(
+                path.clone(),
+                fs_context.clone(),
+                file_blocks.clone(),
+                read_end.clone(),
+            );
             base.disable_cache_handles();
 
             let reader = Self::from_base(base, parallel_id, chunk_size as i64, slice, ino);

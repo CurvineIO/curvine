@@ -24,6 +24,7 @@ use fxhash::FxHasher;
 use linked_hash_map::LinkedHashMap;
 use std::hash::BuildHasherDefault;
 use std::mem;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 pub struct FsReaderBase {
@@ -35,6 +36,9 @@ pub struct FsReaderBase {
     // File offset the caller will read up to; block readers do not prefetch
     // past it.
     prefetch_end: i64,
+    // Read end hinted by the file reader's user, shared by all of its lanes.
+    // Block readers prefetch up to the lower of the two ends.
+    read_end: Arc<AtomicI64>,
 
     // The block that is currently being read
     cur_reader: Option<BlockReader>,
@@ -45,7 +49,12 @@ pub struct FsReaderBase {
 }
 
 impl FsReaderBase {
-    pub fn new(path: Path, fs_context: Arc<FsContext>, file_blocks: FileBlocks) -> Self {
+    pub fn new(
+        path: Path,
+        fs_context: Arc<FsContext>,
+        file_blocks: FileBlocks,
+        read_end: Arc<AtomicI64>,
+    ) -> Self {
         let len = file_blocks.status.len;
         let cache_limit = fs_context.conf.client.max_cache_block_handles;
 
@@ -60,6 +69,7 @@ impl FsReaderBase {
             pos: 0,
             len,
             prefetch_end: len,
+            read_end,
             cur_reader: None,
             cache_limit,
             cache_readers,
@@ -210,9 +220,10 @@ impl FsReaderBase {
             }
         }
 
+        let prefetch_end = self.prefetch_end.min(self.read_end.load(Ordering::Relaxed));
         let reader = try_option_mut!(self.cur_reader);
         // The reader's block starts at file offset `self.pos - reader.pos()`.
-        reader.set_prefetch_end(self.prefetch_end - (self.pos - reader.pos()));
+        reader.set_prefetch_end(prefetch_end - (self.pos - reader.pos()));
         Ok(reader)
     }
 }
