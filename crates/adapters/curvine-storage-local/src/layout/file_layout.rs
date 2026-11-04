@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::layout::{validate_open_offset, BlockLayout};
+use crate::layout::{validate_open_offset, BlockLayout, BlockTruncated};
 use crate::{
     BlockChecksum, BlockMeta, BlockState, ChecksumHeader, ChecksumVerify, CHECKSUM_FILE_SUFFIX,
     DEFAULT_CHECKSUM_CHUNK_SIZE,
 };
 use crate::{BlockReadContext, BlockWriteContext, VfsDir};
 use curvine_core_error::{err_box, try_err, CommonResult};
-use curvine_io::{IOResult, LocalFile};
+use curvine_io::{IOError, IOResult, LocalFile};
 use curvine_model::ExtendedBlock;
 #[cfg(test)]
 use curvine_runtime::common::ByteUnit;
@@ -552,12 +552,11 @@ impl BlockLayout for FileLayout {
         if let Some(committed_len) = meta.committed_len() {
             let committed_len = committed_len.min(logical_len);
             if device.len() < committed_len {
-                return err_box!(
-                    "Block {} is truncated: committed length {}, file length {}",
-                    meta.id,
+                return Err(IOError::create(BlockTruncated {
+                    id: meta.id,
                     committed_len,
-                    device.len()
-                );
+                    file_len: device.len(),
+                }));
             }
         }
         let physical_len = device.len().min(logical_len);
