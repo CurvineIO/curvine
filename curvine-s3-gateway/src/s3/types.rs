@@ -225,9 +225,17 @@ impl PutOperation {
     /// failed or disconnected upload destroyed the existing object and left a
     /// truncated one. The body is now staged and only published by a rename
     /// once it is complete, so any failure leaves the previous object intact.
+    /// Write the object atomically.
+    ///
+    /// `on_staged` runs after the body is complete and before the publishing
+    /// rename, so the metadata the client asked for is attached to the staging
+    /// inode and reaches the destination in the same step. Writing it after the
+    /// rename left a window where the object was visible with a fallback ETag.
     pub async fn execute(
         context: PutContext,
         body: &mut crate::utils::io::PollReaderEnum,
+        metadata: crate::utils::s3_utils::S3Metadata,
+        expect_length: Option<usize>,
     ) -> Result<String, String> {
         context.log_start();
 
@@ -236,7 +244,16 @@ impl PutOperation {
         let object = context.get_validated_path()?;
 
         let mut stats = UploadStats::new();
-        let result = Self::stage_and_publish(&context, body, &staging, &object, &mut stats).await;
+        let result = Self::stage_and_publish(
+            &context,
+            body,
+            &staging,
+            &object,
+            &mut stats,
+            &metadata,
+            expect_length,
+        )
+        .await;
 
         if result.is_err() {
             // Best effort: the staging object may not exist if create failed.
@@ -257,6 +274,8 @@ impl PutOperation {
         staging: &Path,
         object: &Path,
         stats: &mut UploadStats,
+        metadata: &crate::utils::s3_utils::S3Metadata,
+        expect_length: Option<usize>,
     ) -> Result<(), String> {
         let mut writer = context.create_writer_at(staging).await?;
 
@@ -287,7 +306,29 @@ impl PutOperation {
             return Err(e);
         }
 
+        // A body shorter than the declared `Content-Length` means the client
+        // disconnected early. The body stream simply ends, so without this
+        // check the truncated body would be published as a successful object.
+        if let Some(expected) = expect_length {
+            if stats.total_written as usize != expected {
+                let _ = writer.cancel().await;
+                let _ = context.fs.delete(staging, false).await;
+                return Err(format!(
+                    "ContentLengthMismatch: received {} of {} bytes",
+                    stats.total_written, expected
+                ));
+            }
+        }
+
         stats.md5 = Some(format!("{:x}", md5.compute()));
+        let digest = stats.md5.clone().unwrap_or_default();
+
+        // Attach the S3 metadata while the object is still staging, so the
+        // rename below publishes body and metadata together.
+        if let Err(e) = metadata.write_to(&context.fs, staging, &digest).await {
+            let _ = context.fs.delete(staging, false).await;
+            return Err(e);
+        }
 
         // Publish. `rename` replaces the destination in this filesystem, so the
         // object only ever holds either the previous body or the complete new

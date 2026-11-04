@@ -255,58 +255,6 @@ impl S3Handlers {
         evaluate_precondition_headers(headers, Some(&current_etag), Some(status.mtime))
     }
 
-    /// Record the S3 metadata a PUT carries in the object's extended
-    /// attributes.
-    ///
-    /// Extended attributes are the only per-object key/value store that
-    /// survives the commit, so ETag, Content-Type and user metadata live there
-    /// instead of being discarded after the response.
-    /// Record the ETag of a completed multipart upload so HEAD and GET report
-    /// the same value the client was given.
-    async fn store_multipart_metadata(
-        fs: &UnifiedFileSystem,
-        path: &Path,
-        etag: &str,
-    ) -> Result<(), String> {
-        use crate::utils::s3_utils::XATTR_S3_ETAG;
-        use curvine_model::SetAttrOptsBuilder;
-
-        let opts = SetAttrOptsBuilder::new()
-            .add_x_attr(XATTR_S3_ETAG, etag.trim_matches('"').as_bytes().to_vec())
-            .build();
-        fs.set_attr(path, opts)
-            .await
-            .map_err(|e| format!("Failed to store multipart etag for {path}: {e}"))
-    }
-
-    async fn store_s3_metadata(
-        fs: &UnifiedFileSystem,
-        path: &Path,
-        opt: &PutObjectOption,
-        md5: &str,
-    ) -> Result<(), String> {
-        use crate::utils::s3_utils::{XATTR_S3_CONTENT_TYPE, XATTR_S3_ETAG, XATTR_S3_META_PREFIX};
-        use curvine_model::SetAttrOptsBuilder;
-
-        let mut builder =
-            SetAttrOptsBuilder::new().add_x_attr(XATTR_S3_ETAG, md5.as_bytes().to_vec());
-        if let Some(content_type) = opt.content_type.as_deref() {
-            builder = builder.add_x_attr(XATTR_S3_CONTENT_TYPE, content_type.as_bytes().to_vec());
-        }
-        if let Some(metadata) = &opt.metadata {
-            for (name, value) in metadata {
-                builder = builder.add_x_attr(
-                    format!("{XATTR_S3_META_PREFIX}{name}"),
-                    value.as_bytes().to_vec(),
-                );
-            }
-        }
-
-        fs.set_attr(path, builder.build())
-            .await
-            .map_err(|e| format!("Failed to store S3 metadata for {path}: {e}"))
-    }
-
     #[inline]
     pub async fn handle_list_buckets(
         &self,
@@ -643,13 +591,42 @@ impl PutObjectHandler for S3Handlers {
         );
 
         async move {
-            let md5 = PutOperation::execute(context, &mut body).await?;
-            let path = path.map_err(|e| e.to_string())?;
+            // S3 applies `If-Match` / `If-None-Match` to the DESTINATION on
+            // PutObject. Without this an `If-Match: <old>` overwrite silently
+            // clobbered a concurrently-replaced object, which is the lost
+            // update the GET path already guards against. `If-None-Match: *`
+            // is the "create only if absent" form.
+            let dest_conditions = crate::s3::handlers::Preconditions {
+                if_match: opt.if_match.clone(),
+                if_none_match: opt.if_none_match.clone(),
+                ..Default::default()
+            };
+            if !dest_conditions.is_empty() {
+                let dest = path.as_ref().map_err(|e| e.to_string())?.clone();
+                let existing = fs.get_status(&dest).await.ok();
+                let etag = existing.as_ref().map(crate::utils::s3_utils::generate_etag);
+                if crate::s3::handlers::evaluate_precondition_headers(
+                    &dest_conditions,
+                    etag.as_deref(),
+                    existing.as_ref().map(|st| st.mtime),
+                )
+                .is_some()
+                {
+                    return Err("PreconditionFailed: destination condition not met".to_string());
+                }
+            }
 
-            // Persist the S3-visible metadata. Without it the ETag was not a
-            // content hash, and Content-Type plus every `x-amz-meta-*` entry
-            // were dropped on upload and lost to later HEAD/GET calls.
-            Self::store_s3_metadata(&fs, &path, &opt, &md5).await?;
+            // Metadata is written to the staging inode, so the rename publishes
+            // body and metadata as one step. Writing it afterwards left a
+            // window where the object answered HEAD with the fallback ETag, and
+            // a failed `set_attr` reported 500 for an object already visible.
+            let metadata = crate::utils::s3_utils::S3Metadata::from_put_option(&opt);
+            let expect_length = opt
+                .content_length
+                .and_then(|v| usize::try_from(v).ok())
+                .filter(|v| *v > 0);
+            let md5 = PutOperation::execute(context, &mut body, metadata, expect_length).await?;
+            let _ = path;
 
             // Report what HEAD/GET will report for the same object.
             Ok(format!("\"{md5}\""))
@@ -1017,7 +994,35 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             return Err(format!("Failed to complete final file write: {e}"));
         }
 
-        // Publish: the destination is only ever replaced by a complete object.
+        // S3 multipart ETag: md5 of the concatenated part MD5s, plus `-N`.
+        // The response used to be the literal "etag-not-computed", so no client
+        // could validate a multipart upload.
+        let multipart_etag = multipart_etag(&part_etags);
+
+        // Record the ETag on the staging inode, so the rename below publishes
+        // body and ETag together. Writing it afterwards left the object
+        // answering HEAD with the fallback ETag if `set_attr` failed, and the
+        // response ETag could differ from HEAD permanently.
+        if let Err(e) = self
+            .fs
+            .set_attr(
+                &staging,
+                curvine_model::SetAttrOptsBuilder::new()
+                    .add_x_attr(
+                        crate::utils::s3_utils::XATTR_S3_ETAG,
+                        multipart_etag.trim_matches('"').as_bytes().to_vec(),
+                    )
+                    .build(),
+            )
+            .await
+        {
+            let _ = self.fs.delete(&staging, false).await;
+            let _ = self.temp_storage.cleanup(&upload_id).await;
+            return Err(format!("Failed to record multipart etag: {e}"));
+        }
+
+        // Publish: the destination is only ever replaced by a complete object
+        // that already carries its metadata.
         if let Err(e) = self.fs.rename(&staging, &final_path).await {
             let _ = self.fs.delete(&staging, false).await;
             let _ = self.temp_storage.cleanup(&upload_id).await;
@@ -1031,18 +1036,6 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                 upload_id,
                 e
             );
-        }
-
-        // S3 multipart ETag: md5 of the concatenated part MD5s, plus `-N`.
-        // The response used to be the literal "etag-not-computed", so no client
-        // could validate a multipart upload.
-        let multipart_etag = multipart_etag(&part_etags);
-
-        // Record it, plus the content type carried by the create request, so
-        // HEAD/GET report the same value the client was given.
-        if let Err(e) = Self::store_multipart_metadata(&self.fs, &final_path, &multipart_etag).await
-        {
-            tracing::warn!("Failed to store multipart metadata for {final_path}: {e}");
         }
 
         tracing::info!(
@@ -1463,5 +1456,42 @@ mod precondition_tests {
         for form in ["\"a826\"", "a826", "W/\"a826\"", "\"A826\""] {
             assert_eq!(etag_value(form), "a826", "{form}");
         }
+    }
+}
+
+#[cfg(test)]
+mod put_destination_condition_tests {
+    use crate::s3::handlers::{evaluate_precondition_headers, Preconditions};
+
+    fn cond(if_match: Option<&str>, if_none_match: Option<&str>) -> Preconditions {
+        Preconditions {
+            if_match: if_match.map(str::to_string),
+            if_none_match: if_none_match.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// PutObject applies the destination conditions; a stale `If-Match` must be
+    /// refused so a concurrent replacement is not silently overwritten.
+    #[test]
+    fn put_destination_conditions_are_enforced() {
+        let etag = "\"abc123\"";
+        assert_eq!(
+            evaluate_precondition_headers(&cond(Some("\"old\""), None), Some(etag), None),
+            Some(412)
+        );
+        assert_eq!(
+            evaluate_precondition_headers(&cond(Some(etag), None), Some(etag), None),
+            None
+        );
+        // `If-None-Match: *` refuses to overwrite an existing object.
+        assert_eq!(
+            evaluate_precondition_headers(&cond(None, Some("*")), Some(etag), None),
+            Some(304)
+        );
+        assert_eq!(
+            evaluate_precondition_headers(&cond(None, Some("*")), None, None),
+            None
+        );
     }
 }

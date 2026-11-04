@@ -211,6 +211,26 @@ impl S3Router {
         } else if args.len() != 2 {
             (StatusCode::BAD_REQUEST, b"").into_response()
         } else {
+            // RFC 9110 §13.2.2 requires HEAD to evaluate conditions exactly as
+            // GET does; a stale `If-Match` must be 412, not a full 200 with
+            // headers. S3 clients use HEAD preconditions for existence checks.
+            let object_path = match handlers.cv_object_path(args[0], args[1]) {
+                Ok(p) => p,
+                Err(_) => return (StatusCode::NOT_FOUND, b"").into_response(),
+            };
+            let conditions = crate::s3::handlers::Preconditions::from_headers(&req, false);
+            if let Some(code) = handlers
+                .evaluate_preconditions(&object_path, &conditions)
+                .await
+            {
+                let status = StatusCode::from_u16(code).unwrap_or(StatusCode::PRECONDITION_FAILED);
+                let mut builder = axum::response::Response::builder().status(status);
+                if code == 304 {
+                    // A 304 must not carry the body-framing headers of a 200.
+                    builder = builder.header("accept-ranges", "bytes");
+                }
+                return builder.body(axum::body::Body::empty()).unwrap();
+            }
             Self::handle_head_object_request(args[0], args[1], &handlers).await
         }
     }

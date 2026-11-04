@@ -1083,9 +1083,12 @@ pub async fn handle_put_object<
             resp.send_header();
         }
         Err(err) => {
-            resp.set_status(500);
+            // A failed `If-Match` / `If-None-Match` is 412, not a server error;
+            // clients must be able to tell a lost update from an outage.
+            let status = status_for_error(&err);
+            log::warn!("put object failed ({status}): {err}");
+            resp.set_status(status);
             resp.send_header();
-            log::error!("put object handle error: {err}");
         }
     }
 }

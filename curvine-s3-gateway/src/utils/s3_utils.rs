@@ -420,3 +420,53 @@ mod metadata_visibility_tests {
         assert_eq!(meta.get("legacy-key").map(String::as_str), Some("kept"));
     }
 }
+
+/// S3-visible metadata an upload carries, written to the object's xattrs.
+///
+/// Kept as a value so the write can happen on the staging inode before the
+/// publishing rename, instead of after the object is already visible.
+#[derive(Debug, Clone, Default)]
+pub struct S3Metadata {
+    pub content_type: Option<String>,
+    pub user_metadata: Vec<(String, String)>,
+}
+
+impl S3Metadata {
+    pub fn from_put_option(opt: &crate::s3::dto::PutObjectOption) -> Self {
+        Self {
+            content_type: opt.content_type.clone(),
+            user_metadata: opt
+                .metadata
+                .as_ref()
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Write ETag, Content-Type and user metadata onto `path`.
+    pub async fn write_to(
+        &self,
+        fs: &curvine_client::unified::UnifiedFileSystem,
+        path: &curvine_fs_api::Path,
+        etag: &str,
+    ) -> Result<(), String> {
+        use curvine_fs_api::FileSystem;
+        use curvine_model::SetAttrOptsBuilder;
+
+        let mut builder =
+            SetAttrOptsBuilder::new().add_x_attr(XATTR_S3_ETAG, etag.as_bytes().to_vec());
+        if let Some(ct) = self.content_type.as_deref() {
+            builder = builder.add_x_attr(XATTR_S3_CONTENT_TYPE, ct.as_bytes().to_vec());
+        }
+        for (name, value) in &self.user_metadata {
+            builder = builder.add_x_attr(
+                format!("{XATTR_S3_META_PREFIX}{name}"),
+                value.as_bytes().to_vec(),
+            );
+        }
+
+        fs.set_attr(path, builder.build())
+            .await
+            .map_err(|e| format!("Failed to store S3 metadata for {path}: {e}"))
+    }
+}

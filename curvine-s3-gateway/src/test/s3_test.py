@@ -160,39 +160,59 @@ class S3BasicOperationsTest:
             self._record_test(f"Put Object ({key})", False)
             return False
     
-    def test_failed_overwrite_preserves_the_old_object(self, key: str) -> bool:
-        """A PUT that dies mid-body must leave the previous object readable.
+    def test_overwrite_is_atomic(self, key: str) -> bool:
+        """A successful overwrite must replace the object in one visible step.
 
-        Writing in place would make the master drop the existing blocks when the
-        upload starts, so a disconnect at any point would destroy the object.
+        The failure half of this property is covered by
+        `test_local_write_part_stream_removes_a_partial_part` and the staging
+        unit tests, not here: a short body is rejected by hyper with 400 before
+        the handler runs, so an early socket close cannot reach the staging
+        code and would make this assertion pass trivially. What is testable from
+        outside is that a normal overwrite publishes the new body whole.
         """
-        original = b"original body that must survive"
-        if not self.test_put_object(key, original):
+        v1 = b"first version of the object"
+        v2 = b"second version, longer than the first"
+
+        if not self.test_put_object(key, v1):
+            return False
+        ok, body = self.test_get_object(key)
+        if not ok or body != v1:
+            print("  FAIL: first version unreadable")
             return False
 
-        # Declare more bytes than are sent, then close the socket, so the
-        # gateway sees a body that ends early.
-        try:
-            import http.client
-            conn = http.client.HTTPConnection(
-                self.config.endpoint_url.split("//")[-1].split(":")[0],
-                int(self.config.endpoint_url.rstrip("/").split(":")[-1]),
-                timeout=5,
-            )
-            conn.putrequest("PUT", f"/{self.config.test_bucket}/{key}")
-            conn.putheader("Host", self.config.endpoint_url.split("//")[-1])
-            conn.putheader("Content-Length", "1048576")
-            conn.putheader("Authorization", "AWS4-HMAC-SHA256 broken")
-            conn.putheader("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
-            conn.endheaders()
-            conn.send(b"partial")
-            conn.close()
-        except OSError:
-            pass
-
+        if not self.test_put_object(key, v2):
+            return False
         ok, body = self.test_get_object(key)
-        if not ok or body != original:
-            print(f"  FAIL: previous object changed after a failed overwrite (got {None if body is None else len(body)} bytes)")
+        if not ok or body != v2:
+            print(f"  FAIL: overwrite did not publish the second version ({body!r})")
+            return False
+
+        # The ETag must follow the content, which is what makes the atomic
+        # publish observable to a client.
+        import subprocess
+
+        head = subprocess.run(
+            [
+                "aws",
+                "--endpoint-url",
+                self.client.config.endpoint_url,
+                "s3api",
+                "head-object",
+                "--bucket",
+                self.client.config.test_bucket,
+                "--key",
+                key,
+                "--query",
+                "ETag",
+                "--output",
+                "text",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        expected = '"' + hashlib.md5(v2).hexdigest() + '"'
+        if head.stdout.strip() != expected:
+            print(f"  FAIL: ETag {head.stdout.strip()} != content md5 {expected}")
             return False
         return True
 
@@ -666,9 +686,7 @@ class ComprehensiveS3TestSuite:
                 return False
         
         # A failed overwrite must not destroy the existing object
-        if not basic_test.test_failed_overwrite_preserves_the_old_object(
-            "failed-overwrite-object"
-        ):
+        if not basic_test.test_overwrite_is_atomic("overwrite-object"):
             return False
 
         # Test list operations
