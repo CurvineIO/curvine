@@ -37,6 +37,9 @@ pub struct FilesystemConf {
 
     pub read_chunk_size: String,
     pub read_chunk_num: usize,
+    // Chunk requests kept in flight per remote block read; see
+    // ClientConf::read_pipeline_depth. 1 sends one request at a time.
+    pub read_pipeline_depth: usize,
     pub read_parallel: i64,
     pub read_slice_size: String,
 
@@ -189,6 +192,7 @@ impl FilesystemConf {
             block_size: "128MB".to_string(),
             write_chunk_size: "128KB".to_string(),
             read_chunk_size: "128KB".to_string(),
+            read_pipeline_depth: 1,
             read_slice_size: "0".to_string(),
             read_ahead_len: "1MB".to_string(),
             drop_cache_len: "64MB".to_string(),
@@ -244,6 +248,7 @@ impl FilesystemConf {
             read_chunk_size: 0,
             read_chunk_size_str: self.read_chunk_size,
             read_chunk_num: self.read_chunk_num,
+            read_pipeline_depth: self.read_pipeline_depth,
 
             read_parallel: self.read_parallel,
             read_slice_size: 0,
@@ -484,6 +489,43 @@ mod tests {
             cluster.client.write_buffer_timeout_ms > cluster.client.rpc_timeout_ms,
             "default deadline must exceed a single master RPC budget"
         );
+    }
+
+    #[test]
+    fn maps_read_pipeline_depth_into_client_conf() {
+        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        assert_eq!(conf.read_pipeline_depth, 1);
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.read_pipeline_depth, 1);
+
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.read_pipeline_depth = 4;
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.read_pipeline_depth, 4);
+    }
+
+    #[test]
+    fn parses_read_pipeline_depth_from_java_toml() {
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                read_chunk_size = "128KB"
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+                read_pipeline_depth = 4
+            "#,
+        )
+        .unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.read_pipeline_depth, 4);
     }
 
     #[test]

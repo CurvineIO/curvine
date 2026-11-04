@@ -35,6 +35,8 @@ public class FilesystemConf {
 
     public String read_chunk_size = "128KB";
     public int read_chunk_num = 8;
+    // Chunk requests kept in flight per remote block read; 1 sends one at a time.
+    public int read_pipeline_depth = 1;
     public int read_parallel = 1;
     public String read_slice_size = "0";
 
@@ -321,6 +323,7 @@ public class FilesystemConf {
                 ", write_chunk_num=" + write_chunk_num +
                 ", read_chunk_size='" + read_chunk_size + '\'' +
                 ", read_chunk_num=" + read_chunk_num +
+                ", read_pipeline_depth=" + read_pipeline_depth +
                 ", read_parallel=" + read_parallel +
                 ", read_slice_size='" + read_slice_size + '\'' +
                 ", max_cache_block_handles=" + max_cache_block_handles +
