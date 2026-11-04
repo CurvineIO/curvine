@@ -1176,13 +1176,27 @@ impl NodeState {
             StatProbe::Hit(status) => return Ok(status),
             StatProbe::Miss(path) => path,
         };
-        let _guard = self.lock_path(&path).await;
-        if let Some(status) = self.unlinked_status(ino) {
+        // The path lock keeps the daemon-side metadata cache coherent across
+        // concurrent resolutions of the same path. With the cache disabled
+        // nothing is updated here, so the lock only serializes this backend
+        // RPC behind other stats of the same path - notably the mount root,
+        // which the kernel revalidates on every traversal when attr_timeout
+        // is 0. Skip it in that mode instead of capping every stat behind one
+        // ~RTT-long critical section.
+        if self.enable_meta_cache {
+            let _guard = self.lock_path(&path).await;
+            if let Some(status) = self.unlinked_status(ino) {
+                return Ok(status);
+            }
+            let status = self.fs.get_status(&path).await?;
+            self.cache_resolved_status(ino, None, &status);
             return Ok(status);
         }
 
+        if let Some(status) = self.unlinked_status(ino) {
+            return Ok(status);
+        }
         let status = self.fs.get_status(&path).await?;
-        self.cache_resolved_status(ino, None, &status);
         Ok(status)
     }
 
@@ -1911,6 +1925,45 @@ mod test {
                     .unwrap()
                     .n_lookup(),
                 1
+            );
+        });
+    }
+
+    #[test]
+    fn stat_without_meta_cache_does_not_wait_on_path_lock() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.enable_meta_cache = false;
+            conf.fuse.metrics_enabled = false;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = Arc::new(NodeState::new(fs).unwrap());
+
+            let ino = {
+                let mut dir = state.dir_write();
+                let mut status = FileStatus::with_name(43, "stat-no-cache".to_string(), false);
+                status.mode = 0o644;
+                dir.lookup(FUSE_ROOT_ID, "stat-no-cache", status, true)
+                    .unwrap()
+                    .ino
+            };
+
+            // Hold the path lock across the would-be RPC. With the metadata
+            // cache disabled stat must not queue behind it: the kernel
+            // revalidates the mount root on every traversal, so holding this
+            // lock across the RPC serializes every stat in the mount.
+            let path = state.get_path(ino).unwrap();
+            let guard = state.lock_path(&path).await;
+
+            let task_state = state.clone();
+            let stat_task = tokio::spawn(async move { task_state.fs_stat_guarded(ino).await });
+            let finished =
+                tokio::time::timeout(std::time::Duration::from_secs(2), stat_task).await;
+            drop(guard);
+
+            assert!(
+                finished.is_ok(),
+                "fs_stat_guarded must not wait on the path lock when the meta cache is disabled"
             );
         });
     }
