@@ -15,7 +15,6 @@
 pub use crate::s3::error_code::Error;
 use std::{
     fmt::{Debug, Display},
-    io::Write,
     str::FromStr,
 };
 
@@ -1254,18 +1253,25 @@ pub struct MultiUploadObjectCompleteOption {
 ///
 /// Deep async call chains require heap-allocated futures to prevent stack overflow.
 /// This is a necessary trade-off: async_trait boxes futures, but prevents crashes.
-/// AsyncReadEnum still provides zero-allocation for body reading.
+/// Part bodies are streamed straight into temp storage, so nothing here
+/// buffers a whole part.
 #[async_trait::async_trait]
 pub trait MultiUploadObjectHandler: Send + Sync {
     async fn handle_create_session(&self, bucket: String, key: String) -> Result<String, ()>;
 
-    async fn handle_upload_part(
+    /// Stages the part body into the configured temp storage.
+    ///
+    /// `expect` carries the checks the body must satisfy before the part is
+    /// visible; leaving it to the handler lets both the local and the Curvine
+    /// backend verify while streaming, without buffering the part in memory.
+    async fn handle_upload_part<R: crate::utils::io::PollRead + Send>(
         &self,
         bucket: String,
         key: String,
         upload_id: String,
         part_number: u32,
-        body: crate::utils::io::AsyncReadEnum,
+        body: &mut R,
+        expect: crate::utils::temp_storage::StageExpect<'_>,
     ) -> Result<String, ()>;
 
     async fn handle_complete(
@@ -1401,8 +1407,32 @@ pub async fn handle_multipart_upload_part<
         return;
     }
 
+    use crate::auth::sig_v4::VHeader as _;
     let header = req.take_header();
-    let body_reader = match req.get_body_reader().await {
+    // The part streams straight into the configured temp storage. Buffering it
+    // first would hold a whole part (up to the S3 5 GiB limit) in memory, and
+    // `panic = "abort"` turns that out-of-memory into a gateway-wide abort.
+    if let Err(status) = reject_streaming_part(&header) {
+        log::warn!("chunked aws-chunked part bodies are not supported");
+        resp.set_status(status);
+        resp.send_header();
+        return;
+    }
+    let content_length = match multipart_part_length(&header) {
+        Ok(length) => length,
+        Err(status) => {
+            resp.set_status(status);
+            resp.send_header();
+            return;
+        }
+    };
+    let declared_sha256 = header.get_header("x-amz-content-sha256");
+    let expect = crate::utils::temp_storage::StageExpect {
+        sha256_hex: part_sha256(declared_sha256.as_deref()),
+        content_length: Some(content_length),
+    };
+
+    let mut body_reader = match req.get_body_reader().await {
         Ok(body_reader) => body_reader,
         Err(err) => {
             log::error!("get body reader failed {err}");
@@ -1412,47 +1442,16 @@ pub async fn handle_multipart_upload_part<
         }
     };
 
-    let (body, release) = match get_body_stream(body_reader, &header).await {
-        Ok(data) => data,
-        Err(err) => {
-            log::error!("get body stream error {err}");
-            resp.set_status(500);
-            resp.send_header();
-            return;
-        }
-    };
-
-    let ret = match body {
-        StreamType::File(file) => {
-            let body = crate::utils::io::AsyncReadEnum::File(file);
-            handler
-                .handle_upload_part(
-                    raw[0].to_string(),
-                    raw[1].to_string(),
-                    upload_id.clone(),
-                    part_number,
-                    body,
-                )
-                .await
-        }
-
-        StreamType::Buff(buf_reader) => {
-            let body = crate::utils::io::AsyncReadEnum::BufCursor(buf_reader);
-            handler
-                .handle_upload_part(
-                    raw[0].to_string(),
-                    raw[1].to_string(),
-                    upload_id.clone(),
-                    part_number,
-                    body,
-                )
-                .await
-        }
-    };
-
-    if let Some(release) = release {
-        release.await;
-    }
+    let ret = handler
+        .handle_upload_part(
+            raw[0].to_string(),
+            raw[1].to_string(),
+            upload_id.clone(),
+            part_number,
+            &mut body_reader,
+            expect,
+        )
+        .await;
 
     if let Ok(etag) = ret {
         resp.set_header("etag", &etag);
@@ -1460,6 +1459,52 @@ pub async fn handle_multipart_upload_part<
         resp.set_status(500);
         resp.send_header();
     }
+}
+
+/// Reject the SigV4 streaming framing, which this build does not decode.
+///
+/// Its bytes are length-prefixed chunk records, not part content, so staging
+/// them would store a corrupt part. `Content-Length` is also only an estimate
+/// for that framing, which makes the length check meaningless.
+fn reject_streaming_part<H: crate::auth::sig_v4::VHeader>(header: &H) -> Result<(), u16> {
+    if header
+        .get_header("x-amz-content-sha256")
+        .is_some_and(|value| value == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+    {
+        return Err(400);
+    }
+    Ok(())
+}
+
+/// Largest part S3 accepts. A larger declared length is a client error, not a
+/// reason to allocate whichever size the header names.
+const MAX_PART_BYTES: usize = 5 << 30;
+
+/// Digest a part body must match, or `None` when the client sent no verifiable
+/// hash.
+///
+/// `UNSIGNED-PAYLOAD` carries no whole-body digest. Comparing that literal
+/// string with the computed hash is what used to fail every unsigned part
+/// above the in-memory threshold. The streaming framing is rejected earlier,
+/// so it never reaches this filter.
+fn part_sha256(declared: Option<&str>) -> Option<&str> {
+    declared.filter(|value| *value != "UNSIGNED-PAYLOAD")
+}
+
+/// Declared part length, or the status to answer with.
+///
+/// A part body is only streamable with a known length: without it the read
+/// loop cannot bound the part or report a truncated upload.
+fn multipart_part_length<H: crate::auth::sig_v4::VHeader>(header: &H) -> Result<usize, u16> {
+    let raw = match header.get_header("content-length") {
+        Some(value) => value,
+        None => return Err(411),
+    };
+    let length = raw.trim().parse::<usize>().map_err(|_| 400_u16)?;
+    if length > MAX_PART_BYTES {
+        return Err(400);
+    }
+    Ok(length)
 }
 
 pub async fn handle_multipart_complete_session<
@@ -2036,139 +2081,7 @@ pub async fn handle_delete_bucket<
 }
 
 //utils
-// Use unified BodyParseError from crate::error module
 pub use crate::error::BodyParseError as ParseBodyError;
-enum StreamType {
-    File(tokio::fs::File),
-    Buff(tokio::io::BufReader<std::io::Cursor<Vec<u8>>>),
-}
-
-async fn get_body_stream<T: crate::utils::io::PollRead + Send, H: crate::auth::sig_v4::VHeader>(
-    mut src: T,
-    header: &H,
-) -> Result<
-    (
-        StreamType,
-        Option<std::pin::Pin<Box<dyn Send + std::future::Future<Output = ()>>>>,
-    ),
-    ParseBodyError,
-> {
-    let cl = header.get_header("content-length");
-    let has_content_length = cl.is_some();
-    let acs = header
-        .get_header("x-amz-content-sha256")
-        .ok_or(ParseBodyError::HashMismatch)?;
-    if let Some(cl) = cl {
-        let cl = cl
-            .as_str()
-            .parse::<usize>()
-            .or(Err(ParseBodyError::ContentLengthMismatch))?;
-        if acs.as_str() != "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
-            if cl <= 10 << 20 {
-                // Use BytesMut to avoid zero-prefilled Vec allocation
-                use bytes::BytesMut;
-                let mut buff = BytesMut::new();
-
-                // Read data using PollRead and accumulate in BytesMut
-                let mut hsh = sha2::Sha256::new();
-                let mut remaining = cl;
-                while let Some(chunk) = src.poll_read().await.map_err(ParseBodyError::Io)? {
-                    let chunk_len = chunk.len();
-                    if remaining < chunk_len {
-                        return Err(ParseBodyError::ContentLengthMismatch);
-                    }
-                    remaining -= chunk_len;
-                    let _ = hsh.write_all(&chunk);
-                    buff.extend_from_slice(&chunk);
-                }
-
-                // Verify SHA256 if not UNSIGNED-PAYLOAD
-                if acs.as_str() != "UNSIGNED-PAYLOAD" {
-                    let ret = hsh.finalize();
-                    let real_sha256 = hex::encode(ret);
-                    if real_sha256.as_str() != acs.as_str() {
-                        return Err(ParseBodyError::HashMismatch);
-                    }
-                }
-
-                return Ok((
-                    StreamType::Buff(tokio::io::BufReader::new(std::io::Cursor::new(
-                        buff.to_vec(),
-                    ))),
-                    None,
-                ));
-            } else {
-                let file_name = format!(
-                    "/tmp/curvine-temp/{}",
-                    &uuid::Uuid::new_v4().to_string()[..8]
-                );
-                let mut fd = tokio::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o644)
-                    .open(file_name.as_str())
-                    .await
-                    .map_err(|err| ParseBodyError::Io(err.to_string()))?;
-                parse_body(src, &mut fd, &acs, cl).await?;
-                drop(fd);
-                match tokio::fs::OpenOptions::new()
-                    .read(true)
-                    .open(file_name.as_str())
-                    .await
-                {
-                    Ok(fd) => {
-                        return Ok((
-                            StreamType::File(fd),
-                            Some({
-                                Box::pin(async move {
-                                    let _ = tokio::fs::remove_file(file_name.as_str()).await;
-                                })
-                            }),
-                        ))
-                    }
-                    Err(err) => {
-                        let _ = tokio::fs::remove_file(file_name.as_str()).await;
-                        return Err(ParseBodyError::Io(err.to_string()));
-                    }
-                }
-                // return Ok(())
-            }
-        }
-    }
-
-    // Chunked (aws-chunked / SigV4 streaming) and unknown-length bodies reach
-    // here. This build does not decode them: the workspace sets
-    // `panic = "abort"`, so an unimplemented body must be rejected with a
-    // client error instead of aborting the whole gateway process.
-    Err(ParseBodyError::Unsupported(format!(
-        "chunked request bodies are not supported (content-sha256: {}, content-length: {})",
-        acs.as_str(),
-        has_content_length
-    )))
-}
-
-async fn parse_body<
-    T: crate::utils::io::PollRead + Send,
-    E: tokio::io::AsyncWrite + Send + Unpin,
->(
-    src: T,
-    dst: &mut E,
-    content_sha256: &str,
-    content_length: usize,
-) -> Result<(), ParseBodyError> {
-    use tokio::io::AsyncWriteExt;
-
-    let (chunks, _hash) = read_and_validate_body(src, content_sha256, content_length).await?;
-
-    // Write all chunks to destination
-    for chunk in chunks {
-        dst.write_all(&chunk)
-            .await
-            .map_err(|err| ParseBodyError::Io(format!("write error {err}")))?;
-    }
-
-    Ok(())
-}
 
 #[async_trait::async_trait]
 impl crate::utils::io::PollRead for tokio::io::BufReader<std::io::Cursor<Vec<u8>>> {
@@ -2252,4 +2165,168 @@ async fn read_body_to_vec<T: crate::utils::io::PollRead + Send>(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::sig_v4::VHeader;
+    use std::collections::HashMap;
+
+    struct Headers(HashMap<String, String>);
+
+    impl VHeader for Headers {
+        fn get_header(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_header(&mut self, key: &str, val: &str) {
+            self.0.insert(key.to_string(), val.to_string());
+        }
+
+        fn delete_header(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+
+        fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
+            for (key, value) in &self.0 {
+                if !cb(key, value) {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn part_header(length: &str, sha256: Option<&str>) -> Headers {
+        let mut map = HashMap::from([("content-length".to_string(), length.to_string())]);
+        if let Some(sha256) = sha256 {
+            map.insert("x-amz-content-sha256".to_string(), sha256.to_string());
+        }
+        Headers(map)
+    }
+
+    /// The declared length is a client claim: an oversized part must be
+    /// refused before anything allocates that much memory.
+    #[test]
+    fn rejects_an_oversized_part_length() {
+        assert_eq!(multipart_part_length(&part_header("6GB", None)), Err(400));
+        assert_eq!(
+            multipart_part_length(&part_header("5368709121", None)),
+            Err(400)
+        );
+        assert_eq!(
+            multipart_part_length(&part_header("5368709120", None)),
+            Ok(MAX_PART_BYTES)
+        );
+    }
+
+    /// Without a length the part cannot be bounded or checked for truncation.
+    #[test]
+    fn rejects_a_part_without_content_length() {
+        let header = Headers(HashMap::new());
+        assert_eq!(multipart_part_length(&header), Err(411));
+    }
+
+    /// A part body is not staged into memory, so the digest and length are
+    /// enforced while writing it. An unsigned part must not be compared with
+    /// the literal header text, which used to fail every such part.
+    #[tokio::test]
+    async fn write_part_stream_verifies_length_and_digest() {
+        use crate::utils::temp_storage::{LocalTempStorage, StageExpect, TempStorageConfig};
+        use std::io::Cursor;
+
+        let dir = std::env::temp_dir().join(format!("curvine-part-{}", uuid::Uuid::new_v4()));
+        let storage = LocalTempStorage::new(TempStorageConfig::new(
+            dir.to_str().unwrap().to_string(),
+            1024,
+            4096,
+        ));
+        let data = vec![7u8; 8192];
+        let digest = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&data))
+        };
+
+        let mut body = tokio::io::BufReader::new(Cursor::new(data.clone()));
+        let etag = storage
+            .write_part_stream(
+                "upload",
+                1,
+                &mut body,
+                StageExpect {
+                    sha256_hex: Some(&digest),
+                    content_length: Some(data.len()),
+                },
+            )
+            .await
+            .expect("a verified part must be staged");
+        assert!(etag.starts_with('"') && etag.ends_with('"'));
+
+        // Unsigned payload: length only.
+        let mut body = tokio::io::BufReader::new(Cursor::new(data.clone()));
+        storage
+            .write_part_stream(
+                "upload",
+                2,
+                &mut body,
+                StageExpect {
+                    sha256_hex: None,
+                    content_length: Some(data.len()),
+                },
+            )
+            .await
+            .expect("an unsigned part must be accepted");
+
+        // A wrong digest must fail and leave no part behind for Complete.
+        let mut body = tokio::io::BufReader::new(Cursor::new(data.clone()));
+        let err = storage
+            .write_part_stream(
+                "upload",
+                3,
+                &mut body,
+                StageExpect {
+                    sha256_hex: Some("00"),
+                    content_length: Some(data.len()),
+                },
+            )
+            .await
+            .expect_err("a wrong digest must be rejected");
+        assert!(err.contains("sha256"), "{err}");
+        assert!(
+            !tokio::fs::try_exists(storage_part_path(&dir, "upload", 3))
+                .await
+                .unwrap_or(false),
+            "a rejected part must not be left for Complete"
+        );
+
+        // A short body must not silently produce a truncated part.
+        let mut body = tokio::io::BufReader::new(Cursor::new(data[..16].to_vec()));
+        let err = storage
+            .write_part_stream(
+                "upload",
+                4,
+                &mut body,
+                StageExpect {
+                    sha256_hex: None,
+                    content_length: Some(data.len()),
+                },
+            )
+            .await
+            .expect_err("a short body must be rejected");
+        assert!(err.contains("length"), "{err}");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    fn storage_part_path(dir: &std::path::Path, upload_id: &str, part: u32) -> std::path::PathBuf {
+        dir.join(upload_id).join(part.to_string())
+    }
+
+    #[test]
+    fn unsigned_parts_carry_no_digest() {
+        assert_eq!(part_sha256(Some("UNSIGNED-PAYLOAD")), None);
+        assert_eq!(part_sha256(None), None);
+        // A real digest is verified, not skipped.
+        assert_eq!(part_sha256(Some("abc")), Some("abc"));
+    }
 }

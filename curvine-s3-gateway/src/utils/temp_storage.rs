@@ -120,13 +120,20 @@ impl LocalTempStorage {
         }
     }
 
-    /// Stream write part data, returns ETag (MD5 hash)
-    pub async fn write_part_stream(
+    /// Stream a part body into the upload session, verifying it while writing.
+    ///
+    /// Returns the part ETag (its MD5). The body is consumed chunk by chunk: a
+    /// part may be up to the S3 5 GiB limit, so buffering it first would be an
+    /// out-of-memory abort rather than a failed request. A part that fails
+    /// `expect` is removed, so the session only ever holds verified parts.
+    pub async fn write_part_stream<R: crate::utils::io::PollRead + Send>(
         &self,
         upload_id: &str,
         part_number: u32,
-        body: &mut crate::utils::io::AsyncReadEnum,
+        body: &mut R,
+        expect: StageExpect<'_>,
     ) -> Result<String, String> {
+        use sha2::Digest;
         use tokio::io::AsyncWriteExt;
 
         let path = self.part_path(upload_id, part_number);
@@ -144,27 +151,19 @@ impl LocalTempStorage {
             .map_err(|e| format!("Failed to create part file {}: {}", path, e))?;
 
         let mut hasher = md5::Context::new();
+        let mut sha256 = sha2::Sha256::new();
         let buffer_size = self.config.buffer_size();
         let threshold = self.config.memory_buffer_threshold;
         let mut memory_buf = BytesMut::with_capacity(threshold.min(buffer_size));
-        let mut temp_buf = BytesMut::with_capacity(buffer_size);
-        temp_buf.resize(buffer_size, 0);
+        let mut staged: usize = 0;
 
-        loop {
-            let n = body
-                .read(&mut temp_buf)
-                .await
-                .map_err(|e| format!("Failed to read from body: {}", e))?;
+        while let Some(chunk) = body.poll_read().await? {
+            staged += chunk.len();
+            sha256.update(&chunk);
+            hasher.consume(&chunk);
 
-            if n == 0 {
-                break;
-            }
-
-            let chunk = &temp_buf[..n];
-            hasher.consume(chunk);
-
-            if memory_buf.len() + n <= threshold {
-                memory_buf.extend_from_slice(chunk);
+            if memory_buf.len() + chunk.len() <= threshold {
+                memory_buf.extend_from_slice(&chunk);
             } else {
                 if !memory_buf.is_empty() {
                     file.write_all(&memory_buf)
@@ -172,7 +171,7 @@ impl LocalTempStorage {
                         .map_err(|e| format!("Failed to write to part file: {}", e))?;
                     memory_buf.clear();
                 }
-                file.write_all(chunk)
+                file.write_all(&chunk)
                     .await
                     .map_err(|e| format!("Failed to write to part file: {}", e))?;
             }
@@ -187,6 +186,12 @@ impl LocalTempStorage {
         file.flush()
             .await
             .map_err(|e| format!("Failed to flush part file: {}", e))?;
+        drop(file);
+
+        if let Err(mismatch) = expect.check(staged, &hex::encode(sha256.finalize())) {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(mismatch);
+        }
 
         let digest = hasher.compute();
         Ok(format!("\"{:x}\"", digest))
@@ -356,13 +361,19 @@ impl CurvineTempStorage {
         }
     }
 
-    /// Stream write part data, returns ETag (MD5 hash)
-    pub async fn write_part_stream(
+    /// Stream a part body into Curvine staging, verifying it while writing.
+    ///
+    /// Same contract as the local backend: no full-part buffering, and a part
+    /// that fails `expect` is deleted instead of being left for `Complete`.
+    pub async fn write_part_stream<R: crate::utils::io::PollRead + Send>(
         &self,
         upload_id: &str,
         part_number: u32,
-        body: &mut crate::utils::io::AsyncReadEnum,
+        body: &mut R,
+        expect: StageExpect<'_>,
     ) -> Result<String, String> {
+        use sha2::Digest;
+
         let dir_path = self.dir_path(upload_id)?;
         let _ = self.fs.mkdir(&dir_path, true).await;
 
@@ -374,27 +385,19 @@ impl CurvineTempStorage {
             .map_err(|e| format!("Failed to create part file in Curvine: {}", e))?;
 
         let mut hasher = md5::Context::new();
+        let mut sha256 = sha2::Sha256::new();
         let buffer_size = self.config.buffer_size();
         let threshold = self.config.memory_buffer_threshold;
         let mut memory_buf = BytesMut::with_capacity(threshold.min(buffer_size));
-        let mut temp_buf = BytesMut::with_capacity(buffer_size);
-        temp_buf.resize(buffer_size, 0);
+        let mut staged: usize = 0;
 
-        loop {
-            let n = body
-                .read(&mut temp_buf)
-                .await
-                .map_err(|e| format!("Failed to read from body: {}", e))?;
+        while let Some(chunk) = body.poll_read().await? {
+            staged += chunk.len();
+            sha256.update(&chunk);
+            hasher.consume(&chunk);
 
-            if n == 0 {
-                break;
-            }
-
-            let chunk = &temp_buf[..n];
-            hasher.consume(chunk);
-
-            if memory_buf.len() + n <= threshold {
-                memory_buf.extend_from_slice(chunk);
+            if memory_buf.len() + chunk.len() <= threshold {
+                memory_buf.extend_from_slice(&chunk);
             } else {
                 if !memory_buf.is_empty() {
                     writer
@@ -404,7 +407,7 @@ impl CurvineTempStorage {
                     memory_buf.clear();
                 }
                 writer
-                    .write(chunk)
+                    .write(&chunk)
                     .await
                     .map_err(|e| format!("Failed to write part data to Curvine: {}", e))?;
             }
@@ -421,6 +424,11 @@ impl CurvineTempStorage {
             .complete()
             .await
             .map_err(|e| format!("Failed to complete part write in Curvine: {}", e))?;
+
+        if let Err(mismatch) = expect.check(staged, &hex::encode(sha256.finalize())) {
+            let _ = self.fs.delete_with_opts(&path, true, true).await;
+            return Err(mismatch);
+        }
 
         let digest = hasher.compute();
         Ok(format!("\"{:x}\"", digest))
@@ -662,15 +670,22 @@ impl TempStorageEnum {
     }
 
     /// Stream write part data, returns ETag (MD5 hash)
-    pub async fn write_part_stream(
+    pub async fn write_part_stream<R: crate::utils::io::PollRead + Send>(
         &self,
         upload_id: &str,
         part_number: u32,
-        body: &mut crate::utils::io::AsyncReadEnum,
+        body: &mut R,
+        expect: StageExpect<'_>,
     ) -> Result<String, String> {
         match self {
-            TempStorageEnum::Local(s) => s.write_part_stream(upload_id, part_number, body).await,
-            TempStorageEnum::Curvine(s) => s.write_part_stream(upload_id, part_number, body).await,
+            TempStorageEnum::Local(s) => {
+                s.write_part_stream(upload_id, part_number, body, expect)
+                    .await
+            }
+            TempStorageEnum::Curvine(s) => {
+                s.write_part_stream(upload_id, part_number, body, expect)
+                    .await
+            }
         }
     }
 
@@ -846,11 +861,11 @@ mod tests {
         storage.create_dir(upload_id).await.unwrap();
 
         let small_data = b"Hello, World!";
-        let mut body = crate::utils::io::AsyncReadEnum::BufCursor(tokio::io::BufReader::new(
-            Cursor::new(small_data.to_vec()),
-        ));
+        let mut body = tokio::io::BufReader::new(Cursor::new(small_data.to_vec()));
 
-        let etag = storage.write_part_stream(upload_id, 1, &mut body).await;
+        let etag = storage
+            .write_part_stream(upload_id, 1, &mut body, StageExpect::default())
+            .await;
         assert!(etag.is_ok());
         let etag_value = etag.unwrap();
         assert!(etag_value.starts_with('"'));
@@ -861,11 +876,11 @@ mod tests {
         assert_eq!(file_data, small_data);
 
         let large_data: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
-        let mut body2 = crate::utils::io::AsyncReadEnum::BufCursor(tokio::io::BufReader::new(
-            Cursor::new(large_data.clone()),
-        ));
+        let mut body2 = tokio::io::BufReader::new(Cursor::new(large_data.clone()));
 
-        let etag2 = storage.write_part_stream(upload_id, 2, &mut body2).await;
+        let etag2 = storage
+            .write_part_stream(upload_id, 2, &mut body2, StageExpect::default())
+            .await;
         assert!(etag2.is_ok());
 
         let part_path2 = storage.part_path(upload_id, 2);

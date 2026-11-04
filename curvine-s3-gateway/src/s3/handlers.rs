@@ -539,19 +539,20 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         Ok(upload_id)
     }
 
-    async fn handle_upload_part(
+    async fn handle_upload_part<R: crate::utils::io::PollRead + Send>(
         &self,
         _bucket: String,
         _key: String,
         upload_id: String,
         part_number: u32,
-        mut body: crate::utils::io::AsyncReadEnum,
+        body: &mut R,
+        expect: crate::utils::temp_storage::StageExpect<'_>,
     ) -> Result<String, ()> {
-        // Use streaming write to avoid loading entire part into memory
-        // This is critical for large parts (S3 allows up to 5GB per part)
+        // Streaming write: a part can be up to the S3 5 GiB limit, so it is
+        // hashed and written chunk by chunk instead of buffered in memory.
         match self
             .temp_storage
-            .write_part_stream(&upload_id, part_number, &mut body)
+            .write_part_stream(&upload_id, part_number, body, expect)
             .await
         {
             Ok(etag) => {

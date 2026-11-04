@@ -132,31 +132,6 @@ pub mod io {
         }
     }
 
-    pub enum AsyncReadEnum {
-        File(tokio::fs::File),
-        BufCursor(tokio::io::BufReader<std::io::Cursor<Vec<u8>>>),
-    }
-
-    impl AsyncReadEnum {
-        #[inline]
-        pub async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            use tokio::io::AsyncReadExt;
-            match self {
-                AsyncReadEnum::File(f) => f.read(buf).await,
-                AsyncReadEnum::BufCursor(r) => r.read(buf).await,
-            }
-        }
-
-        #[inline]
-        pub async fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-            use tokio::io::AsyncReadExt;
-            match self {
-                AsyncReadEnum::File(f) => f.read_to_end(buf).await,
-                AsyncReadEnum::BufCursor(r) => r.read_to_end(buf).await,
-            }
-        }
-    }
-
     /// Legacy trait for async reading - uses async_trait for object safety
     ///
     /// **Prefer `PollReaderEnum` for new code** - provides zero-allocation dispatch.
