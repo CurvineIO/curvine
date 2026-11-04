@@ -23,7 +23,7 @@ use curvine_core_error::try_option_ref;
 use curvine_fs_api::Path;
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{FileStatus, SetAttrOpts};
-use curvine_runtime::common::{FastHashMap, LocalTime};
+use curvine_runtime::common::{FastHashMap, FastHashSet, LocalTime};
 use curvine_runtime::sync::AtomicCounter;
 
 /// Snapshot of dentry state before `unlink`, used to roll back local mutations when
@@ -168,6 +168,19 @@ impl DirTree {
 
     fn remove_inode(&mut self, ino: u64) {
         self.inodes.remove(&ino);
+    }
+
+    /// Remove `ino` when neither the kernel nor a dcache dentry references it
+    /// any more. Returns whether it was removed.
+    pub fn reclaim_if_unreferenced(&mut self, ino: u64) -> bool {
+        let should_remove = self
+            .inodes
+            .get(&ino)
+            .is_some_and(|inode| inode.should_unref());
+        if should_remove {
+            self.remove_inode(ino);
+        }
+        should_remove
     }
 
     fn validate_backend_id(cv_id: i64) -> FuseResult<()> {
@@ -337,6 +350,18 @@ impl DirTree {
             dir.mark_deleted_child(removed_name.clone());
         }
 
+        // A pending deferred delete is completed through release, which does
+        // not know the unlink (parent, name) — it uses the canonical fields.
+        // Point them at the name being unlinked: for the last link this is the
+        // only remaining dentry, and a stale canonical location (e.g. a
+        // repoint that found no survivor) would clear the wrong parent's
+        // `deleted_children` marker when the delete completes.
+        if set_inode_mark_delete {
+            let inode = self.get_inode_mut_check(ino, None)?;
+            inode.parent = parent;
+            inode.name = removed_name.clone();
+        }
+
         // get_path(ino) is used for subsequent opens. If the canonical dentry
         // was removed, repoint it at one of the surviving hard-link names.
         let mut repointed = false;
@@ -420,7 +445,12 @@ impl DirTree {
             None => return Ok(()),
             Some(inode) => {
                 inode.sub_lookup(n_lookup);
-                inode.should_unref()
+                // A pending deferred delete still needs the inode to carry
+                // the recorded path / master id to release time. Dropping it
+                // here would lose the deletion (and its `deleted_children`
+                // marker) instead of completing it. The post-completion
+                // cleanup removes it once the mark is cleared.
+                !inode.mark_delete && inode.should_unref()
             }
         };
         if should_unref {
@@ -634,14 +664,17 @@ impl DirTree {
     /// Clear deferred-delete state after delete completion so release does not delete twice.
     pub fn clear_mark_delete(&mut self, ino: u64) -> FuseResult<()> {
         // Limit the inode borrow before calling get_dir_mut_check, which also borrows inodes.
-        let (parent, name) = {
+        let (parent, name, reclaim) = {
             let Some(inode) = self.inodes.get_mut(&ino) else {
                 return Ok(());
             };
             inode.mark_delete = false;
             inode.deferred_delete_path = None;
             inode.deferred_delete_master_id = 0;
-            (inode.parent, inode.name.clone())
+            // `forget` deliberately keeps mark_delete inodes alive; once the
+            // mark is cleared here the inode may now be fully unreferenced.
+            let reclaim = inode.should_unref();
+            (inode.parent, inode.name.clone(), reclaim)
         };
         // A missing parent directory means there is no deleted_children entry
         // left to clear: the ancestor was evicted. Treat it as nothing to do
@@ -649,6 +682,9 @@ impl DirTree {
         // whole successful deferred delete with ENOENT (#1395).
         if let Ok(dir) = self.get_dir_mut_check(parent) {
             dir.clear_deleted_child(&name);
+        }
+        if reclaim {
+            self.remove_inode(ino);
         }
         Ok(())
     }
@@ -710,6 +746,27 @@ impl DirTree {
             .and_then(|inode| {
                 (inode.deferred_delete_master_id > 0).then_some(inode.deferred_delete_master_id)
             })
+    }
+
+    /// Whether the dcache still associates the pending-delete inode's
+    /// canonical name with that inode.
+    ///
+    /// `true` when the name has no local dentry at all (the normal deferred
+    /// case: `unlink` removed it) or when the parent was evicted. `false` when
+    /// the name was reused locally and now maps to a different inode, which
+    /// means the recorded path no longer describes this deletion target.
+    pub fn deferred_delete_dentry_intact(&self, ino: u64) -> bool {
+        let Some(inode) = self.inodes.get(&ino) else {
+            return false;
+        };
+        let (parent, name) = (inode.parent, inode.name.as_str());
+        let Some(parent) = self.inodes.get(&parent) else {
+            return true;
+        };
+        let Some(dir) = parent.dir.as_ref() else {
+            return true;
+        };
+        dir.children.get(name).is_none_or(|child| *child == ino)
     }
 
     pub fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
@@ -807,7 +864,15 @@ impl DirTree {
     /// `evict_candidates` ran under a separate lock.
     pub fn evict(&mut self, inos: &[u64], has_handle: impl Fn(u64) -> bool) -> usize {
         let ttl = self.cache_ttl;
-        let mut evicted = 0;
+        let mut single = Vec::new();
+        // Hardlinked / aliased inodes (lookup by backend id re-points the
+        // canonical dentry but leaves the old one in place) own more than one
+        // parent entry. Removing only `inode.parent`/`inode.name` would leave
+        // the other parents' `children` maps pointing at an inode that no
+        // longer exists: a dangling dentry that also pins those directories
+        // forever (they only become evictable once `children` is empty).
+        // Those entries are removed with one shared scan instead.
+        let mut aliased = FastHashSet::default();
         for ino in inos {
             let Some(inode) = self.inodes.get(ino) else {
                 continue;
@@ -819,14 +884,34 @@ impl DirTree {
             if !inode.can_evict(ttl) || has_handle(*ino) {
                 continue;
             }
-            let parent = inode.parent;
-            let name = inode.name.clone();
-            if let Some(dir) = self.inodes.get_mut(&parent) {
-                dir.remove_child(&name)
+            if inode.ref_ctr > 1 {
+                aliased.insert(*ino);
+            } else {
+                single.push((*ino, inode.parent, inode.name.clone()));
             }
-            self.remove_inode(*ino);
+        }
+
+        let mut evicted = 0;
+        for (ino, parent, name) in single {
+            if let Some(dir) = self.inodes.get_mut(&parent) {
+                dir.remove_child(&name);
+            }
+            self.remove_inode(ino);
             evicted += 1;
         }
+
+        if !aliased.is_empty() {
+            for parent in self.inodes.values_mut() {
+                if let Some(dir) = parent.dir.as_mut() {
+                    dir.children.retain(|_, child| !aliased.contains(child));
+                }
+            }
+            for ino in aliased.iter().copied() {
+                self.remove_inode(ino);
+                evicted += 1;
+            }
+        }
+
         evicted
     }
 }
@@ -1048,7 +1133,98 @@ mod test {
 
         t.clear_mark_delete(300).unwrap();
         assert!(!t.get_dir_check(FUSE_ROOT_ID).unwrap().is_deleted_child("d"));
-        assert!(!t.get_inode_check(300, None).unwrap().mark_delete);
+        assert!(
+            t.get_inode(300, None::<&str>).is_none(),
+            "completion must reclaim the now-unreferenced inode"
+        );
+    }
+
+    /// FORGET arrives after unlink in the normal kernel sequence (unlink, then
+    /// the dentry stops being referenced). Dropping the inode there would lose
+    /// the recorded deferred-delete target and leave `deleted_children` behind.
+    #[test]
+    fn forget_keeps_pending_delete_until_completed() {
+        let mut t = DirTree::default();
+        let ino = t
+            .lookup(FUSE_ROOT_ID, "pending", file_st("pending", 900), true)
+            .unwrap()
+            .ino;
+        t.unlink(FUSE_ROOT_ID, "pending", true).unwrap();
+        assert_eq!(t.get_inode_check(ino, None).unwrap().ref_ctr, 0);
+        assert_eq!(t.get_inode_check(ino, None).unwrap().n_lookup(), 1);
+
+        t.forget(ino, 1).unwrap();
+
+        assert!(
+            t.pending_delete(ino),
+            "a pending deferred delete must survive FORGET"
+        );
+        assert!(t.get_dir_check(FUSE_ROOT_ID)
+            .unwrap()
+            .is_deleted_child("pending"));
+
+        t.clear_mark_delete(ino).unwrap();
+        assert!(t.get_inode(ino, None::<&str>).is_none());
+    }
+
+    /// The canonical dentry must not have been re-pointed at a different inode
+    /// when release verifies the deferred-delete target.
+    #[test]
+    fn deferred_delete_dentry_intact_detects_reused_name() {
+        let mut t = DirTree::default();
+        let ino = t
+            .lookup(FUSE_ROOT_ID, "f", file_st("f", 700), true)
+            .unwrap()
+            .ino;
+        t.forget(ino, 1).unwrap();
+        t.unlink(FUSE_ROOT_ID, "f", true).unwrap();
+        assert!(t.deferred_delete_dentry_intact(ino));
+
+        // A different file reuses the name locally.
+        t.lookup(FUSE_ROOT_ID, "f", file_st("f", 701), true)
+            .unwrap();
+
+        assert!(
+            !t.deferred_delete_dentry_intact(ino),
+            "name mapped to another inode must fail the identity check"
+        );
+    }
+
+    /// Evicting an inode with several dentries (hardlink, or a lookup-by-id
+    /// that re-pointed the canonical entry) must remove every parent entry.
+    /// Removing only the canonical one dangles (`get_ino` returns a missing
+    /// inode) and pins the other parent forever: a directory only becomes
+    /// evictable once `children` is empty.
+    #[test]
+    fn evict_removes_all_dentries_of_aliased_inode() {
+        let mut t = DirTree::new(FuseConf {
+            node_cache_ttl: std::time::Duration::from_secs(60),
+            ..Default::default()
+        });
+        t.lookup(FUSE_ROOT_ID, "a", dir_st("a", 100), true)
+            .unwrap();
+        t.lookup(FUSE_ROOT_ID, "b", dir_st("b", 101), true)
+            .unwrap();
+        let f = t
+            .lookup(100, "f", file_st("f", 200), true)
+            .unwrap()
+            .ino;
+        t.lookup(101, "f", file_st("f", 200), true).unwrap();
+        assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, 2);
+
+        t.forget(f, 2).unwrap();
+        t.get_inode_mut(f, None).unwrap().last_access = 0;
+
+        evict_all(&mut t, |_| false);
+
+        assert!(
+            t.get_inode(f, None::<&str>).is_none(),
+            "aliased inode must be evicted"
+        );
+        assert!(t.get_dir_check(100).unwrap().children.is_empty());
+        assert!(t.get_dir_check(101).unwrap().children.is_empty());
+        assert!(t.get_ino(100, Some("f")).is_none());
+        assert!(t.get_ino(101, Some("f")).is_none());
     }
 
     /// Repeated lookup on the same name: n_lookup increases each time; ref_ctr increments only on first dirent.

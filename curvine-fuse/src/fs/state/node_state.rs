@@ -280,6 +280,11 @@ impl NodeState {
             evicted: batches.iter().sum(),
             batches,
         };
+        for _ in 0..stats.evicted {
+            FuseMetrics::with(|m| {
+                Self::dec_gauges_lockstep(&m.inode_num, &m.inode_count);
+            });
+        }
         info!(
             "node_state::clear: evicted {} of {} expired inodes in {} batches, remaining {}, \
              cost {} ms",
@@ -421,7 +426,16 @@ impl NodeState {
         new_id: u64,
         new_name: &str,
     ) -> FuseResult<()> {
-        self.dir_write().rename(old_id, old_name, new_id, new_name)
+        let before = self.dir_read().inode_lens();
+        let mut dir = self.dir_write();
+        let result = dir.rename(old_id, old_name, new_id, new_name);
+        let after = dir.inode_lens();
+        drop(dir);
+        // Rename-over may drop the replaced target inode.
+        for _ in 0..before.saturating_sub(after) {
+            FuseMetrics::with(|m| Self::dec_gauges_lockstep(&m.inode_num, &m.inode_count));
+        }
+        result
     }
 
     pub async fn find_writer(&self, ino: u64) -> Option<Arc<FuseWriter>> {
@@ -523,8 +537,16 @@ impl NodeState {
                 );
                 None
             } else {
-                let reader = self.new_reader(path).await?;
-                Some(Arc::new(reader))
+                match self.new_reader(path).await {
+                    Ok(reader) => Some(Arc::new(reader)),
+                    Err(e) => {
+                        // The writer reference taken above would otherwise leak:
+                        // the kernel never receives this handle, so it never
+                        // sends the RELEASE that would drop it.
+                        self.release_writer_ref(ino, &writer).await;
+                        return Err(e);
+                    }
+                }
             }
         } else {
             None
@@ -538,6 +560,22 @@ impl NodeState {
             .await;
 
         Ok(handle)
+    }
+
+    /// Drop one reference to the writer registered under `ino`, running the
+    /// same cleanup as handle release when it was the last one.
+    async fn release_writer_ref(&self, ino: u64, writer: &Arc<FuseWriter>) {
+        let cleanup = writer.clone();
+        let (_last, _result): (bool, Result<(), FsError>) = self
+            .writers
+            .release_with_cleanup(ino, move |last| async move {
+                if last {
+                    cleanup.complete(None).await
+                } else {
+                    cleanup.flush(None).await
+                }
+            })
+            .await;
     }
 
     /// Test-only: register a shared writer without going through `new_handle`
@@ -716,7 +754,15 @@ impl NodeState {
     }
 
     pub fn clear_mark_delete(&self, ino: u64) -> FuseResult<()> {
-        self.dir_write().clear_mark_delete(ino)
+        let before = self.dir_read().inode_lens();
+        let mut dir = self.dir_write();
+        let result = dir.clear_mark_delete(ino);
+        let after = dir.inode_lens();
+        drop(dir);
+        for _ in 0..before.saturating_sub(after) {
+            FuseMetrics::with(|m| Self::dec_gauges_lockstep(&m.inode_num, &m.inode_count));
+        }
+        result
     }
 
     /// Record the unlink-time Curvine path and master file id for a pending
@@ -736,15 +782,31 @@ impl NodeState {
         self.dir_read().deferred_delete_master_id(ino)
     }
 
+    /// Whether the dcache still associates the pending-delete inode's
+    /// canonical name with that inode. See `DirTree::deferred_delete_dentry_intact`.
+    pub fn deferred_delete_dentry_intact(&self, ino: u64) -> bool {
+        self.dir_read().deferred_delete_dentry_intact(ino)
+    }
+
     /// Clear inode `mark_delete` and the `deleted_children` entry for a specific
     /// hardlink name under `parent` (not the inode's primary parent/name).
     pub fn clear_unlink_state(&self, ino: u64, parent: u64, name: &str) -> FuseResult<()> {
+        let before = self.dir_read().inode_lens();
         let mut dir = self.dir_write();
         if let Some(inode) = dir.get_inode_mut(ino, None) {
             inode.mark_delete = false;
         }
         if let Ok(parent_dir) = dir.get_dir_mut_check(parent) {
             parent_dir.clear_deleted_child(name);
+        }
+        // The immediate (non-deferred) unlink path skipped reclaim because
+        // mark_delete was still set. Now that it is cleared the inode may be
+        // fully unreferenced; reclaim instead of waiting for the TTL sweep.
+        dir.reclaim_if_unreferenced(ino);
+        let after = dir.inode_lens();
+        drop(dir);
+        for _ in 0..before.saturating_sub(after) {
+            FuseMetrics::with(|m| Self::dec_gauges_lockstep(&m.inode_num, &m.inode_count));
         }
         Ok(())
     }
@@ -953,6 +1015,14 @@ impl NodeState {
     fn inc_gauges_lockstep(legacy: &curvine_metrics::Gauge, alias: &curvine_metrics::Gauge) {
         legacy.inc();
         alias.inc();
+    }
+
+    /// Account for inodes materialized outside `do_lookup_recorded` (the
+    /// readdir batch path, which holds the tree lock itself).
+    pub(crate) fn note_inodes_materialized(count: usize) {
+        for _ in 0..count {
+            FuseMetrics::with(|m| Self::inc_gauges_lockstep(&m.inode_num, &m.inode_count));
+        }
     }
 
     fn dec_gauges_lockstep(legacy: &curvine_metrics::Gauge, alias: &curvine_metrics::Gauge) {
@@ -1220,7 +1290,7 @@ impl NodeState {
         let path = self.get_path_name(ino, name)?;
         let _guard = self.lock_path(&path).await;
 
-        let handle = if flags.read_only() {
+        if flags.read_only() {
             // The file is completed right away, so a pre-allocated first
             // block would only be journaled, reserved and released again.
             let writer = self
@@ -1233,13 +1303,53 @@ impl NodeState {
 
             let child_ino = self.next_ino(&status)?;
             status.id = child_ino as i64;
-            let _ = self.lookup_status(ino, name, &status)?;
-            return self.new_handle(Some(child_ino), &path, flags, opts).await;
-        } else {
-            self.new_handle(None, &path, flags, opts).await?
-        };
-        self.lookup_status(ino, name, &handle.status())?;
-        Ok(handle)
+            let attr = self.lookup_status(ino, name, &status)?;
+            return match self.new_handle(Some(child_ino), &path, flags, opts).await {
+                Ok(handle) if handle.ino() == attr.ino => Ok(handle),
+                Ok(handle) => {
+                    self.rollback_created_handle(&handle, attr.ino).await;
+                    err_fuse!(
+                        libc::EIO,
+                        "ino mismatch after create: dcache returned ino={} but handle has ino={}",
+                        attr.ino,
+                        handle.ino()
+                    )
+                }
+                Err(e) => {
+                    // The kernel never receives the entry, so it will never
+                    // send the FORGET that should drop this lookup ref.
+                    let _ = self.forget(attr.ino, 1);
+                    Err(e)
+                }
+            };
+        }
+
+        let handle = self.new_handle(None, &path, flags, opts).await?;
+        match self.lookup_status(ino, name, &handle.status()) {
+            Ok(attr) if attr.ino == handle.ino() => Ok(handle),
+            Ok(attr) => {
+                self.rollback_created_handle(&handle, attr.ino).await;
+                err_fuse!(
+                    libc::EIO,
+                    "ino mismatch after create: dcache returned ino={} but handle has ino={}",
+                    attr.ino,
+                    handle.ino()
+                )
+            }
+            Err(e) => {
+                // Roll back the handle and writer: without a CREATE reply the
+                // kernel does not know the fh and never sends RELEASE.
+                let _ = self.release_handle(handle.ino(), handle.fh()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Undo the dcache lookup ref and handle registration of a CREATE that
+    /// cannot be returned to the kernel.
+    async fn rollback_created_handle(&self, handle: &Arc<FileHandle>, looked_up_ino: u64) {
+        let _ = self.release_handle(handle.ino(), handle.fh()).await;
+        let _ = self.forget(looked_up_ino, 1);
     }
 
     pub async fn fs_open(
@@ -1250,6 +1360,11 @@ impl NodeState {
     ) -> FuseResult<Arc<FileHandle>> {
         let flags = OpenFlags::new(flags);
         let path = self.get_path(ino)?;
+        // Serialize with fs_unlink: its open-handle checks decide between an
+        // immediate and a deferred backend delete, and an OPEN that slips in
+        // between the last check and the master delete would have its file
+        // removed while the handle is still live.
+        let _guard = self.lock_path(&path).await;
         self.new_handle(Some(ino), &path, flags, opts).await
     }
 

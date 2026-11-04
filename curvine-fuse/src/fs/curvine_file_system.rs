@@ -273,23 +273,30 @@ impl CurvineFileSystem {
         &self.state
     }
 
-    /// Verify that `path` still resolves on the master to the file recorded
-    /// for the pending deferred delete of `ino` (by master file id).
+    /// Verify that the pending deferred delete of `ino` still targets the file
+    /// that was unlinked.
     ///
-    /// Called only on the fallback lane (dcache path unavailable) while the
-    /// path lock is held. A successful `stat` whose id differs from the
-    /// recorded one means the name was reused after an ancestor rename and
-    /// must not be deleted. Any stat failure also fails verification, so a
-    /// delete is never issued against an unverified target (#1395).
+    /// Two checks run while the path lock is held:
+    /// 1. The dcache must not have re-pointed the inode's canonical name at a
+    ///    different inode (local create/rename-over after the unlink).
+    /// 2. When a master id was recorded, a fresh backend `stat` of `path` must
+    ///    still return it (a name reused by another client, or a renamed
+    ///    ancestor, resolves elsewhere).
+    ///
+    /// Any failure means "miss, not wrong delete": the caller skips the delete.
     async fn verify_deferred_delete_identity(&self, ino: u64, path: &Path) -> bool {
-        let Some(recorded_id) = self.state.deferred_delete_master_id(ino) else {
-            // No identity was recorded (older state, hardlink edge cases);
-            // without proof of identity, do not delete.
+        if !self.state.deferred_delete_dentry_intact(ino) {
             return false;
-        };
-        match self.state.fs_stat_by_path(path).await {
-            Ok(status) => status.id == recorded_id,
-            Err(_) => false,
+        }
+
+        match self.state.deferred_delete_master_id(ino) {
+            Some(recorded_id) => match self.state.fs_stat_by_path(path).await {
+                Ok(status) => status.id == recorded_id,
+                Err(_) => false,
+            },
+            // No identity was recorded (older state): only trust a path the
+            // dcache still resolves, never the recorded fallback.
+            None => self.state.get_path(ino).is_ok(),
         }
     }
 
@@ -522,27 +529,36 @@ impl CurvineFileSystem {
             });
         }
 
-        {
+        let lookup_result = {
             let mut dir = self.state.dir_write();
-            for entry in pending.iter_mut().filter(|e| e.is_child) {
-                // READDIRPLUS takes a kernel lookup ref (kernel caches the
-                // dentry and will send a FORGET); plain READDIR must not
-                // (kernel returns names only, no lookup count, no FORGET).
-                // `lookup` fails before it bumps that ref (see `DirTree::lookup`),
-                // so bailing out below cannot leave a ref the kernel never repays.
-                let inode = dir.lookup(
-                    header.nodeid,
-                    &entry.status.name,
-                    entry.status.as_ref().clone(),
-                    plus,
-                )?;
-                entry.attr.ino = inode.ino;
-                // A dirty inode keeps its local status; report that instead.
-                if inode.is_dirty() {
-                    entry.dirty = Some(Box::new(inode.clone_status()));
+            let before = dir.inode_lens();
+            let result = (|| -> FuseResult<()> {
+                for entry in pending.iter_mut().filter(|e| e.is_child) {
+                    // READDIRPLUS takes a kernel lookup ref (kernel caches the
+                    // dentry and will send a FORGET); plain READDIR must not
+                    // (kernel returns names only, no lookup count, no FORGET).
+                    // `lookup` fails before it bumps that ref (see `DirTree::lookup`),
+                    // so bailing out below cannot leave a ref the kernel never repays.
+                    let inode = dir.lookup(
+                        header.nodeid,
+                        &entry.status.name,
+                        entry.status.as_ref().clone(),
+                        plus,
+                    )?;
+                    entry.attr.ino = inode.ino;
+                    // A dirty inode keeps its local status; report that instead.
+                    if inode.is_dirty() {
+                        entry.dirty = Some(Box::new(inode.clone_status()));
+                    }
                 }
-            }
-        }
+                Ok(())
+            })();
+            let added = dir.inode_lens().saturating_sub(before);
+            drop(dir);
+            NodeState::note_inodes_materialized(added);
+            result
+        };
+        lookup_result?;
 
         for entry in pending {
             let mut attr = entry.attr;
@@ -1992,21 +2008,16 @@ impl fs::FileSystem for CurvineFileSystem {
                             ino,
                             delete_path.full_path()
                         );
-                        // When falling back to the recorded unlink-time path,
-                        // verify it still points at the file that was unlinked:
-                        // a later rename of an ancestor can make the same name
-                        // resolve to an unrelated (recreated) file. Deleting
-                        // by path alone would then remove another user's file.
-                        // Mismatch (or the path is gone) is treated as
-                        // FileNotFound — miss rather than wrong delete. This
-                        // differs from base, where the delete was simply
-                        // skipped.
-                        let identity_ok = if path.is_some() {
-                            true
-                        } else {
-                            self.verify_deferred_delete_identity(ino, &delete_path)
-                                .await
-                        };
+                        // The delete target must still be the file that was
+                        // unlinked: a re-used name (created or renamed onto
+                        // after the unlink) resolves to a different inode.
+                        // This holds even when the dcache path still resolves,
+                        // so the identity check runs on both lanes (#1395).
+                        // A mismatch (or the path is gone) is treated as
+                        // FileNotFound — miss rather than wrong delete.
+                        let identity_ok = self
+                            .verify_deferred_delete_identity(ino, &delete_path)
+                            .await;
                         let deleted = if identity_ok {
                             self.state.delete_path(&delete_path, false).await
                         } else {
@@ -4424,6 +4435,63 @@ mod tests {
                     !fs.state.dir_read().pending_delete(ino),
                     "mark cleared after success"
                 );
+                let _ = handle;
+            });
+        }
+
+        /// Name reuse after a deferred unlink must fail the identity check even
+        /// when the dcache path still resolves: the unlinked inode keeps its
+        /// canonical parent/name, but the dentry now belongs to a new file.
+        /// Release must not delete that file.
+        #[test]
+        fn deferred_delete_identity_rejects_reused_dentry_on_resolved_path() {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let rt = Arc::new(AsyncRuntime::single());
+            rt.block_on(async {
+                let fs = CurvineFileSystem::new(rpc_conf(), rt.clone()).unwrap();
+
+                let dir_ino = {
+                    let mut tree = fs.state.dir_write();
+                    let mut d = FileStatus::with_name(702, "d".to_string(), true);
+                    d.path = "/d".to_string();
+                    d.nlink = 2;
+                    tree.lookup(FUSE_ROOT_ID, "d", d, true).unwrap().ino
+                };
+                let (ino, status) = {
+                    let mut tree = fs.state.dir_write();
+                    let mut st = FileStatus::with_name(703, "f".to_string(), false);
+                    st.path = "/d/f".to_string();
+                    let ino = tree.lookup(dir_ino, "f", st.clone(), true).unwrap().ino;
+                    tree.forget(ino, 1).unwrap();
+                    (ino, st)
+                };
+
+                let handle = fs
+                    .state
+                    .insert_handle_with_writer(ino, None, None, status)
+                    .await;
+                fs.state.fs_unlink(dir_ino, "f").await.unwrap();
+                assert!(fs.state.dir_read().pending_delete(ino));
+
+                // Another file reuses the name while the delete is pending.
+                {
+                    let mut tree = fs.state.dir_write();
+                    let mut st = FileStatus::with_name(704, "f".to_string(), false);
+                    st.path = "/d/f".to_string();
+                    let new_ino = tree.lookup(dir_ino, "f", st, true).unwrap().ino;
+                    assert_ne!(new_ino, ino, "reused name must be a new inode");
+                }
+
+                let path = fs
+                    .state
+                    .get_path(ino)
+                    .expect("the unlinked inode still has a canonical path");
+                assert_eq!(path.full_path(), "/d/f");
+                assert!(
+                    !fs.verify_deferred_delete_identity(ino, &path).await,
+                    "a reused dentry must block the deferred delete"
+                );
+
                 let _ = handle;
             });
         }
