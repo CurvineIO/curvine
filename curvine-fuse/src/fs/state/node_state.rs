@@ -1176,12 +1176,43 @@ impl NodeState {
             StatProbe::Hit(status) => return Ok(status),
             StatProbe::Miss(path) => path,
         };
-        let _guard = self.lock_path(&path).await;
-        if let Some(status) = self.unlinked_status(ino) {
+        // The path lock keeps the daemon-side metadata cache coherent across
+        // concurrent resolutions of the same path. With the cache disabled
+        // only the root inode's status is refreshed (see
+        // cache_resolved_status), which does not take this lock; holding the
+        // lock across the RPC only serializes this backend RPC behind other
+        // stats of the same path - notably the mount root, which the kernel
+        // revalidates on every traversal when attr_timeout is 0. Skip it in
+        // that mode instead of capping every stat behind one ~RTT-long
+        // critical section.
+        if self.enable_meta_cache {
+            let _guard = self.lock_path(&path).await;
+            if let Some(status) = self.unlinked_status(ino) {
+                return Ok(status);
+            }
+            let status = self.fs.get_status(&path).await?;
+            self.cache_resolved_status(ino, None, &status);
             return Ok(status);
         }
 
-        let status = self.fs.get_status(&path).await?;
+        if let Some(status) = self.unlinked_status(ino) {
+            return Ok(status);
+        }
+        let status = match self.fs.get_status(&path).await {
+            Ok(status) => status,
+            Err(e) => {
+                // An unlink may commit while this RPC is in flight (no lock
+                // serializes it in this mode). The tombstone resolver answers
+                // that case without taking the path lock; the success path
+                // pays nothing.
+                if let Some(status) = self.unlinked_status(ino) {
+                    return Ok(status);
+                }
+                return Err(e.into());
+            }
+        };
+        // No-op for non-root inodes; the root refresh is required because
+        // fs_lookup serves `.`/`..` to the root inode without a cache gate.
         self.cache_resolved_status(ino, None, &status);
         Ok(status)
     }
@@ -1587,6 +1618,7 @@ mod test {
     use curvine_fs_api::{ListStream, Path};
     use curvine_fs_api::{StateReader, StateWriter};
     use curvine_model::FileStatus;
+    use curvine_net::net::InetAddr;
     use curvine_runtime::common::{FastHashMap, Utils};
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use std::sync::Arc;
@@ -1911,6 +1943,57 @@ mod test {
                     .unwrap()
                     .n_lookup(),
                 1
+            );
+        });
+    }
+
+    #[test]
+    fn stat_without_meta_cache_does_not_wait_on_path_lock() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.enable_meta_cache = false;
+            conf.fuse.metrics_enabled = false;
+            // Hermetic backend: point at a closed port and keep every retry
+            // budget short, so the RPC fails deterministically well inside
+            // the timeout below. The defaults retry a refused connect for
+            // ~60s, which would trip the timeout even when the lock is
+            // correctly skipped.
+            conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 1)];
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = Arc::new(NodeState::new(fs).unwrap());
+
+            let ino = {
+                let mut dir = state.dir_write();
+                let mut status = FileStatus::with_name(43, "stat-no-cache".to_string(), false);
+                status.mode = 0o644;
+                dir.lookup(FUSE_ROOT_ID, "stat-no-cache", status, true)
+                    .unwrap()
+                    .ino
+            };
+
+            // Hold the path lock across the would-be RPC. With the metadata
+            // cache disabled stat must not queue behind it: the kernel
+            // revalidates the mount root on every traversal, so holding this
+            // lock across the RPC serializes every stat in the mount.
+            let path = state.get_path(ino).unwrap();
+            let guard = state.lock_path(&path).await;
+
+            let task_state = state.clone();
+            let stat_task = tokio::spawn(async move { task_state.fs_stat_guarded(ino).await });
+            let finished = tokio::time::timeout(std::time::Duration::from_secs(2), stat_task).await;
+            drop(guard);
+
+            let joined = finished
+                .expect("fs_stat_guarded must not wait on the path lock when the meta cache is disabled")
+                .expect("fs_stat_guarded panicked");
+            assert!(
+                joined.is_err(),
+                "expected the closed-port backend error from the unlocked RPC"
             );
         });
     }
