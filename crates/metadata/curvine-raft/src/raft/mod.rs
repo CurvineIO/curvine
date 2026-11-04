@@ -26,7 +26,7 @@ mod raft_code;
 pub use self::raft_code::RaftCode;
 
 mod raft_server;
-pub use self::raft_server::RaftServer;
+pub use self::raft_server::{RaftServer, RetryCache, RetryState};
 
 pub mod storage;
 
