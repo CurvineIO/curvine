@@ -16,7 +16,7 @@ use curvine_core_error::CommonResult;
 use curvine_model::{FileLock, LockFlags, LockType};
 use curvine_runtime::common::SerdeUtils as Serde;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// `FileLock` as it was persisted before session ownership (#1878).
 ///
@@ -113,6 +113,18 @@ impl LockValidity {
         }
         now.saturating_sub(lock.acquire_time) > self.legacy_expire_ms
     }
+}
+
+/// Distinct client ids holding a session-owned lock in `locks`.
+///
+/// Only these need an entry in the client ownership index (#1880): legacy locks
+/// keep the `lock_expire_time` path and are never reclaimed per client.
+pub(crate) fn session_owned_clients(locks: &[FileLock]) -> HashSet<String> {
+    locks
+        .iter()
+        .filter(|lock| lock.session_owned)
+        .map(|lock| lock.client_id.clone())
+        .collect()
 }
 
 #[derive(Default, Serialize, Deserialize)]
