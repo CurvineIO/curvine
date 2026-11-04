@@ -153,6 +153,15 @@ pub struct MasterConf {
     #[serde(skip)]
     pub trash_purge_interval_unit: DurationUnit,
 
+    // Whether an S3 UFS mount may name a credential source that resolves the identity from the
+    // node environment: `s3.credentials.type = role` (assume the role from the node identity,
+    // IRSA or AWS_* variables) or `auto` (whatever the SDK default chain finds). Off by default:
+    // the mount RPC is not authenticated (#1972), so enabling it lets any client that can reach
+    // the master mount a bucket with the cluster's own cloud identity, and workers then read it
+    // with that identity. Turn it on deliberately in deployments that treat the master RPC as
+    // admin-only.
+    pub s3_allow_env_credentials: bool,
+
     // Eviction configuration
     pub enable_quota_eviction: bool,
     pub quota_eviction_mode: String,
@@ -439,6 +448,8 @@ impl Default for MasterConf {
 
             audit_logging_enabled: true,
             audit_log: Default::default(),
+
+            s3_allow_env_credentials: false,
 
             block_replication_enabled: false,
             block_replication_concurrency_limit: 1000,

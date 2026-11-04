@@ -82,6 +82,14 @@ meta_dir = "testing/meta"
 # trash_purge_interval = "1s"
 # delete_stage_min_children = 4096
 
+# S3 UFS mounts. `s3.credentials.type = role` and `= auto` resolve the credential from the node
+# environment (instance role, IRSA, AWS_* variables), i.e. from the cluster's own cloud identity
+# rather than from a key the caller supplies. The mount RPC is not authenticated, so any client
+# that can reach the master could mount a bucket with that identity; the capability is therefore
+# off by default. Static AK/SK, sts, and role mounts that carry their own source key are not
+# affected. Enable only where the mount RPC is restricted to trusted operators.
+# s3_allow_env_credentials = false
+
 # Client session lease. Every client (FUSE, SDK, CLI) registers a session with
 # ClientHeartbeat; a session whose lease lapses is reaped together with the locks
 # and writer markers it owns. client_session_timeout is that lease (default 60s)

@@ -3357,7 +3357,9 @@ fn test_reject_invalid_s3_mount_update_before_persist() -> CommonResult<()> {
 #[test]
 fn test_s3_mount_accepts_a_role_credential_without_any_key() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let (fs, js, _loader, _js2, _fs2) = setup_pair("s3-mount-role-credential");
+    let (fs, js, _loader, _js2, _fs2) = setup_pair_with_conf("s3-mount-role-credential", |conf| {
+        conf.master.s3_allow_env_credentials = true
+    });
     let mnt_mgr = js.mount_manager();
     let mount_path = "/mnt/s3";
     let mount = Path::from_str(mount_path)?;
@@ -3389,7 +3391,9 @@ fn test_s3_mount_accepts_a_role_credential_without_any_key() -> CommonResult<()>
 #[test]
 fn test_s3_mount_accepts_an_auto_credential() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let (fs, js, _loader, _js2, _fs2) = setup_pair("s3-mount-auto-credential");
+    let (fs, js, _loader, _js2, _fs2) = setup_pair_with_conf("s3-mount-auto-credential", |conf| {
+        conf.master.s3_allow_env_credentials = true
+    });
     let mnt_mgr = js.mount_manager();
     let mount_path = "/mnt/s3";
     let mount = Path::from_str(mount_path)?;
@@ -3403,6 +3407,45 @@ fn test_s3_mount_accepts_an_auto_credential() -> CommonResult<()> {
 
     assert!(mnt_mgr.get_mount_info(&mount)?.is_some());
     assert!(fs.exists(mount_path)?);
+    Ok(())
+}
+
+// `role` and `auto` resolve the identity from the node environment, so a mount would use the
+// cluster's own cloud identity. The mount RPC is not authenticated (#1972), so that capability is
+// opt-in per master and both kinds must be rejected before anything is persisted.
+#[test]
+fn test_reject_s3_mount_environment_credential_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-s3-mount-env-credential");
+    let mnt_mgr = js.mount_manager();
+    let mount = Path::from_str("/mnt/s3")?;
+
+    for (index, credential_type) in ["auto", "role"].into_iter().enumerate() {
+        let mount_path = format!("/mnt/s3-{index}");
+        let mut builder = MountOptions::builder()
+            .add_property("s3.endpoint_url", "http://s3.example.com")
+            .add_property("s3.region_name", "cn-test-1")
+            .add_property("s3.credentials.type", credential_type);
+        if credential_type == "role" {
+            builder = builder.add_property(
+                "s3.credentials.role_arn",
+                "arn:aws:iam::123456789012:role/curvine-ufs",
+            );
+        }
+
+        let err = mnt_mgr
+            .mount(None, &mount_path, "s3://bucket/path", &builder.build())
+            .expect_err("an environment-resolved credential must be gated by the master");
+
+        assert!(
+            err.to_string().contains("master.s3_allow_env_credentials"),
+            "unexpected error for {}: {}",
+            credential_type,
+            err
+        );
+        assert!(mnt_mgr.get_mount_info(&mount)?.is_none());
+        assert!(!fs.exists(&mount_path)?);
+    }
     Ok(())
 }
 
@@ -3498,7 +3541,10 @@ fn test_s3_mount_update_rotates_session_token_through_legacy_alias() -> CommonRe
 #[test]
 fn test_s3_mount_update_rotates_role_arn_through_legacy_alias() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let (_fs, js, _loader, _js2, _fs2) = setup_pair("s3-mount-update-role-alias");
+    let (_fs, js, _loader, _js2, _fs2) =
+        setup_pair_with_conf("s3-mount-update-role-alias", |conf| {
+            conf.master.s3_allow_env_credentials = true
+        });
     let mnt_mgr = js.mount_manager();
     let mount_path = "/mnt/s3";
     let mount = Path::from_str(mount_path)?;
