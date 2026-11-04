@@ -187,12 +187,11 @@ impl InodeStore {
         &self,
         batch: &mut InodeWriteBatch<'_>,
         ino: i64,
-        before: &[FileLock],
+        before: &HashSet<String>,
         after: &[FileLock],
     ) -> CommonResult<()> {
-        let before = session_owned_clients(before);
         let after = session_owned_clients(after);
-        for client in after.difference(&before) {
+        for client in after.difference(before) {
             batch.add_client_owner(client, OwnerKind::Lock, ino)?;
         }
         for client in before.difference(&after) {
@@ -1218,7 +1217,7 @@ impl InodeStore {
     pub fn apply_set_locks(
         &self,
         id: i64,
-        before: &[FileLock],
+        before: &HashSet<String>,
         locks: &[FileLock],
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();

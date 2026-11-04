@@ -957,7 +957,7 @@ impl JournalLoader {
 
     pub fn set_locks(&self, entry: SetLocksEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
-        let before = fs_dir.store.get_locks(entry.ino)?.to_vec();
+        let before = fs_dir.store.get_locks(entry.ino)?.session_owned_clients();
         fs_dir
             .store
             .apply_set_locks(entry.ino, &before, &entry.locks)

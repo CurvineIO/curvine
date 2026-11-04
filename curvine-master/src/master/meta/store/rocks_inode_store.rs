@@ -44,7 +44,7 @@ impl RocksInodeStore {
     pub const PREFIX_LOCK: u8 = 0x02;
     /// Client ownership index: which inodes a client owns lock/writer state on
     /// (#1880). Key layout:
-    /// `[PREFIX_CLIENT_OWNER][client_id len u8][client_id][kind u8][inode id i64]`.
+    /// `[PREFIX_CLIENT_OWNER][client_id len u16 BE][client_id][kind u8][inode id i64]`.
     /// The length prefix keeps the client-id prefix unambiguous for ids that are
     /// not fixed width (uuid, `curvine-lancedb:<pid>`, ...).
     pub const PREFIX_CLIENT_OWNER: u8 = 0x03;
@@ -291,16 +291,6 @@ impl RocksInodeStore {
             Ok(LockMeta::decode_persisted(&bytes)?)
         } else {
             Ok(LockMeta::default())
-        }
-    }
-
-    pub fn set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
-        let key = RocksUtils::u8_i64_to_bytes(Self::PREFIX_LOCK, id);
-        if lock.is_empty() {
-            self.db.delete_cf(RocksInodeStore::CF_COMMON, key)
-        } else {
-            let value = Serde::serialize(&lock)?;
-            self.db.put_cf(RocksInodeStore::CF_COMMON, key, value)
         }
     }
 

@@ -20,11 +20,10 @@
 //! journal replay stay identical.
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::journal::JournalEntry;
+use crate::master::journal::{JournalEntry, JournalSystem, SetLocksEntry};
 use crate::master::meta::inode::InodePath;
-use crate::master::meta::session_owned_clients;
 use crate::master::meta::store::OwnerKind;
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, JournalConf};
 use curvine_model::{CreateFileOpts, FileLock, LockFlags, LockType};
 use curvine_runtime::common::{LocalTime, Utils};
 
@@ -43,6 +42,31 @@ fn test_fs(name: &str) -> MasterFilesystem {
         Utils::rand_str(6)
     ));
     crate::master::journal::JournalSystem::fs_only_for_test(&conf).unwrap()
+}
+
+/// A journal-backed filesystem that exposes a `JournalLoader`, so entries can be
+/// replayed exactly the way a follower applies them.
+fn test_journal_fs(name: &str) -> (JournalSystem, MasterFilesystem) {
+    let mut conf = ClusterConf::format();
+    conf.testing = true;
+    conf.master.meta_dir = Utils::test_sub_dir(format!(
+        "client-owner-index/meta-{}-{}",
+        name,
+        Utils::rand_str(6)
+    ));
+    conf.journal = JournalConf {
+        journal_dir: Utils::test_sub_dir(format!(
+            "client-owner-index/journal-{}-{}",
+            name,
+            Utils::rand_str(6)
+        )),
+        io_threads: 1,
+        worker_threads: 2,
+        ..JournalConf::with_test()
+    };
+    let js = JournalSystem::from_conf(&conf).unwrap();
+    let fs = js.fs();
+    (js, fs)
 }
 
 fn lock_ranged(client_id: &str, session_owned: bool, start: u64, end: u64) -> FileLock {
@@ -347,7 +371,7 @@ fn lock_index_is_rebuildable_from_the_lock_table() {
     // Rebuild: the lock table is the source of truth.
     let fs_dir = fs.fs_dir.read();
     let locks = fs_dir.store.get_locks(ino).unwrap();
-    for client in session_owned_clients(&locks.to_vec()) {
+    for client in locks.session_owned_clients() {
         fs_dir
             .store
             .add_client_owner(&client, OwnerKind::Lock, ino)
@@ -357,4 +381,62 @@ fn lock_index_is_rebuildable_from_the_lock_table() {
 
     assert_eq!(owners(&fs, "session-client"), vec![(OwnerKind::Lock, ino)]);
     assert!(owners(&fs, "legacy-client").is_empty());
+}
+
+/// Replaying `SetLocks` must reproduce the leader's index in both directions.
+/// The entry carries only the post-state, so the removal direction depends on the
+/// loader reading the pre-replay lock table, and that path is not covered by the
+/// `ReleaseWriter` replay test.
+#[test]
+fn replaying_set_locks_reproduces_the_lock_owner_index() {
+    let (js, follower) = test_journal_fs("locks-replay");
+    let leader = test_fs("locks-replay-leader");
+    let loader = js.journal_loader();
+
+    create_file(&leader, "/lock-replay.log");
+    create_file(&follower, "/lock-replay.log");
+    let follower_ino = file_id(&follower, "/lock-replay.log");
+
+    // Leader acquires; the follower replays the journaled post-state.
+    assert!(leader
+        .set_lock("/lock-replay.log", lock("session-client", true))
+        .unwrap()
+        .is_none());
+    loader
+        .apply_entry(JournalEntry::SetLocks(SetLocksEntry {
+            op_id: 1,
+            rpc_id: 0,
+            ino: follower_ino,
+            locks: vec![lock("session-client", true)],
+        }))
+        .unwrap();
+    assert_eq!(
+        owners(&follower, "session-client"),
+        vec![(OwnerKind::Lock, follower_ino)],
+        "the replayed acquire must index the owner exactly like the leader"
+    );
+
+    // Leader unlocks; the journaled post-state holds no lock for this inode.
+    let mut unlock = lock("session-client", true);
+    unlock.lock_type = LockType::UnLock;
+    leader.set_lock("/lock-replay.log", unlock).unwrap();
+    assert!(owners(&leader, "session-client").is_empty());
+
+    let entry = JournalEntry::SetLocks(SetLocksEntry {
+        op_id: 2,
+        rpc_id: 0,
+        ino: follower_ino,
+        locks: vec![],
+    });
+    loader.apply_entry(entry.clone()).unwrap();
+    assert!(
+        owners(&follower, "session-client").is_empty(),
+        "replay must drop the hint the leader no longer holds"
+    );
+
+    // A duplicated batch is idempotent instead of failing or resurrecting a hint.
+    loader.apply_entry(entry).unwrap();
+    assert!(owners(&follower, "session-client").is_empty());
+
+    js.shutdown();
 }

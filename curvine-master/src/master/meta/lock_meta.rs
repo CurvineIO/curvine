@@ -186,6 +186,18 @@ impl LockMeta {
         (&self.plock, &self.flock)
     }
 
+    /// Session-owned client ids holding a lock here, taken by reference so the
+    /// lock records themselves are not cloned.
+    pub(crate) fn session_owned_clients(&self) -> HashSet<String> {
+        self.plock
+            .values()
+            .flatten()
+            .chain(self.flock.values())
+            .filter(|lock| lock.session_owned)
+            .map(|lock| lock.client_id.clone())
+            .collect()
+    }
+
     fn regions_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
         a_start <= b_end && b_start <= a_end
     }

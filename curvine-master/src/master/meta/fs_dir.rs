@@ -2484,7 +2484,7 @@ impl FsDir {
         };
 
         let mut meta = self.store.get_locks(inode.id())?;
-        let before = meta.to_vec();
+        let before = meta.session_owned_clients();
         let (conflict, changed) = meta.set_lock_with_change(lock, validity, LocalTime::mills());
 
         if !changed {
