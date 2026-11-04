@@ -1178,11 +1178,13 @@ impl NodeState {
         };
         // The path lock keeps the daemon-side metadata cache coherent across
         // concurrent resolutions of the same path. With the cache disabled
-        // nothing is updated here, so the lock only serializes this backend
-        // RPC behind other stats of the same path - notably the mount root,
-        // which the kernel revalidates on every traversal when attr_timeout
-        // is 0. Skip it in that mode instead of capping every stat behind one
-        // ~RTT-long critical section.
+        // only the root inode's status is refreshed (see
+        // cache_resolved_status), which does not take this lock; holding the
+        // lock across the RPC only serializes this backend RPC behind other
+        // stats of the same path - notably the mount root, which the kernel
+        // revalidates on every traversal when attr_timeout is 0. Skip it in
+        // that mode instead of capping every stat behind one ~RTT-long
+        // critical section.
         if self.enable_meta_cache {
             let _guard = self.lock_path(&path).await;
             if let Some(status) = self.unlinked_status(ino) {
@@ -1197,6 +1199,9 @@ impl NodeState {
             return Ok(status);
         }
         let status = self.fs.get_status(&path).await?;
+        // No-op for non-root inodes; the root refresh is required because
+        // fs_lookup serves `.`/`..` to the root inode without a cache gate.
+        self.cache_resolved_status(ino, None, &status);
         Ok(status)
     }
 
@@ -1601,6 +1606,7 @@ mod test {
     use curvine_fs_api::{ListStream, Path};
     use curvine_fs_api::{StateReader, StateWriter};
     use curvine_model::FileStatus;
+    use curvine_net::net::InetAddr;
     use curvine_runtime::common::{FastHashMap, Utils};
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use std::sync::Arc;
@@ -1936,6 +1942,16 @@ mod test {
             let mut conf = ClusterConf::default();
             conf.fuse.enable_meta_cache = false;
             conf.fuse.metrics_enabled = false;
+            // Hermetic backend: point at a closed port and keep every retry
+            // budget short, so the RPC fails deterministically well inside
+            // the timeout below. The defaults retry a refused connect for
+            // ~60s, which would trip the timeout even when the lock is
+            // correctly skipped.
+            conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 1)];
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
             let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
             let state = Arc::new(NodeState::new(fs).unwrap());
 
@@ -1957,8 +1973,7 @@ mod test {
 
             let task_state = state.clone();
             let stat_task = tokio::spawn(async move { task_state.fs_stat_guarded(ino).await });
-            let finished =
-                tokio::time::timeout(std::time::Duration::from_secs(2), stat_task).await;
+            let finished = tokio::time::timeout(std::time::Duration::from_secs(2), stat_task).await;
             drop(guard);
 
             assert!(
