@@ -335,6 +335,16 @@ impl LocalTempStorage {
         }
     }
 
+    /// Whether a part of this upload is staged.
+    ///
+    /// `CompleteMultipartUpload` checks this before touching the destination, so
+    /// a stale upload id cannot destroy an existing object.
+    pub async fn part_exists(&self, upload_id: &str, part_number: u32) -> bool {
+        tokio::fs::try_exists(self.part_path(upload_id, part_number))
+            .await
+            .unwrap_or(false)
+    }
+
     /// Copy a staged part into the destination, verifying it on the way out.
     ///
     /// The MD5 is recomputed while streaming and compared with the ETag the
@@ -595,6 +605,14 @@ impl CurvineTempStorage {
         }
     }
 
+    /// Whether a part of this upload is staged.
+    pub async fn part_exists(&self, upload_id: &str, part_number: u32) -> bool {
+        match self.part_path(upload_id, part_number) {
+            Ok(path) => self.fs.get_status(&path).await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
     /// Copy a staged part into the destination, verifying it on the way out.
     ///
     /// Same contract as the local backend: the MD5 is recomputed while
@@ -794,6 +812,14 @@ impl TempStorageEnum {
                 s.write_part_stream(upload_id, part_number, body, expect)
                     .await
             }
+        }
+    }
+
+    /// Whether a part of this upload is staged, in either backend.
+    pub async fn part_exists(&self, upload_id: &str, part_number: u32) -> bool {
+        match self {
+            TempStorageEnum::Local(s) => s.part_exists(upload_id, part_number).await,
+            TempStorageEnum::Curvine(s) => s.part_exists(upload_id, part_number).await,
         }
     }
 

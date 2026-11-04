@@ -29,6 +29,7 @@
 //! 3. Delegate to specific operation handlers (direct calls, no trait objects)
 //! 4. Handle errors and responses uniformly
 
+use crate::auth::sig_v4::VHeader;
 use crate::http::axum::{Request, Response};
 use crate::s3::handlers::S3Handlers;
 use crate::s3::s3_api::*;
@@ -98,6 +99,10 @@ impl S3Router {
 
             if is_upload_part {
                 Self::handle_multipart_upload_part_request(req, &handlers).await
+            } else if req.get_header("x-amz-copy-source").is_some() {
+                // Server-side copy. Routing it to the PUT handler created a
+                // zero-byte object because a copy request carries no body.
+                Self::handle_copy_object_request(req, &handlers).await
             } else {
                 Self::handle_put_object_request(req, &handlers, v4head).await
             }
@@ -279,6 +284,76 @@ impl S3Router {
         let mut resp = Response::default();
         handle_multipart_upload_part(req, &mut resp, handlers.as_ref()).await;
         resp.into()
+    }
+
+    /// `PUT` with `x-amz-copy-source`: copy an existing object server-side.
+    async fn handle_copy_object_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        use crate::s3::s3_api::VRequest;
+
+        // "bucket/key" or "/bucket/key", URL-encoded, optionally carrying
+        // "?versionId=..." which this backend does not version.
+        let raw = match req.get_header("x-amz-copy-source") {
+            Some(value) => value,
+            None => return (StatusCode::BAD_REQUEST, b"").into_response(),
+        };
+        let source = raw
+            .split('?')
+            .next()
+            .unwrap_or(&raw)
+            .trim_start_matches('/');
+        let decoded = urlencoding::decode(source)
+            .map(|cow| cow.into_owned())
+            .unwrap_or_else(|_| source.to_string());
+        let (src_bucket, src_key) = match decoded.split_once('/') {
+            Some((b, k)) if !b.is_empty() && !k.is_empty() => (b, k),
+            _ => {
+                log::warn!("invalid x-amz-copy-source: {raw}");
+                return (StatusCode::BAD_REQUEST, b"").into_response();
+            }
+        };
+
+        let dest_path = req.url_path();
+        let dest = dest_path
+            .trim_start_matches('/')
+            .splitn(2, '/')
+            .collect::<Vec<&str>>();
+        if dest.len() != 2 || dest[1].is_empty() {
+            return (StatusCode::BAD_REQUEST, b"").into_response();
+        }
+
+        match handlers
+            .copy_object(src_bucket, src_key, dest[0], dest[1])
+            .await
+        {
+            Ok(etag) => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<CopyObjectResult>\
+<ETag>\"{etag}\"</ETag>\
+<LastModified>{}</LastModified>\
+</CopyObjectResult>",
+                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                );
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                    body,
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                let status = match crate::s3::s3_api::status_for_error(&e) {
+                    404 => StatusCode::NOT_FOUND,
+                    409 => StatusCode::CONFLICT,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                log::warn!("copy object failed ({status}): {e}");
+                (status, b"".to_vec()).into_response()
+            }
+        }
     }
 
     async fn handle_put_object_request(

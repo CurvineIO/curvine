@@ -39,6 +39,32 @@ use std::sync::Arc;
 use tracing;
 use uuid;
 
+/// Whether an `ETag` header value is strong (`"x"`) rather than weak (`W/"x"`).
+///
+/// RFC 9110 §8.8.3: only a strong validator may satisfy `If-Match`.
+fn is_strong(tag: &str) -> bool {
+    // The weakness prefix is case-insensitive per RFC 9110 §8.8.3.
+    !tag.trim_start()
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
+}
+
+/// The opaque value of an `ETag`, without the weakness prefix and quotes.
+///
+/// S3 also accepts an unquoted value, and comparison is case-insensitive
+/// because digests are compared as text.
+fn etag_value(tag: &str) -> String {
+    tag.trim()
+        .trim_start_matches("W/")
+        .trim_matches('"')
+        .to_ascii_lowercase()
+}
+
+/// Error text the S3 API layer maps to `NoSuchBucket` (404).
+pub const NO_SUCH_BUCKET: &str = "NoSuchBucket: the specified bucket does not exist";
+/// Error text the S3 API layer maps to `BucketNotEmpty` (409).
+pub const BUCKET_NOT_EMPTY: &str = "BucketNotEmpty: the bucket you tried to delete is not empty";
+
 #[derive(Clone)]
 pub struct S3Handlers {
     pub fs: UnifiedFileSystem,
@@ -91,28 +117,29 @@ impl S3Handlers {
             return None;
         }
         let status = self.fs.get_status(path).await.ok()?;
-        let etag = crate::utils::s3_utils::generate_etag(&status);
+        let current = crate::utils::s3_utils::generate_etag(&status);
 
-        let normalise = |value: &str| {
-            value
-                .trim()
-                .trim_start_matches("W/")
-                .trim_matches('"')
-                .to_ascii_lowercase()
-        };
-        let current = normalise(&etag);
-        let matches = |header: &str| {
-            header
-                .split(',')
-                .map(normalise)
-                .any(|part| part == "*" || part == current)
-        };
-
-        if if_match.as_deref().is_some_and(|h| !matches(h)) {
-            return Some(412);
+        // RFC 9110 §13.1.1/13.1.2, matching s3s `ETag::compare`:
+        // `If-Match` needs a STRONG match, so a weak ETag never satisfies it;
+        // `If-None-Match` uses the weak comparison, so the value suffices.
+        if let Some(header) = if_match.as_deref() {
+            let satisfied = header.split(',').any(|tag| {
+                let tag = tag.trim();
+                tag == "*" || (is_strong(tag) && etag_value(tag) == etag_value(&current))
+            });
+            if !satisfied {
+                return Some(412);
+            }
         }
-        if if_none_match.as_deref().is_some_and(matches) {
-            return Some(304);
+
+        if let Some(header) = if_none_match.as_deref() {
+            let matched = header.split(',').any(|tag| {
+                let tag = tag.trim();
+                tag == "*" || etag_value(tag) == etag_value(&current)
+            });
+            if matched {
+                return Some(304);
+            }
         }
         None
     }
@@ -588,11 +615,126 @@ impl crate::s3::s3_api::DeleteBucketHandler for S3Handlers {
 
         async move {
             let path = path.map_err(|e| e.to_string())?;
+
+            // S3 requires DeleteBucket to fail on a missing bucket (404) and on
+            // a non-empty one (409). Passing straight to `delete` answered 500
+            // for a non-empty bucket and left the client guessing.
+            let status = fs.get_status(&path).await.map_err(|e| e.to_string())?;
+            if !status.is_dir {
+                return Err(NO_SUCH_BUCKET.to_string());
+            }
+            if status.children_num > 0 {
+                return Err(BUCKET_NOT_EMPTY.to_string());
+            }
+
             fs.delete(&path, false)
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }
+    }
+}
+
+impl S3Handlers {
+    /// Server-side copy, the operation behind `x-amz-copy-source`.
+    ///
+    /// Without this branch a copy request fell through to the normal PUT path,
+    /// which has no body: it created a zero-byte object under the destination
+    /// key and answered success, silently destroying whatever was there.
+    pub async fn copy_object(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        dest_bucket: &str,
+        dest_key: &str,
+    ) -> Result<String, String> {
+        use curvine_fs_api::Reader;
+
+        let src = self
+            .cv_object_path(source_bucket, source_key)
+            .map_err(|e| format!("Invalid copy source: {e}"))?;
+        let dst = self
+            .cv_object_path(dest_bucket, dest_key)
+            .map_err(|e| format!("Invalid copy destination: {e}"))?;
+
+        let status = self.fs.get_status(&src).await.map_err(|_| {
+            format!("NoSuchKey: copy source {source_bucket}/{source_key} does not exist")
+        })?;
+
+        // Copy through the same staging-then-rename path a PUT uses, so a
+        // failed copy cannot truncate an existing destination object.
+        let staging_id = uuid::Uuid::new_v4().to_string();
+        let staging = {
+            let parent = dst
+                .parent()
+                .map_err(|e| format!("Invalid destination parent: {e}"))?
+                .ok_or_else(|| format!("Destination {dst} has no parent"))?;
+            Path::from_str(format!("{parent}/.curvine-s3-copy-{staging_id}"))
+                .map_err(|e| format!("Invalid staging path: {e}"))?
+        };
+
+        let mut reader = self.fs.open(&src).await.map_err(|e| e.to_string())?;
+        let mut writer = self
+            .fs
+            .create(&staging, true)
+            .await
+            .map_err(|e| format!("Failed to create copy staging object: {e}"))?;
+
+        let mut md5 = md5::Context::new();
+        loop {
+            let mut buf = vec![0u8; self.get_chunk_size_bytes];
+            let n = match reader.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = writer.cancel().await;
+                    let _ = self.fs.delete(&staging, false).await;
+                    return Err(format!("Failed to read copy source: {e}"));
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            buf.truncate(n);
+            md5.consume(&buf);
+            if let Err(e) = writer.write(&buf).await {
+                let _ = writer.cancel().await;
+                let _ = self.fs.delete(&staging, false).await;
+                return Err(format!("Failed to write copy destination: {e}"));
+            }
+        }
+
+        if let Err(e) = writer.complete().await {
+            let _ = self.fs.delete(&staging, false).await;
+            return Err(format!("Failed to complete copy destination: {e}"));
+        }
+        if let Err(e) = self.fs.rename(&staging, &dst).await {
+            let _ = self.fs.delete(&staging, false).await;
+            return Err(format!("Failed to publish copy destination: {e}"));
+        }
+
+        let etag = format!("{:x}", md5.compute());
+        // Copy inherits the source's Content-Type and user metadata; the
+        // upload path records them the same way.
+        let mut opts = curvine_model::SetAttrOptsBuilder::new().add_x_attr(
+            crate::utils::s3_utils::XATTR_S3_ETAG,
+            etag.as_bytes().to_vec(),
+        );
+        if let Some(ct) = status
+            .x_attr
+            .get(crate::utils::s3_utils::XATTR_S3_CONTENT_TYPE)
+        {
+            opts = opts.add_x_attr(crate::utils::s3_utils::XATTR_S3_CONTENT_TYPE, ct.clone());
+        }
+        for (k, v) in &status.x_attr {
+            if k.starts_with(crate::utils::s3_utils::XATTR_S3_META_PREFIX) {
+                opts = opts.add_x_attr(k.clone(), v.clone());
+            }
+        }
+        if let Err(e) = self.fs.set_attr(&dst, opts.build()).await {
+            tracing::warn!("Failed to record copy metadata for {dst}: {e}");
+        }
+
+        Ok(etag)
     }
 }
 
@@ -678,26 +820,48 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         upload_id: String,
         data: Vec<(String, u32)>,
         _opts: crate::s3::s3_api::MultiUploadObjectCompleteOption,
-    ) -> Result<String, ()> {
+    ) -> Result<String, String> {
         let final_path = match self.cv_object_path(&bucket, &key) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("Invalid object path: {}", e);
-                return Err(());
-            }
-        };
-
-        let mut writer = match self.fs.create(&final_path, true).await {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::error!("Failed to create final file: {}", e);
-                return Err(());
+                return Err(format!("Invalid object path: {e}"));
             }
         };
 
         // Sort parts by part number
         let mut part_list = data;
         part_list.sort_by_key(|(_, n)| *n);
+
+        // Validate the upload before touching the destination. Creating the
+        // final object first meant a bad upload id, or a part that is not
+        // staged, still left a zero-byte object under the destination key —
+        // destroying any previous object and reporting failure afterwards.
+        for (_, part_num) in part_list.iter() {
+            if !self.temp_storage.part_exists(&upload_id, *part_num).await {
+                return Err(format!(
+                    "NoSuchUpload: part {part_num} of upload {upload_id} is not staged"
+                ));
+            }
+        }
+
+        // Stage the assembled object beside the destination and publish it with
+        // a rename, so the destination is only ever the previous object or the
+        // complete new one.
+        let staging_id = uuid::Uuid::new_v4().to_string();
+        let staging = match final_path.parent() {
+            Ok(Some(parent)) => Path::from_str(format!("{parent}/.curvine-s3-mp-{staging_id}"))
+                .map_err(|e| format!("Invalid staging path: {e}"))?,
+            _ => return Err("Destination has no parent".to_string()),
+        };
+
+        let mut writer = match self.fs.create(&staging, true).await {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!("Failed to create final file: {}", e);
+                return Err(format!("Failed to create final file: {e}"));
+            }
+        };
 
         // Stream each part directly to final file (memory-efficient)
         // This avoids loading entire parts into memory
@@ -715,8 +879,12 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                     e
                 );
                 // Cleanup on failure
+                let _ = writer.cancel().await;
+                let _ = self.fs.delete(&staging, false).await;
                 let _ = self.temp_storage.cleanup(&upload_id).await;
-                return Err(());
+                // A missing part means the upload id or the part list does not
+                // match what was staged; S3 answers 404 NoSuchUpload.
+                return Err(format!("NoSuchUpload: {e}"));
             }
             part_etags.push(etag.trim_matches('"').to_ascii_lowercase());
         }
@@ -724,8 +892,16 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         if let Err(e) = writer.complete().await {
             tracing::error!("Failed to complete final file write: {}", e);
             // Cleanup on failure
+            let _ = self.fs.delete(&staging, false).await;
             let _ = self.temp_storage.cleanup(&upload_id).await;
-            return Err(());
+            return Err(format!("Failed to complete final file write: {e}"));
+        }
+
+        // Publish: the destination is only ever replaced by a complete object.
+        if let Err(e) = self.fs.rename(&staging, &final_path).await {
+            let _ = self.fs.delete(&staging, false).await;
+            let _ = self.temp_storage.cleanup(&upload_id).await;
+            return Err(format!("Failed to publish assembled object: {e}"));
         }
 
         // Cleanup temp files after successful completion
@@ -828,6 +1004,18 @@ impl ListObjectHandler for S3Handlers {
             } else {
                 (bkt_path.clone(), String::new())
             };
+
+            // A missing bucket must be an error, not an empty listing: S3
+            // answers 404, and clients rely on it to detect a wrong bucket
+            // instead of concluding the bucket is empty.
+            let bucket_status = this
+                .fs
+                .get_status(&bkt_path)
+                .await
+                .map_err(|_| NO_SUCH_BUCKET.to_string())?;
+            if !bucket_status.is_dir {
+                return Err(NO_SUCH_BUCKET.to_string());
+            }
 
             let list = this
                 .fs
@@ -997,5 +1185,42 @@ mod multipart_etag_tests {
     fn multipart_etag_is_not_a_placeholder() {
         let etag = multipart_etag(&["d41d8cd98f00b204e9800998ecf8427e".to_string()]);
         assert!(!etag.contains("not-computed"), "{etag}");
+    }
+}
+
+#[cfg(test)]
+mod etag_condition_tests {
+    use super::{etag_value, is_strong};
+
+    /// RFC 9110 §8.8.3: `If-Match` requires a strong validator.
+    #[test]
+    fn weak_etags_are_not_strong() {
+        assert!(is_strong("\"abc\""));
+        assert!(is_strong("abc"));
+        assert!(!is_strong("W/\"abc\""));
+        assert!(!is_strong("w/\"abc\""));
+    }
+
+    /// Quoting, weakness and case all denote the same opaque value.
+    #[test]
+    fn values_compare_regardless_of_form() {
+        for form in ["\"a826\"", "a826", "W/\"a826\"", "\"A826\""] {
+            assert_eq!(etag_value(form), "a826", "{form}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use crate::s3::s3_api::status_for_error;
+
+    /// Clients retry 500 and treat 404 as terminal, so the distinction matters.
+    #[test]
+    fn protocol_conditions_map_to_their_status() {
+        assert_eq!(status_for_error("NoSuchBucket: gone"), 404);
+        assert_eq!(status_for_error("BucketNotEmpty: not empty"), 409);
+        assert_eq!(status_for_error("NoSuchKey: gone"), 404);
+        assert_eq!(status_for_error("NoSuchUpload: gone"), 404);
+        assert_eq!(status_for_error("something unexpected"), 500);
     }
 }

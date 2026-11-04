@@ -593,7 +593,15 @@ pub async fn handle_get_list_object<
                 }
             }
         }
-        Err(err) => log::error!("get_list_object error {err}"),
+        Err(err) => {
+            // Without a status this answered whatever the response defaulted
+            // to, so "bucket does not exist" looked like an empty listing or a
+            // silent failure.
+            let status = status_for_error(&err);
+            log::warn!("get_list_object failed ({status}): {err}");
+            resp.set_status(status);
+            resp.send_header();
+        }
     }
 }
 
@@ -1297,7 +1305,7 @@ pub trait MultiUploadObjectHandler: Send + Sync {
         upload_id: String,
         data: Vec<(String, u32)>,
         opts: MultiUploadObjectCompleteOption,
-    ) -> Result<String, ()>;
+    ) -> Result<String, String>;
 
     async fn handle_abort(&self, bucket: String, key: String, upload_id: String) -> Result<(), ()>;
 }
@@ -1641,9 +1649,12 @@ pub async fn handle_multipart_complete_session<
                                     }
                                 }
                             }
-                            Err(_) => {
-                                log::error!("handle_complete error");
-                                resp.set_status(500);
+                            Err(e) => {
+                                // An unknown upload id is 404 NoSuchUpload, not
+                                // a server error; clients retry 500s.
+                                let status = status_for_error(&e);
+                                log::warn!("handle_complete failed ({status}): {e}");
+                                resp.set_status(status);
                                 resp.send_header();
                             }
                         }
@@ -2092,9 +2103,28 @@ pub async fn handle_delete_bucket<
             resp.send_header();
         }
         Err(e) => {
-            resp.set_status(500);
-            log::error!("delete object handler error: {e}")
+            let status = status_for_error(&e);
+            log::warn!("delete bucket failed ({status}): {e}");
+            resp.set_status(status);
+            resp.send_header();
         }
+    }
+}
+
+/// Map a handler error to the HTTP status the S3 protocol requires.
+///
+/// Handlers report protocol conditions as text; without this the caller could
+/// only answer 500, which hid "bucket does not exist" and "bucket not empty"
+/// from every S3 client.
+pub(crate) fn status_for_error(err: &str) -> u16 {
+    if err.starts_with("NoSuchBucket") {
+        404
+    } else if err.starts_with("BucketNotEmpty") {
+        409
+    } else if err.starts_with("NoSuchKey") || err.starts_with("NoSuchUpload") {
+        404
+    } else {
+        500
     }
 }
 
