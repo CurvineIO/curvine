@@ -126,6 +126,17 @@ jobs:
           echo "After etcd service discovery tests, disk usage:"
           df -h
 
+      # `clippy --all-targets` only compiles these tests. Without this step an
+      # auth or multipart regression in the gateway would land green and only
+      # surface in the daily coverage workflow.
+      - name: Run S3 gateway unit tests
+        run: |
+          echo "Running curvine-s3-gateway unit tests"
+          cargo test -p curvine-s3-gateway --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After S3 gateway tests, disk usage:"
+          df -h
+
       - name: Replication lifecycle regression tests
         run: |
           # Exercise the real Master/Worker submit, dropped-report, reaper and
