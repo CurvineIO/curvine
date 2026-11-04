@@ -58,7 +58,7 @@ impl DiskApp {
             ..Default::default()
         };
         let state = FsmState {
-            applied: applied.clone(),
+            applied,
             ufs_applied: applied,
         };
         db.put(b"fsm", state.encode_to_vec())?;

@@ -49,7 +49,7 @@ axum = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 serde_json = { workspace = true }
-tonic = "0.9"
+tonic = "0.14.9"
 prost = { workspace = true }
 tokio-stream = "0.1"
 futures = { workspace = true }

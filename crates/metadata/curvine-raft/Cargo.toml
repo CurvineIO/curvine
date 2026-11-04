@@ -23,6 +23,7 @@ log = { workspace = true }
 mini-moka = { workspace = true }
 num_enum = { workspace = true }
 prost = { workspace = true }
+prost-legacy = { package = "prost", version = "0.11.9" }
 raft = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -30,8 +31,9 @@ slog = { workspace = true }
 slog-stdlog = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tonic = "0.9"
+tonic = "0.14.9"
+tonic-prost = "0.14.9"
 
 [build-dependencies]
 prost-build = { workspace = true }
-tonic-build = "0.9"
+tonic-prost-build = "0.14.9"

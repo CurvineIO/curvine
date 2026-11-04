@@ -52,7 +52,7 @@ curvine-cli = { path = "../curvine-cli" }
 curvine-lancedb = { workspace = true, optional = true }
 curvine-ufs-api = { workspace = true }
 tokio  = { workspace = true }
-tonic = "0.9"
+tonic = "0.14.9"
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }

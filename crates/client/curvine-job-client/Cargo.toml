@@ -17,7 +17,7 @@ curvine-rpc = { workspace = true, features = ["transport"] }
 curvine-runtime = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
-tonic = "0.9"
+tonic = "0.14.9"
 log = { workspace = true }
 bincode = { workspace = true }
 serde = { workspace = true }

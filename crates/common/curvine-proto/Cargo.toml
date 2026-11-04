@@ -8,11 +8,12 @@ license.workspace = true
 prost = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
-tonic = { version = "0.9", default-features = false, features = ["codegen", "prost"] }
+tonic = { version = "0.14.9", default-features = false, features = ["codegen"] }
+tonic-prost = "0.14.9"
 
 [features]
 default = []
 
 [build-dependencies]
 prost-build = { workspace = true }
-tonic-build = "0.9"
+tonic-prost-build = "0.14.9"

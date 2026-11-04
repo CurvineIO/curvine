@@ -43,26 +43,48 @@ forbidden=(
   curvine-hdfs-jni
 )
 
+# tonic 0.14 separates its HTTP/2 transport from its axum router. Checking
+# for axum alone no longer detects a transport-enabled tonic dependency.
+forbidden_tonic_features=(
+  channel
+  server
+  transport
+  router
+  h2
+  tls-ring
+  tls-aws-lc
+  tls-native-roots
+  tls-webpki-roots
+  tls-connect-info
+  _tls-any
+)
+
 failures=0
 
-tree_packages() {
+dependency_tree() {
   cargo tree \
     --no-default-features \
     -p "$1" \
     -e normal \
     --prefix none \
-    -f '{p}' \
-    | awk '{print $1}' \
-    | sort -u
+    -f '{p}|{f}'
 }
 
 for crate in "${crates[@]}"; do
-  packages="$(tree_packages "$crate")"
+  tree="$(dependency_tree "$crate")"
+  packages="$(awk -F'|' '{print $1}' <<<"$tree" | awk '{print $1}' | sort -u)"
+  tonic_features="$(awk -F'|' '$1 ~ /^tonic v/ {print $2}' <<<"$tree" | sort -u)"
   found=()
 
   for dep in "${forbidden[@]}"; do
     if grep -qx "$dep" <<<"$packages"; then
       found+=("$dep")
+    fi
+  done
+
+  for feature in "${forbidden_tonic_features[@]}"; do
+    if grep -Eq "(^|,)${feature}(,|$)" <<<"$tonic_features"; then
+      found+=("tonic feature $feature")
     fi
   done
 

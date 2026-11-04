@@ -29,6 +29,7 @@ use curvine_raft::utils::SerdeUtils;
 use curvine_runtime::common::{FileUtils, Logger, Utils};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use prost::Message;
+use prost_legacy::Message as LegacyMessage;
 use raft::eraftpb::{
     ConfChange, ConfState, Entry, EntryType, HardState, Message as RaftMessage, MessageType,
     Snapshot,
@@ -205,7 +206,7 @@ impl AppStorage for TestKvAppStorage {
     }
 
     fn get_fsm_state(&self) -> FsmState {
-        self.fsm_state.lock().unwrap().clone()
+        *self.fsm_state.lock().unwrap()
     }
 
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
@@ -330,7 +331,7 @@ impl AppStorage for BlockingApplyAppStorage {
     }
 
     fn get_fsm_state(&self) -> FsmState {
-        self.fsm_state.lock().unwrap().clone()
+        *self.fsm_state.lock().unwrap()
     }
 
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
@@ -592,7 +593,7 @@ impl AppStorage for PopulatedRefuseEmptySnapshotAppStorage {
     }
 
     fn get_fsm_state(&self) -> FsmState {
-        self.fsm_state.lock().unwrap().clone()
+        *self.fsm_state.lock().unwrap()
     }
 
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
@@ -714,7 +715,7 @@ fn kv_app_storages_accept_non_data_entries() -> CommonResult<()> {
     };
 
     let hash: HashAppStorage<String, String> = HashAppStorage::new();
-    rt.block_on(hash.apply(true, ApplyMsg::new_scan(applied.clone())))?;
+    rt.block_on(hash.apply(true, ApplyMsg::new_scan(applied)))?;
     rt.block_on(hash.apply(
         true,
         ApplyMsg::new_entry(Entry {
@@ -1168,7 +1169,7 @@ impl AppStorage for RecordingSnapshotAppStorage {
     }
 
     fn get_fsm_state(&self) -> FsmState {
-        self.fsm_state.lock().unwrap().clone()
+        *self.fsm_state.lock().unwrap()
     }
 
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
@@ -1188,7 +1189,7 @@ impl AppStorage for RecordingSnapshotAppStorage {
     }
 
     async fn apply_snapshot(&self, data: SnapshotData) -> RaftResult<()> {
-        *self.fsm_state.lock().unwrap() = data.fsm_state.clone();
+        *self.fsm_state.lock().unwrap() = data.fsm_state;
         self.applied_snapshots.lock().unwrap().push(data);
         Ok(())
     }

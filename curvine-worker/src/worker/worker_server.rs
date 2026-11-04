@@ -291,7 +291,7 @@ impl Worker {
                     .register_encoded_file_descriptor_set(curvine_proto::FILE_DESCRIPTOR_SET)
                     .with_service_name("proto.WorkerControlService")
                     .with_service_name("proto.BlockDataService")
-                    .build()?,
+                    .build_v1alpha()?,
             )
         } else {
             None
@@ -322,7 +322,7 @@ impl Worker {
         let master_client = self.block_actor.client.clone();
         let registered = self.registered.clone();
         let spdk_enabled = self.service.conf.worker.spdk_disk.enabled;
-        let (mut health, health_service) = curvine_rpc::grpc::health_reporter();
+        let (health, health_service) = curvine_rpc::grpc::health_reporter();
         health
             .set_serving::<BlockDataServiceServer<GrpcBlockDataService>>()
             .await;

@@ -30,6 +30,59 @@ fn config() -> GrpcConfig {
 }
 
 #[test]
+fn tls_server_selects_or_preserves_the_process_crypto_provider() {
+    const CHILD_MODE: &str = "CURVINE_TEST_TLS_PROVIDER_MODE";
+    if let Ok(mode) = std::env::var(CHILD_MODE) {
+        use std::sync::Arc;
+
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        let installed = if mode == "preinstalled" {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .install_default()
+                .unwrap();
+            Some(
+                rustls::crypto::CryptoProvider::get_default()
+                    .unwrap()
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        TransportConfig::default()
+            .server(config().server_tls().unwrap().as_ref())
+            .unwrap();
+        let selected = rustls::crypto::CryptoProvider::get_default().unwrap();
+        if let Some(provider) = installed {
+            assert!(Arc::ptr_eq(&provider, selected));
+        } else {
+            let ring = rustls::crypto::ring::default_provider();
+            assert!(std::ptr::eq(selected.secure_random, ring.secure_random));
+        }
+        return;
+    }
+
+    // The rustls provider is process-wide and cannot be reset. Exercise both
+    // cases in fresh processes so other TLS tests cannot set it first.
+    for mode in ["unset", "preinstalled"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tls_server_selects_or_preserves_the_process_crypto_provider",
+                "--nocapture",
+            ])
+            .env(CHILD_MODE, mode)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "TLS provider case {mode} failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn rejects_unsafe_or_incomplete_configuration() {
     let conf = GrpcConfig {
         require_client_auth: true,
@@ -77,7 +130,7 @@ async fn mutual_tls_and_reflection_require_a_trusted_identity() {
     let reflection = reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(curvine_proto::FILE_DESCRIPTOR_SET)
         .with_service_name("proto.MasterService")
-        .build()
+        .build_v1alpha()
         .unwrap();
     let mut server = TransportConfig::default()
         .server(conf.server_tls().unwrap().as_ref())
@@ -112,7 +165,7 @@ async fn mutual_tls_and_reflection_require_a_trusted_identity() {
         .await
         .unwrap();
 
-    use reflection::pb::{
+    use reflection::pb::v1alpha::{
         server_reflection_client::ServerReflectionClient,
         server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
         ServerReflectionRequest,

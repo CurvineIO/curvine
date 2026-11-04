@@ -12,7 +12,7 @@ use curvine_net::net::NetUtils;
 use curvine_proto::worker_control_service_client::WorkerControlServiceClient;
 use curvine_proto::BlockWriteRequest;
 use curvine_proto::QueryTransferTaskRequest;
-use curvine_rpc::grpc::reflection::pb::{
+use curvine_rpc::grpc::reflection::pb::v1alpha::{
     server_reflection_client::ServerReflectionClient, server_reflection_request::MessageRequest,
     server_reflection_response::MessageResponse, ServerReflectionRequest,
 };

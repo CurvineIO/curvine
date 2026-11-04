@@ -8,7 +8,7 @@ license.workspace = true
 curvine-io = { workspace = true }
 curvine-core-error = { workspace = true }
 curvine-proto = { workspace = true }
-tonic = { version = "0.9", default-features = false, features = ["codegen", "prost"] }
+tonic = { version = "0.14.9", default-features = false, features = ["codegen"] }
 tokio = { workspace = true }
 prost = { workspace = true }
 num_enum = { workspace = true }

@@ -332,13 +332,13 @@ impl Master {
                     curvine_rpc::grpc::reflection::server::Builder::configure()
                         .register_encoded_file_descriptor_set(curvine_proto::FILE_DESCRIPTOR_SET)
                         .with_service_name("proto.MasterService")
-                        .build()?,
+                        .build_v1alpha()?,
                 )
             } else {
                 None
             };
             let handler = MasterGrpcHandler::new(service, rt, tracker.clone());
-            let (mut health, health_service) = curvine_rpc::grpc::health_reporter();
+            let (health, health_service) = curvine_rpc::grpc::health_reporter();
             health
                 .set_serving::<MasterServiceServer<MasterGrpcHandler>>()
                 .await;

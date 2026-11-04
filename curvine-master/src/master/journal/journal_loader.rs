@@ -165,11 +165,11 @@ impl JournalLoader {
     }
 
     fn fsm_state_snapshot(&self) -> CommonResult<FsmState> {
-        Ok(self.fsm_state()?.clone())
+        Ok(*self.fsm_state()?)
     }
 
     fn get_ufs_applied(&self) -> CommonResult<AppliedIndex> {
-        Ok(self.fsm_state()?.ufs_applied.clone())
+        Ok(self.fsm_state()?.ufs_applied)
     }
 
     fn abort_on_fatal_apply_error(message: impl AsRef<str>) -> ! {
@@ -193,7 +193,7 @@ impl JournalLoader {
 
         let mut state = self.fsm_state()?;
         if is_leader {
-            state.ufs_applied = applied.clone();
+            state.ufs_applied = applied;
             state.applied = applied;
         } else {
             state.applied = applied;
@@ -1041,7 +1041,7 @@ impl AppStorage for JournalLoader {
 
     fn get_fsm_state(&self) -> FsmState {
         match self.fsm_state.lock() {
-            Ok(state) => state.clone(),
+            Ok(state) => *state,
             Err(e) => {
                 error!("fatal fsm_state lock poisoned: {}", e);
                 std::process::abort();

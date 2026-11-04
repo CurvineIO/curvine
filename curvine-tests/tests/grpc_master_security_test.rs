@@ -5,7 +5,7 @@
 
 use curvine_core_error::CommonResult;
 use curvine_proto::{master_service_client::MasterServiceClient, GetFilesystemInfoRequest};
-use curvine_rpc::grpc::reflection::pb::{
+use curvine_rpc::grpc::reflection::pb::v1alpha::{
     server_reflection_client::ServerReflectionClient, server_reflection_request::MessageRequest,
     server_reflection_response::MessageResponse, ServerReflectionRequest,
 };

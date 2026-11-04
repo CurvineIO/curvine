@@ -285,6 +285,13 @@ impl TransportConfig {
             .initial_stream_window_size(self.stream_window_bytes)
             .initial_connection_window_size(self.connection_window_bytes);
         if let Some(tls) = tls {
+            // Tonic's server uses rustls's process-wide provider. If multiple
+            // providers are compiled in, rustls cannot choose one by itself.
+            // Preserve a provider already installed by the application (or a
+            // racing initializer); otherwise select ring, as tonic 0.9 did.
+            if rustls::crypto::CryptoProvider::get_default().is_none() {
+                let _ = rustls::crypto::ring::default_provider().install_default();
+            }
             let mut config = ServerTlsConfig::new().identity(Identity::from_pem(
                 &tls.certificate_pem,
                 &tls.private_key_pem,

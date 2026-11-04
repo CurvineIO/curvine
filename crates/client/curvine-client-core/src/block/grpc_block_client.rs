@@ -899,7 +899,7 @@ mod tests {
             .request(RequestStatus::Running)
             .req_id(31)
             .seq_id(4)
-            .proto_header(header.clone())
+            .proto_header(header)
             .build();
         let frame = request_frame(&mut message, None).unwrap();
         assert_eq!((frame.req_id, frame.seq_id), (31, 4));

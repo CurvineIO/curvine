@@ -228,7 +228,7 @@ impl TransferServer {
             let task_ready = self.ready.clone();
             let tracker = TransferRequestTracker::default();
             let handler = TransferGrpcHandler::with_tracker(self.rpc_service.service.clone(), tracker.clone());
-            let (mut health, health_service) = curvine_rpc::grpc::health_reporter();
+            let (health, health_service) = curvine_rpc::grpc::health_reporter();
             health
                 .set_serving::<TransferServiceServer<TransferGrpcHandler<TransferStoreBackend>>>()
                 .await;
@@ -237,7 +237,7 @@ impl TransferServer {
                 Some(curvine_rpc::grpc::reflection::server::Builder::configure()
                     .register_encoded_file_descriptor_set(curvine_proto::FILE_DESCRIPTOR_SET)
                     .with_service_name("proto.TransferService")
-                    .build()?)
+                    .build_v1alpha()?)
             } else { None };
             let transport = curvine_rpc::grpc::TransportConfig::default();
             let mut grpc_server = transport.server(tls.as_ref())?;

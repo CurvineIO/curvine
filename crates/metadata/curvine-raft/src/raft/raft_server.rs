@@ -65,7 +65,7 @@ impl RaftServer {
                 curvine_rpc::grpc::reflection::server::Builder::configure()
                     .register_encoded_file_descriptor_set(crate::proto::raft::FILE_DESCRIPTOR_SET)
                     .with_service_name("raft.RaftService")
-                    .build()?,
+                    .build_v1alpha()?,
             )
         } else {
             None
@@ -80,7 +80,7 @@ impl RaftServer {
         let status = monitor.new_listener();
         let state = monitor.clone();
         let service = Arc::new(self.service);
-        let (mut health, health_service) = curvine_rpc::grpc::health_reporter();
+        let (health, health_service) = curvine_rpc::grpc::health_reporter();
         health
             .set_serving::<crate::proto::raft::raft_service_server::RaftServiceServer<
                 crate::raft::grpc_server::RaftGrpcServer,
