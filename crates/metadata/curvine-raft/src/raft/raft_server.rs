@@ -95,11 +95,16 @@ impl RaftService {
             .build();
 
         let (sender, receiver) = mpsc::channel(conf.message_size);
+        // The wait budget must stay strictly below the client's rpc timeout
+        // (`io_timeout_ms`) so a parked retry answers the caller with a
+        // retryable error instead of a transport timeout. Half of it is the
+        // budget; the driver owns the reservation, so only genuinely in-flight
+        // entries can park a retry here.
         Self {
             sender,
             receiver: Some(receiver),
             retry_cache: Arc::new(cache),
-            retry_wait_timeout: Duration::from_millis(conf.io_timeout_ms.max(1)),
+            retry_wait_timeout: Duration::from_millis((conf.io_timeout_ms / 2).max(1)),
             snapshot_chunk_size: conf.snapshot_read_chunk_size,
         }
     }
@@ -135,10 +140,12 @@ pub struct RaftHandler {
 impl RaftHandler {
     /// Wait until the in-flight request becomes committed.
     ///
-    /// Returns `false` when the wait budget (`io_timeout_ms`) expires while the
-    /// entry is still unapplied, e.g. the entry was overwritten by a new leader
-    /// and can never commit. The caller must answer a retryable error instead
-    /// of a success in that case.
+    /// Returns `false` when the wait budget (half of `io_timeout_ms`) expires
+    /// while the entry is still unapplied, e.g. the entry was overwritten by a
+    /// new leader and can never commit. The caller must answer a retryable
+    /// error instead of a success in that case. The budget is kept strictly
+    /// below the client rpc timeout so the caller sees the retryable error
+    /// rather than a transport timeout.
     async fn wait_committed(&self, req_id: i64) -> bool {
         let poll = Duration::from_millis(20);
         let mut waited = Duration::ZERO;
@@ -177,6 +184,13 @@ impl MessageHandler for RaftHandler {
         // Check for duplicate requests. Propose and conf change both carry a
         // client req_id and are applied through the raft log, so both can be
         // deduplicated by the same cache.
+        //
+        // The handler only reads the cache. Reservations (`InFlight`) are
+        // owned by the raft driver and inserted only after the entry was
+        // really appended, so a pre-append rejection never leaves a marker
+        // that would stall later retries; only genuinely in-flight entries
+        // park a retry here. The single-threaded driver is also the only
+        // writer, so `Committed` can never be overwritten by a reservation.
         let code = RaftCode::from(msg.code());
         if matches!(code, RaftCode::Propose | RaftCode::ConfChange) {
             match self.retry_cache.get(&msg.req_id()) {
@@ -196,11 +210,12 @@ impl MessageHandler for RaftHandler {
                         code,
                         msg.req_id()
                     );
-                    // The previous attempt was never acknowledged, so its
-                    // outcome is unknown. Wait until the entry is applied;
-                    // if the wait budget expires the entry may never commit
-                    // (e.g. it was overwritten by a new leader) and the caller
-                    // must be told to retry instead of seeing a fake success.
+                    // The previous attempt was appended but never
+                    // acknowledged, so its outcome is unknown. Wait until the
+                    // entry is applied; if the wait budget expires the entry
+                    // may never commit (e.g. it was overwritten by a new
+                    // leader) and the caller must be told to retry instead of
+                    // seeing a fake success.
                     if self.wait_committed(msg.req_id()).await {
                         return Ok(msg.success());
                     }
@@ -210,9 +225,7 @@ impl MessageHandler for RaftHandler {
                     )));
                 }
 
-                None => {
-                    self.retry_cache.insert(msg.req_id(), RetryState::InFlight);
-                }
+                None => {}
             }
         }
 
@@ -255,19 +268,27 @@ mod tests {
         );
         let handler = test_handler(cache.clone(), Duration::from_secs(5));
 
-        let msg = propose_msg(1);
-        rt.block_on(handler.async_handle(msg)).unwrap_err();
-        assert_eq!(cache.get(&1), Some(RetryState::InFlight));
+        // The driver reserved the req_id after appending the entry; the
+        // handler itself never writes the reservation.
+        cache.insert(1, RetryState::InFlight);
 
-        // A retry stays parked while the entry is unapplied.
+        // A retry stays parked while the entry is unapplied. Assert with a
+        // short timeout instead of an immediate is_finished check, which
+        // would pass whether or not the handler actually waits.
         let retry = propose_msg(1);
         let handler = Arc::new(handler);
         let waiter = {
             let handler = Arc::clone(&handler);
             rt.spawn(async move { handler.async_handle(retry).await })
         };
+        let mut waiter = waiter;
+        let still_parked = rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(100), &mut waiter)
+                .await
+                .is_err()
+        });
         assert!(
-            !waiter.is_finished(),
+            still_parked,
             "an in-flight retry must wait, not return success"
         );
 
@@ -295,8 +316,8 @@ mod tests {
         );
         let handler = test_handler(cache.clone(), Duration::from_millis(100));
 
-        let msg = propose_msg(2);
-        rt.block_on(handler.async_handle(msg)).unwrap_err();
+        // The driver reserved the req_id after appending the entry.
+        cache.insert(2, RetryState::InFlight);
 
         let retry = propose_msg(2);
         let err = rt
@@ -328,9 +349,10 @@ mod tests {
         let response = rt.block_on(handler.async_handle(propose_msg(3))).unwrap();
         assert!(response.is_success());
 
-        // Conf change requests go through the same dedup cache.
+        // Conf change requests go through the same dedup cache: a Committed
+        // conf change retry is answered directly, a miss is just forwarded.
         let conf = Builder::new_rpc(RaftCode::ConfChange).req_id(4).build();
         rt.block_on(handler.async_handle(conf)).unwrap_err();
-        assert_eq!(cache.get(&4), Some(RetryState::InFlight));
+        assert_eq!(cache.get(&4), None, "the handler must not reserve req_ids");
     }
 }

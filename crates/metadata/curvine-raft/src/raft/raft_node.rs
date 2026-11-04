@@ -484,6 +484,10 @@ where
             if let Err(e) = self.raw.propose_conf_change(context, change) {
                 return Self::send_request_error(env, e.into());
             }
+            // The conf change was appended: reserve the req_id for dedup and
+            // unknown-outcome waits (same lifecycle as a propose).
+            self.retry_cache
+                .insert(env.msg.req_id(), RetryState::InFlight);
             promise.insert(env.msg.req_id(), env.cb);
         }
 
@@ -561,6 +565,11 @@ where
             // Propose execution failed and notify the client service.
             env.send_with_log(Ok(rep_msg));
         } else {
+            // The entry was appended: reserve the req_id so a retry either
+            // dedups against the committed result or waits for the unknown
+            // outcome. Only an actually appended entry may hold a marker.
+            self.retry_cache
+                .insert(env.msg.req_id(), RetryState::InFlight);
             // Keep callbacks from the client service side.
             promise.insert(env.msg.req_id(), env.cb);
         }
@@ -916,6 +925,7 @@ where
         sender: Callback,
         response: ProposeResponse,
         apply_done: CallReceiver<RaftResult<()>>,
+        retry_cache: RetryCache,
     ) {
         let response_msg = Builder::new_rpc(RaftCode::Propose)
             .response(ResponseStatus::Success)
@@ -925,7 +935,13 @@ where
 
         rt.spawn(async move {
             let result = match apply_done.receive().await {
-                Ok(Ok(())) => Ok(response_msg),
+                Ok(Ok(())) => {
+                    // Publish the committed state only after the application
+                    // acknowledged success, so a retry can never be answered
+                    // with a success for an entry that failed to apply.
+                    retry_cache.insert(req_id, RetryState::Committed);
+                    Ok(response_msg)
+                }
                 Ok(Err(error)) => Ok(Builder::new_rpc(RaftCode::Propose)
                     .response(ResponseStatus::Error)
                     .req_id(req_id)
@@ -1041,25 +1057,26 @@ where
                     .response(ResponseStatus::Success)
                     .proto_header(rep)
             } else {
-                let apply = self.apply_propose(entry, should_respond).await?;
-                if let Some(context) = &entry_context {
-                    if let Ok(req_id) = SerdeUtils::deserialize::<i64>(context) {
-                        self.mark_retry_committed(req_id);
+                let entry_context = entry_context.map(|c| {
+                    let req_id = SerdeUtils::deserialize::<i64>(&c);
+                    (c, req_id)
+                });
+                let req_id = match &entry_context {
+                    Some((_, Ok(req_id))) => Some(*req_id),
+                    Some((_, Err(e))) => {
+                        warn!(
+                            "failed to decode raft entry context for response, index {}, term {}: {}",
+                            entry_index, entry_term, e
+                        );
+                        None
                     }
-                }
+                    None => None,
+                };
+
+                let apply = self.apply_propose(entry, should_respond).await?;
                 if should_respond {
-                    let Some(entry_context) = entry_context else {
+                    let Some(req_id) = req_id else {
                         continue;
-                    };
-                    let req_id: i64 = match SerdeUtils::deserialize(&entry_context) {
-                        Ok(req_id) => req_id,
-                        Err(e) => {
-                            warn!(
-                                "failed to decode raft entry context for response, index {}, term {}: {}",
-                                entry_index, entry_term, e
-                            );
-                            continue;
-                        }
                     };
                     let Some(apply_done) = apply.apply_done else {
                         warn!(
@@ -1075,10 +1092,24 @@ where
                             sender,
                             apply.response,
                             apply_done,
+                            self.retry_cache.clone(),
                         ),
 
-                        None => debug!("Request {} was already answered", req_id),
+                        None => {
+                            // The original caller is gone (connection closed
+                            // or already answered), so the apply ack would be
+                            // dropped. Publish the committed state here: the
+                            // entry is about to be applied by the app store
+                            // regardless of who is listening.
+                            self.mark_retry_committed(req_id);
+                            debug!("Request {} was already answered", req_id);
+                        }
                     };
+                } else if let Some(req_id) = req_id {
+                    // Follower replay has no caller waiting. The app store
+                    // applies the entry inline for wait=false messages, so the
+                    // apply result is already known here.
+                    self.mark_retry_committed(req_id);
                 }
                 continue;
             };
@@ -1120,7 +1151,6 @@ where
         self.retry_cache.insert(req_id, RetryState::Committed);
     }
 }
-
 #[cfg(test)]
 #[path = "tests/raft_node_recovery_tests.rs"]
 mod raft_node_recovery_tests;
