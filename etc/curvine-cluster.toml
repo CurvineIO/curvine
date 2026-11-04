@@ -128,10 +128,9 @@ log = { level = "info", log_dir = "logs", file_name = "master.log" }
 # compete with RPC threads for CPU. With less than 32GB memory, lower
 # block_cache_size; with fewer than 6 cores, lower max_background_jobs.
 #
-# NOTE: a [master.rocksdb] table replaces the built-in master defaults instead
-# of merging with them. Any key left out falls back to the generic RocksDB
-# default (64MB cache, 2 jobs, no compression, WAL on, no bloom filter).
-# Uncomment the whole block below and edit only the values you need.
+# NOTE: a [master.rocksdb] table overlays the built-in master defaults: keys
+# you write override them, keys you leave out keep them. Uncomment the block
+# below and edit only the values you need.
 # [master.rocksdb]
 # block_size = "4KB"
 # disable_wal = true
