@@ -27,7 +27,6 @@ use curvine_runtime::sync::channel::{
 use curvine_runtime::sync::ErrorMonitor;
 use log::{debug, error};
 use std::sync::Arc;
-use std::time::Duration;
 
 // Control task type
 enum WriterTask {
@@ -149,7 +148,7 @@ impl FsWriterBuffer {
         let monitor = err_monitor.clone();
 
         let rt = writer.fs_context().clone_runtime();
-        rt.spawn(async move {
+        let task = rt.spawn(async move {
             let res = Self::write_future(chunk_receiver, task_receiver, writer).await;
             match res {
                 Ok(_) => {}
@@ -165,10 +164,12 @@ impl FsWriterBuffer {
             }
         });
 
+        let ctx = CallCtx::writer(path.path().to_string(), timeout, err_monitor, task);
+
         let writer = BufferChannel {
             chunk_sender,
             task_sender,
-            ctx: CallCtx::writer(path.path().to_string(), timeout, err_monitor),
+            ctx,
         };
 
         Self {
@@ -323,13 +324,19 @@ mod tests {
     use super::{recv_task, BufferChannel, SelectTask, WriterTask};
     use crate::file::CallCtx;
     use bytes::Bytes;
-    use curvine_error::FsResult;
+    use curvine_error::{FsError, FsResult};
     use curvine_io::DataSlice;
     use curvine_runtime::sync::channel::{AsyncChannel, CallChannel};
-    use curvine_runtime::sync::ErrorMonitor;
+    use curvine_runtime::sync::{AtomicBool, ErrorMonitor};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::time;
+
+    // Tests drive every handshake themselves, so the owned task only has to
+    // exist and stay parked.
+    fn idle_task() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async {})
+    }
 
     #[tokio::test]
     async fn cancel_control_preempts_queued_data() {
@@ -364,6 +371,7 @@ mod tests {
                 "/gh-1908-test".to_string(),
                 Duration::from_millis(timeout_ms),
                 Arc::new(ErrorMonitor::new()),
+                idle_task(),
             ),
         }
     }
@@ -435,6 +443,7 @@ mod tests {
                 "/gh-1908-reply-then-exit".to_string(),
                 Duration::from_secs(10),
                 Arc::new(ErrorMonitor::new()),
+                idle_task(),
             ),
         };
 
@@ -462,6 +471,7 @@ mod tests {
                 "/gh-1908-exit-no-reply".to_string(),
                 Duration::from_secs(60),
                 Arc::new(ErrorMonitor::new()),
+                idle_task(),
             ),
         };
 
@@ -503,6 +513,7 @@ mod tests {
                 "/gh-1908-late-reply".to_string(),
                 Duration::from_millis(200),
                 Arc::new(ErrorMonitor::new()),
+                idle_task(),
             ),
         };
 
@@ -513,6 +524,118 @@ mod tests {
             "unexpected timeout error: {}",
             msg
         );
+    }
+
+    // A timed-out flush means the background task is gone or wedged. Later
+    // writes must fail at once: queuing them would burn another deadline and
+    // silently drop the data when the task stops (see #1908 review).
+    #[tokio::test]
+    async fn timeout_abandons_the_writer_and_later_calls_fail_fast() {
+        let mut channel = test_channel(200);
+
+        let err = channel.flush().await.unwrap_err();
+        assert!(
+            err.to_string().contains("not responding"),
+            "unexpected: {}",
+            err
+        );
+
+        let start = Instant::now();
+        let err = channel
+            .write(DataSlice::Bytes(Bytes::from_static(b"after-timeout")))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("task abandoned"),
+            "the write after a timed-out flush must be refused, got: {}",
+            err
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "the refused write waited {:?}",
+            start.elapsed()
+        );
+
+        // Every handshake is refused, not just data writes.
+        assert!(channel.complete().await.is_err());
+    }
+
+    // The deadline must not hide the cause the background task recorded: the
+    // caller has to see the real failure, not only the synthetic timeout.
+    #[tokio::test]
+    async fn timeout_reports_the_background_error_when_one_exists() {
+        let (chunk_sender, chunk_receiver) = AsyncChannel::new(2).split();
+        let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+        std::mem::forget((chunk_receiver, task_receiver));
+
+        let monitor = ErrorMonitor::new();
+        monitor.set_error(FsError::common("worker connection lost"));
+
+        let mut channel = BufferChannel {
+            chunk_sender,
+            task_sender,
+            ctx: CallCtx::writer(
+                "/gh-1908-background-error".to_string(),
+                Duration::from_millis(100),
+                Arc::new(monitor),
+                idle_task(),
+            ),
+        };
+
+        let err = channel.flush().await.unwrap_err();
+        assert!(
+            err.to_string().contains("worker connection lost"),
+            "the recorded cause must win over the timeout, got: {}",
+            err
+        );
+    }
+
+    // The latch must also stop the task: a parked task never wakes up to see its
+    // closed channels and would hold its FsWriterBase, block lease and queued
+    // chunks for the process lifetime.
+    #[tokio::test]
+    async fn timeout_aborts_the_background_task() {
+        struct MarkOnDrop(Arc<AtomicBool>);
+        impl Drop for MarkOnDrop {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let (chunk_sender, chunk_receiver) = AsyncChannel::new(2).split();
+        let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+
+        // A parked task: it never polls the channels, so only an abort stops it.
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mark = MarkOnDrop(stopped.clone());
+        let task = tokio::spawn(async move {
+            let _channels = (chunk_receiver, task_receiver);
+            let _mark = mark;
+            std::future::pending::<()>().await
+        });
+
+        let mut channel = BufferChannel {
+            chunk_sender,
+            task_sender,
+            ctx: CallCtx::writer(
+                "/gh-1908-abort".to_string(),
+                Duration::from_millis(200),
+                Arc::new(ErrorMonitor::new()),
+                task,
+            ),
+        };
+
+        channel.flush().await.unwrap_err();
+
+        // The abort is delivered by the runtime, so wait for the task to go.
+        let start = Instant::now();
+        while !stopped.get() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the background task was not aborted after the deadline expired"
+            );
+            time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     // End-to-end note: a full FsWriterBase-backed complete requires a live

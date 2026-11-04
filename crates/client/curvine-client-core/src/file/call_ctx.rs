@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core_error::err_msg;
 use curvine_error::{FsError, FsResult};
-use curvine_runtime::sync::ErrorMonitor;
+use curvine_runtime::sync::{AtomicBool, ErrorMonitor};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 pub(crate) struct CallCtx {
@@ -24,6 +26,8 @@ pub(crate) struct CallCtx {
     timeout: Duration,
     err_monitor: Arc<ErrorMonitor<FsError>>,
     side: Side,
+    abandoned: AtomicBool,
+    task: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -52,6 +56,8 @@ impl CallCtx {
             timeout,
             err_monitor,
             side: Side::Read,
+            abandoned: AtomicBool::new(false),
+            task: None,
         }
     }
 
@@ -59,12 +65,15 @@ impl CallCtx {
         path: String,
         timeout: Duration,
         err_monitor: Arc<ErrorMonitor<FsError>>,
+        task: JoinHandle<()>,
     ) -> Self {
         Self {
             path,
             timeout,
             err_monitor,
             side: Side::Write,
+            abandoned: AtomicBool::new(false),
+            task: Some(task),
         }
     }
 
@@ -86,14 +95,42 @@ impl CallCtx {
         ))
     }
 
+    fn abandoned_error(&self, op: &str) -> FsError {
+        FsError::common(err_msg!(
+            "{} buffer task not responding after {:?}, task abandoned, path={}, op={}",
+            self.side.label(),
+            self.timeout,
+            self.path,
+            op
+        ))
+    }
+
+    fn abandon(&self) {
+        self.abandoned.set(true);
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+
     pub(crate) async fn call<T, F, E>(&self, op: &str, fun: F) -> FsResult<T>
     where
         F: Future<Output = Result<T, E>>,
         E: Into<FsError>,
     {
+        if self.abandoned.get() {
+            return Err(self.abandoned_error(op));
+        }
+
         match timeout(self.timeout, fun).await {
             Ok(v) => v.map_err(|e| self.check_error(e)),
-            Err(_) => Err(self.timeout_error(op)),
+
+            Err(_) => match self.err_monitor.take_error() {
+                Some(background) => Err(background),
+                None => {
+                    self.abandon();
+                    Err(self.timeout_error(op))
+                }
+            },
         }
     }
 }

@@ -319,16 +319,27 @@ impl ClientConf {
 
     pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
 
-    pub const DEFAULT_DATA_TIMEOUT_MS: u64 = 120 * 1000;
+    /// 5 minutes: the data path uses one fixed deadline everywhere (worker data
+    /// RPC and client buffer handshake), so the value must be large enough for
+    /// the slowest legitimate one. A handshake may first have to drain queued
+    /// writes, and a read may retry the next replica before it answers; 2
+    /// minutes turned those into spurious "not responding" errors.
+    pub const DEFAULT_DATA_TIMEOUT_MS: u64 = 300 * 1000;
 
     pub const DEFAULT_READ_PARALLEL: i64 = 1;
 
     pub const DEFAULT_MAX_READ_PARALLEL: i64 = 8;
 
-    /// Deadline for one data-path operation and for one buffer control
-    /// handshake (see `data_timeout_ms`). Falls back to the built-in default
-    /// when the field is 0, so an uninitialised conf never yields
-    /// `Duration::ZERO` and makes every `timeout(..)` fire immediately.
+    /// The one fixed deadline of the data path: every worker read/write RPC and
+    /// every client buffer handshake uses it, so a timeout always means the same
+    /// thing regardless of where it fired. The connection layer keeps its own
+    /// fixed receive window (`rpc_timeout_ms`); neither value is derived from a
+    /// single round-trip estimate, so a slow commit cannot shorten a read's
+    /// budget or vice versa.
+    ///
+    /// Falls back to the built-in default when the field is 0, so an
+    /// uninitialised conf never yields `Duration::ZERO` and makes every
+    /// `timeout(..)` fire immediately.
     pub fn data_timeout(&self) -> Duration {
         let millis = if self.data_timeout_ms > 0 {
             self.data_timeout_ms

@@ -60,7 +60,7 @@ impl BlockClient {
             replication_token: None,
             client: Some(client),
             client_name: context.clone_client_name(),
-            timeout: Duration::from_millis(context.conf.client.data_timeout_ms),
+            timeout: context.conf.client.data_timeout(),
             pool: None,
             worker_addr,
             uptime: LocalTime::mills(),

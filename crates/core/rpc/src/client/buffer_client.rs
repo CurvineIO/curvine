@@ -194,7 +194,8 @@ impl BufferClient {
                 Ok(msg) => msg,
 
                 Err(e) if IOUtils::is_timeout(&e) => {
-                    if client_state.has_error() {
+                    if call_map.not_empty() {
+                        client_state.set_error(e);
                         break;
                     }
                     continue;
@@ -421,24 +422,90 @@ mod tests {
             );
         }
 
-        timeout(Duration::from_secs(5), task)
+        let exit = timeout(Duration::from_secs(5), task)
             .await
             .expect("request_future kept running on a closed connection")
-            .expect("request_future must exit cleanly");
+            .expect("request_future must not panic");
+        // The request side leaves through `break`, so stopping is a clean exit.
+        assert!(
+            exit.is_ok(),
+            "request_future must stop cleanly once the connection is closed, got {exit:?}"
+        );
     }
 
-    /// A quiet peer is not a dead peer: the idle tick exists to send heartbeats
-    /// and must not tear a live connection down. A peer that answers after
-    /// several idle ticks must still get its response delivered.
+    /// An idle connection has nothing to receive, so an empty receive window is
+    /// normal and must not tear it down: only a request that is waiting when the
+    /// window expires proves the peer is gone.
     #[tokio::test]
-    async fn idle_ticks_do_not_kill_a_live_connection() {
+    async fn an_idle_connection_survives_the_receive_window() {
         const REQ_ID: i64 = 7;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let client = TcpStream::connect(addr).await.unwrap();
-        let (mut server, _) = listener.accept().await.unwrap();
+        let (mut server, _peer) = listener.accept().await.unwrap();
+
+        let (read_half, _write_half) = tokio::io::split(client);
+        let read_frame = ReadFrame::new(read_half, FrameBuf::new(0));
+
+        let state = Arc::new(ClientState::new(addr.into(), addr.into()));
+        let call_map = Arc::new(CallMap::new());
+
+        // Nothing is outstanding, so the loop must ride out several windows.
+        let task = tokio::spawn(BufferClient::response_future(
+            state.clone(),
+            Duration::from_millis(100),
+            read_frame,
+            call_map.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            !state.is_closed(),
+            "an idle connection must survive empty receive windows"
+        );
+
+        // A request goes out, and the peer answers it.
+        let (cb, promise) = oneshot::channel::<IOResult<Message>>();
+        call_map.insert(REQ_ID, cb);
+
+        let mut frame = BytesMut::new();
+        Builder::new_rpc(1i8)
+            .response(ResponseStatus::Success)
+            .req_id(REQ_ID)
+            .build()
+            .encode(&mut frame)
+            .unwrap();
+        server.write_all(&frame).await.unwrap();
+
+        let msg = timeout(Duration::from_secs(5), promise)
+            .await
+            .expect("the response was never delivered: an idle window killed a live connection")
+            .expect("the callback was dropped")
+            .expect("the response must decode");
+        assert_eq!(msg.req_id(), REQ_ID);
+        assert!(
+            !state.is_closed(),
+            "idle windows must not mark a live connection closed"
+        );
+
+        task.abort();
+    }
+
+    /// With a request outstanding, an empty receive window means the peer
+    /// accepted the request and then went quiet (#1908): the connection must be
+    /// dropped and the inflight call failed, instead of waiting window after
+    /// window.
+    #[tokio::test]
+    async fn a_waiting_request_drops_the_connection_after_one_window() {
+        const REQ_ID: i64 = 7;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (_server, _peer) = listener.accept().await.unwrap();
 
         let (read_half, _write_half) = tokio::io::split(client);
         let read_frame = ReadFrame::new(read_half, FrameBuf::new(0));
@@ -450,39 +517,35 @@ mod tests {
         let (cb, promise) = oneshot::channel::<IOResult<Message>>();
         call_map.insert(REQ_ID, cb);
 
-        let task = tokio::spawn(BufferClient::response_future(
-            state.clone(),
-            Duration::from_millis(100),
-            read_frame,
-            call_map.clone(),
-        ));
-
-        // Stay silent across several idle ticks, then answer.
-        tokio::time::sleep(Duration::from_millis(350)).await;
-
-        let mut frame = BytesMut::new();
-        // `new_rpc` keeps a non-undefined request status: the packed status
-        // byte is `req | resp << 4`, so a frame built from `Builder::new()`
-        // (request status `Undefined` = -1) decodes back as an empty message.
-        Builder::new_rpc(1i8)
-            .response(ResponseStatus::Success)
-            .req_id(REQ_ID)
-            .build()
-            .encode(&mut frame)
-            .unwrap();
-        server.write_all(&frame).await.unwrap();
-
-        let msg = timeout(Duration::from_secs(5), promise)
-            .await
-            .expect("the response was never delivered: an idle tick killed a live connection")
-            .expect("the callback was dropped")
-            .expect("the response must decode");
-        assert_eq!(msg.req_id(), REQ_ID);
+        let exit = timeout(
+            Duration::from_secs(5),
+            BufferClient::response_future(
+                state.clone(),
+                Duration::from_millis(100),
+                read_frame,
+                call_map.clone(),
+            ),
+        )
+        .await
+        .expect("response_future kept waiting after the receive window expired");
+        // The inflight call it had to fail is reported to the caller.
         assert!(
-            !state.is_closed(),
-            "idle ticks must not mark a live connection closed"
+            exit.is_err(),
+            "check_calls must report the call it failed when the peer went silent"
         );
 
-        task.abort();
+        assert!(
+            state.is_closed(),
+            "a silent peer must leave the connection unusable"
+        );
+
+        let err = timeout(Duration::from_secs(1), promise)
+            .await
+            .expect("the inflight call was never failed")
+            .expect("the callback was dropped");
+        assert!(
+            err.is_err(),
+            "the inflight call must fail instead of hanging until the caller gives up"
+        );
     }
 }

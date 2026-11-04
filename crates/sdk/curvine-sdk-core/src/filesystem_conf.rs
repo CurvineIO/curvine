@@ -174,7 +174,7 @@ impl FilesystemConf {
             master_conn_pool_size: 1,
             conn_timeout_ms: 30_000,
             rpc_timeout_ms: 120_000,
-            data_timeout_ms: 120_000,
+            data_timeout_ms: rpc_defaults.data_timeout_ms,
             conn_retry_max_duration_ms: rpc_defaults.conn_retry_max_duration_ms,
             conn_retry_min_sleep_ms: rpc_defaults.conn_retry_min_sleep_ms,
             conn_retry_max_sleep_ms: rpc_defaults.conn_retry_max_sleep_ms,
