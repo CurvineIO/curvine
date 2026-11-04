@@ -1198,7 +1198,19 @@ impl NodeState {
         if let Some(status) = self.unlinked_status(ino) {
             return Ok(status);
         }
-        let status = self.fs.get_status(&path).await?;
+        let status = match self.fs.get_status(&path).await {
+            Ok(status) => status,
+            Err(e) => {
+                // An unlink may commit while this RPC is in flight (no lock
+                // serializes it in this mode). The tombstone resolver answers
+                // that case without taking the path lock; the success path
+                // pays nothing.
+                if let Some(status) = self.unlinked_status(ino) {
+                    return Ok(status);
+                }
+                return Err(e.into());
+            }
+        };
         // No-op for non-root inodes; the root refresh is required because
         // fs_lookup serves `.`/`..` to the root inode without a cache gate.
         self.cache_resolved_status(ino, None, &status);
@@ -1976,9 +1988,12 @@ mod test {
             let finished = tokio::time::timeout(std::time::Duration::from_secs(2), stat_task).await;
             drop(guard);
 
+            let joined = finished
+                .expect("fs_stat_guarded must not wait on the path lock when the meta cache is disabled")
+                .expect("fs_stat_guarded panicked");
             assert!(
-                finished.is_ok(),
-                "fs_stat_guarded must not wait on the path lock when the meta cache is disabled"
+                joined.is_err(),
+                "expected the closed-port backend error from the unlocked RPC"
             );
         });
     }
