@@ -387,6 +387,11 @@ impl JournalSystem {
         self.worker_manager.clone()
     }
 
+    // The raft log store, i.e. the journal RocksDB.
+    pub fn log_store(&self) -> RocksLogStorage {
+        self.raft_journal.log_store().clone()
+    }
+
     #[doc(hidden)]
     pub fn journal_loader(&self) -> JournalLoader {
         self.raft_journal.app_store().clone()

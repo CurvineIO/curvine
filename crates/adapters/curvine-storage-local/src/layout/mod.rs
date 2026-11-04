@@ -17,7 +17,7 @@ mod file_layout;
 
 pub use self::bdev_layout::BdevLayout;
 pub(crate) use self::file_layout::FileFinalizePlan;
-pub use self::file_layout::FileLayout;
+pub use self::file_layout::{FileLayout, SidecarSync};
 
 use crate::{BlockMeta, ChecksumVerify};
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};

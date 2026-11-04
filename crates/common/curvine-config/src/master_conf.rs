@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{ClusterConf, CompatibilityConf, DBConf};
+use crate::{deserialize_master_rocksdb, ClusterConf, CompatibilityConf, DBConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_runtime::common::{ByteUnit, DurationUnit, LogConf, Utils};
 use curvine_runtime::runtime::GroupExecutor;
@@ -178,6 +178,12 @@ pub struct MasterConf {
     #[serde(skip)]
     pub lock_expire_time_unit: DurationUnit,
 
+    // Whether `session_owned` locks are released only by their owner or the
+    // session reaper instead of `lock_expire_time` (#1879). Defaults to false:
+    // until the reaper (#1884) exists, a crashed client's lock must still expire
+    // on the legacy TTL. #1884 flips this default to true.
+    pub client_session_lock_lease: bool,
+
     // Client session lease: a client session that has not sent a ClientHeartbeat
     // within this window is considered expired. Should be several times the
     // client heartbeat interval (default 12s).
@@ -194,7 +200,14 @@ pub struct MasterConf {
     /// explicitly configured).
     pub compatibility: CompatibilityConf,
 
-    #[serde(default = "MasterConf::rocksdb_default")]
+    /// Partial-table semantics (#1966): keys present in the TOML table
+    /// override `MasterConf::rocksdb_default()`; keys left out keep the
+    /// component default (not `DBConf::default()`). The field-level
+    /// `default` still covers the fully-absent-table case.
+    #[serde(
+        default = "MasterConf::rocksdb_default",
+        deserialize_with = "deserialize_master_rocksdb"
+    )]
     pub rocksdb: DBConf,
 }
 
@@ -280,6 +293,19 @@ impl MasterConf {
             use_bloom_filter: true,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks_in_cache: true,
+            // Production baseline for a 10-50M inode master with 32-64GB memory
+            // and at least 6 cores. Smaller masters should lower
+            // `block_cache_size` and `max_background_jobs`. A partial
+            // `[master.rocksdb]` table overlays these defaults: keys you
+            // write override them, keys you leave out keep them (#1966),
+            // so there is no need to copy the full block from
+            // etc/curvine-cluster.toml.
+            block_cache_size: ByteUnit::gb(4),
+            max_background_jobs: 6,
+            max_subcompactions: 2,
+            compression_type: DBConf::COMPRESSION_LZ4.to_string(),
+            max_bytes_for_level_base: ByteUnit::gb(2),
+            enable_statistics: true,
             ..Default::default()
         }
     }
@@ -471,6 +497,8 @@ impl Default for MasterConf {
             lock_expire_time: "5m".to_string(),
             lock_expire_time_unit: Default::default(),
 
+            client_session_lock_lease: false,
+
             client_session_timeout: "60s".to_string(),
             client_session_timeout_unit: Default::default(),
 
@@ -492,6 +520,54 @@ impl Default for MasterConf {
 #[cfg(test)]
 mod tests {
     use super::MasterConf;
+    use crate::DBConf;
+    use curvine_runtime::common::ByteUnit;
+
+    #[test]
+    fn partial_rocksdb_table_keeps_component_defaults() {
+        // #1966: a partial [master.rocksdb] table must overlay the component
+        // baseline, not the generic DBConf::default().
+        let raw = r#"
+            block_report_limit = 1000
+            [rocksdb]
+            block_cache_size = "1GB"
+        "#;
+        let conf: MasterConf = toml::from_str(raw).unwrap();
+
+        assert_eq!(conf.rocksdb.block_cache_size, ByteUnit::gb(1));
+        assert!(conf.rocksdb.disable_wal);
+        assert_eq!(conf.rocksdb.compression_type, DBConf::COMPRESSION_LZ4);
+        assert_eq!(conf.rocksdb.max_background_jobs, 6);
+        assert_eq!(conf.rocksdb.max_subcompactions, 2);
+        assert_eq!(conf.rocksdb.max_bytes_for_level_base, ByteUnit::gb(2));
+        assert!(conf.rocksdb.enable_statistics);
+        assert!(conf.rocksdb.use_bloom_filter);
+    }
+
+    #[test]
+    fn empty_rocksdb_table_equals_default() {
+        let conf: MasterConf = toml::from_str("[rocksdb]").unwrap();
+        let expected = MasterConf::default().rocksdb;
+        assert_eq!(conf.rocksdb.disable_wal, expected.disable_wal);
+        assert_eq!(conf.rocksdb.compression_type, expected.compression_type);
+        assert_eq!(conf.rocksdb.block_cache_size, expected.block_cache_size);
+        assert_eq!(
+            conf.rocksdb.max_background_jobs,
+            expected.max_background_jobs
+        );
+    }
+
+    #[test]
+    fn rocksdb_defaults_match_production_baseline() {
+        let rocksdb = MasterConf::default().rocksdb;
+
+        assert_eq!(rocksdb.block_cache_size, ByteUnit::gb(4));
+        assert_eq!(rocksdb.max_background_jobs, 6);
+        assert_eq!(rocksdb.max_subcompactions, 2);
+        assert_eq!(rocksdb.compression_type, DBConf::COMPRESSION_LZ4);
+        assert_eq!(rocksdb.max_bytes_for_level_base, ByteUnit::gb(2));
+        assert!(rocksdb.enable_statistics);
+    }
 
     #[test]
     fn replication_submit_timeout_must_be_positive() {
@@ -569,6 +645,17 @@ mod tests {
         assert!(error
             .to_string()
             .contains("trash_check_interval must be greater than zero"));
+    }
+
+    #[test]
+    fn client_session_lock_lease_defaults_off() {
+        let mut conf = MasterConf::default();
+        conf.init().unwrap();
+
+        assert!(
+            !conf.client_session_lock_lease,
+            "session-owned locks must keep the legacy TTL until the reaper exists"
+        );
     }
 
     #[test]

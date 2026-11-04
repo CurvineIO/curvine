@@ -19,7 +19,7 @@ use crate::worker::storage::{
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
-use curvine_model::{ExtendedBlock, StorageInfo};
+use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
 use dashmap::{DashMap, DashSet};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
@@ -74,6 +74,27 @@ pub enum CorruptCheck {
     /// The block cannot be checked yet because a writer holds it or it is
     /// not finalized. The caller requeues it for a later heartbeat.
     Retry(String),
+}
+
+/// Outcome of the lock-free verification of one block by the startup scan.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScanResult {
+    /// Every chunk matched its sidecar.
+    Verified,
+    /// A chunk failed its CRC.
+    Mismatch,
+    /// The block has no sidecar and the policy reads it unverified.
+    NoSidecar,
+    /// The block has no sidecar but the policy requires one.
+    Unverifiable,
+    /// Not a finalized file block any more, or the scan stopped.
+    Skipped,
+}
+
+/// The store's checksum policy rejects `meta` when it has no sidecar.
+/// SPDK blocks never have one and are not checked.
+fn requires_sidecar(verify: ChecksumVerify, meta: &BlockMeta) -> bool {
+    verify == ChecksumVerify::RequireSidecar && meta.storage_type() != StorageType::SpdkDisk
 }
 
 #[derive(Clone)]
@@ -363,7 +384,14 @@ impl BlockStore {
         match self.with_dataset_write("finalize", |state| {
             state.publish_file_finalize(&reservation, plan)
         }) {
-            Ok(meta) => Ok(meta),
+            Ok((meta, sync)) => {
+                // Durability only: run it outside the dataset lock, still under
+                // the stripe lock.
+                if let Some(sync) = sync {
+                    sync.finish();
+                }
+                Ok(meta)
+            }
             Err(error) => {
                 self.rollback_finalize_reservation(block.id, &error, |state| {
                     state.rollback_file_finalize(&reservation)
@@ -397,12 +425,17 @@ impl BlockStore {
         self.with_dataset_write("abort", |state| state.abort_block(block))
     }
 
-    pub(crate) fn abort_replication_write(&self, block_id: i64) -> CommonResult<()> {
-        let _lock = self.block_lock(block_id, "abort_replication");
+    /// Aborts a block unless it is in the committed, finalized generation:
+    /// takes the block stripe lock, checks the replication owner, then aborts
+    /// the raw current generation only if `!is_final()`, all inside one
+    /// `with_dataset_write`. Complete/open error paths may already have rolled
+    /// back to an old committed generation — a second abort must not delete
+    /// that finalized replica — so this never goes through the readable view.
+    /// Missing blocks (already aborted) are fine and return `Ok(())`.
+    fn abort_unless_final(&self, block_id: i64, op: &str) -> CommonResult<()> {
+        let _lock = self.block_lock(block_id, op);
         self.check_replication_owner(block_id)?;
-        self.with_dataset_write("abort_replication", |state| {
-            // complete/open error paths may already have rolled back to an old committed
-            // generation. A second abort must not delete that finalized replica.
+        self.with_dataset_write(op, |state| {
             if state
                 .get_block(block_id)
                 .is_some_and(|meta| !meta.is_final())
@@ -411,6 +444,16 @@ impl BlockStore {
             }
             Ok(())
         })
+    }
+
+    pub(crate) fn abort_replication_write(&self, block_id: i64) -> CommonResult<()> {
+        self.abort_unless_final(block_id, "abort_replication")
+    }
+
+    /// Aborts a batch-opened block unless it is already finalized; see
+    /// [`BlockStore::abort_unless_final`] for the check-and-abort contract.
+    pub(crate) fn abort_batch_write(&self, block_id: i64) -> CommonResult<()> {
+        self.abort_unless_final(block_id, "abort_batch")
     }
 
     pub fn get_block(&self, id: i64) -> CommonResult<BlockMeta> {
@@ -596,6 +639,61 @@ impl BlockStore {
             .collect()
     }
 
+    /// Verify a finalized block without the stripe lock, reading at most
+    /// `read_len` bytes at a time and calling `on_read` with each length
+    /// read, which may sleep to limit the rate or return false to stop. A
+    /// read that fails its CRC is still passed to `on_read`, so it is
+    /// counted and paced like the others.
+    ///
+    /// The reader opens the block file and its sidecar together under the
+    /// dataset read lock, so a concurrent rewrite or delete cannot mix two
+    /// generations. Finding a mismatch only reports it: removal re-checks
+    /// the block under the lock.
+    pub fn scan_block(
+        &self,
+        id: i64,
+        read_len: i32,
+        mut on_read: impl FnMut(i64) -> bool,
+    ) -> CommonResult<ScanResult> {
+        let (meta, required, mut reader) = {
+            let state = self.read()?;
+            let Some(meta) = state.get_block(id).cloned() else {
+                return Ok(ScanResult::Skipped);
+            };
+            if *meta.state() != BlockState::Finalized
+                || meta.storage_type() == StorageType::SpdkDisk
+            {
+                return Ok(ScanResult::Skipped);
+            }
+            let (layout, dir) = state.layout_for(&meta)?;
+            let reader =
+                layout.open_reader(&dir, &meta, 0, meta.len(), ChecksumVerify::AllowMissing)?;
+            let required = requires_sidecar(state.checksum_verify(), &meta);
+            (meta, required, reader)
+        };
+        if !reader.is_verified() {
+            return Ok(if required {
+                ScanResult::Unverifiable
+            } else {
+                ScanResult::NoSidecar
+            });
+        }
+        while reader.block_pos() < meta.len() {
+            let before = reader.block_pos();
+            if let Err(e) = reader.read_region(false, read_len) {
+                if reader.checksum_mismatch() {
+                    on_read((read_len as i64).min(meta.len() - before));
+                    return Ok(ScanResult::Mismatch);
+                }
+                return Err(e.into());
+            }
+            if !on_read(reader.block_pos() - before) {
+                return Ok(ScanResult::Skipped);
+            }
+        }
+        Ok(ScanResult::Verified)
+    }
+
     /// Put a block back for the next heartbeat. A fresh read report that
     /// arrived meanwhile keeps its lower count.
     pub fn requeue_corrupt(&self, id: i64, failed_checks: u32) {
@@ -696,7 +794,7 @@ impl BlockStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::block::BlockState;
+    use crate::worker::block::{BlockState, ChecksumScan, ScanStats};
     use crate::worker::storage::{Dataset, FileLayout};
     use curvine_config::WorkerConf;
     use curvine_io::DataSlice;
@@ -1048,8 +1146,20 @@ mod tests {
         verify: bool,
         allow_missing: bool,
     ) -> CommonResult<BlockStore> {
+        open_checksum_store(name, write, verify, allow_missing, true)
+    }
+
+    /// Open the store in `name`; `format` false keeps the blocks on disk, as
+    /// a worker restart does.
+    fn open_checksum_store(
+        name: &str,
+        write: bool,
+        verify: bool,
+        allow_missing: bool,
+        format: bool,
+    ) -> CommonResult<BlockStore> {
         let conf = ClusterConf {
-            format_worker: true,
+            format_worker: format,
             worker: WorkerConf {
                 dir_reserved: "0".to_string(),
                 data_dir: vec![format!("[MEM:16MB]../testing/block-store-{name}")],
@@ -1485,6 +1595,178 @@ mod tests {
             wall_clock.as_micros(),
             max_latency.as_micros(),
         );
+        Ok(())
+    }
+
+    /// Overwrite the block file with zeros of the same length, the damage a
+    /// reboot without sync can leave (#1813).
+    fn zero_block(store: &BlockStore, meta: &BlockMeta) -> CommonResult<()> {
+        let path = store.short_circuit(meta)?.unwrap();
+        std::fs::write(&path, vec![0u8; meta.len() as usize])?;
+        Ok(())
+    }
+
+    #[test]
+    fn zeroed_block_after_restart_fails_verified_read() -> CommonResult<()> {
+        let name = "checksum-restart-zeroed";
+        let store = open_checksum_store(name, true, true, true, true)?;
+        let (finalized, data) = finalize_checksummed(&store, 1)?;
+        zero_block(&store, &finalized)?;
+        drop(store);
+
+        let store = open_checksum_store(name, true, true, true, false)?;
+        assert!(store.get_block(finalized.id)?.is_final());
+        let (_, mut reader) = store.open_reader_by_id(finalized.id, 0, data.len() as i64)?;
+        assert!(reader.read_region(false, 64 * 1024).is_err());
+        assert!(reader.checksum_mismatch());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_block_after_restart_follows_missing_sidecar_policy() -> CommonResult<()> {
+        let name = "checksum-restart-legacy";
+        // Written before checksums were enabled: no sidecar.
+        let store = open_checksum_store(name, false, false, true, true)?;
+        let data = vec![7u8; 100 * 1024];
+        let legacy = finalize_with_data(&store, 1, &data)?;
+        drop(store);
+
+        let store = open_checksum_store(name, true, true, true, false)?;
+        let (_, mut reader) = store.open_reader_by_id(legacy.id, 0, data.len() as i64)?;
+        assert!(!reader.is_verified());
+        assert_eq!(read_bytes(&mut reader, data.len() as i32)?, data);
+        drop(store);
+
+        let store = open_checksum_store(name, true, true, false, false)?;
+        let Err(err) = store.open_reader_by_id(legacy.id, 0, data.len() as i64) else {
+            panic!("a legacy block must be rejected when a sidecar is required");
+        };
+        assert!(err.to_string().contains("sidecar"), "{err}");
+        Ok(())
+    }
+
+    /// Restart a store holding a healthy, a zeroed and a legacy block.
+    fn restarted_store_for_scan(name: &str, allow_missing: bool) -> CommonResult<BlockStore> {
+        let store = open_checksum_store(name, false, false, true, true)?;
+        finalize_with_data(&store, 3, &[9u8; 1000])?;
+        drop(store);
+
+        let store = open_checksum_store(name, true, true, true, false)?;
+        finalize_checksummed(&store, 1)?;
+        let (zeroed, _) = finalize_checksummed(&store, 2)?;
+        zero_block(&store, &zeroed)?;
+        drop(store);
+
+        open_checksum_store(name, true, true, allow_missing, false)
+    }
+
+    #[test]
+    fn startup_scan_removes_zeroed_block_without_a_read() -> CommonResult<()> {
+        let store = restarted_store_for_scan("checksum-scan-allow-missing", true)?;
+        let stats = ChecksumScan::new(store.clone(), 0).run(|| false)?;
+        assert_eq!(
+            (stats.verified, stats.mismatched, stats.no_sidecar),
+            (1, 1, 1),
+            "{stats:?}"
+        );
+        assert_eq!(stats.unverifiable + stats.skipped + stats.failed, 0);
+        // The mismatched read of the zeroed block counts too; the legacy
+        // block has no sidecar and is not read.
+        assert_eq!(stats.bytes, 2 * (150 * 1024 + 17), "{stats:?}");
+        assert_eq!(store.take_corrupt_blocks(), vec![(2, 0)]);
+
+        assert!(matches!(
+            store.invalidate_corrupt_block(2)?,
+            CorruptCheck::Removed(_)
+        ));
+        assert!(store.get_block(2).is_err());
+        assert!(store.get_block(1)?.is_final());
+        assert!(store.get_block(3)?.is_final());
+        Ok(())
+    }
+
+    #[test]
+    fn startup_scan_keeps_legacy_block_when_sidecar_is_required() -> CommonResult<()> {
+        let store = restarted_store_for_scan("checksum-scan-require", false)?;
+        let stats = ChecksumScan::new(store.clone(), 0).run(|| false)?;
+        assert_eq!(
+            (stats.verified, stats.mismatched, stats.unverifiable),
+            (1, 1, 1),
+            "{stats:?}"
+        );
+        // Only the CRC mismatch is queued: a missing sidecar does not prove
+        // the data is wrong, and the block may be the only replica.
+        assert_eq!(store.take_corrupt_blocks(), vec![(2, 0)]);
+        assert!(matches!(
+            store.invalidate_corrupt_block(2)?,
+            CorruptCheck::Removed(_)
+        ));
+        assert!(store.get_block(1)?.is_final());
+        assert!(store.get_block(3)?.is_final());
+        Ok(())
+    }
+
+    #[test]
+    fn startup_scan_keeps_concurrent_writer_block_when_sidecar_is_required() -> CommonResult<()> {
+        let name = "checksum-scan-concurrent-writers";
+        let store = open_checksum_store(name, true, true, true, true)?;
+        let mut block = ExtendedBlock::with_mem(1, "1MB")?;
+        let first = store.ordinary_write_lease(block.id)?;
+        let second = store.ordinary_write_lease(block.id)?;
+        let meta = store.open_block(&block)?;
+        let data = vec![5u8; 100];
+        std::fs::write(store.short_circuit(&meta)?.unwrap(), &data)?;
+        block.len = data.len() as i64;
+        let finalized = store.finalize_block(&block)?;
+        let path = store.short_circuit(&finalized)?.unwrap();
+        assert!(!FileLayout::checksum_path_of(std::path::Path::new(&path)).exists());
+        drop((first, second));
+        drop(store);
+
+        // Concurrent writers skip the checksum on purpose; the data is good.
+        let store = open_checksum_store(name, true, true, false, false)?;
+        let stats = ChecksumScan::new(store.clone(), 0).run(|| false)?;
+        assert_eq!(stats.unverifiable, 1, "{stats:?}");
+        assert!(store.take_corrupt_blocks().is_empty());
+        assert!(store.get_block(finalized.id)?.is_final());
+        assert_eq!(std::fs::read(&path)?, data);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_scan_stops_when_the_worker_stops() -> CommonResult<()> {
+        let store = restarted_store_for_scan("checksum-scan-stop", true)?;
+        let stats = ChecksumScan::new(store.clone(), 0).run(|| true)?;
+        assert_eq!(stats, ScanStats::default());
+        assert!(store.take_corrupt_blocks().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn startup_scan_stops_during_a_throttled_read() -> CommonResult<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let store = restarted_store_for_scan("checksum-scan-throttled-stop", true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = stop.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            setter.store(true, Ordering::Release);
+        });
+        // At 1 KiB/s the first 150 KiB block alone would wait about 150 s.
+        let started = Instant::now();
+        let stats = ChecksumScan::new(store.clone(), 1024).run(|| stop.load(Ordering::Acquire))?;
+        handle.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // Block order is not fixed: the zeroed block may fail on its only
+        // read before the stop is seen, but no healthy block can finish.
+        assert_eq!(stats.verified, 0, "{stats:?}");
+        assert!(stats.mismatched + stats.skipped >= 1, "{stats:?}");
         Ok(())
     }
 }

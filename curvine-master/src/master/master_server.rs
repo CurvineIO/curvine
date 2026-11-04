@@ -20,6 +20,7 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
 use curvine_net::net::ConnState;
+use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_rpc::handler::{HandlerService, LimitConf};
 use curvine_rpc::server::{ServerMonitor, ServerStateListener};
 use curvine_runtime::common::{LocalTime, Logger};
@@ -54,6 +55,7 @@ pub struct MasterService {
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
     compatibility: Arc<MasterCompatibility>,
+    journal_store: RocksLogStorage,
 }
 
 impl MasterService {
@@ -68,6 +70,7 @@ impl MasterService {
         replication_manager: Arc<MasterReplicationManager>,
         metrics: &'static MasterMetrics,
         fault_http: FaultHttpControl,
+        journal_store: RocksLogStorage,
     ) -> Self {
         let actor_rt = Arc::new(AsyncRuntime::new(
             "master-actor",
@@ -91,6 +94,7 @@ impl MasterService {
             metrics,
             fault_http,
             compatibility,
+            journal_store,
         }
     }
 
@@ -170,6 +174,7 @@ impl WebHandlerService for MasterService {
             self.fs.clone(),
             self.metrics,
             self.fault_http.clone(),
+            self.journal_store.clone(),
         )
     }
 }
@@ -231,6 +236,7 @@ impl Master {
             replication_manager.clone(),
             metrics,
             fault_http,
+            journal_system.log_store(),
         );
 
         // step4: Create a web server
