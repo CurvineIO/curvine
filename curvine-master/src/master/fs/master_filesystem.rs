@@ -2537,6 +2537,22 @@ impl MasterFilesystem {
             self.conf.client_session_lock_lease,
         )
     }
+
+    /// Release one client's writer marker and journal the fact (#1880).
+    ///
+    /// Idempotent: returns `false` when the marker was already gone, and logs
+    /// nothing in that case, so a retry cannot grow the journal.
+    pub fn release_writer(&self, ino: i64, client_id: &str) -> FsResult<bool> {
+        let mut fs_dir = self.fs_dir.write();
+        if !fs_dir.release_writer(ino, client_id)? {
+            return Ok(false);
+        }
+        let fs_dir_view: &FsDir = &fs_dir;
+        fs_dir_view
+            .journal_writer
+            .log_release_writer(fs_dir_view, ino, client_id)?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

@@ -1688,6 +1688,7 @@ impl FsDir {
     ) -> FsResult<Option<BlockMeta>> {
         let file = inode.as_file_mut()?;
         let id = file.id();
+        let writers_before = file.writer_clients();
         file.complete(len, &commit_block, client_name, only_flush)?;
         // After `complete` validated the length, so a rejected request keeps
         // the block. The journaled CompleteFile entry carries the shrunk list.
@@ -1708,7 +1709,7 @@ impl FsDir {
         self.evictor.on_access(id);
 
         self.store
-            .apply_complete_file(inode.as_ref(), &commit_block)?;
+            .apply_complete_file(inode.as_ref(), &writers_before, &commit_block)?;
         self.journal_writer
             .log_complete_file(self, path, inode.as_file_ref()?, commit_block)?;
 
@@ -1802,10 +1803,11 @@ impl FsDir {
         };
 
         let file = inode.as_file_mut()?;
+        let writers_before = file.writer_clients();
         let _ = file.reopen(client_name);
         let status = inode.to_file_status(inp.path())?;
 
-        self.store.apply_reopen_file(&inode)?;
+        self.store.apply_reopen_file(&inode, &writers_before)?;
         self.journal_writer
             .log_reopen_file(self, inp.path(), inode.as_file_ref()?)?;
 
@@ -1850,9 +1852,11 @@ impl FsDir {
                         delete_result.blocks.insert(block_meta.id, locations);
                     }
                 }
+                let writers_before = file.writer_clients();
                 file.overwrite(opts, op_ms as i64);
 
-                self.store.apply_overwrite_file(inode.as_ref())?;
+                self.store
+                    .apply_overwrite_file(inode.as_ref(), &writers_before)?;
             }
             None => {
                 return err_ext!(FsError::file_not_found(inp.path()));
@@ -2355,6 +2359,7 @@ impl FsDir {
         let del_blocks = file.resize(opts.clone())?;
         debug!("resize file {} success, opts: {:?}", audit_path, opts);
 
+        let writers_before = file.writer_clients();
         file.complete(file.len, &[], "", true)?;
         let mut del_res = DeleteResult::new();
         for meta in del_blocks {
@@ -2364,7 +2369,8 @@ impl FsDir {
             }
         }
 
-        self.store.apply_complete_file(inode.as_ref(), &[])?;
+        self.store
+            .apply_complete_file(inode.as_ref(), &writers_before, &[])?;
         self.journal_writer
             .log_complete_file(self, audit_path, inode.as_file_ref()?, vec![])?;
 
@@ -2438,6 +2444,34 @@ impl FsDir {
         Ok(meta.find_conflict(lock, validity, LocalTime::mills()))
     }
 
+    /// Drop one client's writer marker (#1880).
+    ///
+    /// Idempotent: a replayed or duplicated entry must not fail, and it must never
+    /// touch another client's marker. Uses the reopen apply path so the client
+    /// ownership index is reconciled in exactly one place.
+    pub fn release_writer(&mut self, ino: i64, client: &str) -> FsResult<bool> {
+        let Some(mut inode) = self.store.get_inode(ino, None)? else {
+            // The inode is gone; nothing to release. The reaper drops the stale
+            // index hint itself.
+            return Ok(false);
+        };
+
+        let mut writers_before = Vec::new();
+        let changed = match inode.as_file_mut() {
+            Ok(file) => {
+                writers_before = file.writer_clients();
+                file.remove_writer(client)
+            }
+            Err(_) => false,
+        };
+        if !changed {
+            return Ok(false);
+        }
+
+        self.store.apply_reopen_file(&inode, &writers_before)?;
+        Ok(true)
+    }
+
     pub fn set_lock(
         &self,
         inp: InodePath,
@@ -2450,6 +2484,7 @@ impl FsDir {
         };
 
         let mut meta = self.store.get_locks(inode.id())?;
+        let before = meta.session_owned_clients();
         let (conflict, changed) = meta.set_lock_with_change(lock, validity, LocalTime::mills());
 
         if !changed {
@@ -2457,7 +2492,7 @@ impl FsDir {
         }
 
         let locks = meta.to_vec();
-        self.store.apply_set_locks(inode.id(), &locks)?;
+        self.store.apply_set_locks(inode.id(), &before, &locks)?;
         self.journal_writer.log_set_locks(self, inode.id(), locks)?;
 
         Ok(conflict)
