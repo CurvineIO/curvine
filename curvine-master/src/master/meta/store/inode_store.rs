@@ -211,6 +211,27 @@ impl InodeStore {
         self.store.get_client_owners(client_id)
     }
 
+    /// At most `limit` hints of `client_id`, optionally of one `kind` (#1884).
+    pub fn get_client_owners_limited(
+        &self,
+        client_id: &str,
+        kind: Option<OwnerKind>,
+        limit: usize,
+    ) -> CommonResult<Vec<(OwnerKind, i64)>> {
+        self.store.get_client_owners_limited(client_id, kind, limit)
+    }
+
+    /// Resumable scan over the lock hints of every client (#1884). See
+    /// [`RocksInodeStore::scan_lock_owners`].
+    #[allow(clippy::type_complexity)]
+    pub fn scan_lock_owners(
+        &self,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> CommonResult<(Vec<(String, i64, Vec<u8>)>, Option<Vec<u8>>)> {
+        self.store.scan_lock_owners(cursor, limit)
+    }
+
     /// Drop one ownership hint. The reaper calls this after acting on a hint, and
     /// also when the hint turned out to be stale (inode or ownership already
     /// gone), which is what keeps stale hints from accumulating.

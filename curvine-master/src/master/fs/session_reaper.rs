@@ -13,12 +13,13 @@
 // limitations under the License.
 
 use crate::master::fs::state::monotonic_ms;
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{MasterFilesystem, ReapClaim, ReapStep};
 use crate::master::meta::store::OwnerKind;
 use crate::master::MasterMonitor;
 use curvine_error::FsResult;
 use curvine_runtime::runtime::LoopTask;
 use log::{info, warn};
+use std::sync::Mutex;
 
 /// What one bounded reaper tick achieved.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -32,13 +33,26 @@ pub struct ReapReport {
     /// Ownership hints dropped because the inode or the ownership was already
     /// gone.
     pub stale_hints: u64,
-    /// Whether the tick stopped on its work budget with sessions still pending.
+    /// Hints not acted on because the claim no longer held at release time: the
+    /// client renewed or re-registered, this master stepped down, or a new epoch
+    /// started. Nothing was changed for them.
+    pub skipped: u64,
+    /// Whether the tick stopped on its work budget with work still pending.
     pub budget_exhausted: bool,
 }
 
 impl ReapReport {
     pub fn is_empty(&self) -> bool {
         self.sessions == 0 && self.locks == 0 && self.writers == 0 && self.stale_hints == 0
+    }
+
+    fn count(&mut self, kind: OwnerKind, step: ReapStep) {
+        match (step, kind) {
+            (ReapStep::Released, OwnerKind::Lock) => self.locks += 1,
+            (ReapStep::Released, OwnerKind::Writer) => self.writers += 1,
+            (ReapStep::Stale, _) => self.stale_hints += 1,
+            (ReapStep::Skipped, _) => self.skipped += 1,
+        }
     }
 }
 
@@ -50,17 +64,55 @@ impl ReapReport {
 /// (`MasterFilesystem::adopt_session_epoch`). The lock path no longer consults
 /// liveness (#1879), so this is the one place the window is enforced.
 ///
-/// Cost per tick is `O(expired sessions + ownership hints processed)` through the
-/// owner index (#1880); it never scans the namespace. Work is bounded by a budget
-/// so a large backlog is drained over several ticks instead of holding `fs_dir`
-/// for a long time in one go.
+/// Two sources of work, both through the owner index (#1880), never a namespace
+/// scan:
+///
+/// * **Expired sessions** in the session map: every lock and writer hint of the
+///   client is released.
+/// * **Orphaned locks** after a failover: a client that died before it ever
+///   heartbeated this leader is absent from the map, so it never expires there.
+///   Once per epoch, after the grace window, the reaper walks the lock hints of
+///   every client and releases those whose owner still has no session. Writer
+///   hints are not covered: legacy writers without a session leave the same
+///   hints, so an absent session does not prove a writer marker is reclaimable.
+///
+/// Every release re-validates its claim inside the `fs_dir` critical section
+/// (`MasterFilesystem::reap_client_owner`), so a heartbeat or a step-down that
+/// lands mid-tick stops the reaper before it touches the client. One work budget
+/// is shared by the whole tick, so a tick's `fs_dir` occupancy is bounded no
+/// matter how many sessions are pending.
 pub struct SessionReaper {
     fs: MasterFilesystem,
     monitor: MasterMonitor,
     /// Maximum sessions examined per tick.
     session_batch: usize,
-    /// Maximum inode mutations (lock sets released + writers released) per tick.
+    /// Maximum inode mutations (released or stale hints) per tick, across all
+    /// sessions and the orphan pass.
     work_budget: usize,
+    /// Resumable position of the once-per-epoch orphan pass.
+    orphan_scan: Mutex<OrphanScan>,
+}
+
+/// Progress of the orphan pass for one epoch.
+#[derive(Debug, Default)]
+struct OrphanScan {
+    /// Epoch (raft term) the pass belongs to; a new term restarts it.
+    term: Option<u64>,
+    /// Index key to resume from; `None` = from the start.
+    cursor: Option<Vec<u8>>,
+    /// Whole index walked for `term`.
+    done: bool,
+}
+
+/// How a session drain ended.
+enum Drain {
+    /// No hint left: the session may be forgotten.
+    Done,
+    /// The tick's budget ran out first; resume next tick.
+    OutOfBudget,
+    /// The claim stopped holding (renewal, re-registration, demotion, new
+    /// epoch): leave the session alone.
+    Skipped,
 }
 
 impl SessionReaper {
@@ -69,14 +121,17 @@ impl SessionReaper {
     /// Default number of inode mutations per tick. Each one is a journalled
     /// metadata write, so the budget keeps a tick's `fs_dir` occupancy bounded.
     pub const DEFAULT_WORK_BUDGET: usize = 256;
+    /// Index keys the orphan pass visits per budget unit. Visiting a key is a
+    /// read; only acting on one costs budget.
+    const ORPHAN_KEYS_PER_UNIT: usize = 4;
 
     pub fn new(fs: MasterFilesystem, monitor: MasterMonitor) -> Self {
-        Self {
+        Self::with_limits(
             fs,
             monitor,
-            session_batch: Self::DEFAULT_SESSION_BATCH,
-            work_budget: Self::DEFAULT_WORK_BUDGET,
-        }
+            Self::DEFAULT_SESSION_BATCH,
+            Self::DEFAULT_WORK_BUDGET,
+        )
     }
 
     pub fn with_limits(
@@ -90,7 +145,15 @@ impl SessionReaper {
             monitor,
             session_batch: session_batch.max(1),
             work_budget: work_budget.max(1),
+            orphan_scan: Mutex::new(OrphanScan::default()),
         }
+    }
+
+    /// Whether lock records are reclaimed at all. With
+    /// `client_session_lock_lease` off, session-owned locks keep the legacy
+    /// `lock_expire_time` and the reaper only releases writer markers.
+    fn reaps_locks(&self) -> bool {
+        self.fs.conf.client_session_lock_lease
     }
 
     /// One bounded pass at `now`.
@@ -100,8 +163,8 @@ impl SessionReaper {
     pub fn reap_once(&self, now: u64) -> FsResult<ReapReport> {
         let mut report = ReapReport::default();
 
-        // A demoted master must not reclaim anything: its session map is about to be
-        // cleared and its journal append would be rejected anyway.
+        // A demoted master must not reclaim anything. This is only the cheap early
+        // exit; every release re-checks leadership under `fs_dir`.
         if !self.monitor.is_active() {
             return Ok(report);
         }
@@ -112,47 +175,79 @@ impl SessionReaper {
         // term first, so the window is measured from this master's election and not
         // from process start (#1883 review).
         self.fs.adopt_session_epoch(now);
-        let reclaim_after = self.fs.session_map.read().reclaim_after();
+        let (term, reclaim_after, expired) = {
+            let sessions = self.fs.session_map.read();
+            // Snapshot and drop the guard: sessions are never held while `fs_dir`
+            // is taken (see `SessionMap`).
+            (
+                sessions.term(),
+                sessions.reclaim_after(),
+                sessions.expired_sessions(now, self.session_batch),
+            )
+        };
+        let Some(term) = term else {
+            return Ok(report);
+        };
         if now < reclaim_after {
             return Ok(report);
         }
 
-        // Snapshot the expired ids and drop the session lock immediately: sessions
-        // must never be held while `fs_dir` is taken (see `SessionMap`).
-        let expired = {
-            let sessions = self.fs.session_map.read();
-            let mut expired = sessions.expired_at(now);
-            expired.truncate(self.session_batch);
-            expired
-        };
-
-        for client_id in expired {
+        let mut budget = self.work_budget;
+        for (client_id, started_at) in expired {
+            if budget == 0 {
+                report.budget_exhausted = true;
+                break;
+            }
             if !self.monitor.is_active() {
                 break;
             }
 
-            match self.reap_session(&client_id, &mut report) {
-                Ok(true) => report.sessions += 1,
-                Ok(false) => {
-                    // Budget exhausted mid-session: keep the session so the next tick
-                    // resumes where this one stopped.
+            let claim = ReapClaim::Expired {
+                client_id,
+                started_at,
+                term,
+            };
+            match self.reap_session(&claim, now, &mut budget, &mut report) {
+                Ok(Drain::Done) => {
+                    // Forget the session only if it is still the drained, expired
+                    // generation; a client that renewed or re-registered mid-tick
+                    // keeps its fresh session.
+                    if self.fs.session_map.write().remove_expired(
+                        claim.client_id(),
+                        started_at,
+                        now,
+                    ) {
+                        report.sessions += 1;
+                    }
+                }
+                Ok(Drain::OutOfBudget) => {
+                    // Keep the session so the next tick resumes where this one
+                    // stopped.
                     report.budget_exhausted = true;
                     break;
                 }
+                Ok(Drain::Skipped) => {}
                 Err(e) => {
-                    warn!("reap client session {} failed: {}", client_id, e);
+                    warn!("reap client session {} failed: {}", claim.client_id(), e);
                 }
             }
         }
 
-        if !report.is_empty() {
+        if self.reaps_locks() && !report.budget_exhausted && budget > 0 {
+            if let Err(e) = self.reap_orphans(term, now, &mut budget, &mut report) {
+                warn!("session reaper orphan pass failed: {}", e);
+            }
+        }
+
+        if !report.is_empty() || report.skipped > 0 {
             info!(
                 "session reaper: {} sessions, {} locks, {} writer markers, {} stale hints \
-                 released (budget exhausted: {})",
+                 released, {} skipped (budget exhausted: {})",
                 report.sessions,
                 report.locks,
                 report.writers,
                 report.stale_hints,
+                report.skipped,
                 report.budget_exhausted
             );
         }
@@ -160,77 +255,103 @@ impl SessionReaper {
         Ok(report)
     }
 
-    /// Release everything `client_id` owns. Returns `false` when the work budget ran
-    /// out before the session was fully drained.
+    /// Release what `claim`'s client owns, spending from the tick's `budget`.
     ///
-    /// The session is only forgotten once it is drained, so an interrupted pass is
-    /// resumed by the next tick: every hint released is gone from the index, so the
-    /// remaining work shrinks monotonically.
-    fn reap_session(&self, client_id: &str, report: &mut ReapReport) -> FsResult<bool> {
-        let owners = self.fs.get_client_owners(client_id)?;
-        let mut budget = self.work_budget;
-        let mut drained = true;
+    /// Reads at most `budget + 1` hints: one more than can be acted on tells
+    /// "drained" apart from "out of budget" without reading the whole backlog.
+    /// The session is forgotten by the caller only once it is drained, so an
+    /// interrupted pass resumes next tick; every hint acted on leaves the index,
+    /// so the remaining work shrinks monotonically.
+    fn reap_session(
+        &self,
+        claim: &ReapClaim,
+        now: u64,
+        budget: &mut usize,
+        report: &mut ReapReport,
+    ) -> FsResult<Drain> {
+        // With the lock lease off, lock hints are left to `lock_expire_time`, so
+        // only writer hints decide whether the session is drained.
+        let kind = if self.reaps_locks() {
+            None
+        } else {
+            Some(OwnerKind::Writer)
+        };
+        let owners =
+            self.fs
+                .get_client_owners_limited(claim.client_id(), kind, budget.saturating_add(1))?;
 
         for (kind, ino) in owners {
-            if budget == 0 {
-                drained = false;
-                break;
+            if *budget == 0 {
+                return Ok(Drain::OutOfBudget);
             }
+            let step = self.fs.reap_client_owner(claim, kind, ino, now)?;
+            report.count(kind, step);
+            if step == ReapStep::Skipped {
+                return Ok(Drain::Skipped);
+            }
+            *budget -= 1;
+        }
+        Ok(Drain::Done)
+    }
 
-            let outcome = match kind {
-                OwnerKind::Lock => self.release_locks(client_id, ino)?,
-                OwnerKind::Writer => self.release_writer(client_id, ino)?,
+    /// Release lock hints whose owner has no session in this epoch (#1884).
+    ///
+    /// Runs once per epoch after the grace window and is resumable across ticks.
+    /// A client absent from the map that late either died before or during the
+    /// failover or never had a session; with the lock lease on, nothing else will
+    /// ever release its session-owned locks. Legacy (non-session) locks are never
+    /// indexed as `Lock` hints, so they are not touched.
+    fn reap_orphans(
+        &self,
+        term: u64,
+        now: u64,
+        budget: &mut usize,
+        report: &mut ReapReport,
+    ) -> FsResult<()> {
+        let mut scan = self.orphan_scan.lock().unwrap();
+        if scan.term != Some(term) {
+            *scan = OrphanScan {
+                term: Some(term),
+                ..OrphanScan::default()
             };
+        }
+        if scan.done {
+            return Ok(());
+        }
 
-            budget -= 1;
-            match outcome {
-                ReleaseOutcome::Released => match kind {
-                    OwnerKind::Lock => report.locks += 1,
-                    OwnerKind::Writer => report.writers += 1,
-                },
-                ReleaseOutcome::Stale => {
-                    report.stale_hints += 1;
-                    // Hint is worthless: drop it so it is never revisited. The apply
-                    // path only removes hints it actually acted on.
-                    self.fs.remove_client_owner(client_id, kind, ino)?;
-                }
+        let keys = budget.saturating_mul(Self::ORPHAN_KEYS_PER_UNIT);
+        let (hints, next) = self.fs.scan_lock_owners(scan.cursor.as_deref(), keys)?;
+
+        for (client_id, ino, key) in hints {
+            // Cheap pre-filter without `fs_dir`; `reap_client_owner` re-checks.
+            if self.fs.session_map.read().get(&client_id).is_some() {
+                continue;
             }
+            if *budget == 0 || !self.monitor.is_active() {
+                report.budget_exhausted |= *budget == 0;
+                scan.cursor = Some(key);
+                return Ok(());
+            }
+
+            let claim = ReapClaim::Orphan { client_id, term };
+            let step = self
+                .fs
+                .reap_client_owner(&claim, OwnerKind::Lock, ino, now)?;
+            report.count(OwnerKind::Lock, step);
+            if step == ReapStep::Skipped {
+                // Map busy or epoch changed: retry this hint next tick.
+                scan.cursor = Some(key);
+                return Ok(());
+            }
+            *budget -= 1;
         }
 
-        if drained {
-            // Fully drained: forget the session so it is never revisited.
-            self.fs.session_map.write().remove(client_id);
+        match next {
+            Some(key) => scan.cursor = Some(key),
+            None => scan.done = true,
         }
-
-        Ok(drained)
+        Ok(())
     }
-
-    /// Drop one client's session-owned locks on `ino`, journalled through `SetLocks`.
-    fn release_locks(&self, client_id: &str, ino: i64) -> FsResult<ReleaseOutcome> {
-        let changed = self.fs.release_client_locks(ino, client_id)?;
-        Ok(if changed {
-            ReleaseOutcome::Released
-        } else {
-            ReleaseOutcome::Stale
-        })
-    }
-
-    /// Drop one client's writer marker on `ino`, journalled through `ReleaseWriter`.
-    fn release_writer(&self, client_id: &str, ino: i64) -> FsResult<ReleaseOutcome> {
-        let changed = self.fs.release_writer(ino, client_id)?;
-        Ok(if changed {
-            ReleaseOutcome::Released
-        } else {
-            ReleaseOutcome::Stale
-        })
-    }
-}
-
-enum ReleaseOutcome {
-    Released,
-    /// The hint no longer matches any state: the inode is gone, or the ownership
-    /// was already released or never session-owned.
-    Stale,
 }
 
 impl LoopTask for SessionReaper {
@@ -242,7 +363,7 @@ impl LoopTask for SessionReaper {
         let report = self.reap_once(monotonic_ms())?;
         if report.budget_exhausted {
             warn!(
-                "session reaper work budget ({} inode mutations) exhausted with sessions \
+                "session reaper work budget ({} inode mutations) exhausted with work \
                  still pending; the remaining work resumes on the next tick",
                 self.work_budget
             );
@@ -251,7 +372,7 @@ impl LoopTask for SessionReaper {
     }
 
     fn terminate(&self) -> bool {
-        false
+        self.monitor.is_stop()
     }
 }
 
@@ -272,11 +393,16 @@ mod tests {
     use std::time::Duration;
 
     fn test_fs(name: &str) -> MasterFilesystem {
+        test_fs_with(name, true)
+    }
+
+    fn test_fs_with(name: &str, lock_lease: bool) -> MasterFilesystem {
         Master::init_test_metrics();
         let mut conf = ClusterConf::format();
         conf.testing = true;
         conf.journal.enable = false;
         conf.master.client_session_timeout = "60s".to_string();
+        conf.master.client_session_lock_lease = lock_lease;
         conf.master.meta_dir = Utils::test_sub_dir(format!(
             "session-reaper/meta-{}-{}",
             name,
@@ -609,5 +735,324 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    fn expired_claim(fs: &MasterFilesystem, client: &str) -> ReapClaim {
+        let sessions = fs.session_map.read();
+        ReapClaim::Expired {
+            client_id: client.to_string(),
+            started_at: sessions.get(client).unwrap().started_at,
+            term: sessions.term().unwrap(),
+        }
+    }
+
+    /// #1884: a re-election restarts the grace window, measured from the new
+    /// epoch, and drops the previous term's sessions.
+    #[test]
+    fn re_election_restarts_the_grace_window() {
+        let fs = test_fs("re-elect");
+        fs.master_monitor.set_term_for_test(1);
+        create_file(&fs, "/re-elect.log", "dead-client");
+        register(&fs, "dead-client", 1_000);
+        let timeout = fs.session_map.read().session_timeout_ms();
+
+        // Step down, then win a later election at `promoted`, long after the old
+        // epoch's grace window ended.
+        fs.master_monitor.set_role_for_test(RoleState::Follower);
+        let promoted = fs.session_map.read().reclaim_after() + 10 * timeout;
+        fs.master_monitor.set_term_for_test(2);
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+
+        let reaper = SessionReaper::new(fs.clone(), fs.master_monitor.clone());
+        let report = reaper.reap_once(promoted).unwrap();
+        assert!(
+            report.is_empty(),
+            "a fresh epoch starts inside its grace window"
+        );
+        assert_eq!(fs.session_map.read().term(), Some(2));
+        assert_eq!(
+            fs.session_map.read().reclaim_after(),
+            promoted + 2 * timeout
+        );
+        assert!(
+            fs.session_map.read().get("dead-client").is_none(),
+            "the previous term's sessions are dropped"
+        );
+        assert_eq!(owners(&fs, "dead-client").len(), 1);
+
+        let report = reaper.reap_once(promoted + 2 * timeout - 1).unwrap();
+        assert!(report.is_empty(), "still inside the new epoch's window");
+        assert_eq!(owners(&fs, "dead-client").len(), 1);
+    }
+
+    /// #1884: a heartbeat that lands between the reaper's snapshot and its release
+    /// re-registers the client; the stale claim must not release anything, and
+    /// the fresh session must survive.
+    #[test]
+    fn re_registration_after_the_snapshot_keeps_locks_and_session() {
+        let fs = test_fs("renewal");
+        let ino = create_file(&fs, "/renewal.log", "busy-client");
+        register(&fs, "busy-client", 1_000);
+        let now = far_future(&fs);
+
+        // The reaper's snapshot: the old generation, expired at `now`.
+        let stale = expired_claim(&fs, "busy-client");
+
+        // The client heartbeats before the release and takes a new lock.
+        register(&fs, "busy-client", now);
+        set_lock(&fs, "/renewal.log", "busy-client", true);
+
+        for kind in [OwnerKind::Lock, OwnerKind::Writer] {
+            let step = fs.reap_client_owner(&stale, kind, ino, now).unwrap();
+            assert_eq!(
+                step,
+                ReapStep::Skipped,
+                "{kind:?} of a re-registered client"
+            );
+        }
+        assert_eq!(stored_locks(&fs, ino).len(), 1, "the new lock survives");
+        assert_eq!(stored_writers(&fs, ino), vec!["busy-client".to_string()]);
+        assert!(!fs.session_map.write().remove_expired(
+            "busy-client",
+            stale_started_at(&stale),
+            now
+        ));
+        assert!(fs.session_map.read().get("busy-client").is_some());
+
+        // A full tick at the same `now` also leaves the live client alone.
+        let report = SessionReaper::new(fs.clone(), fs.master_monitor.clone())
+            .reap_once(now)
+            .unwrap();
+        assert!(report.is_empty());
+        assert_eq!(owners(&fs, "busy-client").len(), 2);
+    }
+
+    fn stale_started_at(claim: &ReapClaim) -> u64 {
+        match claim {
+            ReapClaim::Expired { started_at, .. } => *started_at,
+            ReapClaim::Orphan { .. } => unreachable!(),
+        }
+    }
+
+    /// #1884: leadership is re-checked before every release, not once per session.
+    #[test]
+    fn demotion_between_two_releases_stops_the_second() {
+        let fs = test_fs("demote");
+        fs.master_monitor.set_term_for_test(1);
+        let first = create_file(&fs, "/demote-1.log", "dead-client");
+        let second = create_file(&fs, "/demote-2.log", "dead-client");
+        register(&fs, "dead-client", 1_000);
+        let now = far_future(&fs);
+        let claim = expired_claim(&fs, "dead-client");
+
+        let step = fs
+            .reap_client_owner(&claim, OwnerKind::Writer, first, now)
+            .unwrap();
+        assert_eq!(step, ReapStep::Released);
+
+        fs.master_monitor.set_role_for_test(RoleState::Follower);
+        let step = fs
+            .reap_client_owner(&claim, OwnerKind::Writer, second, now)
+            .unwrap();
+        assert_eq!(
+            step,
+            ReapStep::Skipped,
+            "a demoted master must stop mid-session"
+        );
+        assert_eq!(stored_writers(&fs, second), vec!["dead-client".to_string()]);
+        assert_eq!(
+            owners(&fs, "dead-client"),
+            vec![(OwnerKind::Writer, second)]
+        );
+
+        // Re-elected: the claim belongs to the old epoch and stays void.
+        fs.master_monitor.set_term_for_test(2);
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        fs.adopt_session_epoch(now);
+        let much_later = fs.session_map.read().reclaim_after() + 1;
+        let step = fs
+            .reap_client_owner(&claim, OwnerKind::Writer, second, much_later)
+            .unwrap();
+        assert_eq!(
+            step,
+            ReapStep::Skipped,
+            "a claim from an earlier epoch is void"
+        );
+        assert_eq!(stored_writers(&fs, second), vec!["dead-client".to_string()]);
+    }
+
+    /// #1884: one budget bounds the whole tick, not each session.
+    #[test]
+    fn work_budget_is_shared_across_sessions() {
+        let fs = test_fs("shared-budget");
+        for client in ["dead-a", "dead-b", "dead-c"] {
+            for index in 0..2 {
+                create_file(&fs, &format!("/{client}-{index}.log"), client);
+            }
+            register(&fs, client, 1_000);
+        }
+        let total = |fs: &MasterFilesystem| {
+            ["dead-a", "dead-b", "dead-c"]
+                .iter()
+                .map(|c| owners(fs, c).len())
+                .sum::<usize>()
+        };
+        assert_eq!(total(&fs), 6);
+
+        let reaper = SessionReaper::with_limits(fs.clone(), fs.master_monitor.clone(), 8, 3);
+        let now = far_future(&fs);
+
+        let first = reaper.reap_once(now).unwrap();
+        assert!(first.budget_exhausted);
+        assert_eq!(first.writers, 3, "three sessions share one budget of 3");
+        assert_eq!(first.sessions, 1);
+        assert_eq!(total(&fs), 3);
+
+        let second = reaper.reap_once(now).unwrap();
+        assert_eq!(second.writers, 3);
+        assert_eq!(second.sessions, 2);
+        assert_eq!(total(&fs), 0);
+        assert!(fs.session_map.read().is_empty());
+    }
+
+    /// #1884: a tick examines at most `session_batch` expired sessions.
+    #[test]
+    fn session_batch_bounds_expired_sessions_per_tick() {
+        let fs = test_fs("batch");
+        for client in ["dead-a", "dead-b", "dead-c"] {
+            register(&fs, client, 1_000);
+        }
+        let reaper = SessionReaper::with_limits(fs.clone(), fs.master_monitor.clone(), 2, 64);
+        let now = far_future(&fs);
+
+        assert_eq!(reaper.reap_once(now).unwrap().sessions, 2);
+        assert_eq!(fs.session_map.read().len(), 1);
+        assert_eq!(reaper.reap_once(now).unwrap().sessions, 1);
+        assert!(fs.session_map.read().is_empty());
+    }
+
+    /// #1884: the reaper reads O(budget) hints of a client, not its whole backlog.
+    #[test]
+    fn owner_reads_are_bounded() {
+        let fs = test_fs("bounded-read");
+        for index in 0..5 {
+            create_file(&fs, &format!("/bounded-{index}.log"), "busy-client");
+        }
+        set_lock(&fs, "/bounded-0.log", "busy-client", true);
+
+        let limited = |kind, limit| {
+            fs.get_client_owners_limited("busy-client", kind, limit)
+                .unwrap()
+        };
+        assert_eq!(limited(None, 2).len(), 2);
+        assert_eq!(limited(None, 64).len(), 6);
+        assert_eq!(limited(Some(OwnerKind::Lock), 64).len(), 1);
+        assert_eq!(limited(Some(OwnerKind::Writer), 64).len(), 5);
+        assert_eq!(limited(None, 64), owners(&fs, "busy-client"));
+    }
+
+    /// #1884: a client that died before the failover never heartbeats the new
+    /// leader, so it is absent from the map; its session-owned locks are released
+    /// by the orphan pass once the new epoch's grace window has passed.
+    #[test]
+    fn locks_of_a_client_missing_after_failover_are_released() {
+        let fs = test_fs("orphan");
+        fs.master_monitor.set_term_for_test(1);
+        let dead = create_file(&fs, "/orphan.log", "other-writer");
+        let alive = create_file(&fs, "/alive.log", "other-writer");
+        register(&fs, "dead-client", 1_000);
+        set_lock(&fs, "/orphan.log", "dead-client", true);
+
+        // Failover: the new epoch's map does not know `dead-client`.
+        let promoted = fs.session_map.read().reclaim_after() + 1;
+        fs.master_monitor.set_term_for_test(2);
+        fs.adopt_session_epoch(promoted);
+        let reclaim_after = fs.session_map.read().reclaim_after();
+        assert!(fs.session_map.read().get("dead-client").is_none());
+
+        // A healthy client re-registers in the new epoch and holds a lock.
+        register(&fs, "live-client", reclaim_after - 1);
+        set_lock(&fs, "/alive.log", "live-client", true);
+
+        let reaper = SessionReaper::new(fs.clone(), fs.master_monitor.clone());
+        let report = reaper.reap_once(reclaim_after - 1).unwrap();
+        assert!(report.is_empty(), "orphans wait for the grace window too");
+        assert_eq!(stored_locks(&fs, dead).len(), 1);
+
+        let report = reaper.reap_once(reclaim_after).unwrap();
+        assert_eq!(report.locks, 1);
+        assert!(stored_locks(&fs, dead).is_empty());
+        assert!(owners(&fs, "dead-client").is_empty());
+        assert_eq!(stored_locks(&fs, alive).len(), 1, "a live owner is kept");
+        assert_eq!(owners(&fs, "live-client"), vec![(OwnerKind::Lock, alive)]);
+
+        // The pass runs once per epoch.
+        set_lock(&fs, "/orphan.log", "dead-client", true);
+        assert!(reaper.reap_once(reclaim_after + 1).unwrap().is_empty());
+        assert_eq!(stored_locks(&fs, dead).len(), 1);
+    }
+
+    /// #1884: the orphan pass is resumable under a small budget.
+    #[test]
+    fn orphan_pass_resumes_across_ticks() {
+        let fs = test_fs("orphan-resume");
+        fs.master_monitor.set_term_for_test(1);
+        for index in 0..3 {
+            let path = format!("/orphan-{index}.log");
+            create_file(&fs, &path, "other-writer");
+            set_lock(&fs, &path, &format!("dead-{index}"), true);
+        }
+        fs.master_monitor.set_term_for_test(2);
+        fs.adopt_session_epoch(1_000);
+        let now = fs.session_map.read().reclaim_after();
+
+        let reaper = SessionReaper::with_limits(fs.clone(), fs.master_monitor.clone(), 8, 2);
+        let first = reaper.reap_once(now).unwrap();
+        assert_eq!(first.locks, 2);
+        assert!(first.budget_exhausted);
+        let second = reaper.reap_once(now).unwrap();
+        assert_eq!(second.locks, 1);
+        assert!(!second.budget_exhausted);
+        for index in 0..3 {
+            assert!(owners(&fs, &format!("dead-{index}")).is_empty());
+        }
+    }
+
+    /// #1884: with `client_session_lock_lease` off, locks stay on
+    /// `lock_expire_time`; the reaper releases only writer markers and runs no
+    /// orphan pass.
+    #[test]
+    fn lock_lease_off_leaves_locks_to_the_legacy_ttl() {
+        let fs = test_fs_with("lease-off", false);
+        let ino = create_file(&fs, "/lease-off.log", "dead-client");
+        let orphan = create_file(&fs, "/lease-off-orphan.log", "other-writer");
+        set_lock(&fs, "/lease-off.log", "dead-client", true);
+        set_lock(&fs, "/lease-off-orphan.log", "orphan-client", true);
+        register(&fs, "dead-client", 1_000);
+
+        let report = SessionReaper::new(fs.clone(), fs.master_monitor.clone())
+            .reap_once(far_future(&fs))
+            .unwrap();
+        assert_eq!(report.writers, 1);
+        assert_eq!(report.locks, 0);
+        assert_eq!(report.sessions, 1);
+        assert!(stored_writers(&fs, ino).is_empty());
+        assert_eq!(stored_locks(&fs, ino).len(), 1, "locks keep the TTL path");
+        assert_eq!(stored_locks(&fs, orphan).len(), 1, "no orphan pass");
+        assert_eq!(owners(&fs, "dead-client"), vec![(OwnerKind::Lock, ino)]);
+    }
+
+    #[test]
+    fn terminates_only_when_the_master_stops() {
+        let fs = test_fs("terminate");
+        let reaper = SessionReaper::new(fs.clone(), fs.master_monitor.clone());
+        assert!(!reaper.terminate());
+        fs.master_monitor.set_role_for_test(RoleState::Follower);
+        assert!(
+            !reaper.terminate(),
+            "a standby keeps the task for its next term"
+        );
+        fs.master_monitor.set_role_for_test(RoleState::Exit);
+        assert!(reaper.terminate());
     }
 }

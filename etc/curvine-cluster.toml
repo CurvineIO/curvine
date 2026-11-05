@@ -101,8 +101,10 @@ meta_dir = "testing/meta"
 # Lock lifetime is decided from each master's local config, so every master in
 # the group must run the same value. A gate-off leader would still expire a
 # healthy client's lock after lock_expire_time, which is the regression #1879
-# fixes. Default false; #1884 enables it once the reaper exists.
-# client_session_lock_lease = false
+# fixes. Default true: the session reaper releases a dead client's locks once
+# its lease lapses. With it off, session-owned locks fall back to
+# lock_expire_time and the reaper only releases writer markers.
+# client_session_lock_lease = true
 # Log rotation applies when log_dir is a directory; stdout and stderr are not rotated.
 # max_file_size_mb: rotate when the file reaches this size in MB (default 100, 0 = no size limit).
 # time_rotation: "daily" or "hourly" (default none). Combined with max_file_size_mb, whichever

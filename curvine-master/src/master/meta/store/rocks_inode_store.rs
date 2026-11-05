@@ -338,23 +338,93 @@ impl RocksInodeStore {
 
     /// Every ownership hint held by `client_id`, in key order.
     pub fn get_client_owners(&self, client_id: &str) -> CommonResult<Vec<(OwnerKind, i64)>> {
-        let prefix = Self::client_owner_prefix(client_id, None)?;
+        self.get_client_owners_limited(client_id, None, usize::MAX)
+    }
+
+    /// At most `limit` ownership hints held by `client_id`, in key order,
+    /// optionally restricted to one `kind`. The session reaper reads only what
+    /// one tick can act on, so a client with a large backlog costs O(budget) per
+    /// tick instead of a full rescan (#1884).
+    pub fn get_client_owners_limited(
+        &self,
+        client_id: &str,
+        kind: Option<OwnerKind>,
+        limit: usize,
+    ) -> CommonResult<Vec<(OwnerKind, i64)>> {
+        // With a kind the prefix already includes the kind byte; without one the
+        // kind byte is the first byte after the prefix.
+        let client_prefix_len = Self::client_owner_prefix(client_id, None)?.len();
+        let prefix = Self::client_owner_prefix(client_id, kind)?;
         let iter = self.db.prefix_scan(Self::CF_COMMON, prefix.as_slice())?;
-        let kind_offset = prefix.len();
         let mut owners = Vec::new();
         for item in iter {
-            let (key, _) = item?;
-            if key.len() != kind_offset + 1 + 8 {
-                continue;
+            if owners.len() >= limit {
+                break;
             }
-            let Some(kind) = OwnerKind::from_u8(key[kind_offset]) else {
-                continue;
-            };
-            let mut raw = [0u8; 8];
-            raw.copy_from_slice(&key[kind_offset + 1..kind_offset + 9]);
-            owners.push((kind, i64::from_be_bytes(raw)));
+            let (key, _) = item?;
+            if let Some(owner) = Self::decode_owner_suffix(&key, client_prefix_len) {
+                owners.push(owner);
+            }
         }
         Ok(owners)
+    }
+
+    /// Lock-kind ownership hints of *every* client, in key order, starting at
+    /// `cursor` (inclusive; `None` = from the first hint). Visits at most `limit`
+    /// index keys of any kind, so the cost is bounded even across long runs of
+    /// writer hints, and returns the lock hints among them as `(client_id, ino,
+    /// key)` plus the key to resume from, or `None` once the index is exhausted.
+    ///
+    /// Used by the session reaper to find locks whose owner is absent from the
+    /// session map after a failover (#1884): such a client never heartbeats the
+    /// new leader, so it is never in the map that drives normal reaping.
+    #[allow(clippy::type_complexity)]
+    pub fn scan_lock_owners(
+        &self,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> CommonResult<(Vec<(String, i64, Vec<u8>)>, Option<Vec<u8>>)> {
+        let lower = [Self::PREFIX_CLIENT_OWNER];
+        let upper = [Self::PREFIX_CLIENT_OWNER + 1];
+        let start: &[u8] = cursor.unwrap_or(&lower);
+        let iter = self.db.range_scan(Self::CF_COMMON, start, &upper[..])?;
+
+        let mut hints = Vec::new();
+        for (visited, item) in iter.enumerate() {
+            let (key, _) = item?;
+            if visited >= limit {
+                return Ok((hints, Some(key.to_vec())));
+            }
+            let Some((client_id, prefix_len)) = Self::decode_owner_client(&key) else {
+                continue;
+            };
+            if let Some((OwnerKind::Lock, ino)) = Self::decode_owner_suffix(&key, prefix_len) {
+                hints.push((client_id, ino, key.to_vec()));
+            }
+        }
+        Ok((hints, None))
+    }
+
+    /// Client id and client-prefix length of an ownership key.
+    fn decode_owner_client(key: &[u8]) -> Option<(String, usize)> {
+        if key.len() < 3 || key[0] != Self::PREFIX_CLIENT_OWNER {
+            return None;
+        }
+        let len = u16::from_be_bytes([key[1], key[2]]) as usize;
+        let id = key.get(3..3 + len)?;
+        let id = std::str::from_utf8(id).ok()?.to_string();
+        Some((id, 3 + len))
+    }
+
+    /// `(kind, ino)` of an ownership key whose client prefix is `prefix_len` bytes.
+    fn decode_owner_suffix(key: &[u8], prefix_len: usize) -> Option<(OwnerKind, i64)> {
+        if key.len() != prefix_len + 1 + 8 {
+            return None;
+        }
+        let kind = OwnerKind::from_u8(key[prefix_len])?;
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&key[prefix_len + 1..prefix_len + 9]);
+        Some((kind, i64::from_be_bytes(raw)))
     }
 
     pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {

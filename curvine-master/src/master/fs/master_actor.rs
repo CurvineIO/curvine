@@ -78,14 +78,10 @@ impl MasterActor {
     /// Runs at half the session timeout, so a dead client's locks and writer
     /// markers are released within a bounded multiple of its lease. The reaper
     /// keeps the leader-change grace window itself, so starting it unconditionally
-    /// is safe.
+    /// is safe. `MasterConf::init` rejects a zero `client_session_timeout`, so the
+    /// interval is always positive.
     fn start_session_reaper(&mut self) -> CommonResult<()> {
         let timeout_ms = self.fs.conf.client_session_timeout_ms();
-        if timeout_ms == 0 {
-            info!("session reaper disabled (client_session_timeout = 0)");
-            return Ok(());
-        }
-
         let interval_ms = (timeout_ms / 2).max(1_000);
         let reaper = SessionReaper::new(self.fs.clone(), self.master_monitor.clone());
         let scheduler = ScheduledExecutor::new("session-reaper", interval_ms);
