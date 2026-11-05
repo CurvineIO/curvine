@@ -194,10 +194,6 @@ impl BufferClient {
                 Ok(msg) => msg,
 
                 Err(e) if IOUtils::is_timeout(&e) => {
-                    if call_map.not_empty() {
-                        client_state.set_error(e);
-                        break;
-                    }
                     continue;
                 }
 
@@ -434,8 +430,7 @@ mod tests {
     }
 
     /// An idle connection has nothing to receive, so an empty receive window is
-    /// normal and must not tear it down: only a request that is waiting when the
-    /// window expires proves the peer is gone.
+    /// normal and must not tear it down.
     #[tokio::test]
     async fn an_idle_connection_survives_the_receive_window() {
         const REQ_ID: i64 = 7;
@@ -493,19 +488,21 @@ mod tests {
         task.abort();
     }
 
-    /// With a request outstanding, an empty receive window means the peer
-    /// accepted the request and then went quiet (#1908): the connection must be
-    /// dropped and the inflight call failed, instead of waiting window after
-    /// window.
+    /// A call is bounded by its own deadline, not by the per-connection receive
+    /// window: a call issued late in a window inherits only the remainder of
+    /// that window, and answering it after the window expires must still
+    /// deliver. Failing it here would kill a healthy call (and every other call
+    /// multiplexed on the connection) before its `timeout_rpc` budget ran out.
     #[tokio::test]
-    async fn a_waiting_request_drops_the_connection_after_one_window() {
+    async fn a_late_response_is_delivered_after_the_receive_window() {
         const REQ_ID: i64 = 7;
+        const WINDOW: Duration = Duration::from_millis(400);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let client = TcpStream::connect(addr).await.unwrap();
-        let (_server, _peer) = listener.accept().await.unwrap();
+        let (mut server, _peer) = listener.accept().await.unwrap();
 
         let (read_half, _write_half) = tokio::io::split(client);
         let read_frame = ReadFrame::new(read_half, FrameBuf::new(0));
@@ -513,39 +510,52 @@ mod tests {
         let state = Arc::new(ClientState::new(addr.into(), addr.into()));
         let call_map = Arc::new(CallMap::new());
 
-        // A caller waiting for REQ_ID.
-        let (cb, promise) = oneshot::channel::<IOResult<Message>>();
+        let task = tokio::spawn(BufferClient::response_future(
+            state.clone(),
+            WINDOW,
+            read_frame,
+            call_map.clone(),
+        ));
+
+        // Issue the call near the end of the current window: it does not get a
+        // window of its own, only whatever is left of this one.
+        tokio::time::sleep(WINDOW.mul_f32(0.75)).await;
+        let (cb, mut promise) = oneshot::channel::<IOResult<Message>>();
         call_map.insert(REQ_ID, cb);
 
-        let exit = timeout(
-            Duration::from_secs(5),
-            BufferClient::response_future(
-                state.clone(),
-                Duration::from_millis(100),
-                read_frame,
-                call_map.clone(),
-            ),
-        )
-        .await
-        .expect("response_future kept waiting after the receive window expired");
-        // The inflight call it had to fail is reported to the caller.
-        assert!(
-            exit.is_err(),
-            "check_calls must report the call it failed when the peer went silent"
-        );
-
-        assert!(
-            state.is_closed(),
-            "a silent peer must leave the connection unusable"
-        );
-
-        let err = timeout(Duration::from_secs(1), promise)
+        // The window the call inherited has now expired. It must still be
+        // waiting: only the call's own deadline may fail it.
+        tokio::time::sleep(WINDOW.mul_f32(0.5)).await;
+        let still_waiting = timeout(Duration::from_millis(1), &mut promise)
             .await
-            .expect("the inflight call was never failed")
-            .expect("the callback was dropped");
+            .is_err();
         assert!(
-            err.is_err(),
-            "the inflight call must fail instead of hanging until the caller gives up"
+            still_waiting,
+            "the receive window expired and failed a call that was still inside its own \
+             deadline; on main that call simply kept waiting"
         );
+
+        // The peer answers after the window expired. The response must arrive.
+        let mut frame = BytesMut::new();
+        Builder::new_rpc(1i8)
+            .response(ResponseStatus::Success)
+            .req_id(REQ_ID)
+            .build()
+            .encode(&mut frame)
+            .unwrap();
+        server.write_all(&frame).await.unwrap();
+
+        let msg = timeout(Duration::from_secs(5), promise)
+            .await
+            .expect("the response was never delivered after the window expired")
+            .expect("the callback was dropped")
+            .expect("the response must decode");
+        assert_eq!(msg.req_id(), REQ_ID);
+        assert!(
+            !state.is_closed(),
+            "a late but healthy call must not close the connection"
+        );
+
+        task.abort();
     }
 }
