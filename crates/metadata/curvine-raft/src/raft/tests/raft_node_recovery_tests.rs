@@ -2348,7 +2348,13 @@ fn idle_follower_answers_a_callback_left_over_from_an_older_term() {
     // This node never led, so no Ready will ever carry a role change.
     assert!(!node.is_leader());
     let (tx, rx) = tokio::sync::oneshot::channel();
-    promise.insert(777, tx);
+    promise.insert(
+        777,
+        PendingPropose {
+            sender: tx,
+            term: node.raw.raft.term,
+        },
+    );
 
     drive_one_driver_round(&rt, &mut node, &mut promise);
 
@@ -2740,4 +2746,134 @@ fn conf_change_while_another_is_pending_is_rejected() {
     assert_eq!(retry_cache.get(&4848), None);
     let response = rt.block_on(rx).unwrap().unwrap();
     assert_eq!(response.response_status(), ResponseStatus::Error);
+}
+
+// Issue #1907: an entry that is already quorum-committed may be applied by a
+// Ready that also carries the leader's step-down. Answering the caller with
+// "is the node still leader" reported a retryable failure for a write that
+// had committed, so a journal sender (or any retrying caller) replayed an
+// already landed write. The callback must be answered from local evidence
+// (the caller is parked here and proposed in the entry's own term), not from
+// the current role.
+#[test]
+fn committed_propose_is_answered_even_when_the_same_round_steps_down() {
+    let rt = JournalConf::with_test().create_runtime();
+    // A single-voter group commits every appended entry once its commit
+    // index advances; here it is advanced directly so the propose is already
+    // quorum-committed.
+    let mut node = test_node_with_voters(rt.clone(), 1, vec![1]);
+    let mut promise: PendingPromises = HashMap::new();
+    let retry_cache = node.retry_cache.clone();
+
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+    let leader_term = node.raw.raft.term;
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: node.id(),
+        raft_state: raft::StateRole::Leader,
+    });
+
+    let req_id = 4949;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let msg = Builder::new_rpc(RaftCode::Propose)
+        .req_id(req_id)
+        .proto_header(ProposeRequest {
+            data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+        })
+        .build();
+    node.handle_propose(Envelope::new(msg, tx), &mut promise)
+        .unwrap();
+    assert!(promise.contains_key(&req_id));
+
+    // The entry is quorum-committed (single voter), but the driver has not
+    // applied it yet: that is the state a leader is in between receiving the
+    // last acknowledgement and its next Ready.
+    let committed = node.raw.raft.raft_log.last_index();
+    node.raw.raft.raft_log.commit_to(committed);
+    assert!(promise.contains_key(&req_id));
+
+    // A higher term demotes the node before it applies those committed
+    // entries: apply and step-down land in the same driver round, which is
+    // the window of issue #1907.
+    node.raw.raft.become_follower(leader_term + 1, 2);
+    assert!(!node.is_leader());
+
+    drive_one_driver_round(&rt, &mut node, &mut promise);
+
+    let response = rt
+        .block_on(rx)
+        .expect("the caller of a committed entry must be answered")
+        .expect("the answer must be a response message");
+    assert_eq!(
+        response.response_status(),
+        ResponseStatus::Success,
+        "an already committed write must not be reported as failed"
+    );
+    assert_eq!(
+        retry_cache.get(&req_id),
+        Some(RetryState::Committed),
+        "the committed entry must be published to the dedup cache after the apply ack"
+    );
+}
+
+// Contrast case: the entry never reached quorum and the term is dead. The
+// caller must be answered with the retryable LeaderNotReady error, which the
+// rpc layer retries across the group instead of surfacing a failure (the
+// journal sender aborts the master only on non-retryable errors).
+#[test]
+fn uncommitted_propose_in_a_dead_term_still_gets_a_retryable_error() {
+    let rt = JournalConf::with_test().create_runtime();
+    // Three voters with no reachable peers: the entry is appended but can
+    // never reach quorum, so it stays uncommitted for the whole test.
+    let mut node = test_node_with_voters(rt.clone(), 1, vec![1, 2, 3]);
+    let mut promise: PendingPromises = HashMap::new();
+    let retry_cache = node.retry_cache.clone();
+
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+    let leader_term = node.raw.raft.term;
+
+    let req_id = 4950;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let msg = Builder::new_rpc(RaftCode::Propose)
+        .req_id(req_id)
+        .proto_header(ProposeRequest {
+            data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+        })
+        .build();
+    node.handle_propose(Envelope::new(msg, tx), &mut promise)
+        .unwrap();
+    assert!(promise.contains_key(&req_id));
+
+    // The term is replaced before any peer can acknowledge: the entry can
+    // never commit, so the callback stays pending for the drain.
+    node.raw.raft.become_follower(leader_term + 1, 2);
+    drive_one_driver_round(&rt, &mut node, &mut promise);
+
+    assert!(
+        promise.is_empty(),
+        "the drain must answer the abandoned caller"
+    );
+    let response = rt
+        .block_on(rx)
+        .expect("the callback must be answered")
+        .expect("the answer must be a response message");
+    assert_eq!(response.response_status(), ResponseStatus::Error);
+    let error = response
+        .check_error_ext::<RaftError>()
+        .expect_err("the answer must carry the retryable reason");
+    assert!(
+        matches!(error, RaftError::LeaderNotReady(_)),
+        "expected LeaderNotReady, got {:?}",
+        error
+    );
+    assert!(
+        error.retry_leader(),
+        "the error must be retryable so the rpc layer retries across the group"
+    );
+    assert_eq!(
+        retry_cache.get(&req_id),
+        Some(RetryState::InFlight),
+        "an uncommitted proposal must stay in-flight, never committed"
+    );
 }
