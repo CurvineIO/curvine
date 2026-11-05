@@ -19,6 +19,7 @@ use curvine_net::net::InetAddr;
 use curvine_rpc::client::ClientConf as RpcConf;
 use curvine_runtime::common::{ByteUnit, DurationUnit, Utils};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ClientCliArgs)]
 #[client_cli(prefix = "client", strip_suffix = "_str", opt_in)]
@@ -226,15 +227,6 @@ pub struct ClientConf {
     #[client_cli]
     pub close_timeout_secs: u64,
 
-    // Maximum time to wait for one request/response handshake with the write
-    // buffer background task (data enqueue, flush, complete, cancel, seek,
-    // resize), in milliseconds. Bounds how long a writer (and e.g. the Java
-    // SDK closeWriter) can block when the background task stops responding.
-    // Keep it above the slowest expected single data write.
-    #[serde(alias = "write_buffer_timeout")]
-    #[client_cli]
-    pub write_buffer_timeout_ms: u64,
-
     #[client_cli(skip)]
     pub metadata_operation_buckets: Vec<f64>,
 
@@ -327,13 +319,35 @@ impl ClientConf {
 
     pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
 
-    // Extra margin added on top of the budgets one handshake can legitimately
-    // wait on (see DEFAULT_WRITE_BUFFER_TIMEOUT_MARGIN_MS).
-    pub const DEFAULT_WRITE_BUFFER_TIMEOUT_MARGIN_MS: u64 = 60 * 1000;
+    /// 5 minutes: the data path uses one fixed deadline everywhere (worker data
+    /// RPC and client buffer handshake), so the value must be large enough for
+    /// the slowest legitimate one. A handshake may first have to drain queued
+    /// writes, and a read may retry the next replica before it answers; 2
+    /// minutes turned those into spurious "not responding" errors.
+    pub const DEFAULT_DATA_TIMEOUT_MS: u64 = 300 * 1000;
 
     pub const DEFAULT_READ_PARALLEL: i64 = 1;
 
     pub const DEFAULT_MAX_READ_PARALLEL: i64 = 8;
+
+    /// The one fixed deadline of the data path: every worker read/write RPC and
+    /// every client buffer handshake uses it, so a timeout always means the same
+    /// thing regardless of where it fired. The connection layer keeps its own
+    /// fixed receive window (`rpc_timeout_ms`); neither value is derived from a
+    /// single round-trip estimate, so a slow commit cannot shorten a read's
+    /// budget or vice versa.
+    ///
+    /// Falls back to the built-in default when the field is 0, so an
+    /// uninitialised conf never yields `Duration::ZERO` and makes every
+    /// `timeout(..)` fire immediately.
+    pub fn data_timeout(&self) -> Duration {
+        let millis = if self.data_timeout_ms > 0 {
+            self.data_timeout_ms
+        } else {
+            Self::DEFAULT_DATA_TIMEOUT_MS
+        };
+        Duration::from_millis(millis)
+    }
 
     pub fn init(&mut self) -> CommonResult<()> {
         self.hostname = self.hostname.trim().to_string();
@@ -375,22 +389,6 @@ impl ClientConf {
 
         self.seek_absorb_window =
             ByteUnit::from_str(&self.seek_absorb_window_str)?.as_byte() as i64;
-
-        // 0 means "unset" (e.g. the SDK FilesystemConf omits it): derive the
-        // default from the budgets one handshake legitimately waits on. One
-        // master RPC is a leader attempt bounded by rpc_timeout_ms followed
-        // by polling bounded by rpc_retry_max_duration_ms (~240s during a
-        // master failover), and a Complete also drains up to write_chunk_num
-        // queued chunks each bounded by data_timeout_ms. The deadline must
-        // exceed those budgets, otherwise slow-but-healthy closes get
-        // reported as failed (see #1908 review). A fixed margin covers the
-        // queue drain; strictly larger total budgets keep the derivation
-        // sound.
-        if self.write_buffer_timeout_ms == 0 {
-            self.write_buffer_timeout_ms = self.rpc_timeout_ms
-                + self.rpc_retry_max_duration_ms
-                + Self::DEFAULT_WRITE_BUFFER_TIMEOUT_MARGIN_MS;
-        }
 
         self.small_file_size = ByteUnit::from_str(&self.small_file_size_str)?.as_byte() as i64;
 
@@ -497,7 +495,7 @@ impl Default for ClientConf {
             rpc_close_idle: true,
             conn_timeout_ms: 30 * 1000,
             rpc_timeout_ms: 120 * 1000,
-            data_timeout_ms: 120 * 1000,
+            data_timeout_ms: Self::DEFAULT_DATA_TIMEOUT_MS,
             pipeline_timeout_ms: 120 * 1000,
             master_conn_pool_size: 1,
 
@@ -525,10 +523,6 @@ impl Default for ClientConf {
             heartbeat_interval_ms: Self::DEFAULT_HEARTBEAT_INTERVAL_MS,
 
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
-
-            // Placeholder; init() derives the real default from the RPC
-            // budgets when this stays 0 (unset).
-            write_buffer_timeout_ms: 0,
 
             metadata_operation_buckets: vec![
                 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
@@ -617,5 +611,25 @@ mod tests {
         };
         conf.init().unwrap();
         assert_eq!(conf.seek_absorb_window, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn data_timeout_accessor_matches_the_configured_budget() {
+        let conf = ClientConf::default();
+        assert_eq!(
+            conf.data_timeout(),
+            Duration::from_millis(conf.data_timeout_ms)
+        );
+
+        // A struct literal can leave the field at 0 and never reach init();
+        // the accessor must then derive instead of yielding Duration::ZERO.
+        let conf = ClientConf {
+            data_timeout_ms: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            conf.data_timeout(),
+            Duration::from_millis(ClientConf::DEFAULT_DATA_TIMEOUT_MS)
+        );
     }
 }
