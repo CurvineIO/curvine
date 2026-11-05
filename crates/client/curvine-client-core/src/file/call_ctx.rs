@@ -23,7 +23,7 @@ use tokio::time::timeout;
 
 pub(crate) struct CallCtx {
     path: String,
-    timeout: Duration,
+    deadline: Option<Duration>,
     err_monitor: Arc<ErrorMonitor<FsError>>,
     side: Side,
     abandoned: AtomicBool,
@@ -46,14 +46,10 @@ impl Side {
 }
 
 impl CallCtx {
-    pub(crate) fn reader(
-        path: String,
-        timeout: Duration,
-        err_monitor: Arc<ErrorMonitor<FsError>>,
-    ) -> Self {
+    pub(crate) fn reader(path: String, err_monitor: Arc<ErrorMonitor<FsError>>) -> Self {
         Self {
             path,
-            timeout,
+            deadline: None,
             err_monitor,
             side: Side::Read,
             abandoned: AtomicBool::new(false),
@@ -69,7 +65,7 @@ impl CallCtx {
     ) -> Self {
         Self {
             path,
-            timeout,
+            deadline: Some(timeout),
             err_monitor,
             side: Side::Write,
             abandoned: AtomicBool::new(false),
@@ -85,11 +81,18 @@ impl CallCtx {
         self.err_monitor.take_error().unwrap_or(e.into())
     }
 
+    fn deadline_text(&self) -> String {
+        match self.deadline {
+            Some(deadline) => format!("{deadline:?}"),
+            None => "no deadline".to_string(),
+        }
+    }
+
     fn timeout_error(&self, op: &str) -> FsError {
         FsError::common(format!(
-            "{} buffer task not responding after {:?}, path={}, op={}",
+            "{} buffer task not responding after {}, path={}, op={}",
             self.side.label(),
-            self.timeout,
+            self.deadline_text(),
             self.path,
             op
         ))
@@ -97,9 +100,9 @@ impl CallCtx {
 
     fn abandoned_error(&self, op: &str) -> FsError {
         FsError::common(err_msg!(
-            "{} buffer task not responding after {:?}, task abandoned, path={}, op={}",
+            "{} buffer task not responding after {}, task abandoned, path={}, op={}",
             self.side.label(),
-            self.timeout,
+            self.deadline_text(),
             self.path,
             op
         ))
@@ -121,7 +124,11 @@ impl CallCtx {
             return Err(self.abandoned_error(op));
         }
 
-        match timeout(self.timeout, fun).await {
+        let Some(deadline) = self.deadline else {
+            return fun.await.map_err(|e| self.check_error(e));
+        };
+
+        match timeout(deadline, fun).await {
             Ok(v) => v.map_err(|e| self.check_error(e)),
 
             Err(_) => match self.err_monitor.take_error() {

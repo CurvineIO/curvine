@@ -290,7 +290,6 @@ impl FsReaderBuffer {
         let chunk_size = conf.read_chunk_size;
         let slice_size = conf.read_slice_size;
         let absorb_window = conf.seek_absorb_window;
-        let timeout = conf.data_timeout();
 
         let pos = 0;
         let len = file_blocks.status.len;
@@ -330,7 +329,7 @@ impl FsReaderBuffer {
                     }),
                     chunk_receiver,
                     task_sender,
-                    ctx: CallCtx::reader(path.path().to_string(), timeout, err_monitor.clone()),
+                    ctx: CallCtx::reader(path.path().to_string(), err_monitor.clone()),
                     produced_end,
                     needs_drain: false,
                     #[cfg(test)]
@@ -483,7 +482,7 @@ impl FsReaderBuffer {
         if self.slice_size <= 0 || pos / self.slice_size != self.pos / self.slice_size {
             return false;
         }
-        // 随机模式选中的是 base reader(无缓冲 channel),不可吸收。
+
         let Some(id) = Self::select_reader_index(
             self.read_detector.is_random(),
             pos,
@@ -494,12 +493,12 @@ impl FsReaderBuffer {
             return false;
         };
         let Some(ReaderAdapter::Buffer(ch)) = self.readers.get_mut(id) else {
-            return false; // base reader 或未初始化
+            return false;
         };
-        ch.start_prefetch(); // 保证预取任务已启动(否则水位必为 0,自然拒绝)
+        ch.start_prefetch();
         let absorbed = ch.can_absorb(pos);
         if absorbed {
-            ch.mark_absorbed(); // 后续 read 需要 drain 掉 pos 之下的残留 chunk
+            ch.mark_absorbed();
         }
         absorbed
     }
@@ -509,7 +508,6 @@ impl FsReaderBuffer {
             return Ok(());
         }
 
-        // 前向小跳且落在目标 lane 的已生产数据内:本地吸收,零后端交互。
         if pos > self.pos && self.try_absorb(pos) {
             debug!(
                 "seek absorbed: path={}, from={}, to={}, skipped={} bytes",
@@ -534,9 +532,6 @@ impl FsReaderBuffer {
         let was_random = self.read_detector.is_random();
         self.read_detector.record_seek(&self.path);
         if self.read_detector.enabled && was_random && self.absorb_window > 0 {
-            // 随机模式且吸收特性开启:只有 base reader 服务读;lane 在翻转 seek
-            // 时已 pause/drain,由 Random→Sequential 的 pause(pos, false) 循环
-            // 统一重定位。window=0 时走全量循环,与上游逐字节一致。
             if let Some(base) = self.readers.get_mut(self.base_reader_index) {
                 base.seek(pos).await?;
             }
@@ -657,7 +652,6 @@ mod tests {
     use bytes::BytesMut;
     use curvine_config::ClusterConf;
     use curvine_model::{ExtendedBlock, FileStatus, FileType, LocatedBlock, StorageType};
-    use std::time::Duration;
 
     // The seek-absorb tests assert on the process-global
     // `ClientMetrics::seek_absorbed_total` counter, which is shared across all
@@ -1276,11 +1270,9 @@ mod tests {
         assert_eq!(reader.pos(), 6);
 
         // First read: the drain cycle starts but the channel is empty, so the
-        // future parks inside the receive — cancel it right there. Polling
-        // inside the runtime is required now that the receive runs under a
-        // deadline: `tokio::time::timeout` registers with the time driver on
-        // its first poll. The noop waker never wakes the task, so the single
-        // poll must still return Pending.
+        // future parks inside the receive — cancel it right there. The noop
+        // waker never wakes the task, so a single poll must still return
+        // Pending.
         rt.block_on(async {
             let mut fut = Box::pin(reader.read());
             let waker = std::task::Waker::noop();
@@ -1409,7 +1401,6 @@ mod tests {
             task_sender,
             ctx: CallCtx::reader(
                 "/gh-1908-failed-seek".to_string(),
-                Duration::from_millis(200),
                 Arc::new(ErrorMonitor::new()),
             ),
             produced_end: produced_end.clone(),
