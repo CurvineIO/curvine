@@ -150,6 +150,7 @@ print_help() {
   echo "                          - python: Python SDK"
   echo "                          - rust-sdk: Rust SDK (rlib + cdylib)"
   echo "                          - tests: test suite and benchmarks"
+  echo "                          - object: S3 object gateway"
   echo "                          - all: all packages"
   echo
   echo "  -u, --ufs TYPE        UFS storage type (can be specified multiple times, default: opendal-s3)"
@@ -470,6 +471,7 @@ declare -a SERVER_RUST_BUILD_ARGS=()
 declare -a CLIENT_RUST_BUILD_ARGS=()
 declare -a CLI_RUST_BUILD_ARGS=()
 declare -a TEST_RUST_BUILD_ARGS=()
+declare -a OBJECT_RUST_BUILD_ARGS=()
 declare -a COPY_TARGETS=()
 declare -a CLIENT_ARTIFACT_CHECK_TARGETS=()
 
@@ -501,6 +503,12 @@ fi
 if should_build_package "tests"; then
   TEST_RUST_BUILD_ARGS+=("-p" "curvine-tests")
   COPY_TARGETS+=("curvine-bench")
+fi
+
+# S3 object gateway ships as its own binary.
+if should_build_package "object" || [[ " ${PACKAGES[@]} " =~ " all " ]]; then
+  OBJECT_RUST_BUILD_ARGS+=("-p" "curvine-s3-gateway")
+  COPY_TARGETS+=("curvine-s3-gateway")
 fi
 
 declare -a FEATURES=()
@@ -902,6 +910,7 @@ if [ $ENABLE_SPDK_RDMA -eq 1 ]; then
   add_feature "curvine-server/spdk-rdma"
 fi
 TEST_FEATURES=("${FEATURES[@]}")
+OBJECT_FEATURES=("${FEATURES[@]}")
 
 if [ ${#CLIENT_SKIPPED_SERVER_NATIVE_FEATURES[@]} -gt 0 ]; then
   echo "Client artifacts skip server-native features: ${CLIENT_SKIPPED_SERVER_NATIVE_FEATURES[*]}"
@@ -917,13 +926,14 @@ elif [ -d "/opt/spdk" ]; then
 fi
 
 # Skip cargo build when no non-SDK rust package was selected
-if [ ${#SERVER_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLIENT_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLI_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#TEST_RUST_BUILD_ARGS[@]} -eq 0 ]; then
+if [ ${#SERVER_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLIENT_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLI_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#TEST_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#OBJECT_RUST_BUILD_ARGS[@]} -eq 0 ]; then
   echo "No non-SDK rust packages selected, skipping workspace cargo build..."
 else
   build_rust_packages "server-native" "${SERVER_RUST_BUILD_ARGS[@]}" -- "${SERVER_FEATURES[@]}"
   build_rust_packages "tests" "${TEST_RUST_BUILD_ARGS[@]}" -- "${TEST_FEATURES[@]}"
   build_rust_packages "client-safe" "${CLIENT_RUST_BUILD_ARGS[@]}" -- "${CLIENT_FEATURES[@]}"
   build_rust_packages "cli-minimal" "${CLI_RUST_BUILD_ARGS[@]}" -- "${CLI_FEATURES[@]}"
+  build_rust_packages "object-gateway" "${OBJECT_RUST_BUILD_ARGS[@]}" -- "${OBJECT_FEATURES[@]}"
 fi
 
 if [ $BUILD_JAVA_SDK -eq 1 ]; then

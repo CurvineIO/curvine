@@ -122,6 +122,10 @@ message BlockReportInfoProto {
     required BlockReportStatusProto status = 2;
     required int64 block_size = 3;
     required StorageTypeProto storage_type = 4;
+    // Set on a Deleted report when the worker removed the replica because its
+    // data failed checksum verification. A master that does not know the
+    // field treats the report as a plain deletion.
+    optional bool corrupted = 5;
 }
 
 // Report the block information to the master。
