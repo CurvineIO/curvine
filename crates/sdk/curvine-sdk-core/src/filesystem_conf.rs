@@ -339,6 +339,7 @@ impl FilesystemConf {
 mod tests {
     use super::{FilesystemConf, TransferClientConf};
     use curvine_config::ClientConf;
+    use std::time::Duration;
 
     #[test]
     fn default_master_conn_pool_size_is_one() {
@@ -479,6 +480,46 @@ mod tests {
         .unwrap();
         let cluster = conf.into_cluster_conf().unwrap();
         assert_eq!(cluster.client.data_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn java_default_data_timeout_outlasts_the_master_failover_budget() {
+        // `FilesystemConf.java` mirrors every field into the toml that
+        // `JavaFilesystem::new` parses, so this is the Java `closeWriter` chain.
+        // The writer handshake is bounded by `data_timeout()`, which must outlast
+        // a Complete/Flush that drains the queued writes and then retries the
+        // master through a failover: rpc_timeout + rpc_retry_max_duration.
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                read_chunk_size = "128KB"
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+                rpc_timeout_ms = 120000
+                rpc_retry_max_duration_ms = 120000
+                data_timeout_ms = 300000
+            "#,
+        )
+        .unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        let failover = Duration::from_millis(
+            cluster.client.rpc_timeout_ms + cluster.client.rpc_retry_max_duration_ms,
+        );
+        assert!(
+            cluster.client.data_timeout() > failover,
+            "the Java SDK handshake deadline {:?} must exceed the failover budget {:?}",
+            cluster.client.data_timeout(),
+            failover
+        );
     }
 
     #[test]

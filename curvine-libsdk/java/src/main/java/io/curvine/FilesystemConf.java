@@ -60,7 +60,13 @@ public class FilesystemConf {
     //Configuration of timeout for a request.
     public long conn_timeout_ms = 30 * 1000;
     public long rpc_timeout_ms = 120 * 1000;
-    public long data_timeout_ms = 120 * 1000;
+    // One fixed deadline for the data path, mirroring
+    // ClientConf::DEFAULT_DATA_TIMEOUT_MS (300s). The writer buffer handshake is
+    // bounded by it, and that handshake must outlast a Complete/Flush that drains
+    // the queued writes and then retries the master through a failover
+    // (rpc_timeout_ms + rpc_retry_max_duration_ms = 240s), otherwise a
+    // slow-but-healthy closeWriter is reported as failed (#1908).
+    public long data_timeout_ms = 300 * 1000;
 
     // Number of fs master connections.
     // Pool size 3 reaches the highest QPS. Pool size 1 supports the most clients, so the default is 1.
