@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::time::Duration;
 use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::net::TcpStream;
 
 use crate::handler::FrameBuf;
 use crate::message::Message;
+use crate::IOUtils;
 use curvine_io::IOResult;
 
 pub struct WriteFrame {
@@ -52,5 +54,9 @@ impl WriteFrame {
         }
         self.io.flush().await?;
         Ok(())
+    }
+
+    pub async fn send_timeout(&mut self, msg: &Message, dur: Duration) -> IOResult<()> {
+        IOUtils::timeout_io("frame send", dur, self.send(msg)).await
     }
 }

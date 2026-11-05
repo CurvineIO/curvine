@@ -518,7 +518,7 @@ fn client_heartbeat_rpc_to_standby_is_rejected() -> CommonResult<()> {
 fn rpc_queue_count(fs: &MasterFilesystem, executor: &str) -> u64 {
     let text = Master::get_metrics()
         .expect("test master metrics should initialize")
-        .text_output(fs.clone())
+        .text_output(fs.clone(), None)
         .expect("metrics text output should render");
     let prefix = format!("rpc_queue_duration_count{{executor=\"{executor}\"}}");
     text.lines()
@@ -3351,6 +3351,295 @@ fn test_reject_invalid_s3_mount_update_before_persist() -> CommonResult<()> {
             .map(String::as_str),
         Some(region)
     );
+    Ok(())
+}
+
+#[test]
+fn test_s3_mount_accepts_a_role_credential_without_any_key() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair_with_conf("s3-mount-role-credential", |conf| {
+        conf.master.s3_allow_env_credentials = true
+    });
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let role_arn = "arn:aws:iam::123456789012:role/curvine-ufs";
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "role")
+        .add_property("s3.credentials.role_arn", role_arn)
+        .build();
+
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    let info = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("a role mount must be stored");
+    assert_eq!(
+        info.properties
+            .get("s3.credentials.role_arn")
+            .map(String::as_str),
+        Some(role_arn)
+    );
+    assert!(!info.properties.contains_key("s3.credentials.access"));
+    assert!(!info.properties.contains_key("s3.credentials.secret"));
+    assert!(fs.exists(mount_path)?);
+    Ok(())
+}
+
+// A `role` mount that carries its own source key pair uses the caller's credential, not the node
+// identity, so it must persist on a master with the default `s3_allow_env_credentials = false`.
+#[test]
+fn test_s3_mount_accepts_a_role_credential_with_a_source_key_without_opt_in() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("s3-mount-role-source-key");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let role_arn = "arn:aws:iam::123456789012:role/curvine-ufs";
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "role")
+        .add_property("s3.credentials.role_arn", role_arn)
+        .add_property("s3.credentials.access", "source-access-key")
+        .add_property("s3.credentials.secret", "source-secret-key")
+        .build();
+
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    let info = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("a role mount with a source key pair must be stored");
+    assert_eq!(
+        info.properties
+            .get("s3.credentials.role_arn")
+            .map(String::as_str),
+        Some(role_arn)
+    );
+    assert_eq!(
+        info.properties
+            .get("s3.credentials.access")
+            .map(String::as_str),
+        Some("source-access-key")
+    );
+    assert!(fs.exists(mount_path)?);
+    Ok(())
+}
+
+#[test]
+fn test_s3_mount_accepts_an_auto_credential() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair_with_conf("s3-mount-auto-credential", |conf| {
+        conf.master.s3_allow_env_credentials = true
+    });
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "auto")
+        .build();
+
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    assert!(mnt_mgr.get_mount_info(&mount)?.is_some());
+    assert!(fs.exists(mount_path)?);
+    Ok(())
+}
+
+// `role` and `auto` resolve the identity from the node environment, so a mount would use the
+// cluster's own cloud identity. The mount RPC is not authenticated (#1972), so that capability is
+// opt-in per master and both kinds must be rejected before anything is persisted.
+#[test]
+fn test_reject_s3_mount_environment_credential_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-s3-mount-env-credential");
+    let mnt_mgr = js.mount_manager();
+    let mount = Path::from_str("/mnt/s3")?;
+
+    for (index, credential_type) in ["auto", "role"].into_iter().enumerate() {
+        let mount_path = format!("/mnt/s3-{index}");
+        let mut builder = MountOptions::builder()
+            .add_property("s3.endpoint_url", "http://s3.example.com")
+            .add_property("s3.region_name", "cn-test-1")
+            .add_property("s3.credentials.type", credential_type);
+        if credential_type == "role" {
+            builder = builder.add_property(
+                "s3.credentials.role_arn",
+                "arn:aws:iam::123456789012:role/curvine-ufs",
+            );
+        }
+
+        let err = mnt_mgr
+            .mount(None, &mount_path, "s3://bucket/path", &builder.build())
+            .expect_err("an environment-resolved credential must be gated by the master");
+
+        assert!(
+            err.to_string().contains("master.s3_allow_env_credentials"),
+            "unexpected error for {}: {}",
+            credential_type,
+            err
+        );
+        assert!(mnt_mgr.get_mount_info(&mount)?.is_none());
+        assert!(!fs.exists(&mount_path)?);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_reject_s3_mount_role_without_role_arn_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-s3-mount-role-without-arn");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "role")
+        .build();
+
+    let err = mnt_mgr
+        .mount(None, mount_path, "s3://bucket/path", &opts)
+        .expect_err("a role mount without role_arn must be rejected");
+
+    assert!(err.to_string().contains("s3.credentials.role_arn"));
+    assert!(mnt_mgr.get_mount_info(&mount)?.is_none());
+    assert!(!fs.exists(mount_path)?);
+    Ok(())
+}
+
+#[test]
+fn test_reject_s3_mount_auto_with_static_credentials_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-s3-mount-auto-with-key");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "auto")
+        .add_property("s3.credentials.access", "access-key")
+        .add_property("s3.credentials.secret", "secret-key")
+        .build();
+
+    let err = mnt_mgr
+        .mount(None, mount_path, "s3://bucket/path", &opts)
+        .expect_err("auto must not silently ignore static credentials");
+
+    assert!(err.to_string().contains("s3.credentials.access"));
+    assert!(mnt_mgr.get_mount_info(&mount)?.is_none());
+    assert!(!fs.exists(mount_path)?);
+    Ok(())
+}
+
+#[test]
+fn test_s3_mount_update_rotates_session_token_through_legacy_alias() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (_fs, js, _loader, _js2, _fs2) = setup_pair("s3-mount-update-token-alias");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "sts")
+        .add_property("s3.credentials.access", "access-key")
+        .add_property("s3.credentials.secret", "secret-key")
+        .add_property("s3.credentials.token", "old-token")
+        .build();
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    // Rotating through the legacy spelling must overwrite the stored canonical key instead of
+    // colliding with it. The update names the key exactly once.
+    let update = MountOptions::builder()
+        .update(true)
+        .add_property("s3.session_token", "new-token")
+        .build();
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &update)?;
+
+    let properties = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("mount must still be stored")
+        .properties;
+    assert_eq!(
+        properties.get("s3.credentials.token").map(String::as_str),
+        Some("new-token")
+    );
+    assert!(!properties.contains_key("s3.session_token"));
+    assert_eq!(
+        properties.get("s3.credentials.type").map(String::as_str),
+        Some("sts")
+    );
+    Ok(())
+}
+
+#[test]
+fn test_s3_mount_update_rotates_role_arn_through_legacy_alias() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (_fs, js, _loader, _js2, _fs2) =
+        setup_pair_with_conf("s3-mount-update-role-alias", |conf| {
+            conf.master.s3_allow_env_credentials = true
+        });
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "role")
+        .add_property("s3.credentials.role_arn", "arn:aws:iam::1:role/old")
+        .build();
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    let update = MountOptions::builder()
+        .update(true)
+        .add_property("s3.role_arn", "arn:aws:iam::1:role/new")
+        .build();
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &update)?;
+
+    let properties = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("mount must still be stored")
+        .properties;
+    assert_eq!(
+        properties
+            .get("s3.credentials.role_arn")
+            .map(String::as_str),
+        Some("arn:aws:iam::1:role/new")
+    );
+    assert!(!properties.contains_key("s3.role_arn"));
+    Ok(())
+}
+
+#[test]
+fn test_reject_s3_mount_static_without_credentials_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-s3-mount-static-without-keys");
+    let mnt_mgr = js.mount_manager();
+    let mount = Path::from_str("/mnt/s3")?;
+
+    for (index, credential_type) in [None, Some("static")].into_iter().enumerate() {
+        let mount_path = format!("/mnt/s3-{index}");
+        let mut builder = MountOptions::builder()
+            .add_property("s3.endpoint_url", "http://s3.example.com")
+            .add_property("s3.region_name", "cn-test-1");
+        if let Some(credential_type) = credential_type {
+            builder = builder.add_property("s3.credentials.type", credential_type);
+        }
+
+        let err = mnt_mgr
+            .mount(None, &mount_path, "s3://bucket/path", &builder.build())
+            .expect_err("a static mount without a key pair must be rejected");
+
+        assert!(err.to_string().contains("s3.credentials.access"));
+        assert!(mnt_mgr.get_mount_info(&mount)?.is_none());
+        assert!(!fs.exists(&mount_path)?);
+    }
     Ok(())
 }
 

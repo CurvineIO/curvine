@@ -74,6 +74,13 @@ start() {
       --service ${SERVICE_NAME} \
       --conf "${CURVINE_CONF_FILE}" \
       > "${OUT_FILE}" 2>&1 < /dev/null  &
+    elif [[ "$SERVICE_NAME" = "s3-gateway" ]]; then
+       name="curvine-s3-gateway"
+       local gw_args=("${CURVINE_HOME}/lib/curvine-s3-gateway" "${PARAMS[@]}")
+       if ! has_fuse_conf_arg; then
+         gw_args+=(--conf "${CURVINE_CONF_FILE}")
+       fi
+       nohup "${gw_args[@]}" > "${OUT_FILE}" 2>&1 < /dev/null &
     elif [[ "$SERVICE_NAME" = "fuse" ]]; then
        name="curvine-fuse"
        local fuse_args=("${CURVINE_HOME}/lib/curvine-fuse" "${PARAMS[@]}")

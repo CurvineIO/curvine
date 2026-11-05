@@ -17,6 +17,7 @@
 use crate::conf::{JournalConf, JournalConfExt};
 use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
+use crate::raft::raft_server::RetryState;
 use crate::raft::recovery::{PeerSessions, Recovery, SessionEvent};
 use crate::raft::storage::{AppStorage, ApplyMsg, LogStorage, PeerStorage};
 use crate::raft::*;
@@ -51,7 +52,17 @@ struct PendingReady {
     demoted: bool,
 }
 
-type PendingPromises = HashMap<i64, Callback>;
+/// A caller callback parked in the driver, together with the raft term in
+/// which the propose was accepted. The term lets `apply_committed_entries`
+/// decide whether to answer a caller from local evidence ("this entry is the
+/// one proposed here in this term, and it has committed") instead of the
+/// node's current leadership role.
+struct PendingPropose {
+    sender: Callback,
+    term: u64,
+}
+
+type PendingPromises = HashMap<i64, PendingPropose>;
 
 pub struct RaftNode<A, B>
 where
@@ -99,6 +110,11 @@ where
     last_snapshot_ms: u64,
 
     last_snapshot_op_id: u64,
+
+    // Dedup cache shared with the rpc handlers. Entries are inserted as
+    // `RetryState::InFlight` when the request reaches the node and flipped to
+    // `RetryState::Committed` once the entry is applied.
+    retry_cache: RetryCache,
 }
 
 impl<A, B> RaftNode<A, B>
@@ -115,6 +131,7 @@ where
         role_monitor: RoleMonitor,
         receiver: mpsc::Receiver<Envelope>,
         sender: mpsc::Sender<Envelope>,
+        retry_cache: RetryCache,
         logger: &slog::Logger,
     ) -> RaftResult<Self> {
         let group = RaftGroup::from_conf(conf);
@@ -168,6 +185,7 @@ where
             snapshot_entries,
             last_snapshot_ms: LocalTime::mills(),
             last_snapshot_op_id,
+            retry_cache,
         };
 
         Ok(node)
@@ -468,15 +486,48 @@ where
         if !self.is_leader() {
             Self::send_not_leader(self.leader(), env, &self.group)?;
         } else {
+            let req_id = env.msg.req_id();
+            // Driver-side in-flight dedup, same rationale as handle_propose.
+            if Self::is_req_id_in_flight(&self.retry_cache, promise, req_id) {
+                return Self::send_request_error(
+                    env,
+                    RaftError::leader_not_ready().ctx(format!(
+                        "request {req_id} is still in flight on this node, please retry"
+                    )),
+                );
+            }
+
             if change.get_node_id() == 0 {
                 change.set_node_id(self.id())
+            }
+
+            // raft-rs silently converts a conf change proposed while another
+            // conf change is still pending (unapplied) into an empty normal
+            // entry and still appends it, so the caller would park on a change
+            // that is never applied as a conf change and end up with a phantom
+            // success. Reject it up front instead.
+            if self.raw.raft.has_pending_conf() {
+                return Self::send_request_error(
+                    env,
+                    RaftError::other("another conf change is still pending, please retry".into()),
+                );
             }
 
             let context = SerdeUtils::serialize(&env.msg.req_id())?;
             if let Err(e) = self.raw.propose_conf_change(context, change) {
                 return Self::send_request_error(env, e.into());
             }
-            promise.insert(env.msg.req_id(), env.cb);
+            // The conf change was appended: reserve the req_id for dedup and
+            // unknown-outcome waits (same lifecycle as a propose).
+            self.retry_cache
+                .insert(env.msg.req_id(), RetryState::InFlight);
+            promise.insert(
+                env.msg.req_id(),
+                PendingPropose {
+                    sender: env.cb,
+                    term: self.raw.raft.term,
+                },
+            );
         }
 
         Ok(())
@@ -535,6 +586,24 @@ where
             return Self::send_not_leader(self.leader(), env, &self.group);
         }
 
+        let req_id = env.msg.req_id();
+        // Driver-side in-flight dedup. A caller may re-send the same req_id
+        // while a previous attempt is still parked here (e.g. the client rpc
+        // timeout expired while the driver was stalled on RocksDB compaction
+        // or apply-worker backpressure). Appending a second entry for the
+        // same req_id would commit it twice, and a non-idempotent apply
+        // failure on the leader ends in process abort, so a duplicate must
+        // never be appended. The driver is single-threaded, so this check has
+        // no race with the append below.
+        if Self::is_req_id_in_flight(&self.retry_cache, promise, req_id) {
+            return Self::send_request_error(
+                env,
+                RaftError::leader_not_ready().ctx(format!(
+                    "request {req_id} is still in flight on this node, please retry"
+                )),
+            );
+        }
+
         let before_index = self.raw.raft.raft_log.last_index() + 1;
         let header: ProposeRequest = match env.msg.parse_header() {
             Ok(header) => header,
@@ -553,8 +622,20 @@ where
             // Propose execution failed and notify the client service.
             env.send_with_log(Ok(rep_msg));
         } else {
-            // Keep callbacks from the client service side.
-            promise.insert(env.msg.req_id(), env.cb);
+            // The entry was appended: reserve the req_id so a retry either
+            // dedups against the committed result or waits for the unknown
+            // outcome. Only an actually appended entry may hold a marker.
+            self.retry_cache
+                .insert(env.msg.req_id(), RetryState::InFlight);
+            // Keep callbacks from the client service side, recording the term
+            // the propose was accepted in.
+            promise.insert(
+                env.msg.req_id(),
+                PendingPropose {
+                    sender: env.cb,
+                    term: self.raw.raft.term,
+                },
+            );
         }
 
         Ok(())
@@ -908,6 +989,7 @@ where
         sender: Callback,
         response: ProposeResponse,
         apply_done: CallReceiver<RaftResult<()>>,
+        retry_cache: RetryCache,
     ) {
         let response_msg = Builder::new_rpc(RaftCode::Propose)
             .response(ResponseStatus::Success)
@@ -917,7 +999,13 @@ where
 
         rt.spawn(async move {
             let result = match apply_done.receive().await {
-                Ok(Ok(())) => Ok(response_msg),
+                Ok(Ok(())) => {
+                    // Publish the committed state only after the application
+                    // acknowledged success, so a retry can never be answered
+                    // with a success for an entry that failed to apply.
+                    retry_cache.insert(req_id, RetryState::Committed);
+                    Ok(response_msg)
+                }
                 Ok(Err(error)) => Ok(Builder::new_rpc(RaftCode::Propose)
                     .response(ResponseStatus::Error)
                     .req_id(req_id)
@@ -950,14 +1038,28 @@ where
         }
     }
 
+    /// Whether `req_id` already has an appended-but-unanswered entry parked in
+    /// this driver: either a pending callback or an in-flight reservation.
+    fn is_req_id_in_flight(
+        retry_cache: &RetryCache,
+        promise: &PendingPromises,
+        req_id: i64,
+    ) -> bool {
+        promise.contains_key(&req_id) || retry_cache.get(&req_id) == Some(RetryState::InFlight)
+    }
+
     fn fail_pending_promises(promise: &mut PendingPromises, reason: &str) {
         if promise.is_empty() {
             return;
         }
 
         let failed = promise.len();
-        for (req_id, sender) in promise.drain() {
-            Self::send_promise_error(req_id, sender, RaftError::leader_not_ready().ctx(reason));
+        for (req_id, pending) in promise.drain() {
+            Self::send_promise_error(
+                req_id,
+                pending.sender,
+                RaftError::leader_not_ready().ctx(reason),
+            );
         }
 
         info!("failed {} pending propose callbacks: {}", failed, reason);
@@ -1012,36 +1114,56 @@ where
             }
 
             let is_conf_change = matches!(entry.get_entry_type(), EntryType::EntryConfChange);
+            let (entry_index, entry_term) = (entry.index, entry.term);
             let has_caller = !entry.get_context().is_empty();
-            let should_respond = self.is_leader() && has_caller;
-            let (entry_index, entry_term, entry_context) = if has_caller {
-                (entry.index, entry.term, Some(entry.get_context().to_vec()))
+            // A context that does not decode to a req_id means the entry was
+            // not proposed through handle_propose / handle_conf_change: no
+            // caller waits on it and no dedup marker exists for it.
+            let req_id = if has_caller {
+                match SerdeUtils::deserialize::<i64>(entry.get_context()) {
+                    Ok(req_id) => Some(req_id),
+                    Err(e) => {
+                        warn!(
+                            "failed to decode raft entry context for response, index {}, term {}: {}",
+                            entry.index, entry_term, e
+                        );
+                        None
+                    }
+                }
             } else {
-                (0, 0, None)
+                None
             };
+
+            // Whether to answer the caller is decided by local evidence, not by
+            // the current role (issue #1907): an entry that reached the
+            // committed entries is quorum-committed, so when its caller is
+            // still parked here with a propose accepted in this entry's own
+            // term, the callback must be answered with the apply result — even
+            // if this node steps down in the same round. Gating on
+            // `is_leader()` instead reported a retryable failure for an
+            // already committed write.
+            let should_respond = req_id.is_some_and(|req_id| {
+                client_send
+                    .get(&req_id)
+                    .is_some_and(|p| p.term == entry_term)
+            });
+
             let rep_msg = if is_conf_change {
                 let rep = self.apply_config_change(&entry)?;
                 self.storage
                     .apply_propose(false, ApplyMsg::new_entry(entry))
                     .await?;
+                if let Some(req_id) = req_id {
+                    self.mark_retry_committed(req_id);
+                }
                 Builder::new_rpc(RaftCode::ConfChange)
                     .response(ResponseStatus::Success)
                     .proto_header(rep)
             } else {
                 let apply = self.apply_propose(entry, should_respond).await?;
                 if should_respond {
-                    let Some(entry_context) = entry_context else {
+                    let Some(req_id) = req_id else {
                         continue;
-                    };
-                    let req_id: i64 = match SerdeUtils::deserialize(&entry_context) {
-                        Ok(req_id) => req_id,
-                        Err(e) => {
-                            warn!(
-                                "failed to decode raft entry context for response, index {}, term {}: {}",
-                                entry_index, entry_term, e
-                            );
-                            continue;
-                        }
                     };
                     let Some(apply_done) = apply.apply_done else {
                         warn!(
@@ -1051,39 +1173,47 @@ where
                         continue;
                     };
                     match client_send.remove(&req_id) {
-                        Some(sender) => Self::send_propose_response_after_apply(
+                        Some(pending) => Self::send_propose_response_after_apply(
                             &self.rt,
                             req_id,
-                            sender,
+                            pending.sender,
                             apply.response,
                             apply_done,
+                            self.retry_cache.clone(),
                         ),
 
-                        None => debug!("Request {} was already answered", req_id),
+                        None => {
+                            // The original caller is gone (connection closed
+                            // or already answered), so the apply ack would be
+                            // dropped. Publish the committed state here: the
+                            // entry is about to be applied by the app store
+                            // regardless of who is listening.
+                            self.mark_retry_committed(req_id);
+                            debug!("Request {} was already answered", req_id);
+                        }
                     };
+                } else if let Some(req_id) = req_id {
+                    // Follower replay has no caller waiting. The entry is
+                    // already quorum-committed at this point; a follower whose
+                    // apply fails aborts the node, so no false success can
+                    // survive the apply. Publishing here just records that
+                    // known outcome instead of waiting for an ack that would
+                    // never be observed by a retry.
+                    self.mark_retry_committed(req_id);
                 }
                 continue;
             };
 
-            // Followers only replay the message: no caller is waiting on them.
+            // Conf change answers right after the membership apply; there is
+            // no separate FSM ack to wait for.
             if should_respond {
-                let Some(entry_context) = entry_context else {
+                let Some(req_id) = req_id else {
                     continue;
-                };
-                let req_id: i64 = match SerdeUtils::deserialize(&entry_context) {
-                    Ok(req_id) => req_id,
-                    Err(e) => {
-                        warn!(
-                            "failed to decode raft entry context for response, index {}, term {}: {}",
-                            entry_index, entry_term, e
-                        );
-                        continue;
-                    }
                 };
                 let rep_msg = rep_msg.req_id(req_id).build();
                 match client_send.remove(&req_id) {
-                    Some(sender) => {
-                        if sender.send(Ok(rep_msg)).is_err() {
+                    Some(pending) => {
+                        if pending.sender.send(Ok(rep_msg)).is_err() {
                             warn!("The client connection has been closed, req {}", req_id)
                         }
                     }
@@ -1094,8 +1224,14 @@ where
         }
         Ok(())
     }
-}
 
+    /// Flip the dedup cache entry of `req_id` to committed after its log entry
+    /// was applied successfully. Only a committed state may be acknowledged as
+    /// a duplicate success to a retrying caller.
+    fn mark_retry_committed(&self, req_id: i64) {
+        self.retry_cache.insert(req_id, RetryState::Committed);
+    }
+}
 #[cfg(test)]
 #[path = "tests/raft_node_recovery_tests.rs"]
 mod raft_node_recovery_tests;
