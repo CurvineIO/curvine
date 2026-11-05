@@ -96,6 +96,15 @@ pub struct MountCommand {
     #[arg(long, default_value_t = false)]
     check: bool,
 
+    /// Skip the UFS reachability probe performed before mounting.
+    ///
+    /// A `role`/`auto` S3 mount resolves its credential from the runtime environment of every
+    /// participant, which the host running `cv mount` usually does not have. Use this flag when the
+    /// mount identity only exists on the cluster side; UFS access failures then surface on the
+    /// first data access instead of at mount time.
+    #[arg(long = "skip-ufs-probe", default_value_t = false)]
+    skip_ufs_probe: bool,
+
     /// Perform a dry run: scan and report differences without create/delete/set_attr changes.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
@@ -310,29 +319,48 @@ impl MountCommand {
         }
 
         let mnt_opts = self.to_mnt_opts()?;
-        let should_auto_resync = !self.update
+        let environment_resolved = s3_uses_environment_credential(&mnt_opts.add_properties);
+        let first_fs_mode_mount = !self.update
             && matches!(mnt_opts.write_type, WriteType::FsMode)
             && fs.fs_client().get_mount_info(&cv_path).await?.is_none();
+        let should_auto_resync = first_fs_mode_mount && !self.skip_ufs_probe;
 
-        let ufs = UfsFileSystem::new(
-            &ufs_path,
-            mnt_opts.add_properties.clone(),
-            mnt_opts.provider,
-        )
-        .map_err(|err| {
-            FsError::common(format!(
-                "Unable to initialize UFS {}: {}. Verify the URI, mount configuration, and credentials.",
-                ufs_path.full_path(),
-                err
-            ))
-        })?;
-        ufs.list_status(&ufs_path).await.map_err(|err| {
-            FsError::common(format!(
-                "Unable to access UFS {}: {}. Verify the endpoint, credentials, and network connectivity.",
-                ufs_path.full_path(),
-                err
-            ))
-        })?;
+        if self.skip_ufs_probe {
+            println!("│ ⏭️  UFS probe skipped (--skip-ufs-probe).");
+            if first_fs_mode_mount {
+                println!(
+                    "│ ⚠️  auto resync is skipped as well: it reads UFS from this host, whose identity may differ from the cluster's"
+                );
+            }
+        } else {
+            if environment_resolved {
+                eprintln!(
+                    "Warning: this mount resolves its S3 credential from the runtime environment of each participant.\n  \
+                     The probe below uses this host's identity; if this host has no source identity the probe fails.\n  \
+                     Re-run with --skip-ufs-probe to mount without probing."
+                );
+            }
+
+            let ufs = UfsFileSystem::new(
+                &ufs_path,
+                mnt_opts.add_properties.clone(),
+                mnt_opts.provider,
+            )
+            .map_err(|err| {
+                FsError::common(format!(
+                    "Unable to initialize UFS {}: {}. Verify the URI, mount configuration, and credentials.",
+                    ufs_path.full_path(),
+                    err
+                ))
+            })?;
+            ufs.list_status(&ufs_path).await.map_err(|err| {
+                FsError::common(format!(
+                    "Unable to access UFS {}: {}. Verify the endpoint, credentials, and network connectivity.",
+                    ufs_path.full_path(),
+                    err
+                ))
+            })?;
+        }
 
         handle_rpc_result(fs.mount(&ufs_path, &cv_path, mnt_opts)).await;
         println!("│ ✅️ mount success.");
@@ -596,6 +624,22 @@ fn display_config_value<'a>(key: &str, value: &'a str) -> &'a str {
 
 fn is_sensitive_config_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
+
+    // Structural fields that live under the credential namespace but carry no secret. Showing them
+    // is useful (an operator can confirm which role a mount uses) and safe; anything not listed
+    // here still falls through to the patterns below and is masked.
+    const NON_SECRET: &[&str] = &[
+        "s3.credentials.type",
+        "s3.credentials.role_arn",
+        "s3.credentials.role_session_name",
+        "s3.credentials.external_id",
+        "s3.credentials.disable_config_load",
+        "s3.credentials.disable_ec2_metadata",
+    ];
+    if NON_SECRET.contains(&key.as_str()) {
+        return false;
+    }
+
     key.contains("credential")
         || key.contains("secret")
         || key.contains("token")
@@ -604,4 +648,84 @@ fn is_sensitive_config_key(key: &str) -> bool {
         || key.ends_with(".access")
         || key.ends_with(".ak")
         || key.ends_with(".sk")
+}
+
+/// True when the mount resolves its credential from the runtime environment instead of carrying a
+/// secret in the mount configuration.
+fn s3_uses_environment_credential(properties: &HashMap<String, String>) -> bool {
+    curvine_ufs_api::S3Conf::credential_plan(properties)
+        .map(|plan| plan.is_environment_resolved())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{display_config_value, is_sensitive_config_key, s3_uses_environment_credential};
+    use std::collections::HashMap;
+
+    #[test]
+    fn new_credential_keys_are_masked() {
+        for key in [
+            "s3.credentials.access",
+            "s3.credentials.secret",
+            "s3.credentials.token",
+            "s3.session_token",
+            "s3.security_token",
+        ] {
+            assert!(is_sensitive_config_key(key), "{key} must be masked");
+            assert_eq!(display_config_value(key, "value"), "******");
+        }
+    }
+
+    #[test]
+    fn non_secret_credential_keys_are_not_masked() {
+        for key in [
+            "s3.credentials.type",
+            "s3.credentials.role_arn",
+            "s3.credentials.role_session_name",
+            "s3.credentials.external_id",
+            "s3.credentials.disable_config_load",
+            "s3.credentials.disable_ec2_metadata",
+            "s3.endpoint_url",
+        ] {
+            assert!(!is_sensitive_config_key(key), "{key} must not be masked");
+            assert_eq!(display_config_value(key, "value"), "value");
+        }
+    }
+
+    #[test]
+    fn unknown_credential_keys_stay_masked() {
+        // Fail safe: a key the list does not know about is treated as a secret.
+        for key in ["s3.credentials.foo", "s3.credentials.token_v2"] {
+            assert!(is_sensitive_config_key(key), "{key} must stay masked");
+        }
+    }
+
+    #[test]
+    fn environment_resolved_mount_types_are_detected() {
+        let base = HashMap::from([
+            (
+                "s3.endpoint_url".to_string(),
+                "http://s3.example.com".to_string(),
+            ),
+            ("s3.region_name".to_string(), "cn-test-1".to_string()),
+        ]);
+
+        let mut role = base.clone();
+        role.insert("s3.credentials.type".to_string(), "role".to_string());
+        role.insert(
+            "s3.credentials.role_arn".to_string(),
+            "arn:aws:iam::1:role/ufs".to_string(),
+        );
+        assert!(s3_uses_environment_credential(&role));
+
+        let mut auto = base.clone();
+        auto.insert("s3.credentials.type".to_string(), "auto".to_string());
+        assert!(s3_uses_environment_credential(&auto));
+
+        let mut stat = base.clone();
+        stat.insert("s3.credentials.access".to_string(), "ak".to_string());
+        stat.insert("s3.credentials.secret".to_string(), "sk".to_string());
+        assert!(!s3_uses_environment_credential(&stat));
+    }
 }
