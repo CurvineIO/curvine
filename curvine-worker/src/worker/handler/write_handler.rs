@@ -2039,4 +2039,87 @@ mod tests {
 
         Ok(())
     }
+
+    /// Writer B finalizes the block between A's failed abort and A's retry;
+    /// the retried abort must leave B's acked replica intact.
+    #[test]
+    fn complete_retry_after_failed_abort_preserves_replica_finalized_by_other_writer(
+    ) -> FsResult<()> {
+        let block_size = 0_i64;
+        let block = ExtendedBlock::new(49, block_size, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("pending-abort-two-writers")?;
+        store.open_block(&block).map_err(FsError::from)?;
+
+        // Writer A: flush fails, abort fails too -> pending abort.
+        let lease_a = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        let mut handler_a = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                FailingFlushBlockIO,
+                0,
+                block_size,
+                0,
+            )?),
+            lease: lease_a,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "writer-a".to_string(),
+            pending_abort: None,
+        };
+        store.set_force_transient_abort_failure_for_test(true);
+        handler_a
+            .complete(&complete_msg(&block, block_size, 1), true)
+            .unwrap_err();
+        assert!(handler_a.pending_abort.is_some(), "A must defer its abort");
+
+        // Writer B: second ordinary lease is allowed; B finalizes the block.
+        let lease_b = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        assert!(lease_b.is_some(), "ordinary leases are not exclusive");
+        store.open_block(&block).map_err(FsError::from)?;
+        store.finalize_block(&block).map_err(FsError::from)?;
+        assert!(
+            store.get_block(block.id).map_err(FsError::from)?.is_final(),
+            "setup: B's replica must be finalized"
+        );
+
+        // Writer A retries. The replayed abort must not touch B's replica.
+        let err = handler_a
+            .complete(&complete_msg(&block, block_size, 2), true)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("flush failed"),
+            "A must still get its original error: {err}"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Finalized),
+            "B's finalized replica must survive A's retried abort"
+        );
+        assert!(
+            handler_a.is_commit,
+            "finalized block is terminal: must latch"
+        );
+        assert!(handler_a.lease.is_none(), "A's lease must be released");
+
+        Ok(())
+    }
 }

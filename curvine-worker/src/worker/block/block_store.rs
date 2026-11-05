@@ -418,7 +418,14 @@ impl BlockStore {
         {
             return curvine_core_error::err_box!("injected transient abort failure for test");
         }
-        self.with_dataset_write("abort", |state| state.abort_block(block))
+        self.with_dataset_write("abort", |state| {
+            // Ordinary leases are not exclusive: another writer may have
+            // finalized this block meanwhile. Never delete an acked replica.
+            if state.get_block(block.id).is_some_and(|m| m.is_final()) {
+                return Ok(());
+            }
+            state.abort_block(block)
+        })
     }
 
     /// Abort with an uncertain (timed-out) write/flush outcome; see `Dataset::abort_block_uncertain`.
