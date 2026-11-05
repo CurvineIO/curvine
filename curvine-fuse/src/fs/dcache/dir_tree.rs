@@ -611,10 +611,17 @@ impl DirTree {
                 return Ok(());
             };
             inode.mark_delete = false;
+            inode.deferred_delete_path = None;
+            inode.deferred_delete_master_id = None;
             (inode.parent, inode.name.clone())
         };
-        let dir = self.get_dir_mut_check(parent)?;
-        dir.clear_deleted_child(&name);
+        // A missing parent directory means there is no deleted_children entry
+        // left to clear: the ancestor was evicted. Treat it as nothing to do
+        // (same convention as `clear_unlink_state`) instead of failing the
+        // whole successful deferred delete with ENOENT (#1395).
+        if let Ok(dir) = self.get_dir_mut_check(parent) {
+            dir.clear_deleted_child(&name);
+        }
         Ok(())
     }
 
@@ -642,6 +649,37 @@ impl DirTree {
             None => false,
             Some(inode) => inode.is_deleted(),
         }
+    }
+
+    /// Record the unlink-time Curvine path and master file id for a pending
+    /// deferred delete.
+    ///
+    /// `fs_unlink` calls this right after `unlink(.., true)` under `lock_path`,
+    /// so the stored path is exactly what the unlink resolved and the correct
+    /// backend deletion target for the release-time fallback (#1395). The
+    /// master id lets release verify the path still points at the same file
+    /// before deleting it (renames after unlink can reuse the name).
+    pub fn set_deferred_delete_path(&mut self, ino: u64, path: String) {
+        if let Some(inode) = self.inodes.get_mut(&ino) {
+            inode.deferred_delete_path = Some(path);
+            // The master file id captured when this inode was materialized
+            // (before `status.id` was re-stamped with the FUSE ino).
+            inode.deferred_delete_master_id = inode.master_id;
+        }
+    }
+
+    /// The recorded unlink-time path of a pending deferred delete, if any.
+    pub fn deferred_delete_path(&self, ino: u64) -> Option<String> {
+        self.get_inode(ino, None)
+            .filter(|inode| inode.is_deleted())
+            .and_then(|inode| inode.deferred_delete_path.clone())
+    }
+
+    /// The recorded master file id of a pending deferred delete, if any.
+    pub fn deferred_delete_master_id(&self, ino: u64) -> Option<i64> {
+        self.get_inode(ino, None)
+            .filter(|inode| inode.is_deleted())
+            .and_then(|inode| inode.deferred_delete_master_id)
     }
 
     pub fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {

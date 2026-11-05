@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{ClusterConf, DBConf, RaftPeer};
+use crate::{deserialize_journal_rocksdb, ClusterConf, DBConf, RaftPeer};
 use curvine_net::net::{InetAddr, NetUtils};
 use curvine_rpc::client::ClientConf;
 use curvine_runtime::common::{ByteUnit, DurationUnit, Utils};
@@ -164,7 +164,14 @@ pub struct JournalConf {
     // Default: 20 minutes.
     pub ufs_copy_timeout: String,
 
-    #[serde(default = "JournalConf::rocksdb_default")]
+    /// Partial-table semantics (#1966): keys present in the TOML table
+    /// override `JournalConf::rocksdb_default()`; keys left out keep the
+    /// component default (not `DBConf::default()`). The field-level
+    /// `default` still covers the fully-absent-table case.
+    #[serde(
+        default = "JournalConf::rocksdb_default",
+        deserialize_with = "deserialize_journal_rocksdb"
+    )]
     pub rocksdb: DBConf,
 
     /// Raft ID of one lost HA member to explicitly rebuild from healthy peers.
@@ -371,5 +378,28 @@ impl Default for JournalConf {
             rocksdb,
             recover_from_peers: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JournalConf;
+    use curvine_runtime::common::ByteUnit;
+
+    #[test]
+    fn partial_rocksdb_table_keeps_component_defaults() {
+        // #1966: a partial [journal.rocksdb] table must overlay the component
+        // baseline, not the generic DBConf::default().
+        let raw = r#"
+            scan_batch_size = 500
+            [rocksdb]
+            block_size = "32KB"
+        "#;
+        let conf: JournalConf = toml::from_str(raw).unwrap();
+
+        assert_eq!(conf.rocksdb.block_size, ByteUnit::kb(32));
+        assert!(conf.rocksdb.use_bloom_filter);
+        assert!(!conf.rocksdb.disable_wal);
+        assert_eq!(conf.scan_batch_size, 500);
     }
 }

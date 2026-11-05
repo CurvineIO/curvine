@@ -14,7 +14,8 @@
 
 use crate::layout::{validate_open_offset, BlockLayout};
 use crate::{
-    BlockChecksum, BlockMeta, BlockState, CHECKSUM_FILE_SUFFIX, DEFAULT_CHECKSUM_CHUNK_SIZE,
+    BlockChecksum, BlockMeta, BlockState, ChecksumHeader, ChecksumVerify, CHECKSUM_FILE_SUFFIX,
+    DEFAULT_CHECKSUM_CHUNK_SIZE,
 };
 use crate::{BlockReadContext, BlockWriteContext, VfsDir};
 use curvine_core_error::{err_box, try_err, CommonResult};
@@ -26,7 +27,7 @@ use curvine_runtime::common::FileUtils;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy)]
@@ -51,6 +52,32 @@ pub struct FileFinalizePlan {
 impl FileFinalizePlan {
     pub(crate) fn final_meta(&self) -> &BlockMeta {
         &self.final_meta
+    }
+}
+
+/// The last step of a sidecar publish: sync the directory after the sidecar
+/// rename. It only adds durability, so callers run it after releasing the
+/// dataset lock, while still holding the block's stripe lock so nothing else
+/// changes the block.
+#[must_use = "the sidecar rename is not durable until the directory is synced"]
+pub struct SidecarSync {
+    block_id: i64,
+    path: PathBuf,
+}
+
+impl SidecarSync {
+    /// Sync the directory. On failure the sidecar is removed so the block is
+    /// unverified now rather than only after a crash; a reader that already
+    /// opened it keeps a consistent pair.
+    pub fn finish(self) {
+        if let Err(e) = FileLayout::sync_parent_dir(&self.path) {
+            log::warn!(
+                "block {} published without checksum, sidecar sync failed: {}",
+                self.block_id,
+                e
+            );
+            let _ = FileLayout::remove_if_exists(&self.path);
+        }
     }
 }
 
@@ -120,6 +147,75 @@ impl FileLayout {
         let mut name = OsString::from(block_path.as_os_str());
         name.push(CHECKSUM_FILE_SUFFIX);
         PathBuf::from(name)
+    }
+
+    /// Load the sidecar of `block_path`, `Ok(None)` when it does not exist.
+    /// Called right after opening the block file under the dataset read lock,
+    /// so both belong to the same published generation.
+    ///
+    /// The header is checked against `file_len` and the sidecar's own size
+    /// before the rest is read, and the read is capped at that size, so a
+    /// damaged or enlarged sidecar fails without loading it into memory.
+    fn read_checksum(
+        block_id: i64,
+        block_path: &Path,
+        file_len: i64,
+    ) -> IOResult<Option<BlockChecksum>> {
+        let checksum_path = Self::checksum_path_of(block_path);
+        let mut file = match File::open(&checksum_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let invalid = |reason: String| -> IOResult<Option<BlockChecksum>> {
+            err_box!(
+                "invalid checksum sidecar {}: {}",
+                checksum_path.display(),
+                reason
+            )
+        };
+
+        let sidecar_len = file.metadata()?.len();
+        let mut buf = vec![0u8; ChecksumHeader::LEN];
+        match file.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                return invalid(format!("checksum data too short: {sidecar_len} bytes"));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let header = match ChecksumHeader::parse(&buf) {
+            Ok(header) => header,
+            Err(e) => return invalid(e.to_string()),
+        };
+        // Finalize materializes the file to the checksummed length, so a
+        // different file length means the block changed afterwards.
+        if header.data_len as i64 != file_len {
+            return err_box!(
+                "Block {} checksum length mismatch: checksum covers {}, file length {}",
+                block_id,
+                header.data_len,
+                file_len
+            );
+        }
+        let expected = match header.encoded_len() {
+            Some(len) if len == sidecar_len => len,
+            _ => return invalid(format!("size {sidecar_len} does not match its header")),
+        };
+
+        // One byte past `expected` detects a sidecar that grew after the size
+        // check.
+        let rest = expected - ChecksumHeader::LEN as u64;
+        (&mut file).take(rest + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 != expected {
+            return invalid(format!(
+                "size changed while reading, expected {expected} bytes"
+            ));
+        }
+        match BlockChecksum::decode(&buf) {
+            Ok(checksum) => Ok(Some(checksum)),
+            Err(e) => invalid(e.to_string()),
+        }
     }
 
     fn is_checksum_file(file: &str) -> bool {
@@ -228,34 +324,55 @@ impl FileLayout {
     ///    block id (rewrite, or a failed sidecar delete) is stale either way.
     /// 2. Rename the block. With a new sidecar, sync the directory so the block
     ///    rename is durable before the sidecar can become visible.
-    /// 3. Rename the new sidecar.
+    /// 3. Rename the new sidecar. The returned [`SidecarSync`] then syncs the
+    ///    directory, which the caller runs after releasing the dataset lock.
+    ///    Without that sync the rename can be lost while the block stays, and
+    ///    the block would pass as a legacy block whose data is not verified
+    ///    (#1813).
+    ///
+    /// A reboot between the step 2 sync and the step 3 sync can still leave
+    /// the block without its sidecar: recovery deletes the staging sidecar,
+    /// so the block reads unverified under `AllowMissing`. This narrows that
+    /// window but does not close it.
     ///
     /// Outcomes on failure: if step 1 fails, publish fails before the rename
     /// and rollback keeps the committed block and its sidecar. If step 2's
     /// rename fails, rollback keeps the committed block, but its sidecar is
     /// already gone and T5 handles the missing sidecar. If the sync in step 2
     /// or step 3 fails, the new block stays published without a sidecar.
-    pub(crate) fn publish_finalize(mut plan: FileFinalizePlan) -> CommonResult<BlockMeta> {
+    pub(crate) fn publish_finalize(
+        mut plan: FileFinalizePlan,
+    ) -> CommonResult<(BlockMeta, Option<SidecarSync>)> {
         let active_checksum = Self::checksum_path_of(&plan.active_path);
         if Self::remove_if_exists(&active_checksum)? {
             Self::sync_parent_dir(&active_checksum)?;
         }
         FileUtils::rename(&plan.staging_path, &plan.active_path)?;
+        let mut sync = None;
         if let Some(staging_checksum) = plan.staging_checksum.take() {
             let published = Self::sync_parent_dir(&plan.active_path)
                 .and_then(|_| fs::rename(&staging_checksum, &active_checksum));
-            if let Err(e) = published {
-                // The block is already visible; keep it and publish without a
-                // sidecar rather than failing a completed rename.
-                log::warn!(
-                    "block {} published without checksum, sidecar publish failed: {}",
-                    plan.final_meta.id(),
-                    e
-                );
-                let _ = Self::remove_if_exists(&staging_checksum);
+            match published {
+                Ok(()) => {
+                    sync = Some(SidecarSync {
+                        block_id: plan.final_meta.id(),
+                        path: active_checksum,
+                    })
+                }
+                Err(e) => {
+                    // The block is already visible; keep it and publish
+                    // without a sidecar rather than failing a completed rename.
+                    log::warn!(
+                        "block {} published without checksum, sidecar publish failed: {}",
+                        plan.final_meta.id(),
+                        e
+                    );
+                    let _ = Self::remove_if_exists(&staging_checksum);
+                    let _ = Self::remove_if_exists(&active_checksum);
+                }
             }
         }
-        Ok(plan.final_meta.clone())
+        Ok((plan.final_meta.clone(), sync))
     }
 
     fn block_file(dir: &VfsDir, meta: &BlockMeta) -> CommonResult<String> {
@@ -330,7 +447,11 @@ impl BlockLayout for FileLayout {
         checksum: bool,
     ) -> CommonResult<BlockMeta> {
         let plan = Self::prepare_finalize(dir, meta, committed_len, checksum)?;
-        Self::publish_finalize(plan)
+        let (meta, sync) = Self::publish_finalize(plan)?;
+        if let Some(sync) = sync {
+            sync.finish();
+        }
+        Ok(meta)
     }
 
     fn scan(&self, dir: &VfsDir) -> CommonResult<Vec<BlockMeta>> {
@@ -409,6 +530,7 @@ impl BlockLayout for FileLayout {
         meta: &BlockMeta,
         off: i64,
         logical_len: i64,
+        verify: ChecksumVerify,
     ) -> IOResult<BlockReadContext> {
         let file = Self::block_file(dir, meta)?;
         // The opened file is the source of truth for bytes that can be read
@@ -426,17 +548,37 @@ impl BlockLayout for FileLayout {
         // sparse tail (master-side truncate up). Bytes the worker committed
         // must be present; a shorter file means the block was truncated or
         // damaged, and zero-filling it would return corrupted data as success.
-        let committed_len = meta.len.min(logical_len);
-        if device.len() < committed_len {
-            return err_box!(
-                "Block {} is truncated: committed length {}, file length {}",
-                meta.id,
-                committed_len,
-                device.len()
-            );
+        // A block that is still being written has no committed length yet:
+        // its file holds the bytes written so far, which may be fewer than
+        // the reserved block size.
+        if let Some(committed_len) = meta.committed_len() {
+            let committed_len = committed_len.min(logical_len);
+            if device.len() < committed_len {
+                return err_box!(
+                    "Block {} is truncated: committed length {}, file length {}",
+                    meta.id,
+                    committed_len,
+                    device.len()
+                );
+            }
         }
         let physical_len = device.len().min(logical_len);
-        BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)
+        let file_len = device.len();
+        let reader = BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)?;
+        // Only a finalized generation has a published sidecar. Writing,
+        // Recovering and Finalizing blocks are served from staging, where the
+        // sidecar does not exist yet or is still being written by finalize.
+        if !verify.is_enabled() || !meta.is_final() {
+            return Ok(reader);
+        }
+
+        match Self::read_checksum(meta.id, Path::new(&file), file_len)? {
+            Some(checksum) => reader.with_checksum(checksum),
+            None if verify == ChecksumVerify::RequireSidecar => {
+                err_box!("Block {} has no checksum sidecar", meta.id)
+            }
+            None => Ok(reader),
+        }
     }
 
     fn short_circuit(&self, dir: &VfsDir, meta: &BlockMeta) -> CommonResult<Option<String>> {

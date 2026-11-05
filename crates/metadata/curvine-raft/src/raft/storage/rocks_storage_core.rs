@@ -20,6 +20,7 @@ use log::{info, warn};
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot, SnapshotMetadata};
 use raft::{GetEntriesContext, RaftState};
+use std::collections::HashMap;
 use std::{cmp, mem};
 
 pub struct RocksStorageCore {
@@ -504,6 +505,11 @@ impl RocksStorageCore {
         }
 
         Ok(vec)
+    }
+
+    // RocksDB metrics of the journal DB, keyed as in `DBEngine::get_rocksdb_metrics`.
+    pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
+        self.db.get_rocksdb_metrics()
     }
 
     fn get_index_range(&self) -> RaftResult<Option<(u64, u64)>> {

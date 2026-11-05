@@ -1589,6 +1589,20 @@ mod tests {
             handler.lease.is_none(),
             "the write lease must be released once the rewrite is actually finalized"
         );
+        // The rewrite must be published: pending copy finalized, no stale
+        // committed_rewrites entry left for readers.
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Finalized),
+            "pending copy must be Finalized after the retry, not still Writing"
+        );
+        assert!(
+            store.get_block(block.id).map_err(FsError::from)?.is_final(),
+            "readers must see the finalized rewrite"
+        );
 
         Ok(())
     }

@@ -356,4 +356,20 @@ mod tests {
         assert_eq!(conf.fuse.web_port, 9100);
         assert!(conf.fuse.direct_io);
     }
+
+    #[test]
+    fn get_conf_names_fuse_log_when_fuse_section_has_no_log() {
+        // The mount path is ClusterConf load -> CLI overrides -> fuse.init() ->
+        // Logger::init(conf.fuse.log), so the fuse.log default must survive that
+        // whole chain, not just a bare FuseConf deserialization. Deployment
+        // templates set a top-level [log] instead, which must not leak into the
+        // fuse process log.
+        let conf = get_conf(
+            "[fuse]\nio_threads = 1\n\n[log]\nlog_dir = \"stdout\"\nfile_name = \"client.log\"\n",
+            &[],
+        );
+
+        assert_eq!(conf.fuse.log.file_name, "fuse.log");
+        assert_eq!(conf.log.file_name, "client.log");
+    }
 }

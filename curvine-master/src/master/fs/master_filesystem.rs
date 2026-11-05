@@ -18,10 +18,12 @@ use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
 use crate::master::meta::{
-    trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
+    trash, CacheInvalidationResult, FsDir, LockValidity, RestoredTrashEntry, TrashListing,
+    TrashScanPage,
 };
 
 use crate::master::fs::state::{SessionHeartbeat, SessionMap};
+use crate::master::fs::worker_manager::WorkerManager;
 use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
@@ -122,9 +124,10 @@ impl Drop for PurgingGuard<'_> {
     }
 }
 
-/// Reservation taken for a pre-allocated first block.
+/// Reservation taken for a pre-allocated first block. The release settles the
+/// block's bound credit on these workers, so only the stamps' worker ids are
+/// consumed.
 struct PreAllocBlock {
-    block_size: i64,
     /// `(worker_id, scheduled_since_ms)` right after the reservation.
     stamps: Vec<(u32, u64)>,
     alloc_ms: u64,
@@ -137,6 +140,9 @@ const PRE_ALLOC_PRUNE_THRESHOLD: usize = 65536;
 
 pub struct BlockReportResult {
     pub delete_blocks: Vec<i64>,
+    /// Blocks reported as removed for failing checksum verification and
+    /// queued for re-replication.
+    pub corrupt_blocks: Vec<i64>,
 }
 
 #[derive(Default)]
@@ -1218,14 +1224,12 @@ impl MasterFilesystem {
             if !file.blocks.is_empty() || file.len != 0 {
                 return Ok(None);
             }
-            let block_size = file.block_size as i64;
             let block =
                 self.allocate_block(&mut fs_dir, path, inode, client_addr, vec![], vec![], 0)?;
             let stamps = self.worker_manager.read().schedule_stamps(&block.locs);
             self.register_pre_alloc(
                 block.block.id,
                 PreAllocBlock {
-                    block_size,
                     stamps,
                     alloc_ms: LocalTime::mills(),
                 },
@@ -1344,6 +1348,7 @@ impl MasterFilesystem {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
+        let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         let block =
             match fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len) {
                 Ok(block) => block,
@@ -1354,6 +1359,11 @@ impl MasterFilesystem {
                     return Err(e);
                 }
             };
+        {
+            let mut wm = self.worker_manager.write();
+            wm.settle_committed_blocks(&settle_blocks);
+            wm.bind_scheduled_blocks(&choose_workers, block.id, block_size);
+        }
         let located = LocatedBlock {
             block,
             locs: choose_workers,
@@ -1438,6 +1448,7 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         let committed: Vec<i64> = commit_blocks.iter().map(|v| v.block_id).collect();
         // Only the creator of a still-registered pre-allocation may release
         // it. Checked under `fs_dir`, which also serialises the hand-offs in
@@ -1455,7 +1466,10 @@ impl MasterFilesystem {
             options.set_attr_opts,
             release_block_id,
         )?;
-        let released_entry = released.and_then(|b| self.pre_alloc.lock().remove(&b.id));
+        let released_entry = released.and_then(|b| {
+            let entry = self.pre_alloc.lock().remove(&b.id)?;
+            Some((b.id, entry))
+        });
         self.forget_pre_alloc(committed);
 
         let res = if options.only_flush && options.return_file_blocks {
@@ -1470,12 +1484,22 @@ impl MasterFilesystem {
         };
         drop(fs_dir);
 
-        // Return the capacity reserved when the block was chosen, after the
-        // namespace lock is gone (same order as delete/free).
-        if let Some(entry) = released_entry {
-            self.worker_manager
-                .write()
-                .unschedule_stamped(&entry.stamps, entry.block_size);
+        // Settle the committed blocks, and return an unwritten pre-allocated
+        // block's remaining credit, after the namespace lock is gone (same
+        // order as delete/free). Settling the released block to zero returns
+        // exactly the credit it still owns; credit a heartbeat already
+        // reclaimed stays reclaimed.
+        {
+            let mut wm = self.worker_manager.write();
+            wm.settle_committed_blocks(&settle_blocks);
+            if let Some((block_id, entry)) = released_entry {
+                let releases: Vec<_> = entry
+                    .stamps
+                    .iter()
+                    .map(|&(worker_id, _)| (block_id, 0, worker_id))
+                    .collect();
+                wm.settle_committed_blocks(&releases);
+            }
         }
 
         res
@@ -1927,6 +1951,7 @@ impl MasterFilesystem {
         if list.blocks.is_empty() && full_reported_blocks.is_none() {
             return Ok(BlockReportResult {
                 delete_blocks: Vec::new(),
+                corrupt_blocks: Vec::new(),
             });
         }
 
@@ -1984,6 +2009,7 @@ impl MasterFilesystem {
         }
 
         let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
+        let mut corrupt_blocks = Vec::new();
         let mut wm = self.worker_manager.write();
         for (item, exists) in checked {
             let loc = BlockLocation::new(list.worker_id, item.storage_type);
@@ -2009,6 +2035,9 @@ impl MasterFilesystem {
                     }
                 }
                 BlockReportStatus::Deleted => {
+                    if item.corrupted {
+                        corrupt_blocks.push(item.id);
+                    }
                     batch.push((false, item.id, loc));
                     wm.deleted_block(list.worker_id, item.id);
                 }
@@ -2018,6 +2047,11 @@ impl MasterFilesystem {
 
         // Keep the block ids of a completing batch so a failure can be retried.
         let retry_blocks = full_reported_blocks.clone();
+        let corrupt_handler = if corrupt_blocks.is_empty() {
+            None
+        } else {
+            replication_handler.clone()
+        };
         let applied = (|| -> FsResult<()> {
             if let Some(reported_blocks) = full_reported_blocks {
                 self.submit_full_block_reconcile(
@@ -2046,7 +2080,47 @@ impl MasterFilesystem {
         }
         applied?;
 
-        Ok(BlockReportResult { delete_blocks })
+        if !corrupt_blocks.is_empty() {
+            self.recover_corrupt_blocks(list.worker_id, &corrupt_blocks, corrupt_handler);
+        }
+
+        Ok(BlockReportResult {
+            delete_blocks,
+            corrupt_blocks,
+        })
+    }
+
+    /// A worker dropped these replicas because their data failed checksum
+    /// verification. Recover like a lost replica: invalidate cache files that
+    /// became unreadable, then queue the rest for re-replication.
+    fn recover_corrupt_blocks(
+        &self,
+        worker_id: u32,
+        block_ids: &[i64],
+        replication_handler: Option<MasterReplicationHandler>,
+    ) {
+        warn!(
+            "worker {} removed {} corrupt block replicas: {:?}",
+            worker_id,
+            block_ids.len(),
+            block_ids
+        );
+        let replication_block_ids = self.recover_removed_locations(worker_id, block_ids);
+        if replication_block_ids.is_empty() {
+            return;
+        }
+        let Some(replication_handler) = replication_handler else {
+            return;
+        };
+        let count = replication_block_ids.len();
+        if let Err(e) =
+            replication_handler.report_under_replicated_blocks(worker_id, replication_block_ids)
+        {
+            error!(
+                "Errors on reporting under-replicated {} corrupt blocks from worker {}. err: {:?}",
+                count, worker_id, e
+            );
+        }
     }
 
     fn submit_full_block_reconcile(
@@ -2227,6 +2301,18 @@ impl MasterFilesystem {
             let fs_dir = self.fs_dir.write();
             fs_dir.delete_locations(worker_id)?
         };
+        let replication_block_ids = self.recover_removed_locations(worker_id, &removed_block_ids);
+
+        Ok(LostWorkerLocationCleanup {
+            removed_block_ids,
+            replication_block_ids,
+        })
+    }
+
+    /// After `worker_id` lost the given block locations, invalidate cache
+    /// files that no replica can serve any more and schedule their surviving
+    /// replicas for deletion. Returns the blocks that still need repair.
+    fn recover_removed_locations(&self, worker_id: u32, removed_block_ids: &[i64]) -> Vec<i64> {
         let mut invalidated = CacheInvalidationResult::default();
 
         for chunk in removed_block_ids.chunks(Self::LOST_WORKER_INVALIDATION_CHUNK) {
@@ -2258,10 +2344,7 @@ impl MasterFilesystem {
                 .remove_blocks(&invalidated.delete_result);
         }
 
-        Ok(LostWorkerLocationCleanup {
-            removed_block_ids,
-            replication_block_ids,
-        })
+        replication_block_ids
     }
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
@@ -2395,7 +2478,13 @@ impl MasterFilesystem {
                 // Another writer is now writing this block: a pending release
                 // from its creator must not drop it.
                 self.forget_pre_alloc([block.id]);
-                if !assigned {
+                if assigned {
+                    self.worker_manager.write().bind_scheduled_blocks(
+                        &choose_workers,
+                        block.id,
+                        block_size,
+                    );
+                } else {
                     self.worker_manager
                         .write()
                         .unschedule_chosen_workers(&choose_workers, block_size);
@@ -2420,20 +2509,33 @@ impl MasterFilesystem {
     pub fn get_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
+        let validity = self.lock_validity();
         let fs_dir = self.fs_dir.read();
         let inp = Self::resolve_path(&fs_dir, path)?;
-        let expire_ms = self.conf.lock_expire_time_ms();
 
-        fs_dir.get_lock(inp, &lock, expire_ms)
+        fs_dir.get_lock(inp, &lock, &validity)
     }
 
     pub fn set_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
+        let validity = self.lock_validity();
         let fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
-        fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms())
+        fs_dir.set_lock(inp, lock, &validity)
+    }
+
+    /// Lock lifetime policy for this request (#1879).
+    ///
+    /// Config-only: session-owned locks are exempted from the legacy TTL while
+    /// `client_session_lock_lease` is on, and nothing here consults liveness, so
+    /// no session snapshot can go stale between this and `fs_dir`.
+    fn lock_validity(&self) -> LockValidity {
+        LockValidity::new(
+            self.conf.lock_expire_time_ms(),
+            self.conf.client_session_lock_lease,
+        )
     }
 }
 
@@ -2720,6 +2822,52 @@ mod tests {
         assert!(!fs_dir
             .add_replication_location_if_needed(old_block_id, BlockLocation::with_id(200))
             .unwrap());
+    }
+
+    #[test]
+    fn corrupted_deletion_queues_the_block_for_re_replication() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("corrupted-deletion-re-replication");
+        let block_id = replication_file(&fs, "/corrupted-re-replication.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+        let handler = || Some(MasterReplicationHandler::new(manager.clone()));
+        let report = |worker_id, corrupted| BlockReportList {
+            report_id: 0,
+            cluster_id: "curvine".into(),
+            worker_id,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo {
+                corrupted,
+                ..BlockReportInfo::with_deleted(block_id, 0)
+            }],
+        };
+
+        // A plain deletion does not ask for a new replica.
+        fs.block_report(report(200, false), handler()).unwrap();
+        assert!(!manager.has_pending_repair(block_id));
+
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        let result = fs.block_report(report(200, true), handler()).unwrap();
+        assert_eq!(result.corrupt_blocks, vec![block_id]);
+        assert!(manager.has_pending_repair(block_id));
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100]
+        );
     }
 
     #[test]
@@ -3159,6 +3307,66 @@ mod tests {
                 .unwrap()
                 .scheduled_bytes,
             0
+        );
+    }
+
+    #[test]
+    fn assign_worker_commit_settles_through_entry_path() {
+        let fs = test_fs("assign-worker-settle");
+        let capacity = 1 << 40;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/assign/settle.log", true).unwrap();
+        let blocks = fs
+            .resize(
+                "/assign/settle.log",
+                FileAllocOpts::with_alloc(created.block_size, FileAllocMode::DEFAULT),
+            )
+            .unwrap();
+        let block = blocks.block_locs[0].block.clone();
+        let located = fs
+            .assign_worker(
+                "/assign/settle.log",
+                block,
+                ClientAddress::default(),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size
+        );
+
+        // The commit settles the credit bound by assign_worker: removing that
+        // bind call leaves the full block reserved and fails this assertion.
+        let mut commit = CommitBlock::from(&located);
+        commit.block_len = 4096;
+        fs.complete_file(
+            "/assign/settle.log",
+            None,
+            4096,
+            vec![commit],
+            "client",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            4096
         );
     }
 
@@ -3927,6 +4135,114 @@ mod tests {
             .unwrap();
         assert_eq!(blocks.status.len, 128);
     }
+    #[test]
+    fn complete_file_settles_commit_reservation_through_entry_path() {
+        let fs = test_fs("complete-file-settles");
+        let capacity = 1 << 40;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/settle/small.log", true).unwrap();
+        let located = fs
+            .add_block(
+                "/settle/small.log",
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size
+        );
+
+        let mut commit = CommitBlock::from(&located);
+        commit.block_len = 4096;
+        fs.complete_file(
+            "/settle/small.log",
+            None,
+            4096,
+            vec![commit],
+            "client",
+            false,
+            None,
+        )
+        .unwrap();
+
+        // The unused remainder is released on commit; only the written bytes
+        // stay reserved until the heartbeat delta reclaims them.
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            4096
+        );
+    }
+
+    #[test]
+    fn add_block_settles_previous_commit_through_entry_path() {
+        let fs = test_fs("add-block-settles");
+        let capacity = 1 << 40;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/settle/grow.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .add_block(
+                "/settle/grow.log",
+                None,
+                client.clone(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+
+        let mut commit = CommitBlock::from(&first);
+        commit.block_len = 4096;
+        let second = fs
+            .add_block(
+                "/settle/grow.log",
+                None,
+                client,
+                vec![commit],
+                vec![],
+                4096,
+                Some(first.block.clone()),
+            )
+            .unwrap();
+        assert_ne!(second.block.id, first.block.id);
+
+        // The first block's reservation settles to its committed 4 KiB while
+        // the new block holds a fresh full reservation.
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size + 4096
+        );
+    }
 
     // Journal enabled in testing mode: entries stay on the writer's channel and
     // every journaled mutation emits a leader checkpoint.
@@ -4410,12 +4726,15 @@ mod tests {
             .alloc_first_block("/a.log", a.id, client.clone())
             .unwrap();
 
-        // Expiry (or a full heartbeat reclaim) clears the window.
+        // Expiry (or a full heartbeat reclaim) clears the window, the block
+        // credits, and their running sum together.
         {
             let mut wm = fs.worker_manager.write();
             let worker = wm.worker_map.workers.get_mut(&1).unwrap();
             worker.scheduled_bytes = 0;
             worker.scheduled_since_ms = 0;
+            worker.scheduled_blocks.clear();
+            worker.scheduled_block_bytes = 0;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
 
@@ -4654,5 +4973,139 @@ mod tests {
         drop(staging);
         drop(observer);
         js.shutdown();
+    }
+
+    /// Filesystem with a 1ms legacy lock TTL, so "older than the TTL" needs no
+    /// sleeping for minutes. `session_lock_lease` is the #1879 rollout gate.
+    fn lock_test_fs(name: &str, session_lock_lease: bool) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.lock_expire_time = "1ms".to_string();
+        conf.master.client_session_lock_lease = session_lock_lease;
+        conf.master.meta_dir = Utils::test_sub_dir(format!(
+            "master-fs-lock-test/meta-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-lock-test/journal-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.master.init().unwrap();
+        assert_eq!(conf.master.lock_expire_time_ms(), 1);
+        assert_eq!(
+            conf.master.client_session_lock_lease, session_lock_lease,
+            "the test must run with the gate it asked for"
+        );
+        JournalSystem::fs_only_for_test(&conf).unwrap()
+    }
+
+    fn lock_for(client_id: &str, owner_id: u64, session_owned: bool) -> FileLock {
+        FileLock {
+            client_id: client_id.to_string(),
+            owner_id,
+            pid: 1,
+            acquire_time: 0,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Plock,
+            start: 0,
+            end: 100,
+            session_owned,
+        }
+    }
+
+    #[test]
+    fn session_owned_lock_survives_the_legacy_ttl_with_the_lease_policy_on() {
+        let fs = lock_test_fs("session-lock-live", true);
+        fs.create("/live-lock.log", true).unwrap();
+        fs.set_lock("/live-lock.log", lock_for("session-client", 1, true))
+            .unwrap();
+
+        // Well past the 1ms legacy TTL.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Both the query and the mutating path must agree: the lock is still owned.
+        let queried = fs
+            .get_lock("/live-lock.log", lock_for("other-client", 2, true))
+            .unwrap();
+        assert_eq!(
+            queried.map(|lock| lock.client_id),
+            Some("session-client".to_string())
+        );
+
+        let conflict = fs
+            .set_lock("/live-lock.log", lock_for("other-client", 2, true))
+            .unwrap();
+        let conflict = conflict.expect("a session-owned lock must not be stolen");
+        assert_eq!(conflict.client_id, "session-client");
+    }
+
+    #[test]
+    fn session_owned_lock_keeps_the_ttl_with_the_lease_policy_off() {
+        let fs = lock_test_fs("session-lock-off", false);
+        fs.create("/ttl-lock.log", true).unwrap();
+        fs.set_lock("/ttl-lock.log", lock_for("session-client", 1, true))
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        assert!(
+            fs.set_lock("/ttl-lock.log", lock_for("other-client", 2, true))
+                .unwrap()
+                .is_none(),
+            "with the gate off, session ownership must not change lock lifetime"
+        );
+    }
+
+    #[test]
+    fn legacy_lock_keeps_the_ttl_with_the_lease_policy_on() {
+        let fs = lock_test_fs("legacy-lock-on", true);
+        fs.create("/legacy-lock.log", true).unwrap();
+        fs.set_lock("/legacy-lock.log", lock_for("legacy-client", 1, false))
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        assert!(
+            fs.set_lock("/legacy-lock.log", lock_for("other-client", 2, false))
+                .unwrap()
+                .is_none(),
+            "pre-#1878 locks must keep the lock_expire_time behaviour"
+        );
+    }
+
+    #[test]
+    fn get_lock_does_not_reclaim_the_lock_it_reports_stale() {
+        let fs = lock_test_fs("session-lock-getlk", true);
+        fs.create("/getlk.log", true).unwrap();
+        fs.set_lock("/getlk.log", lock_for("legacy-client", 1, false))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let conflict = fs
+            .get_lock("/getlk.log", lock_for("other-client", 2, false))
+            .unwrap();
+        assert!(conflict.is_none(), "an expired lock is not a conflict");
+
+        // F_GETLK must not have written: the stale entry is still stored, so the
+        // next set_lock is the call that reclaims and journals it.
+        let stored = {
+            let fs_dir = fs.fs_dir.read();
+            let inode_id = MasterFilesystem::resolve_path(&fs_dir, "/getlk.log")
+                .unwrap()
+                .get_last_inode()
+                .unwrap()
+                .id();
+            fs_dir.store.get_locks(inode_id).unwrap()
+        };
+        assert_eq!(stored.to_vec().len(), 1, "a query must not write");
+
+        assert!(fs
+            .set_lock("/getlk.log", lock_for("other-client", 2, false))
+            .unwrap()
+            .is_none());
     }
 }

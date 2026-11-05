@@ -19,6 +19,9 @@ pub const DEFAULT_HOSTNAME: &str = "localhost";
 mod db_conf;
 pub use self::db_conf::DBConf;
 
+mod rocksdb_conf;
+pub use self::rocksdb_conf::{deserialize_journal_rocksdb, deserialize_master_rocksdb};
+
 mod raft_peer;
 pub use self::raft_peer::RaftPeer;
 
@@ -41,7 +44,7 @@ mod worker_conf;
 pub use self::worker_conf::{WorkerConf, WorkerDataDir};
 
 mod cluster_conf;
-pub use self::cluster_conf::ClusterConf;
+pub use self::cluster_conf::{ClusterConf, S3GatewayConf};
 
 mod cli_conf;
 pub use self::cli_conf::CliConf;

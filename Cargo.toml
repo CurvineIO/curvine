@@ -50,6 +50,7 @@ members = [
     "crates/sdk/curvine-libsdk-java",
     "crates/sdk/curvine-libsdk-python",
     "curvine-lancedb",
+    "curvine-s3-gateway",
     # Top-level integration/regression harness. It remains a workspace member so
     # explicit test commands keep working, but it is intentionally opt-in via
     # default-members because it pulls server/client/FUSE/native test paths.
@@ -100,7 +101,8 @@ default-members = [
     "curvine-fuse",
     "curvine-web",
     "curvine-ufs",
-    "curvine-cli"
+    "curvine-cli",
+    "curvine-s3-gateway"
 ]
 
 [workspace.package]

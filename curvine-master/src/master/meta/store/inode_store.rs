@@ -17,11 +17,12 @@ use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::{Inode, InodeFile, InodePath, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
+use crate::master::Master;
 use curvine_core_error::{err_box, try_err, try_option, CommonResult};
 use curvine_model::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
 use curvine_rocksdb::{DBConf, RocksUtils};
 use curvine_runtime::common::SerdeUtils;
-use curvine_runtime::common::{FileUtils, Utils};
+use curvine_runtime::common::{FileUtils, TimeSpent, Utils};
 use log::info;
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::sync::Arc;
@@ -1003,8 +1004,17 @@ impl InodeStore {
         Ok(hash)
     }
 
+    // Create a checkpoint and record its flush and total duration, also when it fails.
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
-        self.store.db.create_checkpoint(id)
+        let spend = TimeSpent::new();
+        let flushed = self.store.db.flush(true);
+        let flush_ms = spend.used_ms();
+        let result = flushed.and_then(|_| self.store.db.create_flushed_checkpoint(id));
+
+        if let Ok(metrics) = Master::get_metrics() {
+            metrics.record_checkpoint(flush_ms, spend.used_ms(), result.is_ok());
+        }
+        result
     }
 
     pub fn restore<T: AsRef<str>>(&mut self, path: T) -> CommonResult<()> {
@@ -1099,6 +1109,52 @@ mod tests {
         )));
         let rocks = RocksInodeStore::new(conf, true)?;
         InodeStore::new(rocks, Arc::new(TtlBucketList::new(60_000)?))
+    }
+
+    // Counters only increase, so delta assertions stay valid even when other
+    // tests in this binary create checkpoints concurrently.
+    #[test]
+    fn create_checkpoint_records_checkpoint_metrics() -> CommonResult<()> {
+        let store = new_store("checkpoint-metrics")?;
+        let metrics = Master::get_metrics()?;
+        let count = metrics.checkpoint_count.get();
+
+        let dir = store.create_checkpoint(1)?;
+
+        assert!(FileUtils::exists(&dir));
+        assert!(
+            metrics.checkpoint_count.get() > count,
+            "every checkpoint must be counted"
+        );
+        // `record_checkpoint` adds to the total before the flush time, so reading
+        // the flush time first keeps `total >= flush` under concurrent updates.
+        let flush_time = metrics.checkpoint_flush_time.get();
+        assert!(metrics.checkpoint_time.get() >= flush_time);
+
+        Ok(())
+    }
+
+    #[test]
+    fn failed_checkpoint_is_counted_as_a_failure() -> CommonResult<()> {
+        let store = new_store("checkpoint-failure")?;
+        let metrics = Master::get_metrics()?;
+        let count = metrics.checkpoint_count.get();
+        let fail_count = metrics.checkpoint_fail_count.get();
+
+        // A regular file where the checkpoint directory should be makes RocksDB
+        // fail to create the checkpoint.
+        let checkpoint_dir = store.store.db.conf().checkpoint_dir.clone();
+        FileUtils::create_parent_dir(&checkpoint_dir, true)?;
+        std::fs::write(&checkpoint_dir, b"not a directory")?;
+
+        assert!(store.create_checkpoint(1).is_err());
+        assert!(metrics.checkpoint_count.get() > count);
+        assert!(
+            metrics.checkpoint_fail_count.get() > fail_count,
+            "a failed checkpoint must be counted as a failure"
+        );
+
+        Ok(())
     }
 
     #[test]

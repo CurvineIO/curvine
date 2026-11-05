@@ -33,6 +33,7 @@ pub struct WorkerMetrics {
     pub(crate) read_count: Counter,
     pub(crate) read_blocks: CounterVec,
     pub(crate) read_error_count: CounterVec,
+    pub(crate) checksum_invalidated_count: Counter,
 
     pub(crate) block_store_stripe_lock_wait_us: HistogramVec,
     pub(crate) block_dataset_write_lock_wait_us: HistogramVec,
@@ -93,6 +94,10 @@ impl WorkerMetrics {
                 "read_error_count",
                 "Reads that failed with an IO error",
                 &["dir_id"],
+            )?,
+            checksum_invalidated_count: m::new_counter(
+                "checksum_invalidated_count",
+                "Blocks removed after failing checksum verification",
             )?,
 
             block_store_stripe_lock_wait_us: m::new_histogram_vec(

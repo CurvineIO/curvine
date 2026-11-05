@@ -540,7 +540,15 @@ impl NodeState {
         Ok(handle)
     }
 
-    async fn insert_handle_with_writer(
+    /// Test-only: register a shared writer without going through `new_handle`
+    /// (used by release-cleanup tests that inject a failing writer).
+    #[cfg(test)]
+    pub(crate) async fn insert_shared_writer_for_test(&self, ino: u64, writer: Arc<FuseWriter>) {
+        self.writers.insert::<FuseError>(ino, writer).await.unwrap();
+    }
+
+    /// Test-visible handle insertion; production callers go through `new_handle`.
+    pub(crate) async fn insert_handle_with_writer(
         &self,
         ino: u64,
         reader: Option<Arc<FuseReader>>,
@@ -711,6 +719,23 @@ impl NodeState {
         self.dir_write().clear_mark_delete(ino)
     }
 
+    /// Record the unlink-time Curvine path and master file id for a pending
+    /// deferred delete. See `DirTree::set_deferred_delete_path`.
+    pub fn set_deferred_delete_path(&self, ino: u64, path: &Path) {
+        self.dir_write()
+            .set_deferred_delete_path(ino, path.full_path().to_owned());
+    }
+
+    /// The recorded unlink-time path of a pending deferred delete, if any.
+    pub fn deferred_delete_path(&self, ino: u64) -> Option<String> {
+        self.dir_read().deferred_delete_path(ino)
+    }
+
+    /// The recorded master file id of a pending deferred delete, if any.
+    pub fn deferred_delete_master_id(&self, ino: u64) -> Option<i64> {
+        self.dir_read().deferred_delete_master_id(ino)
+    }
+
     /// Clear inode `mark_delete` and the `deleted_children` entry for a specific
     /// hardlink name under `parent` (not the inode's primary parent/name).
     pub fn clear_unlink_state(&self, ino: u64, parent: u64, name: &str) -> FuseResult<()> {
@@ -803,6 +828,7 @@ impl NodeState {
 
         if has_handles {
             debug!("unlink ino={}, path={}: open handles, deferring", ino, path);
+            self.set_deferred_delete_path(ino, &path);
             return Ok(());
         }
 
@@ -812,6 +838,7 @@ impl NodeState {
                 "unlink ino={}, path={}: handle appeared, deferring",
                 ino, path
             );
+            self.set_deferred_delete_path(ino, &path);
             return Ok(());
         }
 
@@ -1137,17 +1164,55 @@ impl NodeState {
         Ok(status)
     }
 
+    /// Backend `get_status` for an explicit path, without touching the dcache.
+    /// Used by the release-time deferred-delete identity check, which must not
+    /// repopulate cache state for a path that may have been reused (#1395).
+    pub async fn fs_stat_by_path(&self, path: &Path) -> FuseResult<FileStatus> {
+        Ok(self.fs.get_status(path).await?)
+    }
+
     pub async fn fs_stat_guarded(&self, ino: u64) -> FuseResult<FileStatus> {
         let path = match self.probe_status(ino, None)? {
             StatProbe::Hit(status) => return Ok(status),
             StatProbe::Miss(path) => path,
         };
-        let _guard = self.lock_path(&path).await;
-        if let Some(status) = self.unlinked_status(ino) {
+        // The path lock keeps the daemon-side metadata cache coherent across
+        // concurrent resolutions of the same path. With the cache disabled
+        // only the root inode's status is refreshed (see
+        // cache_resolved_status), which does not take this lock; holding the
+        // lock across the RPC only serializes this backend RPC behind other
+        // stats of the same path - notably the mount root, which the kernel
+        // revalidates on every traversal when attr_timeout is 0. Skip it in
+        // that mode instead of capping every stat behind one ~RTT-long
+        // critical section.
+        if self.enable_meta_cache {
+            let _guard = self.lock_path(&path).await;
+            if let Some(status) = self.unlinked_status(ino) {
+                return Ok(status);
+            }
+            let status = self.fs.get_status(&path).await?;
+            self.cache_resolved_status(ino, None, &status);
             return Ok(status);
         }
 
-        let status = self.fs.get_status(&path).await?;
+        if let Some(status) = self.unlinked_status(ino) {
+            return Ok(status);
+        }
+        let status = match self.fs.get_status(&path).await {
+            Ok(status) => status,
+            Err(e) => {
+                // An unlink may commit while this RPC is in flight (no lock
+                // serializes it in this mode). The tombstone resolver answers
+                // that case without taking the path lock; the success path
+                // pays nothing.
+                if let Some(status) = self.unlinked_status(ino) {
+                    return Ok(status);
+                }
+                return Err(e.into());
+            }
+        };
+        // No-op for non-root inodes; the root refresh is required because
+        // fs_lookup serves `.`/`..` to the root inode without a cache gate.
         self.cache_resolved_status(ino, None, &status);
         Ok(status)
     }
@@ -1553,6 +1618,7 @@ mod test {
     use curvine_fs_api::{ListStream, Path};
     use curvine_fs_api::{StateReader, StateWriter};
     use curvine_model::FileStatus;
+    use curvine_net::net::InetAddr;
     use curvine_runtime::common::{FastHashMap, Utils};
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use std::sync::Arc;
@@ -1877,6 +1943,57 @@ mod test {
                     .unwrap()
                     .n_lookup(),
                 1
+            );
+        });
+    }
+
+    #[test]
+    fn stat_without_meta_cache_does_not_wait_on_path_lock() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.enable_meta_cache = false;
+            conf.fuse.metrics_enabled = false;
+            // Hermetic backend: point at a closed port and keep every retry
+            // budget short, so the RPC fails deterministically well inside
+            // the timeout below. The defaults retry a refused connect for
+            // ~60s, which would trip the timeout even when the lock is
+            // correctly skipped.
+            conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 1)];
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = Arc::new(NodeState::new(fs).unwrap());
+
+            let ino = {
+                let mut dir = state.dir_write();
+                let mut status = FileStatus::with_name(43, "stat-no-cache".to_string(), false);
+                status.mode = 0o644;
+                dir.lookup(FUSE_ROOT_ID, "stat-no-cache", status, true)
+                    .unwrap()
+                    .ino
+            };
+
+            // Hold the path lock across the would-be RPC. With the metadata
+            // cache disabled stat must not queue behind it: the kernel
+            // revalidates the mount root on every traversal, so holding this
+            // lock across the RPC serializes every stat in the mount.
+            let path = state.get_path(ino).unwrap();
+            let guard = state.lock_path(&path).await;
+
+            let task_state = state.clone();
+            let stat_task = tokio::spawn(async move { task_state.fs_stat_guarded(ino).await });
+            let finished = tokio::time::timeout(std::time::Duration::from_secs(2), stat_task).await;
+            drop(guard);
+
+            let joined = finished
+                .expect("fs_stat_guarded must not wait on the path lock when the meta cache is disabled")
+                .expect("fs_stat_guarded panicked");
+            assert!(
+                joined.is_err(),
+                "expected the closed-port backend error from the unlocked RPC"
             );
         });
     }
@@ -2269,6 +2386,91 @@ mod test {
             assert!(state.find_handle(1, second_handle.fh()).is_err());
             assert!(!state.has_open_handles(1));
             assert!(state.find_writer(1).await.is_none());
+        });
+    }
+
+    /// Builds the issue-#1395 scenario: a root-level entry whose dcache inode
+    /// was removed entirely, so `get_path(ino)` fails with ENOENT.
+    /// Returns the file ino and a status snapshot with a resolvable path.
+    fn cached_then_forgotten_file(state: &NodeState, name: &str, id: i64) -> (u64, FileStatus) {
+        let mut status = FileStatus::with_name(id, name.to_string(), false);
+        status.path = format!("/{}", name);
+        let ino = {
+            let mut tree = state.dir_write();
+            let ino = tree
+                .lookup(FUSE_ROOT_ID, name, status.clone(), true)
+                .unwrap()
+                .ino;
+            // Simulate kernel FORGET; `clear()` then evicts the expired inode.
+            tree.forget(ino, 1).unwrap();
+            tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            ino
+        };
+        state.clear().unwrap();
+        assert!(state.get_path(ino).is_err(), "ancestor must be evicted");
+        (ino, status)
+    }
+
+    #[test]
+    fn release_without_dcache_path_still_releases_handle() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+            let (ino, status) = cached_then_forgotten_file(&state, "stale", 300);
+
+            let handle = state
+                .insert_handle_with_writer(ino, None, None, status)
+                .await;
+            assert!(state.has_open_handles(ino));
+
+            let path = state.get_path(ino);
+            assert!(path.is_err(), "precondition: dcache path unavailable");
+
+            let (handle, result) = state.release_handle(ino, handle.fh()).await.unwrap();
+            assert!(result.is_ok());
+            assert!(!state.has_open_handles(ino));
+            assert!(state.find_handle(ino, handle.fh()).is_err());
+        });
+    }
+
+    #[test]
+    fn release_without_dcache_path_completes_writer() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+            let (ino, status) = cached_then_forgotten_file(&state, "stalew", 301);
+
+            let full_path = Path::from_str("/dev/null").unwrap();
+            let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+            let fuse_writer = Arc::new(FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
+            ));
+            state
+                .writers
+                .insert::<FuseError>(ino, fuse_writer.clone())
+                .await
+                .unwrap();
+            let handle = state
+                .insert_handle_with_writer(ino, None, Some(fuse_writer.clone()), status)
+                .await;
+            fuse_writer
+                .write(0, Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+
+            assert!(handle.has_writer());
+            let (handle, result) = state.release_handle(ino, handle.fh()).await.unwrap();
+            assert!(result.is_ok(), "writer complete must succeed: {:?}", result);
+            assert!(!state.has_open_handles(ino));
+            assert!(state.find_writer(ino).await.is_none());
+            assert!(state.find_handle(ino, handle.fh()).is_err());
         });
     }
 }

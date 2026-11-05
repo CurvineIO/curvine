@@ -176,6 +176,20 @@ impl BlockMeta {
         self.state == BlockState::Quarantined
     }
 
+    /// Length the worker has committed for this block, or `None` while the
+    /// block is still open for writing. Until finalize publishes the block,
+    /// `len` is only the reserved block size, and the file holds just the
+    /// bytes written so far.
+    pub fn committed_len(&self) -> Option<i64> {
+        match self.state {
+            BlockState::Finalized | BlockState::Recovering => Some(self.len),
+            BlockState::Writing
+            | BlockState::Allocating
+            | BlockState::Finalizing
+            | BlockState::Quarantined => None,
+        }
+    }
+
     pub fn dir_id(&self) -> u32 {
         self.dir_id
     }
