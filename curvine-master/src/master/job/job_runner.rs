@@ -756,10 +756,17 @@ mod tests {
     use crate::master::journal::JournalSystem;
     use crate::Master;
     use curvine_config::ClusterConf;
+    use curvine_core_error::{CommonErrorExt, CommonResultExt};
+    use curvine_fs_api::RpcCode;
+    use curvine_net::net::{ConnState, NetUtils};
+    use curvine_proto::{CancelJobRequest, CancelJobResponse};
+    use curvine_rpc::handler::{HandlerService, MessageHandler};
+    use curvine_rpc::message::{Builder, Message};
+    use curvine_rpc::server::{RpcServer, ServerConf};
     use curvine_runtime::common::Utils;
     use curvine_runtime::runtime::RpcRuntime;
     use std::net::TcpListener;
-    use std::time::Duration;
+    use std::sync::Mutex;
 
     fn worker(id: u32, port: u16) -> WorkerAddress {
         WorkerAddress {
@@ -768,6 +775,37 @@ mod tests {
             ip_addr: "127.0.0.1".to_string(),
             rpc_port: port as u32,
             web_port: 0,
+        }
+    }
+
+    /// Worker stand-in that records the job id of every CancelJob it receives.
+    struct CancelProbe {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MessageHandler for CancelProbe {
+        type Error = CommonErrorExt;
+
+        fn handle(&self, msg: &Message) -> CommonResultExt<Message> {
+            if RpcCode::from(msg.code()) == RpcCode::CancelJob {
+                let req: CancelJobRequest = msg.parse_header()?;
+                self.seen.lock().unwrap().push(req.job_id);
+            }
+            Ok(Builder::success_with_header(msg, CancelJobResponse {}).build())
+        }
+    }
+
+    struct CancelProbeService {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl HandlerService for CancelProbeService {
+        type Item = CancelProbe;
+
+        fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
+            CancelProbe {
+                seen: self.seen.clone(),
+            }
         }
     }
 
@@ -798,11 +836,18 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        // Accepts the connection but never answers; seeing a connection is
-        // enough to prove the cancel was attempted on this worker.
-        let live = TcpListener::bind("127.0.0.1:0").unwrap();
-        let live_port = live.local_addr().unwrap().port();
-        live.set_nonblocking(true).unwrap();
+        // Real RPC server that answers CancelJob and records the job id.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let live_port = NetUtils::hold_available_port();
+        let server = RpcServer::new(
+            ServerConf::with_hostname("127.0.0.1", live_port),
+            CancelProbeService { seen: seen.clone() },
+        );
+        let server_rt = server.clone_rt();
+        let mut listener = server.start();
+        server_rt
+            .block_on(listener.wait_startup())
+            .expect("cancel probe server must start");
 
         let rt = conf.journal.create_runtime();
         let runner = LoadJobRunner::new(
@@ -820,14 +865,10 @@ mod tests {
         let res = rt.block_on(runner.cancel_job("job-1", workers));
         assert!(res.is_ok(), "unreachable worker failed cancel: {:?}", res);
 
-        let mut reached = false;
-        for _ in 0..50 {
-            if live.accept().is_ok() {
-                reached = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(reached, "live worker never received the cancel request");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["job-1".to_string()],
+            "live worker must receive exactly one CancelJob for job-1"
+        );
     }
 }
