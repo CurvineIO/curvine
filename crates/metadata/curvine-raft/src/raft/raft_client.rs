@@ -172,6 +172,12 @@ impl RaftClient {
         self.rt.block_on(fut)
     }
 
+    /// The runtime this client schedules on; callers without their own handle
+    /// can block on RPCs through it.
+    pub fn runtime(&self) -> Arc<Runtime> {
+        self.rt.clone()
+    }
+
     pub fn get_addr_string(&self, id: u64) -> String {
         self.connector.get_addr_string(id)
     }

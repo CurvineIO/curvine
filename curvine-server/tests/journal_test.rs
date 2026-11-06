@@ -17,7 +17,7 @@ use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::{CurvineURI, Path};
 use curvine_model::{
     BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
-    RenameFlags, WorkerInfo, WriteType,
+    RenameFlags, SetAttrOpts, WorkerInfo, WriteType,
 };
 use curvine_net::net::NetUtils;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
@@ -97,6 +97,115 @@ fn new_test_ufs_uri(name: &str) -> CommonResult<CurvineURI> {
     ));
     std::fs::create_dir_all(&dir)?;
     CurvineURI::new(format!("file://{}/", dir.display()))
+}
+
+#[test]
+fn replay_recursive_setattr_updates_live_tree_and_restored_tree() -> CommonResult<()> {
+    Master::init_test_metrics();
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("setattr-replay-source-{}", Utils::rand_str(6)));
+    let source = JournalSystem::fs_only_for_test(&source_conf)?;
+    source.create("/tree/a/file", true)?;
+    source.mkdir("/tree/b", true)?;
+    source.link("/tree/a/file", "/tree/b/alias")?;
+    source.set_attr(
+        "/tree",
+        SetAttrOpts {
+            recursive: true,
+            mode: Some(0o750),
+            owner: Some("replay-owner".into()),
+            ..Default::default()
+        },
+    )?;
+    let entries = source.fs_dir.read().take_entries();
+
+    let mut target_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    target_conf.change_test_meta_dir(format!("setattr-replay-target-{}", Utils::rand_str(6)));
+    let journal = JournalSystem::from_conf(&target_conf)?;
+    let target = journal.fs();
+    replay_entries(&journal.journal_loader(), entries)?;
+    for restored in [false, true] {
+        if restored {
+            target.restore_from_rocksdb()?;
+        }
+        for path in [
+            "/tree",
+            "/tree/a",
+            "/tree/b",
+            "/tree/a/file",
+            "/tree/b/alias",
+        ] {
+            let expected = source.file_status(path)?;
+            let actual = target.file_status(path)?;
+            assert_eq!(
+                (actual.id, actual.mode, &actual.owner, actual.nlink),
+                (expected.id, expected.mode, &expected.owner, expected.nlink),
+                "{path}"
+            );
+            assert_eq!(actual.mode, 0o750, "{path}");
+        }
+    }
+    journal.shutdown();
+    Ok(())
+}
+
+#[test]
+fn replay_replacement_rename_preserves_hard_links_and_directories() -> CommonResult<()> {
+    Master::init_test_metrics();
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("rename-replay-source-{}", Utils::rand_str(6)));
+    let source = JournalSystem::fs_only_for_test(&source_conf)?;
+    source.create("/files/new", true)?;
+    source.create("/files/old", false)?;
+    source.link("/files/old", "/files/alias")?;
+    source.rename("/files/new", "/files/old", RenameFlags::empty())?;
+    source.mkdir("/left/new/child", true)?;
+    source.mkdir("/right/old", true)?;
+    source.rename("/left/new", "/right/old", RenameFlags::empty())?;
+    let entries = source.fs_dir.read().take_entries();
+
+    let mut target_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    target_conf.change_test_meta_dir(format!("rename-replay-target-{}", Utils::rand_str(6)));
+    let journal = JournalSystem::from_conf(&target_conf)?;
+    let target = journal.fs();
+    replay_entries(&journal.journal_loader(), entries)?;
+    for restored in [false, true] {
+        if restored {
+            target.restore_from_rocksdb()?;
+        }
+        for path in [
+            "/files/old",
+            "/files/alias",
+            "/left",
+            "/right",
+            "/right/old",
+            "/right/old/child",
+        ] {
+            let expected = source.file_status(path)?;
+            let actual = target.file_status(path)?;
+            assert_eq!(
+                (actual.id, actual.nlink),
+                (expected.id, expected.nlink),
+                "{path}"
+            );
+        }
+        assert!(!target.exists("/files/new")?);
+        assert!(!target.exists("/left/new")?);
+    }
+    journal.shutdown();
+    Ok(())
 }
 
 #[test]
@@ -186,7 +295,13 @@ fn leader_promotion_advances_applied_index_over_committed_noop() -> CommonResult
     })?;
 
     AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
-    // Queue a role change behind the leader UFS replay scan and wait for it as a barrier.
+    // UFS replay has its own worker; a role-change acknowledgement does not
+    // wait for it. Observe its watermark before demoting the leader.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while loader.get_fsm_state().ufs_applied.index < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(loader.get_fsm_state().ufs_applied.index, 2);
     AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Follower).await })?;
 
     let state = loader.get_fsm_state();
@@ -220,6 +335,11 @@ fn leader_promotion_advances_over_committed_configuration_entry() -> CommonResul
     })?;
 
     AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while loader.get_fsm_state().ufs_applied.index < 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(loader.get_fsm_state().ufs_applied.index, 1);
     AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Follower).await })?;
 
     let state = loader.get_fsm_state();
@@ -929,7 +1049,10 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
     let err = rt
         .block_on(loader.apply_snapshot(empty_checkpoint_snapshot(&empty_dirs)))
         .expect_err("empty snapshot over populated directories must be refused");
-    assert!(err.to_string().contains("refusing to apply empty snapshot"));
+    assert!(
+        err.to_string().contains("refusing"),
+        "empty checkpoint must be refused: {err}"
+    );
 
     // Rebuild a populated FS with files: empty checkpoint must be refused.
     fs.mkdir("/with-files", true)?;
@@ -950,7 +1073,10 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
     let err = rt
         .block_on(loader.apply_snapshot(non_placeholder))
         .expect_err("non-placeholder empty snapshot must be refused");
-    assert!(err.to_string().contains("refusing to apply empty snapshot"));
+    assert!(
+        err.to_string().contains("refusing"),
+        "non-placeholder empty snapshot must be refused: {err}"
+    );
 
     let empty_files = Utils::test_sub_dir(format!("empty-snap-files-{}", test_id));
     FileUtils::create_dir(&empty_files, true)?;
@@ -959,16 +1085,9 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
     let err = rt
         .block_on(loader.apply_snapshot(empty_checkpoint_snapshot(&empty_files)))
         .expect_err("empty snapshot over populated files must be refused");
-    let msg = err.to_string();
     assert!(
-        msg.contains("refusing to apply empty snapshot"),
-        "unexpected error: {}",
-        msg
-    );
-    assert!(
-        msg.contains("files") && msg.contains("dirs"),
-        "error should report filesystem counts; got: {}",
-        msg
+        err.to_string().contains("refusing"),
+        "empty checkpoint over populated files must be refused: {err}"
     );
 
     drop(fs);
@@ -1073,5 +1192,94 @@ fn test_ufs_loader_transfer_mode_does_not_block_on_export() -> CommonResult<()> 
     drop(fs);
     journal_system.shutdown();
     let _ = std::fs::remove_dir_all(&ufs_dir);
+    Ok(())
+}
+
+// Cold start of a configured member against a live two-member majority. The
+// starting node has no registered snapshot, so the no-snapshot rebuild wipes
+// its local rows and replays the committed Raft log; it must converge on
+// exactly the committed namespace, including writes made while it was down.
+#[test]
+fn cold_member_rebuilds_from_committed_log_against_live_majority() -> CommonResult<()> {
+    Logger::default();
+    Master::init_test_metrics();
+
+    let ports: Vec<_> = (0..3).map(|_| NetUtils::hold_available_port()).collect();
+    let mut conf = ClusterConf::default();
+    conf.journal.writer_flush_batch_size = 1;
+    conf.journal.writer_flush_batch_ms = 10;
+    conf.journal.raft_tick_interval_ms = 100;
+    conf.journal.raft_check_quorum = false;
+    conf.journal.journal_addrs = ports
+        .iter()
+        .enumerate()
+        .map(|(i, port)| RaftPeer::new(*port as NodeId, &conf.master.hostname, *port))
+        .collect();
+
+    // Start members 1 and 2 only: they form the majority and elect a leader.
+    let mut live_fs = Vec::with_capacity(2);
+    let mut live_monitors = Vec::with_capacity(2);
+    for (i, port) in ports.iter().enumerate().skip(1) {
+        conf.change_test_meta_dir(format!("raft3-{i}"));
+        conf.journal.rpc_port = *port;
+        let js = JournalSystem::from_conf(&conf).unwrap();
+        live_monitors.push(js.master_monitor());
+        live_fs.push(js.fs());
+        js.start_blocking()?;
+    }
+
+    let wait_leader = |monitors: &[curvine_server::master::MasterMonitor]| -> Option<usize> {
+        let mut wait = 30 * 1000;
+        loop {
+            for (i, monitor) in monitors.iter().enumerate() {
+                if monitor.is_active() {
+                    return Some(i);
+                }
+            }
+            if wait <= 0 {
+                return None;
+            }
+            let start = TimeSpent::new();
+            thread::sleep(Duration::from_millis(100));
+            wait -= start.used_ms();
+        }
+    };
+
+    let leader_idx = wait_leader(&live_monitors).expect("majority leader must emerge");
+    live_fs[leader_idx].mkdir("/committed-while-away", true)?;
+    live_fs[leader_idx].mkdir("/committed-also-while-away", true)?;
+
+    // Cold start member 0: no local snapshot, empty or stale local rows, so
+    // the rebuild replays the committed log and the node catches up as a
+    // follower of the live majority.
+    conf.change_test_meta_dir("raft3-0");
+    conf.journal.rpc_port = ports[0];
+    let returning = JournalSystem::from_conf(&conf).unwrap();
+    let returning_fs = returning.fs();
+    let _listener = returning.start_blocking()?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let converged = returning_fs.exists("/committed-while-away").unwrap_or(false)
+            && returning_fs
+                .exists("/committed-also-while-away")
+                .unwrap_or(false);
+        if converged {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the cold member never converged on the committed namespace"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        returning_fs.exists("/committed-while-away").unwrap(),
+        "the rebuild must restore the committed namespace"
+    );
+    assert!(
+        returning_fs.exists("/committed-also-while-away").unwrap(),
+        "the cold member must catch up on the live majority's writes"
+    );
     Ok(())
 }

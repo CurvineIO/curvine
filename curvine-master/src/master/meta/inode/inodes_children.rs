@@ -116,12 +116,34 @@ impl InodeChildren {
             InodeChildren::List(list) => {
                 let index = Self::search_by_name(list, child_name);
                 match index {
-                    Ok(v) => Some(list.remove(v)),
+                    Ok(v) => {
+                        let id = list[v].id();
+                        if id != child_id {
+                            return err_box!(
+                                "Inode status error, expect id {}, actually delete {}",
+                                child_id,
+                                id
+                            );
+                        }
+                        Some(list.remove(v))
+                    }
                     Err(_) => None,
                 }
             }
 
-            InodeChildren::Map(map) => map.remove(child_name),
+            InodeChildren::Map(map) => {
+                if let Some(inode) = map.get(child_name) {
+                    let id = inode.id();
+                    if id != child_id {
+                        return err_box!(
+                            "Inode status error, expect id {}, actually delete {}",
+                            child_id,
+                            id
+                        );
+                    }
+                }
+                map.remove(child_name)
+            }
             InodeChildren::Packed(packed) => {
                 return packed.delete_child(child_id, child_name);
             }
@@ -129,17 +151,7 @@ impl InodeChildren {
 
         match removed {
             None => err_box!("Child {} not exists", child_name),
-            Some(r) => {
-                if r.id() != child_id {
-                    err_box!(
-                        "Inode status error, expect id {}, actually delete {}",
-                        child_id,
-                        r.id()
-                    )
-                } else {
-                    Ok(*r)
-                }
-            }
+            Some(r) => Ok(*r),
         }
     }
 

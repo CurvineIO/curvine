@@ -144,7 +144,7 @@ mod recovery_metrics_tests {
     use crate::master::Master;
     use curvine_config::{JournalConf, MasterConf};
     use curvine_raft::proto::raft::AppliedIndex;
-    use curvine_raft::raft::storage::PeerStorage;
+    use curvine_raft::raft::storage::{ApplyMsg, PeerStorage};
     use curvine_raft::raft::RaftGroup;
     use curvine_runtime::common::Utils;
     use raft::eraftpb::HardState;
@@ -179,6 +179,141 @@ mod recovery_metrics_tests {
                 }
             }
         }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn zero_replay_batch_size_is_rejected() -> FsResult<()> {
+        let root = std::env::temp_dir().join(format!("curvine-scan-zero-{}", Utils::rand_id()));
+        let conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            master: MasterConf {
+                meta_dir: root.join("meta").to_str().unwrap().into(),
+                ..Default::default()
+            },
+            journal: JournalConf {
+                journal_dir: root.join("journal").to_str().unwrap().into(),
+                scan_batch_size: 0,
+                io_threads: 1,
+                worker_threads: 2,
+                ..JournalConf::with_test()
+            },
+            ..Default::default()
+        };
+        let meta = Path::new(&conf.db_conf().data_dir).join("sentinel");
+        let journal = Path::new(&conf.journal.db_conf().data_dir).join("sentinel");
+        fs::create_dir_all(meta.parent().unwrap())?;
+        fs::create_dir_all(journal.parent().unwrap())?;
+        fs::write(&meta, b"existing metadata")?;
+        fs::write(&journal, b"existing journal")?;
+        let Err(error) = JournalSystem::from_conf(&conf) else {
+            panic!("zero scan batch size must be rejected");
+        };
+        assert!(error.to_string().contains("scan_batch_size"));
+        assert_eq!(fs::read(meta)?, b"existing metadata");
+        assert_eq!(fs::read(journal)?, b"existing journal");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn replay_scan_rejects_missing_committed_entries() -> FsResult<()> {
+        for (batch_size, indices) in [(1, vec![1]), (3, vec![1, 3])] {
+            let root = std::env::temp_dir().join(format!("curvine-scan-gap-{}", Utils::rand_id()));
+            let conf = ClusterConf {
+                testing: true,
+                format_master: true,
+                master: MasterConf {
+                    meta_dir: root.join("meta").to_str().unwrap().into(),
+                    ..Default::default()
+                },
+                journal: JournalConf {
+                    journal_dir: root.join("journal").to_str().unwrap().into(),
+                    scan_batch_size: batch_size,
+                    io_threads: 1,
+                    worker_threads: 2,
+                    ..JournalConf::with_test()
+                },
+                ..Default::default()
+            };
+            let js = JournalSystem::from_conf(&conf)?;
+            let loader = js.journal_loader();
+            let log = js.raft_journal.log_store().clone();
+            log.append(
+                &indices
+                    .into_iter()
+                    .map(|index| Entry {
+                        index,
+                        term: 1,
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>(),
+            )?;
+            log.set_hard_state(&HardState {
+                term: 1,
+                vote: 1,
+                commit: 3,
+            })?;
+            let error = js
+                .rt
+                .block_on(loader.apply(true, ApplyMsg::new_scan(AppliedIndex::default())))
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("missing committed journal entry"));
+            assert!(loader.get_fsm_state().applied.index < 2);
+            drop(log);
+            drop(loader);
+            js.shutdown();
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn replay_scan_advances_with_single_entry_batches() -> FsResult<()> {
+        let root = std::env::temp_dir().join(format!("curvine-scan-one-{}", Utils::rand_id()));
+        let conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            master: MasterConf {
+                meta_dir: root.join("meta").to_str().unwrap().into(),
+                ..Default::default()
+            },
+            journal: JournalConf {
+                journal_dir: root.join("journal").to_str().unwrap().into(),
+                scan_batch_size: 1,
+                io_threads: 1,
+                worker_threads: 2,
+                ..JournalConf::with_test()
+            },
+            ..Default::default()
+        };
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let log = js.raft_journal.log_store().clone();
+        log.append(
+            &(1..=3)
+                .map(|index| Entry {
+                    index,
+                    term: 1,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        log.set_hard_state(&HardState {
+            term: 1,
+            vote: 1,
+            commit: 3,
+        })?;
+        js.rt
+            .block_on(loader.apply(true, ApplyMsg::new_scan(AppliedIndex::default())))?;
+        assert_eq!(loader.get_fsm_state().applied.index, 3);
+        drop(log);
+        drop(loader);
+        js.shutdown();
         fs::remove_dir_all(root)?;
         Ok(())
     }

@@ -28,13 +28,13 @@ use curvine_model::{
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
-    BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
-    CreateFileRequest, CreateLeaderSnapshotRequest, CreateLeaderSnapshotResponse, DeleteRequest,
-    EmptyTrashRequest, EmptyTrashResponse, GetContentSummaryRequest, GetContentSummaryResponse,
-    GetFilesystemInfoRequest, GetFilesystemInfoResponse, HeartbeatStatusProto, ListTrashRequest,
-    ListTrashResponse, MkdirOptsProto, MkdirRequest, MountRequest, RenameRequest,
-    RestoreTrashRequest, RestoreTrashResponse, WorkerAddressProto, WorkerHeartbeatRequest,
-    WorkerHeartbeatResponse,
+    BlockReportInfoProto, BlockReportListRequest, BlockReportListResponse, CompleteFileRequest,
+    CompleteFileResponse, CreateFileRequest, CreateLeaderSnapshotRequest,
+    CreateLeaderSnapshotResponse, DeleteRequest, EmptyTrashRequest, EmptyTrashResponse,
+    GetContentSummaryRequest, GetContentSummaryResponse, GetFilesystemInfoRequest,
+    GetFilesystemInfoResponse, HeartbeatStatusProto, ListTrashRequest, ListTrashResponse,
+    MkdirOptsProto, MkdirRequest, MountRequest, RenameRequest, RestoreTrashRequest,
+    RestoreTrashResponse, WorkerAddressProto, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -489,6 +489,92 @@ fn control_plane_requests_use_the_async_handler() {
 }
 
 #[test]
+fn full_block_report_rpc_restarts_invalidated_snapshot() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (handler, fs, _) =
+        new_handler_for_test_with_options("full-block-report-rpc-restart", false, true, |_| {});
+    let worker_id = 7;
+    let session_id = "report-session";
+    let mut worker = WorkerInfo::default();
+    worker.address.worker_id = worker_id;
+    worker.worker_session_id = session_id.to_string();
+    fs.add_test_worker(worker);
+
+    let begin = |report_id: u64, worker_session_id: &str| {
+        Builder::new_rpc(RpcCode::WorkerBlockReport)
+            .proto_header(BlockReportListRequest {
+                cluster_id: "curvine".to_string(),
+                worker_id,
+                worker_session_id: Some(worker_session_id.to_string()),
+                full_report: false,
+                total_len: 0,
+                report_id: Some(report_id),
+                full_report_begin: Some(true),
+                blocks: vec![],
+            })
+            .build()
+    };
+
+    let response = handler.handle(&begin(7, session_id))?;
+    let response: BlockReportListResponse = response.parse_header()?;
+    assert_eq!(response.full_report_begin_accepted, Some(true));
+    assert_eq!(response.restart_full_report, Some(false));
+
+    // An incremental report is newer worker-location evidence than the snapshot
+    // that followed the accepted begin. The next full-report batch must restart.
+    let update = Builder::new_rpc(RpcCode::WorkerBlockReport)
+        .proto_header(BlockReportListRequest {
+            cluster_id: "curvine".to_string(),
+            worker_id,
+            worker_session_id: Some(session_id.to_string()),
+            full_report: false,
+            total_len: 1,
+            report_id: None,
+            full_report_begin: None,
+            blocks: vec![BlockReportInfoProto {
+                id: -1,
+                status: BlockReportStatus::Finalized.into(),
+                block_size: 1,
+                storage_type: StorageType::Disk.into(),
+            }],
+        })
+        .build();
+    assert!(handler.handle(&update)?.is_success());
+
+    let stale_snapshot = Builder::new_rpc(RpcCode::WorkerBlockReport)
+        .proto_header(BlockReportListRequest {
+            cluster_id: "curvine".to_string(),
+            worker_id,
+            worker_session_id: Some(session_id.to_string()),
+            full_report: true,
+            total_len: 1,
+            report_id: Some(7),
+            full_report_begin: None,
+            blocks: vec![BlockReportInfoProto {
+                id: -1,
+                status: BlockReportStatus::Finalized.into(),
+                block_size: 1,
+                storage_type: StorageType::Disk.into(),
+            }],
+        })
+        .build();
+    let response = handler.handle(&stale_snapshot)?;
+    let response: BlockReportListResponse = response.parse_header()?;
+    assert_eq!(response.restart_full_report, Some(true));
+
+    let response = handler.handle(&begin(7, session_id))?;
+    let response: BlockReportListResponse = response.parse_header()?;
+    assert_eq!(response.full_report_begin_accepted, Some(false));
+    assert_eq!(response.restart_full_report, Some(true));
+
+    let response = handler.handle(&begin(8, session_id))?;
+    let response: BlockReportListResponse = response.parse_header()?;
+    assert_eq!(response.full_report_begin_accepted, Some(true));
+    assert_eq!(response.restart_full_report, Some(false));
+    Ok(())
+}
+
+#[test]
 fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let handler = new_handler();
@@ -742,6 +828,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
 
     let req = BlockReportListRequest {
         report_id: None,
+        full_report_begin: None,
         cluster_id: "curvine".into(),
         worker_id,
         worker_session_id: None,
@@ -1546,6 +1633,16 @@ fn ttl_path_resolution_no_reentrant_deadlock_under_writers() -> CommonResult<()>
         &deep_path,
         opts,
         OpenFlags::new_create().set_overwrite(true),
+    )?;
+    // TTL skips in-flight writes: finish the file so the executor may delete it.
+    fs.complete_file(
+        &deep_path,
+        None,
+        0,
+        vec![],
+        &ClientAddress::default().client_name,
+        false,
+        None,
     )?;
     std::thread::sleep(Duration::from_millis(10));
 
@@ -2783,7 +2880,7 @@ fn create_leader_snapshot_rpc_is_rejected_on_a_standby_master() -> CommonResult<
 #[test]
 fn restore_trash_overwrite_releases_replaced_blocks() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_with_conf("trash-restore-overwrite", |conf| {
+    let handler = new_handler_with_active_master("trash-restore-overwrite", |conf| {
         conf.master.trash_enabled = true
     });
     let fs = handler.clone_fs();

@@ -783,7 +783,11 @@ impl MasterReplicationManager {
                 req.storage_type.into(),
             );
             metadata_result = self
-                .commit_replication_location(block_id, location)
+                .commit_replication_location(
+                    block_id,
+                    location,
+                    &snapshot.attempt.target_worker_session_id,
+                )
                 .map(|added| {
                     if added {
                         info!("Successfully replicated {}", block_id);
@@ -837,6 +841,7 @@ impl MasterReplicationManager {
         &self,
         block_id: BlockId,
         location: BlockLocation,
+        worker_session_id: &str,
     ) -> curvine_error::FsResult<bool> {
         crate::fault_point! {
             sync,
@@ -846,9 +851,7 @@ impl MasterReplicationManager {
             return_error: |fault| Err(curvine_error::FsError::common(fault.message)),
         }
         self.fs
-            .fs_dir
-            .write()
-            .add_replication_location_if_needed(block_id, location)
+            .commit_replication_location(block_id, location, worker_session_id)
     }
 
     fn release_target(&self, block_id: BlockId, attempt: &ReplicationAttempt) {

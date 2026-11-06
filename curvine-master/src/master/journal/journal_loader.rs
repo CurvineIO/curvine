@@ -21,10 +21,13 @@ use crate::master::journal::recovery::{
 use crate::master::journal::*;
 use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
-use crate::master::meta::InodeId;
+use crate::master::meta::store::{JournalCursorStore, RocksInodeStore};
+use crate::master::meta::{CommitGate, FsDir, InodeId};
+use crate::master::space::MetadataScanControl;
 use crate::master::{
     JobManager, Master, MasterMetrics, MountManager, SyncFsDir, SyncWorkerManager,
 };
+use curvine_config::DBConf;
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, ternary, CommonResult, ErrorExt};
 use curvine_error::FsError;
@@ -33,12 +36,15 @@ use curvine_raft::conf::JournalConfExt;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData};
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg, LogStorage, RocksLogStorage};
 use curvine_raft::raft::{RaftClient, RaftError, RaftResult, RaftUtils};
+use curvine_raft::utils::SerdeUtils;
 use curvine_runtime::common::{FileUtils, TimeSpent};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
+use curvine_runtime::sync::AtomicCounter;
 use log::{debug, error, info, warn};
+use prost::Message as _;
 use raft::eraftpb::{Entry, EntryType};
-use raft::StateRole;
+use raft::{StateRole, Storage};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +52,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use std::{fs, mem};
 use tokio::sync::Notify;
+
+#[cfg(test)]
+#[path = "tests/role_queue_fence_test.rs"]
+mod role_queue_fence_test;
 
 enum UfsDrive {
     CaughtUp,
@@ -59,7 +69,13 @@ enum UfsDrive {
 #[derive(Clone)]
 pub struct JournalLoader {
     node_id: u64,
+    client: RaftClient,
+    group_size: usize,
     fs_dir: SyncFsDir,
+    meta_data_dir: String,
+    scan_control: Arc<MetadataScanControl>,
+    inode_id: Arc<InodeId>,
+    op_id: Arc<AtomicCounter>,
     mnt_mgr: Arc<MountManager>,
     journal_writer: Arc<JournalWriter>,
     ufs_loader: UfsLoader,
@@ -73,15 +89,73 @@ pub struct JournalLoader {
     fsm_state: Arc<Mutex<FsmState>>,
     retain_checkpoint_num: usize,
     ignore_reply_error: bool,
+    applied_req_window: u64,
     max_retry_num: u64,
     skip_failed_ufs_replay_after_retry: bool,
     batch_size: u64,
     retry_interval: Duration,
     metrics: &'static MasterMetrics,
     has_apply_worker: bool,
+    metadata_commit_gate: Arc<CommitGate>,
+    ufs_shutdown: Arc<AtomicBool>,
+    ufs_stopped: tokio::sync::watch::Sender<bool>,
+    /// Replaceable handle for the cursor row; the applier must persist the
+    /// applied boundary without waiting on the namespace guard, and restore
+    /// republishes the new store into the same handle.
+    cursor_store: JournalCursorStore,
 }
 
 impl JournalLoader {
+    /// Reset namespace rows for journal-only recovery when the local rows may
+    /// contain uncommitted mutations.
+    ///
+    /// The write path materializes RocksDB rows before the Raft commit
+    /// receipt, so a crash can leave durable rows that no committed entry
+    /// covers. When no registered snapshot exists and the log still retains
+    /// every entry from index 1 (nothing was compacted — compaction only
+    /// follows a registered snapshot), the committed log alone can rebuild the
+    /// namespace: wipe the rows and reset the cursor, then the normal startup
+    /// scan replays `[1..commit]` with the same convergence guarantee the
+    /// follower path already has. Member recovery (recover_from_peers or a
+    /// recovery marker) bypasses this: it replaces state from a peer instead.
+    ///
+    /// A crash mid-replay re-runs the whole wipe+replay on restart, so the
+    /// protocol converges without a separate staging marker.
+    pub fn maybe_reset_namespace_for_replay(
+        log_store: &RocksLogStorage,
+        meta_db_conf: DBConf,
+        conf: &JournalConf,
+        recovering: bool,
+        format_master: bool,
+    ) -> CommonResult<bool> {
+        if !conf.enable || recovering || format_master {
+            return Ok(false);
+        }
+        if log_store.latest_snapshot()?.is_some() {
+            return Ok(false);
+        }
+        if log_store.first_index()? != 1 {
+            return err_box!(
+                "journal log starts at {} without a registered snapshot; \
+                 namespace rows cannot be rebuilt from the committed log",
+                log_store.first_index()?
+            );
+        }
+        let committed = log_store.hard_state().commit;
+        info!(
+            "no registered snapshot: resetting namespace rows for committed-log \
+             replay, commit {}",
+            committed
+        );
+        let store = RocksInodeStore::new(meta_db_conf, false)?;
+        store.reset_namespace_for_replay()?;
+        info!(
+            "namespace rows reset complete; replaying committed log [1..{}]",
+            committed
+        );
+        Ok(true)
+    }
+
     pub fn new_replay_loader(
         fs_dir: SyncFsDir,
         mnt_mgr: Arc<MountManager>,
@@ -136,6 +210,13 @@ impl JournalLoader {
         )
     }
 
+    pub(crate) fn validate_conf(conf: &JournalConf) -> CommonResult<()> {
+        if conf.scan_batch_size == 0 {
+            return err_box!("journal scan_batch_size must be greater than zero");
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build(
         rt: Arc<Runtime>,
@@ -149,6 +230,8 @@ impl JournalLoader {
         recovery: RecoveryGate,
         testing: bool,
     ) -> CommonResult<Self> {
+        let client = RaftClient::from_conf(rt.clone(), conf);
+        Self::validate_conf(conf)?;
         // Install the fs_mode release gate before anything can serve a release:
         // with transfer enabled the replayer no longer waits for exports, so an
         // unverified Free would drop Curvine data UFS never received.
@@ -157,12 +240,82 @@ impl JournalLoader {
             job_manager.master_fs().set_fs_mode_releaser(releaser);
         }
 
+        let metadata_commit_gate = job_manager.master_fs().metadata_commit_gate();
         let ufs_loader = UfsLoader::new(job_manager, fs_dir.clone(), conf);
         let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
         let worker_notify = worker_manager.read().registered_notify();
+        // The cursor and metadata rows are persisted independently. An invalid
+        // cursor cannot safely be replaced by zero: replay may mutate already
+        // materialized metadata a second time.
+        let persisted_applied = fs_dir.read().load_journal_applied()?;
+        let mut initial_state = FsmState::default();
+        if let Some(ref bytes) = persisted_applied {
+            let applied = match AppliedIndex::decode(bytes.as_slice()) {
+                Ok(applied) => applied,
+                Err(error) => return err_box!("invalid journal applied cursor: {}", error),
+            };
+            if applied.index > 0 {
+                // A local applied cursor must never claim entries beyond the
+                // durable Raft commit. Offline replay uses a separate loader.
+                if conf.enable && !testing {
+                    let committed = log_store.hard_state().commit;
+                    if applied.index > committed {
+                        return err_box!(
+                            "journal applied cursor {} exceeds raft commit {}",
+                            applied.index,
+                            committed
+                        );
+                    }
+                    match log_store.term(applied.index) {
+                        Ok(term) if term != applied.term => {
+                            return err_box!(
+                                "journal applied cursor term mismatch at index {}: cursor {}, raft {}",
+                                applied.index, applied.term, term
+                            );
+                        }
+                        Ok(_) => {}
+                        // An already compacted entry cannot be checked here;
+                        // snapshot recovery must establish the baseline separately.
+                        Err(raft::Error::Store(raft::StorageError::Compacted)) => {}
+                        Err(error) => {
+                            return err_box!(
+                                "failed to validate journal applied cursor at index {}: {}",
+                                applied.index,
+                                error
+                            );
+                        }
+                    }
+                }
+                info!(
+                    "recover journal applied cursor from meta store: {:?}",
+                    applied
+                );
+                initial_state.applied = applied;
+            }
+        } else {
+            info!(
+                "no persisted journal applied cursor; recovery requires a snapshot or log replay"
+            );
+        }
+        let (meta_data_dir, scan_control, inode_id, op_id, cursor_store) = {
+            let dir = fs_dir.read();
+            (
+                dir.store.store().db.conf().data_dir.clone(),
+                dir.store.scan_control().clone(),
+                dir.inode_id.clone(),
+                dir.op_id.clone(),
+                dir.store.cursor_store(),
+            )
+        };
         let loader = Self {
             node_id: conf.node_id()?,
+            client,
+            group_size: conf.journal_addrs.len().max(1),
             fs_dir,
+            meta_data_dir,
+            scan_control,
+            inode_id,
+            op_id,
             mnt_mgr,
             journal_writer,
             ufs_loader,
@@ -173,15 +326,20 @@ impl JournalLoader {
             ufs_wake: Arc::new(Notify::new()),
             log_store,
             sender,
-            fsm_state: Arc::new(Mutex::new(FsmState::default())),
+            fsm_state: Arc::new(Mutex::new(initial_state)),
             retain_checkpoint_num: conf.retain_checkpoint_num,
             ignore_reply_error: conf.ignore_reply_error,
+            applied_req_window: conf.raft_retry_cache_size,
             max_retry_num: conf.max_retry_num,
             skip_failed_ufs_replay_after_retry: conf.skip_failed_ufs_replay_after_retry,
             batch_size: conf.scan_batch_size,
             retry_interval: Duration::from_secs(conf.retry_interval_secs),
             metrics: Master::get_metrics()?,
             has_apply_worker: !testing,
+            metadata_commit_gate,
+            ufs_shutdown: Arc::new(AtomicBool::new(false)),
+            ufs_stopped: tokio::sync::watch::channel(testing).0,
+            cursor_store,
         };
 
         loader.refresh_metrics()?;
@@ -191,12 +349,31 @@ impl JournalLoader {
                 Self::run_apply(apply_loader, receiver).await;
             });
             let replay_loader = loader.clone();
+            let stopped = loader.ufs_stopped.clone();
             rt.spawn(async move {
                 replay_loader.run_ufs_replay().await;
+                stopped.send_replace(true);
             });
         }
 
         Ok(loader)
+    }
+
+    /// The cursor and metadata are separate writes, so crash consistency is
+    /// not guaranteed. A cursor write failure must fence and fail the apply.
+    fn persist_applied(&self, applied: &AppliedIndex) -> CommonResult<()> {
+        if let Err(error) = self.cursor_store.put(
+            RocksInodeStore::JOURNAL_APPLIED_KEY,
+            &applied.encode_to_vec(),
+        ) {
+            let message = format!(
+                "failed to persist journal applied cursor at index {}: {}",
+                applied.index, error
+            );
+            self.recovery.enter_safe_mode(&message);
+            return err_box!("{}", message);
+        }
+        Ok(())
     }
 
     fn fsm_state(&self) -> CommonResult<MutexGuard<'_, FsmState>> {
@@ -219,8 +396,28 @@ impl JournalLoader {
         // Metadata and UFS watermarks move independently. UFS success is
         // recorded by the replay coordinator, not by this apply path.
         let mut state = self.fsm_state()?;
+        if applied.index < state.applied.index {
+            let message = format!(
+                "metadata applied cursor regressed from {} to {}",
+                state.applied.index, applied.index
+            );
+            self.recovery.enter_safe_mode(&message);
+            return err_box!("{}", message);
+        }
+        if applied.index > 0
+            && applied.index == state.applied.index
+            && applied.term != state.applied.term
+        {
+            let message = format!(
+                "metadata applied term changed at index {}: {} to {}",
+                applied.index, state.applied.term, applied.term
+            );
+            self.recovery.enter_safe_mode(&message);
+            return err_box!("{}", message);
+        }
+        self.persist_applied(&applied)?;
+        let applied_index = applied.index;
         state.applied = applied;
-        let applied_index = state.applied.index;
         self.refresh_fsm_metrics(&state);
         drop(state);
         if is_leader {
@@ -271,6 +468,17 @@ impl JournalLoader {
         }
     }
 
+    /// The proposing request's ID, recorded by the Raft layer in the entry
+    /// context so a duplicate proposal can be recognized after a restart or
+    /// failover. Empty for no-op/config entries.
+    fn entry_req_id(entry: &Entry) -> Option<i64> {
+        let context = entry.get_context();
+        if context.is_empty() {
+            return None;
+        }
+        SerdeUtils::deserialize(context).ok()
+    }
+
     /// Advance the committed apply high-water mark without replaying any
     /// metadata op: the no-op/config branch and batches deliberately skipped
     /// under `ignore_reply_error` both need the watermark to move so that
@@ -283,12 +491,12 @@ impl JournalLoader {
     }
 
     async fn replay_entry(&self, is_leader: bool, entry: &JournalEntry) -> CommonResult<()> {
-        {
-            let fs_dir = self.fs_dir.read();
-            fs_dir.update_op_id(entry.op_id());
-            if let Some(inode_id) = entry.inode_id() {
-                fs_dir.update_last_inode_id(inode_id)?;
-            }
+        // The counters survive restore and advance monotonically. Do not take
+        // the namespace lock here: a writer can hold it while the bounded
+        // journal queue waits for this apply to finish.
+        FsDir::advance_op_id(&self.op_id, entry.op_id());
+        if let Some(inode_id) = entry.inode_id() {
+            self.inode_id.advance_to(inode_id);
         }
 
         if is_leader {
@@ -307,8 +515,19 @@ impl JournalLoader {
         skip_ufs_error: bool,
     ) -> CommonResult<()> {
         let cur = self.fsm_state_snapshot()?;
+        if entry.index > 0 && entry.index == cur.applied.index && entry.term != cur.applied.term {
+            let message = format!(
+                "metadata applied term changed at index {}: {} to {}",
+                entry.index, cur.applied.term, entry.term
+            );
+            self.recovery.enter_safe_mode(&message);
+            return err_box!("{}", message);
+        }
         let role_applied = ternary!(is_leader, cur.ufs_applied.index, cur.applied.index);
-        if entry.index <= role_applied {
+        // A leader can retry its current entry while UFS is behind (notably
+        // to finish snapshot publication), but an older entry must never
+        // rewind the metadata cursor or reprocess an obsolete snapshot.
+        if entry.index < cur.applied.index || entry.index <= role_applied {
             info!(
                 "skip entry index {}, term {}, fsm_state {:?}",
                 entry.index, entry.term, cur
@@ -334,13 +553,42 @@ impl JournalLoader {
             Err(e) => return err_box!("failed to decode journal batch: {}", e),
         };
 
+        // A duplicate proposal can reach a different leader after a failover
+        // or reach this node again after a restart; the in-process retry cache
+        // cannot see across either boundary. The persisted applied-request
+        // record is the durable dedup boundary: the same proposing request
+        // must never replay its metadata a second time.
+        if let Some(req_id) = Self::entry_req_id(entry) {
+            match self.fs_dir.read().store.store.get_applied_req(req_id) {
+                Ok(Some(applied_req)) => {
+                    warn!(
+                        "skip duplicate journal batch: request {} already applied at index {}, duplicate entry index {}, term {}",
+                        req_id, applied_req.index, entry.index, entry.term
+                    );
+                    return self.advance_watermark(is_leader, cur, entry);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return err_box!(
+                        "failed to read applied-request record for request {}: {}",
+                        req_id,
+                        error
+                    )
+                }
+            }
+        }
+
         let batch_len = batch.len();
         let mut snapshot = None;
         let mut applied = Self::build_applied(entry);
+        // Operation IDs can be allocated before independent writers enqueue
+        // their entries, and UFS markers can carry older IDs. Preserve the
+        // maximum committed ID for snapshot recovery and future allocation.
+        applied.op_id = cur.applied.op_id;
         let mut has_ufs_affecting = false;
 
         for (seq, op_entry) in batch.batch.into_iter().enumerate() {
-            applied.op_id = op_entry.op_id();
+            applied.op_id = applied.op_id.max(op_entry.op_id());
             applied.rpc_id = op_entry.rpc_id();
 
             match op_entry {
@@ -384,7 +632,27 @@ impl JournalLoader {
             }
         }
 
+        // Record the proposing request before the cursor advance so every
+        // crash window between rows and cursor keeps the request marked as
+        // applied: with a snapshot the duplicate is skipped and the cursor
+        // catches up; without one the rebuild wipes rows and records together
+        // and replays everything from scratch.
+        if let Some(req_id) = Self::entry_req_id(entry) {
+            let store = &self.fs_dir.read().store.store;
+            store.put_applied_req(req_id, entry.index, entry.term)?;
+        }
         self.set_applied(is_leader, applied, has_ufs_affecting)?;
+        if Self::entry_req_id(entry).is_some() {
+            let entry_index = entry.index;
+            let window = self.applied_req_window;
+            if entry_index % 8192 == 0 {
+                self.fs_dir
+                    .read()
+                    .store
+                    .store
+                    .prune_applied_req_below(entry_index.saturating_sub(window))?;
+            }
+        }
 
         if let Some(e) = snapshot {
             let spent = TimeSpent::new();
@@ -392,7 +660,22 @@ impl JournalLoader {
             // log drop them. If the UFS replay is behind, those entries are
             // still owed a copy: publishing this snapshot would delete them and
             // strand the replay forever. Skip it and keep the log.
-            let state = self.fsm_state_snapshot()?;
+            let state = {
+                let mut state = self.fsm_state()?;
+                // A snapshot-only entry has no UFS side effect. If the UFS
+                // cursor reached the preceding entry, advance it here rather
+                // than racing the asynchronous replay after set_applied().
+                if batch_len == 1
+                    && state.applied.index == entry.index
+                    && state.ufs_applied.index.checked_add(1) == Some(entry.index)
+                {
+                    let mut ufs_applied = state.applied.clone();
+                    ufs_applied.op_id = ufs_applied.op_id.max(state.ufs_applied.op_id);
+                    state.ufs_applied = ufs_applied;
+                    self.refresh_fsm_metrics(&state);
+                }
+                state.clone()
+            };
             if !state.ufs_replay_caught_up() {
                 info!(
                     "skip leader snapshot {}: UFS replay at i{} is behind applied i{}",
@@ -443,11 +726,19 @@ impl JournalLoader {
                         return Ok(());
                     }
 
-                    let high = (last_applied + self.batch_size).min(commit_index + 1);
-                    let list = self.log_store.scan_entries(last_applied + 1, high)?;
+                    let low = last_applied + 1;
+                    let end = commit_index.checked_add(1).ok_or_else(|| {
+                        "cannot scan a committed journal index at u64::MAX".to_string()
+                    })?;
+                    let high = low.saturating_add(self.batch_size).min(end);
+                    let list = self.log_store.scan_entries(low, high)?;
 
                     if list.is_empty() {
-                        return Ok(());
+                        return err_box!(
+                            "corrupt journal: missing committed journal entry at index {} (commit {})",
+                            low,
+                            commit_index
+                        );
                     };
 
                     info!(
@@ -458,6 +749,14 @@ impl JournalLoader {
                     );
 
                     for entry in list {
+                        if entry.index != last_applied + 1 {
+                            return err_box!(
+                                "corrupt journal: missing committed journal entry at index {} (found {}, commit {})",
+                                last_applied + 1,
+                                entry.index,
+                                commit_index
+                            );
+                        }
                         self.apply0(is_leader, &entry, skip_ufs_error).await?;
                         last_applied = entry.index;
                         if skip_ufs_error {
@@ -479,6 +778,71 @@ impl JournalLoader {
         }
     }
 
+    /// Enable persisted directory child counts only when every peer in the
+    /// Raft group reports it can read the newer record format.
+    ///
+    /// The probe rides the existing Ping RPC. Re-evaluated on every leader
+    /// promotion (covering membership changes, restarts, and term changes)
+    /// and reset whenever this node leaves the leader role, so a downgrade or
+    /// an unreachable peer immediately returns new records to the legacy
+    /// format. Readers always accept both formats, so flipping the flag is
+    /// safe; it only decides what NEW records encode.
+    async fn negotiate_record_format(&self) {
+        curvine_model::persist_children_count(false);
+        // Ping this node first: the reply carries the group membership, so no
+        // extra configuration plumbing is needed here. A configured
+        // single-node group skips the probe entirely.
+        if self.group_size <= 1 {
+            curvine_model::persist_children_count(true);
+            info!("single-node raft group: persisted child counts enabled");
+            return;
+        }
+        let peers = match self.client.ping(self.node_id).await {
+            Ok(response) => response.group,
+            Err(error) => {
+                warn!(
+                    "record-format negotiation skipped: cannot list raft group: {}",
+                    error
+                );
+                return;
+            }
+        };
+        let others: Vec<_> = peers
+            .iter()
+            .filter(|peer| peer.node_id != self.node_id)
+            .collect();
+        if others.is_empty() {
+            curvine_model::persist_children_count(true);
+            info!("single-node raft group: persisted child counts enabled");
+            return;
+        }
+        for peer in others {
+            let peer_id = peer.node_id;
+            let readable = match self.client.ping(peer_id).await {
+                Ok(response) => {
+                    response.reader_format.unwrap_or(0)
+                        >= curvine_raft::raft::RECORD_FORMAT_READABLE
+                }
+                Err(error) => {
+                    warn!(
+                        "record-format negotiation: ping node {} failed: {}",
+                        peer_id, error
+                    );
+                    false
+                }
+            };
+            if !readable {
+                info!(
+                    "record format negotiation: node {} cannot read the newer format yet; child counts stay unpersisted",
+                    peer_id
+                );
+                return;
+            }
+        }
+        curvine_model::persist_children_count(true);
+        info!("record format negotiation: all replicas can read the newer format; persisted child counts enabled");
+    }
+
     async fn catch_up_committed_metadata(&self) -> RaftResult<()> {
         let committed = self.log_store.hard_state().commit;
         let applied = self.fsm_state_snapshot()?.applied;
@@ -497,29 +861,26 @@ impl JournalLoader {
         }
         Ok(())
     }
-    fn publish_leadership(&self, is_leader: bool) {
-        self.is_leader.store(is_leader, Ordering::Release);
-        self.recovery.bump_generation();
-        if is_leader {
-            let caught_up = self
-                .fsm_state_snapshot()
-                .map(|state| {
-                    state.ufs_applied.index >= state.applied.index
-                        && self.deferred_ufs_count().unwrap_or(1) == 0
-                })
-                .unwrap_or(false);
+    fn publish_leader_if_current(&self, epoch: u64) -> bool {
+        let caught_up = self
+            .fsm_state_snapshot()
+            .map(|state| {
+                state.ufs_applied.index >= state.applied.index
+                    && self.deferred_ufs_count().unwrap_or(1) == 0
+            })
+            .unwrap_or(false);
+        let published = self.journal_writer.unfence_metadata_if_epoch(epoch, || {
+            self.recovery.bump_generation();
             self.recovery.set_ufs_caught_up(caught_up);
             if !caught_up {
                 self.recovery.set_pending(1);
             }
-        } else {
-            self.recovery.set_ufs_caught_up(false);
-            // A follower must not publish namespace writes while its metadata
-            // view may lag committed Raft state. The leader promotion path
-            // clears this fence after catch_up_committed_metadata().
-            self.journal_writer.fence_metadata();
+            self.is_leader.store(true, Ordering::Release);
+        });
+        if published {
+            self.ufs_wake.notify_one();
         }
-        self.ufs_wake.notify_one();
+        published
     }
 
     async fn run_apply(self, mut receiver: AsyncReceiver<ApplyMsg>) {
@@ -580,7 +941,16 @@ impl JournalLoader {
 
             match apply_msg {
                 ApplyMsg::CreateSnapshot(tx) => {
-                    if let Err(e) = tx.send(self.create_snapshot0(None)) {
+                    // A retrying batch may already have applied some operations.
+                    // Its watermark has not advanced, so that state cannot be snapshotted.
+                    let result = if retry_msg.is_some() {
+                        Err(RaftError::raft(raft::Error::Store(
+                            raft::StorageError::SnapshotTemporarilyUnavailable,
+                        )))
+                    } else {
+                        self.create_snapshot0(None)
+                    };
+                    if let Err(e) = tx.send(result) {
                         warn!("send create snapshot result failed: {}", e);
                     }
                 }
@@ -591,16 +961,34 @@ impl JournalLoader {
                     }
                 }
 
-                ApplyMsg::RoleChange((role, tx)) => {
+                ApplyMsg::RoleChange((role, epoch, tx)) => {
                     let result = async {
                         if role == StateRole::Leader {
                             self.catch_up_committed_metadata().await?;
+                            // The probe can wait on unresponsive peers for
+                            // seconds; it must not delay the role publish that
+                            // unblocks reads. It runs in the background and
+                            // flips the flag when it completes (default false,
+                            // the safe side).
+                            if self.group_size > 1 {
+                                let negotiator = self.clone();
+                                tokio::spawn(async move {
+                                    negotiator.negotiate_record_format().await;
+                                });
+                            } else {
+                                self.negotiate_record_format().await;
+                            }
+                            if !self.publish_leader_if_current(epoch) {
+                                return Err("leader promotion superseded by a newer metadata fence".to_string().into());
+                            }
                             is_leader = true;
-                            self.publish_leadership(true);
                             info!("metadata caught up for leader promotion; UFS replay continues in the background");
                         } else {
+                            curvine_model::persist_children_count(false);
+                            if !self.journal_writer.is_metadata_role_epoch(epoch) {
+                                return Err("role change superseded by a newer metadata fence".to_string().into());
+                            }
                             is_leader = false;
-                            self.publish_leadership(false);
                         }
                         Ok(())
                     }
@@ -680,8 +1068,14 @@ impl JournalLoader {
         let mut failures: u64 = 0;
         let mut logged_skip_ignored = false;
         loop {
+            if self.ufs_shutdown.load(Ordering::Acquire) {
+                break;
+            }
             if self.recovery.is_safe_mode() {
-                tokio::time::sleep(self.retry_interval).await;
+                tokio::select! {
+                    _ = self.ufs_wake.notified() => {}
+                    _ = tokio::time::sleep(self.retry_interval) => {}
+                }
                 continue;
             }
             if !self.is_leader.load(Ordering::Acquire) {
@@ -808,7 +1202,8 @@ impl JournalLoader {
                 AppliedIndex {
                     term: entry.term,
                     index: entry.index,
-                    ..Default::default()
+                    op_id: state.ufs_applied.op_id,
+                    rpc_id: state.ufs_applied.rpc_id,
                 },
                 false,
             );
@@ -826,7 +1221,8 @@ impl JournalLoader {
                     AppliedIndex {
                         term: entry.term,
                         index: entry.index,
-                        ..Default::default()
+                        op_id: state.ufs_applied.op_id,
+                        rpc_id: state.ufs_applied.rpc_id,
                     },
                     false,
                 );
@@ -840,12 +1236,13 @@ impl JournalLoader {
         let mut applied = AppliedIndex {
             term: entry.term,
             index: entry.index,
-            ..Default::default()
+            op_id: state.ufs_applied.op_id,
+            rpc_id: state.ufs_applied.rpc_id,
         };
         let mut ufs_ops = Vec::new();
         let mut needs_worker = false;
         for op in batch.batch {
-            applied.op_id = op.op_id();
+            applied.op_id = applied.op_id.max(op.op_id());
             applied.rpc_id = op.rpc_id();
             if self.ufs_loader.needs_worker(&op) {
                 needs_worker = true;
@@ -931,16 +1328,19 @@ impl JournalLoader {
 
     fn deferred_ufs_records(&self) -> CommonResult<Vec<(u64, Vec<u8>)>> {
         let fs_dir = self.fs_dir.read();
+        fs_dir.store.ensure_available()?;
         fs_dir.store.store().ufs_deferred_records()
     }
 
     fn put_deferred_ufs(&self, index: u64, payload: &[u8]) -> CommonResult<()> {
         let fs_dir = self.fs_dir.read();
+        fs_dir.store.ensure_available()?;
         fs_dir.store.store().put_ufs_deferred(index, payload)
     }
 
     fn delete_deferred_ufs(&self, index: u64) -> CommonResult<()> {
         let fs_dir = self.fs_dir.read();
+        fs_dir.store.ensure_available()?;
         fs_dir.store.store().delete_ufs_deferred(index)
     }
 
@@ -1046,7 +1446,12 @@ impl JournalLoader {
     }
 
     fn create_snapshot0(&self, dir_option: Option<String>) -> RaftResult<SnapshotData> {
-        Self::check_meta_data_dir(&self.fs_dir, "create_snapshot")?;
+        if self.recovery.is_safe_mode() {
+            return Err(RaftError::raft(raft::Error::Store(
+                raft::StorageError::SnapshotTemporarilyUnavailable,
+            )));
+        }
+        self.check_meta_data_dir("create_snapshot")?;
         let fsm_state = self.fsm_state_snapshot()?;
         let dir = match dir_option {
             Some(dir) => dir,
@@ -1061,7 +1466,7 @@ impl JournalLoader {
                         let msg = format!(
                             "failed to create metadata checkpoint (id {}) under meta dir {}: {}",
                             fsm_state.applied.index,
-                            Self::meta_data_dir(&self.fs_dir),
+                            fs_dir.store.store().db.conf().data_dir,
                             e
                         );
                         if Self::meta_dir_missing(e.as_ref()) {
@@ -1093,9 +1498,12 @@ impl JournalLoader {
     /// Without this check the failure surfaces later as a bare
     /// "No such file or directory" deep inside checkpoint/restore, which gives
     /// no clue about which directory or what remediation is required.
-    fn check_meta_data_dir(fs_dir: &SyncFsDir, op: &str) -> RaftResult<()> {
-        let data_dir = Self::meta_data_dir(fs_dir);
-        let path = Path::new(&data_dir);
+    fn check_meta_data_dir(&self, op: &str) -> RaftResult<()> {
+        // Restore temporarily opens a different database, then reopens this
+        // same configured directory; its path is stable for this loader.
+        self.scan_control.wait_until_restored();
+        let data_dir = &self.meta_data_dir;
+        let path = Path::new(data_dir);
         let valid = path.is_dir() && path.join("CURRENT").is_file();
         if !valid {
             return Err(RaftError::storage(format!(
@@ -1107,11 +1515,6 @@ impl JournalLoader {
             )));
         }
         Ok(())
-    }
-
-    fn meta_data_dir(fs_dir: &SyncFsDir) -> String {
-        let fs_dir = fs_dir.read();
-        fs_dir.store.store().db.conf().data_dir.clone()
     }
 
     /// Heuristic: the checkpoint/restore layer reports a vanished underlying
@@ -1144,37 +1547,31 @@ impl JournalLoader {
                 )
             }
         };
-        let actual_size = FileUtils::dir_size(&restore_path).unwrap_or_else(|e| {
-            warn!(
-                "failed to compute checkpoint size for {}: {}",
-                restore_path, e
+        if !Path::new(&restore_path).join("CURRENT").is_file() {
+            return err_box!(
+                "refusing snapshot {}: checkpoint {} is not a RocksDB directory",
+                snapshot.snapshot_id,
+                restore_path
             );
-            0
-        });
+        }
+        let actual_size = FileUtils::dir_size(&restore_path).map_err(|error| {
+            RaftError::storage(format!(
+                "failed to inspect checkpoint {}: {}",
+                restore_path, error
+            ))
+        })?;
+        if actual_size == 0 {
+            return err_box!(
+                "refusing to apply empty snapshot {} at {}",
+                snapshot.snapshot_id,
+                restore_path
+            );
+        }
         let checkpoint_size = if log::log_enabled!(log::Level::Info) {
             actual_size
         } else {
             0
         };
-
-        // Never wipe populated metadata with an empty checkpoint. Harness
-        // daily failures showed FileNotFound after restore from checkpoint_size=0
-        // following raft quorum loss (CurvineIO/curvine#1207).
-        // get_file_counts() returns (dir_count, file_count).
-        {
-            let fs_dir = self.fs_dir.read();
-            let (dir_count, file_count) = fs_dir.get_file_counts();
-            if actual_size == 0 && (dir_count > 0 || file_count > 0) {
-                return err_box!(
-                    "refusing to apply empty snapshot {} at {} ({} bytes) over filesystem with {} files and {} dirs",
-                    snapshot.snapshot_id,
-                    restore_path,
-                    actual_size,
-                    file_count,
-                    dir_count
-                );
-            }
-        }
 
         let mut fs_dir = self.fs_dir.write();
         fs_dir
@@ -1185,7 +1582,7 @@ impl JournalLoader {
                  local meta data_dir is {}: {}",
                     restore_path,
                     checkpoint_size,
-                    Self::meta_data_dir(&self.fs_dir),
+                    fs_dir.store.store().db.conf().data_dir,
                     e
                 );
                 if Self::meta_dir_missing(e.as_ref()) {
@@ -1194,6 +1591,20 @@ impl JournalLoader {
                     RaftError::from(msg)
                 }
             })?;
+        // The checkpoint can predate its snapshot journal entry. Persist the
+        // snapshot's actual applied index before reporting a successful restore.
+        // This does not make the replacement itself crash-atomic.
+        self.persist_applied(&snapshot.fsm_state.applied)
+            .map_err(|e| {
+                fs_dir.store.invalidate_cursor_store();
+                RaftError::storage(e.to_string())
+            })?;
+        if let Err(error) = fs_dir.store.store().db.flush(true) {
+            fs_dir.store.invalidate_cursor_store();
+            let message = format!("failed to flush restored journal cursor: {}", error);
+            self.recovery.enter_safe_mode(&message);
+            return Err(RaftError::storage(message));
+        }
         fs_dir.update_op_id(snapshot.fsm_state.op_id());
         drop(fs_dir);
         let restore_ms = spend.used_ms();
@@ -1518,13 +1929,16 @@ impl JournalLoader {
     }
 
     pub fn ufs_applied(&self, entry: UfsAppliedEntry) -> CommonResult<()> {
-        let mut lock = self.fsm_state()?;
-        lock.ufs_applied = AppliedIndex {
-            op_id: entry.op_id,
-            rpc_id: entry.rpc_id,
-            term: entry.term,
-            index: entry.index,
-        };
+        let mut state = self.fsm_state()?;
+        if entry.index > state.ufs_applied.index {
+            state.ufs_applied = AppliedIndex {
+                op_id: state.ufs_applied.op_id.max(entry.op_id),
+                rpc_id: entry.rpc_id,
+                term: entry.term,
+                index: entry.index,
+            };
+            self.refresh_fsm_metrics(&state);
+        }
         Ok(())
     }
 
@@ -1581,6 +1995,22 @@ impl JournalLoader {
     }
 
     pub async fn shutdown(&self) -> RaftResult<()> {
+        // Let any in-flight UFS operation finish while the apply worker is
+        // still available, then release the replay task's log-store handle.
+        self.ufs_shutdown.store(true, Ordering::Release);
+        self.ufs_wake.notify_one();
+        let mut stopped = self.ufs_stopped.subscribe();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !*stopped.borrow_and_update() {
+                stopped
+                    .changed()
+                    .await
+                    .map_err(|error| RaftError::from(error.to_string()))?;
+            }
+            Ok::<(), RaftError>(())
+        })
+        .await
+        .map_err(|_| RaftError::from("timed out stopping UFS journal replay".to_owned()))??;
         let (tx, rx) = CallChannel::channel();
         self.sender.send(ApplyMsg::Shutdown(tx)).await?;
         rx.receive().await?;
@@ -1634,32 +2064,73 @@ impl AppStorage for JournalLoader {
     }
 
     async fn role_change(&self, role: StateRole) -> RaftResult<()> {
+        // Fence before waiting for the apply queue: a delayed role-change
+        // message must not leave the previous role accepting new writes.
+        let epoch = self.journal_writer.fence_metadata_with(|| {
+            self.is_leader.store(false, Ordering::Release);
+            self.recovery.bump_generation();
+            self.recovery.set_ufs_caught_up(false);
+        });
+        self.ufs_wake.notify_one();
         if !self.has_apply_worker {
-            if role != StateRole::Leader {
-                self.journal_writer.fence_metadata();
-            }
             if role == StateRole::Leader {
                 self.catch_up_committed_metadata().await?;
+                if self.group_size > 1 {
+                    let negotiator = self.clone();
+                    tokio::spawn(async move {
+                        negotiator.negotiate_record_format().await;
+                    });
+                } else {
+                    self.negotiate_record_format().await;
+                }
+                if !self.journal_writer.unfence_metadata_if_epoch(epoch, || {}) {
+                    return Err("leader promotion superseded by a newer metadata fence"
+                        .to_string()
+                        .into());
+                }
+            } else {
+                curvine_model::persist_children_count(false);
             }
             return Ok(());
         }
         let (tx, rx) = CallChannel::channel();
-        self.sender.send(ApplyMsg::RoleChange((role, tx))).await?;
+        self.sender
+            .send(ApplyMsg::RoleChange((role, epoch, tx)))
+            .await?;
         rx.receive().await?
     }
 
     async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
-        if !self.has_apply_worker {
-            return self.create_snapshot0(None);
-        }
-        let (tx, rx) = CallChannel::channel();
-        let msg = ApplyMsg::CreateSnapshot(tx);
-
-        self.sender.send(msg).await?;
-        rx.receive().await?
+        // The task retains the fence until the queued snapshot completes even
+        // if the caller drops its future after sending the apply message.
+        let loader = self.clone();
+        tokio::spawn(async move {
+            // In-flight commits may need the apply worker, so drain elsewhere.
+            let gate = loader.metadata_commit_gate.clone();
+            let _barrier = tokio::task::spawn_blocking(move || gate.close_and_wait_owned())
+                .await
+                .map_err(|error| RaftError::from(error.to_string()))?;
+            if !loader.has_apply_worker {
+                return loader.create_snapshot0(None);
+            }
+            let (tx, rx) = CallChannel::channel();
+            loader.sender.send(ApplyMsg::CreateSnapshot(tx)).await?;
+            rx.receive().await?
+        })
+        .await
+        .map_err(|error| RaftError::from(error.to_string()))?
     }
 
     async fn apply_snapshot(&self, snapshot: SnapshotData) -> RaftResult<()> {
+        // Admitted writers finish only after their Raft commit, and a commit
+        // response waits on the apply worker. Draining them here — in the Raft
+        // job executor — would therefore deadlock if the barrier ran inside
+        // the apply worker. Close the gate in the caller, keep it closed while
+        // the worker replaces metadata, and release it after completion.
+        let gate = self.metadata_commit_gate.clone();
+        let _barrier = tokio::task::spawn_blocking(move || gate.close_and_wait_owned())
+            .await
+            .map_err(|error| RaftError::from(error.to_string()))?;
         if !self.has_apply_worker {
             return self.apply_snapshot0(snapshot);
         }
@@ -1675,6 +2146,10 @@ impl AppStorage for JournalLoader {
         Ok(fs_dir.get_checkpoint_path(snapshot_id))
     }
 }
+
+#[cfg(test)]
+#[path = "tests/journal_watermark_test.rs"]
+mod journal_watermark_test;
 
 #[cfg(test)]
 mod tests {

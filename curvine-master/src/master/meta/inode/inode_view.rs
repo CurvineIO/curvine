@@ -267,7 +267,7 @@ impl InodeView {
     }
 
     // Test and print for use.
-    pub fn children(&self) -> Vec<InodePtr> {
+    pub fn children(&self) -> Vec<InodeView> {
         if let Dir(d) = self {
             return d.children_handle().list_options(&ListOptions::default());
         }
@@ -338,8 +338,7 @@ impl InodeView {
                 f.update_ctime(ctime);
             }
             Dir(d) => {
-                d.nlink += 1;
-                d.update_ctime(ctime);
+                let _ = d.apply_nlink_delta(1, ctime);
             }
             FileEntry(..) => (),
         }
@@ -354,10 +353,7 @@ impl InodeView {
                 }
             }
             Dir(d) => {
-                if d.nlink > 0 {
-                    d.nlink -= 1;
-                    d.update_ctime(ctime);
-                }
+                let _ = d.apply_nlink_delta(-1, ctime);
             }
             FileEntry(..) => (),
         }
@@ -412,6 +408,52 @@ impl InodeView {
             Dir(d) => Some(d.children_handle()),
             _ => None,
         }
+    }
+
+    pub(crate) fn directory_attribute_delta(
+        &self,
+        delta: curvine_model::DirectoryAttributeDelta,
+    ) -> curvine_model::DirectoryAttributeDelta {
+        match self {
+            Dir(d) => d.dir.directory_attribute_delta(delta),
+            _ => delta,
+        }
+    }
+
+    pub(crate) fn directory_attributes(&self) -> curvine_model::DirectoryAttributes {
+        match self {
+            Dir(d) => d.dir.directory_attributes(),
+            _ => curvine_model::DirectoryAttributes::new(
+                self.mtime(),
+                self.ctime(),
+                self.nlink().unwrap_or(0),
+            ),
+        }
+    }
+
+    pub(crate) fn set_directory_attributes(
+        &self,
+        attributes: curvine_model::DirectoryAttributes,
+    ) {
+        if let Dir(d) = self {
+            d.dir.set_directory_attributes(attributes);
+        }
+    }
+
+    pub(crate) fn mark_directory_attributes_persisted(&self) {
+        if let Dir(d) = self {
+            d.dir.mark_directory_attributes_persisted();
+        }
+    }
+
+    pub(crate) fn apply_directory_attribute_delta(
+        &self,
+        delta: curvine_model::DirectoryAttributeDelta,
+    ) -> CommonResult<()> {
+        if let Dir(d) = self {
+            d.dir.apply_directory_attribute_delta(delta)?;
+        }
+        Ok(())
     }
 
     pub fn as_file_ref(&self) -> CommonResult<&InodeFile> {
@@ -691,10 +733,10 @@ impl InodeView {
     pub fn sum_hash(&self) -> CommonResult<u128> {
         let mut res: u128 = 0;
         let mut stack = LinkedList::new();
-        stack.push_back(InodePtr::from_ref(self));
+        stack.push_back(self.clone());
 
         while let Some(v) = stack.pop_front() {
-            let bytes = MetadataCodec::encode(v.as_ref())?;
+            let bytes = MetadataCodec::encode(&v)?;
             if !v.is_root() {
                 let hash = Utils::crc32(&bytes) as u128;
                 res += hash

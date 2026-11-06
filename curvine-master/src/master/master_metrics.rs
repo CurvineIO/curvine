@@ -216,6 +216,13 @@ pub struct MasterMetrics {
     pub(crate) dir_space_scan_inodes: GaugeVec,
     pub(crate) dir_space_scan_edges: GaugeVec,
     pub(crate) dir_space_scan_anomalies: GaugeVec,
+
+    // Sharded-lock health (design doc §11.2): how long acquiring a path/inode
+    // or block-location lock takes, by request mode. A growing tail here is
+    // the observable signal for a hot directory or a stalled lock holder;
+    // counts stay bounded because the histogram has fixed buckets.
+    pub(crate) inode_lock_acquire_us: HistogramVec,
+    pub(crate) block_lock_acquire_us: HistogramVec,
 }
 
 impl MasterMetrics {
@@ -477,6 +484,20 @@ impl MasterMetrics {
                 "dir_space_scan_anomalies",
                 "Anomalies recorded by the last successful dir-space scan round, labelled by scope",
                 &["scope"],
+            )?,
+
+            inode_lock_acquire_us: m::new_histogram_vec_with_buckets(
+                "inode_lock_acquire_us",
+                "Microseconds to acquire inode/path locks by mode (read/write)",
+                &["mode"],
+                &buckets,
+            )?,
+
+            block_lock_acquire_us: m::new_histogram_vec_with_buckets(
+                "block_lock_acquire_us",
+                "Microseconds to acquire block-location locks by mode (read/write)",
+                &["mode"],
+                &buckets,
             )?,
         };
 

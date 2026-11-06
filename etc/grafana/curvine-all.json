@@ -3263,6 +3263,76 @@
     {
       "datasource": {
         "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "含义：Master 分片 inode/path 锁与块位置锁的单次获取耗时（微秒，按模式 read/write 分桶）。\n趋势：P99 上升表示存在热点目录或锁持有者卡住；持续分钟级上升要对照目录锁阻塞与命名空间规模。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "lines",
+            "lineWidth": 1,
+            "showPoints": "never"
+          },
+          "unit": "µs",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 10000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 99001,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, mode) (rate(inode_lock_acquire_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\"}[$interval])))",
+          "legendFormat": "inode {{mode}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, mode) (rate(block_lock_acquire_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\"}[$interval])))",
+          "legendFormat": "block {{mode}}",
+          "refId": "B"
+        }
+      ],
+      "title": "分片锁获取 P99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
         "uid": "${datasource}"
       },
       "description": "含义：目录数、文件数、块数随时间的变化。\n趋势：稳定斜线上升是正常增长。断崖下跌要确认删除任务，或 Master 指标重置。",

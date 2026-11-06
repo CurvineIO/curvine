@@ -19,6 +19,7 @@ use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
 use crate::raft::recovery::{PeerSessions, Recovery, SessionEvent};
 use crate::raft::storage::{AppStorage, ApplyMsg, LogStorage, PeerStorage};
+use crate::raft::RECORD_FORMAT_READABLE;
 use crate::raft::*;
 use crate::utils::SerdeUtils;
 use curvine_core_error::{err_ext, ErrorExt};
@@ -98,6 +99,7 @@ where
     last_snapshot_ms: u64,
 
     last_snapshot_op_id: u64,
+    snapshot_retry_pending: bool,
 }
 
 impl<A, B> RaftNode<A, B>
@@ -167,6 +169,7 @@ where
             snapshot_entries,
             last_snapshot_ms: LocalTime::mills(),
             last_snapshot_op_id,
+            snapshot_retry_pending: false,
         };
 
         Ok(node)
@@ -200,9 +203,10 @@ where
             }
 
             Some(mut snapshot) => {
-                snapshot.mut_metadata().mut_conf_state().voters = voters;
                 // app store app snapshot.
                 let mut data: SnapshotData = SnapshotData::decode(snapshot.get_data())?;
+                PeerStorage::<A, B>::validate_snapshot(&snapshot, &data)?;
+                snapshot.mut_metadata().mut_conf_state().voters = voters;
 
                 info!(
                     "install snapshot start, node id: {}, node addr {}, dir: {}, fsm_state {:?}",
@@ -221,7 +225,6 @@ where
                 data = fetcher.fetch().await?;
                 data.node_id = ps.id;
 
-                // log store application snapshot.
                 snapshot.data = data.encode_to_vec();
                 ps.log_store.apply_snapshot(snapshot.clone())?;
                 ps.app_store.apply_snapshot(data).await?;
@@ -562,6 +565,7 @@ where
         let header = PingResponse {
             leader_id: self.leader(),
             group: self.group.to_proto(),
+            reader_format: Some(RECORD_FORMAT_READABLE),
         };
         let msg = Builder::success(&env.msg).proto_header(header).build();
 
@@ -986,6 +990,8 @@ where
     }
 
     fn anchor_snapshot_markers(&mut self) {
+        self.snapshot_retry_pending = false;
+        self.storage.take_snapshot_retry();
         self.last_snapshot_op_id = self.storage.get_fsm_state().op_id();
         self.last_snapshot_ms = LocalTime::mills();
     }
@@ -1000,22 +1006,29 @@ where
             return Ok(());
         }
 
+        self.snapshot_retry_pending |= self.storage.take_snapshot_retry();
         let now = LocalTime::mills();
-        if self.last_snapshot_op_id > 0
-            && now.saturating_sub(self.last_snapshot_ms) < self.snapshot_min_interval_ms
-        {
+        let elapsed = now.saturating_sub(self.last_snapshot_ms);
+        // A rejected snapshot must retry even without new writes, but never in a tight loop.
+        if self.snapshot_retry_pending && elapsed < self.snapshot_min_interval_ms.max(1_000) {
+            return Ok(());
+        }
+        if self.last_snapshot_op_id > 0 && elapsed < self.snapshot_min_interval_ms {
             return Ok(());
         }
 
         let last_op_id = self.storage.get_fsm_state().op_id();
         let diff = last_op_id.saturating_sub(self.last_snapshot_op_id);
-        if (now.saturating_sub(self.last_snapshot_ms) > self.snapshot_interval_ms && diff > 0)
+        if self.snapshot_retry_pending
+            || (elapsed > self.snapshot_interval_ms && diff > 0)
             || diff > self.snapshot_entries
         {
-            self.storage.gen_create_snapshot_job()?;
-
+            let started = self.storage.gen_create_snapshot_job()?;
+            self.snapshot_retry_pending = !started;
             self.last_snapshot_ms = now;
-            self.last_snapshot_op_id = last_op_id;
+            if started {
+                self.last_snapshot_op_id = last_op_id;
+            }
         }
 
         Ok(())

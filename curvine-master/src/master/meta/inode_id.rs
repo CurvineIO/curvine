@@ -73,6 +73,18 @@ impl InodeId {
         self.0.get()
     }
 
+    /// Advances the allocation watermark without moving it backwards if
+    /// concurrent allocations or replay have already passed `value`.
+    pub fn advance_to(&self, value: i64) {
+        let mut current = self.current();
+        while value > current {
+            if self.0.compare_and_set(current, value) {
+                return;
+            }
+            current = self.current();
+        }
+    }
+
     pub fn reset(&self, new_value: i64) -> CommonResult<()> {
         loop {
             let c = self.current();

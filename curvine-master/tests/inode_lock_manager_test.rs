@@ -1,5 +1,6 @@
 use curvine_master::master::meta::{InodeLockManager, InodeLockRequest};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -33,6 +34,65 @@ fn duplicate_requests_are_merged_with_write_access() {
     ]);
     assert!(guard.covers_request(InodeLockRequest::write(0, 42)));
     assert!(!guard.covers_request(InodeLockRequest::read(0, 43)));
+}
+
+#[test]
+fn coverage_handles_sorted_lock_ids_and_modes() {
+    let manager = InodeLockManager::new(2);
+    let guard = manager.lock_many(&[
+        InodeLockRequest::read(2, 99),
+        InodeLockRequest::write(1, -7),
+        InodeLockRequest::read(0, 42),
+        InodeLockRequest::write(2, 99),
+    ]);
+    assert!(guard.covers_requests(&[
+        InodeLockRequest::read(8, -7),
+        InodeLockRequest::read(1, 42),
+        InodeLockRequest::write(0, 99),
+    ]));
+    assert!(!guard.covers_request(InodeLockRequest::write(0, 42)));
+    for id in [-8, 0, 43, 100] {
+        assert!(!guard.covers_request(InodeLockRequest::read(0, id)));
+    }
+    assert!(manager.lock_many(&[]).covers_requests(&[]));
+}
+
+#[test]
+fn opposite_path_orders_do_not_deadlock() {
+    let locks = Arc::new(InodeLockManager::new(1));
+    let start = Arc::new(Barrier::new(3));
+    let active = Arc::new(AtomicUsize::new(0));
+    let (done_tx, done_rx) = mpsc::channel();
+    let mut workers = Vec::new();
+    for reverse in [false, true] {
+        let locks = locks.clone();
+        let start = start.clone();
+        let active = active.clone();
+        let done = done_tx.clone();
+        workers.push(thread::spawn(move || {
+            start.wait();
+            for _ in 0..1_000 {
+                let requests = if reverse {
+                    [InodeLockRequest::write(0, 2), InodeLockRequest::write(1, 1)]
+                } else {
+                    [InodeLockRequest::write(0, 1), InodeLockRequest::write(1, 2)]
+                };
+                let _guard = locks.lock_many(&requests);
+                assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+            }
+            done.send(()).unwrap();
+        }));
+    }
+    start.wait();
+    for _ in 0..2 {
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("opposite lock requests deadlocked");
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
 }
 
 #[test]

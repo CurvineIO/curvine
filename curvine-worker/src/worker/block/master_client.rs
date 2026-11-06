@@ -182,6 +182,7 @@ impl MasterClient {
             full_report: true,
             total_len: total_size as u64,
             report_id: Some(report_id),
+            full_report_begin: None,
             blocks: vec![],
         };
 
@@ -208,6 +209,26 @@ impl MasterClient {
         Ok(rep_header)
     }
 
+    /// Sends a harmless incremental empty request before taking the local full
+    /// report snapshot. Older Masters ignore the optional field and reply
+    /// without the optional acknowledgement, so callers can retain the legacy
+    /// reporting path during a rolling upgrade.
+    pub fn begin_full_block_report(&self, report_id: u64) -> CommonResult<BlockReportListResponse> {
+        let req = BlockReportListRequest {
+            cluster_id: self.cluster_id.clone(),
+            worker_id: self.worker_id,
+            worker_session_id: Some(self.worker_session_id.clone()),
+            full_report: false,
+            total_len: 0,
+            report_id: Some(report_id),
+            full_report_begin: Some(true),
+            blocks: vec![],
+        };
+        Ok(self
+            .fs_client
+            .rpc_blocking(RpcCode::WorkerBlockReport, req)?)
+    }
+
     pub fn incr_block_report(
         &self,
         blocks: &[BlockReportInfo],
@@ -219,6 +240,7 @@ impl MasterClient {
             full_report: false,
             total_len: blocks.len() as u64,
             report_id: None,
+            full_report_begin: None,
             blocks: vec![],
         };
 

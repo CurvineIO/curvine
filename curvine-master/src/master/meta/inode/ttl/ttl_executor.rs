@@ -73,7 +73,7 @@ impl InodeTtlExecutor {
 
     fn is_empty_dir(&self, path: &str) -> FsResult<bool> {
         let fs_dir = self.filesystem.fs_dir();
-        let fs_dir_guard = fs_dir.read();
+        let fs_dir_guard = fs_dir.write();
         let inp = InodePath::resolve(fs_dir_guard.root_ptr(), path, &fs_dir_guard.store)?;
         Ok(inp.is_empty_dir())
     }
@@ -116,6 +116,11 @@ impl InodeTtlExecutor {
             return Ok((true, inode, 0));
         }
 
+        if matches!(&inode, InodeView::File(file) if file.is_writing()) {
+            debug!("skip ttl action for in-use file {}", inode_id);
+            return Ok((false, inode, 0));
+        }
+
         if !inode.is_expired()? {
             return Ok((false, inode, 0));
         }
@@ -147,6 +152,12 @@ impl InodeTtlExecutor {
                 // Unlinking one name of a hard-linked file keeps the shared
                 // blocks, so only the last link reclaims the file size. A staged
                 // async purge has not reclaimed anything yet either.
+                let Some((_, inode)) =
+                    self.filesystem
+                        .delete_expired_inode(&path, inode_id, delete_mode)?
+                else {
+                    return Ok((false, inode, 0));
+                };
                 let reclaimed = match &inode {
                     InodeView::File(f)
                         if f.nlink() <= 1 && !matches!(delete_mode, DeleteMode::AsyncPurge) =>
@@ -155,17 +166,20 @@ impl InodeTtlExecutor {
                     }
                     _ => 0,
                 };
-                self.filesystem.delete_with_mode(&path, true, delete_mode)?;
                 debug!("ttl delete {} {:?}", path, inode);
                 Ok((true, inode, reclaimed))
             }
             TtlAction::Free => {
+                let Some((outcome, inode)) = self.filesystem.free_expired_inode(&path, inode_id)?
+                else {
+                    return Ok((false, inode, 0));
+                };
                 let reclaimed = match &inode {
                     InodeView::File(f) => f.len.max(0),
                     _ => 0,
                 };
 
-                match self.filesystem.free_or_defer(&path, true)? {
+                match outcome {
                     FreeOutcome::Freed(_) => {
                         debug!("ttl free {} {:?}", path, inode);
                         Ok((true, inode, reclaimed))

@@ -147,10 +147,19 @@ message BlockReportListRequest {
     // Session that produced this report. Lets the master attribute blocks to the
     // reporting session and recover replicas after a worker restart.
     optional string worker_session_id = 7 [default = ""];
+    // Sent before taking a full-report snapshot. It is deliberately an
+    // incremental empty request so older Masters handle it harmlessly.
+    optional bool full_report_begin = 8 [default = false];
 }
 
 message BlockReportListResponse {
     repeated WorkerCommandProto cmds = 1;
+    // Presence distinguishes a Master that understands the pre-snapshot
+    // handshake from an older Master that silently ignores the request field.
+    optional bool full_report_begin_accepted = 2;
+    // The snapshot was invalidated after its begin handshake. The Worker must
+    // allocate a new report id, take a new snapshot, and start again.
+    optional bool restart_full_report = 3;
 }
 
 message WriteCommitRequest {

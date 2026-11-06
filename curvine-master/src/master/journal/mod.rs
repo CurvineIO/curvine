@@ -49,3 +49,7 @@ mod free_reconcile_test;
 #[cfg(test)]
 #[path = "tests/journal_entry_proto_test.rs"]
 mod journal_entry_proto_test;
+
+#[cfg(test)]
+#[path = "tests/directory_attribute_recovery_test.rs"]
+mod directory_attribute_recovery_test;

@@ -278,6 +278,7 @@ impl JournalSystem {
     }
 
     pub fn from_conf(conf: &ClusterConf) -> FsResult<Self> {
+        JournalLoader::validate_conf(&conf.journal)?;
         // Check the persistent marker before any directory formatting, even if
         // the configuration flag was removed during an interrupted recovery.
         let local_id = conf.journal.node_id()?;
@@ -299,6 +300,18 @@ impl JournalSystem {
         if conf.format_master && FileUtils::exists(&db_conf.data_dir) {
             FileUtils::delete_path(&db_conf.data_dir, true)?;
         }
+
+        // Local rows may contain uncommitted mutations (rows materialize
+        // before the Raft commit receipt). Without a registered snapshot the
+        // committed log alone rebuilds the namespace; see the method docs for
+        // the convergence argument.
+        JournalLoader::maybe_reset_namespace_for_replay(
+            &log_store,
+            db_conf,
+            &conf.journal,
+            recovering,
+            conf.format_master,
+        )?;
 
         let role_monitor = RoleMonitor::new();
         let master_monitor = MasterMonitor::new(role_monitor.read_ctl(), StateCtl::new(0));
@@ -366,7 +379,12 @@ impl JournalSystem {
             job_manager,
         } = self;
 
-        let _ = rt.block_on(raft_journal.app_store().shutdown());
+        if let Err(error) = rt.block_on(raft_journal.app_store().shutdown()) {
+            log::error!(
+                "failed to stop journal application and UFS replay: {}",
+                error
+            );
+        }
         drop(fs);
         drop(worker_manager);
         drop(raft_journal);
@@ -391,6 +409,13 @@ impl JournalSystem {
     #[doc(hidden)]
     pub fn journal_loader(&self) -> JournalLoader {
         self.raft_journal.app_store().clone()
+    }
+
+    /// Test access to the Raft log store for fixtures that must register a
+    /// snapshot the way a real installation would.
+    #[doc(hidden)]
+    pub fn raft_journal_for_test(&self) -> &MetaRaftJournal {
+        &self.raft_journal
     }
 
     #[doc(hidden)]

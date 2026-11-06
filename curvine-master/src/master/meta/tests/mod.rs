@@ -1,0 +1,5 @@
+mod directory_attribute_corruption_test;
+mod directory_attribute_state_test;
+mod inode_lock_pool_test;
+mod inode_snapshot_corruption_test;
+mod metadata_replica_reader_test;

@@ -1,6 +1,6 @@
 use curvine_proto::{
-    BlockReportListRequest, ComponentInfoProto, HeartbeatStatusProto, WorkerAddressProto,
-    WorkerHeartbeatRequest, WorkerInfoProto,
+    BlockReportListRequest, BlockReportListResponse, ComponentInfoProto, HeartbeatStatusProto,
+    WorkerAddressProto, WorkerCommandProto, WorkerHeartbeatRequest, WorkerInfoProto,
 };
 use prost::Message;
 
@@ -59,6 +59,13 @@ struct LegacyBlockReportListRequest {
     full_report: bool,
     #[prost(uint64, required, tag = "4")]
     total_len: u64,
+}
+
+/// A legacy master's response before full-report handshake fields existed.
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct LegacyBlockReportListResponse {
+    #[prost(message, repeated, tag = "1")]
+    cmds: Vec<WorkerCommandProto>,
 }
 
 /// Append a raw varint field (field number, wire type 0) to a wire buffer.
@@ -162,6 +169,7 @@ fn test_block_report_session_is_backward_compatible() {
         full_report: true,
         total_len: 0,
         report_id: Some(42),
+        full_report_begin: Some(true),
         blocks: vec![],
     };
     let decoded = BlockReportListRequest::decode(request.encode_to_vec().as_slice()).unwrap();
@@ -169,6 +177,25 @@ fn test_block_report_session_is_backward_compatible() {
     // Session ownership and report-round identity travel together: the master
     // needs both to attribute a resent batch to the right attempt.
     assert_eq!(decoded.report_id, Some(42));
+    assert_eq!(decoded.full_report_begin, Some(true));
+
+    // New worker -> old master: unknown optional fields are ignored while the
+    // original report still decodes, so the worker can fall back to legacy
+    // upload when the acknowledgement is absent.
+    let legacy_decoded =
+        LegacyBlockReportListRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(legacy_decoded.cluster_id, "test-cluster");
+    assert_eq!(legacy_decoded.worker_id, 7);
+    assert!(legacy_decoded.full_report);
+    assert_eq!(legacy_decoded.total_len, 0);
+
+    // Old master -> new worker: absence, rather than `false`, means the
+    // handshake is not supported and the worker keeps the legacy path.
+    let legacy_response = LegacyBlockReportListResponse { cmds: vec![] };
+    let decoded_response =
+        BlockReportListResponse::decode(legacy_response.encode_to_vec().as_slice()).unwrap();
+    assert!(decoded_response.full_report_begin_accepted.is_none());
+    assert!(decoded_response.restart_full_report.is_none());
 
     let legacy = LegacyBlockReportListRequest {
         cluster_id: "test-cluster".to_string(),
@@ -178,6 +205,7 @@ fn test_block_report_session_is_backward_compatible() {
     };
     let decoded = BlockReportListRequest::decode(legacy.encode_to_vec().as_slice()).unwrap();
     assert!(decoded.worker_session_id.is_none());
+    assert!(decoded.full_report_begin.is_none());
     assert!(
         decoded.report_id.is_none(),
         "a legacy report carries no round id"

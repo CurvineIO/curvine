@@ -23,28 +23,47 @@
 
 use super::sharded_children::{min_sharded_children, ShardedChildren};
 use super::{InodeChildren, InodePtr, InodeView};
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_model::ListOptions;
 use glob::Pattern;
 use parking_lot::{RwLock, RwLockWriteGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-/// Odd while a mutation is inside the lock, even when quiescent: a reader
-/// that captured `version()` before touching children can detect overlap by
-/// re-reading an even value with the same number.
+/// Atomically tracks a directory-wide generation and in-flight writers.
+/// Different shards can mutate simultaneously, so parity alone is insufficient.
+/// The low 16 bits count writers; the upper 48 bits advance on every entry and
+/// exit. Overflow fails closed instead of letting an old version become valid.
 #[derive(Debug, Default)]
 pub(crate) struct SequenceState {
     value: AtomicU64,
 }
 
 impl SequenceState {
+    const WRITER_BITS: u32 = 16;
+    const WRITER_MASK: u64 = (1 << Self::WRITER_BITS) - 1;
+    const GENERATION_STEP: u64 = 1 << Self::WRITER_BITS;
+
     pub(crate) fn begin(&self) {
-        self.value.fetch_add(1, Ordering::AcqRel);
+        self.value
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                if value & Self::WRITER_MASK == Self::WRITER_MASK {
+                    return None;
+                }
+                value.checked_add(Self::GENERATION_STEP + 1)
+            })
+            .expect("directory sequence writer count or generation overflow");
     }
 
     pub(crate) fn finish(&self) {
-        self.value.fetch_add(1, Ordering::Release);
+        self.value
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                if value & Self::WRITER_MASK == 0 {
+                    return None;
+                }
+                value.checked_add(Self::GENERATION_STEP - 1)
+            })
+            .expect("directory sequence writer underflow or generation overflow");
     }
 
     pub(crate) fn version(&self) -> u64 {
@@ -52,8 +71,7 @@ impl SequenceState {
     }
 
     pub(crate) fn is_current(&self, version: u64) -> bool {
-        let current = self.value.load(Ordering::Acquire);
-        current.is_multiple_of(2) && current == version
+        version & Self::WRITER_MASK == 0 && self.value.load(Ordering::Acquire) == version
     }
 }
 
@@ -77,6 +95,9 @@ impl Drop for WriteSequence<'_> {
 pub struct DirectoryChildren {
     sequence: SequenceState,
     children: RwLock<InodeChildren>,
+    // Promotion changes the representation, not the names that can be
+    // reloaded into the original Packed container after a restart.
+    packed_names: bool,
     /// Created on first promotion; `ready` only flips inside the single-index
     /// write lock, so readers racing the promotion re-read after their
     /// fallback lock and never observe a half-filled shard table.
@@ -94,17 +115,17 @@ impl std::fmt::Debug for DirectoryChildren {
 
 impl Default for DirectoryChildren {
     fn default() -> Self {
-        Self {
-            sequence: SequenceState::default(),
-            children: RwLock::new(InodeChildren::default()),
-            shards: OnceLock::new(),
-        }
+        Self::with_container(InodeChildren::default())
     }
 }
 
 enum MutationGuard<'a> {
     Single(RwLockWriteGuard<'a, InodeChildren>),
-    Shard(RwLockWriteGuard<'a, InodeChildren>),
+    Shard {
+        children: RwLockWriteGuard<'a, InodeChildren>,
+        index: usize,
+        count: usize,
+    },
 }
 
 enum RenameMutationGuard<'a> {
@@ -114,6 +135,7 @@ enum RenameMutationGuard<'a> {
         second: Option<RwLockWriteGuard<'a, InodeChildren>>,
         shard_count: usize,
         first_index: usize,
+        second_index: Option<usize>,
     },
 }
 
@@ -125,6 +147,7 @@ enum RenameMutationGuard<'a> {
 /// plus the sequence bump for the whole mutation.
 pub struct DirectoryMutation<'a> {
     children: MutationGuard<'a>,
+    packed_names: bool,
     _sequence: WriteSequence<'a>,
 }
 
@@ -137,6 +160,7 @@ impl DirectoryChildren {
     pub fn with_container(children: InodeChildren) -> Self {
         Self {
             sequence: SequenceState::default(),
+            packed_names: matches!(children, InodeChildren::Packed(_)),
             children: RwLock::new(children),
             shards: OnceLock::new(),
         }
@@ -178,15 +202,36 @@ impl DirectoryChildren {
         sharded.mark_ready();
     }
 
+    /// Pre-create shard routing for bulk restore. Concurrent or earlier
+    /// insertions are migrated under the same lock as runtime promotion.
+    pub fn seed_shards_for_bulk_load(&self, expected_children: usize) {
+        if expected_children < min_sharded_children() || self.sharded().is_some() {
+            return;
+        }
+        let mut children = self.children.write();
+        if self.sharded().is_none() {
+            if children.is_empty() {
+                self.shards.get_or_init(ShardedChildren::new).mark_ready();
+            } else {
+                self.promote_to_shards(&mut children);
+            }
+        }
+    }
+
     /// Begin a dentry mutation. Large contended directories promote to shards
     /// here; the returned guard owns one shard write lock, so independent
     /// dentries in different shards mutate concurrently once promoted.
     pub fn begin_mutation(&self, child_name: &str) -> DirectoryMutation<'_> {
         if let Some(shards) = self.sharded() {
-            let shard = shards.shard(child_name);
-            let children = shard.children.write();
+            let index = shards.shard_index(child_name);
+            let children = shards.shard_at(index).children.write();
             return DirectoryMutation {
-                children: MutationGuard::Shard(children),
+                children: MutationGuard::Shard {
+                    children,
+                    index,
+                    count: shards.shards.len(),
+                },
+                packed_names: self.packed_names,
                 _sequence: WriteSequence::begin(&self.sequence),
             };
         }
@@ -204,6 +249,7 @@ impl DirectoryChildren {
 
         DirectoryMutation {
             children: MutationGuard::Single(children),
+            packed_names: self.packed_names,
             _sequence: WriteSequence::begin(&self.sequence),
         }
     }
@@ -237,7 +283,9 @@ impl DirectoryChildren {
                     second,
                     shard_count: shards.shards.len(),
                     first_index,
+                    second_index: (second_index != first_index).then_some(second_index),
                 },
+                packed_names: self.packed_names,
                 _sequence: WriteSequence::begin(&self.sequence),
             };
         }
@@ -255,6 +303,7 @@ impl DirectoryChildren {
 
         DirectoryRenameMutation {
             children: RenameMutationGuard::Single(children),
+            packed_names: self.packed_names,
             _sequence: WriteSequence::begin(&self.sequence),
         }
     }
@@ -286,8 +335,30 @@ impl DirectoryChildren {
         )
     }
 
-    /// Optimistic read protocol: the read is valid only when the sequence is
-    /// still even at the captured version (no mutation overlapping it).
+    /// Reads one child with an owned version token that remains valid after
+    /// this call returns. Topology readers use it instead of retaining a raw
+    /// child pointer beyond the directory read guard.
+    pub fn read_child_shared(
+        self: &std::sync::Arc<Self>,
+        name: &str,
+    ) -> (Option<InodeView>, DirectoryChildrenSharedVersion) {
+        let (view, version) = self.with_children_for_name(name, |children, name| {
+            (
+                children.get_child(name).map(|ptr| ptr.as_ref().clone()),
+                self.sequence.version(),
+            )
+        });
+        (
+            view,
+            DirectoryChildrenSharedVersion {
+                children: self.clone(),
+                version,
+            },
+        )
+    }
+
+    /// The captured generation is valid only when no writer was active and
+    /// no mutation has started or finished since it was captured.
     pub fn version_is(&self, version: &DirectoryReadVersion<'_>) -> bool {
         std::ptr::eq(version.children as *const _, self)
             && self.sequence.is_current(version.version)
@@ -299,6 +370,17 @@ impl DirectoryChildren {
         mutation.add_child(inode)
     }
 
+    pub(crate) fn validate_child_name(&self, name: &str) -> CommonResult<()> {
+        Self::validate_name(self.packed_names, name)
+    }
+
+    fn validate_name(packed_names: bool, name: &str) -> CommonResult<()> {
+        if packed_names && name.len() > super::PackedChildren::NAME_MAX {
+            return err_box!("destination name is too long for packed children");
+        }
+        Ok(())
+    }
+
     pub fn delete_child(&self, child_id: i64, child_name: &str) -> CommonResult<InodeView> {
         let mut mutation = self.begin_mutation(child_name);
         mutation.delete_child(child_id, child_name)
@@ -308,9 +390,15 @@ impl DirectoryChildren {
         self.with_children_for_name(name, |children, name| children.get_child(name))
     }
 
-    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodePtr> {
-        let mut out: Vec<InodePtr> = self
-            .read_all_guards(|children| children.get_child_by_glob_pattern(glob_pattern))
+    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodeView> {
+        let mut out: Vec<InodeView> = self
+            .read_all_guards(|children| {
+                children
+                    .get_child_by_glob_pattern(glob_pattern)
+                    .into_iter()
+                    .map(|child| child.as_ref().clone())
+                    .collect::<Vec<_>>()
+            })
             .into_iter()
             .flatten()
             .collect();
@@ -318,12 +406,28 @@ impl DirectoryChildren {
         out
     }
 
-    pub fn list_options(&self, opts: &ListOptions) -> Vec<InodePtr> {
-        let mut out: Vec<InodePtr> = self
-            .read_all_guards(|children| children.list_options(opts))
+    /// Returns owned entries captured while their shard read locks are held.
+    pub fn list_options(&self, opts: &ListOptions) -> Vec<InodeView> {
+        if opts.limit == Some(0) {
+            return Vec::new();
+        }
+        let mut out: Vec<InodeView> = self
+            .read_all_guards(|children| {
+                children
+                    .list_options(opts)
+                    .into_iter()
+                    .map(|child| child.as_ref().clone())
+                    .collect::<Vec<_>>()
+            })
             .into_iter()
             .flatten()
             .collect();
+        if let Some(limit) = opts.limit {
+            if limit < out.len() {
+                out.select_nth_unstable_by(limit, |left, right| left.name().cmp(right.name()));
+                out.truncate(limit);
+            }
+        }
         out.sort_unstable_by(|left, right| left.name().cmp(right.name()));
         out
     }
@@ -345,9 +449,14 @@ impl DirectoryChildren {
     }
 
     /// Owned snapshot of the children, sorted by name across shards.
-    pub(crate) fn read_all(&self) -> Vec<InodePtr> {
-        let mut out: Vec<InodePtr> = self
-            .read_all_guards(|children| children.iter().collect::<Vec<_>>())
+    pub(crate) fn read_all(&self) -> Vec<InodeView> {
+        let mut out: Vec<InodeView> = self
+            .read_all_guards(|children| {
+                children
+                    .iter()
+                    .map(|child| child.as_ref().clone())
+                    .collect::<Vec<_>>()
+            })
             .into_iter()
             .flatten()
             .collect();
@@ -370,26 +479,37 @@ impl DirectoryChildren {
 }
 
 impl DirectoryMutation<'_> {
-    pub fn add_child(&mut self, inode: InodeView) -> CommonResult<InodePtr> {
+    fn children_for_name(&mut self, name: &str) -> CommonResult<&mut InodeChildren> {
         match &mut self.children {
-            MutationGuard::Single(children) | MutationGuard::Shard(children) => {
-                children.add_child(inode)
+            MutationGuard::Single(children) => Ok(children),
+            MutationGuard::Shard {
+                children,
+                index,
+                count,
+            } => {
+                if super::sharded_children::shard_index(name, *count) != *index {
+                    return err_box!("mutation touches a shard without its write guard");
+                }
+                Ok(children)
             }
         }
     }
 
+    pub fn add_child(&mut self, inode: InodeView) -> CommonResult<InodePtr> {
+        DirectoryChildren::validate_name(self.packed_names, inode.name())?;
+        self.children_for_name(inode.name())?.add_child(inode)
+    }
+
     pub fn delete_child(&mut self, child_id: i64, child_name: &str) -> CommonResult<InodeView> {
-        match &mut self.children {
-            MutationGuard::Single(children) | MutationGuard::Shard(children) => {
-                children.delete_child(child_id, child_name)
-            }
-        }
+        self.children_for_name(child_name)?
+            .delete_child(child_id, child_name)
     }
 }
 
 /// Write window over one or two shards of the same directory.
 pub struct DirectoryRenameMutation<'a> {
     children: RenameMutationGuard<'a>,
+    packed_names: bool,
     _sequence: WriteSequence<'a>,
 }
 
@@ -410,6 +530,122 @@ impl DirectoryRenameMutation<'_> {
         }
     }
 
+    /// Same-window variant of [`Self::rename_child`] that inserts the fully
+    /// prepared `new_view` (name/ctime/xattr already applied by the caller)
+    /// instead of re-deriving it from the detached source.
+    pub fn rename_to(
+        &mut self,
+        source_id: i64,
+        source_name: &str,
+        replaced: Option<(i64, &str)>,
+        new_view: InodeView,
+    ) -> CommonResult<()> {
+        let destination_name = new_view.name().to_owned();
+        if source_name == destination_name {
+            return err_box!("source and destination names are identical");
+        }
+        if let RenameMutationGuard::Shards {
+            shard_count,
+            first_index,
+            second_index,
+            ..
+        } = &self.children
+        {
+            let locked = |name: &str| {
+                let index = super::sharded_children::shard_index(name, *shard_count);
+                index == *first_index || Some(index) == *second_index
+            };
+            if !locked(source_name)
+                || !locked(&destination_name)
+                || replaced.is_some_and(|(_, name)| !locked(name))
+            {
+                return err_box!("rename touches a shard without its write guard");
+            }
+        }
+        match self.child_view(source_name) {
+            Some(source) if source.id() == source_id => (),
+            _ => return err_box!("source edge {} changed before rename", source_name),
+        }
+        if let Some((replaced_id, replaced_name)) = replaced {
+            match self.child_view(replaced_name) {
+                Some(target) if target.id() == replaced_id => (),
+                _ => return err_box!("replacement edge {} changed before rename", replaced_name),
+            }
+        }
+        DirectoryChildren::validate_name(self.packed_names, &destination_name)?;
+        if let Some(target) = self.child_view(&destination_name) {
+            if !replaced.is_some_and(|(id, name)| name == destination_name && id == target.id()) {
+                return err_box!("destination edge {} already exists", destination_name);
+            }
+        }
+        match &mut self.children {
+            RenameMutationGuard::Single(children) => {
+                Self::apply_replace(children, source_id, source_name, replaced, new_view)
+            }
+            RenameMutationGuard::Shards {
+                first,
+                second,
+                shard_count,
+                first_index,
+                ..
+            } => {
+                let source_index = super::sharded_children::shard_index(source_name, *shard_count);
+                let destination_index =
+                    super::sharded_children::shard_index(&destination_name, *shard_count);
+                if let Some((replaced_id, replaced_name)) = replaced {
+                    let replaced_index =
+                        super::sharded_children::shard_index(replaced_name, *shard_count);
+                    let replaced_shard: &mut InodeChildren = if replaced_index == *first_index {
+                        first
+                    } else {
+                        second
+                            .as_mut()
+                            .expect("cross-shard rename must own both shard guards")
+                    };
+                    let _ = replaced_shard.delete_child(replaced_id, replaced_name)?;
+                }
+                let source_shard: &mut InodeChildren = if source_index == *first_index {
+                    first
+                } else {
+                    second
+                        .as_mut()
+                        .expect("cross-shard rename must own both shard guards")
+                };
+                // The detached source carries the live child index; a
+                // directory must keep it under its new name.
+                let detached = source_shard.delete_child(source_id, source_name)?;
+                let mut new_view = new_view;
+                new_view.adopt_directory_children(detached);
+                let destination_shard: &mut InodeChildren = if destination_index == *first_index {
+                    first
+                } else {
+                    second
+                        .as_mut()
+                        .expect("cross-shard rename must own both shard guards")
+                };
+                let _ = destination_shard.add_child(new_view)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_replace(
+        children: &mut InodeChildren,
+        source_id: i64,
+        source_name: &str,
+        replaced: Option<(i64, &str)>,
+        new_view: InodeView,
+    ) -> CommonResult<()> {
+        if let Some((replaced_id, replaced_name)) = replaced {
+            let _ = children.delete_child(replaced_id, replaced_name)?;
+        }
+        let detached = children.delete_child(source_id, source_name)?;
+        let mut new_view = new_view;
+        new_view.adopt_directory_children(detached);
+        let _ = children.add_child(new_view)?;
+        Ok(())
+    }
+
     /// Moves `source_name` to `destination_name` inside this directory.
     /// `replaced` deletes the overwrite target first, mirroring the store
     /// batch order of `apply_rename`. Each touched name routes to its own
@@ -420,24 +656,67 @@ impl DirectoryRenameMutation<'_> {
         source_id: i64,
         source_name: &str,
         replaced: Option<(i64, &str)>,
-        destination: InodeView,
+        destination_name: &str,
     ) -> CommonResult<()> {
+        if source_name == destination_name {
+            return err_box!("source and destination names are identical");
+        }
+        if replaced.is_some_and(|(_, name)| name != destination_name) {
+            return err_box!("replacement edge does not match destination name");
+        }
+        if let RenameMutationGuard::Shards {
+            shard_count,
+            first_index,
+            second_index,
+            ..
+        } = &self.children
+        {
+            let locked = |name: &str| {
+                let index = super::sharded_children::shard_index(name, *shard_count);
+                index == *first_index || Some(index) == *second_index
+            };
+            if !locked(source_name)
+                || !locked(destination_name)
+                || replaced.is_some_and(|(_, name)| !locked(name))
+            {
+                return err_box!("rename touches a shard without its write guard");
+            }
+        }
+        // Validate both edge identities before deleting either one. A stale
+        // source or replacement must not leave the directory half-mutated.
+        match self.child_view(source_name) {
+            Some(source) if source.id() == source_id => (),
+            _ => return err_box!("source edge {} changed before rename", source_name),
+        }
+        if let Some((replaced_id, replaced_name)) = replaced {
+            match self.child_view(replaced_name) {
+                Some(target) if target.id() == replaced_id => (),
+                _ => return err_box!("replacement edge {} changed before rename", replaced_name),
+            }
+        }
+        DirectoryChildren::validate_name(self.packed_names, destination_name)?;
+        if let Some(target) = self.child_view(destination_name) {
+            if !replaced.is_some_and(|(id, name)| name == destination_name && id == target.id()) {
+                return err_box!("destination edge {} already exists", destination_name);
+            }
+        }
         match &mut self.children {
             RenameMutationGuard::Single(children) => {
-                Self::apply_rename(children, source_id, source_name, replaced, destination)
+                Self::apply_rename(children, source_id, source_name, replaced, destination_name)
             }
             RenameMutationGuard::Shards {
                 first,
                 second,
                 shard_count,
                 first_index,
+                ..
             } => {
                 // Route each touched name to the shard guard this mutation
                 // already owns; reads use the same hash, so the routing is
                 // consistent with them.
                 let source_index = super::sharded_children::shard_index(source_name, *shard_count);
                 let destination_index =
-                    super::sharded_children::shard_index(destination.name(), *shard_count);
+                    super::sharded_children::shard_index(destination_name, *shard_count);
 
                 // Sequential scoped borrows: each shard guard is borrowed for
                 // exactly one operation, so the borrow checker sees disjoint
@@ -462,7 +741,8 @@ impl DirectoryRenameMutation<'_> {
                         .as_mut()
                         .expect("cross-shard rename must own both shard guards")
                 };
-                let _ = source_shard.delete_child(source_id, source_name)?;
+                let mut destination = source_shard.delete_child(source_id, source_name)?;
+                destination.change_name(destination_name.to_owned());
 
                 let destination_shard: &mut InodeChildren = if destination_index == *first_index {
                     first
@@ -482,12 +762,13 @@ impl DirectoryRenameMutation<'_> {
         source_id: i64,
         source_name: &str,
         replaced: Option<(i64, &str)>,
-        destination: InodeView,
+        destination_name: &str,
     ) -> CommonResult<()> {
         if let Some((replaced_id, replaced_name)) = replaced {
             let _ = children.delete_child(replaced_id, replaced_name)?;
         }
-        let _ = children.delete_child(source_id, source_name)?;
+        let mut destination = children.delete_child(source_id, source_name)?;
+        destination.change_name(destination_name.to_owned());
         let _ = children.add_child(destination)?;
         Ok(())
     }

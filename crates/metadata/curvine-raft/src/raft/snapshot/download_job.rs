@@ -20,9 +20,8 @@ use curvine_core_error::err_box;
 use curvine_io::DataSlice;
 use curvine_runtime::common::{ByteUnit, FileUtils, TimeSpent};
 use log::{debug, error, info};
-use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 use tokio::task::JoinSet;
 
 pub struct DownloadJob {
@@ -53,7 +52,33 @@ impl DownloadJob {
         }
     }
 
+    pub(crate) fn validate_files(files: &[SnapshotFileInfo]) -> RaftResult<()> {
+        let mut seen = HashSet::with_capacity(files.len());
+        for file in files {
+            let path = Path::new(&file.path);
+            if file.path.is_empty()
+                || !path
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+                || !seen.insert(path.to_path_buf())
+            {
+                return err_box!("invalid or duplicate snapshot file path: {:?}", file.path);
+            }
+        }
+        for path in &seen {
+            if path
+                .ancestors()
+                .skip(1)
+                .any(|parent| !parent.as_os_str().is_empty() && seen.contains(parent))
+            {
+                return err_box!("conflicting snapshot file path: {:?}", path);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn run(&mut self) -> RaftResult<String> {
+        Self::validate_files(&self.files.files)?;
         let dir = self.snapshot_dir.clone();
         match self.run0().await {
             Ok(_) => Ok(dir),
@@ -92,24 +117,37 @@ impl DownloadJob {
             self.files.dir, total, parallel, self.node_id
         );
 
-        let semaphore = Arc::new(Semaphore::new(parallel));
         let mut tasks: JoinSet<RaftResult<()>> = JoinSet::new();
+        let mut failure: Option<RaftError> = None;
 
         for file in self.files.files.iter().cloned() {
-            let path = self.get_write_path(&file)?;
+            if tasks.len() == parallel {
+                match tasks.join_next().await.expect("download task is present") {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        failure = Some(error);
+                        break;
+                    }
+                    Err(error) => {
+                        failure = Some(error.into());
+                        break;
+                    }
+                }
+            }
+            let path = match self.get_write_path(&file) {
+                Ok(path) => path,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
 
-            let semaphore = semaphore.clone();
             let client = self.client.clone();
             let dir = self.files.dir.clone();
             let node_id = self.node_id;
             let chunk_size = self.chunk_size;
 
             tasks.spawn(async move {
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| RaftError::from(format!("Snapshot download cancelled: {}", e)))?;
-
                 let writer = FileWriter::from_file(&path, chunk_size)?;
                 let client = client.create_snapshot_client(node_id).await?;
                 let client = SnapshotClient::new(dir, file, client);
@@ -118,7 +156,9 @@ impl DownloadJob {
             });
         }
 
-        let mut failure: Option<RaftError> = None;
+        if failure.is_some() {
+            tasks.abort_all();
+        }
         while let Some(joined) = tasks.join_next().await {
             let err = match joined {
                 Ok(Ok(())) => continue,
@@ -218,6 +258,21 @@ impl DownloadJob {
                         client.file_path(),
                         receiver_checksum
                     );
+                    // The transfer checksum only proves the wire round-trip;
+                    // the manifest checksum identifies the content itself, so a
+                    // tampered or stale source is rejected even when the transfer
+                    // was faithful.
+                    if let Some(expected) = client.file_checksum() {
+                        if expected != 0 && expected != receiver_checksum {
+                            return err_box!(
+                                "Snapshot file {} manifest checksum mismatch, \
+                                 expected {}, actual {}",
+                                client.file_path(),
+                                expected,
+                                receiver_checksum
+                            );
+                        }
+                    }
                     break;
                 } else {
                     return err_box!("Status Error");

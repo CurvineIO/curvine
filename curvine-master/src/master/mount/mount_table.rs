@@ -110,37 +110,21 @@ impl MountTable {
 
     //for new master node
     pub fn restore(&self) -> FsResult<()> {
-        let mounts = self.fs_dir.read().get_mount_table()?;
-        let version = self.fs_dir.read().get_mount_table_version()?;
+        let fs_dir = self.fs_dir.read();
+        let mounts = fs_dir.get_mount_table()?;
+        let version = fs_dir.get_mount_table_version()?;
         self.replace_with_mounts(mounts, version)
     }
 
     pub fn restore_best_effort(&self) {
-        let mounts = match self.fs_dir.read().get_mount_table() {
-            Ok(mounts) => mounts,
-            Err(e) => {
-                warn!("failed to restore mount table: {}", e);
-                return;
-            }
-        };
-        // Read before replace_with_mounts: that helper must stay pure
-        // in-memory, and this caller already held the fs_dir read guard above.
-        let version = match self.fs_dir.read().get_mount_table_version() {
-            Ok(version) => version,
-            Err(e) => {
-                warn!("failed to read mount table version: {}", e);
-                return;
-            }
-        };
-        if let Err(e) = self.replace_with_mounts(mounts, version) {
+        if let Err(e) = self.restore() {
             warn!("failed to restore mount table: {}", e);
         }
     }
 
     /// Replaces the in-memory table and snapshot with `mounts`. Pure
-    /// in-memory: never touches `fs_dir`, because callers (`restore`,
-    /// `restore_best_effort`) already hold or just released its guard and
-    /// `SyncFsDir` forbids re-entrancy.
+    /// in-memory: the caller holds the `fs_dir` read guard and `SyncFsDir`
+    /// forbids re-entrancy.
     fn replace_with_mounts(&self, mounts: Vec<MountInfo>, version: u64) -> FsResult<()> {
         let mut restored = MountTableInner {
             ufs2mountid: HashMap::new(),
@@ -173,9 +157,10 @@ impl MountTable {
             .values()
             .map(|m| Arc::new(m.clone()))
             .collect();
-        *self.write_snapshot()? = Arc::new(TableSnapshot { version, entries });
-
-        *self.write_inner()? = restored;
+        let mut inner = self.write_inner()?;
+        let mut snapshot = self.write_snapshot()?;
+        *inner = restored;
+        *snapshot = Arc::new(TableSnapshot { version, entries });
         Ok(())
     }
 
@@ -250,6 +235,7 @@ impl MountTable {
         ufs_path: &str,
         mnt_opt: &MountOptions,
     ) -> FsResult<()> {
+        let mut fs_dir = self.fs_dir.write();
         if self.exists(ufs_path)? {
             return err_box!("{} already exists in mount table", ufs_path);
         }
@@ -258,17 +244,21 @@ impl MountTable {
             return err_box!("{} already exists in mount table", cv_path);
         }
 
+        if self.has_mounted(mount_id)? {
+            return err_box!("mount id {} already exists in mount table", mount_id);
+        }
+
         self.check_conflict(cv_path, ufs_path)?;
 
         let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
         let version = self.unprotected_add_mount(info.clone())?;
 
-        let mut fs_dir = self.fs_dir.write();
         fs_dir.store_mount(info, true)?;
         fs_dir.save_mount_table_version(version)
     }
 
     pub fn update_mount(&self, info: MountInfo) -> FsResult<()> {
+        let mut fs_dir = self.fs_dir.write();
         let old = self.get_mount_info_by_id(info.mount_id)?;
         if old.cv_path != info.cv_path || old.ufs_path != info.ufs_path {
             return err_box!("cannot change mount path");
@@ -276,7 +266,6 @@ impl MountTable {
 
         let version = self.unprotected_add_mount(info.clone())?;
 
-        let mut fs_dir = self.fs_dir.write();
         fs_dir.store_mount(info, true)?;
         fs_dir.save_mount_table_version(version)
     }
@@ -294,6 +283,7 @@ impl MountTable {
     }
 
     pub fn umount(&self, mount_path: &str) -> FsResult<()> {
+        let mut fs_dir = self.fs_dir.write();
         let mount_id = {
             let inner = self.read_inner()?;
             match inner.mountpath2id.get(mount_path) {
@@ -304,7 +294,6 @@ impl MountTable {
 
         let version = self.unprotected_umount_by_id(mount_id)?;
 
-        let mut fs_dir = self.fs_dir.write();
         fs_dir.unmount(mount_id)?;
         fs_dir.save_mount_table_version(version)
     }

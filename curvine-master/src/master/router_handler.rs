@@ -29,6 +29,7 @@ use curvine_runtime::common::LocalTime;
 use curvine_web::router::RouterHandler;
 
 use crate::master::fs::MasterFilesystem;
+use crate::master::meta::inode::ROOT_INODE_NAME;
 use crate::master::MasterMetrics;
 
 #[derive(Clone)]
@@ -183,8 +184,10 @@ async fn browse(
     Query(params): Query<HashMap<String, String>>,
 ) -> FsResult<Json<Vec<FileStatus>>> {
     let fs = &instance.fs;
-    let root_path = fs.fs_dir.read().root_dir().name().to_string();
-    let path = params.get("path").unwrap_or(&root_path);
+    let path = params
+        .get("path")
+        .map(String::as_str)
+        .unwrap_or(ROOT_INODE_NAME);
     let files = fs.list_status(path)?;
     Ok(Json(files))
 }

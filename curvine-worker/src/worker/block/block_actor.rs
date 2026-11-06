@@ -30,7 +30,7 @@ use curvine_runtime::sync::StateCtl;
 use dashmap::{DashMap, DashSet};
 use log::{info, warn};
 use std::mem::size_of_val;
-use std::sync::atomic::{AtomicI64, AtomicUsize};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,6 +44,12 @@ const FULL_REPORT_MAX_ATTEMPTS: u32 = 3;
 const FULL_REPORT_RETRY_BASE: Duration = Duration::from_secs(1);
 /// Upper bound of the backoff between two attempts.
 const FULL_REPORT_RETRY_MAX: Duration = Duration::from_secs(10);
+/// A report invalidated after its begin handshake needs a new local snapshot.
+/// Bound restarts so a stream of concurrent replica completions cannot make
+/// worker startup retry forever.
+const FULL_REPORT_MAX_RESTARTS: u32 = 3;
+
+static NEXT_REPORT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Id shared by every batch of one full report round, so the master can tell a
 /// resent batch from the start of a new round. Never 0, which means "no id".
@@ -52,7 +58,19 @@ fn new_report_id() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(1);
-    nanos.max(1)
+    let mut previous = NEXT_REPORT_ID.load(Ordering::Relaxed);
+    loop {
+        let next = nanos.max(previous.saturating_add(1)).max(1);
+        match NEXT_REPORT_ID.compare_exchange_weak(
+            previous,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(current) => previous = current,
+        }
+    }
 }
 
 /// Whether a failed full block report batch may succeed when sent again.
@@ -236,45 +254,65 @@ impl BlockActor {
     }
 
     pub fn full_block_report(&self) -> CommonResult<usize> {
-        let blocks = self.store.all_blocks()?;
-        let report_id = new_report_id();
-        if blocks.is_empty() {
-            let response = self.send_full_report(report_id, 0, &[])?;
-            let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
-            HeartbeatTask::delete_block_task(
-                self.executor.clone(),
-                self.store.clone(),
-                cmds,
-                self.report_blocks.clone(),
-                self.pending_deletes.clone(),
-            );
-            return Ok(0);
+        for restart in 0..=FULL_REPORT_MAX_RESTARTS {
+            let report_id = new_report_id();
+            let begin = self.send_full_report_begin(report_id)?;
+            let supports_begin = begin.full_report_begin_accepted.is_some();
+            if begin.restart_full_report.unwrap_or(false) {
+                continue;
+            }
+            if supports_begin && !begin.full_report_begin_accepted.unwrap_or(false) {
+                return Err(FsError::common("master rejected full block report begin").into());
+            }
+
+            // The accepted handshake is ordered before this snapshot. A newer
+            // Master can therefore reject this round if replication completes
+            // while the local scan or batch uploads are in progress.
+            let blocks = self.store.all_blocks()?;
+            let mut off = 0;
+            let mut restart_requested = false;
+            loop {
+                let end = if blocks.is_empty() {
+                    0
+                } else {
+                    (off + self.block_report_limit).min(blocks.len())
+                };
+                let batch = &blocks[off..end];
+                let spend = TimeSpent::new();
+                let response = self.send_full_report(report_id, blocks.len(), batch)?;
+                if response.restart_full_report.unwrap_or(false) {
+                    restart_requested = true;
+                    break;
+                }
+                info!(
+                    "full block report, blocks={}, msg_bytes={}, used_ms={}",
+                    batch.len(),
+                    size_of_val(batch),
+                    spend.used_ms()
+                );
+                let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
+                HeartbeatTask::delete_block_task(
+                    self.executor.clone(),
+                    self.store.clone(),
+                    cmds,
+                    self.report_blocks.clone(),
+                    self.pending_deletes.clone(),
+                );
+                if blocks.is_empty() || end == blocks.len() {
+                    break;
+                }
+                off = end;
+            }
+
+            if !restart_requested {
+                return Ok(blocks.len());
+            }
+            if restart == FULL_REPORT_MAX_RESTARTS {
+                break;
+            }
         }
 
-        let mut off = 0;
-        while off < blocks.len() {
-            let end = (off + self.block_report_limit).min(blocks.len());
-            let batch = &blocks[off..end];
-            let spend = TimeSpent::new();
-            let response = self.send_full_report(report_id, blocks.len(), batch)?;
-            info!(
-                "full block report, blocks={}, msg_bytes={}, used_ms={}",
-                batch.len(),
-                size_of_val(batch),
-                spend.used_ms()
-            );
-            let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
-            HeartbeatTask::delete_block_task(
-                self.executor.clone(),
-                self.store.clone(),
-                cmds,
-                self.report_blocks.clone(),
-                self.pending_deletes.clone(),
-            );
-            off = end;
-        }
-
-        Ok(blocks.len())
+        Err(FsError::common("full block report repeatedly invalidated").into())
     }
 
     fn send_full_report(
@@ -288,6 +326,15 @@ impl BlockActor {
             || self.worker_ctl.state::<ServerState>() == ServerState::Stop,
             std::thread::sleep,
             || self.client.full_block_report(report_id, total_len, batch),
+        )
+    }
+
+    fn send_full_report_begin(&self, report_id: u64) -> CommonResult<BlockReportListResponse> {
+        send_with_retry(
+            "full block report begin",
+            || self.worker_ctl.state::<ServerState>() == ServerState::Stop,
+            std::thread::sleep,
+            || self.client.begin_full_block_report(report_id),
         )
     }
 

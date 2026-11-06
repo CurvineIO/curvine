@@ -13,7 +13,12 @@
 // limitations under the License.
 
 mod inode_store;
-pub use self::inode_store::{InodeStore, InodeStoreSnapshot, PurgeItem, PurgeTarget};
+pub use self::inode_store::{
+    InodeStore, InodeStoreSnapshot, JournalCursorStore, PurgeItem, PurgeTarget,
+};
 
 mod rocks_inode_store;
 pub use self::rocks_inode_store::*;
+
+mod store_path;
+pub use self::store_path::StoreResolvedPath;

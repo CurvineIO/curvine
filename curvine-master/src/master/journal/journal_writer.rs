@@ -36,36 +36,59 @@ use std::cell::RefCell;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+struct CommitScopeEntry {
+    writer: *const JournalWriter,
+    id: u64,
+    waiters: Vec<mpsc::Receiver<()>>,
+}
+
 thread_local! {
-    /// Commit waiters accumulated inside one `JournalCommitScope`. Entries
-    /// enqueued in the same scope share one notification round instead of one
-    /// blocking wait per entry.
-    static JOURNAL_COMMIT_SCOPES: RefCell<Vec<Vec<mpsc::Receiver<()>>>> =
-        const { RefCell::new(Vec::new()) };
+    static JOURNAL_COMMIT_SCOPES: RefCell<Vec<CommitScopeEntry>> = const { RefCell::new(Vec::new()) };
+    static NEXT_COMMIT_SCOPE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Waits for every journal entry enqueued inside the scope to be committed.
 /// A scope that never waits (journal disabled or no waiter recorded) is a
-/// no-op; dropping without `wait` discards the waiters so a lost confirmation
-/// cannot block an unrelated future scope.
-pub struct JournalCommitScope {
-    active: bool,
-    completed: bool,
+/// no-op. Dropping a scope with pending confirmations fences metadata writes:
+/// the mutation may already be durable locally while its Raft outcome is
+/// unknown.
+pub struct JournalCommitScope<'a> {
+    id: Option<u64>,
+    writer: Option<&'a JournalWriter>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-impl JournalCommitScope {
+impl JournalCommitScope<'_> {
     pub fn wait(mut self) -> FsResult<()> {
-        if !self.active {
+        let Some(id) = self.id.take() else {
             return Ok(());
-        }
-        let waiters = JOURNAL_COMMIT_SCOPES
-            .with(|scopes| scopes.borrow_mut().pop())
-            .unwrap_or_default();
-        self.completed = true;
+        };
+        let waiters = Self::remove(id);
+        let mut result = Ok(());
         for waiter in waiters {
-            Self::wait_for_commit(waiter)?;
+            if let Err(error) = Self::wait_for_commit(waiter) {
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
         }
-        Ok(())
+        if result.is_err() {
+            if let Some(writer) = self.writer {
+                writer.fail_metadata_commit();
+            }
+        }
+        result
+    }
+
+    fn remove(id: u64) -> Vec<mpsc::Receiver<()>> {
+        JOURNAL_COMMIT_SCOPES.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            let index = scopes
+                .iter()
+                .position(|scope| scope.id == id)
+                .expect("commit scope missing");
+            scopes.remove(index).waiters
+        })
     }
 
     fn wait_for_commit(waiter: mpsc::Receiver<()>) -> FsResult<()> {
@@ -76,12 +99,15 @@ impl JournalCommitScope {
     }
 }
 
-impl Drop for JournalCommitScope {
+impl Drop for JournalCommitScope<'_> {
     fn drop(&mut self) {
-        if self.active && !self.completed {
-            JOURNAL_COMMIT_SCOPES.with(|scopes| {
-                scopes.borrow_mut().pop();
-            });
+        if let Some(id) = self.id.take() {
+            let waiters = Self::remove(id);
+            if !waiters.is_empty() {
+                if let Some(writer) = self.writer {
+                    writer.fail_metadata_commit();
+                }
+            }
         }
     }
 }
@@ -173,31 +199,45 @@ impl JournalWriter {
         if !self.require_raft_commit {
             // Testing writer: entries stay in the retained receiver for direct
             // assertions and no commit notification is ever produced.
-            return self.send_inner(entry);
+            let result = self.send_inner(entry);
+            if result.is_err() {
+                self.fail_metadata_commit();
+            }
+            return result;
         }
         if self.recovery.rejects_writes() {
+            self.fail_metadata_commit();
             return Err(FsError::journal_unavailable(
                 "journal writer is not accepting writes",
             ));
         }
         debug!("send_entry_wait {:?}", entry);
+        let scoped = self.has_commit_scope();
         let (tx, rx) = mpsc::sync_channel(1);
-        self.sender.send(QueuedJournalEntry {
+        if let Err(error) = self.sender.send(QueuedJournalEntry {
             entry,
             completion: Some(tx),
-        })?;
+        }) {
+            self.fail_metadata_commit();
+            return Err(error.into());
+        }
         self.metrics.journal_queue_len.inc();
-        let scoped = JOURNAL_COMMIT_SCOPES.with(|scopes| scopes.borrow_mut().last_mut().is_some());
         if scoped {
             JOURNAL_COMMIT_SCOPES.with(|scopes| {
                 scopes
                     .borrow_mut()
-                    .last_mut()
+                    .iter_mut()
+                    .rev()
+                    .find(|scope| std::ptr::eq(scope.writer, self))
                     .expect("scope vanished while enqueueing")
+                    .waiters
                     .push(rx);
             });
         } else {
-            JournalCommitScope::wait_for_commit(rx)?;
+            if let Err(error) = JournalCommitScope::wait_for_commit(rx) {
+                self.fail_metadata_commit();
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -205,18 +245,39 @@ impl JournalWriter {
     /// Opens a commit scope so every journal entry enqueued inside it shares
     /// one Raft-commit wait. The caller must invoke `wait` after its metadata
     /// work completes.
-    pub fn begin_commit_scope(&self) -> JournalCommitScope {
-        if !self.enable || !self.require_raft_commit {
-            return JournalCommitScope {
-                active: false,
-                completed: true,
-            };
-        }
-        JOURNAL_COMMIT_SCOPES.with(|scopes| scopes.borrow_mut().push(vec![]));
+    pub fn begin_commit_scope(&self) -> JournalCommitScope<'_> {
+        let id = if self.enable && self.require_raft_commit {
+            let id = NEXT_COMMIT_SCOPE_ID.with(|next| {
+                let id = next.get();
+                next.set(id.checked_add(1).expect("commit scope ID overflow"));
+                id
+            });
+            JOURNAL_COMMIT_SCOPES.with(|scopes| {
+                scopes.borrow_mut().push(CommitScopeEntry {
+                    writer: self,
+                    id,
+                    waiters: Vec::new(),
+                })
+            });
+            Some(id)
+        } else {
+            None
+        };
         JournalCommitScope {
-            active: true,
-            completed: false,
+            id,
+            writer: Some(self),
+            _thread_bound: std::marker::PhantomData,
         }
+    }
+
+    fn has_commit_scope(&self) -> bool {
+        JOURNAL_COMMIT_SCOPES.with(|scopes| {
+            scopes
+                .borrow()
+                .iter()
+                .rev()
+                .any(|scope| std::ptr::eq(scope.writer, self))
+        })
     }
 
     /// Read-barrier API for the catch-up coordinator (see JournalLoader) and
@@ -230,8 +291,24 @@ impl JournalWriter {
         self.read_barrier.require_catch_up(required_index);
     }
 
-    pub fn fence_metadata(&self) {
-        self.read_barrier.fence();
+    pub fn fence_metadata(&self) -> u64 {
+        self.read_barrier.fence()
+    }
+
+    pub(crate) fn fence_metadata_with(&self, publish: impl FnOnce()) -> u64 {
+        self.read_barrier.fence_with(publish)
+    }
+
+    pub(crate) fn is_metadata_role_epoch(&self, epoch: u64) -> bool {
+        self.read_barrier.is_role_epoch(epoch)
+    }
+
+    pub(crate) fn unfence_metadata_if_epoch(&self, epoch: u64, publish: impl FnOnce()) -> bool {
+        self.read_barrier.unfence_if_epoch(epoch, publish)
+    }
+
+    pub fn unfence_metadata(&self) {
+        self.read_barrier.unfence();
     }
 
     pub fn advance_metadata_applied(&self, applied_index: u64) {
@@ -242,51 +319,103 @@ impl JournalWriter {
         self.read_barrier.advance_catch_up(applied_index);
     }
 
+    pub(crate) fn fail_metadata_commit(&self) {
+        self.fail_metadata("metadata journal commit failed after mutation");
+    }
+
+    pub(crate) fn fail_metadata_publication(&self) {
+        self.fail_metadata("metadata publication failed after durable commit");
+    }
+
+    pub(crate) fn fail_metadata_restore(&self) {
+        self.fail_metadata("metadata restore failed after store replacement began");
+    }
+
+    fn fail_metadata(&self, reason: &str) {
+        self.fence_metadata();
+        self.recovery.enter_safe_mode(reason);
+        self.recovery.mark_writer_failed();
+    }
+
     pub fn ensure_metadata_current(&self) -> FsResult<()> {
+        if self.recovery.rejects_writes() {
+            return Err(FsError::journal_unavailable(
+                "journal writer is not accepting writes",
+            ));
+        }
         self.read_barrier.ensure_current()
     }
 
-    pub fn is_metadata_current(&self) -> bool {
-        self.read_barrier.is_current()
+    pub(crate) fn metadata_epoch(&self) -> FsResult<u64> {
+        if self.recovery.rejects_writes() {
+            return Err(FsError::journal_unavailable(
+                "journal writer is not accepting writes",
+            ));
+        }
+        self.read_barrier.current_epoch()
     }
 
-    fn send(&self, fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
+    pub(crate) fn ensure_metadata_epoch(&self, epoch: u64) -> FsResult<()> {
+        if self.recovery.rejects_writes() {
+            return Err(FsError::journal_unavailable(
+                "journal writer is not accepting writes",
+            ));
+        }
+        self.read_barrier.ensure_epoch(epoch)
+    }
+
+    pub fn is_metadata_current(&self) -> bool {
+        !self.recovery.rejects_writes() && self.read_barrier.is_current()
+    }
+
+    fn send(&self, _fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
         if self.enable {
-            self.send_inner(entry)?;
-            self.maybe_emit_snapshot(fs_dir)?;
+            if self.has_commit_scope() {
+                self.enqueue_and_wait(entry)?;
+            } else {
+                if let Err(error) = self.send_inner(entry) {
+                    self.fail_metadata_commit();
+                    return Err(error);
+                }
+            }
+            self.record_snapshot_entry();
         }
         Ok(())
     }
 
     /// Sends the entry and waits for Raft to commit the batch carrying it.
-    /// Namespace mutations that must not become visible ahead of their journal
-    /// route through here; inside a commit scope the wait defers to the scope.
-    pub(crate) fn send_and_wait(&self, fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
+    /// Within a commit scope the wait is deferred to the scope. Local metadata
+    /// may already be materialized before this wait; crash isolation is not
+    /// provided by this method.
+    pub(crate) fn send_and_wait(&self, _fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
         self.enqueue_and_wait(entry)?;
-        self.maybe_emit_snapshot(fs_dir)
+        if self.enable {
+            self.record_snapshot_entry();
+        }
+        Ok(())
     }
 
-    fn maybe_emit_snapshot(&self, fs_dir: &FsDir) -> FsResult<()> {
-        if !self.leader_create_snapshot {
-            return Ok(());
+    fn record_snapshot_entry(&self) {
+        if self.leader_create_snapshot && self.snapshot_entries != 0 {
+            self.entries_since_snapshot.incr();
         }
-        if self.snapshot_entries == 0 {
-            return Ok(());
-        }
+    }
 
-        let entries = self.entries_since_snapshot.add_and_get(1);
-        if entries < self.snapshot_entries {
-            return Ok(());
+    pub(crate) fn periodic_snapshot_due(&self) -> bool {
+        if !self.leader_create_snapshot
+            || self.snapshot_entries == 0
+            || self.entries_since_snapshot.get() < self.snapshot_entries
+        {
+            return false;
         }
-
-        let now = LocalTime::mills();
         let last = self.last_snapshot_ms.get();
-        if last > 0 && now.saturating_sub(last) < self.snapshot_min_interval_ms {
-            return Ok(());
+        last == 0 || LocalTime::mills().saturating_sub(last) >= self.snapshot_min_interval_ms
+    }
+
+    pub(crate) fn maybe_emit_snapshot(&self, fs_dir: &FsDir) -> FsResult<()> {
+        if self.periodic_snapshot_due() {
+            self.emit_snapshot(fs_dir, "periodic", self.entries_since_snapshot.get())?;
         }
-
-        self.emit_snapshot(fs_dir, "periodic", entries)?;
-
         Ok(())
     }
 
@@ -349,6 +478,7 @@ impl JournalWriter {
         if !self.enable {
             return err_box!("leader snapshot requires journal.enable = true");
         }
+        self.ensure_metadata_current()?;
 
         if !force && self.inside_snapshot_interval() {
             return err_box!(
@@ -680,415 +810,9 @@ impl JournalWriter {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::master::meta::inode::ttl::TtlBucketList;
-    use crate::master::quota::eviction::evictor::{Evictor, LRUEvictor};
-    use crate::master::quota::eviction::EvictionConf;
-    use curvine_config::{ClusterConf, RaftPeer};
-    use curvine_runtime::common::DurationUnit;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    fn test_conf(name: &str) -> ClusterConf {
-        let mut conf = ClusterConf {
-            testing: true,
-            format_master: true,
-            journal: JournalConf {
-                enable: true,
-                snapshot_entries: 1,
-                writer_channel_size: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        conf.change_test_meta_dir(name);
-        conf
-    }
-
-    fn build_writer(conf: &ClusterConf) -> FsResult<JournalWriter> {
-        Master::init_test_metrics();
-
-        let rt = conf.journal.create_runtime();
-        let client = RaftClient::from_conf(rt, &conf.journal);
-        JournalWriter::new(true, client, &conf.journal, super::RecoveryGate::new())
-    }
-
-    fn build_fs_dir(conf: &ClusterConf, writer: Arc<JournalWriter>) -> FsResult<FsDir> {
-        let ttl_bucket_list = Arc::new(TtlBucketList::new(
-            conf.master.ttl_bucket_interval_ms() as i64
-        )?);
-
-        let eviction_conf = EvictionConf::from_conf(conf);
-        let evictor: Arc<dyn Evictor> = Arc::new(LRUEvictor::new(eviction_conf));
-
-        FsDir::new(conf, writer, ttl_bucket_list, evictor)
-    }
-
-    fn checkpoint_dirs(conf: &ClusterConf) -> Vec<PathBuf> {
-        let db_conf = conf.db_conf();
-        let checkpoint_dir = Path::new(&db_conf.checkpoint_dir);
-
-        if !checkpoint_dir.exists() {
-            return Vec::new();
-        }
-
-        fs::read_dir(checkpoint_dir)
-            .expect("failed to read checkpoint directory")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect()
-    }
-
-    #[test]
-    fn removes_checkpoint_when_snapshot_enqueue_fails() -> FsResult<()> {
-        let conf = test_conf("snapshot_enqueue_failure");
-        let mut writer = build_writer(&conf)?;
-
-        // The testing writer retains the only receiver. Dropping it makes
-        // std::sync::mpsc::Sender::send return an error before handoff.
-        let receiver = writer
-            .receiver
-            .take()
-            .expect("testing writer should retain its receiver");
-        drop(receiver);
-
-        let writer = Arc::new(writer);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        let result = writer.maybe_emit_snapshot(&fs_dir);
-        assert!(result.is_err(), "snapshot enqueue should fail");
-
-        let checkpoints = checkpoint_dirs(&conf);
-        assert!(
-            checkpoints.is_empty(),
-            "checkpoint should be removed after enqueue failure: {:?}",
-            checkpoints
-        );
-        assert_eq!(
-            writer.last_snapshot_ms.get(),
-            0,
-            "failed snapshot must not start the interval"
-        );
-        assert_eq!(
-            writer.entries_since_snapshot.get(),
-            1,
-            "failed snapshot must not consume the entry count"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn keeps_checkpoint_when_snapshot_enqueue_succeeds() -> FsResult<()> {
-        let conf = test_conf("snapshot_enqueue_success");
-        let writer = Arc::new(build_writer(&conf)?);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        writer.maybe_emit_snapshot(&fs_dir)?;
-
-        let entry = writer
-            .receiver
-            .as_ref()
-            .expect("testing writer should retain its receiver")
-            .lock()
-            .expect("testing receiver lock should not be poisoned")
-            .recv_timeout(Duration::from_secs(1))
-            .expect("snapshot entry should be enqueued");
-
-        match entry.entry {
-            JournalEntry::Snapshot(entry) => {
-                assert!(
-                    Path::new(&entry.dir).exists(),
-                    "checkpoint should remain after successful handoff: {}",
-                    entry.dir
-                );
-            }
-            other => panic!("expected snapshot entry, got {:?}", other),
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn retries_snapshot_after_failure_without_waiting_for_entries() -> FsResult<()> {
-        let mut conf = test_conf("snapshot_failure_retry");
-        conf.journal.snapshot_entries = 2;
-        let mut writer = build_writer(&conf)?;
-
-        let receiver = writer
-            .receiver
-            .take()
-            .expect("testing writer should retain its receiver");
-        drop(receiver);
-
-        let writer = Arc::new(writer);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        // The first check only reaches one of the two required entries.
-        writer.maybe_emit_snapshot(&fs_dir)?;
-        assert_eq!(writer.entries_since_snapshot.get(), 1);
-
-        // The second check creates a checkpoint, but handing the entry off
-        // fails; the consumed entry count must be restored.
-        assert!(writer.maybe_emit_snapshot(&fs_dir).is_err());
-        assert_eq!(
-            writer.entries_since_snapshot.get(),
-            2,
-            "failed snapshot must restore the consumed entry count"
-        );
-
-        // With the count restored, the next check retries immediately instead
-        // of waiting for another full snapshot_entries batch.
-        assert!(
-            writer.maybe_emit_snapshot(&fs_dir).is_err(),
-            "a restored entry count must allow an immediate retry"
-        );
-
-        Ok(())
-    }
-
-    fn raft_group(conf: &ClusterConf, nodes: u64) -> Vec<RaftPeer> {
-        (1..=nodes)
-            .map(|id| {
-                let hostname = if id == 1 {
-                    conf.journal.hostname.clone()
-                } else {
-                    format!("10.0.0.{id}")
-                };
-                RaftPeer::new(id, hostname, conf.journal.rpc_port)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn skips_checkpoint_when_raft_group_has_multiple_nodes() -> FsResult<()> {
-        let mut conf = test_conf("snapshot_multi_node");
-        conf.journal.journal_addrs = raft_group(&conf, 3);
-        // Default is None, so a multi-node raft group must fall back to
-        // single-node-only creation and skip the leader checkpoint.
-        let writer = Arc::new(build_writer(&conf)?);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        writer.maybe_emit_snapshot(&fs_dir)?;
-
-        assert!(
-            checkpoint_dirs(&conf).is_empty(),
-            "leader checkpoint is disabled when the raft group has more than one node"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn creates_checkpoint_when_leader_override_is_enabled() -> FsResult<()> {
-        let mut conf = test_conf("snapshot_leader_override");
-        conf.journal.journal_addrs = raft_group(&conf, 3);
-        conf.journal.leader_create_snapshot = Some(true);
-        let writer = Arc::new(build_writer(&conf)?);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        writer.maybe_emit_snapshot(&fs_dir)?;
-
-        assert_eq!(checkpoint_dirs(&conf).len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn skips_checkpoint_when_leader_override_is_disabled() -> FsResult<()> {
-        let mut conf = test_conf("snapshot_leader_disabled");
-        conf.journal.leader_create_snapshot = Some(false);
-        let writer = Arc::new(build_writer(&conf)?);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        writer.maybe_emit_snapshot(&fs_dir)?;
-
-        assert!(checkpoint_dirs(&conf).is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn creates_at_most_one_checkpoint_per_interval() -> FsResult<()> {
-        let mut conf = test_conf("snapshot_min_interval");
-        conf.journal.writer_channel_size = 8;
-        conf.journal.snapshot_min_interval = DurationUnit::new(10 * DurationUnit::MINUTE);
-        let writer = Arc::new(build_writer(&conf)?);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        writer.maybe_emit_snapshot(&fs_dir)?;
-        assert_eq!(checkpoint_dirs(&conf).len(), 1);
-
-        writer.maybe_emit_snapshot(&fs_dir)?;
-        assert_eq!(
-            checkpoint_dirs(&conf).len(),
-            1,
-            "a second checkpoint inside the interval must be skipped"
-        );
-
-        writer
-            .last_snapshot_ms
-            .set(LocalTime::mills().saturating_sub(writer.snapshot_min_interval_ms + 1));
-        std::thread::sleep(Duration::from_millis(2));
-        writer.maybe_emit_snapshot(&fs_dir)?;
-        assert_eq!(checkpoint_dirs(&conf).len(), 2);
-
-        Ok(())
-    }
-
-    #[test]
-    fn safe_mode_rejects_metadata_writes() -> FsResult<()> {
-        let conf = test_conf("writer_safe_mode");
-        let writer = build_writer(&conf)?;
-        writer
-            .recovery
-            .enter_safe_mode("failed to deserialize journal batch");
-        let error = writer
-            .log_ufs_applied(1, 1, 1)
-            .expect_err("safe mode must reject journal writes");
-        assert!(
-            error.to_string().contains("JournalUnavailable"),
-            "unexpected error: {error}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn create_snapshot_creates_checkpoint_and_enqueues_snapshot_entry() -> FsResult<()> {
-        let conf = test_conf("snapshot_operator_create");
-        let writer = Arc::new(build_writer(&conf)?);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        let info = writer.create_snapshot(&fs_dir, false)?;
-
-        assert!(Path::new(&info.dir).exists(), "checkpoint should be kept");
-        let entry = writer
-            .receiver
-            .as_ref()
-            .expect("testing writer should retain its receiver")
-            .lock()
-            .expect("testing receiver lock should not be poisoned")
-            .recv_timeout(Duration::from_secs(1))
-            .expect("snapshot entry should be enqueued");
-
-        match entry.entry {
-            JournalEntry::Snapshot(entry) => {
-                assert_eq!(entry.dir, info.dir);
-                assert_eq!(entry.node_id, conf.journal.node_id()?);
-            }
-            other => panic!("expected snapshot entry, got {:?}", other),
-        }
-
-        assert_eq!(writer.entries_since_snapshot.get(), 0);
-        assert!(writer.last_snapshot_ms.get() > 0);
-        Ok(())
-    }
-
-    #[test]
-    fn create_snapshot_rejects_concurrent_requests() -> FsResult<()> {
-        let conf = test_conf("snapshot_operator_busy");
-        let writer = Arc::new(build_writer(&conf)?);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        writer.snapshot_in_flight.set(true);
-
-        let err = writer
-            .create_snapshot(&fs_dir, false)
-            .expect_err("a concurrent snapshot must be rejected");
-        assert!(err.to_string().contains("already in progress"));
-        Ok(())
-    }
-
-    #[test]
-    fn create_snapshot_respects_the_min_interval_unless_forced() -> FsResult<()> {
-        let mut conf = test_conf("snapshot_operator_min_interval");
-        conf.journal.writer_channel_size = 8;
-        conf.journal.snapshot_min_interval = DurationUnit::new(10 * DurationUnit::MINUTE);
-        let writer = Arc::new(build_writer(&conf)?);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        writer.create_snapshot(&fs_dir, false)?;
-
-        let err = writer
-            .create_snapshot(&fs_dir, false)
-            .expect_err("a second call inside the interval must be rejected");
-        assert!(
-            err.to_string().contains("snapshot_min_interval"),
-            "unexpected error: {}",
-            err
-        );
-        assert_eq!(checkpoint_dirs(&conf).len(), 1);
-
-        writer.create_snapshot(&fs_dir, true)?;
-        assert_eq!(checkpoint_dirs(&conf).len(), 2);
-        Ok(())
-    }
-
-    #[test]
-    fn create_snapshot_never_reuses_a_checkpoint_id() -> FsResult<()> {
-        let mut conf = test_conf("snapshot_operator_unique_id");
-        conf.journal.writer_channel_size = 8;
-        let writer = Arc::new(build_writer(&conf)?);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        let first = writer.create_snapshot(&fs_dir, true)?;
-        let second = writer.create_snapshot(&fs_dir, true)?;
-
-        assert_ne!(first.dir, second.dir);
-        assert!(
-            Path::new(&first.dir).exists(),
-            "a second snapshot must not delete the registered checkpoint"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn create_snapshot_requires_journal() -> FsResult<()> {
-        let mut conf = test_conf("snapshot_operator_no_journal");
-        conf.journal.enable = false;
-        let writer = Arc::new(build_writer(&conf)?);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        let err = writer
-            .create_snapshot(&fs_dir, false)
-            .expect_err("journal disabled must reject operator snapshots");
-        assert!(err.to_string().contains("journal.enable"));
-        Ok(())
-    }
-
-    #[test]
-    fn next_checkpoint_id_steps_over_existing_directories() -> FsResult<()> {
-        let conf = test_conf("snapshot_operator_existing_id");
-        let writer = Arc::new(build_writer(&conf)?);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        let first = writer.next_checkpoint_id(&fs_dir);
-        fs::create_dir_all(fs_dir.get_checkpoint_path(first))?;
-
-        let second = writer.next_checkpoint_id(&fs_dir);
-
-        assert!(second > first, "an existing checkpoint id must be skipped");
-        assert!(
-            !Path::new(&fs_dir.get_checkpoint_path(second)).exists(),
-            "the picked id must be free on disk"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn create_snapshot_keeps_the_throttle_clock_in_real_time() -> FsResult<()> {
-        let conf = test_conf("snapshot_operator_throttle_clock");
-        let writer = Arc::new(build_writer(&conf)?);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        let before = LocalTime::mills();
-        writer.create_snapshot(&fs_dir, false)?;
-
-        assert!(writer.last_snapshot_ms.get() >= before);
-        assert!(
-            writer.last_snapshot_ms.get() <= LocalTime::mills(),
-            "a snapshot must never push the throttle clock into the future"
-        );
-        Ok(())
-    }
-}
+#[path = "tests/journal_writer_test.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "tests/commit_scope_test.rs"]
+mod commit_scope_test;

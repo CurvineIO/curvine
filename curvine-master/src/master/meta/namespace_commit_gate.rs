@@ -72,9 +72,9 @@ impl CommitGate {
 
     /// Attempts a non-blocking writer admission.
     ///
-    /// This is for an optional fast path. A caller that cannot enter must fall
-    /// back to the regular blocking path; it must never mutate outside the
-    /// gate. Successful admissions are visible to every close barrier.
+    /// A caller that cannot enter must either skip the optional mutation or
+    /// fall back to blocking admission; it must never mutate outside the gate.
+    /// Successful admissions are visible to every close barrier.
     pub fn try_enter(&self) -> Option<CommitGateGuard<'_>> {
         let mut state = self.state.load(Ordering::Acquire);
         loop {

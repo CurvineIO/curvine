@@ -15,11 +15,11 @@
 use crate::proto::raft::{SnapshotData, SnapshotFileInfo};
 use crate::raft::snapshot::DownloadJob;
 use crate::raft::storage::AppStorage;
-use crate::raft::{RaftClient, RaftResult};
+use crate::raft::{RaftClient, RaftResult, RaftUtils};
 use curvine_config::JournalConf;
 use curvine_core_error::err_box;
 use curvine_runtime::common::{FileUtils, Utils};
-use log::info;
+use log::warn;
 use std::path::Path;
 
 pub enum SnapshotFetcher {
@@ -33,8 +33,11 @@ impl SnapshotFetcher {
         app_store: &impl AppStorage,
         conf: &JournalConf,
         client: RaftClient,
-        mut data: SnapshotData,
+        data: SnapshotData,
     ) -> RaftResult<Self> {
+        if let Some(files) = &data.files_data {
+            DownloadJob::validate_files(&files.files)?;
+        }
         if node_id == data.node_id {
             if let Some(files) = data.files_data.as_ref() {
                 if !Self::local_snapshot_ready(&files.dir, &files.files) {
@@ -48,23 +51,9 @@ impl SnapshotFetcher {
             return Ok(Self::Local(data));
         }
 
-        // The registered owner may be another member, but the snapshot files may
-        // already be present locally (manual meta+journal copies, reused volume).
-        // The manifest dir is the snapshot's own directory (named at creation,
-        // e.g. ck-{millis}, not necessarily ck-{snapshot_id}), so a local copy
-        // can only be judged against the manifest itself. Reusing the complete
-        // local copy avoids a full download; the fetch layer records this member
-        // as the owner afterwards.
-        if let Some(files) = data.files_data.as_mut() {
-            if Self::local_snapshot_ready(&files.dir, &files.files) {
-                info!(
-                    "snapshot {} already exists locally at {}, skip download from node {}",
-                    data.snapshot_id, files.dir, data.node_id
-                );
-                return Ok(Self::Local(data));
-            }
-        }
-
+        // A remote manifest contains lengths but no content digests. A local
+        // file with the same name and size is not proof of snapshot identity;
+        // download it from the owner and verify the transfer checksum instead.
         let Some(files) = &data.files_data else {
             return err_box!("Not found snapshot data");
         };
@@ -74,9 +63,10 @@ impl SnapshotFetcher {
     }
 
     /// A local copy is reusable only when every manifest file exists with the
-    /// expected length. mtime/ctime are deliberately not compared: copying the
-    /// directory legitimately changes them. Anything missing falls back to the
-    /// download path.
+    /// expected length and, when the manifest carries one, the expected content
+    /// checksum. mtime/ctime are deliberately not compared: copying the
+    /// directory legitimately changes them. Anything missing or mismatched
+    /// falls back to the download path.
     fn local_snapshot_ready(dir: &str, files: &[SnapshotFileInfo]) -> bool {
         if dir.is_empty() || files.is_empty() {
             return false;
@@ -84,7 +74,29 @@ impl SnapshotFetcher {
 
         files.iter().all(|file| {
             let path = Path::new(dir).join(&file.path);
-            matches!(FileUtils::metadata(&path), Ok(meta) if meta.len() == file.len)
+            match FileUtils::metadata(&path) {
+                Ok(meta) if meta.len() == file.len => match file.checksum {
+                    Some(0) | None => true,
+                    Some(expected) => match RaftUtils::file_crc32(&path) {
+                        Ok(actual) => {
+                            if actual as u64 != expected {
+                                warn!(
+                                    "local snapshot file {} checksum mismatch, expected {}, actual {}",
+                                    path.display(),
+                                    expected,
+                                    actual
+                                );
+                            }
+                            actual as u64 == expected
+                        }
+                        Err(e) => {
+                            warn!("failed to checksum local snapshot file {}: {}", path.display(), e);
+                            false
+                        }
+                    },
+                },
+                _ => false,
+            }
         })
     }
 

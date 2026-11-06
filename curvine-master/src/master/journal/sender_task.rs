@@ -71,15 +71,13 @@ impl SenderTask {
     }
 
     fn loop0(receiver: BlockingReceiver<QueuedJournalEntry>, poll: Duration, mut task: SenderTask) {
-        // The thread stays up. Transient Raft errors keep the current batch and
-        // retry. Serialization or metadata damage enters safe mode instead of
-        // aborting the process.
+        // Metadata may already be committed locally when a proposal fails.
+        // Unknown proposal outcomes fence the writer instead of resubmitting.
         let mut backoff = Duration::from_millis(200);
         loop {
             if task.recovery.rejects_writes() {
-                discard_unproposed(&mut task.batch, &receiver);
-                thread::sleep(Duration::from_secs(1));
-                continue;
+                discard_unproposed(&mut task.batch, &receiver, &mut task.completions);
+                return;
             }
             let event = match receiver.recv_timeout(poll) {
                 Ok(v) => Some(v),
@@ -95,6 +93,10 @@ impl SenderTask {
                 Ok(()) => backoff = Duration::from_millis(200),
                 Err(e) => {
                     let message = e.to_string();
+                    if task.recovery.rejects_writes() {
+                        log::error!("journal-writer stopped after proposal failure: {}", message);
+                        continue;
+                    }
                     match classify_apply_error(&message) {
                         ApplyDisposition::Retry => {
                             log::warn!(
@@ -163,11 +165,16 @@ impl SenderTask {
 
         let spend = TimeSpent::new();
 
-        // encode drains its input. Propose from a copy so a refused Raft
-        // call can retry the same entries.
+        // Encoding drains its input; keep the original batch until the
+        // proposal has a confirmed outcome or safe mode discards it.
         let mut staging = self.batch.clone();
         let bytes = JournalBatch::encode(&mut staging)?;
-        self.client.block_on_send_propose(bytes)?;
+        if let Err(error) = self.client.block_on_send_propose(bytes) {
+            self.recovery
+                .enter_safe_mode("journal proposal failed with unknown commit outcome");
+            self.recovery.mark_writer_failed();
+            return Err(error.into());
+        }
         self.batch.batch.clear();
         for completion in mem::take(&mut self.completions) {
             let _ = completion.send(());
@@ -186,101 +193,27 @@ impl SenderTask {
     }
 }
 
-/// Entries still in this process have not been proposed. Safe mode must not
-/// flush them later and must not apply them to local metadata.
-fn discard_unproposed(batch: &mut JournalBatch, receiver: &BlockingReceiver<QueuedJournalEntry>) {
+/// Do not resubmit a pending batch after its outcome became uncertain. Some
+/// entries may already be committed and must be resolved by recovery.
+fn discard_unproposed(
+    batch: &mut JournalBatch,
+    receiver: &BlockingReceiver<QueuedJournalEntry>,
+    completions: &mut Vec<SyncSender<()>>,
+) {
     if !batch.is_empty() {
         log::warn!(
-            "journal-writer dropping unproposed batch in safe mode, seq={}",
+            "journal-writer dropping pending batch in safe mode, seq={}",
             batch.seq_id
         );
         batch.batch.clear();
         batch.next();
     }
     while receiver.try_recv().is_ok() {}
+    // Report failure only after the batch is discarded so scoped writers do
+    // not leave the commit gate while it is still retained for retry.
+    completions.clear();
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::master::journal::{CacheInvalidationEntry, JournalEntry};
-    use crate::master::Master;
-    use curvine_config::RaftPeer;
-
-    #[test]
-    #[allow(clippy::field_reassign_with_default)]
-    fn transient_propose_failure_keeps_the_batch() {
-        Master::init_test_metrics();
-        let mut conf = JournalConf::default();
-        conf.hostname = "127.0.0.1".to_string();
-        conf.rpc_port = 1;
-        conf.journal_addrs = vec![RaftPeer::new(1, "127.0.0.1", 1)];
-        conf.io_threads = 1;
-        conf.worker_threads = 1;
-        conf.conn_timeout_ms = 200;
-        conf.io_timeout_ms = 200;
-        conf.conn_retry_max_duration_ms = 0;
-        conf.rpc_retry_max_duration_ms = 0;
-        conf.conn_retry_min_sleep_ms = 1;
-        conf.conn_retry_max_sleep_ms = 1;
-        conf.rpc_retry_min_sleep_ms = 1;
-        conf.rpc_retry_max_sleep_ms = 1;
-        conf.writer_flush_batch_size = 1;
-        conf.writer_flush_batch_ms = 60_000;
-
-        let rt = conf.create_runtime();
-        let client = RaftClient::from_conf(rt, &conf);
-        let recovery = RecoveryGate::new();
-        let mut task = SenderTask::new(client, &conf, 7, recovery).expect("sender");
-        let error = task
-            .handle(Some(QueuedJournalEntry {
-                entry: JournalEntry::CacheInvalidation(CacheInvalidationEntry {
-                    op_id: 3,
-                    rpc_id: 1,
-                    inodes: vec![],
-                }),
-                completion: None,
-            }))
-            .expect_err("propose to a closed port must fail");
-
-        assert!(
-            classify_apply_error(&error.to_string()) == ApplyDisposition::Retry,
-            "connection failure must stay retryable: {error}"
-        );
-        assert_eq!(task.batch.len(), 1, "failed flush must keep the batch");
-        assert_eq!(task.batch.seq_id, 7, "failed flush must not roll the batch");
-        assert!(!task.recovery.is_safe_mode());
-    }
-
-    #[test]
-    fn safe_mode_discards_unproposed_entries() {
-        use curvine_runtime::sync::channel::BlockingChannel;
-
-        let (sender, receiver) = BlockingChannel::new(0).split();
-        let mut batch = JournalBatch::new(4);
-        batch.push(JournalEntry::CacheInvalidation(CacheInvalidationEntry {
-            op_id: 1,
-            rpc_id: 1,
-            inodes: vec![],
-        }));
-        sender
-            .send(QueuedJournalEntry {
-                entry: JournalEntry::CacheInvalidation(CacheInvalidationEntry {
-                    op_id: 2,
-                    rpc_id: 2,
-                    inodes: vec![],
-                }),
-                completion: None,
-            })
-            .expect("enqueue");
-
-        discard_unproposed(&mut batch, &receiver);
-
-        assert!(batch.is_empty(), "the unproposed batch must be dropped");
-        assert_eq!(batch.seq_id, 5);
-        assert!(
-            receiver.try_recv().is_err(),
-            "queued entries must not remain to be flushed later"
-        );
-    }
-}
+#[path = "tests/sender_task_test.rs"]
+mod tests;

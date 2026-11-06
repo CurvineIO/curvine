@@ -93,16 +93,40 @@ impl Default for InodeLockManager {
 }
 
 impl InodeLockManager {
+    /// Record how long the caller waited for this lock acquisition, in
+    /// microseconds, so hot directories and stalled holders stay observable
+    /// (design doc §11.2). Best-effort: metric registration failure is
+    /// ignored on the hot path.
+    fn record_acquire_us(mode: InodeLockMode, started: std::time::Instant) {
+        if let Ok(metrics) = crate::master::Master::get_metrics() {
+            metrics
+                .inode_lock_acquire_us
+                .with_label_values(&[match mode {
+                    InodeLockMode::Read => "read",
+                    InodeLockMode::Write => "write",
+                }])
+                .observe(started.elapsed().as_micros() as f64);
+        }
+    }
+
     pub fn new(shard_count: usize) -> Self {
         Self {
             locks: ObjectLockPool::new(shard_count),
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn cached_lock_count(&self) -> usize {
+        self.locks.cached_lock_count()
+    }
+
     pub fn lock_many<'a>(&'a self, requests: &[InodeLockRequest]) -> InodeLockSet<'a> {
+        let started = std::time::Instant::now();
         let normalized = Self::normalize_requests(requests);
         if normalized.len() == 1 {
-            return self.lock_normalized_one(normalized[0]);
+            let result = self.lock_normalized_one(normalized[0]);
+            Self::record_acquire_us(normalized[0].mode, started);
+            return result;
         }
 
         let inode_ids = normalized
@@ -112,6 +136,7 @@ impl InodeLockManager {
         assert_no_reentrant_locks(self, &inode_ids);
 
         let mut guards = InodeLocks::with_capacity(normalized.len());
+        let mut any_write = false;
         for request in &normalized {
             let lock = self.locks.get_or_create_lock(inode_key(request.inode_id));
             let guard = match request.mode {
@@ -122,14 +147,22 @@ impl InodeLockManager {
                     _guard: lock.write_arc(),
                 },
             };
+            any_write |= matches!(request.mode, InodeLockMode::Write);
             guards.push(guard);
         }
 
         mark_locks_held(self, &inode_ids);
 
+        Self::record_acquire_us(
+            if any_write {
+                InodeLockMode::Write
+            } else {
+                InodeLockMode::Read
+            },
+            started,
+        );
+
         InodeLockSet {
-            _marker: std::marker::PhantomData,
-            #[cfg(debug_assertions)]
             manager: self,
             inner: InodeLockSetInner::Many {
                 guards,
@@ -147,13 +180,21 @@ impl InodeLockManager {
         })
     }
 
+    pub fn write_inode(&self, inode_id: i64) -> InodeLockSet<'_> {
+        self.lock_normalized_one(NormalizedInodeLock {
+            depth: 0,
+            inode_id,
+            mode: InodeLockMode::Write,
+        })
+    }
+
     fn lock_normalized_one<'a>(&'a self, request: NormalizedInodeLock) -> InodeLockSet<'a> {
+        let started = std::time::Instant::now();
         assert_no_reentrant_lock(self, request.inode_id);
         let guard = self.lock_one_guard(request);
         mark_lock_held(self, request.inode_id);
+        Self::record_acquire_us(request.mode, started);
         InodeLockSet {
-            _marker: std::marker::PhantomData,
-            #[cfg(debug_assertions)]
             manager: self,
             inner: InodeLockSetInner::One {
                 guard: Some(guard),
@@ -211,8 +252,6 @@ impl InodeLockManager {
 }
 
 pub struct InodeLockSet<'a> {
-    _marker: std::marker::PhantomData<&'a InodeLockManager>,
-    #[cfg(debug_assertions)]
     manager: &'a InodeLockManager,
     inner: InodeLockSetInner,
 }
@@ -260,8 +299,8 @@ impl InodeLockSet<'_> {
                 held_lock.inode_id == required.inode_id && held_lock.mode.covers(required.mode)
             }
             InodeLockSetInner::Many { held_locks, .. } => held_locks
-                .iter()
-                .any(|held| held.inode_id == required.inode_id && held.mode.covers(required.mode)),
+                .binary_search_by_key(&required.inode_id, |held| held.inode_id)
+                .is_ok_and(|index| held_locks[index].mode.covers(required.mode)),
         }
     }
 }
@@ -282,8 +321,9 @@ impl Drop for InodeLockSet<'_> {
                 guard.take();
                 #[cfg(debug_assertions)]
                 mark_lock_released(self.manager, held_lock.inode_id);
-                #[cfg(not(debug_assertions))]
-                let _ = held_lock;
+                self.manager
+                    .locks
+                    .cleanup_lock(inode_key(held_lock.inode_id));
             }
             InodeLockSetInner::Many {
                 guards, inode_ids, ..
@@ -291,8 +331,12 @@ impl Drop for InodeLockSet<'_> {
                 guards.clear();
                 #[cfg(debug_assertions)]
                 mark_locks_released(self.manager, inode_ids);
-                #[cfg(not(debug_assertions))]
-                let _ = inode_ids;
+                let keys = inode_ids
+                    .iter()
+                    .copied()
+                    .map(inode_key)
+                    .collect::<InodeLocks<_>>();
+                self.manager.locks.cleanup_locks(&keys);
             }
         }
     }

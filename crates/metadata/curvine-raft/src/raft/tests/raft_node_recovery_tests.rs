@@ -85,6 +85,7 @@ fn test_node_with_voters(
         session_sender,
         session_receiver,
         recovery: Recovery::load(&conf, node_id).unwrap(),
+        snapshot_retry_pending: false,
         pending_ready: None,
         snapshot_done: None,
         storage,
@@ -185,6 +186,7 @@ fn test_rocks_node_with_conf(
         session_sender,
         session_receiver,
         recovery: Recovery::load(conf, node_id).unwrap(),
+        snapshot_retry_pending: false,
         pending_ready: None,
         snapshot_done: None,
         storage,
@@ -456,7 +458,12 @@ fn applied_state(node_id: u64, op_id: u64) -> SnapshotData {
                 op_id,
                 rpc_id: 0,
             },
-            ..Default::default()
+            ufs_applied: AppliedIndex {
+                term: 1,
+                index: 1,
+                op_id,
+                rpc_id: 0,
+            },
         },
     }
 }
@@ -515,6 +522,65 @@ fn restarted_node_does_not_create_a_snapshot_from_restored_state() {
     node.apply_create_snapshot().unwrap();
     assert_eq!(node.last_snapshot_op_id, 120);
     wait_for_snapshot_job(&node);
+}
+
+#[test]
+fn deferred_snapshot_retries_without_new_operations_and_respects_backoff() {
+    let rt = JournalConf::with_test().create_runtime();
+    let mut node = test_node(rt.clone(), 1);
+    seed_applied_state(&node, 100);
+    node.storage
+        .append(&[Entry {
+            index: 1,
+            term: 1,
+            ..Default::default()
+        }])
+        .unwrap();
+    node.storage
+        .set_hard_state(&HardState {
+            term: 1,
+            commit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    node.snapshot_entries = 10;
+    node.snapshot_interval_ms = u64::MAX;
+    node.snapshot_min_interval_ms = 0;
+    node.anchor_snapshot_markers();
+    node.snapshot_retry_pending = true;
+    node.apply_create_snapshot().unwrap();
+    assert!(node.snapshot_retry_pending, "retry must respect backoff");
+    assert!(node.storage.can_generate_snapshot());
+    node.last_snapshot_ms = LocalTime::mills().saturating_sub(1_000);
+    let mut lagging = applied_state(node.id(), 100);
+    lagging.fsm_state.ufs_applied = AppliedIndex::default();
+    rt.block_on(node.storage.app_store.apply_snapshot(lagging))
+        .unwrap();
+    node.apply_create_snapshot().unwrap();
+    assert!(
+        node.snapshot_retry_pending,
+        "UFS backlog must preserve the retry"
+    );
+    seed_applied_state(&node, 100);
+    node.apply_create_snapshot().unwrap();
+    assert!(node.snapshot_retry_pending, "UFS skip must also back off");
+    node.last_snapshot_ms = LocalTime::mills().saturating_sub(1_000);
+    node.apply_create_snapshot().unwrap();
+    assert!(
+        !node.snapshot_retry_pending,
+        "retry must start without new writes"
+    );
+    wait_for_snapshot_job(&node);
+    assert_eq!(
+        node.storage
+            .log_store
+            .latest_snapshot()
+            .unwrap()
+            .unwrap()
+            .get_metadata()
+            .index,
+        1
+    );
 }
 
 #[test]
@@ -705,15 +771,7 @@ fn follower_snapshot_is_throttled_by_min_interval() {
     // Freeze a follower state whose applied op_id (2) exceeds the
     // snapshot_entries trigger (1), so only the min interval holds snapshots
     // back.
-    let fsm_state = FsmState {
-        applied: AppliedIndex {
-            term: 1,
-            index: 1,
-            op_id: 2,
-            rpc_id: 0,
-        },
-        ..Default::default()
-    };
+    let fsm_state = applied_state(1, 2).fsm_state;
     rt.block_on(node.storage.app_store.apply_snapshot(SnapshotData {
         snapshot_id: 1,
         node_id: 1,
@@ -770,15 +828,7 @@ fn follower_snapshot_is_throttled_by_min_interval() {
         create_time: LocalTime::mills(),
         bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
         files_data: None,
-        fsm_state: FsmState {
-            applied: AppliedIndex {
-                term: 1,
-                index: 1,
-                op_id: 4,
-                rpc_id: 0,
-            },
-            ..Default::default()
-        },
+        fsm_state: applied_state(1, 4).fsm_state,
     }))
     .unwrap();
 

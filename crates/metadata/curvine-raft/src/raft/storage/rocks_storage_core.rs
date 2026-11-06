@@ -289,9 +289,34 @@ impl RocksStorageCore {
             let next_index = index.saturating_add(1);
             let old_first = self.first_index();
             let old_last = self.last_index();
-            let new_last = cmp::max(old_last, index);
+            // A suffix belongs to this snapshot only when the local log (or
+            // an already installed snapshot) has the same boundary term.
+            let boundary_term = if index == self.snapshot_metadata.index {
+                Some(self.snapshot_metadata.term)
+            } else if self.has_entry_at(index) {
+                self.get(index)?.map(|entry| entry.term)
+            } else {
+                None
+            };
+            let matches_boundary = boundary_term == Some(meta.term);
+            if !matches_boundary && self.raft_state.hard_state.commit >= index {
+                return err_box!(
+                    "snapshot boundary at index {} conflicts with committed local state",
+                    index
+                );
+            }
+            let new_last = if matches_boundary {
+                cmp::max(old_last, index)
+            } else {
+                index
+            };
 
-            batch.delete_entry(old_first, next_index)?;
+            let delete_end = if matches_boundary {
+                next_index
+            } else {
+                cmp::max(next_index, old_last.saturating_add(1))
+            };
+            batch.delete_entry(old_first, delete_end)?;
             batch.append_index_range(next_index, new_last)?;
             batch.append_snapshot(&snapshot)?;
             batch.set_state(&hard_state)?;
@@ -342,6 +367,14 @@ impl RocksStorageCore {
             }
         };
 
+        if meta.term != data.fsm_state.applied.term {
+            return err_box!(
+                "snapshot applied term mismatch at index {}: snapshot {}, raft {}",
+                request_index,
+                data.fsm_state.applied.term,
+                meta.term
+            );
+        }
         meta.set_conf_state(self.raft_state.conf_state.clone());
 
         let mut batch = StoreWriteBatch::new(&self.db);

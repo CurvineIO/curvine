@@ -52,13 +52,30 @@ impl ShardedChildren {
 
     /// Migrates every child of `children` into the shards. Called while the
     /// single index write lock is held, so the snapshot is complete.
-    pub(crate) fn insert_children(&self, children: &InodeChildren) {
+    pub(crate) fn insert_children(&self, children: &mut InodeChildren) {
         let mut shard_buffers: Vec<BTreeMap<String, Box<InodeView>>> =
             (0..self.shards.len()).map(|_| BTreeMap::new()).collect();
-        let mut owned = flatten_children(children);
-        for (name, view) in owned.drain(..) {
+        let owned = std::mem::replace(children, InodeChildren::new_map());
+        let mut insert = |name: String, view: Box<InodeView>| {
             let index = self.shard_index(&name);
             shard_buffers[index].insert(name, view);
+        };
+        match owned {
+            InodeChildren::List(list) => {
+                for view in list {
+                    insert(view.name().to_owned(), view);
+                }
+            }
+            InodeChildren::Map(map) => {
+                for (name, view) in map {
+                    insert(name, view);
+                }
+            }
+            InodeChildren::Packed(packed) => {
+                for (name, view) in packed.into_entries() {
+                    insert(name, view);
+                }
+            }
         }
         for (buffer, shard) in shard_buffers.into_iter().zip(&self.shards) {
             let container = if buffer.is_empty() {
@@ -103,28 +120,18 @@ impl ShardedChildren {
     }
 }
 
-/// Moves every child out of `children` as `(name, view)` pairs, sorted by
-/// name. Packed containers clone directory views; file edges reconstruct the
-/// lightweight entry, matching the pointer contract of `PackedChildren`.
-pub(crate) fn flatten_children(children: &InodeChildren) -> Vec<(String, Box<InodeView>)> {
-    children
-        .iter()
-        .map(|ptr| {
-            let name = ptr.name().to_string();
-            let view = ptr.as_ref().clone();
-            (name, Box::new(view))
-        })
-        .collect()
-}
-
 fn shard_count() -> usize {
     static SHARD_COUNT: OnceLock<usize> = OnceLock::new();
     *SHARD_COUNT.get_or_init(|| {
+        // Eight shards per core keeps per-shard packed areas small on very
+        // large directories: each area grow is an O(entries) memcpy, and a
+        // finer grid cuts that spike while leaving small directories
+        // unchanged (they stay in the pre-shard container).
         std::thread::available_parallelism()
-            .map(|count| count.get().saturating_mul(2))
-            .unwrap_or(8)
+            .map(|count| count.get().saturating_mul(8))
+            .unwrap_or(32)
             .next_power_of_two()
-            .clamp(8, 64)
+            .clamp(32, 256)
     })
 }
 

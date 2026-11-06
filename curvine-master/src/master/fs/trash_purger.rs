@@ -128,11 +128,11 @@ impl TrashPurger {
                 return Ok(None);
             }
 
-            // The walk only reads metadata, and the batch it produces is bounded,
-            // so the read lock is held for one page of children at most.
+            // The bounded walk dereferences live inodes, so exclude sharded
+            // writers for one page at a time.
             let batch = {
                 let fs_dir = self.fs.fs_dir();
-                let fs_dir = fs_dir.read();
+                let fs_dir = fs_dir.write();
                 Self::next_batch(&fs_dir, &mut frames, self.batch_inodes, self.batch_bytes)?
             };
             if batch.is_empty() {
@@ -302,7 +302,7 @@ impl TrashPurger {
                     name: child.name().to_string(),
                     path: format!("{}{}{}", prefix, PATH_SEPARATOR, child.name()),
                     is_dir: child.is_dir(),
-                    has_children: matches!(&*child, InodeView::Dir(d) if d.children_len() > 0),
+                    has_children: matches!(&child, InodeView::Dir(d) if d.children_len() > 0),
                 })
                 .collect(),
         ))

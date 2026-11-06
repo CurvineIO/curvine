@@ -13,25 +13,47 @@
 // limitations under the License.
 
 use crate::proto::raft::{SnapshotDownloadRequest, SnapshotDownloadResponse};
-use crate::raft::snapshot::FileReader;
+use crate::raft::snapshot::{DownloadJob, FileReader};
 use crate::raft::{RaftResult, RaftUtils};
 use curvine_core_error::{err_box, try_option_mut};
 use curvine_io::DataSlice;
 use curvine_rpc::message::{Builder, Message, RequestStatus};
 use log::{debug, error};
 
+/// Directory of the currently registered snapshot, or `None` when the node has
+/// none. Served files must belong to it.
+pub type RegisteredSnapshotDir = std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 // Snapshot read processor.
 pub struct SnapshotDownloadHandler {
     reader: Option<FileReader>,
     chunk_size: usize,
+    registered_dir: RegisteredSnapshotDir,
 }
 
 impl SnapshotDownloadHandler {
-    pub fn new(chunk_size: usize) -> Self {
+    pub fn new(chunk_size: usize, registered_dir: RegisteredSnapshotDir) -> Self {
         Self {
             reader: None,
             chunk_size,
+            registered_dir,
         }
+    }
+
+    /// The request dir and file name are attacker-controlled. Only files under
+    /// the currently registered snapshot directory may be served.
+    fn check_request(&self, req: &SnapshotDownloadRequest) -> RaftResult<()> {
+        let Some(registered) = (self.registered_dir)() else {
+            return err_box!("snapshot download rejected: no registered snapshot");
+        };
+        if req.dir != registered {
+            return err_box!(
+                "snapshot download rejected: dir {:?} is not the registered snapshot {:?}",
+                req.dir,
+                registered
+            );
+        }
+        DownloadJob::validate_files(std::slice::from_ref(&req.snapshot_file))
     }
 
     //@todo Add offset to support disconnection and retransmission.
@@ -41,6 +63,7 @@ impl SnapshotDownloadHandler {
         }
 
         let req: SnapshotDownloadRequest = msg.parse_header()?;
+        self.check_request(&req)?;
         let path = RaftUtils::snapshot_file_path(&req);
         let reader = FileReader::from_file(&path, req.offset, self.chunk_size)?;
         if (reader.len() as u64) > req.snapshot_file.len {

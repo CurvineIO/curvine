@@ -43,10 +43,33 @@ fn read_barrier_fence_rejects_until_catch_up() {
     barrier.advance_catch_up(41);
     assert!(barrier.is_current());
 
+    barrier.require_catch_up(100);
     barrier.fence();
-    assert!(barrier.ensure_current().is_err());
     barrier.advance_catch_up(42);
+    barrier.unfence();
+    assert!(barrier.ensure_current().is_err());
+    barrier.advance_catch_up(100);
     assert!(barrier.ensure_current().is_ok());
+
+    barrier.fence();
+    barrier.begin_catch_up(100, 100);
+    assert!(barrier.ensure_current().is_err());
+    barrier.unfence();
+    assert!(barrier.ensure_current().is_ok());
+}
+
+#[test]
+fn role_epoch_rejects_requests_from_before_a_completed_fence() {
+    let barrier = JournalReadBarrier::new();
+    let old_epoch = barrier.current_epoch().unwrap();
+    barrier.fence();
+    assert!(barrier.ensure_epoch(old_epoch).is_err());
+    barrier.unfence();
+    assert!(barrier.ensure_current().is_ok());
+    assert!(barrier.ensure_epoch(old_epoch).is_err());
+    let new_epoch = barrier.current_epoch().unwrap();
+    assert_ne!(old_epoch, new_epoch);
+    assert!(barrier.ensure_epoch(new_epoch).is_ok());
 }
 
 #[test]

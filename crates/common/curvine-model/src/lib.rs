@@ -38,7 +38,10 @@ pub trait CurvinePath: Sized + std::fmt::Display {
 }
 
 mod directory_attributes;
-pub use self::directory_attributes::{DirectoryAttributeDelta, DirectoryAttributes};
+pub use self::directory_attributes::{
+    children_count_persisted, encode_matching, is_legacy_record, persist_children_count,
+    DirectoryAttributeDelta, DirectoryAttributes, RECORD_FORMAT_READABLE,
+};
 
 mod storage_info;
 pub use self::storage_info::*;

@@ -37,6 +37,12 @@ impl SnapshotClient {
         }
     }
 
+    /// Manifest content checksum for this file, when the producer provided one.
+    /// Zero means "absent" and skips the identity check.
+    pub fn file_checksum(&self) -> Option<u64> {
+        self.file.checksum
+    }
+
     // Request to download the snapshot file.
     pub async fn open_file(
         &self,

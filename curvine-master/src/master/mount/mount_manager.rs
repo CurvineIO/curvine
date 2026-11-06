@@ -108,19 +108,22 @@ impl MountManager {
 
         let mut normalized_options = mnt_opt.clone();
         normalized_options.add_properties = mount.properties;
-        self.mount_table
-            .add_mount(assign_id, mount_path, ufs_path, &normalized_options)
+        self.master_fs.run_metadata_write(|| {
+            self.mount_table
+                .add_mount(assign_id, mount_path, ufs_path, &normalized_options)
+        })
     }
 
     fn update_mount(&self, cv_path: &str, mnt_opt: &MountOptions) -> FsResult<()> {
-        let path = Path::from_str(cv_path)?;
-        let Some(existing) = self.get_mount_info(&path)? else {
-            return err_box!("mount point {} not found for update", cv_path);
-        };
-        let mut merged = existing.merge_with(mnt_opt.clone());
-        Self::normalize_mount_config(&mut merged)?;
-
-        self.mount_table.update_mount(merged)
+        self.master_fs.run_metadata_write(|| {
+            let path = Path::from_str(cv_path)?;
+            let Some(existing) = self.get_mount_info(&path)? else {
+                return err_box!("mount point {} not found for update", cv_path);
+            };
+            let mut merged = existing.merge_with(mnt_opt.clone());
+            Self::normalize_mount_config(&mut merged)?;
+            self.mount_table.update_mount(merged)
+        })
     }
 
     /// same baseuri of ufs can only mount once
@@ -148,7 +151,8 @@ impl MountManager {
     }
 
     pub fn umount(&self, cv_path: &str) -> FsResult<()> {
-        self.mount_table.umount(cv_path)
+        self.master_fs
+            .run_metadata_write(|| self.mount_table.umount(cv_path))
     }
 
     pub fn unmount_by_id(&self, id: u32) -> FsResult<()> {

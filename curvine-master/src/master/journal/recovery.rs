@@ -36,6 +36,9 @@ fn is_metadata_damage(lower: &str) -> bool {
     lower.contains("corrupt")
         || lower.contains("checksum")
         || lower.contains("deserialize")
+        || lower.contains("failed to decode journal batch")
+        || lower.contains("invalid directory attributes")
+        || lower.contains("inode record id mismatch")
         || lower.contains("invariant")
         || lower.contains("poisoned")
 }

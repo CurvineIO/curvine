@@ -67,6 +67,25 @@ fn purger(fs: &MasterFilesystem) -> TrashPurger {
 }
 
 #[test]
+fn missing_entry_walk_waits_for_namespace_readers() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let fs = trash_fs("walk-lock", 8, 0);
+    let fs_dir = fs.fs_dir();
+    let held = fs_dir.read();
+    let worker_fs = fs.clone();
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tx.send(purger(&worker_fs).purge_entry("/.Trash/missing"))
+            .unwrap();
+    });
+    let early = rx.recv_timeout(Duration::from_millis(100));
+    drop(held);
+    worker.join().unwrap();
+    assert!(early.is_err(), "trash walk bypassed the namespace lock");
+    assert!(rx.recv().unwrap().unwrap().is_some());
+}
+
+#[test]
 fn purges_a_large_entry_in_bounded_batches() {
     let _serial = TEST_LOCK.lock().unwrap();
     let fs = trash_fs("bounded", 8, 0);

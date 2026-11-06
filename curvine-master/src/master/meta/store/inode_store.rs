@@ -23,11 +23,13 @@ use crate::master::space::scan_lease::{
 use crate::master::MetadataCodec;
 use curvine_core_error::{err_box, try_err, try_option, CommonResult};
 use curvine_model::{
-    BlockLocation, CommitBlock, DirectoryAttributes, FileLock, FileStatus, MountInfo,
+    BlockLocation, CommitBlock, DirectoryAttributeDelta, DirectoryAttributes, FileLock, FileStatus,
+    ListOptions, MountInfo,
 };
 use curvine_rocksdb::{DBConf, DbReadSnapshot as DBReadSnapshot, RocksIterator, RocksUtils};
 use curvine_runtime::common::{FileUtils, Utils};
 use log::info;
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::sync::Arc;
 
@@ -119,19 +121,118 @@ pub enum PurgeTarget {
 // If you need to share InodeStore, use Arc<InodeStore> or access it via FsDir.
 pub struct InodeStore {
     pub(crate) store: Arc<RocksInodeStore>,
-    pub(crate) fs_stats: Arc<FileSystemStats>,
+    fs_stats: Arc<FileSystemStats>,
     ttl_bucket_list: Arc<TtlBucketList>,
     scan_control: Arc<MetadataScanControl>,
+    /// Replaceable handle for the journal applied cursor row. Cloning this
+    /// handle never pins a RocksInodeStore: restore clears it before swapping
+    /// the database instance and republishes the new one afterwards, so the
+    /// journal applier can persist the cursor without taking the namespace
+    /// guard and without blocking a restore.
+    cursor_store: Arc<RwLock<Option<Arc<RocksInodeStore>>>>,
+}
+
+const DIRECTORY_ATTRIBUTE_MIGRATION_BATCH_SIZE: usize = 4096;
+
+/// Cloneable handle to the journal applied cursor row. It follows store
+/// replacement during restore without pinning any RocksInodeStore.
+#[derive(Clone)]
+pub struct JournalCursorStore {
+    inner: Arc<RwLock<Option<Arc<RocksInodeStore>>>>,
+}
+
+impl JournalCursorStore {
+    pub fn put(&self, key: &str, value: &[u8]) -> CommonResult<()> {
+        crate::fault_point! {
+            sync,
+            name: "master.journal.cursor.before_write",
+            description: "Before persisting the journal applied cursor",
+            context: { "key" => key },
+            return_error: |fault| Err(fault.message.into()),
+        }
+        let store = self.inner.read();
+        match store.as_ref() {
+            Some(store) => store.put_common_kv(key, value),
+            None => err_box!("cursor store unavailable during metadata restore"),
+        }
+    }
 }
 
 impl InodeStore {
+    fn merge_directory_attributes(
+        batch: &mut InodeWriteBatch<'_>,
+        parent: &InodeView,
+        delta: DirectoryAttributeDelta,
+    ) -> CommonResult<()> {
+        batch.merge_directory_attributes(parent.id(), parent.directory_attribute_delta(delta))
+    }
+
     pub fn new(store: RocksInodeStore, ttl_bucket_list: Arc<TtlBucketList>) -> CommonResult<Self> {
+        let store = Arc::new(store);
         Ok(InodeStore {
-            store: Arc::new(store),
+            cursor_store: Arc::new(RwLock::new(Some(store.clone()))),
+            store,
             fs_stats: Arc::new(FileSystemStats::new()?),
             ttl_bucket_list,
             scan_control: Arc::new(MetadataScanControl::new()),
         })
+    }
+
+    /// Snapshot handle for the journal cursor row. It stays valid across a
+    /// restore (which republishes the new store into the same handle) and
+    /// never pins the current RocksInodeStore itself.
+    pub fn cursor_store(&self) -> JournalCursorStore {
+        JournalCursorStore {
+            inner: self.cursor_store.clone(),
+        }
+    }
+
+    /// Adds directory-attribute records absent from stores created before the
+    /// separate directory-attributes column family existed. Existing records
+    /// are preserved because they may already contain merged updates.
+    pub fn migrate_directory_attributes(&self) -> CommonResult<()> {
+        if self.store.directory_attributes_migrated()? {
+            return Ok(());
+        }
+
+        let existing: HashSet<i64> = self.store.directory_attribute_ids()?.into_iter().collect();
+        let mut batch = self.store.new_batch();
+        let mut pending = 0;
+
+        for entry in self.store.bulk_scan_inodes()? {
+            let (key, bytes) = entry?;
+            let id = RocksUtils::i64_from_bytes(&key)?;
+            let inode = RocksInodeStore::decode_inode(id, &bytes)?;
+            let Ok(directory) = inode.as_dir_ref() else {
+                continue;
+            };
+            if existing.contains(&directory.id()) {
+                continue;
+            }
+
+            let mut attributes =
+                DirectoryAttributes::new(directory.mtime(), directory.ctime(), directory.nlink());
+            attributes.children = None;
+            batch.write_legacy_directory_attributes(directory.id(), attributes)?;
+            pending += 1;
+            if pending == DIRECTORY_ATTRIBUTE_MIGRATION_BATCH_SIZE {
+                batch.commit()?;
+                batch = self.store.new_batch();
+                pending = 0;
+            }
+        }
+
+        if pending > 0 {
+            batch.commit()?;
+        }
+
+        // A crash before this marker is durable repeats only idempotent
+        // missing-record writes on the next startup.
+        self.store.mark_directory_attributes_migrated()
+    }
+
+    pub fn initialize_root_directory_attributes(&self) -> CommonResult<()> {
+        self.store.initialize_root_directory_attributes()
     }
 
     /// Acquire a metadata snapshot scan lease.
@@ -140,6 +241,7 @@ impl InodeStore {
     /// must drop the lease before the store can be restored. Returns an error
     /// while a restore is pending or in progress.
     pub fn begin_snapshot_scan(&self) -> CommonResult<MetadataScanLease> {
+        self.ensure_available()?;
         let ticket = self.scan_control.try_acquire_lease()?;
         Ok(MetadataScanLease::new(
             self.scan_control.clone(),
@@ -174,9 +276,29 @@ impl InodeStore {
 
         batch.write_inode(child)?;
         batch.write_inode(parent)?;
+        Self::merge_directory_attributes(
+            &mut batch,
+            parent,
+            DirectoryAttributeDelta::new(parent.mtime(), parent.ctime(), i32::from(child.is_dir()))
+                .for_child_entry(),
+        )?;
+        if child.is_dir() {
+            batch.write_directory_attributes(child.id(), child.directory_attributes())?;
+        }
         batch.add_child(parent.id(), child.name(), child.id())?;
 
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.add.before_commit",
+            description: "Before committing the add metadata batch",
+            context: { "child_name" => child.name() },
+            return_error: |fault| Err(fault.message.into()),
+        }
+
         batch.commit()?;
+
+        parent.mark_directory_attributes_persisted();
+        child.mark_directory_attributes_persisted();
 
         self.ttl_bucket_list.add(child);
 
@@ -222,11 +344,22 @@ impl InodeStore {
             } = item;
 
             batch.write_inode(&parent)?;
+            Self::merge_directory_attributes(
+                &mut batch,
+                &parent,
+                DirectoryAttributeDelta::new(
+                    parent.mtime(),
+                    parent.ctime(),
+                    -i32::from(matches!(&target, PurgeTarget::Dir(_))),
+                )
+                .for_child_removal(),
+            )?;
             batch.delete_child(parent.id(), &name)?;
 
             match target {
                 PurgeTarget::Dir(dir) => {
                     batch.delete_inode(dir.id())?;
+                    batch.delete_directory_attributes(dir.id())?;
                     if dir.id() != ROOT_INODE_ID {
                         deleted_dirs += 1;
                     }
@@ -235,6 +368,7 @@ impl InodeStore {
                 PurgeTarget::File(inode_id) => {
                     let res = self.stage_decrement_nlink(
                         inode_id,
+                        1,
                         ctime,
                         &mut batch,
                         &mut staged,
@@ -272,6 +406,12 @@ impl InodeStore {
     ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
         batch.write_inode(parent)?;
+        Self::merge_directory_attributes(
+            &mut batch,
+            parent,
+            DirectoryAttributeDelta::new(parent.mtime(), parent.ctime(), -i32::from(del.is_dir()))
+                .for_child_removal(),
+        )?;
 
         let mut stack = LinkedList::new();
         // The caller keeps the namespace stable until this batch commits.
@@ -281,6 +421,7 @@ impl InodeStore {
         let mut deleted_files = 0i64;
         let mut deleted_dirs = 0i64;
         let mut file_link_counts: HashMap<i64, u32> = HashMap::new();
+        let mut ttl_removals = Vec::new();
 
         while let Some((parent_id, edge_name, item)) = stack.pop_front() {
             // Delete inode edges
@@ -290,7 +431,8 @@ impl InodeStore {
             match item.as_ref() {
                 InodeView::Dir(dir) => {
                     batch.delete_inode(inode_id)?;
-                    self.ttl_bucket_list.remove(item.as_ref());
+                    batch.delete_directory_attributes(inode_id)?;
+                    ttl_removals.push(item.as_ref().clone_metadata());
 
                     // Don't count root directory
                     if dir.id != ROOT_INODE_ID {
@@ -317,13 +459,25 @@ impl InodeStore {
         // removals in this traversal so every edge decrements the persisted
         // nlink count exactly once.
         for (inode_id, links) in file_link_counts {
-            let res = self.decrement_inode_nlink(inode_id, links, ctime, &mut batch)?;
+            let res =
+                self.decrement_inode_nlink(inode_id, links, ctime, &mut batch, &mut ttl_removals)?;
             del_res.inodes += res.inodes;
             del_res.bytes += res.bytes;
             del_res.blocks.extend(res.blocks);
         }
 
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.delete.before_commit",
+            description: "Before committing delete metadata",
+            context: {},
+            return_error: |fault| Err(fault.message.into()),
+        }
         batch.commit()?;
+
+        for inode in &ttl_removals {
+            self.ttl_bucket_list.remove(inode);
+        }
 
         if deleted_files > 0 {
             self.fs_stats.add_file_count(-deleted_files);
@@ -339,6 +493,16 @@ impl InodeStore {
         let mut batch = self.store.new_batch();
         for inode in inodes {
             batch.write_inode(&inode)?;
+            if inode.is_dir() {
+                batch.write_directory_attributes(inode.id(), inode.directory_attributes())?;
+            }
+        }
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.free.before_commit",
+            description: "Before committing free metadata",
+            context: {},
+            return_error: |fault| Err(fault.message.into()),
         }
         batch.commit()?;
         Ok(())
@@ -378,14 +542,134 @@ impl InodeStore {
         // Add new node.
         batch.write_inode(dst_inode)?;
         batch.add_child(dst_parent.id(), dst_inode.name(), dst_inode.id())?;
+        if src_parent.id() == dst_parent.id() {
+            Self::merge_directory_attributes(
+                &mut batch,
+                src_parent,
+                DirectoryAttributeDelta::new(src_parent.mtime(), src_parent.ctime(), 0),
+            )?;
+        } else {
+            Self::merge_directory_attributes(
+                &mut batch,
+                src_parent,
+                DirectoryAttributeDelta::new(
+                    src_parent.mtime(),
+                    src_parent.ctime(),
+                    -i32::from(src_inode.is_dir()),
+                )
+                .for_child_removal(),
+            )?;
+            Self::merge_directory_attributes(
+                &mut batch,
+                dst_parent,
+                DirectoryAttributeDelta::new(
+                    dst_parent.mtime(),
+                    dst_parent.ctime(),
+                    i32::from(src_inode.is_dir()),
+                )
+                .for_child_entry(),
+            )?;
+        }
 
         // Update the modification time of the previous node.
         batch.write_inode(src_parent)?;
         batch.write_inode(dst_parent)?;
 
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.rename.before_commit",
+            description: "Before committing the rename metadata batch",
+            context: { "source_name" => src_name },
+            return_error: |fault| Err(fault.message.into()),
+        }
         batch.commit()?;
 
+        src_parent.mark_directory_attributes_persisted();
+        dst_parent.mark_directory_attributes_persisted();
+
         Ok(())
+    }
+
+    pub fn apply_replace_rename(
+        &self,
+        src_parent: &InodeView,
+        src_inode: &InodeView,
+        src_name: &str,
+        dst_parent: &InodeView,
+        dst_inode: &InodeView,
+        replaced: &InodeView,
+        ctime: i64,
+    ) -> CommonResult<DeleteResult> {
+        if src_inode.id() != dst_inode.id() || src_inode.id() == replaced.id() {
+            return err_box!("invalid inode identities for replacement rename");
+        }
+        let mut batch = self.store.new_batch();
+        let mut ttl_removals = Vec::new();
+        batch.delete_child(src_parent.id(), src_name)?;
+        batch.delete_child(dst_parent.id(), dst_inode.name())?;
+        let result = if replaced.is_dir() {
+            batch.delete_inode(replaced.id())?;
+            batch.delete_directory_attributes(replaced.id())?;
+            ttl_removals.push(replaced.clone_metadata());
+            DeleteResult::new()
+        } else {
+            self.decrement_inode_nlink(replaced.id(), 1, ctime, &mut batch, &mut ttl_removals)?
+        };
+        batch.write_inode(dst_inode)?;
+        batch.add_child(dst_parent.id(), dst_inode.name(), dst_inode.id())?;
+        if src_parent.id() == dst_parent.id() {
+            Self::merge_directory_attributes(
+                &mut batch,
+                src_parent,
+                DirectoryAttributeDelta::new(
+                    src_parent.mtime(),
+                    src_parent.ctime(),
+                    -i32::from(replaced.is_dir()),
+                )
+                .for_child_removal(),
+            )?;
+        } else {
+            Self::merge_directory_attributes(
+                &mut batch,
+                src_parent,
+                DirectoryAttributeDelta::new(
+                    src_parent.mtime(),
+                    src_parent.ctime(),
+                    -i32::from(src_inode.is_dir()),
+                )
+                .for_child_removal(),
+            )?;
+            Self::merge_directory_attributes(
+                &mut batch,
+                dst_parent,
+                DirectoryAttributeDelta::new(
+                    dst_parent.mtime(),
+                    dst_parent.ctime(),
+                    i32::from(src_inode.is_dir()) - i32::from(replaced.is_dir()),
+                ),
+            )?;
+        }
+        batch.write_inode(src_parent)?;
+        batch.write_inode(dst_parent)?;
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.rename.before_commit",
+            description: "Before committing the rename metadata batch",
+            context: { "source_name" => src_name },
+            return_error: |fault| Err(fault.message.into()),
+        }
+        batch.commit()?;
+        src_parent.mark_directory_attributes_persisted();
+        dst_parent.mark_directory_attributes_persisted();
+        for inode in &ttl_removals {
+            self.ttl_bucket_list.remove(inode);
+        }
+        if replaced.is_dir() {
+            self.fs_stats.add_dir_count(-1);
+        } else {
+            self.fs_stats.decrement_file_count();
+        }
+        Ok(result)
     }
 
     pub fn apply_exchange(
@@ -405,10 +689,46 @@ impl InodeStore {
         batch.write_inode(at_dst)?;
         batch.add_child(src_parent.id(), at_src.name(), at_src.id())?;
         batch.add_child(dst_parent.id(), at_dst.name(), at_dst.id())?;
+        if src_parent.id() == dst_parent.id() {
+            Self::merge_directory_attributes(
+                &mut batch,
+                src_parent,
+                DirectoryAttributeDelta::new(src_parent.mtime(), src_parent.ctime(), 0),
+            )?;
+        } else {
+            let src_nlink_delta = i32::from(at_src.is_dir()) - i32::from(at_dst.is_dir());
+            Self::merge_directory_attributes(
+                &mut batch,
+                src_parent,
+                DirectoryAttributeDelta::new(
+                    src_parent.mtime(),
+                    src_parent.ctime(),
+                    src_nlink_delta,
+                ),
+            )?;
+            Self::merge_directory_attributes(
+                &mut batch,
+                dst_parent,
+                DirectoryAttributeDelta::new(
+                    dst_parent.mtime(),
+                    dst_parent.ctime(),
+                    -src_nlink_delta,
+                ),
+            )?;
+        }
         batch.write_inode(src_parent)?;
         batch.write_inode(dst_parent)?;
 
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.exchange.before_commit",
+            description: "Before committing the exchange metadata batch",
+            context: { "source_name" => src_name },
+            return_error: |fault| Err(fault.message.into()),
+        }
         batch.commit()?;
+        src_parent.mark_directory_attributes_persisted();
+        dst_parent.mark_directory_attributes_persisted();
 
         Ok(())
     }
@@ -427,6 +747,13 @@ impl InodeStore {
             }
         }
 
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.add_block.before_commit",
+            description: "Before committing add-block metadata",
+            context: { "inode_id" => file.id() },
+            return_error: |fault| Err(fault.message.into()),
+        }
         batch.commit()
     }
 
@@ -444,6 +771,13 @@ impl InodeStore {
             }
         }
 
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.complete_file.before_commit",
+            description: "Before committing completed-file metadata",
+            context: { "inode_id" => file.id() },
+            return_error: |fault| Err(fault.message.into()),
+        }
         batch.commit()?;
 
         // Refresh TTL index in case set_attr_opts changed ttl_ms/ttl_action or
@@ -456,6 +790,14 @@ impl InodeStore {
     pub fn apply_overwrite_file(&self, file: &InodeView) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         batch.write_inode(file)?;
+
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.overwrite.before_commit",
+            description: "Before committing overwrite metadata",
+            context: { "inode_id" => file.id() },
+            return_error: |fault| Err(fault.message.into()),
+        }
         batch.commit()?;
 
         // Overwrite can change ttl_ms/ttl_action and the TTL-base marker;
@@ -469,16 +811,41 @@ impl InodeStore {
     pub fn apply_reopen_file(&self, file: &InodeView) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         batch.write_inode(file)?;
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.writer.before_commit",
+            description: "Before committing writer metadata",
+            context: { "inode_id" => file.id() },
+            return_error: |fault| Err(fault.message.into()),
+        }
         batch.commit()
     }
 
-    pub fn apply_set_attr(&self, inodes: Vec<InodeView>) -> CommonResult<()> {
+    pub fn apply_set_attr(&self, inodes: impl AsRef<[InodeView]>) -> CommonResult<()> {
+        let inodes = inodes.as_ref();
         let mut batch = self.store.new_batch();
-        for inode in &inodes {
+        for inode in inodes {
             batch.write_inode(inode)?;
-            self.ttl_bucket_list.add(inode);
+            if inode.is_dir() {
+                batch.write_directory_attributes(inode.id(), inode.directory_attributes())?;
+            }
+        }
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.set_attr.before_commit",
+            description: "Before committing the set-attribute metadata batch",
+            context: { "root_name" => inodes.first().map_or("", |inode| inode.name()) },
+            return_error: |fault| Err(fault.message.into()),
         }
         batch.commit()?;
+
+        for inode in inodes {
+            if inode.is_dir() {
+                inode.set_directory_attributes(inode.directory_attributes());
+            }
+            inode.mark_directory_attributes_persisted();
+            self.ttl_bucket_list.add(inode);
+        }
 
         Ok(())
     }
@@ -496,7 +863,27 @@ impl InodeStore {
 
         batch.write_inode(parent)?;
         batch.write_inode(new_inode)?;
+        if is_add {
+            Self::merge_directory_attributes(
+                &mut batch,
+                parent,
+                DirectoryAttributeDelta::new(parent.mtime(), parent.ctime(), 0).for_child_entry(),
+            )?;
+        } else {
+            let mut attributes = parent.directory_attributes();
+            attributes.mtime = attributes.mtime.max(parent.mtime());
+            attributes.ctime = attributes.ctime.max(parent.ctime());
+            batch.write_directory_attributes(parent.id(), attributes)?;
+        }
         batch.add_child(parent.id(), new_inode.name(), new_inode.id())?;
+
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.symlink.before_commit",
+            description: "Before committing the symlink metadata batch",
+            context: { "child_name" => new_inode.name() },
+            return_error: |fault| Err(fault.message.into()),
+        }
 
         batch.commit()?;
 
@@ -517,12 +904,25 @@ impl InodeStore {
         let mut batch = self.store.new_batch();
 
         batch.write_inode(parent)?;
+        Self::merge_directory_attributes(
+            &mut batch,
+            parent,
+            DirectoryAttributeDelta::new(parent.mtime(), parent.ctime(), 0).for_child_entry(),
+        )?;
 
         //link is a edge, link to same inode
         batch.add_child(parent.id(), new_entry.name(), original_inode_id)?;
 
         // Increment nlink count of the original inode (in the same batch for atomicity)
         self.increment_inode_nlink(original_inode_id, ctime, &mut batch)?;
+
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.link.before_commit",
+            description: "Before committing the link metadata batch",
+            context: { "child_name" => new_entry.name() },
+            return_error: |fault| Err(fault.message.into()),
+        }
 
         batch.commit()?;
 
@@ -564,19 +964,29 @@ impl InodeStore {
 
         // Write the updated parent directory (child will be removed by the caller)
         batch.write_inode(parent)?;
+        Self::merge_directory_attributes(
+            &mut batch,
+            parent,
+            DirectoryAttributeDelta::new(parent.mtime(), parent.ctime(), 0).for_child_removal(),
+        )?;
 
         // Remove the child from the parent's children list
         batch.delete_child(parent.id(), child_name)?;
 
         // Decrement nlink count of the file being unlinked.
         // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
+        let mut ttl_removals = Vec::new();
         let del_res = if let InodeView::File(_) = child {
-            self.decrement_inode_nlink(child.id(), 1, ctime, &mut batch)?
+            self.decrement_inode_nlink(child.id(), 1, ctime, &mut batch, &mut ttl_removals)?
         } else {
             DeleteResult::new()
         };
 
         batch.commit()?;
+
+        for inode in &ttl_removals {
+            self.ttl_bucket_list.remove(inode);
+        }
 
         self.fs_stats.decrement_file_count();
 
@@ -603,15 +1013,26 @@ impl InodeStore {
 
         // Write the updated parent directory
         batch.write_inode(parent)?;
+        Self::merge_directory_attributes(
+            &mut batch,
+            parent,
+            DirectoryAttributeDelta::new(parent.mtime(), parent.ctime(), 0).for_child_removal(),
+        )?;
 
         // Remove the FileEntry from the parent's children list
         batch.delete_child(parent.id(), child_name)?;
 
         // Decrement nlink count of the original inode.
         // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
-        let del_res = self.decrement_inode_nlink(inode_id, 1, ctime, &mut batch)?;
+        let mut ttl_removals = Vec::new();
+        let del_res =
+            self.decrement_inode_nlink(inode_id, 1, ctime, &mut batch, &mut ttl_removals)?;
 
         batch.commit()?;
+
+        for inode in &ttl_removals {
+            self.ttl_bucket_list.remove(inode);
+        }
 
         self.fs_stats.decrement_file_count();
 
@@ -622,26 +1043,21 @@ impl InodeStore {
     fn decrement_inode_nlink(
         &self,
         inode_id: i64,
-        _links: u32,
+        links: u32,
         ctime: i64,
         batch: &mut InodeWriteBatch<'_>,
+        ttl_removals: &mut Vec<InodeView>,
     ) -> CommonResult<DeleteResult> {
         let mut staged = HashMap::new();
-        let mut ttl_removals = Vec::new();
-        let del_res =
-            self.stage_decrement_nlink(inode_id, ctime, batch, &mut staged, &mut ttl_removals)?;
-
-        for inode in &ttl_removals {
-            self.ttl_bucket_list.remove(inode);
-        }
-        Ok(del_res)
+        self.stage_decrement_nlink(inode_id, links, ctime, batch, &mut staged, ttl_removals)
     }
 
-    // Stages one nlink decrement, reading through `staged` so repeated names of
-    // the same inode inside a purge batch accumulate instead of resetting.
+    // Stages link removal, reading through `staged` so repeated names of the
+    // same inode inside one delete batch accumulate instead of resetting.
     fn stage_decrement_nlink(
         &self,
         inode_id: i64,
+        links: u32,
         ctime: i64,
         batch: &mut InodeWriteBatch<'_>,
         staged: &mut HashMap<i64, Option<InodeView>>,
@@ -653,13 +1069,13 @@ impl InodeStore {
             Some(None) => return err_box!("Inode {} not found when decrementing nlink", inode_id),
             None => match self.get_inode(inode_id, None)? {
                 Some(inode) => inode,
-                None => return err_box!("Inode {} not found when decrementing nlink", inode_id),
+                None => return Ok(del_res),
             },
         };
 
         let last_link = match &mut inode_view {
             InodeView::File(f) => {
-                if f.decrement_nlink(ctime) == 0 {
+                if f.decrement_nlink_by(links, ctime) == 0 {
                     // Collect block info
                     let locs = f.get_locs(self)?;
                     del_res.inodes = 1;
@@ -686,12 +1102,6 @@ impl InodeStore {
         }
 
         Ok(del_res)
-    }
-
-    pub fn create_blank_tree(&self) -> CommonResult<(i64, InodeView)> {
-        let root = FsDir::create_root();
-        self.fs_stats.set_counts(0, 0);
-        Ok((ROOT_INODE_ID, root))
     }
 
     // Restore to a directory tree from rocksdb.
@@ -732,17 +1142,15 @@ impl InodeStore {
         }
         timer.mark("scan_edges");
 
-        // --- 1a2. Scan dir_attrs CF when the column family exists ---
+        // --- 1a2. Scan the registered dir_attrs CF ---
         let mut dir_attrs: HashMap<i64, DirectoryAttributes> = HashMap::new();
-        if let Ok(attrs_iter) = self.store.scan_directory_attributes() {
-            for item in attrs_iter {
-                let (key, value) = try_err!(item);
-                let id = RocksUtils::i64_from_bytes(&key)?;
-                let attributes =
-                    RocksInodeStore::decode_directory_attributes(id, Some(value.to_vec()))?;
-                if let Some(attributes) = attributes {
-                    dir_attrs.insert(id, attributes);
-                }
+        for item in self.store.scan_directory_attributes()? {
+            let (key, value) = try_err!(item);
+            let id = RocksUtils::i64_from_bytes(&key)?;
+            let attributes =
+                RocksInodeStore::decode_directory_attributes(id, Some(value.to_vec()))?;
+            if let Some(attributes) = attributes {
+                dir_attrs.insert(id, attributes);
             }
         }
         timer.mark("scan_dir_attrs");
@@ -784,7 +1192,7 @@ impl InodeStore {
 
         if num_threads <= 1 || total < 1000 {
             for (id, bytes) in raw {
-                let inode: InodeView = MetadataCodec::decode(&bytes)?;
+                let inode = RocksInodeStore::decode_inode(id, &bytes)?;
                 inodes.insert(id, inode);
             }
             return Ok(inodes);
@@ -802,7 +1210,7 @@ impl InodeStore {
                     s.spawn(move || -> CommonResult<Vec<(i64, InodeView)>> {
                         let mut result = Vec::with_capacity(chunk.len());
                         for (id, bytes) in chunk {
-                            let inode: InodeView = MetadataCodec::decode(bytes)?;
+                            let inode = RocksInodeStore::decode_inode(*id, bytes)?;
                             result.push((*id, inode));
                         }
                         Ok(result)
@@ -845,6 +1253,9 @@ impl InodeStore {
             .inodes
             .remove(&ROOT_INODE_ID)
             .unwrap_or_else(FsDir::create_root);
+        if let Some(attributes) = data.dir_attrs.get(&ROOT_INODE_ID) {
+            root.as_dir_ref()?.set_directory_attributes(*attributes);
+        }
 
         // BFS stack: (parent_ptr, parent_id)
         let mut stack: VecDeque<(InodePtr, i64)> = VecDeque::new();
@@ -862,6 +1273,12 @@ impl InodeStore {
                 Some(c) => c,
                 None => continue,
             };
+
+            if let Ok(directory) = parent.as_dir_ref() {
+                directory
+                    .children_handle()
+                    .seed_shards_for_bulk_load(children.len());
+            }
 
             for (edge_name, child_id) in children {
                 last_inode_id = last_inode_id.max(*child_id);
@@ -922,12 +1339,9 @@ impl InodeStore {
                         let mut store_inode = store_inode;
                         dir_edges.insert(*child_id, (parent_id, edge_name.clone()));
                         if let Some(attributes) = data.dir_attrs.get(child_id) {
-                            log::debug!(
-                                "create_tree: directory {} has persisted attributes mtime={}, version={}",
-                                child_id,
-                                attributes.mtime,
-                                attributes.version
-                            );
+                            store_inode
+                                .as_dir_ref()?
+                                .set_directory_attributes(*attributes);
                         }
 
                         // Name / parent_id mismatch repair
@@ -959,7 +1373,10 @@ impl InodeStore {
 
                 // If directory, push onto stack for its children
                 if child_ptr.is_dir() {
-                    stack.push_back((child_ptr, *child_id));
+                    // The queue owns its metadata copy instead of retaining a
+                    // pointer into the parent's container. The directory's
+                    // child index remains shared with the tree entry.
+                    stack.push_back((InodePtr::from_owned(child_ptr.as_ref().clone()), *child_id));
                 }
             }
         }
@@ -1006,6 +1423,13 @@ impl InodeStore {
     //TODO refactor: remove seq name from store_inode
     pub fn get_inode(&self, id: i64, name: Option<&str>) -> CommonResult<Option<InodeView>> {
         let mut inode_view = self.store.get_inode(id)?;
+        if let Some(inode) = inode_view.as_ref() {
+            if inode.is_dir() {
+                if let Some(attributes) = self.store.get_directory_attributes(id)? {
+                    inode.set_directory_attributes(attributes);
+                }
+            }
+        }
         if let Some(name) = name {
             if let Some(ref mut inode) = inode_view {
                 inode.change_name(name.to_string());
@@ -1017,7 +1441,7 @@ impl InodeStore {
     pub fn batched_get_inodes(
         &self,
         inp: &InodePath,
-        list: Vec<InodePtr>,
+        list: Vec<InodeView>,
     ) -> CommonResult<Vec<FileStatus>> {
         if list.is_empty() {
             return Ok(vec![]);
@@ -1027,7 +1451,7 @@ impl InodeStore {
         let mut scan_inodes = Vec::with_capacity(list.len());
 
         for (index, inode) in list.iter().enumerate() {
-            match inode.as_ref() {
+            match inode {
                 InodeView::FileEntry(e) => {
                     scan_inodes.push((index, RocksUtils::i64_to_bytes(e.id)));
                 }
@@ -1096,47 +1520,98 @@ impl InodeStore {
     }
 
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
+        self.ensure_available()?;
         self.store.db.create_checkpoint(id)
     }
 
-    pub fn restore<T: AsRef<str>>(&mut self, path: T) -> CommonResult<()> {
-        // Check if there are other references to the Arc, which would prevent the lock from being released
+    fn restore<T: AsRef<str>>(&mut self, path: T) -> CommonResult<()> {
+        // Exclude cursor writes while checking the old database references.
+        let mut cursor = self.cursor_store.write();
+        if !cursor
+            .as_ref()
+            .is_some_and(|store| Arc::ptr_eq(store, &self.store))
+        {
+            return err_box!("cannot restore: journal cursor store is unavailable");
+        }
+        // The two expected references belong to self.store and cursor.
         let ref_count = Arc::strong_count(&self.store);
-        if ref_count > 1 {
+        if ref_count > 2 {
             return err_box!(
-                "cannot restore: RocksInodeStore has {} references (expected 1). \
-                Other components are still holding clones of InodeStore, \
-                which prevents RocksDB lock from being released.",
+                "cannot restore: RocksInodeStore has {} references (expected 2). \
+                Other components are still holding the database open.",
                 ref_count
             );
         }
 
         let conf = self.store.db.conf().clone();
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.restore.before_temp_store",
+            description: "Before opening the temporary metadata store",
+            context: { "data_dir" => conf.data_dir.as_str() },
+            return_error: |fault| Err(fault.message.into()),
+        }
 
-        // The database points to a temporary directory.
-        let tmp_path = Utils::temp_file();
-        let tmp_conf = DBConf::new(tmp_path);
-        self.store = Arc::new(RocksInodeStore::new(tmp_conf, false)?);
+        // Open the temporary database before releasing either old handle: a
+        // failure here leaves both the old store and cursor usable.
+        let tmp_conf = DBConf::new(Utils::temp_file());
+        let tmp_store = Arc::new(RocksInodeStore::new(tmp_conf, false)?);
+        *cursor = None;
+        self.store = tmp_store;
+        drop(cursor);
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.restore.after_store_detach",
+            description: "After detaching the original metadata store",
+            context: { "data_dir" => conf.data_dir.as_str() },
+            return_error: |fault| Err(fault.message.into()),
+        }
 
         // Delete the original file and move the checkpoint to the data directory.
         FileUtils::delete_path(&conf.data_dir, true)?;
         FileUtils::copy_dir(path.as_ref(), &conf.data_dir)?;
 
         self.store = Arc::new(RocksInodeStore::new(conf, false)?);
+        *self.cursor_store.write() = Some(self.store.clone());
         Ok(())
+    }
+
+    pub(crate) fn cursor_store_available(&self) -> bool {
+        self.cursor_store
+            .read()
+            .as_ref()
+            .is_some_and(|store| Arc::ptr_eq(store, &self.store))
+    }
+
+    pub(crate) fn invalidate_cursor_store(&self) {
+        *self.cursor_store.write() = None;
+    }
+
+    /// Call with the namespace guard held while accessing metadata.
+    pub(crate) fn ensure_available(&self) -> CommonResult<()> {
+        if !self.cursor_store_available() {
+            return err_box!("metadata store is unavailable after failed restore");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn checked_read_snapshot(&self) -> CommonResult<DBReadSnapshot<'_>> {
+        self.ensure_available()?;
+        Ok(self.store.read_snapshot())
     }
 
     /// Restore under a previously acquired restore guard (see `begin_restore`).
     ///
-    /// The guard proves scan leases have been drained and new ones are locked
-    /// out for the whole replace window. `wait_timeout` is only used when the
-    /// guard was not obtained through `begin_restore` — passing a guard means
-    /// the wait already happened, so this path never blocks.
+    /// The guard must belong to this store; it proves scan leases have been
+    /// drained and new ones are locked out for the whole replace window.
     pub fn restore_with_guard<T: AsRef<str>>(
         &mut self,
-        _guard: &MetadataRestoreGuard,
+        guard: &MetadataRestoreGuard,
         path: T,
     ) -> CommonResult<()> {
+        if !guard.belongs_to(&self.scan_control) {
+            return err_box!("metadata restore guard belongs to a different store");
+        }
         self.restore(path)
     }
 
@@ -1230,10 +1705,7 @@ impl<'a> InodeStoreSnapshot<'a> {
             .get_cf(RocksInodeStore::CF_INODES, RocksUtils::i64_to_bytes(id))?;
         match bytes {
             None => Ok(None),
-            Some(v) => {
-                let inode: InodeView = MetadataCodec::decode(&v)?;
-                Ok(Some(inode))
-            }
+            Some(v) => Ok(Some(RocksInodeStore::decode_inode(id, &v)?)),
         }
     }
 
@@ -1273,6 +1745,58 @@ impl<'a> InodeStoreSnapshot<'a> {
             RocksInodeStore::CF_EDGES,
             RocksUtils::i64_to_bytes(parent_id),
         )
+    }
+
+    /// Read child edges and their owned inodes from the same snapshot.
+    pub fn children(&self, parent_id: i64) -> CommonResult<Vec<InodeView>> {
+        self.children_page(parent_id, &ListOptions::default())
+    }
+
+    pub fn children_page(
+        &self,
+        parent_id: i64,
+        opts: &ListOptions,
+    ) -> CommonResult<Vec<InodeView>> {
+        let mut children = Vec::new();
+        if opts.limit == Some(0) {
+            return Ok(children);
+        }
+        let prefix = RocksUtils::i64_to_bytes(parent_id);
+        let start = opts.start_after.as_ref().map_or_else(
+            || prefix.to_vec(),
+            |name| RocksUtils::i64_str_to_bytes(parent_id, name),
+        );
+        let mut count = 0;
+        for edge in self
+            .snapshot
+            .prefix_scan_from(RocksInodeStore::CF_EDGES, &prefix, &start)?
+        {
+            if opts.limit.is_some_and(|limit| count >= limit) {
+                break;
+            }
+            let (key, value) = edge?;
+            let (_, name) = RocksUtils::i64_str_from_bytes(&key)?;
+            if opts
+                .start_after
+                .as_ref()
+                .is_some_and(|cursor| name <= *cursor)
+            {
+                continue;
+            }
+            let id = RocksUtils::i64_from_bytes(&value)?;
+            let Some(mut inode) = self.get_inode(id)? else {
+                log::warn!(
+                    "listing skips missing inode {} for parent {}",
+                    id,
+                    parent_id
+                );
+                continue;
+            };
+            inode.change_name(name.to_string());
+            children.push(inode);
+            count += 1;
+        }
+        Ok(children)
     }
 
     /// Point-read up to `ids.len()` inodes within this snapshot (missing keys
@@ -1849,9 +2373,10 @@ mod tests {
         let iter = reader.scan_inodes()?;
         assert!(!lease.is_cancelled());
 
-        // Strong count: store's own Arc + the lease's Arc.
+        // Strong count: store's own Arc + the lease's Arc + the cursor row
+        // handle that follows store replacement across restore.
         let strong = Arc::strong_count(&store.store);
-        assert_eq!(strong, 2, "lease should hold exactly one extra store ref");
+        assert_eq!(strong, 3, "lease and cursor handle each hold one extra ref");
 
         // 2. Restore concurrently; scanner stays idle holding lease+iter.
         let restore_store = Arc::new(parking_lot::Mutex::new(store));
@@ -1886,9 +2411,10 @@ mod tests {
             res
         );
 
-        // 5. New leases work again and strong count returned to 1.
+        // 5. New leases work again; the count is back to the store plus the
+        // cursor row handle republished by restore.
         assert!(store_begin_scan_ok(&restore_store));
-        assert_eq!(store_strong_count(&restore_store), 1);
+        assert_eq!(store_strong_count(&restore_store), 2);
 
         Ok(())
     }
@@ -1959,7 +2485,8 @@ mod tests {
         let res = store.restore_with_guard(&guard, "/nonexistent-checkpoint");
         // restore_with_guard performs the strong-count defensive check.
         assert!(res.is_err());
-        assert_eq!(Arc::strong_count(&leaked), 2);
+        // The live store and cursor both retain the original database.
+        assert_eq!(Arc::strong_count(&leaked), 3);
         drop(leaked);
 
         Ok(())

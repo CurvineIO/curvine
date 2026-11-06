@@ -92,6 +92,14 @@ impl MetadataScanControl {
         self.state.lock().restoring
     }
 
+    /// Wait until an active restore has finished before inspecting its data directory.
+    pub(crate) fn wait_until_restored(&self) {
+        let mut state = self.state.lock();
+        while state.restoring {
+            self.idle.wait(&mut state);
+        }
+    }
+
     /// Try to register a new scan lease.
     ///
     /// Returns `Err` when a restore is pending/in progress so that scanners
@@ -111,11 +119,15 @@ impl MetadataScanControl {
 
     /// Begin a restore: mark restoring, bump the cancel epoch and wait for all
     /// active leases to be dropped (scanners observe the epoch change and
-    /// cancel). On timeout the restore is aborted and the state cleaned up, so
-    /// scans can continue against the untouched store.
+    /// cancel). A second concurrent restore is rejected so only its owner can
+    /// reopen scan admission. On timeout the restore is aborted and scans can
+    /// continue against the untouched store.
     pub fn begin_restore(&self, wait_timeout: Duration) -> CommonResult<RestoreTicket> {
         let deadline = std::time::Instant::now() + wait_timeout;
         let mut state = self.state.lock();
+        if state.restoring {
+            return err_box!("metadata snapshot restore is already pending or in progress");
+        }
 
         state.restoring = true;
         state.cancel_epoch = state.cancel_epoch.wrapping_add(1);
@@ -186,7 +198,7 @@ pub struct RestoreTicket;
 /// and the store reference, allowing a pending restore to proceed.
 pub struct MetadataScanLease {
     control: Arc<MetadataScanControl>,
-    store: Arc<RocksInodeStore>,
+    store: Option<Arc<RocksInodeStore>>,
     ticket: Option<LeaseTicket>,
 }
 
@@ -198,7 +210,7 @@ impl MetadataScanLease {
     ) -> Self {
         Self {
             control,
-            store,
+            store: Some(store),
             ticket: Some(ticket),
         }
     }
@@ -207,14 +219,14 @@ impl MetadataScanLease {
     /// temporarily hold this Arc; scanners must not clone it out.
     #[allow(dead_code)]
     pub(crate) fn store(&self) -> &RocksInodeStore {
-        &self.store
+        self.store.as_deref().expect("live lease has a store")
     }
 
     /// Create a typed consistent-read snapshot over the inode/edge column
     /// families. The returned reader borrows from this lease; the underlying
     /// RocksDB snapshot is released when the reader (then the lease) drops.
     pub fn snapshot_reader(&self) -> CommonResult<InodeStoreSnapshot<'_>> {
-        Ok(InodeStoreSnapshot::new(self.store.read_snapshot()))
+        Ok(InodeStoreSnapshot::new(self.store().read_snapshot()))
     }
 
     /// Whether a restore has started after this lease was acquired. Scanners
@@ -227,6 +239,10 @@ impl MetadataScanLease {
 impl Drop for MetadataScanLease {
     fn drop(&mut self) {
         if self.ticket.take().is_some() {
+            // Restore may proceed immediately after release_lease wakes it.
+            // Drop the DB reference first so the lease count reaching zero
+            // actually means all lease-owned store references are gone.
+            drop(self.store.take());
             self.control.release_lease();
         }
     }
@@ -243,6 +259,10 @@ pub struct MetadataRestoreGuard {
 impl MetadataRestoreGuard {
     pub(crate) fn new(control: Arc<MetadataScanControl>) -> Self {
         Self { control }
+    }
+
+    pub(crate) fn belongs_to(&self, control: &Arc<MetadataScanControl>) -> bool {
+        Arc::ptr_eq(&self.control, control)
     }
 }
 

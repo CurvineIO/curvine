@@ -114,21 +114,21 @@ impl SingleExecutor {
         let builder = thread::Builder::new().name(name.clone());
 
         let poll_time = Duration::from_millis(300);
-        let res = builder.spawn(move || {
-            ctl.store(Self::ST_RUNNING, Ordering::SeqCst);
-
-            while ctl.load(Ordering::SeqCst) <= Self::ST_SHUTDOWN {
-                loop {
-                    match receiver.recv_timeout(poll_time) {
-                        Ok(task) => task(),
-                        Err(RecvTimeoutError::Timeout) => break,
-                        Err(RecvTimeoutError::Disconnected) => {
-                            // The channel has been closed
-                            error!("thread {} abnormal shutdown", name);
-                            ctl.store(Self::ST_STOP, Ordering::SeqCst);
-                            break;
-                        }
-                    }
+        let res = builder.spawn(move || loop {
+            if ctl.load(Ordering::SeqCst) == Self::ST_STOP {
+                match receiver.try_recv() {
+                    Ok(task) => task(),
+                    Err(_) => break,
+                }
+                continue;
+            }
+            match receiver.recv_timeout(poll_time) {
+                Ok(task) => task(),
+                Err(RecvTimeoutError::Timeout) => (),
+                Err(RecvTimeoutError::Disconnected) => {
+                    error!("thread {} abnormal shutdown", name);
+                    ctl.store(Self::ST_STOP, Ordering::SeqCst);
+                    break;
                 }
             }
         });
@@ -147,10 +147,10 @@ impl Drop for SingleExecutor {
             return;
         }
 
-        self.ctl.store(Self::ST_SHUTDOWN, Ordering::SeqCst);
-        while self.sender.try_send(Box::new(|| {})).is_ok() {}
-
         self.ctl.store(Self::ST_STOP, Ordering::SeqCst);
+        // Wake an idle worker; if the queue is full it will observe STOP after
+        // draining the tasks already accepted.
+        let _ = self.sender.try_send(Box::new(|| {}));
         match self.handler.take() {
             None => {
                 error!("Thread {} does not appear to exist", self.name)

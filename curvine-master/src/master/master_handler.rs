@@ -207,6 +207,10 @@ impl MasterHandler {
         let query = manager.query(path.path()).map_err(|err| match err {
             DirSpaceQueryError::Disabled => FsError::unsupported("dir-space content summary"),
             DirSpaceQueryError::Path(p) => FsError::file_not_found(p),
+            DirSpaceQueryError::Storage(error) => {
+                log::warn!("dir-space namespace lookup failed: {}", error);
+                FsError::common("dir-space namespace lookup failed")
+            }
             DirSpaceQueryError::SnapshotMiss(SnapshotMiss::NoSnapshot)
             | DirSpaceQueryError::SnapshotMiss(SnapshotMiss::NotInSnapshot) => {
                 FsError::snapshot_not_ready(path_str)
@@ -1170,26 +1174,56 @@ impl MasterHandler {
 
     pub fn block_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: BlockReportListRequest = ctx.parse_header()?;
-        let cmds =
+        if header.full_report_begin.unwrap_or(false) {
+            Self::validate_full_report_begin(&header)?;
+            let worker_session_id = header.worker_session_id.as_deref().unwrap_or_default();
+            let begin = if worker_session_id.is_empty() {
+                None
+            } else {
+                self.fs.begin_full_block_report_for_live_worker_session(
+                    header.worker_id,
+                    header.report_id.unwrap_or(0),
+                    worker_session_id,
+                )
+            };
+            let rep_header = BlockReportListResponse {
+                cmds: Vec::new(),
+                full_report_begin_accepted: Some(begin == Some(true)),
+                restart_full_report: Some(begin == Some(false)),
+            };
+            return ctx.response(rep_header);
+        }
+        let (cmds, restart_full_report) =
             Self::process_block_report(self.fs.clone(), self.replication_handler.clone(), header)?;
         let rep_header = BlockReportListResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+            full_report_begin_accepted: None,
+            restart_full_report: restart_full_report.then_some(true),
         };
         ctx.response(rep_header)
+    }
+
+    fn validate_full_report_begin(header: &BlockReportListRequest) -> FsResult<()> {
+        if header.full_report || header.total_len != 0 || !header.blocks.is_empty() {
+            return err_ext!(FsError::invalid_argument(
+                "full block report begin must be an empty incremental request"
+            ));
+        }
+        Ok(())
     }
 
     fn process_block_report(
         fs: MasterFilesystem,
         replication_handler: Option<MasterReplicationHandler>,
         header: BlockReportListRequest,
-    ) -> FsResult<Vec<WorkerCommand>> {
+    ) -> FsResult<(Vec<WorkerCommand>, bool)> {
         let worker_id = header.worker_id;
         let worker_session_id = header.worker_session_id.clone().unwrap_or_default();
         let list = ProtoUtils::block_report_list_from_pb(header);
         let result = if worker_session_id.is_empty() {
             match fs.block_report_for_legacy_live_worker(list, replication_handler)? {
                 Some(result) => result,
-                None => return Ok(Vec::new()),
+                None => return Ok((Vec::new(), false)),
             }
         } else {
             match fs.block_report_for_live_worker_session(
@@ -1204,17 +1238,20 @@ impl MasterHandler {
                         worker_id,
                         worker_session_id
                     );
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), false));
                 }
             }
         };
 
-        if result.delete_blocks.is_empty() {
-            Ok(Vec::new())
+        if result.restart_full_report || result.delete_blocks.is_empty() {
+            Ok((Vec::new(), result.restart_full_report))
         } else {
-            Ok(vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
-                blocks: result.delete_blocks,
-            })])
+            Ok((
+                vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
+                    blocks: result.delete_blocks,
+                })],
+                false,
+            ))
         }
     }
 
@@ -1791,6 +1828,32 @@ mod tests {
     use crate::master::journal::JournalSystem;
     use curvine_model::{TrashEntry, WorkerAddress};
     use curvine_runtime::common::Utils;
+
+    #[test]
+    fn full_block_report_begin_must_be_empty_incremental_request() {
+        let mut request = BlockReportListRequest {
+            cluster_id: "test".to_owned(),
+            worker_id: 1,
+            worker_session_id: Some("session".to_owned()),
+            full_report: false,
+            total_len: 0,
+            report_id: Some(1),
+            full_report_begin: Some(true),
+            blocks: vec![],
+        };
+        assert!(MasterHandler::validate_full_report_begin(&request).is_ok());
+
+        request.full_report = true;
+        assert!(MasterHandler::validate_full_report_begin(&request).is_err());
+        request.full_report = false;
+
+        request.total_len = 1;
+        assert!(MasterHandler::validate_full_report_begin(&request).is_err());
+        request.total_len = 0;
+
+        request.blocks.push(BlockReportInfoProto::default());
+        assert!(MasterHandler::validate_full_report_begin(&request).is_err());
+    }
 
     #[test]
     fn process_worker_heartbeat_stores_worker_report_fields() {

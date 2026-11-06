@@ -198,6 +198,88 @@ fn snapshot_install_compacts_the_durable_log_range() {
 }
 
 #[test]
+fn snapshot_with_conflicting_boundary_discards_uncommitted_suffix_after_restart() {
+    let conf = test_conf("snapshot-conflicting-suffix");
+    let mut storage = RocksStorageCore::new(conf.clone(), true);
+    let entries: Vec<_> = (1..=5)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            ..Default::default()
+        })
+        .collect();
+    storage.append(&entries).unwrap();
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 3;
+    snapshot.mut_metadata().term = 2;
+    storage.apply_snapshot(snapshot).unwrap();
+    drop(storage);
+
+    let mut storage = RocksStorageCore::new(conf, false);
+    assert_eq!(storage.init_state().unwrap().hard_state.commit, 3);
+    assert_eq!(storage.first_index(), 4);
+    assert_eq!(storage.last_index(), 3);
+    assert!(storage.get(4).unwrap().is_none());
+}
+
+#[test]
+fn snapshot_with_matching_boundary_keeps_suffix_after_restart() {
+    let conf = test_conf("snapshot-matching-suffix");
+    let mut storage = RocksStorageCore::new(conf.clone(), true);
+    let entries: Vec<_> = (1..=5)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            ..Default::default()
+        })
+        .collect();
+    storage.append(&entries).unwrap();
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 3;
+    snapshot.mut_metadata().term = 1;
+    storage.apply_snapshot(snapshot).unwrap();
+    drop(storage);
+
+    let mut storage = RocksStorageCore::new(conf, false);
+    storage.init_state().unwrap();
+    assert_eq!(storage.first_index(), 4);
+    assert_eq!(storage.last_index(), 5);
+    assert_eq!(storage.get(4).unwrap().unwrap().term, 1);
+}
+
+#[test]
+fn snapshot_conflicting_with_committed_history_is_rejected_without_mutation() {
+    let conf = test_conf("snapshot-conflicting-committed");
+    let mut storage = RocksStorageCore::new(conf.clone(), true);
+    let entries: Vec<_> = (1..=5)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            ..Default::default()
+        })
+        .collect();
+    storage.append(&entries).unwrap();
+    storage
+        .set_hard_state(HardState {
+            term: 1,
+            vote: 0,
+            commit: 4,
+        })
+        .unwrap();
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 3;
+    snapshot.mut_metadata().term = 2;
+    assert!(storage.apply_snapshot(snapshot).is_err());
+    drop(storage);
+
+    let mut storage = RocksStorageCore::new(conf, false);
+    assert_eq!(storage.init_state().unwrap().hard_state.commit, 4);
+    assert_eq!(storage.first_index(), 1);
+    assert_eq!(storage.last_index(), 5);
+    assert_eq!(storage.get(3).unwrap().unwrap().term, 1);
+}
+
+#[test]
 fn restart_accepts_snapshot_adjacent_to_first_retained_log() {
     let conf = test_conf("snapshot-adjacent");
     FileUtils::delete_path(&conf.base_dir, true).unwrap();

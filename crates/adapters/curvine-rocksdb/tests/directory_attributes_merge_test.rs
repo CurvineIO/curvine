@@ -94,6 +94,104 @@ fn partial_merge_must_not_hide_intermediate_underflow() {
 }
 
 #[test]
+fn compaction_preserves_current_format_operands_when_writes_are_disabled() {
+    let path = Utils::test_sub_dir(format!("directory_current_merge_{}", Utils::rand_str(12)));
+    let mut options = Options::default();
+    options.create_if_missing(true);
+    configure_directory_attributes_merge(&mut options);
+    let db = DB::open(&options, &path).unwrap();
+    db.put(b"key", DirectoryAttributes::new(0, 0, 0).encode())
+        .unwrap();
+    db.flush().unwrap();
+    for _ in 0..10 {
+        db.merge(
+            b"key",
+            DirectoryAttributeDelta::for_child(1)
+                .for_child_entry()
+                .encode(),
+        )
+        .unwrap();
+    }
+    db.flush().unwrap();
+    db.compact_range::<&[u8], &[u8]>(None, None);
+    assert_eq!(
+        DirectoryAttributes::decode(&db.get(b"key").unwrap().unwrap())
+            .unwrap()
+            .children,
+        Some(10)
+    );
+    drop(db);
+    DB::destroy(&options, &path).unwrap();
+}
+
+#[test]
+fn mixed_generation_operands_invalidate_count_even_after_compaction() {
+    let path = Utils::test_sub_dir(format!("directory_mixed_merge_{}", Utils::rand_str(12)));
+    let mut options = Options::default();
+    options.create_if_missing(true);
+    configure_directory_attributes_merge(&mut options);
+    let db = DB::open(&options, &path).unwrap();
+    db.put(b"key", DirectoryAttributes::new(0, 0, 0).encode())
+        .unwrap();
+    db.flush().unwrap();
+    db.merge(
+        b"key",
+        DirectoryAttributeDelta::for_child(1)
+            .for_child_entry()
+            .encode_legacy(),
+    )
+    .unwrap();
+    db.merge(
+        b"key",
+        DirectoryAttributeDelta::for_child(2)
+            .for_child_entry()
+            .encode(),
+    )
+    .unwrap();
+    db.flush().unwrap();
+    db.compact_range::<&[u8], &[u8]>(None, None);
+    let attributes = DirectoryAttributes::decode(&db.get(b"key").unwrap().unwrap()).unwrap();
+    assert_eq!(attributes.children, None);
+    assert_eq!(attributes.version, 2);
+    drop(db);
+    DB::destroy(&options, &path).unwrap();
+}
+
+#[test]
+fn mixed_operands_keep_the_generation_of_the_first_record() {
+    let path = Utils::test_sub_dir(format!("directory_first_format_{}", Utils::rand_str(12)));
+    let mut options = Options::default();
+    options.create_if_missing(true);
+    configure_directory_attributes_merge(&mut options);
+    let db = DB::open(&options, &path).unwrap();
+    let base = DirectoryAttributes::new(0, 0, 0);
+    db.merge(
+        b"key",
+        DirectoryAttributeDelta::for_child(1)
+            .with_base(base)
+            .encode_legacy(),
+    )
+    .unwrap();
+    db.merge(
+        b"key",
+        DirectoryAttributeDelta::for_child(2)
+            .for_child_entry()
+            .with_base(base)
+            .encode(),
+    )
+    .unwrap();
+    db.flush().unwrap();
+    db.compact_range::<&[u8], &[u8]>(None, None);
+    let value = db.get(b"key").unwrap().unwrap();
+    assert!(curvine_model::is_legacy_record(&value));
+    let attributes = DirectoryAttributes::decode(&value).unwrap();
+    assert_eq!(attributes.children, None);
+    assert_eq!(attributes.version, 2);
+    drop(db);
+    DB::destroy(&options, &path).unwrap();
+}
+
+#[test]
 fn concurrent_merges_preserve_all_updates() {
     let path = Utils::test_sub_dir(format!("directory_concurrent_{}", Utils::rand_str(12)));
     let mut options = Options::default();

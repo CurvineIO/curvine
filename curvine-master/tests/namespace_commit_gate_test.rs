@@ -3,6 +3,183 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 #[test]
+fn filesystem_handles_for_same_journal_share_commit_gate() {
+    use curvine_master::master::fs::MasterFilesystem;
+    use curvine_master::master::journal::JournalSystem;
+    use curvine_master::Master;
+
+    Master::init_test_metrics();
+    let mut conf = curvine_config::ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!(
+        "shared-commit-gate-{}",
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    let journal = JournalSystem::from_conf(&conf).unwrap();
+    let original = journal.fs();
+    let other = MasterFilesystem::with_js(&conf, &journal);
+    let original_gate = original.metadata_commit_gate();
+    let other_gate = other.metadata_commit_gate();
+    assert!(Arc::ptr_eq(&original_gate, &other_gate));
+    let barrier = original_gate.close_owned();
+    assert!(other_gate.try_enter().is_none());
+    drop(barrier);
+    assert!(other_gate.try_enter().is_some());
+    drop(other);
+    drop(original);
+    journal.shutdown();
+}
+
+#[test]
+fn raft_snapshot_waits_for_inflight_metadata_writers() {
+    use curvine_master::master::journal::JournalSystem;
+    use curvine_master::Master;
+    use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+
+    Master::init_test_metrics();
+    let mut conf = curvine_config::ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!(
+        "snapshot-commit-gate-{}",
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    let journal = JournalSystem::from_conf(&conf).unwrap();
+    let gate = journal.fs().metadata_commit_gate();
+    let in_flight = gate.enter();
+    let loader = journal.journal_loader();
+    let snapshot_loader = loader.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let snapshot = std::thread::spawn(move || {
+        let rt = AsyncRuntime::single();
+        started_tx.send(()).unwrap();
+        done_tx
+            .send(rt.block_on(snapshot_loader.create_snapshot()))
+            .unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while gate.try_enter().is_some() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let admission_closed = gate.try_enter().is_none();
+    let entry = raft::eraftpb::Entry {
+        term: 1,
+        index: 1,
+        ..Default::default()
+    };
+    journal
+        .append_committed_entry_for_test(entry.clone())
+        .unwrap();
+    let runtime = AsyncRuntime::single();
+    let applied = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            loader.apply(true, ApplyMsg::new_entry(entry)),
+        )
+        .await
+    });
+    let finished_early = done_rx.try_recv().ok();
+    let completed_before_drain = finished_early.is_some();
+    drop(in_flight);
+    let result = match finished_early {
+        Some(result) => result,
+        None => done_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+    };
+    snapshot.join().unwrap();
+    journal.shutdown();
+    assert!(admission_closed, "snapshot must close writer admission");
+    assert!(
+        matches!(applied, Ok(Ok(()))),
+        "apply worker must remain live"
+    );
+    assert!(
+        !completed_before_drain,
+        "snapshot must wait for in-flight writers"
+    );
+    assert!(result.is_ok(), "snapshot failed: {result:?}");
+}
+
+#[test]
+fn cancelling_snapshot_request_keeps_gate_closed_until_apply_finishes() {
+    use curvine_master::master::journal::JournalSystem;
+    use curvine_master::Master;
+    use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
+    use curvine_runtime::sync::channel::CallChannel;
+
+    Master::init_test_metrics();
+    let mut conf = curvine_config::ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!(
+        "snapshot-cancel-gate-{}",
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    let journal = JournalSystem::from_conf(&conf).unwrap();
+    let fs = journal.fs();
+    let gate = fs.metadata_commit_gate();
+    let fs_dir = fs.fs_dir();
+    let fs_lock = fs_dir.write();
+    let loader = journal.journal_loader();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let snapshot_loader = loader.clone();
+    let snapshot = runtime.spawn(async move { snapshot_loader.create_snapshot().await });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while gate.try_enter().is_some() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let closed_before_cancel = gate.try_enter().is_none();
+    // An acknowledged no-op queued behind the snapshot cannot finish while
+    // the apply worker is blocked by fs_lock. Retry if it overtakes the snapshot.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let marker = loop {
+        let (tx, rx) = CallChannel::channel();
+        runtime
+            .block_on(loader.apply(false, ApplyMsg::new_entry_with_ack(Default::default(), tx)))
+            .unwrap();
+        let mut marker = runtime.spawn(async move { rx.receive().await });
+        if runtime
+            .block_on(async { tokio::time::timeout(Duration::from_millis(100), &mut marker).await })
+            .is_err()
+        {
+            break marker;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "snapshot never blocked the apply queue"
+        );
+    };
+    snapshot.abort();
+    let _ = runtime.block_on(snapshot);
+    let closed_after_cancel = gate.try_enter().is_none();
+    drop(fs_lock);
+    runtime.block_on(marker).unwrap().unwrap().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while gate.try_enter().is_none() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let reopened = gate.try_enter().is_some();
+    drop(fs);
+    journal.shutdown();
+    assert!(closed_before_cancel, "snapshot must close admission");
+    assert!(
+        closed_after_cancel,
+        "cancelled caller must not release the snapshot fence"
+    );
+    assert!(reopened, "snapshot fence must eventually reopen");
+}
+
+#[test]
 fn multiple_barriers_keep_gate_closed_until_last_drop() {
     let gate = Arc::new(CommitGate::new());
     let first = gate.close_owned();

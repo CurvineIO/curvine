@@ -66,6 +66,42 @@ fn pending_entries(fs: &MasterFilesystem) -> Vec<String> {
 }
 
 #[test]
+fn background_delete_waits_for_metadata_gate() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let fs = fs_with("background-gate", false);
+    fs.create("/victim", false).unwrap();
+    let gate = fs.metadata_commit_gate();
+    let barrier = gate.close_owned();
+    let worker_fs = fs.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        done_tx
+            .send(worker_fs.delete_with_mode_if_active("/victim", false, DeleteMode::SkipTrash))
+            .unwrap();
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let early = done_rx
+        .recv_timeout(std::time::Duration::from_millis(200))
+        .ok();
+    let exists_while_closed = fs.exists("/victim").unwrap();
+    drop(barrier);
+    let result = match early {
+        Some(result) => result,
+        None => done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap(),
+    };
+    worker.join().unwrap();
+    assert!(exists_while_closed, "delete crossed the closed commit gate");
+    assert!(result.unwrap().is_some());
+    assert!(!fs.exists("/victim").unwrap());
+}
+
+#[test]
 fn async_delete_returns_after_staging_instead_of_walking_the_subtree() {
     let _serial = TEST_LOCK.lock().unwrap();
     let fs = fs_with("staged", false);

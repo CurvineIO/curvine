@@ -27,6 +27,10 @@ struct Session {
     total_len: u64,
     update_time_ms: u64,
     reported_blocks: HashSet<i64>,
+    /// True after the Worker completed the pre-snapshot handshake. Such a
+    /// session must never accept blocks once invalidated: they came from an
+    /// older local snapshot and must be re-read under a new report id.
+    begun: bool,
     invalidated: bool,
 }
 
@@ -50,6 +54,14 @@ pub(super) enum FullReportProgress {
     Duplicate,
     /// The batch belongs to a round whose completing batch is still being processed.
     InFlight,
+    /// A replication completion invalidated the pre-snapshot report round.
+    /// The Worker must start a new round before sending more batches.
+    Restart,
+}
+
+pub(super) enum FullReportBegin {
+    Accepted,
+    Restart,
 }
 
 #[derive(Default)]
@@ -71,6 +83,55 @@ pub(super) struct FullReportTracker {
 }
 
 impl FullReportTracker {
+    /// Registers a report id before the Worker reads its local block snapshot.
+    /// A duplicate begin is idempotent until an intervening location update
+    /// invalidates it; a completed id is never reused.
+    pub(super) fn begin(&self, worker_id: u32, report_id: u64, now: u64) -> FullReportBegin {
+        if report_id == 0 {
+            return FullReportBegin::Restart;
+        }
+
+        let mut state = self.state.lock();
+        state
+            .rounds
+            .retain(|_, round| now.saturating_sub(round.time_ms) <= FULL_BLOCK_REPORT_TTL_MS);
+        state.sessions.retain(|_, session| {
+            now.saturating_sub(session.update_time_ms) <= FULL_BLOCK_REPORT_TTL_MS
+        });
+
+        if state
+            .rounds
+            .get(&worker_id)
+            .is_some_and(|round| round.report_id == report_id)
+        {
+            return FullReportBegin::Restart;
+        }
+
+        if let Some(session) = state.sessions.get_mut(&worker_id) {
+            if session.report_id == report_id && session.begun {
+                session.update_time_ms = now;
+                return if session.invalidated {
+                    FullReportBegin::Restart
+                } else {
+                    FullReportBegin::Accepted
+                };
+            }
+        }
+
+        state.sessions.insert(
+            worker_id,
+            Session {
+                report_id,
+                total_len: 0,
+                update_time_ms: now,
+                reported_blocks: HashSet::new(),
+                begun: true,
+                invalidated: false,
+            },
+        );
+        FullReportBegin::Accepted
+    }
+
     pub(super) fn collect(&self, list: &BlockReportList, now: u64) -> FullReportProgress {
         if !list.full_report {
             return FullReportProgress::Partial;
@@ -102,6 +163,21 @@ impl FullReportTracker {
 
         let sessions = &mut state.sessions;
         let rounds = &mut state.rounds;
+        if sessions
+            .get(&list.worker_id)
+            .is_some_and(|session| session.invalidated)
+        {
+            let restart = sessions
+                .get(&list.worker_id)
+                .is_some_and(|session| session.begun && session.report_id == list.report_id);
+            if restart {
+                // Retain this invalidated begin as a tombstone. Otherwise a
+                // retry of the same begin after this rejected batch could be
+                // accepted and make the stale snapshot appear current again.
+                return FullReportProgress::Restart;
+            }
+            sessions.remove(&list.worker_id);
+        }
         // A different round id means the worker started a new full report, so the
         // blocks accumulated for the previous round no longer apply.
         if list.report_id != 0
@@ -122,6 +198,7 @@ impl FullReportTracker {
             total_len: list.total_len,
             update_time_ms: now,
             reported_blocks: HashSet::with_capacity(list.total_len as usize),
+            begun: false,
             invalidated: false,
         });
 
@@ -204,6 +281,7 @@ impl FullReportTracker {
             total_len,
             update_time_ms: now,
             reported_blocks: blocks,
+            begun: false,
             invalidated: false,
         });
     }
@@ -387,5 +465,23 @@ mod tests {
         ));
         let blocks = complete(tracker.collect(&batch(1, 7, 2, &[1]), T0));
         assert_eq!(blocks, HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn begun_report_restarts_after_replica_completion() {
+        let tracker = FullReportTracker::default();
+        assert!(matches!(tracker.begin(1, 7, T0), FullReportBegin::Accepted));
+        tracker.invalidate_session(1, T0);
+
+        assert!(matches!(
+            tracker.collect(&batch(1, 7, 1, &[1]), T0),
+            FullReportProgress::Restart
+        ));
+        assert!(matches!(tracker.begin(1, 7, T0), FullReportBegin::Restart));
+        assert!(matches!(tracker.begin(1, 8, T0), FullReportBegin::Accepted));
+        assert_eq!(
+            complete(tracker.collect(&batch(1, 8, 1, &[1]), T0)),
+            HashSet::from([1])
+        );
     }
 }

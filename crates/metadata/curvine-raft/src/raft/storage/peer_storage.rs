@@ -24,6 +24,7 @@ use log::{error, info, warn};
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::{GetEntriesContext, RaftState, StateRole, Storage};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
@@ -38,6 +39,7 @@ pub struct PeerStorage<A, B> {
     pub(crate) conf: JournalConf,
     pub(crate) executor: Arc<GroupExecutor>,
     snap_state: Arc<Mutex<SnapshotState>>,
+    snapshot_retry: Arc<AtomicBool>,
     pub(crate) client: RaftClient,
 }
 
@@ -64,6 +66,7 @@ where
             conf: conf.clone(),
             executor: Arc::new(executor),
             snap_state: Arc::new(Mutex::new(SnapshotState::Relax)),
+            snapshot_retry: Arc::new(AtomicBool::new(false)),
             client,
         }
     }
@@ -184,6 +187,24 @@ where
         self.app_store.role_change(role).await
     }
 
+    pub(crate) fn validate_snapshot(snapshot: &Snapshot, data: &SnapshotData) -> RaftResult<()> {
+        let meta = snapshot
+            .metadata
+            .as_ref()
+            .ok_or_else(|| RaftError::other("snapshot is missing Raft metadata".into()))?;
+        let applied = &data.fsm_state.applied;
+        if meta.index != applied.index || meta.term != applied.term {
+            return err_box!(
+                "snapshot watermark mismatch: raft ({}, {}), application ({}, {})",
+                meta.index,
+                meta.term,
+                applied.index,
+                applied.term
+            );
+        }
+        Ok(())
+    }
+
     pub fn gen_apply_snapshot_job(
         &self,
         mut snapshot: Snapshot,
@@ -199,6 +220,7 @@ where
         let ps = self.clone();
         let job = move || {
             let data = SnapshotData::decode(snapshot.get_data())?;
+            Self::validate_snapshot(&snapshot, &data)?;
             let mut spend = TimeSpent::new();
 
             let fetcher = ps.create_fetcher(data)?;
@@ -209,14 +231,10 @@ where
             spend.reset();
 
             snapshot.data = data.encode_to_vec();
-            if let Err(e) = ps.log_store.apply_snapshot(snapshot) {
-                return if e.is_snapshot_out_of_date() {
-                    warn!("{}, skip apply; local state is already newer", e);
-                    Ok(())
-                } else {
-                    Err(e)
-                };
-            }
+            // A newer log boundary does not prove the application snapshot was
+            // applied. Propagate every failure rather than advancing Ready with
+            // an application state that may still be behind.
+            ps.log_store.apply_snapshot(snapshot)?;
 
             ps.rt.block_on(ps.app_store.apply_snapshot(data.clone()))?;
             let apply_ms = spend.used_ms();
@@ -232,7 +250,7 @@ where
         self.spawn_job(job, job_ctl)
     }
 
-    pub fn gen_create_snapshot_job(&self) -> RaftResult<()> {
+    pub fn gen_create_snapshot_job(&self) -> RaftResult<bool> {
         if !self.can_generate_snapshot() {
             return err_box!("Currently creating snapshot");
         }
@@ -250,10 +268,11 @@ where
                 state.applied.term,
                 state.applied.index
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let id = self.id;
+        let snapshot_retry = self.snapshot_retry.clone();
         let log_store = self.log_store.clone();
         let app_store = self.app_store.clone();
         let rt = self.rt.clone();
@@ -266,7 +285,27 @@ where
         let job = move || {
             let cost = TimeSpent::new();
 
-            let mut snap_data = rt.block_on(app_store.create_snapshot())?;
+            let mut snap_data = match rt.block_on(app_store.create_snapshot()) {
+                Ok(snapshot) => snapshot,
+                Err(RaftError::Raft(error))
+                    if matches!(
+                        error.source,
+                        raft::Error::Store(raft::StorageError::SnapshotTemporarilyUnavailable)
+                    ) =>
+                {
+                    info!("snapshot temporarily unavailable; keeping the current log");
+                    snapshot_retry.store(true, Ordering::Release);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            // Apply and UFS progress may change after the admission check.
+            // Only publish the state actually captured by this snapshot.
+            if !snap_data.fsm_state.ufs_replay_caught_up() {
+                info!("captured snapshot has pending UFS replay; keeping the current log");
+                snapshot_retry.store(true, Ordering::Release);
+                return Ok(());
+            }
             snap_data.node_id = id;
             log_store.create_snapshot(snap_data.clone())?;
             log_store.compact(snap_data.fsm_state.compact_upto(None))?;
@@ -290,7 +329,11 @@ where
         };
 
         drop(self.spawn_job(job, job_ctl)?);
-        Ok(())
+        Ok(true)
+    }
+
+    pub(crate) fn take_snapshot_retry(&self) -> bool {
+        self.snapshot_retry.swap(false, Ordering::AcqRel)
     }
 
     pub fn register_snapshot(

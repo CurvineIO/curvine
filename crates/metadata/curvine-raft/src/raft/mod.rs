@@ -17,6 +17,11 @@ use raft::eraftpb;
 
 mod raft_node;
 mod recovery;
+/// Highest directory-attribute record generation this binary can read.
+/// Mirrors `curvine_model::RECORD_FORMAT_READABLE`; keep the two in sync
+/// (an integration test asserts equality).
+pub const RECORD_FORMAT_READABLE: u32 = 4;
+
 pub use self::raft_node::RaftNode;
 
 mod raft_client;

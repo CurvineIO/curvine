@@ -16,14 +16,17 @@
 
 use curvine_core_error::CommonResult;
 use curvine_raft::conf::JournalConf;
-use curvine_raft::proto::raft::{FsmState, SnapshotData, SnapshotFileInfo, SnapshotFileList};
-use curvine_raft::raft::snapshot::SnapshotFetcher;
+use curvine_raft::proto::raft::{
+    FsmState, ProposeRequest, ProposeResponse, SnapshotData, SnapshotFileInfo, SnapshotFileList,
+};
+use curvine_raft::raft::snapshot::{DownloadJob, SnapshotFetcher};
 use curvine_raft::raft::storage::{
     AppStorage, ApplyMsg, HashAppStorage, LogStorage, MemLogStorage, PeerStorage, RocksAppStorage,
     RocksLogStorage,
 };
 use curvine_raft::raft::{
-    RaftClient, RaftCode, RaftError, RaftGroup, RaftJournal, RaftNode, RaftResult, RoleMonitor,
+    RaftClient, RaftCode, RaftError, RaftGroup, RaftJournal, RaftNode, RaftResult, RaftUtils,
+    RoleMonitor,
 };
 use curvine_raft::utils::SerdeUtils;
 use curvine_rpc::client::{ClientConf, RpcClient};
@@ -156,6 +159,47 @@ impl AppStorage for FailingSnapshotAppStorage {
 
     async fn apply_snapshot(&self, _: SnapshotData) -> RaftResult<()> {
         Err(RaftError::other("injected snapshot restore failure".into()))
+    }
+
+    fn snapshot_dir(&self, _: u64) -> RaftResult<String> {
+        Ok(String::new())
+    }
+}
+
+#[derive(Clone, Default)]
+struct FailOnceSnapshotAppStorage {
+    failed: Arc<AtomicBool>,
+    fsm_state: Arc<Mutex<FsmState>>,
+}
+
+impl AppStorage for FailOnceSnapshotAppStorage {
+    async fn apply(&self, _: bool, msg: curvine_raft::raft::storage::ApplyMsg) -> RaftResult<()> {
+        if let curvine_raft::raft::storage::ApplyMsg::Scan(applied) = msg {
+            self.fsm_state.lock().unwrap().applied = applied;
+        }
+        Ok(())
+    }
+
+    fn get_fsm_state(&self) -> FsmState {
+        self.fsm_state.lock().unwrap().clone()
+    }
+
+    async fn role_change(&self, _: StateRole) -> RaftResult<()> {
+        Ok(())
+    }
+
+    async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
+        Ok(SnapshotData::default())
+    }
+
+    async fn apply_snapshot(&self, snapshot: SnapshotData) -> RaftResult<()> {
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            return Err(RaftError::other(
+                "injected first snapshot restore failure".into(),
+            ));
+        }
+        *self.fsm_state.lock().unwrap() = snapshot.fsm_state;
+        Ok(())
     }
 
     fn snapshot_dir(&self, _: u64) -> RaftResult<String> {
@@ -599,6 +643,128 @@ fn install_snapshot_skips_empty_app_snapshot_when_applied_index_nonzero() -> Com
     Ok(())
 }
 
+#[derive(Clone, Default)]
+struct DelayedAckStorage(TestKvAppStorage, Arc<std::sync::atomic::AtomicUsize>);
+
+impl AppStorage for DelayedAckStorage {
+    async fn apply(&self, wait: bool, msg: ApplyMsg) -> RaftResult<()> {
+        if let ApplyMsg::EntryWithAck((entry, tx)) = msg {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            let result = self.0.apply_entry(entry);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                let _ = tx.send(result);
+            });
+            Ok(())
+        } else {
+            self.0.apply(wait, msg).await
+        }
+    }
+
+    fn get_fsm_state(&self) -> FsmState {
+        self.0.get_fsm_state()
+    }
+
+    async fn role_change(&self, role: StateRole) -> RaftResult<()> {
+        self.0.role_change(role).await
+    }
+
+    async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
+        self.0.create_snapshot().await
+    }
+
+    async fn apply_snapshot(&self, snapshot: SnapshotData) -> RaftResult<()> {
+        self.0.apply_snapshot(snapshot).await
+    }
+
+    fn snapshot_dir(&self, id: u64) -> RaftResult<String> {
+        self.0.snapshot_dir(id)
+    }
+}
+
+#[test]
+fn retried_proposal_does_not_ack_before_apply() -> CommonResult<()> {
+    let mut conf = JournalConf::with_test();
+    conf.journal_dir = Utils::test_sub_dir(format!("delayed-ack-{}", Utils::rand_id()));
+    conf.io_timeout_ms = 100;
+    conf.rpc_retry_max_duration_ms = 600;
+    conf.rpc_retry_min_sleep_ms = 10;
+    conf.rpc_retry_max_sleep_ms = 30;
+    let rt = conf.create_runtime();
+    let log = RocksLogStorage::from_conf(&conf, true);
+    let app = DelayedAckStorage::default();
+    let raft = RaftJournal::new(
+        rt.clone(),
+        log.clone(),
+        app.clone(),
+        conf.clone(),
+        RoleMonitor::new(),
+    );
+    let mut listener = rt.block_on(raft.run())?;
+    rt.block_on(listener.wait_leader())?;
+    let client = RaftClient::from_conf(rt.clone(), &conf);
+    let data = SerdeUtils::serialize(&("retry".to_string(), "value".to_string()))?;
+    let result = rt.block_on(client.send_propose_response(data.clone()));
+    assert!(app.1.load(Ordering::SeqCst) > 0, "probe must delay an ack");
+    assert!(
+        matches!(&result, Err(error) if error.to_string().contains("duplicate raft proposal has unknown commit outcome")),
+        "retry must report an unknown outcome, not success: {result:?}"
+    );
+    let last = log.last_index()?;
+    let copies = log
+        .scan_entries(log.first_index()?, last + 1)?
+        .iter()
+        .filter(|entry| entry.data == data)
+        .count();
+    assert_eq!(copies, 1, "duplicate entries; response: {result:?}");
+    Ok(())
+}
+
+#[test]
+fn concurrent_duplicate_proposals_are_forwarded_once() -> CommonResult<()> {
+    let mut conf = JournalConf::with_test();
+    conf.journal_dir = Utils::test_sub_dir(format!("concurrent-proposals-{}", Utils::rand_id()));
+    conf.io_timeout_ms = 150;
+    conf.rpc_retry_max_duration_ms = 200;
+    conf.rpc_retry_min_sleep_ms = 10;
+    conf.rpc_retry_max_sleep_ms = 30;
+    let rt = conf.create_runtime();
+    let log = RocksLogStorage::from_conf(&conf, true);
+    let app = DelayedAckStorage::default();
+    let raft = RaftJournal::new(
+        rt.clone(),
+        log.clone(),
+        app.clone(),
+        conf.clone(),
+        RoleMonitor::new(),
+    );
+    let mut listener = rt.block_on(raft.run())?;
+    rt.block_on(listener.wait_leader())?;
+    let client = RaftClient::from_conf(rt.clone(), &conf);
+    let node_id = conf.journal_addrs[0].id;
+    let data = SerdeUtils::serialize(&("concurrent".to_string(), "value".to_string()))?;
+    rt.block_on(async {
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let client = client.clone();
+            let msg = Builder::new_rpc(RaftCode::Propose)
+                .req_id(3_871_234)
+                .proto_header(ProposeRequest { data: data.clone() })
+                .build();
+            tasks.push(tokio::spawn(async move {
+                client.retry_rpc::<ProposeResponse>(node_id, msg).await
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.unwrap().is_err());
+        }
+    });
+    let entries = log.scan_entries(log.first_index()?, log.last_index()? + 1)?;
+    assert_eq!(entries.iter().filter(|entry| entry.data == data).count(), 1);
+    assert_eq!(app.1.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
 #[test]
 fn propose_response_waits_until_committed_entry_is_applied() -> CommonResult<()> {
     Logger::default();
@@ -789,6 +955,44 @@ fn reported_snapshot(index: u64, node_id: u64) -> SnapshotData {
     }
 }
 
+#[test]
+fn rocks_rejects_snapshot_with_mismatched_applied_term() {
+    let mut conf = JournalConf::with_test();
+    conf.journal_dir = Utils::test_sub_dir(format!("snapshot-term-{}", Utils::rand_id()));
+    let log = RocksLogStorage::from_conf(&conf, true);
+    log.append(&[
+        Entry {
+            index: 1,
+            term: 1,
+            ..Default::default()
+        },
+        Entry {
+            index: 2,
+            term: 1,
+            ..Default::default()
+        },
+    ])
+    .unwrap();
+    log.set_hard_state(&HardState {
+        term: 1,
+        commit: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut good = reported_snapshot(1, 2);
+    good.fsm_state.applied.term = 1;
+    assert!(log.register_snapshot(good).unwrap());
+    let mut wrong = reported_snapshot(2, 3);
+    wrong.fsm_state.applied.term = 2;
+    assert!(log.register_snapshot(wrong).is_err());
+    assert_eq!(
+        log.latest_snapshot().unwrap().unwrap().get_metadata().index,
+        1
+    );
+    drop(log);
+    FileUtils::delete_path(&conf.journal_dir, true).unwrap();
+}
+
 fn remote_files() -> SnapshotFileList {
     SnapshotFileList {
         dir: "/remote/snapshot".to_string(),
@@ -797,6 +1001,7 @@ fn remote_files() -> SnapshotFileList {
             mtime: 0,
             ctime: 0,
             len: 16,
+            checksum: None,
         }],
     }
 }
@@ -904,6 +1109,153 @@ fn snapshot_fetcher_treats_matching_node_as_local() -> CommonResult<()> {
     Ok(())
 }
 
+#[test]
+fn snapshot_fetcher_rejects_unsafe_manifest_paths() {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0);
+    for path in ["../escape", "/tmp/escape", "dir/../../escape", ""] {
+        let mut data = reported_snapshot(5, 7);
+        data.files_data = Some(SnapshotFileList {
+            dir: "/remote/snapshot".into(),
+            files: vec![SnapshotFileInfo {
+                path: path.into(),
+                ..Default::default()
+            }],
+        });
+        assert!(
+            SnapshotFetcher::new(9, &app, &conf, test_client(&conf, rt.clone()), data).is_err(),
+            "unsafe path {path:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn invalid_download_manifest_does_not_delete_destination() {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let path = std::env::temp_dir().join(format!("snapshot-invalid-{}", Utils::rand_id()));
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join("keep"), b"keep").unwrap();
+    let files = SnapshotFileList {
+        dir: "/remote".into(),
+        files: vec![SnapshotFileInfo {
+            path: "../escape".into(),
+            ..Default::default()
+        }],
+    };
+    let mut job = DownloadJob::new(
+        7,
+        path.to_str().unwrap().into(),
+        files,
+        &conf,
+        test_client(&conf, rt.clone()),
+    );
+    assert!(rt.block_on(job.run()).is_err());
+    assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"keep");
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn conflicting_snapshot_paths_are_rejected_before_destination_cleanup() {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    for paths in [["a", "a/b"], ["a/b", "a"]] {
+        let path = std::env::temp_dir().join(format!("snapshot-conflict-{}", Utils::rand_id()));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("keep"), b"keep").unwrap();
+        let files = SnapshotFileList {
+            dir: "/remote".into(),
+            files: paths
+                .into_iter()
+                .map(|path| SnapshotFileInfo {
+                    path: path.into(),
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        let mut job = DownloadJob::new(
+            7,
+            path.to_str().unwrap().into(),
+            files,
+            &conf,
+            test_client(&conf, rt.clone()),
+        );
+        assert!(rt.block_on(job.run()).is_err());
+        assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"keep");
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0);
+    let mut data = reported_snapshot(5, 7);
+    data.files_data = Some(SnapshotFileList {
+        dir: "/remote".into(),
+        files: ["a", "ab/b", "ab/c"]
+            .into_iter()
+            .map(|path| SnapshotFileInfo {
+                path: path.into(),
+                ..Default::default()
+            })
+            .collect(),
+    });
+    assert!(SnapshotFetcher::new(9, &app, &conf, test_client(&conf, rt.clone()), data).is_ok());
+}
+
+#[test]
+fn snapshot_download_does_not_start_more_files_than_parallel_limit() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut conf = JournalConf::with_test();
+    conf.journal_addrs = vec![curvine_config::RaftPeer::new(7, "127.0.0.1", port)];
+    conf.snapshot_download_parallel = 1;
+    conf.io_timeout_ms = 10_000;
+    conf.conn_retry_max_duration_ms = 0;
+    conf.rpc_retry_max_duration_ms = 0;
+    let rt = conf.create_runtime();
+    let path = std::env::temp_dir().join(format!("snapshot-bounded-{}", Utils::rand_id()));
+    std::fs::create_dir_all(&path).unwrap();
+    let files = SnapshotFileList {
+        dir: "/remote".into(),
+        files: ["first", "not-started/second"]
+            .into_iter()
+            .map(|path| SnapshotFileInfo {
+                path: path.into(),
+                len: 1,
+                ..Default::default()
+            })
+            .collect(),
+    };
+    let mut job = DownloadJob::new(
+        7,
+        path.to_str().unwrap().into(),
+        files,
+        &conf,
+        test_client(&conf, rt.clone()),
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || tx.send(rt.block_on(job.run())).unwrap());
+    // The first transfer can connect but cannot receive a reply. Preparing the
+    // second path early creates its parent even before a semaphore permit.
+    let early = rx.recv_timeout(std::time::Duration::from_secs(2));
+    let finished_early = early.is_ok();
+    let prepared_second = path.join("not-started").exists();
+    drop(listener);
+    let result = match early {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap()
+        }
+        Err(error) => panic!("download worker disconnected: {error}"),
+    };
+    worker.join().unwrap();
+    assert!(result.is_err());
+    assert!(!finished_early, "first transfer did not remain pending");
+    assert!(
+        !prepared_second,
+        "second file was prepared before a slot was free"
+    );
+}
+
 /// A remote snapshot without a file list cannot be downloaded and must error.
 #[test]
 fn snapshot_fetcher_requires_files_for_remote_snapshot() {
@@ -941,10 +1293,9 @@ fn snapshot_fetcher_builds_download_for_remote_snapshot() {
     );
 }
 
-/// A complete local copy wins over a remote owner: manual meta+journal copies
-/// must not trigger a full re-download.
+/// Length alone cannot authenticate a manually copied remote snapshot.
 #[test]
-fn snapshot_fetcher_uses_complete_local_copy_of_remote_snapshot() -> CommonResult<()> {
+fn snapshot_fetcher_downloads_even_if_remote_copy_has_matching_length() -> CommonResult<()> {
     let conf = JournalConf::with_test();
     let rt = conf.create_runtime();
     let dir = Utils::test_sub_dir(format!("snapshot-local-copy-{}", Utils::rand_id()));
@@ -959,19 +1310,27 @@ fn snapshot_fetcher_uses_complete_local_copy_of_remote_snapshot() -> CommonResul
     let fetcher =
         SnapshotFetcher::new(9, &app, &conf, test_client(&conf, rt.clone()), data).unwrap();
 
-    match fetcher {
-        SnapshotFetcher::Local(data) => {
-            let files = data
-                .files_data
-                .expect("local snapshot must keep its file manifest");
-            assert_eq!(
-                files.dir, dir,
-                "a reused local copy must keep its manifest dir"
-            );
-        }
-        SnapshotFetcher::Remote(..) => panic!("complete local copy must not be downloaded"),
-    }
+    assert!(matches!(fetcher, SnapshotFetcher::Remote(..)));
 
+    FileUtils::delete_path(&dir, true)?;
+    Ok(())
+}
+
+#[test]
+fn snapshot_fetcher_does_not_trust_same_length_remote_copy() -> CommonResult<()> {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let dir = Utils::test_sub_dir(format!("snapshot-wrong-copy-{}", Utils::rand_id()));
+    FileUtils::create_dir(&dir, true)?;
+    let path = Path::new(&dir).join("checkpoint.db");
+    std::fs::write(&path, [0u8; 16])?;
+    let mut data = reported_snapshot(5, 7);
+    data.files_data = Some(files_in_dir(&dir));
+    // Different bytes of identical length cannot establish snapshot identity.
+    std::fs::write(&path, [1u8; 16])?;
+    let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0);
+    let fetcher = SnapshotFetcher::new(9, &app, &conf, test_client(&conf, rt.clone()), data)?;
+    assert!(matches!(fetcher, SnapshotFetcher::Remote(_, _)));
     FileUtils::delete_path(&dir, true)?;
     Ok(())
 }
@@ -997,6 +1356,47 @@ fn snapshot_fetcher_falls_back_on_local_length_mismatch() -> CommonResult<()> {
     assert!(
         matches!(fetcher, SnapshotFetcher::Remote(_, _)),
         "truncated local copy must fall back to download"
+    );
+
+    FileUtils::delete_path(&dir, true)?;
+    Ok(())
+}
+
+/// A manifest checksum authenticates a local copy: matching content is
+/// reusable without a download; tampered content is refused instead of reused.
+#[test]
+fn snapshot_fetcher_uses_manifest_checksum_for_local_copy() -> CommonResult<()> {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let dir = Utils::test_sub_dir(format!("snapshot-summed-copy-{}", Utils::rand_id()));
+    FileUtils::delete_path(&dir, true)?;
+    FileUtils::create_dir(&dir, true)?;
+    let content = [7u8; 16];
+    std::fs::write(Path::new(&dir).join("checkpoint.db"), content)?;
+
+    let mut files = files_in_dir(&dir);
+    files.files[0].checksum =
+        Some(RaftUtils::file_crc32(Path::new(&dir).join("checkpoint.db"))? as u64);
+
+    let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(0);
+    let mut data = reported_snapshot(5, 7);
+    data.files_data = Some(files.clone());
+    let fetcher =
+        SnapshotFetcher::new(7, &app, &conf, test_client(&conf, rt.clone()), data).unwrap();
+    assert!(
+        matches!(fetcher, SnapshotFetcher::Local(_)),
+        "matching checksum must allow local reuse"
+    );
+
+    std::fs::write(Path::new(&dir).join("checkpoint.db"), [8u8; 16])?;
+    let mut data = reported_snapshot(5, 7);
+    data.files_data = Some(files);
+    let err = SnapshotFetcher::new(7, &app, &conf, test_client(&conf, rt.clone()), data)
+        .err()
+        .expect("tampered local content must be refused");
+    assert!(
+        err.to_string().contains("incomplete"),
+        "checksum mismatch must reject local reuse: {err}"
     );
 
     FileUtils::delete_path(&dir, true)?;
@@ -1103,6 +1503,76 @@ fn empty_group_client(rt: Arc<Runtime>, conf: &JournalConf, name: &str) -> RaftC
     RaftClient::new(rt, &group, conf.new_client_conf())
 }
 
+#[derive(Clone)]
+struct SnapshotWithUfsLag(RecordingSnapshotAppStorage);
+
+impl AppStorage for SnapshotWithUfsLag {
+    async fn apply(&self, wait: bool, msg: ApplyMsg) -> RaftResult<()> {
+        self.0.apply(wait, msg).await
+    }
+    fn get_fsm_state(&self) -> FsmState {
+        self.0.get_fsm_state()
+    }
+    async fn role_change(&self, role: StateRole) -> RaftResult<()> {
+        self.0.role_change(role).await
+    }
+    async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
+        let mut snapshot = self.0.create_snapshot().await?;
+        snapshot.fsm_state.ufs_applied.index = 0;
+        Ok(snapshot)
+    }
+    async fn apply_snapshot(&self, snapshot: SnapshotData) -> RaftResult<()> {
+        self.0.apply_snapshot(snapshot).await
+    }
+    fn snapshot_dir(&self, id: u64) -> RaftResult<String> {
+        self.0.snapshot_dir(id)
+    }
+}
+
+#[test]
+fn snapshot_job_rechecks_ufs_watermark_after_capture() -> CommonResult<()> {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let log = MemLogStorage::new();
+    log.append(
+        &(1..=5)
+            .map(|index| Entry {
+                index,
+                term: 1,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    log.set_hard_state(&HardState {
+        term: 1,
+        commit: 5,
+        ..Default::default()
+    })?;
+    let app = SnapshotWithUfsLag(RecordingSnapshotAppStorage::with_applied_index(5));
+    let client = empty_group_client(rt.clone(), &conf, "snapshot-ufs-race");
+    let storage = PeerStorage::new(rt, 1, log.clone(), app, client, &conf);
+    assert!(storage.gen_create_snapshot_job()?);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !storage.can_generate_snapshot() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "snapshot job did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        log.first_index()?,
+        1,
+        "UFS backlog must keep the journal prefix"
+    );
+    assert!(
+        log.latest_snapshot()?
+            .is_none_or(|snapshot| snapshot.get_metadata().index == 0),
+        "lagging snapshot must not be published"
+    );
+    Ok(())
+}
+
 /// #5: `gen_create_snapshot_job` must overwrite the app-store `node_id` with the
 /// raft node id, so the creator later recognizes its own snapshot as local
 /// instead of re-downloading it, and the leader records the true owner.
@@ -1141,6 +1611,118 @@ fn create_snapshot_job_stamps_raft_node_id() -> CommonResult<()> {
     );
     assert_eq!(stamped.fsm_state.applied.index, 5);
     Ok(())
+}
+
+#[test]
+fn install_snapshot_rejects_mismatched_application_term() {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let log = MemLogStorage::new();
+    let mut data = reported_snapshot(9, 1);
+    data.fsm_state.applied.term = 7;
+    log.register_snapshot(data).unwrap();
+    let app = RecordingSnapshotAppStorage::with_applied_index(0);
+    let client = empty_group_client(rt.clone(), &conf, "snapshot-bad-term");
+    let storage = PeerStorage::new(rt.clone(), 1, log, app.clone(), client, &conf);
+    let result = rt.block_on(
+        RaftNode::<MemLogStorage, RecordingSnapshotAppStorage>::install_snapshot(&storage, vec![1]),
+    );
+    assert!(result.is_err());
+    assert_eq!(app.get_fsm_state().applied.index, 0);
+}
+
+#[test]
+fn stale_snapshot_does_not_succeed_when_application_is_behind() {
+    let mut conf = JournalConf::with_test();
+    conf.journal_dir = Utils::test_sub_dir(format!("snapshot-stale-{}", Utils::rand_id()));
+    let rt = conf.create_runtime();
+    let log = RocksLogStorage::from_conf(&conf, true);
+    let mut latest = Snapshot::default();
+    latest.mut_metadata().index = 10;
+    latest.mut_metadata().term = 1;
+    log.apply_snapshot(latest).unwrap();
+    let app = RecordingSnapshotAppStorage::with_applied_index(0);
+    let client = empty_group_client(rt.clone(), &conf, "stale-snapshot");
+    let storage = PeerStorage::new(rt.clone(), 1, log.clone(), app.clone(), client, &conf);
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 5;
+    snapshot.mut_metadata().term = 1;
+    let mut data = reported_snapshot(5, 1);
+    data.fsm_state.applied.term = 1;
+    data.bytes_data = Some(vec![1]);
+    snapshot.data = data.encode_to_vec();
+    let receiver = storage.gen_apply_snapshot_job(snapshot).unwrap();
+    assert!(rt.block_on(receiver).unwrap().is_err());
+    assert_eq!(app.get_fsm_state().applied.index, 0);
+    drop(storage);
+    drop(log);
+    FileUtils::delete_path(&conf.journal_dir, true).unwrap();
+}
+
+#[test]
+fn failed_snapshot_restore_is_retried_on_restart() {
+    let mut conf = JournalConf::with_test();
+    conf.journal_dir = Utils::test_sub_dir(format!("snapshot-apply-failure-{}", Utils::rand_id()));
+    let rt = conf.create_runtime();
+    let log = RocksLogStorage::from_conf(&conf, true);
+    let app = FailOnceSnapshotAppStorage::default();
+    let client = empty_group_client(rt.clone(), &conf, "snapshot-failed-restore");
+    let storage = PeerStorage::new(rt.clone(), 1, log.clone(), app.clone(), client, &conf);
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 5;
+    snapshot.mut_metadata().term = 1;
+    snapshot.mut_metadata().mut_conf_state().voters = vec![1];
+    let mut data = reported_snapshot(5, 1);
+    data.fsm_state.applied.term = 1;
+    data.bytes_data = Some(vec![1]);
+    snapshot.data = data.encode_to_vec();
+    let receiver = storage.gen_apply_snapshot_job(snapshot).unwrap();
+    assert!(rt.block_on(receiver).unwrap().is_err());
+    drop(storage);
+    drop(log);
+    let reopened = RocksLogStorage::from_conf(&conf, false);
+    assert_eq!(
+        reopened.last_index().unwrap(),
+        5,
+        "the persisted snapshot must be available for recovery after a failed restore"
+    );
+    let client = empty_group_client(rt.clone(), &conf, "snapshot-retry-after-restart");
+    let restarted = PeerStorage::new(rt.clone(), 1, reopened, app.clone(), client, &conf);
+    let index = rt
+        .block_on(
+            RaftNode::<RocksLogStorage, FailOnceSnapshotAppStorage>::install_snapshot(
+                &restarted,
+                vec![1],
+            ),
+        )
+        .unwrap();
+    assert_eq!(index, 5);
+    assert_eq!(app.get_fsm_state().applied.index, 5);
+    drop(restarted);
+    FileUtils::delete_path(&conf.journal_dir, true).unwrap();
+}
+
+#[test]
+fn incoming_snapshot_rejects_mismatched_application_index() {
+    let conf = JournalConf::with_test();
+    let rt = conf.create_runtime();
+    let log = MemLogStorage::new();
+    let app = RecordingSnapshotAppStorage::with_applied_index(0);
+    let client = empty_group_client(rt.clone(), &conf, "snapshot-bad-index");
+    let storage = PeerStorage::new(rt.clone(), 1, log.clone(), app.clone(), client, &conf);
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 10;
+    snapshot.mut_metadata().term = 1;
+    let mut data = reported_snapshot(9, 1);
+    data.fsm_state.applied.term = 1;
+    snapshot.data = data.encode_to_vec();
+    let result = match storage.gen_apply_snapshot_job(snapshot) {
+        Err(error) => Err(error),
+        Ok(receiver) => rt.block_on(receiver).unwrap(),
+    };
+    assert!(result.is_err());
+    assert_eq!(log.last_index().unwrap(), 0);
+    assert_eq!(app.get_fsm_state().applied.index, 0);
 }
 
 /// #1/#3b: on restart, a persisted snapshot this member owns is re-fetched

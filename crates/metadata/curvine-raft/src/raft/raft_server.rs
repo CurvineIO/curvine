@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::conf::JournalConf;
-use crate::raft::snapshot::SnapshotDownloadHandler;
+use crate::raft::snapshot::{RegisteredSnapshotDir, SnapshotDownloadHandler};
 use crate::raft::{RaftCode, RaftError, RaftResult};
 use curvine_core_error::{err_box, try_option, CommonResult};
 use curvine_net::net::ConnState;
@@ -26,7 +26,7 @@ use curvine_runtime::runtime::Runtime;
 use curvine_runtime::sync::FastMutex;
 use log::warn;
 use mini_moka::sync::{Cache, CacheBuilder};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -35,7 +35,11 @@ pub struct RaftServer {
 }
 
 impl RaftServer {
-    pub fn with_rt(rt: Arc<Runtime>, conf: &JournalConf) -> Self {
+    pub fn with_rt(
+        rt: Arc<Runtime>,
+        conf: &JournalConf,
+        registered_dir: RegisteredSnapshotDir,
+    ) -> Self {
         let mut server_conf = ServerConf::with_hostname(conf.hostname.to_string(), conf.rpc_port);
         server_conf.name = "curvine-journal".to_string();
         server_conf.enable_splice = false;
@@ -43,7 +47,7 @@ impl RaftServer {
         server_conf.pipe_pool_init_cap = 0;
         server_conf.pipe_pool_max_cap = 0;
 
-        let service = RaftService::new(conf);
+        let service = RaftService::new(conf, registered_dir);
 
         let server = RpcServer::with_rt(rt, server_conf, service);
         Self { server }
@@ -66,11 +70,13 @@ pub struct RaftService {
     sender: mpsc::Sender<Envelope>,
     receiver: Option<mpsc::Receiver<Envelope>>,
     retry_cache: Arc<Cache<i64, ()>>,
+    retry_cache_lock: Arc<Mutex<()>>,
     snapshot_chunk_size: usize,
+    registered_dir: RegisteredSnapshotDir,
 }
 
 impl RaftService {
-    pub fn new(conf: &JournalConf) -> Self {
+    pub fn new(conf: &JournalConf, registered_dir: RegisteredSnapshotDir) -> Self {
         let ttl = DurationUnit::from_str(&conf.raft_retry_cache_ttl).unwrap();
         let cache = CacheBuilder::new(conf.raft_retry_cache_size)
             .time_to_live(Duration::from_millis(ttl.as_millis()))
@@ -81,7 +87,9 @@ impl RaftService {
             sender,
             receiver: Some(receiver),
             retry_cache: Arc::new(cache),
+            retry_cache_lock: Arc::new(Mutex::new(())),
             snapshot_chunk_size: conf.snapshot_read_chunk_size,
+            registered_dir,
         }
     }
 
@@ -99,8 +107,10 @@ impl HandlerService for RaftService {
             sender: self.sender.clone(),
             download_handler: FastMutex::new(SnapshotDownloadHandler::new(
                 self.snapshot_chunk_size,
+                self.registered_dir.clone(),
             )),
             retry_cache: self.retry_cache.clone(),
+            retry_cache_lock: self.retry_cache_lock.clone(),
         }
     }
 }
@@ -109,6 +119,7 @@ pub struct RaftHandler {
     sender: mpsc::Sender<Envelope>,
     download_handler: FastMutex<SnapshotDownloadHandler>,
     retry_cache: Arc<Cache<i64, ()>>,
+    retry_cache_lock: Arc<Mutex<()>>,
 }
 
 impl MessageHandler for RaftHandler {
@@ -131,13 +142,20 @@ impl MessageHandler for RaftHandler {
     async fn async_handle(&self, msg: Message) -> Result<Message, Self::Error> {
         // Check for duplicate requests
         if RaftCode::from(msg.code()) == RaftCode::Propose {
+            let _guard = self
+                .retry_cache_lock
+                .lock()
+                .map_err(|_| RaftError::other("raft proposal retry cache lock poisoned".into()))?;
             match self.retry_cache.get(&msg.req_id()) {
                 None => self.retry_cache.insert(msg.req_id(), ()),
 
                 Some(_) => {
                     warn!("Retry propose log request, req id {}", msg.req_id());
-                    // Repeat request, return directly
-                    return Ok(msg.success());
+                    // A seen request may still be in flight or may have failed.
+                    // Its presence alone is not evidence of a committed apply.
+                    return Err(RaftError::other(
+                        "duplicate raft proposal has unknown commit outcome".into(),
+                    ));
                 }
             }
         }

@@ -312,7 +312,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.hard_state().vote, 3);
 
-        store.apply_snapshot(snapshot_at(4, 9)).unwrap();
+        store.apply_snapshot(snapshot_at(6, 9)).unwrap();
 
         let hard_state = store.hard_state();
         assert_eq!(hard_state.term, 9);
@@ -320,7 +320,7 @@ mod tests {
             hard_state.vote, 0,
             "a newer-term snapshot must clear the stale vote"
         );
-        assert_eq!(hard_state.commit, 5);
+        assert_eq!(hard_state.commit, 6);
     }
 
     // The inverse guard: a snapshot at the same term must not discard a vote
@@ -337,7 +337,7 @@ mod tests {
             })
             .unwrap();
 
-        store.apply_snapshot(snapshot_at(4, 9)).unwrap();
+        store.apply_snapshot(snapshot_at(6, 9)).unwrap();
 
         let hard_state = store.hard_state();
         assert_eq!(hard_state.term, 9);

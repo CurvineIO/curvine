@@ -15,16 +15,20 @@
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::LockMeta;
 use crate::master::MetadataCodec;
+use curvine_config::CfMergeOperator;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{
-    BlockLocation, DirectoryAttributeDelta, DirectoryAttributes, FileLock, MountInfo,
+    encode_matching, BlockLocation, DirectoryAttributeDelta, DirectoryAttributes, FileLock,
+    MountInfo,
 };
+use curvine_raft::proto::raft::AppliedIndex;
 use curvine_rocksdb::{
     DBConf, DBEngine, DbReadSnapshot as DBReadSnapshot, ReadOptions, RocksIterator, RocksUtils,
 };
 use curvine_rocksdb::{
     DBIteratorWithThreadMode, DBPinnableSlice, Error, WriteBatchWithTransaction, DB,
 };
+use prost::Message as _;
 use std::collections::HashMap;
 
 #[cfg(test)]
@@ -47,22 +51,65 @@ impl RocksInodeStore {
     pub const PREFIX_MOUNT: u8 = 0x01;
     pub const PREFIX_LOCK: u8 = 0x02;
     pub const PREFIX_UFS_DEFERRED: u8 = 0x03;
+    pub const PREFIX_APPLIED_REQ: u8 = 0x04;
 
     // Single-key marker for the mount table version (get mount table
     // negotiation). Must not share PREFIX_MOUNT: the mount table is read via a
     // prefix scan on that prefix and would pick the version key up as a row.
     pub const PREFIX_MOUNT_TABLE_VERSION: u8 = 0x04;
 
+    /// System row key for the journal applied cursor (see `put_common_kv`).
+    pub const JOURNAL_APPLIED_KEY: &str = "journal_applied";
+    const PREFIX_SCHEMA: u8 = 0x05;
+    const DIRECTORY_ATTRIBUTE_SCHEMA: u8 = 0x01;
+    const DIRECTORY_ATTRIBUTE_SCHEMA_VERSION: u8 = 0x01;
+
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
-            .set_disable_wal(true)
+            .set_disable_wal(false)
             .add_cf(Self::CF_INODES)
             .add_cf(Self::CF_EDGES)
             .add_cf(Self::CF_BLOCK)
             .add_cf(Self::CF_LOCATION)
-            .add_cf(Self::CF_COMMON);
+            .add_cf(Self::CF_COMMON)
+            .add_cf(Self::CF_DIR_ATTRS)
+            .set_cf_merge_operator(Self::CF_DIR_ATTRS, CfMergeOperator::DirectoryAttributes);
         let db = DBEngine::new(conf, format)?;
         Ok(Self { db })
+    }
+
+    /// Reset namespace rows so the committed Raft log alone determines the
+    /// recovered tree.
+    ///
+    /// Local rows may contain mutations that never reached Raft commit (the
+    /// write path materializes rows before the journal commit receipt). When
+    /// no registered snapshot exists and the log still starts at index 1,
+    /// replaying `[1..commit]` onto an empty namespace reproduces exactly the
+    /// committed state (the same convergence the follower path already
+    /// guarantees). This clears every namespace column family, drops pending
+    /// UFS-deferred records (their journal entries are replayed again), and
+    /// zeroes the applied cursor so replay starts at 1.
+    pub fn reset_namespace_for_replay(&self) -> CommonResult<()> {
+        for cf in [
+            Self::CF_INODES,
+            Self::CF_EDGES,
+            Self::CF_BLOCK,
+            Self::CF_LOCATION,
+            Self::CF_DIR_ATTRS,
+        ] {
+            self.db.clear_cf(cf)?;
+        }
+        self.db
+            .prefix_delete(Self::CF_COMMON, [Self::PREFIX_UFS_DEFERRED])?;
+        self.db
+            .prefix_delete(Self::CF_COMMON, [Self::PREFIX_APPLIED_REQ])?;
+        let zero = AppliedIndex::default();
+        self.db.put_cf_sync_wal(
+            Self::CF_COMMON,
+            Self::JOURNAL_APPLIED_KEY,
+            &zero.encode_to_vec(),
+        )?;
+        Ok(())
     }
 
     pub fn get_child_ids(
@@ -166,8 +213,7 @@ impl RocksInodeStore {
         self.db.scan(Self::CF_INODES)
     }
 
-    /// Best-effort scan of the optional dir_attrs column family.
-    /// Returns an error while the database has not opted into it.
+    /// Scan the registered dir_attrs column family.
     pub fn scan_directory_attributes(&self) -> CommonResult<RocksIterator<'_>> {
         self.db.scan(Self::CF_DIR_ATTRS)
     }
@@ -184,6 +230,43 @@ impl RocksInodeStore {
         Self::decode_directory_attributes(id, value)
     }
 
+    pub fn initialize_root_directory_attributes(&self) -> CommonResult<()> {
+        use crate::master::meta::inode::ROOT_INODE_ID;
+
+        if self.get_directory_attributes(ROOT_INODE_ID)?.is_none() {
+            let mut batch = self.new_batch();
+            batch.write_directory_attributes(ROOT_INODE_ID, DirectoryAttributes::new(0, 0, 2))?;
+            batch.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn directory_attributes_migrated(&self) -> CommonResult<bool> {
+        let key = [Self::PREFIX_SCHEMA, Self::DIRECTORY_ATTRIBUTE_SCHEMA];
+        Ok(self
+            .db
+            .get_cf(Self::CF_COMMON, key)?
+            .is_some_and(|value| value == [Self::DIRECTORY_ATTRIBUTE_SCHEMA_VERSION]))
+    }
+
+    pub fn mark_directory_attributes_migrated(&self) -> CommonResult<()> {
+        self.db.put_cf(
+            Self::CF_COMMON,
+            [Self::PREFIX_SCHEMA, Self::DIRECTORY_ATTRIBUTE_SCHEMA],
+            [Self::DIRECTORY_ATTRIBUTE_SCHEMA_VERSION],
+        )
+    }
+
+    pub fn directory_attribute_ids(&self) -> CommonResult<Vec<i64>> {
+        self.db
+            .bulk_scan(Self::CF_DIR_ATTRS)?
+            .map(|entry| {
+                let (key, _) = entry?;
+                RocksUtils::i64_from_bytes(&key)
+            })
+            .collect()
+    }
+
     pub(super) fn decode_directory_attributes(
         id: i64,
         value: Option<Vec<u8>>,
@@ -197,6 +280,18 @@ impl RocksInodeStore {
         }
     }
 
+    pub(super) fn decode_inode(id: i64, bytes: &[u8]) -> CommonResult<InodeView> {
+        let inode: InodeView = MetadataCodec::decode(bytes)?;
+        if inode.id() != id {
+            return err_box!(
+                "inode record id mismatch: expected {}, got {}",
+                id,
+                inode.id()
+            );
+        }
+        Ok(inode)
+    }
+
     pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
         let bytes = self
             .db
@@ -205,7 +300,7 @@ impl RocksInodeStore {
             None => Ok(None),
 
             Some(v) => {
-                let inode: InodeView = MetadataCodec::decode(&v)?;
+                let inode = Self::decode_inode(id, &v)?;
                 Ok(Some(inode))
             }
         }
@@ -252,16 +347,15 @@ impl RocksInodeStore {
     pub fn delete_locations(&self, worker_id: u32) -> CommonResult<Vec<i64>> {
         let block_ids = self.get_block_ids(worker_id)?;
 
-        // delete all worker_id -> block_ids
-        let prefix = RocksUtils::u32_to_bytes(worker_id);
-        self.db.prefix_delete(Self::CF_LOCATION, prefix)?;
-
-        // delete all block_id -> worker_ids
-        for block_id in &block_ids {
-            let key = RocksUtils::i64_u32_to_bytes(*block_id, worker_id);
-            self.db.delete_cf(Self::CF_BLOCK, key)?;
+        // Keep both indexes consistent even if a later batch fails. Bounded
+        // batches avoid building a single write batch for a large worker.
+        for chunk in block_ids.chunks(4096) {
+            let mut batch = self.new_batch();
+            for block_id in chunk {
+                batch.delete_location(*block_id, worker_id)?;
+            }
+            batch.commit()?;
         }
-
         Ok(block_ids)
     }
 
@@ -363,6 +457,83 @@ impl RocksInodeStore {
         key[0] = Self::PREFIX_UFS_DEFERRED;
         key[1..].copy_from_slice(&index.to_be_bytes());
         key
+    }
+
+    fn applied_req_key(req_id: i64) -> [u8; 9] {
+        let mut key = [0u8; 9];
+        key[0] = Self::PREFIX_APPLIED_REQ;
+        key[1..].copy_from_slice(&req_id.to_be_bytes());
+        key
+    }
+
+    /// Persist which request IDs already applied, with their entry index, so a
+    /// duplicate proposal that reaches a new leader after a restart or
+    /// failover cannot double-apply namespace mutations.
+    pub fn put_applied_req(&self, req_id: i64, index: u64, term: u64) -> CommonResult<()> {
+        let applied = AppliedIndex {
+            term,
+            index,
+            ..Default::default()
+        };
+        self.db.put_cf(
+            Self::CF_COMMON,
+            Self::applied_req_key(req_id),
+            &applied.encode_to_vec(),
+        )
+    }
+
+    pub fn get_applied_req(&self, req_id: i64) -> CommonResult<Option<AppliedIndex>> {
+        match self
+            .db
+            .get_cf(Self::CF_COMMON, Self::applied_req_key(req_id))?
+        {
+            Some(bytes) => Ok(Some(AppliedIndex::decode(bytes.as_slice())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop applied-request records whose entry index is below the retention
+    /// window; they can no longer collide with a live retry.
+    pub fn prune_applied_req_below(&self, first_kept_index: u64) -> CommonResult<()> {
+        let cf = self.db.cf(Self::CF_COMMON)?;
+        let mut batch = WriteBatchWithTransaction::<false>::default();
+        let mut dropped = 0usize;
+        for item in self
+            .db
+            .prefix_scan(Self::CF_COMMON, [Self::PREFIX_APPLIED_REQ])?
+        {
+            let (key, value) = match item {
+                Ok(item) => item,
+                Err(_) => continue,
+            };
+            if key.len() != 9 {
+                continue;
+            }
+            let expired = match AppliedIndex::decode(value.as_ref()) {
+                Ok(applied) => applied.index < first_kept_index,
+                // A corrupted record can never match a live retry again.
+                Err(_) => true,
+            };
+            if expired {
+                batch.delete_cf(cf, &key);
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            self.db.write_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Synchronize the cursor WAL record after preceding namespace writes.
+    /// This does not remove uncommitted namespace writes after a crash.
+    pub fn put_common_kv(&self, key: &str, value: &[u8]) -> CommonResult<()> {
+        self.db
+            .put_cf_sync_wal(Self::CF_COMMON, key.as_bytes(), value)
+    }
+
+    pub fn get_common_kv(&self, key: &str) -> CommonResult<Option<Vec<u8>>> {
+        self.db.get_cf(Self::CF_COMMON, key.as_bytes())
     }
 
     pub fn put_ufs_deferred(&self, index: u64, payload: &[u8]) -> CommonResult<()> {
@@ -478,10 +649,37 @@ impl<'a> InodeWriteBatch<'a> {
         id: i64,
         attributes: DirectoryAttributes,
     ) -> CommonResult<()> {
+        let key = RocksUtils::i64_to_bytes(id);
+        let existing = self.db.get_cf(RocksInodeStore::CF_DIR_ATTRS, key)?;
+        if existing
+            .as_deref()
+            .is_some_and(|value| DirectoryAttributes::decode(value).is_none())
+        {
+            return err_box!("invalid directory attributes record for inode {}", id);
+        }
+        self.put_cf(
+            RocksInodeStore::CF_DIR_ATTRS,
+            key,
+            encode_matching(
+                existing.as_deref(),
+                &attributes.encode(),
+                &attributes.encode_legacy(),
+            ),
+        )
+    }
+
+    /// Backfills an attribute row for an existing database without claiming a
+    /// child count that was never stored. Migration records must remain
+    /// readable by older replicas even if a newer process has enabled CDA4.
+    pub fn write_legacy_directory_attributes(
+        &mut self,
+        id: i64,
+        attributes: DirectoryAttributes,
+    ) -> CommonResult<()> {
         self.put_cf(
             RocksInodeStore::CF_DIR_ATTRS,
             RocksUtils::i64_to_bytes(id),
-            attributes.encode(),
+            attributes.encode_legacy(),
         )
     }
 
@@ -491,8 +689,11 @@ impl<'a> InodeWriteBatch<'a> {
         delta: DirectoryAttributeDelta,
     ) -> CommonResult<()> {
         let cf = self.db.cf(RocksInodeStore::CF_DIR_ATTRS)?;
-        self.batch
-            .merge_cf(cf, RocksUtils::i64_to_bytes(id), delta.encode());
+        self.batch.merge_cf(
+            cf,
+            RocksUtils::i64_to_bytes(id),
+            encode_matching(None, &delta.encode(), &delta.encode_legacy()),
+        );
         Ok(())
     }
 

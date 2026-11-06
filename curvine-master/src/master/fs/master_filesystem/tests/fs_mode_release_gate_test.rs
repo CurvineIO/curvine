@@ -76,6 +76,23 @@ impl FsModeReleaser for RecordingReleaser {
     }
 }
 
+#[test]
+fn expired_free_does_not_enqueue_a_different_inode() {
+    let fs = test_fs("fs-mode-free-inode-mismatch");
+    let original = fs.create("/original", false).unwrap();
+    let replacement = fs.create("/replacement", false).unwrap();
+    let releaser = Arc::new(RecordingReleaser::deferring());
+    fs.set_fs_mode_releaser(releaser.clone());
+
+    assert!(fs
+        .free_expired_inode("/replacement", original.id)
+        .unwrap()
+        .is_none());
+    assert!(releaser.recorded().is_empty());
+    assert!(releaser.cleanups.lock().unwrap().is_empty());
+    assert_eq!(fs.file_status("/replacement").unwrap().id, replacement.id);
+}
+
 /// A completed file marked `Both`, i.e. eligible for a release.
 fn releasable_file(fs: &MasterFilesystem, path: &str) -> i64 {
     for worker_id in [100, 200] {

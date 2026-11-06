@@ -13,10 +13,14 @@
 // limitations under the License.
 
 use crate::conf::JournalConf;
+use crate::proto::raft::SnapshotData;
+use crate::raft::snapshot::RegisteredSnapshotDir;
 use crate::raft::storage::{AppStorage, LogStorage};
 use crate::raft::{RaftNode, RaftResult, RaftServer, RoleMonitor, RoleStateListener};
 use curvine_runtime::runtime::Runtime;
 use curvine_runtime::sync::StateCtl;
+use log::debug;
+use prost::Message;
 use slog::{o, Drain};
 use std::sync::Arc;
 
@@ -69,7 +73,26 @@ where
 
     // Start the current raft node as a leader candidate node.
     pub async fn run_candidate(self) -> RaftResult<RoleStateListener> {
-        let mut server = RaftServer::with_rt(self.rt.clone(), &self.conf);
+        // The download server may only serve files under the currently
+        // registered snapshot. The log store is the single source of truth;
+        // decoding is cheap and only runs when a download request arrives.
+        let log_store = self.log_store.clone();
+        let registered_dir: RegisteredSnapshotDir = std::sync::Arc::new(move || {
+            let snapshot = match log_store.latest_snapshot() {
+                Ok(Some(snapshot)) => snapshot,
+                _ => return None,
+            };
+            match SnapshotData::decode(snapshot.get_data()) {
+                Ok(data) if data.files_data.is_some() => Some(data.data_dir()),
+                Ok(_) => None,
+                Err(e) => {
+                    debug!("failed to decode registered snapshot for download: {}", e);
+                    None
+                }
+            }
+        });
+
+        let mut server = RaftServer::with_rt(self.rt.clone(), &self.conf, registered_dir);
         let receiver = server.take_receiver()?;
         let sender = server.new_sender();
         let node = RaftNode::new_candidate(

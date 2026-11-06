@@ -80,15 +80,16 @@ impl<T> RawPtr<T> {
         if self.owned {
             unsafe { std::ptr::replace(self.ptr, value) }
         } else {
-            panic!("Cannot replace a pointer that owns the value")
+            panic!("Cannot replace a pointer that does not own the value")
         }
     }
 
-    pub fn take(&self) -> T {
+    pub fn take(mut self) -> T {
         if self.owned {
+            self.owned = false;
             unsafe { *Box::from_raw(self.ptr) }
         } else {
-            panic!("Cannot take a pointer that owns the value")
+            panic!("Cannot take a pointer that does not own the value")
         }
     }
 }

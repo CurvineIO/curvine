@@ -31,6 +31,17 @@ impl Default for BlockLocationLockManager {
 }
 
 impl BlockLocationLockManager {
+    /// Best-effort lock-acquire duration in microseconds (design doc §11.2);
+    /// metric registration failure is ignored on the hot path.
+    fn record_acquire_us(mode: &'static str, started: std::time::Instant) {
+        if let Ok(metrics) = crate::master::Master::get_metrics() {
+            metrics
+                .block_lock_acquire_us
+                .with_label_values(&[mode])
+                .observe(started.elapsed().as_micros() as f64);
+        }
+    }
+
     pub fn new(block_shards: usize, worker_shards: usize) -> Self {
         Self {
             block_locks: ObjectLockPool::new(block_shards),
@@ -39,6 +50,7 @@ impl BlockLocationLockManager {
     }
 
     pub fn read_blocks<'a>(&'a self, block_ids: &[i64]) -> BlockLocationLockSet<'a> {
+        let started = std::time::Instant::now();
         let block_keys = sorted_unique_keys(block_ids.iter().map(|block_id| *block_id as u64));
         let guards = block_keys
             .iter()
@@ -46,6 +58,7 @@ impl BlockLocationLockManager {
                 _guard: self.block_locks.get_or_create_lock(*key).read_arc(),
             })
             .collect();
+        Self::record_acquire_us("read", started);
 
         BlockLocationLockSet {
             manager: self,
@@ -56,6 +69,7 @@ impl BlockLocationLockManager {
     }
 
     pub fn write_blocks<'a>(&'a self, block_ids: &[i64]) -> BlockLocationLockSet<'a> {
+        let started = std::time::Instant::now();
         let block_keys = sorted_unique_keys(block_ids.iter().map(|block_id| *block_id as u64));
         let guards = block_keys
             .iter()
@@ -63,6 +77,7 @@ impl BlockLocationLockManager {
                 _guard: self.block_locks.get_or_create_lock(*key).write_arc(),
             })
             .collect();
+        Self::record_acquire_us("write", started);
 
         BlockLocationLockSet {
             manager: self,
@@ -73,6 +88,7 @@ impl BlockLocationLockManager {
     }
 
     pub fn write_worker<'a>(&'a self, worker_id: u32) -> BlockLocationLockSet<'a> {
+        let started = std::time::Instant::now();
         let worker_keys = vec![worker_id as u64];
         let guards = vec![BlockLocationGuard::Write {
             _guard: self
@@ -80,6 +96,7 @@ impl BlockLocationLockManager {
                 .get_or_create_lock(worker_id as u64)
                 .write_arc(),
         }];
+        Self::record_acquire_us("write", started);
 
         BlockLocationLockSet {
             manager: self,
@@ -102,6 +119,7 @@ impl BlockLocationLockManager {
         worker_ids: &[u32],
         block_ids: &[i64],
     ) -> BlockLocationLockSet<'a> {
+        let started = std::time::Instant::now();
         let worker_keys = sorted_unique_keys(worker_ids.iter().map(|worker_id| *worker_id as u64));
         let block_keys = sorted_unique_keys(block_ids.iter().map(|block_id| *block_id as u64));
         let mut guards = Vec::with_capacity(block_keys.len() + worker_keys.len());
@@ -118,6 +136,7 @@ impl BlockLocationLockManager {
             });
         }
 
+        Self::record_acquire_us("write", started);
         BlockLocationLockSet {
             manager: self,
             guards,

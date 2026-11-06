@@ -17,6 +17,7 @@ use curvine_master::master::meta::inode::{
     DirectoryChildren, InodeChildren, InodeDir, InodeFile, InodeView,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 fn file(id: i64) -> InodeView {
     InodeView::new_file(format!("f{id}"), InodeFile::new(id, 1))
@@ -39,7 +40,64 @@ fn names(children: &DirectoryChildren) -> Vec<String> {
 }
 
 #[test]
-fn promotion_preserves_container_contents_for_every_container() {
+fn packed_name_limit_survives_promotion() {
+    let children = Arc::new(seeded(ChildrenContainer::Packed, 2048));
+    let long_name = "界".repeat(86);
+    let add = || InodeView::new_file(long_name.clone(), InodeFile::new(3000, 1));
+    assert!(children.add_child(add()).is_err());
+    assert!(children
+        .begin_rename_mutation("f1", &long_name)
+        .rename_child(1, "f1", None, &long_name)
+        .is_err());
+
+    let guard = children.begin_mutation("holder");
+    let other = children.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        drop(other.begin_mutation("waiter"));
+        done_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let blocked = done_rx.recv_timeout(Duration::from_millis(100));
+    drop(guard);
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    worker.join().unwrap();
+    assert!(matches!(
+        blocked,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert!(format!("{children:?}").contains("sharded: true"));
+
+    assert!(children.add_child(add()).is_err());
+    assert!(children
+        .begin_mutation(&long_name)
+        .add_child(add())
+        .is_err());
+    assert!(children
+        .begin_rename_mutation("f1", &long_name)
+        .rename_child(1, "f1", None, &long_name)
+        .is_err());
+    assert_eq!(children.read_child_view("f1").0.unwrap().id(), 1);
+    assert!(children.read_child_view(&long_name).0.is_none());
+
+    let max_name = "x".repeat(255);
+    children
+        .add_child(InodeView::new_file(
+            max_name.clone(),
+            InodeFile::new(3001, 1),
+        ))
+        .unwrap();
+    assert!(children.read_child_view(&max_name).0.is_some());
+
+    let map = DirectoryChildren::with_container(InodeChildren::new_map());
+    map.add_child(add()).unwrap();
+    assert!(map.read_child_view(&long_name).0.is_some());
+}
+
+#[test]
+fn container_contents_are_preserved_for_every_container() {
     for container in [
         ChildrenContainer::List,
         ChildrenContainer::Map,
@@ -47,9 +105,8 @@ fn promotion_preserves_container_contents_for_every_container() {
     ] {
         let children = seeded(container, 512);
         assert_eq!(children.iter_len(), 512, "{container:?}");
-        // A contended mutation at >= threshold promotes to shards: hold the
-        // single-index write lock once, then add through a fresh mutation so
-        // the promoted shard path is exercised.
+        // This exercises normal mutation for each container; promotion is
+        // separately tested with overlapping lock acquisitions.
         {
             let _guard = children.begin_mutation("f1");
         }
@@ -68,7 +125,67 @@ fn promotion_preserves_container_contents_for_every_container() {
 }
 
 #[test]
-fn sharded_writes_remain_consistent_under_concurrency() {
+fn bulk_restore_seeds_shards_before_children_are_inserted() {
+    let children = DirectoryChildren::with_container(InodeChildren::new_map());
+    children.seed_shards_for_bulk_load(4096);
+    assert!(format!("{children:?}").contains("sharded: true"));
+
+    for id in 1..=128 {
+        children.add_child(file(id)).unwrap();
+    }
+
+    assert_eq!(children.iter_len(), 128);
+    assert_eq!(children.read_child_view("f128").0.unwrap().id(), 128);
+}
+
+#[test]
+fn bulk_seed_preserves_existing_children() {
+    for container in [
+        ChildrenContainer::List,
+        ChildrenContainer::Map,
+        ChildrenContainer::Packed,
+    ] {
+        let children = seeded(container, 32);
+        children.seed_shards_for_bulk_load(4096);
+        assert!(format!("{children:?}").contains("sharded: true"));
+        assert_eq!(children.iter_len(), 32);
+        for id in 1..=32 {
+            assert_eq!(
+                children.read_child_view(&format!("f{id}")).0.unwrap().id(),
+                id
+            );
+        }
+    }
+}
+
+#[test]
+fn bulk_seed_waits_for_active_mutation() {
+    let children = Arc::new(DirectoryChildren::with_container(InodeChildren::new_map()));
+    let mut mutation = children.begin_mutation("f1");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let other = children.clone();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        other.seed_shards_for_bulk_load(4096);
+        done_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let blocked = done_rx.recv_timeout(Duration::from_millis(100));
+    mutation.add_child(file(1)).unwrap();
+    drop(mutation);
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    worker.join().unwrap();
+    assert!(matches!(
+        blocked,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert_eq!(children.read_child_view("f1").0.unwrap().id(), 1);
+    assert_eq!(children.iter_len(), 1);
+}
+
+#[test]
+fn directory_writes_remain_consistent_under_concurrency() {
     let children = Arc::new(seeded(ChildrenContainer::Map, 512));
     let mut handles = Vec::new();
     for thread in 0..4 {
@@ -102,6 +219,235 @@ fn sharded_writes_remain_consistent_under_concurrency() {
 }
 
 #[test]
+fn paginated_listing_matches_sorted_names_before_and_after_sharding() {
+    for container in [
+        ChildrenContainer::List,
+        ChildrenContainer::Map,
+        ChildrenContainer::Packed,
+    ] {
+        let children = seeded(container, 2048);
+        for sharded in [false, true] {
+            if sharded {
+                children.seed_shards_for_bulk_load(2048);
+            }
+            let all = names(&children);
+            for start in [None, Some("f10"), Some("f100x"), Some("zzzz")] {
+                for limit in [0, 1, 2, 17, 100, 1000, 3000] {
+                    let options = curvine_model::ListOptions {
+                        limit: Some(limit),
+                        start_after: start.map(str::to_owned),
+                    };
+                    let actual: Vec<_> = children
+                        .list_options(&options)
+                        .iter()
+                        .map(|inode| inode.name().to_owned())
+                        .collect();
+                    let expected: Vec<_> = all
+                        .iter()
+                        .filter(|name| start.is_none_or(|start| name.as_str() > start))
+                        .take(limit)
+                        .cloned()
+                        .collect();
+                    assert_eq!(
+                        actual, expected,
+                        "{container:?}, sharded={sharded}, start={start:?}, limit={limit}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn concurrent_shard_writes_never_produce_a_current_version() {
+    use fxhash::FxHasher;
+    use std::hash::{Hash, Hasher};
+    use std::sync::mpsc;
+
+    // The promotion threshold is at most 2048. Force real contention while
+    // holding the unsharded write guard, then verify promotion took place.
+    let children = Arc::new(seeded(ChildrenContainer::Map, 2048));
+    let guard = children.begin_mutation("promotion-holder");
+    let other = children.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let promote = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        drop(other.begin_mutation("promotion-waiter"));
+        done_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(guard);
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    promote.join().unwrap();
+    assert!(format!("{children:?}").contains("sharded: true"));
+    let all_names = names(&children);
+    for start in [None, Some("f100"), Some("f100x"), Some("zzzz")] {
+        for limit in [0, 1, 3, 100] {
+            let options = curvine_model::ListOptions {
+                limit: Some(limit),
+                start_after: start.map(str::to_owned),
+            };
+            let page: Vec<String> = children
+                .list_options(&options)
+                .iter()
+                .map(|item| item.name().to_owned())
+                .collect();
+            let expected: Vec<String> = all_names
+                .iter()
+                .filter(|name| start.map_or(true, |start| name.as_str() > start))
+                .take(limit)
+                .cloned()
+                .collect();
+            assert_eq!(page, expected, "start={start:?}, limit={limit}");
+        }
+    }
+
+    let count = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_mul(2))
+        .unwrap_or(8)
+        .next_power_of_two()
+        .clamp(8, 64);
+    let shard = |name: &str| {
+        let mut hasher = FxHasher::default();
+        name.hash(&mut hasher);
+        (hasher.finish() as usize) & (count - 1)
+    };
+    let first = (0..1000)
+        .map(|n| format!("first-{n}"))
+        .find(|name| shard(name) != shard("f1"))
+        .unwrap();
+    let second = (0..1000)
+        .map(|n| format!("second-{n}"))
+        .find(|name| shard(name) != shard(&first))
+        .unwrap();
+    let first_guard = children.begin_mutation(&first);
+    let other = children.clone();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let _guard = other.begin_mutation(&second);
+        entered_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let version = children.shared_version();
+    let incorrectly_current = version.is_current();
+    release_tx.send(()).unwrap();
+    writer.join().unwrap();
+    let one_writer_version = children.shared_version();
+    let one_writer_current = one_writer_version.is_current();
+    drop(first_guard);
+    assert!(
+        !one_writer_current,
+        "the remaining writer must remain visible"
+    );
+    assert!(!one_writer_version.is_current());
+    assert!(
+        !incorrectly_current,
+        "two active writers cannot yield a current version"
+    );
+    assert!(
+        !version.is_current(),
+        "a version captured during writes stays invalid"
+    );
+    assert!(children.shared_version().is_current());
+
+    let mut mutation = children.begin_mutation("f1");
+    let wrong_child = InodeView::new_file(first.clone(), InodeFile::new(9000, 1));
+    assert!(mutation.add_child(wrong_child).is_err());
+    drop(mutation);
+    assert!(children.read_child_view(&first).0.is_none());
+    assert_eq!(children.iter_len(), 2048);
+
+    // The rename guard owns only the source and destination shards; reject
+    // a later request that changes the destination to an unlocked shard.
+    let wrong_destination = (0..1000)
+        .map(|n| format!("unlocked-{n}"))
+        .find(|name| shard(name) != shard("f1") && shard(name) != shard(&first))
+        .unwrap();
+    let mut rename = children.begin_rename_mutation("f1", &first);
+    assert!(rename
+        .rename_child(1, "f1", None, &wrong_destination)
+        .is_err());
+    rename.rename_child(1, "f1", None, &first).unwrap();
+    drop(rename);
+    assert!(children.read_child_view("f1").0.is_none());
+    assert_eq!(children.read_child_view(&first).0.unwrap().id(), 1);
+
+    let mut dir = InodeDir::new(9001, 1);
+    dir.add_child(file(9002)).unwrap();
+    let handle = dir.children_handle();
+    children
+        .add_child(InodeView::new_dir("sub".into(), dir))
+        .unwrap();
+    let destination = (0..1000)
+        .map(|n| format!("moved-{n}"))
+        .find(|name| shard(name) != shard("sub"))
+        .unwrap();
+    children
+        .begin_rename_mutation("sub", &destination)
+        .rename_child(9001, "sub", None, &destination)
+        .unwrap();
+    let moved = children.read_child_view(&destination).0.unwrap();
+    let InodeView::Dir(moved) = moved else {
+        panic!("directory changed type")
+    };
+    assert!(Arc::ptr_eq(&handle, &moved.children_handle()));
+    assert_eq!(moved.get_child("f9002").unwrap().id(), 9002);
+}
+
+#[test]
+fn promotion_preserves_directory_node_identity() {
+    use std::sync::mpsc;
+
+    for container in [
+        ChildrenContainer::List,
+        ChildrenContainer::Map,
+        ChildrenContainer::Packed,
+    ] {
+        let children = Arc::new(seeded(container, 2048));
+        children
+            .add_child(InodeView::new_dir("removed".into(), InodeDir::new(8999, 1)))
+            .unwrap();
+        children.delete_child(8999, "removed").unwrap();
+        children
+            .add_child(InodeView::new_dir("sub".into(), InodeDir::new(9000, 1)))
+            .unwrap();
+        children
+            .add_child(InodeView::new_dir("hole".into(), InodeDir::new(9001, 1)))
+            .unwrap();
+        children.delete_child(9001, "hole").unwrap();
+        let mut original = children.get_child_ptr("sub").unwrap();
+        let original_names = names(&children);
+        let guard = children.begin_mutation("holder");
+        let other = children.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            drop(other.begin_mutation("waiter"));
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(guard);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert!(format!("{children:?}").contains("sharded: true"));
+        assert_eq!(names(&children), original_names, "{container:?}");
+        let promoted = children.get_child_ptr("sub").unwrap();
+        assert!(
+            std::ptr::eq(original.as_ref(), promoted.as_ref()),
+            "{container:?}"
+        );
+        original.as_dir_mut().unwrap().update_mtime(123);
+        assert_eq!(children.read_child_view("sub").0.unwrap().mtime(), 123);
+    }
+}
+
+#[test]
 fn small_directories_stay_unsharded() {
     let children = seeded(ChildrenContainer::Map, 4);
     {
@@ -125,10 +471,10 @@ fn dir_views_move_between_containers_with_their_own_children() {
 }
 
 #[test]
-fn opposite_cross_shard_renames_both_complete() {
+fn concurrent_same_directory_renames_both_complete() {
     use std::sync::Barrier;
     let children = Arc::new(seeded(ChildrenContainer::Map, 512));
-    // Promote first via a contended mutation.
+    // This test does not force promotion; it checks same-directory behavior.
     {
         let _guard = children.begin_mutation("f1");
     }
@@ -145,20 +491,18 @@ fn opposite_cross_shard_renames_both_complete() {
     let rename_a = std::thread::spawn(move || {
         a_start.wait();
         let mut mutation = a_children.begin_rename_mutation("x-aaa", "x-renamed-a");
-        let view = mutation.child_view("x-aaa").unwrap();
-        let mut moved = view;
-        moved.change_name("x-renamed-a".into());
-        mutation.rename_child(800, "x-aaa", None, moved).unwrap();
+        mutation
+            .rename_child(800, "x-aaa", None, "x-renamed-a")
+            .unwrap();
     });
     let b_children = children.clone();
     let b_start = start.clone();
     let rename_b = std::thread::spawn(move || {
         b_start.wait();
         let mut mutation = b_children.begin_rename_mutation("x-zzz", "x-renamed-b");
-        let view = mutation.child_view("x-zzz").unwrap();
-        let mut moved = view;
-        moved.change_name("x-renamed-b".into());
-        mutation.rename_child(801, "x-zzz", None, moved).unwrap();
+        mutation
+            .rename_child(801, "x-zzz", None, "x-renamed-b")
+            .unwrap();
     });
 
     rename_a.join().unwrap();
@@ -171,23 +515,85 @@ fn opposite_cross_shard_renames_both_complete() {
 }
 
 #[test]
-fn same_shard_rename_replaces_target_atomically() {
+fn failed_rename_preserves_source_and_target() {
+    for container in [
+        ChildrenContainer::List,
+        ChildrenContainer::Map,
+        ChildrenContainer::Packed,
+    ] {
+        let children = seeded(container, 4);
+        let mut mutation = children.begin_rename_mutation("f1", "f2");
+        assert!(mutation
+            .rename_child(99, "f1", Some((2, "f2")), "f2")
+            .is_err());
+        assert!(mutation
+            .rename_child(1, "f1", Some((99, "f2")), "f2")
+            .is_err());
+        assert!(mutation.rename_child(1, "f1", None, "f2").is_err());
+        drop(mutation);
+        assert_eq!(
+            children.read_child_view("f1").0.unwrap().id(),
+            1,
+            "{container:?}"
+        );
+        assert_eq!(
+            children.read_child_view("f2").0.unwrap().id(),
+            2,
+            "{container:?}"
+        );
+    }
+}
+
+#[test]
+fn rename_rejects_oversized_packed_name_without_removing_source() {
+    let children = seeded(ChildrenContainer::Packed, 4);
+    let name = "x".repeat(1024);
+    let mut mutation = children.begin_rename_mutation("f1", &name);
+    assert!(mutation.rename_child(1, "f1", None, &name).is_err());
+    drop(mutation);
+    assert_eq!(children.read_child_view("f1").0.unwrap().id(), 1);
+}
+
+#[test]
+fn rename_moves_original_directory_and_children() {
+    for container in [
+        ChildrenContainer::List,
+        ChildrenContainer::Map,
+        ChildrenContainer::Packed,
+    ] {
+        let children = seeded(container, 2);
+        let mut dir = InodeDir::new(10, 1);
+        dir.add_child(file(11)).unwrap();
+        let handle = dir.children_handle();
+        children
+            .add_child(InodeView::new_dir("sub".into(), dir))
+            .unwrap();
+        let mut mutation = children.begin_rename_mutation("sub", "moved");
+        mutation.rename_child(10, "sub", None, "moved").unwrap();
+        drop(mutation);
+        assert!(children.read_child_view("sub").0.is_none());
+        let moved = children.read_child_view("moved").0.unwrap();
+        let InodeView::Dir(moved) = moved else {
+            panic!("directory changed type")
+        };
+        assert!(Arc::ptr_eq(&handle, &moved.children_handle()));
+        assert_eq!(moved.get_child("f11").unwrap().id(), 11);
+    }
+}
+
+#[test]
+fn single_index_rename_replaces_target() {
     let children = Arc::new(seeded(ChildrenContainer::Map, 4));
     {
         let _guard = children.begin_mutation("f1");
     }
     let mut mutation = children.begin_rename_mutation("f1", "f2");
-    let view = mutation.child_view("f1").unwrap();
-    let mut moved = view;
-    moved.change_name("f8".into());
-    // Replace f2 with the moved f1 (renamed f8).
     mutation
-        .rename_child(1, "f1", Some((2, "f2")), moved)
+        .rename_child(1, "f1", Some((2, "f2")), "f2")
         .unwrap();
     drop(mutation);
     assert!(children.get_child_ptr("f1").is_none());
-    assert!(children.get_child_ptr("f2").is_none());
-    assert_eq!(children.get_child_ptr("f8").unwrap().id(), 1);
-    // f1..f4 seeded (4) minus f1, minus replaced f2, plus f8 = 3 entries.
+    assert_eq!(children.get_child_ptr("f2").unwrap().id(), 1);
+    // f1..f4 seeded (4) minus f1, minus replaced f2, plus f2 = 3 entries.
     assert_eq!(children.iter_len(), 3);
 }

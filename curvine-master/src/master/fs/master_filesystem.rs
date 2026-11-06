@@ -13,13 +13,16 @@
 // limitations under the License.
 
 use crate::master::fs::context::ValidateAddBlock;
-use crate::master::fs::full_block_report::{FullReportProgress, FullReportTracker};
+use crate::master::fs::full_block_report::{
+    FullReportBegin, FullReportProgress, FullReportTracker,
+};
 use crate::master::fs::policy::ChooseContext;
-use crate::master::journal::{FsModeReleaser, JournalSystem};
+use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
+use crate::master::meta::store::{InodeStoreSnapshot, StoreResolvedPath};
 use crate::master::meta::{
-    trash, CacheInvalidationResult, CommitGate, FsDir, RestoredTrashEntry, TrashListing,
-    TrashScanPage,
+    trash, BlockLocationLockManager, CacheInvalidationResult, CommitGate, FsDir, InodeLockManager,
+    InodeLockRequest, RestoredTrashEntry, TrashListing, TrashScanPage,
 };
 
 use crate::master::fs::DeleteResult;
@@ -27,14 +30,12 @@ use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_config::{ClusterConf, MasterConf};
-use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
+use curvine_core_error::{err_box, err_ext, try_option, CommonError, CommonResult};
+use curvine_error::ErrorKind;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::GET_BLOCK_LOCATIONS_BATCH_MAX_PATHS;
 
-/// Bounded optimistic-read retries before falling back to the stable
-/// shared-lock resolve.
-const OPTIMISTIC_READ_RETRIES: usize = 8;
 use curvine_model::*;
 use curvine_raft::conf::JournalConfExt;
 use curvine_runtime::common::LocalTime;
@@ -73,6 +74,7 @@ pub struct CvMetadataSnapshotPage {
     pub epoch: u64,
 }
 
+#[derive(Clone)]
 struct CompleteFileOptions {
     only_flush: bool,
     return_file_blocks: bool,
@@ -88,9 +90,12 @@ pub struct MasterFilesystem {
     /// Serialises namespace mutations across the commit boundary so a snapshot
     /// or role fence can drain in-flight writers before reading metadata.
     metadata_commit_gate: Arc<CommitGate>,
+    pub(crate) journal_writer: Arc<JournalWriter>,
     full_report_tracker: FullReportTracker,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
+    block_location_locks: Arc<BlockLocationLockManager>,
+    inode_locks: Arc<InodeLockManager>,
     worker_location_locks: Arc<Vec<Mutex<()>>>,
     /// Serialises drains of `/.Trash/.pending`. The blocking empty-trash call
     /// owns the staging directory across staging and draining, and the
@@ -125,6 +130,7 @@ pub struct FsModeSnapshot {
 
 pub struct BlockReportResult {
     pub delete_blocks: Vec<i64>,
+    pub restart_full_report: bool,
 }
 
 #[derive(Default)]
@@ -172,7 +178,7 @@ const FULL_BLOCK_RECONCILE_QUEUE_SIZE: usize = 128;
 const WORKER_LOCATION_LOCK_STRIPES: usize = 256;
 
 impl MasterFilesystem {
-    // Max block-report location updates applied under a single fs_dir write lock.
+    // Max block-report location updates applied under one namespace guard.
     const BLOCK_REPORT_WRITE_CHUNK: usize = 4096;
     // Max lost-worker block ids inspected under a single fs_dir write lock.
     const LOST_WORKER_INVALIDATION_CHUNK: usize = Self::BLOCK_REPORT_WRITE_CHUNK;
@@ -205,6 +211,10 @@ impl MasterFilesystem {
         worker_manager: SyncWorkerManager,
         master_monitor: MasterMonitor,
     ) -> Self {
+        let journal_writer = {
+            let dir = fs_dir.read();
+            dir.journal_writer.clone()
+        };
         Self {
             fs_dir,
             worker_manager,
@@ -217,6 +227,8 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_THREADS,
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
+            block_location_locks: Arc::new(BlockLocationLockManager::default()),
+            inode_locks: Arc::new(InodeLockManager::default()),
             worker_location_locks: Arc::new(
                 (0..WORKER_LOCATION_LOCK_STRIPES)
                     .map(|_| Mutex::new(()))
@@ -225,10 +237,12 @@ impl MasterFilesystem {
             pending_drain: Default::default(),
             fs_mode_releaser: Default::default(),
             metadata_commit_gate: Default::default(),
+            journal_writer,
         }
     }
 
-    /// The gate serialises namespace mutations against snapshots and role fences.
+    /// Coordinates namespace mutations with snapshot barriers. Role fencing
+    /// rejects new admissions separately; admitted writes are not yet drained.
     pub fn metadata_commit_gate(&self) -> Arc<CommitGate> {
         self.metadata_commit_gate.clone()
     }
@@ -245,26 +259,22 @@ impl MasterFilesystem {
     }
 
     pub fn with_js(conf: &ClusterConf, js: &JournalSystem) -> Self {
+        let fs_dir = js.fs().fs_dir.clone();
         Self {
-            fs_dir: js.fs().fs_dir.clone(),
+            fs_dir,
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
             conf: Arc::new(conf.master.clone()),
-            full_report_tracker: Default::default(),
-            full_block_reconciles: Default::default(),
-            full_block_reconcile_executor: Arc::new(GroupExecutor::new(
-                "master-full-block-reconcile",
-                FULL_BLOCK_RECONCILE_THREADS,
-                FULL_BLOCK_RECONCILE_QUEUE_SIZE,
-            )),
-            worker_location_locks: Arc::new(
-                (0..WORKER_LOCATION_LOCK_STRIPES)
-                    .map(|_| Mutex::new(()))
-                    .collect(),
-            ),
-            pending_drain: Default::default(),
-            fs_mode_releaser: Default::default(),
-            metadata_commit_gate: Default::default(),
+            full_report_tracker: js.fs().full_report_tracker.clone(),
+            full_block_reconciles: js.fs().full_block_reconciles.clone(),
+            full_block_reconcile_executor: js.fs().full_block_reconcile_executor.clone(),
+            block_location_locks: js.fs().block_location_locks.clone(),
+            inode_locks: js.fs().inode_locks.clone(),
+            worker_location_locks: js.fs().worker_location_locks.clone(),
+            pending_drain: js.fs().pending_drain.clone(),
+            fs_mode_releaser: js.fs().fs_mode_releaser.clone(),
+            metadata_commit_gate: js.fs().metadata_commit_gate(),
+            journal_writer: js.fs().journal_writer.clone(),
         }
     }
 
@@ -289,75 +299,1052 @@ impl MasterFilesystem {
     }
 
     pub fn print_tree(&self) {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.write();
         fs_dir.print_tree();
     }
 
-    /// Read-barrier precheck before the commit gate. Re-run inside the gate so
-    /// a role change cannot slip between the check and the mutation.
-    pub(crate) fn ensure_metadata_current(&self) -> FsResult<()> {
-        let writer = self.fs_dir.read().journal_writer.clone();
-        writer.ensure_metadata_current()
+    /// Live-tree reads retry a hydration race a few times before surfacing.
+    const LIVE_READ_RETRIES: usize = 16;
+
+    /// Resolve `path` over the live tree, retrying the transient window where
+    /// a cloned file-edge handle loses its store row to a concurrent delete.
+    fn resolve_live(&self, path: &str) -> FsResult<InodePath> {
+        for attempt in 0..Self::LIVE_READ_RETRIES {
+            let fs_dir = self.fs_dir.read();
+            let result = Self::resolve_path(&fs_dir, path);
+            drop(fs_dir);
+            match result {
+                Ok(inp) => return Ok(inp),
+                Err(error) => {
+                    if !Self::is_transient_hydration_race(&error) {
+                        return Err(error);
+                    }
+                    // Retries exhausted: the edge is persistently dangling
+                    // rather than racing a delete. Surface the same message
+                    // the store-snapshot protocol used for corruption.
+                    if attempt + 1 == Self::LIVE_READ_RETRIES {
+                        return err_box!("directory edge references missing inode: {}", error);
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+            }
+        }
+        unreachable!("retry loop returns on every branch")
     }
 
-    /// Runs a namespace mutation inside the commit gate: the writer enters
-    /// before mutating and the journal scope waits for Raft commit afterwards,
-    /// so a snapshot or role fence can never observe a half-published change.
-    /// The gate is re-checked inside the boundary so an old request cannot
-    /// write after a follower catch-up has started.
-    fn run_metadata_write<R>(&self, f: impl FnOnce() -> FsResult<R>) -> FsResult<R> {
-        self.ensure_metadata_current()?;
-        let _commit_guard = self.metadata_commit_gate.enter();
-        self.ensure_metadata_current()?;
-        let writer = self.fs_dir.read().journal_writer.clone();
-        let scope = writer.begin_commit_scope();
+    /// Read-barrier precheck before the commit gate. Re-run inside the gate to
+    /// reject requests that waited while a role fence was installed.
+    pub(crate) fn ensure_metadata_current(&self) -> FsResult<()> {
+        self.journal_writer.ensure_metadata_current()
+    }
+
+    /// Holds the commit gate through mutation and journal confirmation so a
+    /// gate-closing snapshot can drain the write. The second role check rejects
+    /// requests delayed at admission; it does not drain writers already admitted
+    /// when a role change installs its fence.
+    pub(crate) fn run_metadata_write<R>(&self, f: impl FnOnce() -> FsResult<R>) -> FsResult<R> {
+        let epoch = self.journal_writer.metadata_epoch()?;
+        self.run_metadata_write_epoch(epoch, f)
+    }
+
+    fn run_metadata_write_epoch<R>(
+        &self,
+        epoch: u64,
+        f: impl FnOnce() -> FsResult<R>,
+    ) -> FsResult<R> {
+        let commit_guard = self.metadata_commit_gate.enter();
+        self.journal_writer.ensure_metadata_epoch(epoch)?;
+        let result = self.run_admitted_metadata_write(f);
+        drop(commit_guard);
+        if result.is_ok() {
+            self.maybe_create_periodic_snapshot(epoch);
+        }
+        result
+    }
+
+    fn maybe_create_periodic_snapshot(&self, epoch: u64) {
+        // Only include confirmed writes; snapshot failure cannot undo an RPC.
+        if self.journal_writer.periodic_snapshot_due() {
+            if let Some(_snapshot_guard) = self.metadata_commit_gate.close_and_enter_if_open() {
+                if self.journal_writer.ensure_metadata_epoch(epoch).is_ok() {
+                    let fs_dir = self.fs_dir.read();
+                    if let Err(error) = self.journal_writer.maybe_emit_snapshot(&fs_dir) {
+                        warn!("periodic metadata snapshot failed: {}", error);
+                    }
+                }
+            }
+        }
+    }
+
+    fn run_admitted_metadata_write<R>(&self, f: impl FnOnce() -> FsResult<R>) -> FsResult<R> {
+        // Every caller already re-checked the read barrier immediately after
+        // taking its commit-gate slot (see run_metadata_write_epoch / atime
+        // touch), and nothing waits between that check and `f` — the scope
+        // registration is purely local. A third barrier read here would only
+        // re-read the same uncontended state.
+        let scope = self.journal_writer.begin_commit_scope();
         let result = f();
         scope.wait()?;
         result
     }
 
-    pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
-        let inp = self.run_metadata_write(|| {
-            let mut fs_dir = self.fs_dir.write();
-            let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
-            Self::check_not_reserved_path(inp.path())?;
+    fn resolve_store_path(&self, path: &str) -> FsResult<(StoreResolvedPath, u64)> {
+        let fs_dir = self.fs_dir.read();
+        let epoch = fs_dir.store.scan_control().cancel_epoch();
+        let lease = fs_dir.store.begin_snapshot_scan()?;
+        let reader = lease.snapshot_reader()?;
+        Ok((reader.resolve_path(path)?, epoch))
+    }
 
-            // Creation of root directory is not allowed
-            if inp.is_root() {
-                return err_box!("Not allowed to create existing root path: {}", inp.path());
+    /// Component count of an absolute path without touching the namespace.
+    fn inp_components_len(path: &str) -> usize {
+        InodeView::path_components(path)
+            .map(|components| components.len())
+            .unwrap_or(0)
+    }
+
+    /// Lock-planning variant of [`Self::resolve_live_store_view`]: returns the
+    /// resolved inode-id chain without cloning inode bodies. The retry
+    /// comparisons only need ids, so the hot write loops use this.
+    fn resolve_live_ids(&self, path: &str) -> FsResult<(Vec<i64>, usize, bool, u64)> {
+        let fs_dir = self.fs_dir.read();
+        let control = fs_dir.store.scan_control();
+        if control.is_restoring() {
+            return err_box!(
+                "metadata scan lease rejected: snapshot restore is pending or in progress"
+            );
+        }
+        let epoch = control.cancel_epoch();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+        let full = inp.inodes.len() == inp.components.len();
+        let ids = inp.inodes.iter().map(|inode| inode.id()).collect();
+        Ok((ids, inp.components.len(), full, epoch))
+    }
+
+    /// Live-tree counterpart of [`Self::resolve_store_path`]: resolves over
+    /// the shared namespace guard and returns the same comparison shape. The
+    /// per-directory child locks make the result authoritative while the
+    /// sharded write locks are held, and the restore epoch still fences store
+    /// replacement.
+    fn resolve_live_store_view(&self, path: &str) -> FsResult<(StoreResolvedPath, u64)> {
+        let fs_dir = self.fs_dir.read();
+        let control = fs_dir.store.scan_control();
+        // Mirror the snapshot-scan admission gate: mutations are rejected
+        // while a Raft snapshot restore is pending or in progress.
+        if control.is_restoring() {
+            return err_box!(
+                "metadata scan lease rejected: snapshot restore is pending or in progress"
+            );
+        }
+        let epoch = control.cancel_epoch();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+        Ok((StoreResolvedPath::from_live(&inp), epoch))
+    }
+
+    fn live_path_matches(resolved: &StoreResolvedPath, inp: &InodePath) -> bool {
+        resolved.components() == inp.components.as_slice()
+            && resolved.inodes().len() == inp.inodes.len()
+            && resolved
+                .inodes()
+                .iter()
+                .zip(&inp.inodes)
+                .all(|(stored, live)| stored.id() == live.id())
+    }
+
+    fn mkdir_single_parent_sharded(&self, path: &str, opts: MkdirOpts) -> FsResult<FileStatus> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (ids, components_len, full, restore_epoch) = self.resolve_live_ids(path)?;
+            Self::check_not_pending_path(path)?;
+            Self::check_not_reserved_path(path)?;
+            if components_len <= 1 {
+                return err_box!("Not allowed to create existing root path: {}", path);
+            }
+            if full {
+                // A concurrent creator won the race, or the target already
+                // exists: mkdir is idempotent only with create_parent.
+                let fs_dir = self.fs_dir.read();
+                let inp = Self::resolve_path(&fs_dir, path)?;
+                let inode = inp
+                    .get_last_inode()
+                    .ok_or_else(|| FsError::file_not_found(path))?;
+                if opts.create_parent && inode.is_dir() {
+                    return Ok(inode.to_file_status(path)?);
+                }
+                return err_ext!(FsError::file_exists(path));
             }
 
+            let parent_index = ids.len().saturating_sub(1);
+            let requests: Vec<_> = ids
+                .iter()
+                .enumerate()
+                .map(|(depth, inode_id)| {
+                    if !full && depth == parent_index {
+                        InodeLockRequest::write(depth, *inode_id)
+                    } else {
+                        InodeLockRequest::read(depth, *inode_id)
+                    }
+                })
+                .collect();
+            let _locks = self.inode_locks.lock_many(&requests);
+            // Post-lock verification needs only the restore epoch (a single
+            // atomic read — it moves exactly when a restore begins) plus the
+            // one walk that doubles as the mutation input. A second full
+            // traversal here would duplicate the one below.
+            let locked_epoch = {
+                let fs_dir = self.fs_dir.read();
+                fs_dir.store.scan_control().cancel_epoch()
+            };
+            if restore_epoch != locked_epoch {
+                continue;
+            }
+
+            // Single post-lock walk: the inode chain doubles as the
+            // re-verification and the mutation input. A mkdir input is
+            // deliberately partial — the missing trailing level is what the
+            // mutation creates.
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if inp.inodes.len() != ids.len()
+                || inp
+                    .inodes
+                    .iter()
+                    .zip(&ids)
+                    .any(|(live, expected)| live.id() != *expected)
+            {
+                continue;
+            }
             if inp.is_full() {
                 if opts.create_parent {
-                    if let Some(last_inode) = inp.get_last_inode() {
-                        if last_inode.is_dir() {
-                            let status = last_inode.to_file_status(inp.path())?;
-                            return Ok(Some(status));
-                        }
+                    let inode = inp
+                        .get_last_inode()
+                        .ok_or_else(|| FsError::file_not_found(path))?;
+                    if inode.is_dir() {
+                        return Ok(inode.to_file_status(path)?);
                     }
                 }
-                return err_ext!(FsError::file_exists(inp.path()));
+                return err_ext!(FsError::file_exists(path));
             }
-
-            // Check whether the directory can be created recursively.
             if !opts.create_parent {
                 Self::check_parent(&inp)?;
             }
+            let inp = fs_dir.mkdir(inp, opts.clone())?;
+            return fs_dir.file_status(&inp);
+        }
 
-            let inp = fs_dir.mkdir(inp, opts)?;
-            let last = try_option!(
-                inp.get_last_inode(),
-                "Path {} has no inode after mkdir",
-                inp.path()
+        err_ext!(FsError::common(format!(
+            "namespace changed while creating {}",
+            path
+        )))
+    }
+
+    fn create_single_parent_sharded(
+        &self,
+        path: &str,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> FsResult<(FileStatus, Option<DeleteResult>)> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (ids, components_len, full, restore_epoch) = self.resolve_live_ids(path)?;
+            Self::check_not_pending_path(path)?;
+            Self::check_not_reserved_path(path)?;
+            if ids.len() + 1 < components_len {
+                return self.create_with_global_lock(path, opts, flags);
+            }
+            if full {
+                if flags.overwrite() && !flags.exclusive() {
+                    if let Some(result) = self.overwrite_file_sharded(path, opts.clone())? {
+                        return Ok((result.0, Some(result.1)));
+                    }
+                }
+                return self.create_with_global_lock(path, opts, flags);
+            }
+
+            let parent_index = ids.len().saturating_sub(1);
+            let requests: Vec<_> = ids
+                .iter()
+                .enumerate()
+                .map(|(depth, inode_id)| {
+                    if !full && depth == parent_index {
+                        InodeLockRequest::write(depth, *inode_id)
+                    } else {
+                        InodeLockRequest::read(depth, *inode_id)
+                    }
+                })
+                .collect();
+            let _locks = self.inode_locks.lock_many(&requests);
+            let locked_epoch = {
+                let fs_dir = self.fs_dir.read();
+                fs_dir.store.scan_control().cancel_epoch()
+            };
+            if restore_epoch != locked_epoch {
+                continue;
+            }
+
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if inp.is_full() {
+                // A concurrent creator won (or the target appeared): route
+                // through the same overwrite / conflict handling a full
+                // pre-lock resolution would take.
+                drop(fs_dir);
+                return self.create_with_global_lock(path, opts, flags);
+            }
+            if inp.inodes.len() != ids.len()
+                || inp
+                    .inodes
+                    .iter()
+                    .zip(&ids)
+                    .any(|(live, expected)| live.id() != *expected)
+            {
+                continue;
+            }
+            debug_assert!(!inp.is_full());
+            if !opts.create_parent {
+                Self::check_parent(&inp)?;
+            }
+            let inp = fs_dir.create_file(inp, opts.clone())?;
+            return Ok((fs_dir.file_status(&inp)?, None));
+        }
+
+        err_ext!(FsError::common(format!(
+            "namespace changed while creating {}",
+            path
+        )))
+    }
+
+    fn overwrite_file_sharded(
+        &self,
+        path: &str,
+        opts: CreateFileOpts,
+    ) -> FsResult<Option<(FileStatus, DeleteResult)>> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
+            let Some(target) = resolved.target() else {
+                return Ok(None);
+            };
+            if resolved.inodes().len() < 2 || !target.is_file() {
+                return Ok(None);
+            }
+
+            let target_depth = resolved.inodes().len() - 1;
+            let block_ids = target.as_file_ref()?.block_ids();
+            let worker_ids = {
+                let fs_dir = self.fs_dir.read();
+                let mut worker_ids = HashSet::new();
+                for block_id in &block_ids {
+                    let locations = match fs_dir.get_block_locations(*block_id) {
+                        Ok(locations) => locations,
+                        Err(_) => return Ok(None),
+                    };
+                    worker_ids.extend(locations.into_iter().map(|location| location.worker_id));
+                }
+                worker_ids.into_iter().collect::<Vec<_>>()
+            };
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| {
+                    if depth == target_depth {
+                        InodeLockRequest::write(depth, inode.id())
+                    } else {
+                        InodeLockRequest::read(depth, inode.id())
+                    }
+                })
+                .collect();
+            let _locks = self.inode_locks.lock_many(&requests);
+            let _location_locks = self
+                .block_location_locks
+                .write_workers_blocks(&worker_ids, &block_ids);
+
+            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
+            if restore_epoch != locked_epoch || !resolved.same_resolution(&locked) {
+                continue;
+            }
+            let Some(locked_target) = locked.target() else {
+                continue;
+            };
+            if locked_target.id() != target.id()
+                || !locked_target.is_file()
+                || locked_target.as_file_ref()?.block_ids() != block_ids
+            {
+                continue;
+            }
+
+            let fs_dir = self.fs_dir.read();
+            let current_workers = {
+                let mut current_workers = HashSet::new();
+                for block_id in &block_ids {
+                    let locations = match fs_dir.get_block_locations(*block_id) {
+                        Ok(locations) => locations,
+                        Err(_) => return Ok(None),
+                    };
+                    current_workers
+                        .extend(locations.into_iter().map(|location| location.worker_id));
+                }
+                current_workers
+            };
+            if current_workers.len() != worker_ids.len()
+                || !worker_ids
+                    .iter()
+                    .all(|worker_id| current_workers.contains(worker_id))
+            {
+                continue;
+            }
+
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            let deleted = fs_dir.overwrite_file(&inp, opts.clone())?;
+            let status = fs_dir.file_status(&inp)?;
+            return Ok(Some((status, deleted)));
+        }
+
+        Ok(None)
+    }
+
+    fn create_with_global_lock(
+        &self,
+        path: &str,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> FsResult<(FileStatus, Option<DeleteResult>)> {
+        let fs_dir = self.fs_dir.write();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+        Self::check_not_reserved_path(inp.path())?;
+        let last_inode = inp.get_last_inode();
+        if let Some(inode) = &last_inode {
+            if inode.is_dir() {
+                return err_box!("{}  already exists as a dir", inp.path());
+            }
+            if flags.exclusive() {
+                return err_ext!(FsError::file_exists(inp.path()));
+            }
+        }
+        if !opts.create_parent {
+            Self::check_parent(&inp)?;
+        }
+        let (inp, deleted) = if last_inode.is_some() {
+            if !flags.overwrite() {
+                return err_ext!(FsError::file_exists(inp.path()));
+            }
+            let deleted = fs_dir.overwrite_file(&inp, opts)?;
+            (inp, Some(deleted))
+        } else {
+            (fs_dir.create_file(inp, opts)?, None)
+        };
+        Ok((fs_dir.file_status(&inp)?, deleted))
+    }
+
+    fn delete_single_parent_sharded(&self, path: &str) -> FsResult<DeleteResult> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (ids, _components, full, restore_epoch) = self.resolve_live_ids(path)?;
+            if !full || ids.len() < 2 {
+                return self.delete_with_global_lock(path);
+            }
+
+            let target_index = ids.len() - 1;
+            let parent_index = target_index - 1;
+            let requests: Vec<_> = ids
+                .iter()
+                .enumerate()
+                .map(|(depth, inode_id)| {
+                    if depth == parent_index || depth == target_index {
+                        InodeLockRequest::write(depth, *inode_id)
+                    } else {
+                        InodeLockRequest::read(depth, *inode_id)
+                    }
+                })
+                .collect();
+            let _locks = self.inode_locks.lock_many(&requests);
+            let locked_epoch = {
+                let fs_dir = self.fs_dir.read();
+                fs_dir.store.scan_control().cancel_epoch()
+            };
+            if restore_epoch != locked_epoch {
+                continue;
+            }
+
+            // Under the inode write locks the target body is authoritative:
+            // the single post-lock walk doubles as the id re-verification and
+            // the location sample input.
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if inp.inodes.len() != ids.len()
+                || inp
+                    .inodes
+                    .iter()
+                    .zip(&ids)
+                    .any(|(live, expected)| live.id() != *expected)
+                || inp.inodes.len() != inp.components.len()
+            {
+                continue;
+            }
+            let Some(target) = inp.get_last_inode() else {
+                return self.delete_with_global_lock(path);
+            };
+            let block_ids = target
+                .as_file_ref()
+                .ok()
+                .map(|file| file.block_ids())
+                .unwrap_or_default();
+            let worker_ids = {
+                let mut worker_ids = HashSet::new();
+                for block_id in &block_ids {
+                    let locations = match fs_dir.get_block_locations(*block_id) {
+                        Ok(locations) => locations,
+                        Err(_) => {
+                            drop(fs_dir);
+                            drop(_locks);
+                            return self.delete_with_global_lock(path);
+                        }
+                    };
+                    worker_ids.extend(locations.into_iter().map(|location| location.worker_id));
+                }
+                worker_ids.into_iter().collect::<Vec<_>>()
+            };
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.locations_sampled",
+                description: "Worker locations sampled before inode locks",
+                context: {"path" => path},
+            }
+            let _location_locks = self
+                .block_location_locks
+                .write_workers_blocks(&worker_ids, &block_ids);
+            let current_workers = {
+                let mut current_workers = HashSet::new();
+                for block_id in &block_ids {
+                    let locations = match fs_dir.get_block_locations(*block_id) {
+                        Ok(locations) => locations,
+                        Err(_) => {
+                            drop(fs_dir);
+                            drop(_location_locks);
+                            drop(_locks);
+                            return self.delete_with_global_lock(path);
+                        }
+                    };
+                    current_workers
+                        .extend(locations.into_iter().map(|location| location.worker_id));
+                }
+                current_workers
+            };
+            if current_workers.len() != worker_ids.len()
+                || !worker_ids
+                    .iter()
+                    .all(|worker_id| current_workers.contains(worker_id))
+            {
+                continue;
+            }
+            return fs_dir.delete(&inp, false);
+        }
+
+        self.delete_with_global_lock(path)
+    }
+
+    fn delete_with_global_lock(&self, path: &str) -> FsResult<DeleteResult> {
+        let mut fs_dir = self.fs_dir.write();
+        self.delete_locked(&mut fs_dir, path, false, DeleteMode::SkipTrash)
+    }
+
+    fn rename_sharded(&self, src: &str, dst: &str, flags: RenameFlags) -> FsResult<bool> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (source_ids, _source_components, source_full, source_epoch) =
+                self.resolve_live_ids(src)?;
+            let (destination_ids, destination_components, destination_full, destination_epoch) =
+                self.resolve_live_ids(dst)?;
+            if !source_full
+                || destination_full
+                || destination_ids.len() + 1 < destination_components
+                || source_ids.len() < 2
+            {
+                return self.rename_with_global_lock(src, dst, flags);
+            }
+
+            let source_parent = source_ids.len() - 2;
+            let source_target = source_ids.len() - 1;
+            let destination_parent = destination_ids.len().saturating_sub(1);
+            let mut requests = Vec::with_capacity(source_ids.len() + destination_ids.len());
+            requests.extend(source_ids.iter().enumerate().map(|(depth, inode_id)| {
+                if depth == source_parent || depth == source_target {
+                    InodeLockRequest::write(depth, *inode_id)
+                } else {
+                    InodeLockRequest::read(depth, *inode_id)
+                }
+            }));
+            requests.extend(destination_ids.iter().enumerate().map(|(depth, inode_id)| {
+                if depth == destination_parent {
+                    InodeLockRequest::write(depth, *inode_id)
+                } else {
+                    InodeLockRequest::read(depth, *inode_id)
+                }
+            }));
+            let _locks = self.inode_locks.lock_many(&requests);
+
+            let (source_epoch_now, destination_epoch_now) = {
+                let fs_dir = self.fs_dir.read();
+                let control = fs_dir.store.scan_control();
+                (control.cancel_epoch(), control.cancel_epoch())
+            };
+            if source_epoch != source_epoch_now || destination_epoch != destination_epoch_now {
+                continue;
+            }
+
+            let fs_dir = self.fs_dir.read();
+            let source_path = Self::resolve_path(&fs_dir, src)?;
+            let destination_path = Self::resolve_path(&fs_dir, dst)?;
+            if source_path.inodes.len() != source_ids.len()
+                || source_path
+                    .inodes
+                    .iter()
+                    .zip(&source_ids)
+                    .any(|(live, expected)| live.id() != *expected)
+                || destination_path.inodes.len() != destination_ids.len()
+                || destination_path
+                    .inodes
+                    .iter()
+                    .zip(&destination_ids)
+                    .any(|(live, expected)| live.id() != *expected)
+            {
+                continue;
+            }
+            if destination_path.is_full() {
+                drop(fs_dir);
+                drop(_locks);
+                return self.rename_with_global_lock(src, dst, flags);
+            }
+            fs_dir.rename(&source_path, &destination_path, flags)?;
+            return Ok(true);
+        }
+
+        self.rename_with_global_lock(src, dst, flags)
+    }
+
+    fn rename_with_global_lock(&self, src: &str, dst: &str, flags: RenameFlags) -> FsResult<bool> {
+        let fs_dir = self.fs_dir.write();
+        let src_inp = Self::resolve_path(&fs_dir, src)?;
+        let dst_inp = Self::resolve_path(&fs_dir, dst)?;
+        let deleted = fs_dir.rename(&src_inp, &dst_inp, flags)?;
+        if let Some(deleted) = deleted {
+            self.worker_manager.write().remove_blocks(&deleted);
+        }
+        Ok(true)
+    }
+
+    fn set_attr_single_path_sharded(&self, path: &str, opts: SetAttrOpts) -> FsResult<FileStatus> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
+            if !resolved.is_full() {
+                let fs_dir = self.fs_dir.write();
+                let inp = Self::resolve_path(&fs_dir, path)?;
+                return fs_dir.set_attr(inp, opts);
+            }
+
+            let target_depth = resolved.inodes().len() - 1;
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| {
+                    if depth == target_depth {
+                        InodeLockRequest::write(depth, inode.id())
+                    } else {
+                        InodeLockRequest::read(depth, inode.id())
+                    }
+                })
+                .collect();
+            let _locks = self.inode_locks.lock_many(&requests);
+            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
+            if restore_epoch != locked_epoch || !resolved.same_resolution(&locked) {
+                continue;
+            }
+
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            return fs_dir.set_attr(inp, opts);
+        }
+
+        let fs_dir = self.fs_dir.write();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+        fs_dir.set_attr(inp, opts)
+    }
+
+    fn complete_file_sharded(
+        &self,
+        path: &str,
+        inode_id: Option<i64>,
+        len: i64,
+        commit_blocks: Vec<CommitBlock>,
+        client_name: &str,
+        options: CompleteFileOptions,
+    ) -> FsResult<Option<FileBlocks>> {
+        const MAX_RETRIES: usize = 3;
+
+        let block_ids: Vec<_> = commit_blocks.iter().map(|block| block.block_id).collect();
+        let worker_ids: Vec<_> = commit_blocks
+            .iter()
+            .flat_map(|block| block.locations.iter().map(|location| location.worker_id))
+            .collect();
+
+        for _ in 0..MAX_RETRIES {
+            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
+            let Some(target) = resolved.target() else {
+                return self.complete_file_with_global_lock(
+                    path,
+                    inode_id,
+                    len,
+                    commit_blocks,
+                    client_name,
+                    options,
+                );
+            };
+            if resolved.inodes().len() < 2
+                || inode_id.is_some_and(|id| id != target.id())
+                || !target.is_file()
+            {
+                return self.complete_file_with_global_lock(
+                    path,
+                    inode_id,
+                    len,
+                    commit_blocks,
+                    client_name,
+                    options,
+                );
+            }
+
+            let target_depth = resolved.inodes().len() - 1;
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| {
+                    if depth == target_depth {
+                        InodeLockRequest::write(depth, inode.id())
+                    } else {
+                        InodeLockRequest::read(depth, inode.id())
+                    }
+                })
+                .collect();
+            let _inode_locks = self.inode_locks.lock_many(&requests);
+            let _location_locks = self
+                .block_location_locks
+                .write_workers_blocks(&worker_ids, &block_ids);
+
+            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
+            if restore_epoch != locked_epoch || !resolved.same_resolution(&locked) {
+                continue;
+            }
+
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            let mut inode = inp
+                .get_last_inode()
+                .ok_or_else(|| FsError::file_not_found(path))?;
+            if inode_id.is_some_and(|id| id != inode.id()) {
+                drop(fs_dir);
+                drop(_location_locks);
+                drop(_inode_locks);
+                return self.complete_file_with_global_lock(
+                    path,
+                    inode_id,
+                    len,
+                    commit_blocks,
+                    client_name,
+                    options,
+                );
+            }
+
+            fs_dir.complete_file(
+                path,
+                &mut inode,
+                len,
+                commit_blocks,
+                client_name,
+                options.only_flush,
+                options.set_attr_opts,
+            )?;
+
+            if options.only_flush && options.return_file_blocks {
+                let file = inode.as_file_ref()?;
+                let locs = self.get_block_locs(path, &fs_dir, file)?;
+                let status = inode.to_file_status(path)?;
+                return Ok(Some(FileBlocks::new(status, locs)));
+            }
+            return Ok(None);
+        }
+
+        self.complete_file_with_global_lock(
+            path,
+            inode_id,
+            len,
+            commit_blocks,
+            client_name,
+            options,
+        )
+    }
+
+    fn complete_file_with_global_lock(
+        &self,
+        path: &str,
+        inode_id: Option<i64>,
+        len: i64,
+        commit_blocks: Vec<CommitBlock>,
+        client_name: &str,
+        options: CompleteFileOptions,
+    ) -> FsResult<Option<FileBlocks>> {
+        let fs_dir = self.fs_dir.write();
+        let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        fs_dir.complete_file(
+            path,
+            &mut inode,
+            len,
+            commit_blocks,
+            client_name,
+            options.only_flush,
+            options.set_attr_opts,
+        )?;
+
+        if options.only_flush && options.return_file_blocks {
+            let file = inode.as_file_ref()?;
+            let locs = self.get_block_locs(path, &fs_dir, file)?;
+            let status = inode.to_file_status(path)?;
+            return Ok(Some(FileBlocks::new(status, locs)));
+        }
+        Ok(None)
+    }
+
+    fn close_file_sharded(&self, path: &str, client_name: &str) -> FsResult<()> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (resolved, restore_epoch) = match self.resolve_live_store_view(path) {
+                Ok(value) => value,
+                Err(error) if matches!(error.kind(), ErrorKind::FileNotFound) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            let Some(target) = resolved.target() else {
+                return Ok(());
+            };
+            if resolved.inodes().len() < 2 || !target.is_file() {
+                return self.close_file_with_global_lock(path, client_name);
+            }
+
+            let target_depth = resolved.inodes().len() - 1;
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| {
+                    if depth == target_depth {
+                        InodeLockRequest::write(depth, inode.id())
+                    } else {
+                        InodeLockRequest::read(depth, inode.id())
+                    }
+                })
+                .collect();
+            let _locks = self.inode_locks.lock_many(&requests);
+            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
+            if restore_epoch != locked_epoch || !resolved.same_resolution(&locked) {
+                continue;
+            }
+
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            fs_dir.close_writer(&inp, client_name)?;
+            return Ok(());
+        }
+
+        self.close_file_with_global_lock(path, client_name)
+    }
+
+    fn close_file_with_global_lock(&self, path: &str, client_name: &str) -> FsResult<()> {
+        let fs_dir = self.fs_dir.write();
+        let Ok(inp) = Self::resolve_path(&fs_dir, path) else {
+            return Ok(());
+        };
+        fs_dir.close_writer(&inp, client_name)
+    }
+
+    fn symlink_single_parent_sharded(
+        &self,
+        target: &str,
+        link: &str,
+        mode: u32,
+        owner: Option<String>,
+        group: Option<String>,
+    ) -> FsResult<()> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (resolved, restore_epoch) = self.resolve_live_store_view(link)?;
+            if resolved.is_full() || resolved.inodes().len() + 1 < resolved.components().len() {
+                return self.symlink_with_global_lock(target, link, false, mode, owner, group);
+            }
+
+            let parent_index = resolved.inodes().len() - 1;
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| {
+                    if depth == parent_index {
+                        InodeLockRequest::write(depth, inode.id())
+                    } else {
+                        InodeLockRequest::read(depth, inode.id())
+                    }
+                })
+                .collect();
+            let _locks = self.inode_locks.lock_many(&requests);
+            let (locked, locked_epoch) = self.resolve_live_store_view(link)?;
+            if restore_epoch != locked_epoch || !resolved.same_resolution(&locked) {
+                continue;
+            }
+
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, link)?;
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            if inp.is_full() {
+                drop(fs_dir);
+                drop(_locks);
+                return self.symlink_with_global_lock(target, link, false, mode, owner, group);
+            }
+            fs_dir.symlink(
+                target.to_string(),
+                inp,
+                false,
+                mode,
+                owner.clone(),
+                group.clone(),
+            )?;
+            return Ok(());
+        }
+
+        err_ext!(FsError::common(format!(
+            "namespace changed while creating symlink {}",
+            link
+        )))
+    }
+
+    fn symlink_with_global_lock(
+        &self,
+        target: &str,
+        link: &str,
+        force: bool,
+        mode: u32,
+        owner: Option<String>,
+        group: Option<String>,
+    ) -> FsResult<()> {
+        let fs_dir = self.fs_dir.write();
+        let inp = Self::resolve_path(&fs_dir, link)?;
+        Self::check_not_reserved_path(inp.path())?;
+        fs_dir.symlink(target.to_string(), inp, force, mode, owner, group)
+    }
+
+    fn link_single_parent_sharded(&self, src: &str, dst: &str) -> FsResult<()> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (source, source_epoch) = self.resolve_live_store_view(src)?;
+            let (destination, destination_epoch) = self.resolve_live_store_view(dst)?;
+            if !source.is_full()
+                || destination.is_full()
+                || destination.inodes().len() + 1 < destination.components().len()
+            {
+                return self.link_with_global_lock(src, dst);
+            }
+
+            let mut requests =
+                Vec::with_capacity(source.inodes().len() + destination.inodes().len());
+            requests.extend(source.inodes().iter().enumerate().map(|(depth, inode)| {
+                if depth + 1 == source.inodes().len() {
+                    InodeLockRequest::write(depth, inode.id())
+                } else {
+                    InodeLockRequest::read(depth, inode.id())
+                }
+            }));
+            let destination_parent = destination.inodes().len() - 1;
+            requests.extend(
+                destination
+                    .inodes()
+                    .iter()
+                    .enumerate()
+                    .map(|(depth, inode)| {
+                        if depth == destination_parent {
+                            InodeLockRequest::write(depth, inode.id())
+                        } else {
+                            InodeLockRequest::read(depth, inode.id())
+                        }
+                    }),
             );
-            let status = last.to_file_status(inp.path())?;
-            Ok(Some(status))
-        })?;
-        Ok(try_option!(
-            inp,
-            "mkdir {} produced no status after the commit gate",
-            path.as_ref()
-        ))
+            let _locks = self.inode_locks.lock_many(&requests);
+            let (locked_source, locked_source_epoch) = self.resolve_live_store_view(src)?;
+            let (locked_destination, locked_destination_epoch) =
+                self.resolve_live_store_view(dst)?;
+            if source_epoch != locked_source_epoch
+                || destination_epoch != locked_destination_epoch
+                || !source.same_resolution(&locked_source)
+                || !destination.same_resolution(&locked_destination)
+            {
+                continue;
+            }
+
+            let fs_dir = self.fs_dir.read();
+            let source_path = Self::resolve_path(&fs_dir, src)?;
+            let destination_path = Self::resolve_path(&fs_dir, dst)?;
+            if !Self::live_path_matches(&locked_source, &source_path)
+                || !Self::live_path_matches(&locked_destination, &destination_path)
+            {
+                continue;
+            }
+            if destination_path.is_full() {
+                return err_ext!(FsError::file_exists(dst));
+            }
+            fs_dir.link(source_path, destination_path)?;
+            return Ok(());
+        }
+
+        err_ext!(FsError::common(format!(
+            "namespace changed while linking {} to {}",
+            src, dst
+        )))
+    }
+
+    fn link_with_global_lock(&self, src: &str, dst: &str) -> FsResult<()> {
+        let fs_dir = self.fs_dir.write();
+        let src_path = Self::resolve_path(&fs_dir, src)?;
+        let dst_path = Self::resolve_path(&fs_dir, dst)?;
+        Self::check_not_reserved_path(src_path.path())?;
+        Self::check_not_reserved_path(dst_path.path())?;
+        fs_dir.link(src_path, dst_path)
+    }
+
+    pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
+        self.run_metadata_write(|| self.mkdir_single_parent_sharded(path.as_ref(), opts))
     }
 
     pub fn mkdir<T: AsRef<str>>(&self, path: T, create_parent: bool) -> FsResult<FileStatus> {
@@ -379,33 +1366,222 @@ impl MasterFilesystem {
         mode: DeleteMode,
     ) -> FsResult<DeleteResult> {
         let mut delete_res = self.run_metadata_write(|| {
-            let mut fs_dir = self.fs_dir.write();
-            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)
+            let path = path.as_ref();
+            let (resolved, _) = self.resolve_live_store_view(path)?;
+            Self::check_not_pending_path(path)?;
+            let sharded = matches!(mode, DeleteMode::SkipTrash)
+                && !recursive
+                && resolved.is_full()
+                && resolved.components().len() > 1
+                && path != trash::TRASH_ROOT;
+            if sharded {
+                self.delete_single_parent_sharded(path)
+            } else {
+                let mut fs_dir = self.fs_dir.write();
+                self.delete_locked(&mut fs_dir, path, recursive, mode)
+            }
         })?;
         self.release_deleted_blocks(&mut delete_res);
 
         Ok(delete_res)
     }
 
-    /// Leader-fenced variant of `delete_with_mode`. The role is re-checked
-    /// while holding the same write lock that guards the metadata mutation, so
-    /// a demotion cannot interleave between the check and the delete. Returns
-    /// `None` when this node is no longer the active master.
+    pub(crate) fn delete_expired_inode(
+        &self,
+        path: &str,
+        inode_id: i64,
+        mode: DeleteMode,
+    ) -> FsResult<Option<(DeleteResult, InodeView)>> {
+        let result = self.run_metadata_write(|| {
+            if matches!(mode, DeleteMode::SkipTrash) {
+                if let Some(result) = self.delete_expired_inode_sharded(path, inode_id)? {
+                    return Ok(Some(result));
+                }
+            }
+            self.delete_expired_inode_with_global_lock(path, inode_id, mode)
+        })?;
+        let Some((mut result, inode)) = result else {
+            return Ok(None);
+        };
+        self.release_deleted_blocks(&mut result);
+        Ok(Some((result, inode)))
+    }
+
+    fn delete_expired_inode_with_global_lock(
+        &self,
+        path: &str,
+        inode_id: i64,
+        mode: DeleteMode,
+    ) -> FsResult<Option<(DeleteResult, InodeView)>> {
+        let mut fs_dir = self.fs_dir.write();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+        let Some(inode) = inp.get_last_inode() else {
+            return Ok(None);
+        };
+        if inode.id() != inode_id
+            || !inode.is_expired()?
+            || inode.storage_policy()?.ttl_action != TtlAction::Delete
+            || matches!(inode.as_ref(), InodeView::File(file) if file.is_writing())
+            || (inode.is_dir() && !inp.is_empty_dir())
+        {
+            return Ok(None);
+        }
+        let current = inode.as_ref().clone_metadata();
+        self.delete_locked(&mut fs_dir, path, true, mode)
+            .map(|result| Some((result, current)))
+    }
+
+    fn delete_expired_inode_sharded(
+        &self,
+        path: &str,
+        inode_id: i64,
+    ) -> FsResult<Option<(DeleteResult, InodeView)>> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
+            if !resolved.is_full() || resolved.inodes().len() < 2 {
+                return Ok(None);
+            }
+            let target = resolved.target().expect("full path has a target");
+            if target.id() != inode_id
+                || !target.is_expired()?
+                || target.storage_policy()?.ttl_action != TtlAction::Delete
+                || matches!(target, InodeView::File(file) if file.is_writing())
+                || (target.is_dir() && target.child_len() != 0)
+            {
+                return Ok(None);
+            }
+
+            let target_index = resolved.inodes().len() - 1;
+            let parent_index = target_index - 1;
+            let block_ids = target
+                .as_file_ref()
+                .map(|file| file.block_ids())
+                .unwrap_or_default();
+            let worker_ids = {
+                let fs_dir = self.fs_dir.read();
+                let mut worker_ids = HashSet::new();
+                for block_id in &block_ids {
+                    let locations = match fs_dir.get_block_locations(*block_id) {
+                        Ok(locations) => locations,
+                        Err(_) => return Ok(None),
+                    };
+                    worker_ids.extend(locations.into_iter().map(|location| location.worker_id));
+                }
+                worker_ids.into_iter().collect::<Vec<_>>()
+            };
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.locations_sampled",
+                description: "Worker locations sampled before inode locks",
+                context: {"path" => path},
+            }
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| {
+                    if depth == parent_index || depth == target_index {
+                        InodeLockRequest::write(depth, inode.id())
+                    } else {
+                        InodeLockRequest::read(depth, inode.id())
+                    }
+                })
+                .collect();
+            let _locks = self.inode_locks.lock_many(&requests);
+            let _location_locks = self
+                .block_location_locks
+                .write_workers_blocks(&worker_ids, &block_ids);
+
+            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
+            if restore_epoch != locked_epoch
+                || !resolved.same_resolution(&locked)
+                || locked.target().is_none_or(|target| {
+                    target.id() != inode_id
+                        || target
+                            .as_file_ref()
+                            .map(|file| file.block_ids())
+                            .unwrap_or_default()
+                            != block_ids
+                })
+            {
+                continue;
+            }
+
+            let fs_dir = self.fs_dir.read();
+            let current_workers = {
+                let mut current_workers = HashSet::new();
+                for block_id in &block_ids {
+                    let locations = match fs_dir.get_block_locations(*block_id) {
+                        Ok(locations) => locations,
+                        Err(_) => return Ok(None),
+                    };
+                    current_workers
+                        .extend(locations.into_iter().map(|location| location.worker_id));
+                }
+                current_workers
+            };
+            if current_workers.len() != worker_ids.len()
+                || !worker_ids
+                    .iter()
+                    .all(|worker_id| current_workers.contains(worker_id))
+            {
+                continue;
+            }
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            if inp.path() == trash::TRASH_ROOT {
+                return Ok(None);
+            }
+            let Some(inode) = inp.get_last_inode() else {
+                continue;
+            };
+            if inode.id() != inode_id
+                || !inode.is_expired()?
+                || inode.storage_policy()?.ttl_action != TtlAction::Delete
+                || matches!(inode.as_ref(), InodeView::File(file) if file.is_writing())
+                || (inode.is_dir() && !inp.is_empty_dir())
+            {
+                return Ok(None);
+            }
+            let current = inode.as_ref().clone_metadata();
+            return fs_dir
+                .delete(&inp, false)
+                .map(|result| Some((result, current)));
+        }
+
+        Ok(None)
+    }
+
+    /// Variant of `delete_with_mode` that also checks the active-master
+    /// monitor before deletion. Role fencing and the commit gate are checked
+    /// separately; a demotion can still race an already-admitted operation.
+    /// Returns `None` if the monitor is inactive at either check.
     pub fn delete_with_mode_if_active<T: AsRef<str>>(
         &self,
         path: T,
         recursive: bool,
         mode: DeleteMode,
     ) -> FsResult<Option<DeleteResult>> {
-        let mut delete_res = {
+        if !self.master_monitor.is_active() {
+            return Ok(None);
+        }
+        let result = self.run_metadata_write(|| {
             let mut fs_dir = self.fs_dir.write();
             if !self.master_monitor.is_active() {
                 return Ok(None);
             }
-            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)?
+            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)
+                .map(Some)
+        })?;
+        let Some(mut delete_res) = result else {
+            return Ok(None);
         };
         self.release_deleted_blocks(&mut delete_res);
-
         Ok(Some(delete_res))
     }
 
@@ -472,7 +1648,10 @@ impl MasterFilesystem {
         entry: &str,
         paths: &[String],
     ) -> FsResult<Option<(u64, u64)>> {
-        let mut delete_res = {
+        if !self.master_monitor.is_active() {
+            return Ok(None);
+        }
+        let result = self.run_metadata_write(|| {
             let mut fs_dir = self.fs_dir.write();
             if !self.master_monitor.is_active() {
                 return Ok(None);
@@ -480,12 +1659,13 @@ impl MasterFilesystem {
 
             let mtime = LocalTime::mills() as i64;
             let delete_res = fs_dir.purge_paths(paths, mtime)?;
-
             let writer = fs_dir.journal_writer.clone();
             writer.log_trash_purge(&fs_dir, entry, mtime, paths.to_vec())?;
-            delete_res
+            Ok(Some(delete_res))
+        })?;
+        let Some(mut delete_res) = result else {
+            return Ok(None);
         };
-
         self.release_deleted_blocks(&mut delete_res);
         Ok(Some((delete_res.inodes, delete_res.bytes)))
     }
@@ -495,7 +1675,7 @@ impl MasterFilesystem {
         after: Option<&trash::TrashCursor>,
         limit: usize,
     ) -> FsResult<TrashListing> {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.write();
         fs_dir.list_trash(after, limit)
     }
 
@@ -514,19 +1694,19 @@ impl MasterFilesystem {
     }
 
     pub fn restore_dst<T: AsRef<str>>(&self, path: T, dst: Option<&str>) -> FsResult<String> {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.write();
         fs_dir.restore_dst(path.as_ref(), dst)
     }
 
     /// Returns one bounded page of expired trash entry paths. The namespace
-    /// read lock is held only while scanning that page.
+    /// exclusive lock is held only while scanning that page.
     pub fn scan_expired_trash(
         &self,
         cutoff_ms: i64,
         limit: usize,
         start_after: Option<&str>,
     ) -> FsResult<TrashScanPage> {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.write();
         fs_dir.scan_expired_trash(cutoff_ms, limit, start_after)
     }
 
@@ -537,11 +1717,16 @@ impl MasterFilesystem {
         &self,
         trash_path: &str,
     ) -> FsResult<Option<Option<String>>> {
-        let mut fs_dir = self.fs_dir.write();
         if !self.master_monitor.is_active() {
             return Ok(None);
         }
-        fs_dir.claim_trash_entry_for_purge(trash_path).map(Some)
+        self.run_metadata_write(|| {
+            let mut fs_dir = self.fs_dir.write();
+            if !self.master_monitor.is_active() {
+                return Ok(None);
+            }
+            fs_dir.claim_trash_entry_for_purge(trash_path).map(Some)
+        })
     }
 
     /// One bounded page of `/.Trash/.pending` entries, i.e. entries staged by
@@ -551,7 +1736,7 @@ impl MasterFilesystem {
         limit: usize,
         start_after: Option<&str>,
     ) -> FsResult<TrashScanPage> {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.write();
         fs_dir.scan_pending_trash(limit, start_after)
     }
 
@@ -561,9 +1746,10 @@ impl MasterFilesystem {
         dst: Option<&str>,
         overwrite: bool,
     ) -> FsResult<RestoredTrashEntry> {
-        let mut fs_dir = self.fs_dir.write();
-        let restored = fs_dir.restore_trash(path.as_ref(), dst, overwrite)?;
-        drop(fs_dir);
+        let restored = self.run_metadata_write(|| {
+            let mut fs_dir = self.fs_dir.write();
+            fs_dir.restore_trash(path.as_ref(), dst, overwrite)
+        })?;
 
         // Overwriting an existing destination deletes it; release its blocks
         // just like a regular rename-with-replace.
@@ -587,16 +1773,18 @@ impl MasterFilesystem {
 
         // Snapshot the names once: entries added after the snapshot stay for the
         // next empty, and each batch releases the write lock between renames.
-        let names = self.fs_dir.read().trash_entry_names()?;
+        let names = self.fs_dir.write().trash_entry_names()?;
         let mut staged = 0;
         for batch in names.chunks(BATCH_SIZE) {
-            let mut fs_dir = self.fs_dir.write();
-            if !self.master_monitor.is_active() {
-                return err_ext!(FsError::not_leader(
-                    "empty-trash staging lost leadership mid-sweep"
-                ));
-            }
-            staged += fs_dir.stage_trash_entries(batch)?;
+            staged += self.run_metadata_write(|| {
+                let mut fs_dir = self.fs_dir.write();
+                if !self.master_monitor.is_active() {
+                    return err_ext!(FsError::not_leader(
+                        "empty-trash staging lost leadership mid-sweep"
+                    ));
+                }
+                fs_dir.stage_trash_entries(batch)
+            })?;
         }
         Ok(staged)
     }
@@ -694,9 +1882,31 @@ impl MasterFilesystem {
     /// mount point but is not itself in one is refused: freeing it directly
     /// would release those files unverified.
     pub fn free_or_defer(&self, path: &str, recursive: bool) -> FsResult<FreeOutcome> {
+        self.free_or_defer_inner(path, recursive, None)?
+            .map(|(outcome, _)| outcome)
+            .ok_or_else(|| FsError::file_not_found(path))
+    }
+
+    pub(crate) fn free_expired_inode(
+        &self,
+        path: &str,
+        inode_id: i64,
+    ) -> FsResult<Option<(FreeOutcome, InodeView)>> {
+        self.free_or_defer_inner(path, true, Some(inode_id))
+    }
+
+    fn free_or_defer_inner(
+        &self,
+        path: &str,
+        recursive: bool,
+        expected_id: Option<i64>,
+    ) -> FsResult<Option<(FreeOutcome, InodeView)>> {
+        let mut outcome = self.run_metadata_write(|| {
         if let Some(releaser) = self.fs_mode_releaser() {
             if releaser.is_fs_mode(path) {
-                let (pending, cleanup) = self.fs_mode_release_candidates(path, recursive)?;
+                let Some((pending, cleanup, inode)) = self.fs_mode_release_candidates(path, recursive, expected_id)? else {
+                    return Ok(None);
+                };
                 let count = pending.len();
                 if cleanup {
                     releaser.defer_cleanup(path)?;
@@ -704,7 +1914,7 @@ impl MasterFilesystem {
                 for inode_id in pending {
                     releaser.defer_release(inode_id);
                 }
-                return Ok(FreeOutcome::Deferred { pending: count });
+                return Ok(Some((FreeOutcome::Deferred { pending: count }, inode)));
             }
             if recursive && releaser.contains_fs_mode_mount(path) {
                 return err_box!(
@@ -714,14 +1924,156 @@ impl MasterFilesystem {
             }
         }
 
+        if !recursive && expected_id.is_none() {
+            if let Some((free_res, inode)) = self.free_single_file_sharded(path)? {
+                return Ok(Some((FreeOutcome::Freed(free_res), inode)));
+            }
+        }
+
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
         Self::check_not_reserved_path(inp.path())?;
+        let Some(inode) = Self::free_target(&inp, expected_id)? else {
+            return Ok(None);
+        };
 
-        let mut free_res = fs_dir.free(&inp, recursive)?;
-        drop(fs_dir);
-        self.remove_freed_blocks(&mut free_res);
-        Ok(FreeOutcome::Freed(free_res))
+        let free_res = fs_dir.free(&inp, recursive)?;
+        Ok(Some((FreeOutcome::Freed(free_res), inode)))
+        })?;
+        if let Some((FreeOutcome::Freed(ref mut result), _)) = outcome {
+            self.remove_freed_blocks(result);
+        }
+        Ok(outcome)
+    }
+
+    fn free_single_file_sharded(&self, path: &str) -> FsResult<Option<(FreeResult, InodeView)>> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
+            let Some(target) = resolved.target() else {
+                return Ok(None);
+            };
+            if resolved.inodes().len() < 2 || !target.is_file() {
+                return Ok(None);
+            }
+
+            let Ok(target_file) = target.as_file_ref() else {
+                return Ok(None);
+            };
+            let block_ids = target_file.block_ids();
+            let worker_ids = {
+                let fs_dir = self.fs_dir.read();
+                let mut worker_ids = HashSet::new();
+                for block_id in &block_ids {
+                    let locations = match fs_dir.get_block_locations(*block_id) {
+                        Ok(locations) => locations,
+                        Err(_) => return Ok(None),
+                    };
+                    worker_ids.extend(locations.into_iter().map(|location| location.worker_id));
+                }
+                worker_ids.into_iter().collect::<Vec<_>>()
+            };
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.locations_sampled",
+                description: "Worker locations sampled before inode locks",
+                context: {"path" => path},
+            }
+            let target_depth = resolved.inodes().len() - 1;
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| {
+                    if depth == target_depth {
+                        InodeLockRequest::write(depth, inode.id())
+                    } else {
+                        InodeLockRequest::read(depth, inode.id())
+                    }
+                })
+                .collect();
+            let _inode_locks = self.inode_locks.lock_many(&requests);
+            let _location_locks = self
+                .block_location_locks
+                .write_workers_blocks(&worker_ids, &block_ids);
+
+            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
+            let Some(locked_target) = locked.target() else {
+                continue;
+            };
+            let Ok(locked_file) = locked_target.as_file_ref() else {
+                continue;
+            };
+            if restore_epoch != locked_epoch
+                || !resolved.same_resolution(&locked)
+                || locked_file.block_ids() != block_ids
+            {
+                continue;
+            }
+
+            let fs_dir = self.fs_dir.read();
+            let current_workers = {
+                let mut current_workers = HashSet::new();
+                for block_id in &block_ids {
+                    let locations = match fs_dir.get_block_locations(*block_id) {
+                        Ok(locations) => locations,
+                        Err(_) => return Ok(None),
+                    };
+                    current_workers
+                        .extend(locations.into_iter().map(|location| location.worker_id));
+                }
+                current_workers
+            };
+            if current_workers.len() != worker_ids.len()
+                || !worker_ids
+                    .iter()
+                    .all(|worker_id| current_workers.contains(worker_id))
+            {
+                continue;
+            }
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            Self::check_not_reserved_path(inp.path())?;
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            let Some(live_inode) = inp.get_last_inode() else {
+                continue;
+            };
+            let Ok(live_file) = live_inode.as_file_ref() else {
+                continue;
+            };
+            if live_inode.id() != locked_target.id() || live_file.block_ids() != block_ids {
+                continue;
+            }
+
+            let original = live_inode.as_ref().clone_metadata();
+            let free_res = fs_dir.free_file(&inp, LocalTime::mills() as i64)?;
+            return Ok(Some((free_res, original)));
+        }
+
+        Ok(None)
+    }
+
+    fn free_target(inp: &InodePath, expected_id: Option<i64>) -> FsResult<Option<InodeView>> {
+        let Some(inode) = inp.get_last_inode() else {
+            return if expected_id.is_some() {
+                Ok(None)
+            } else {
+                err_ext!(FsError::file_not_found(inp.path()))
+            };
+        };
+        if let Some(id) = expected_id {
+            if inode.id() != id
+                || !inode.is_expired()?
+                || inode.storage_policy()?.ttl_action != TtlAction::Free
+                || matches!(inode.as_ref(), InodeView::File(file) if file.is_writing())
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(inode.as_ref().clone_metadata()))
     }
 
     fn remove_freed_blocks(&self, free_res: &mut FreeResult) {
@@ -737,7 +2089,9 @@ impl MasterFilesystem {
 
     /// State Free reconciliation needs for one file, read under one lock.
     pub fn fs_mode_snapshot(&self, inode_id: i64) -> FsResult<Option<FsModeSnapshot>> {
-        let fs_dir = self.fs_dir.read();
+        // Shared fs_dir readers include sharded writers; exclude them while
+        // resolving raw pointers and collecting the verification fields.
+        let fs_dir = self.fs_dir.write();
         let path = match fs_dir.get_inode_path(inode_id) {
             Ok(path) => path,
             Err(FsError::FileNotFound(_)) => return Ok(None),
@@ -771,13 +2125,130 @@ impl MasterFilesystem {
         gen: FileGen,
         ufs_mtime: i64,
     ) -> FsResult<bool> {
-        let mut fs_dir = self.fs_dir.write();
-        let Some(mut free_res) = fs_dir.free_verified(inode_id, path, gen, ufs_mtime)? else {
+        let result = self
+            .run_metadata_write(|| self.release_verified_sharded(inode_id, path, gen, ufs_mtime))?;
+        let Some(mut free_res) = result else {
             return Ok(false);
         };
-        drop(fs_dir);
         self.remove_freed_blocks(&mut free_res);
         Ok(true)
+    }
+
+    fn release_verified_sharded(
+        &self,
+        inode_id: i64,
+        path: &str,
+        gen: FileGen,
+        ufs_mtime: i64,
+    ) -> FsResult<Option<FreeResult>> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
+            let Some(target) = resolved.target() else {
+                return Ok(None);
+            };
+            let Ok(file) = target.as_file_ref() else {
+                return Ok(None);
+            };
+            if resolved.inodes().len() < 2
+                || file.id != inode_id
+                || file.gen() != gen
+                || file.storage_policy.state != StorageState::Both
+                || file.storage_policy.ufs_mtime != ufs_mtime
+            {
+                return Ok(None);
+            }
+
+            let block_ids = file.block_ids();
+            // Location updates also serialize on worker locks. Snapshot their
+            // identities before locking, then retry if that set changed.
+            let read_workers = |fs_dir: &FsDir| -> FsResult<HashSet<u32>> {
+                let mut workers = HashSet::new();
+                for block_id in &block_ids {
+                    workers.extend(
+                        fs_dir
+                            .get_block_locations(*block_id)?
+                            .into_iter()
+                            .map(|loc| loc.worker_id),
+                    );
+                }
+                Ok(workers)
+            };
+            let Ok(worker_ids) = read_workers(&self.fs_dir.read()) else {
+                break;
+            };
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.locations_sampled",
+                description: "Worker locations sampled before inode locks",
+                context: {"path" => path},
+            }
+            let target_depth = resolved.inodes().len() - 1;
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| {
+                    if depth == target_depth {
+                        InodeLockRequest::write(depth, inode.id())
+                    } else {
+                        InodeLockRequest::read(depth, inode.id())
+                    }
+                })
+                .collect();
+            let _inode_locks = self.inode_locks.lock_many(&requests);
+            let _location_locks = self
+                .block_location_locks
+                .write_workers_blocks(&worker_ids.iter().copied().collect::<Vec<_>>(), &block_ids);
+
+            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
+            let Some(locked_target) = locked.target() else {
+                continue;
+            };
+            let Ok(locked_file) = locked_target.as_file_ref() else {
+                continue;
+            };
+            if restore_epoch != locked_epoch
+                || !resolved.same_resolution(&locked)
+                || locked_file.id != inode_id
+                || locked_file.gen() != gen
+                || locked_file.storage_policy.state != StorageState::Both
+                || locked_file.storage_policy.ufs_mtime != ufs_mtime
+                || locked_file.block_ids() != block_ids
+            {
+                continue;
+            }
+
+            let fs_dir = self.fs_dir.read();
+            let Ok(current_workers) = read_workers(&fs_dir) else {
+                break;
+            };
+            if current_workers != worker_ids {
+                continue;
+            }
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            let Some(live_inode) = inp.get_last_inode() else {
+                continue;
+            };
+            let live_file = live_inode.as_file_ref()?;
+            if live_file.id != inode_id
+                || live_file.gen() != gen
+                || live_file.storage_policy.state != StorageState::Both
+                || live_file.storage_policy.ufs_mtime != ufs_mtime
+                || live_file.block_ids() != block_ids
+            {
+                continue;
+            }
+            return Ok(Some(fs_dir.free_file(&inp, LocalTime::mills() as i64)?));
+        }
+
+        let mut fs_dir = self.fs_dir.write();
+        fs_dir.free_verified(inode_id, path, gen, ufs_mtime)
     }
 
     /// Files under `path` that still hold Curvine data and must be routed
@@ -788,13 +2259,18 @@ impl MasterFilesystem {
         &self,
         path: &str,
         recursive: bool,
-    ) -> FsResult<(Vec<i64>, bool)> {
-        let fs_dir = self.fs_dir.read();
+        expected_id: Option<i64>,
+    ) -> FsResult<Option<(Vec<i64>, bool, InodeView)>> {
+        // Recursive collection needs a stable tree and inode content.
+        let fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
         Self::check_not_reserved_path(inp.path())?;
         if inp.is_root() {
             return err_box!("The root is not allowed to be free");
         }
+        let Some(current) = Self::free_target(&inp, expected_id)? else {
+            return Ok(None);
+        };
         let root = inp
             .get_last_inode()
             .ok_or_else(|| FsError::file_not_found(inp.path()))?;
@@ -821,7 +2297,7 @@ impl MasterFilesystem {
                 _ => {}
             }
         }
-        Ok((ids, cleanup))
+        Ok(Some((ids, cleanup, current)))
     }
 
     pub fn rename<T: AsRef<str>>(&self, src: T, dst: T, flags: RenameFlags) -> FsResult<bool> {
@@ -850,43 +2326,66 @@ impl MasterFilesystem {
             }
         }
 
-        self.run_metadata_write(|| {
-            let mut fs_dir = self.fs_dir.write();
-            let src_inp = Self::resolve_path(&fs_dir, src)?;
-            let dst_inp = Self::resolve_path(&fs_dir, dst)?;
+        let (renamed, deleted) = self.run_metadata_write(|| {
+            let (source, destination) = {
+                let fs_dir = self.fs_dir.read();
+                let lease = fs_dir.store.begin_snapshot_scan()?;
+                let reader = lease.snapshot_reader()?;
+                let source = reader.resolve_path(src)?;
+                Self::check_not_pending_path(src)?;
+                let destination = reader.resolve_path(dst)?;
+                Self::check_not_pending_path(dst)?;
+                (source, destination)
+            };
 
-            Self::check_not_reserved_path(src_inp.path())?;
-            Self::check_not_reserved_path(dst_inp.path())?;
+            Self::check_not_reserved_path(src)?;
+            Self::check_not_reserved_path(dst)?;
 
-            if src_inp.is_root() {
+            if source.components().len() <= 1 {
                 return err_box!("Cannot rename root path");
             }
 
             if src == dst {
-                return Ok(false);
+                return Ok((false, None));
             }
 
-            if let Some(del_res) = fs_dir.rename(&src_inp, &dst_inp, flags)? {
-                let mut worker_manager = self.worker_manager.write();
-                worker_manager.remove_blocks(&del_res);
+            // POSIX rename of two names for the same inode is a no-op.
+            // Keep NO_REPLACE's existing destination-exists error and leave
+            // journal replay unchanged for entries written by older leaders.
+            if !flags.no_replace() && !flags.exchange_mode() {
+                if let (Some(source), Some(target)) = (source.target(), destination.target()) {
+                    if source.id() == target.id() {
+                        return Ok((true, None));
+                    }
+                }
             }
 
-            Ok(true)
-        })
+            let sharded = !flags.exchange_mode()
+                && !flags.trash()
+                && !flags.restore()
+                && source.is_full()
+                && !destination.is_full()
+                && source.inodes().len() >= 2
+                && destination.inodes().len() + 1 >= destination.components().len();
+            if sharded {
+                return Ok((self.rename_sharded(src, dst, flags)?, None));
+            }
+
+            let fs_dir = self.fs_dir.write();
+            let src_inp = Self::resolve_path(&fs_dir, src)?;
+            let dst_inp = Self::resolve_path(&fs_dir, dst)?;
+            let deleted = fs_dir.rename(&src_inp, &dst_inp, flags)?;
+            Ok((true, deleted))
+        })?;
+        if let Some(deleted) = deleted {
+            self.worker_manager.write().remove_blocks(&deleted);
+        }
+        Ok(renamed)
     }
 
     pub fn create<T: AsRef<str>>(&self, path: T, create_parent: bool) -> FsResult<FileStatus> {
         let ctx = CreateFileOpts::with_create(create_parent);
         self.create_with_opts(path, ctx, OpenFlags::new_create().set_overwrite(true))
-    }
-
-    fn truncate(&self, fs_dir: &mut FsDir, inp: &InodePath, opts: CreateFileOpts) -> FsResult<()> {
-        let clean_result = fs_dir.overwrite_file(inp, opts)?;
-        if !clean_result.blocks.is_empty() {
-            let mut worker_manager = self.worker_manager.write();
-            worker_manager.remove_blocks(&clean_result);
-        }
-        Ok(())
     }
 
     pub fn create_with_opts<T: AsRef<str>>(
@@ -921,41 +2420,12 @@ impl MasterFilesystem {
             );
         }
 
-        self.run_metadata_write(|| {
-            let mut fs_dir = self.fs_dir.write();
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            Self::check_not_reserved_path(inp.path())?;
-
-            let last_inode = inp.get_last_inode();
-            if let Some(inode) = &last_inode {
-                if inode.is_dir() {
-                    return err_box!("{}  already exists as a dir", inp.path());
-                }
-
-                if flags.exclusive() {
-                    return err_ext!(FsError::file_exists(inp.path()));
-                }
-            }
-
-            if !opts.create_parent {
-                Self::check_parent(&inp)?;
-            }
-
-            let inp = if last_inode.is_some() {
-                if flags.overwrite() {
-                    self.truncate(&mut fs_dir, &inp, opts)?;
-                } else {
-                    return err_ext!(FsError::file_exists(inp.path()));
-                }
-                inp
-            } else {
-                fs_dir.create_file(inp, opts)?
-            };
-
-            let status = fs_dir.file_status(&inp)?;
-
-            Ok(status)
-        })
+        let (status, deleted) =
+            self.run_metadata_write(|| self.create_single_parent_sharded(path, opts, flags))?;
+        if let Some(deleted) = deleted {
+            self.worker_manager.write().remove_blocks(&deleted);
+        }
+        Ok(status)
     }
 
     pub fn open_file<T: AsRef<str>>(
@@ -976,47 +2446,153 @@ impl MasterFilesystem {
             return self.get_block_locations(path);
         }
 
-        let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-        Self::check_not_reserved_path(inp.path())?;
+        let opened = self.run_metadata_write(|| {
+            let (resolved, _) = self.resolve_live_store_view(path)?;
+            Self::check_not_pending_path(path)?;
+            Self::check_not_reserved_path(path)?;
 
-        let inode = match inp.get_last_inode() {
-            None => {
-                return if flags.create() {
-                    drop(fs_dir);
-                    let status = self.create_with_opts(path, opts, flags)?;
-                    Ok(FileBlocks::new(status, vec![]))
-                } else {
-                    err_ext!(FsError::file_not_found(inp.path()))
+            match resolved.target() {
+                None => {
+                    return if flags.create() {
+                        Ok(Err(opts))
+                    } else {
+                        err_ext!(FsError::file_not_found(path))
+                    }
                 }
+                Some(inode) if inode.is_dir() => {
+                    return err_box!("{} is a directory", path);
+                }
+                Some(_) => {}
             }
 
-            Some(inode) => {
-                if inode.is_dir() {
-                    return err_box!("{} is a directory", inp.path());
-                }
-                inode
+            if !flags.truncate() {
+                let blocks = self.reopen_file_sharded(path, &opts.client_name)?;
+                return Ok(Ok((blocks, None)));
             }
-        };
 
-        if flags.truncate() {
-            self.truncate(&mut fs_dir, &inp, opts)?;
+            if let Some((status, deleted)) = self.overwrite_file_sharded(path, opts.clone())? {
+                return Ok(Ok((FileBlocks::new(status, vec![]), Some(deleted))));
+            }
+
+            let fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            Self::check_not_reserved_path(inp.path())?;
+            let deleted = fs_dir.overwrite_file(&inp, opts)?;
             let status = fs_dir.file_status(&inp)?;
-            return Ok(FileBlocks::new(status, vec![]));
+            return Ok(Ok((FileBlocks::new(status, vec![]), Some(deleted))));
+        })?;
+        match opened {
+            Ok((blocks, deleted)) => {
+                if let Some(deleted) = deleted {
+                    self.worker_manager.write().remove_blocks(&deleted);
+                }
+                Ok(blocks)
+            }
+            Err(opts) => {
+                let status = self.create_with_opts(path, opts, flags)?;
+                Ok(FileBlocks::new(status, vec![]))
+            }
+        }
+    }
+
+    fn reopen_file_sharded(&self, path: &str, client_name: &str) -> FsResult<FileBlocks> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
+            let Some(target) = resolved.target() else {
+                return err_ext!(FsError::file_not_found(path));
+            };
+            if resolved.inodes().len() < 2 || !target.is_file() {
+                return err_box!("{} is not a regular file", path);
+            }
+            let target_depth = resolved.inodes().len() - 1;
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| {
+                    if depth == target_depth {
+                        InodeLockRequest::write(depth, inode.id())
+                    } else {
+                        InodeLockRequest::read(depth, inode.id())
+                    }
+                })
+                .collect();
+            let _locks = self.inode_locks.lock_many(&requests);
+
+            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
+            if locked_epoch != restore_epoch || !resolved.same_resolution(&locked) {
+                continue;
+            }
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            let Some(inode) = inp.get_last_inode() else {
+                continue;
+            };
+            if inode.id() != target.id() || !inode.is_file() {
+                continue;
+            }
+            let status = fs_dir.reopen_file(&inp, client_name)?;
+            let file = inode.as_file_ref()?;
+            let blocks = self.get_block_locs(path, &fs_dir, file)?;
+            return Ok(FileBlocks::new(status, blocks));
         }
 
-        let status = fs_dir.reopen_file(&inp, opts.client_name)?;
+        let fs_dir = self.fs_dir.write();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+        let status = fs_dir.reopen_file(&inp, client_name)?;
+        let inode = inp
+            .get_last_inode()
+            .ok_or_else(|| FsError::file_not_found(path))?;
         let file = inode.as_file_ref()?;
-        let blocks = if !file.blocks.is_empty() {
-            self.get_block_locs(path, &fs_dir, file)?
-        } else {
-            vec![]
-        };
+        let blocks = self.get_block_locs(path, &fs_dir, file)?;
         Ok(FileBlocks::new(status, blocks))
     }
 
     pub fn file_status<T: AsRef<str>>(&self, path: T) -> FsResult<FileStatus> {
         self.file_status_by_id(path, None)
+    }
+
+    fn file_status_from_snapshot(
+        snapshot: &InodeStoreSnapshot<'_>,
+        path: &str,
+        inode: InodeView,
+    ) -> FsResult<FileStatus> {
+        if !inode.is_dir() {
+            return Ok(inode.to_file_status(path)?);
+        }
+
+        let attributes = snapshot.get_directory_attributes(inode.id())?;
+        let child_len = match attributes.and_then(|attributes| attributes.children()) {
+            Some(children) if children >= 0 => children,
+            Some(_) => return err_box!("directory {} has an invalid child count", inode.id()),
+            None => {
+                let mut children = 0_i32;
+                for entry in snapshot.scan_children(inode.id())? {
+                    entry.map_err(|error| FsError::from(Box::new(error) as CommonError))?;
+                    children = children
+                        .checked_add(1)
+                        .ok_or_else(|| FsError::common("directory has too many children"))?;
+                }
+                children
+            }
+        };
+        let mut status = inode.to_file_status(path)?;
+        if let Some(attributes) = attributes {
+            status.mtime = attributes.mtime;
+            status.nlink = attributes.nlink;
+            status.x_attr.insert(
+                INTERNAL_CTIME_XATTR.to_string(),
+                attributes.ctime.to_le_bytes().to_vec(),
+            );
+        }
+        status.children_num = child_len;
+        status.len = i64::from(child_len);
+        Ok(status)
     }
 
     /// Release one writer record registered by OpenFile. Idempotent: missing
@@ -1026,11 +2602,7 @@ impl MasterFilesystem {
     /// correct unfinished state either way.
     pub fn close_file<T: AsRef<str>>(&self, path: T, client_name: &str) -> FsResult<()> {
         let path = path.as_ref();
-        let mut fs_dir = self.fs_dir.write();
-        let Ok(inp) = Self::resolve_path(&fs_dir, path) else {
-            return Ok(());
-        };
-        fs_dir.close_writer(&inp, client_name)
+        self.run_metadata_write(|| self.close_file_sharded(path, client_name))
     }
 
     pub fn file_status_by_id<T: AsRef<str>>(
@@ -1039,69 +2611,53 @@ impl MasterFilesystem {
         inode_id: Option<i64>,
     ) -> FsResult<FileStatus> {
         let path = path.as_ref();
-        // Stable shared-lock resolve: the directory sequence only covers
-        // namespace structure, not per-inode content or attribute changes
-        // (complete_file / set_attr bump neither), so an optimistic walk
-        // could publish a stale size or mode. The per-inode version that
-        // Astra pairs with its file-status cache is a phase-3B component.
-        let fs_dir = self.fs_dir.read();
-        if inode_id.is_none_or(|id| id <= 0) {
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            return match inp.get_last_inode() {
-                Some(inode) => Ok(inode.to_file_status(path)?),
-                None => err_ext!(FsError::file_not_found(path)),
+        if let Some(id) = inode_id.filter(|id| *id > 0) {
+            // Directory inode fields and its separate attributes must come
+            // from the same generation, even when another writer holds a read guard.
+            let fs_dir = self.fs_dir.read();
+            let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+            let Some(inode) = snapshot.get_inode(id)? else {
+                return err_ext!(FsError::file_not_found(path).ctx(format!("inode_id={}", id)));
             };
+            return Self::file_status_from_snapshot(&snapshot, path, inode);
         }
-        let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
-        Ok(inode.to_file_status(path)?)
+
+        Self::check_not_pending_path(path)?;
+        // Baseline protocol: shared namespace read over the live tree.
+        let fs_dir = self.fs_dir.read();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+        fs_dir.file_status(&inp)
     }
 
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
         let path = path.as_ref();
-        if let Some(inp) = self.resolve_shared_retry(path)? {
-            if trash::is_pending_path(inp.path()) {
-                return Ok(false);
-            }
-            return Ok(inp.get_last_inode().is_some());
-        }
-        // Progress fallback: stable read under the shared lock (reads are
-        // cheap; this is not the global write lock).
-        let fs_dir = self.fs_dir.read();
-        let inp = Self::resolve_path_raw(&fs_dir, path)?;
-        if trash::is_pending_path(inp.path()) {
+        if trash::is_pending_path(path) {
             return Ok(false);
         }
+
+        // Same protocol as the baseline: a shared namespace read over the live
+        // tree. Per-directory child locks make each traversal step mutually
+        // exclusive with the sharded writers; a FileEdge hydration that races
+        // a concurrent delete retries briefly before surfacing the error.
+        let inp = self.resolve_live(path)?;
         Ok(inp.get_last_inode().is_some())
     }
 
-    /// Optimistic read resolution: walk shared directory handles, re-validate
-    /// captured odd/even sequence versions and retry on invalidation. The
-    /// shared-lock window is limited to fetching the root view and the store
-    /// borrow. Returns `None` after `OPTIMISTIC_READ_RETRIES` failed walks so
-    /// concurrent writers cannot starve a reader; callers fall back to the
-    /// stable shared-lock path.
-    fn resolve_shared_retry(&self, path: &str) -> FsResult<Option<InodePath>> {
-        for _ in 0..OPTIMISTIC_READ_RETRIES {
-            let root = self.fs_dir.read().root_dir().clone();
-            let inp = {
-                let fs_dir = self.fs_dir.read();
-                InodePath::resolve_shared(&root, path, &fs_dir.store)?
-            };
-            if inp.walk_is_current() {
-                return Ok(Some(inp));
-            }
-            std::thread::yield_now();
-        }
-        Ok(None)
+    /// A live-tree read that loaded a file edge from the store can race a
+    /// concurrent delete: the child handle was cloned before the writer took
+    /// the directory lock, and the row is gone by hydration time. Such a miss
+    /// is transient, unlike a persistently dangling edge.
+    fn is_transient_hydration_race(error: &FsError) -> bool {
+        error.to_string().contains("Failed to load inode")
     }
 
     pub fn list_status<T: AsRef<str>>(&self, path: T) -> FsResult<Vec<FileStatus>> {
-        // Stable shared-lock read: listing returns inode content (sizes,
-        // mtimes), which the directory sequence alone cannot vouch for.
-        let fs_dir = self.fs_dir.read();
-        let (is_glob_pattern, _) = parse_glob_pattern(path.as_ref());
+        let path = path.as_ref();
+        let (is_glob_pattern, _) = parse_glob_pattern(path);
         if is_glob_pattern {
-            let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;
+            // Glob resolution still traverses live inode pointers.
+            let fs_dir = self.fs_dir.write();
+            let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path)?;
             let mut all_statuses = Vec::new();
             for path in &paths {
                 if trash::is_pending_path(path.path()) {
@@ -1112,9 +2668,26 @@ impl MasterFilesystem {
             }
             Ok(all_statuses)
         } else {
-            let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
-            let statuses = fs_dir.list_status(&inp)?;
-            Ok(Self::hide_pending(inp.path(), statuses))
+            Self::check_not_pending_path(path)?;
+            // Baseline protocol: shared namespace read over the live tree. A
+            // sharded rename mutates the directory in two child mutations, so
+            // the walk versions gate the result: any writer active during the
+            // read makes the listing stale and triggers a retry.
+            for attempt in 0..Self::LIVE_READ_RETRIES {
+                let fs_dir = self.fs_dir.read();
+                let inp = Self::resolve_path(&fs_dir, path)?;
+                let current = inp.walk_is_current();
+                let statuses = fs_dir.list_status(&inp)?;
+                drop(fs_dir);
+                if current {
+                    return Ok(Self::hide_pending(path, statuses));
+                }
+                if attempt + 1 == Self::LIVE_READ_RETRIES {
+                    return Ok(Self::hide_pending(path, statuses));
+                }
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            unreachable!("retry loop returns on every branch")
         }
     }
 
@@ -1124,15 +2697,41 @@ impl MasterFilesystem {
         opts: ListOptions,
     ) -> FsResult<Vec<FileStatus>> {
         let path = path.as_ref();
-        // Stable shared-lock read, same consistency reasoning as list_status.
-        let fs_dir = self.fs_dir.read();
         let (is_glob_pattern, _) = parse_glob_pattern(path);
         if is_glob_pattern {
             return err_box!("list_options does not support glob pattern, path {}", path);
         }
-        let inp = Self::resolve_path(&fs_dir, path)?;
-        let statuses = fs_dir.list_options(&inp, &opts)?;
-        Ok(Self::hide_pending(inp.path(), statuses))
+        Self::check_not_pending_path(path)?;
+        // Baseline protocol over the live tree; walk versions gate the page
+        // against concurrent renames (see list_status). The pending trash
+        // entry must not consume a client-visible page slot, so the trash
+        // root over-fetches one entry and hide_pending removes it again.
+        for attempt in 0..Self::LIVE_READ_RETRIES {
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let current = inp.walk_is_current();
+            let extended_opts;
+            let page_opts =
+                if path == trash::TRASH_ROOT && opts.limit.is_some_and(|limit| limit > 0) {
+                    extended_opts = ListOptions {
+                        limit: opts.limit.map(|limit| limit.saturating_add(1)),
+                        start_after: opts.start_after.clone(),
+                    };
+                    &extended_opts
+                } else {
+                    &opts
+                };
+            let statuses = fs_dir.list_options(&inp, page_opts)?;
+            drop(fs_dir);
+            if current {
+                return Ok(Self::hide_pending(path, statuses));
+            }
+            if attempt + 1 == Self::LIVE_READ_RETRIES {
+                return Ok(Self::hide_pending(path, statuses));
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        unreachable!("retry loop returns on every branch")
     }
 
     /// Resolves a client-supplied path. `/.Trash/.pending` is master-owned
@@ -1172,13 +2771,6 @@ impl MasterFilesystem {
             )));
         }
         Ok(())
-    }
-
-    // NUL-prefixed keys are master-owned (ctime, trash markers) and never
-    // surface in FileStatus, so a client cannot legitimately send them. The
-    // check itself lives on `FsDir` so every client-facing writer shares it.
-    fn check_not_internal_x_attr(opts: &SetAttrOpts) -> FsResult<()> {
-        FsDir::check_not_internal_x_attr(opts)
     }
 
     fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {
@@ -1298,7 +2890,179 @@ impl MasterFilesystem {
         last_block: Option<ExtendedBlock>,
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
-        let mut fs_dir = self.fs_dir.write();
+        self.run_metadata_write(|| {
+            if let Some(located) = self.add_block_sharded(
+                path,
+                inode_id,
+                client_addr.clone(),
+                commit_blocks.clone(),
+                exclude_workers.clone(),
+                file_len,
+                last_block.clone(),
+            )? {
+                return Ok(located);
+            }
+            self.add_block_with_global_lock(
+                path,
+                inode_id,
+                client_addr,
+                commit_blocks,
+                exclude_workers,
+                file_len,
+                last_block,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_block_sharded(
+        &self,
+        path: &str,
+        expected_id: Option<i64>,
+        client_addr: ClientAddress,
+        commit_blocks: Vec<CommitBlock>,
+        exclude_workers: Vec<u32>,
+        file_len: i64,
+        last_block: Option<ExtendedBlock>,
+    ) -> FsResult<Option<LocatedBlock>> {
+        const MAX_RETRIES: usize = 3;
+        let mut commit_block_ids: Vec<i64> =
+            commit_blocks.iter().map(|block| block.block_id).collect();
+        commit_block_ids.sort_unstable();
+        commit_block_ids.dedup();
+        let mut commit_worker_ids: Vec<u32> = commit_blocks
+            .iter()
+            .flat_map(|block| block.locations.iter().map(|location| location.worker_id))
+            .collect();
+        commit_worker_ids.sort_unstable();
+        commit_worker_ids.dedup();
+
+        for _ in 0..MAX_RETRIES {
+            let (resolved, restore_epoch) = match self.resolve_live_store_view(path) {
+                Ok(value) => value,
+                Err(_) if expected_id.is_some() => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let Some(target) = resolved.target() else {
+                return Ok(None);
+            };
+            if resolved.inodes().len() < 2
+                || expected_id.is_some_and(|id| id != target.id())
+                || !target.is_file()
+            {
+                return Ok(None);
+            }
+            let target_depth = resolved.inodes().len() - 1;
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| {
+                    if depth == target_depth {
+                        InodeLockRequest::write(depth, inode.id())
+                    } else {
+                        InodeLockRequest::read(depth, inode.id())
+                    }
+                })
+                .collect();
+            let _inode_locks = self.inode_locks.lock_many(&requests);
+
+            let (locked, locked_epoch) = match self.resolve_live_store_view(path) {
+                Ok(value) => value,
+                Err(_) if expected_id.is_some() => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if locked_epoch != restore_epoch || !resolved.same_resolution(&locked) {
+                continue;
+            }
+            let Some(locked_target) = locked.target() else {
+                continue;
+            };
+            if expected_id.is_some_and(|id| id != locked_target.id()) || !locked_target.is_file() {
+                return Ok(None);
+            }
+
+            let locked_file = locked_target.as_file_ref()?;
+            let next = locked_file.search_next_block(last_block.as_ref().map(|block| block.id));
+            let mut block_ids = commit_block_ids.clone();
+            if let Some(next_block) = &next {
+                block_ids.push(next_block.id);
+            }
+            let _location_locks = self
+                .block_location_locks
+                .write_workers_blocks(&commit_worker_ids, &block_ids);
+
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            let Some(inode) = inp.get_last_inode() else {
+                continue;
+            };
+            if inode.id() != locked_target.id()
+                || expected_id.is_some_and(|id| id != inode.id())
+                || !inode.is_file()
+            {
+                continue;
+            }
+            let file = inode.as_file_ref()?;
+
+            if let Some(next) = file.search_next_block(last_block.as_ref().map(|block| block.id)) {
+                let locs = fs_dir.get_block_locations(next.id)?;
+                let extend_block = ExtendedBlock {
+                    id: next.id,
+                    len: next.len as i64,
+                    storage_type: file.storage_policy.storage_type,
+                    file_type: file.file_type,
+                    alloc_opts: next.alloc_opts.clone(),
+                };
+                return Ok(Some(self.create_locate_block(path, extend_block, &locs)?));
+            }
+
+            let block_size = file.block_size as i64;
+            let choose_workers =
+                self.choose_worker_for_file(file, client_addr.clone(), exclude_workers.clone())?;
+            let has_spdk = {
+                let wm = self.worker_manager.read();
+                wm.workers_have_spdk(&choose_workers)
+            };
+            let block = match fs_dir.acquire_new_block(
+                path,
+                inode,
+                commit_blocks.clone(),
+                &choose_workers,
+                file_len,
+            ) {
+                Ok(block) => block,
+                Err(error) => {
+                    self.worker_manager
+                        .write()
+                        .unschedule_chosen_workers(&choose_workers, block_size);
+                    return Err(error);
+                }
+            };
+            return Ok(Some(LocatedBlock {
+                block,
+                locs: choose_workers,
+                has_spdk,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn add_block_with_global_lock(
+        &self,
+        path: &str,
+        inode_id: Option<i64>,
+        client_addr: ClientAddress,
+        commit_blocks: Vec<CommitBlock>,
+        exclude_workers: Vec<u32>,
+        file_len: i64,
+        last_block: Option<ExtendedBlock>,
+    ) -> FsResult<LocatedBlock> {
+        let fs_dir = self.fs_dir.write();
         let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
 
@@ -1402,26 +3166,10 @@ impl MasterFilesystem {
         options: CompleteFileOptions,
     ) -> FsResult<Option<FileBlocks>> {
         let path = path.as_ref();
-        let mut fs_dir = self.fs_dir.write();
-        let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
-        fs_dir.complete_file(
-            path,
-            &mut inode,
-            len,
-            commit_blocks,
-            client_name,
-            options.only_flush,
-            options.set_attr_opts,
-        )?;
-
-        if options.only_flush && options.return_file_blocks {
-            let file = inode.as_file_ref()?;
-            let locs = self.get_block_locs(path, &fs_dir, file)?;
-            let status = inode.to_file_status(path)?;
-            return Ok(Some(FileBlocks::new(status, locs)));
-        }
-
-        Ok(None)
+        let client_name = client_name.as_ref().to_string();
+        self.run_metadata_write(|| {
+            self.complete_file_sharded(path, inode_id, len, commit_blocks, &client_name, options)
+        })
     }
 
     pub fn get_file_blocks(
@@ -1480,42 +3228,146 @@ impl MasterFilesystem {
     }
 
     pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
-        // Stable shared-lock read: blocks and status must reflect completed
-        // writes, which the directory sequence alone cannot vouch for.
-        let fs_dir = self.fs_dir.read();
+        const MAX_RETRIES: usize = 3;
         let path = path.as_ref();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-
-        let inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => return err_ext!(FsError::file_not_found(path)),
+        let read = |fs_dir: &FsDir, inp: &InodePath| -> FsResult<_> {
+            let inode = inp
+                .get_last_inode()
+                .ok_or_else(|| FsError::file_not_found(path))?;
+            let needs_touch = inode.is_file() && Self::atime_refresh_due(&inode);
+            let inode_id = inode.id();
+            let file = inode.as_file_ref()?;
+            let block_locs = self.get_block_locs(path, fs_dir, file)?;
+            let blocks = FileBlocks {
+                status: inode.to_file_status(path)?,
+                block_locs,
+            };
+            let epoch = fs_dir.store_ref().scan_control().cancel_epoch();
+            Ok((blocks, needs_touch, inode_id, epoch))
         };
 
-        // Refresh atime on the read path so files under an atime-based TTL
-        // policy stay alive while actively read. Done after locating blocks;
-        // the write lock is only taken when a refresh is actually due.
-        let needs_touch = inode.is_file() && Self::atime_refresh_due(&inode);
-
-        let file = inode.as_file_ref()?;
-        let block_locs = self.get_block_locs(path, &fs_dir, file)?;
-        let locate_blocks = FileBlocks {
-            status: inode.to_file_status(path)?,
-            block_locs,
+        // Live-tree read under the inode read locks: the locks keep the read
+        // mutually exclusive with the sharded writers for this path, while
+        // every resolution step stays in memory (no store-snapshot walks).
+        let mut result = None;
+        for _ in 0..MAX_RETRIES {
+            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
+            Self::check_not_pending_path(path)?;
+            if !resolved.is_full() {
+                break;
+            }
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| InodeLockRequest::read(depth, inode.id()))
+                .collect();
+            let _locks = self.inode_locks.lock_many(&requests);
+            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
+            if restore_epoch != locked_epoch || !resolved.same_resolution(&locked) {
+                continue;
+            }
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            result = Some(read(&fs_dir, &inp)?);
+            break;
+        }
+        let (blocks, needs_touch, inode_id, restore_epoch) = match result {
+            Some(result) => result,
+            None => {
+                let fs_dir = self.fs_dir.write();
+                let inp = Self::resolve_path(&fs_dir, path)?;
+                read(&fs_dir, &inp)?
+            }
         };
 
+        // Drop the inode read locks before attempting the best-effort atime write.
         if needs_touch {
-            drop(fs_dir);
-            // Best-effort refresh: a concurrent delete (or any re-resolve
-            // failure) between the read and write locks must not turn an
-            // already-successful locate into an error, so both failures are
-            // ignored and the located blocks are still returned.
-            let mut fs_dir = self.fs_dir.write();
-            if let Ok(inp) = Self::resolve_path(&fs_dir, path) {
-                let _ = fs_dir.touch_atime_for_ttl(&inp);
+            if let Ok(epoch) = self.journal_writer.metadata_epoch() {
+                if let Some(commit_guard) = self.metadata_commit_gate.try_enter() {
+                    // The epoch check inside the gate keeps the admission
+                    // window the same as the blocking write path.
+                    let epoch_check = self.journal_writer.ensure_metadata_epoch(epoch);
+                    let result = epoch_check.and_then(|()| {
+                        self.run_admitted_metadata_write(|| {
+                            self.touch_atime_sharded(path, inode_id, restore_epoch)
+                        })
+                    });
+                    drop(commit_guard);
+                    if result.is_ok() {
+                        self.maybe_create_periodic_snapshot(epoch);
+                    }
+                }
             }
         }
+        Ok(blocks)
+    }
 
-        Ok(locate_blocks)
+    fn touch_atime_sharded(
+        &self,
+        path: &str,
+        expected_id: i64,
+        expected_epoch: u64,
+    ) -> FsResult<()> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let Ok((resolved, restore_epoch)) = self.resolve_live_store_view(path) else {
+                return Ok(());
+            };
+            if restore_epoch != expected_epoch {
+                return Ok(());
+            }
+            let Some(target) = resolved.target() else {
+                return Ok(());
+            };
+            if target.id() != expected_id || !target.is_file() || resolved.inodes().len() < 2 {
+                return Ok(());
+            }
+
+            let target_depth = resolved.inodes().len() - 1;
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| {
+                    if depth == target_depth {
+                        InodeLockRequest::write(depth, inode.id())
+                    } else {
+                        InodeLockRequest::read(depth, inode.id())
+                    }
+                })
+                .collect();
+            let _locks = self.inode_locks.lock_many(&requests);
+
+            let Ok((locked, locked_epoch)) = self.resolve_live_store_view(path) else {
+                return Ok(());
+            };
+            if locked_epoch != expected_epoch || !resolved.same_resolution(&locked) {
+                continue;
+            }
+
+            let fs_dir = self.fs_dir.read();
+            let Ok(inp) = Self::resolve_path(&fs_dir, path) else {
+                return Ok(());
+            };
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            let Some(inode) = inp.get_last_inode() else {
+                return Ok(());
+            };
+            if inode.id() != expected_id {
+                return Ok(());
+            }
+            fs_dir.touch_atime_for_ttl(&inp, expected_id, expected_epoch)?;
+            return Ok(());
+        }
+
+        Ok(())
     }
 
     pub fn get_block_locations_batch<'a>(
@@ -1560,7 +3412,9 @@ impl MasterFilesystem {
         let path = path.as_ref();
 
         let (status, block_snapshots, worker_snapshots) = {
-            let fs_dir = self.fs_dir.read();
+            // The snapshot includes mutable inode content; exclude sharded
+            // writers until it has the same inode-lock protocol as block reads.
+            let fs_dir = self.fs_dir.write();
             let inp = Self::resolve_path(&fs_dir, path)?;
             let inode = match inp.get_last_inode() {
                 Some(inode) => inode,
@@ -1646,7 +3500,8 @@ impl MasterFilesystem {
             return err_box!("cv metadata snapshot page_size must be greater than 0");
         }
 
-        let fs_dir = self.fs_dir.read();
+        // Traversal reads mutable inode contents as well as directory topology.
+        let fs_dir = self.fs_dir.write();
         let epoch = fs_dir.op_id.get();
         let start_after = page_token.filter(|token| !token.is_empty());
         let mut entries = Vec::with_capacity(page_size.saturating_add(1));
@@ -1733,7 +3588,7 @@ impl MasterFilesystem {
 
     /// Directory children live only in the in-memory tree. Borrow that node.
     /// `FileEntry` stores a name and id, so load the file inode for its blocks
-    /// and hard-link name. The caller holds the namespace read lock for the walk.
+    /// and hard-link name. The caller holds the exclusive namespace lock for the walk.
     fn resolve_snapshot_inode<'a>(
         &self,
         fs_dir: &FsDir,
@@ -1821,7 +3676,8 @@ impl MasterFilesystem {
     }
 
     pub fn sum_hash(&self) -> CommonResult<u128> {
-        let fs_dir = self.fs_dir.read();
+        // Hashing traverses and clones live inode contents, not just topology.
+        let fs_dir = self.fs_dir.write();
         fs_dir.sum_hash()
     }
 
@@ -1934,7 +3790,13 @@ impl MasterFilesystem {
         replication_handler: Option<MasterReplicationHandler>,
     ) -> FsResult<BlockReportResult> {
         let _worker_lock = self.worker_location_lock(list.worker_id).lock();
-        self.block_report_locked(list, replication_handler)
+        let block_ids: Vec<_> = list.blocks.iter().map(|block| block.id).collect();
+        self.run_metadata_write(|| {
+            let _location_locks = self
+                .block_location_locks
+                .write_worker_blocks(list.worker_id, &block_ids);
+            self.block_report_locked(list, replication_handler)
+        })
     }
 
     pub(crate) fn block_report_for_live_worker_session(
@@ -1944,6 +3806,7 @@ impl MasterFilesystem {
         replication_handler: Option<MasterReplicationHandler>,
     ) -> FsResult<Option<BlockReportResult>> {
         let _worker_lock = self.worker_location_lock(list.worker_id).lock();
+        let block_ids: Vec<_> = list.blocks.iter().map(|block| block.id).collect();
         if !self
             .worker_manager
             .read()
@@ -1951,8 +3814,39 @@ impl MasterFilesystem {
         {
             return Ok(None);
         }
-        self.block_report_locked(list, replication_handler)
-            .map(Some)
+        self.run_metadata_write(|| {
+            let _location_locks = self
+                .block_location_locks
+                .write_worker_blocks(list.worker_id, &block_ids);
+            self.block_report_locked(list, replication_handler)
+        })
+        .map(Some)
+    }
+
+    /// Opens a full-report round before the Worker snapshots its local block
+    /// store. The worker stripe orders this handshake against replication
+    /// completion, which invalidates a started report before it can reconcile
+    /// an older snapshot.
+    pub(crate) fn begin_full_block_report_for_live_worker_session(
+        &self,
+        worker_id: u32,
+        report_id: u64,
+        worker_session_id: &str,
+    ) -> Option<bool> {
+        let _worker_lock = self.worker_location_lock(worker_id).lock();
+        if !self
+            .worker_manager
+            .read()
+            .is_live_worker_session(worker_id, worker_session_id)
+        {
+            return None;
+        }
+
+        Some(matches!(
+            self.full_report_tracker
+                .begin(worker_id, report_id, LocalTime::mills()),
+            FullReportBegin::Accepted
+        ))
     }
 
     pub(crate) fn block_report_for_legacy_live_worker(
@@ -1961,6 +3855,7 @@ impl MasterFilesystem {
         replication_handler: Option<MasterReplicationHandler>,
     ) -> FsResult<Option<BlockReportResult>> {
         let _worker_lock = self.worker_location_lock(list.worker_id).lock();
+        let block_ids: Vec<_> = list.blocks.iter().map(|block| block.id).collect();
         if !self
             .worker_manager
             .read()
@@ -1969,8 +3864,13 @@ impl MasterFilesystem {
         {
             return Ok(None);
         }
-        self.block_report_locked(list, replication_handler)
-            .map(Some)
+        self.run_metadata_write(|| {
+            let _location_locks = self
+                .block_location_locks
+                .write_worker_blocks(list.worker_id, &block_ids);
+            self.block_report_locked(list, replication_handler)
+        })
+        .map(Some)
     }
 
     fn block_report_locked(
@@ -2016,10 +3916,17 @@ impl MasterFilesystem {
             }
             FullReportProgress::Complete(blocks) => Some(blocks),
             FullReportProgress::Partial => None,
+            FullReportProgress::Restart => {
+                return Ok(BlockReportResult {
+                    delete_blocks: Vec::new(),
+                    restart_full_report: true,
+                });
+            }
         };
         if list.blocks.is_empty() && full_reported_blocks.is_none() {
             return Ok(BlockReportResult {
                 delete_blocks: Vec::new(),
+                restart_full_report: false,
             });
         }
 
@@ -2142,7 +4049,10 @@ impl MasterFilesystem {
         delete_blocks.sort_unstable();
         delete_blocks.dedup();
 
-        Ok(BlockReportResult { delete_blocks })
+        Ok(BlockReportResult {
+            delete_blocks,
+            restart_full_report: false,
+        })
     }
 
     fn submit_full_block_reconcile(
@@ -2272,14 +4182,24 @@ impl MasterFilesystem {
 
         if !batch.is_empty() {
             let _worker_lock = self.worker_location_lock(worker_id).lock();
-            if !self.is_full_block_reconcile_current(worker_id, generation) {
-                info!(
-                    "skip stale full block report reconcile apply for worker {}, generation {}",
-                    worker_id, generation
-                );
+            let block_ids: Vec<_> = batch.iter().map(|(_, block_id, _)| *block_id).collect();
+            let applied = self.run_metadata_write(|| {
+                let _location_locks = self
+                    .block_location_locks
+                    .write_worker_blocks(worker_id, &block_ids);
+                if !self.is_full_block_reconcile_current(worker_id, generation) {
+                    info!(
+                        "skip stale full block report reconcile apply for worker {}, generation {}",
+                        worker_id, generation
+                    );
+                    return Ok(false);
+                }
+                self.apply_block_report_batch_locked(worker_id, batch, false)?;
+                Ok(true)
+            })?;
+            if !applied {
                 return Ok(Vec::new());
             }
-            self.apply_block_report_batch_locked(worker_id, batch, false)?;
         }
 
         Ok(stale_block_ids)
@@ -2302,7 +4222,9 @@ impl MasterFilesystem {
             if chunk.is_empty() {
                 break;
             }
-            let mut fs_dir = self.fs_dir.write();
+            // Inode state is read from the store; the namespace guard excludes
+            // restore, while block/worker locks serialize location changes.
+            let fs_dir = self.fs_dir.read();
             let mut accepted = Vec::with_capacity(chunk.len());
             for (add, block_id, location) in chunk {
                 if !add {
@@ -2327,13 +4249,47 @@ impl MasterFilesystem {
                 }
                 accepted.push((true, block_id, location));
             }
-            fs_dir.block_report(accepted)?;
+            fs_dir.block_report_locked(accepted)?;
         }
         Ok(delete_blocks)
     }
 
     fn worker_location_lock(&self, worker_id: u32) -> &Mutex<()> {
         &self.worker_location_locks[worker_id as usize % WORKER_LOCATION_LOCK_STRIPES]
+    }
+
+    pub(crate) fn commit_replication_location(
+        &self,
+        block_id: i64,
+        location: BlockLocation,
+        worker_session_id: &str,
+    ) -> FsResult<bool> {
+        let worker_id = location.worker_id;
+        let _worker_lock = self.worker_location_lock(worker_id).lock();
+        self.run_metadata_write(|| {
+            let _location_locks = self
+                .block_location_locks
+                .write_worker_blocks(worker_id, &[block_id]);
+            if !self
+                .worker_manager
+                .read()
+                .get_worker(worker_id)
+                .is_some_and(|worker| worker.worker_session_id == worker_session_id)
+            {
+                return err_ext!(FsError::common(format!(
+                    "replication target worker {} session changed",
+                    worker_id
+                )));
+            }
+            let added = self
+                .fs_dir
+                .read()
+                .add_replication_location_if_needed(block_id, location)?;
+            // Completion is newer evidence even if the location was already
+            // present, so an older full report cannot safely reconcile it.
+            self.invalidate_full_block_state(worker_id);
+            Ok(added)
+        })
     }
 
     fn is_full_block_reconcile_current(&self, worker_id: u32, generation: u64) -> bool {
@@ -2366,17 +4322,25 @@ impl MasterFilesystem {
     }
 
     fn delete_locations_unchecked(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
-        let removed_block_ids = {
-            let fs_dir = self.fs_dir.write();
-            fs_dir.delete_locations(worker_id)?
+        let block_ids = {
+            let fs_dir = self.fs_dir.read();
+            fs_dir.block_ids_for_worker(worker_id)?
         };
+        let removed_block_ids = self.run_metadata_write(|| {
+            let _location_locks = self
+                .block_location_locks
+                .write_worker_blocks(worker_id, &block_ids);
+            let fs_dir = self.fs_dir.write();
+            fs_dir.delete_locations(worker_id)
+        })?;
         let mut invalidated = CacheInvalidationResult::default();
 
         for chunk in removed_block_ids.chunks(Self::LOST_WORKER_INVALIDATION_CHUNK) {
-            let result = {
+            let result = self.run_metadata_write(|| {
+                let _location_locks = self.block_location_locks.write_blocks(chunk);
                 let mut fs_dir = self.fs_dir.write();
                 fs_dir.invalidate_lost_cache_files(chunk)
-            };
+            });
             match result {
                 Ok(result) => invalidated.extend(result),
                 Err(e) => warn!(
@@ -2408,11 +4372,20 @@ impl MasterFilesystem {
     }
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
-        let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
-        Self::check_not_reserved_path(inp.path())?;
-        Self::check_not_internal_x_attr(&opts)?;
-        fs_dir.set_attr(inp, opts)
+        self.run_metadata_write(|| {
+            let path = path.as_ref();
+            let (resolved, _) = self.resolve_live_store_view(path)?;
+            Self::check_not_pending_path(path)?;
+            Self::check_not_reserved_path(path)?;
+            let sharded = resolved.is_full();
+            if sharded {
+                self.set_attr_single_path_sharded(path, opts)
+            } else {
+                let fs_dir = self.fs_dir.write();
+                let inp = Self::resolve_path(&fs_dir, path)?;
+                fs_dir.set_attr(inp, opts)
+            }
+        })
     }
 
     pub fn symlink<T: AsRef<str>>(
@@ -2434,20 +4407,47 @@ impl MasterFilesystem {
         owner: Option<String>,
         group: Option<String>,
     ) -> FsResult<()> {
-        let mut fs_dir = self.fs_dir.write();
         let target = target.as_ref().to_string();
-        let link = Self::resolve_path(&fs_dir, link.as_ref())?;
-        Self::check_not_reserved_path(link.path())?;
-        fs_dir.symlink(target, link, force, mode, owner, group)
+        let link = link.as_ref().to_string();
+        self.run_metadata_write(|| {
+            let (resolved, _) = self.resolve_live_store_view(&link)?;
+            Self::check_not_pending_path(&link)?;
+            Self::check_not_reserved_path(&link)?;
+            let single_parent = !force
+                && !resolved.is_full()
+                && resolved.inodes().len() + 1 >= resolved.components().len();
+            if single_parent {
+                self.symlink_single_parent_sharded(
+                    &target,
+                    &link,
+                    mode,
+                    owner.clone(),
+                    group.clone(),
+                )
+            } else {
+                self.symlink_with_global_lock(&target, &link, force, mode, owner, group)
+            }
+        })
     }
 
     pub fn link<T: AsRef<str>>(&self, src_path: T, dst_path: T) -> FsResult<()> {
-        let mut fs_dir = self.fs_dir.write();
-        let src_path = Self::resolve_path(&fs_dir, src_path.as_ref())?;
-        let dst_path = Self::resolve_path(&fs_dir, dst_path.as_ref())?;
-        Self::check_not_reserved_path(src_path.path())?;
-        Self::check_not_reserved_path(dst_path.path())?;
-        fs_dir.link(src_path, dst_path)
+        let src_path = src_path.as_ref().to_string();
+        let dst_path = dst_path.as_ref().to_string();
+        self.run_metadata_write(|| {
+            let (src, _) = self.resolve_live_store_view(&src_path)?;
+            Self::check_not_pending_path(&src_path)?;
+            let (dst, _) = self.resolve_live_store_view(&dst_path)?;
+            Self::check_not_pending_path(&dst_path)?;
+            Self::check_not_reserved_path(&src_path)?;
+            Self::check_not_reserved_path(&dst_path)?;
+            let single_parent =
+                src.is_full() && !dst.is_full() && dst.inodes().len() + 1 >= dst.components().len();
+            if single_parent {
+                self.link_single_parent_sharded(&src_path, &dst_path)
+            } else {
+                self.link_with_global_lock(&src_path, &dst_path)
+            }
+        })
     }
 
     pub fn resize<T: AsRef<str>>(&self, path: T, opts: FileAllocOpts) -> FsResult<FileBlocks> {
@@ -2473,35 +4473,128 @@ impl MasterFilesystem {
             self.worker_manager.read().available_bytes()
         };
 
-        let (del_res, inode_id) = {
-            let mut fs_dir = self.fs_dir.write();
-            let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
-            if inode_id.is_some() {
-                // A by-id request may carry a stale path, so also check where
-                // the inode actually lives.
-                let live_path = fs_dir.get_inode_path(inode.id())?;
-                Self::check_not_reserved_path(&live_path)?;
+        let (del_res, inode_id) = self.run_metadata_write(|| {
+            if let Some(result) =
+                self.resize_single_file_sharded(path, inode_id, opts.clone(), available)?
+            {
+                return Ok(result);
             }
-            let file = inode.as_file_ref()?;
-            Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
-            let inode_id = inode.id();
-            let del_res = fs_dir.resize_inode(path, &mut inode, opts)?;
-            (del_res, inode_id)
-        };
+            self.resize_with_global_lock(path, inode_id, opts, available)
+        })?;
 
         if !del_res.blocks.is_empty() {
             self.worker_manager.write().remove_blocks(&del_res);
         }
 
-        let blocks = {
-            let fs_dir = self.fs_dir.read();
-            let inode = Self::resolve_file_inode(&fs_dir, path, Some(inode_id))?;
-            let file = inode.as_file_ref()?;
-            let locs = self.get_block_locs(path, &fs_dir, file)?;
-            FileBlocks::new(inode.to_file_status(path)?, locs)
-        };
+        let fs_dir = self.fs_dir.read();
+        let inode = Self::resolve_file_inode(&fs_dir, path, Some(inode_id))?;
+        let file = inode.as_file_ref()?;
+        let locs = self.get_block_locs(path, &fs_dir, file)?;
+        Ok(FileBlocks::new(inode.to_file_status(path)?, locs))
+    }
 
-        Ok(blocks)
+    fn resize_with_global_lock(
+        &self,
+        path: &str,
+        inode_id: Option<i64>,
+        opts: FileAllocOpts,
+        available: i64,
+    ) -> FsResult<(DeleteResult, i64)> {
+        let fs_dir = self.fs_dir.write();
+        let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        if inode_id.is_some() {
+            // A by-id request may carry a stale path, so also check where
+            // the inode actually lives.
+            let live_path = fs_dir.get_inode_path(inode.id())?;
+            Self::check_not_reserved_path(&live_path)?;
+        }
+        let file = inode.as_file_ref()?;
+        Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
+        let inode_id = inode.id();
+        let del_res = fs_dir.resize_inode(path, &mut inode, opts)?;
+        Ok((del_res, inode_id))
+    }
+
+    fn resize_single_file_sharded(
+        &self,
+        path: &str,
+        expected_id: Option<i64>,
+        opts: FileAllocOpts,
+        available: i64,
+    ) -> FsResult<Option<(DeleteResult, i64)>> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (resolved, restore_epoch) = match self.resolve_live_store_view(path) {
+                Ok(value) => value,
+                Err(_) if expected_id.is_some() => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let Some(target) = resolved.target() else {
+                return Ok(None);
+            };
+            let Ok(file) = target.as_file_ref() else {
+                return Ok(None);
+            };
+            if resolved.inodes().len() < 2 || expected_id.is_some_and(|id| id != target.id()) {
+                return Ok(None);
+            }
+            Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
+            let block_ids = file.block_ids();
+            let target_depth = resolved.inodes().len() - 1;
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| {
+                    if depth == target_depth {
+                        InodeLockRequest::write(depth, inode.id())
+                    } else {
+                        InodeLockRequest::read(depth, inode.id())
+                    }
+                })
+                .collect();
+            let _inode_locks = self.inode_locks.lock_many(&requests);
+
+            let (locked, locked_epoch) = match self.resolve_live_store_view(path) {
+                Ok(value) => value,
+                Err(_) if expected_id.is_some() => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let Some(locked_target) = locked.target() else {
+                continue;
+            };
+            let Ok(locked_file) = locked_target.as_file_ref() else {
+                continue;
+            };
+            if locked_epoch != restore_epoch
+                || !resolved.same_resolution(&locked)
+                || expected_id.is_some_and(|id| id != locked_target.id())
+                || locked_file.block_ids() != block_ids
+            {
+                continue;
+            }
+            Self::validate_alloc_capacity(locked_file.len, locked_file.replicas, &opts, available)?;
+            let _location_locks = self.block_location_locks.write_blocks(&block_ids);
+
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            let Some(inode) = inp.get_last_inode() else {
+                continue;
+            };
+            if inode.id() != locked_target.id() || expected_id.is_some_and(|id| id != inode.id()) {
+                continue;
+            }
+            let inode_id = inode.id();
+            let mut inode = inode;
+            let del_res = fs_dir.resize_inode(path, &mut inode, opts.clone())?;
+            return Ok(Some((del_res, inode_id)));
+        }
+
+        Ok(None)
     }
 
     pub fn assign_worker<T: AsRef<str>>(
@@ -2523,9 +4616,30 @@ impl MasterFilesystem {
         exclude_workers: Vec<u32>,
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
-        let mut fs_dir = self.fs_dir.write();
-        let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        self.run_metadata_write(|| {
+            if let Some(located) = self.assign_worker_sharded(
+                path,
+                inode_id,
+                block.clone(),
+                client_addr.clone(),
+                exclude_workers.clone(),
+            )? {
+                return Ok(located);
+            }
+            self.assign_worker_with_global_lock(path, inode_id, block, client_addr, exclude_workers)
+        })
+    }
 
+    fn assign_worker_with_global_lock(
+        &self,
+        path: &str,
+        inode_id: Option<i64>,
+        block: ExtendedBlock,
+        client_addr: ClientAddress,
+        exclude_workers: Vec<u32>,
+    ) -> FsResult<LocatedBlock> {
+        let fs_dir = self.fs_dir.write();
+        let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
         let block_size = file.block_size as i64;
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
@@ -2557,10 +4671,116 @@ impl MasterFilesystem {
         })
     }
 
+    fn assign_worker_sharded(
+        &self,
+        path: &str,
+        expected_id: Option<i64>,
+        block: ExtendedBlock,
+        client_addr: ClientAddress,
+        exclude_workers: Vec<u32>,
+    ) -> FsResult<Option<LocatedBlock>> {
+        const MAX_RETRIES: usize = 3;
+
+        for _ in 0..MAX_RETRIES {
+            let (resolved, restore_epoch) = match self.resolve_live_store_view(path) {
+                Ok(value) => value,
+                Err(_) if expected_id.is_some() => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let Some(target) = resolved.target() else {
+                return Ok(None);
+            };
+            if resolved.inodes().len() < 2
+                || expected_id.is_some_and(|id| id != target.id())
+                || !target.is_file()
+            {
+                return Ok(None);
+            }
+
+            let target_depth = resolved.inodes().len() - 1;
+            let requests: Vec<_> = resolved
+                .inodes()
+                .iter()
+                .enumerate()
+                .map(|(depth, inode)| {
+                    if depth == target_depth {
+                        InodeLockRequest::write(depth, inode.id())
+                    } else {
+                        InodeLockRequest::read(depth, inode.id())
+                    }
+                })
+                .collect();
+            let _inode_locks = self.inode_locks.lock_many(&requests);
+
+            let (locked, locked_epoch) = match self.resolve_live_store_view(path) {
+                Ok(value) => value,
+                Err(_) if expected_id.is_some() => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if locked_epoch != restore_epoch || !resolved.same_resolution(&locked) {
+                continue;
+            }
+            let Some(locked_target) = locked.target() else {
+                continue;
+            };
+            if expected_id.is_some_and(|id| id != locked_target.id()) || !locked_target.is_file() {
+                return Ok(None);
+            }
+
+            let _location_lock = self.block_location_locks.write_blocks(&[block.id]);
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if !Self::live_path_matches(&locked, &inp) {
+                continue;
+            }
+            let Some(live_inode) = inp.get_last_inode() else {
+                continue;
+            };
+            if live_inode.id() != locked_target.id()
+                || expected_id.is_some_and(|id| id != live_inode.id())
+                || !live_inode.is_file()
+            {
+                continue;
+            }
+
+            let file = live_inode.as_file_ref()?;
+            let block_size = file.block_size as i64;
+            let choose_workers =
+                self.choose_worker_for_file(file, client_addr.clone(), exclude_workers.clone())?;
+            let has_spdk = {
+                let wm = self.worker_manager.read();
+                wm.workers_have_spdk(&choose_workers)
+            };
+            let mut inode = live_inode;
+            let result = fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers);
+            let (block, assigned) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    self.worker_manager
+                        .write()
+                        .unschedule_chosen_workers(&choose_workers, block_size);
+                    return Err(error);
+                }
+            };
+            if !assigned {
+                self.worker_manager
+                    .write()
+                    .unschedule_chosen_workers(&choose_workers, block_size);
+            }
+            return Ok(Some(LocatedBlock {
+                block,
+                locs: choose_workers,
+                has_spdk,
+            }));
+        }
+
+        Ok(None)
+    }
+
     pub fn get_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
         let expire_ms = self.conf.lock_expire_time_ms();
 
@@ -2569,11 +4789,43 @@ impl MasterFilesystem {
 
     pub fn set_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
-
-        let fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-
-        fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms())
+        self.run_metadata_write(|| {
+            const MAX_RETRIES: usize = 3;
+            for _ in 0..MAX_RETRIES {
+                let (resolved, epoch) = self.resolve_live_store_view(path)?;
+                Self::check_not_pending_path(path)?;
+                if !resolved.is_full() {
+                    break;
+                }
+                let target_depth = resolved.inodes().len() - 1;
+                let requests: Vec<_> = resolved
+                    .inodes()
+                    .iter()
+                    .enumerate()
+                    .map(|(depth, inode)| {
+                        if depth == target_depth {
+                            InodeLockRequest::write(depth, inode.id())
+                        } else {
+                            InodeLockRequest::read(depth, inode.id())
+                        }
+                    })
+                    .collect();
+                let _locks = self.inode_locks.lock_many(&requests);
+                let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
+                if epoch != locked_epoch || !resolved.same_resolution(&locked) {
+                    continue;
+                }
+                let fs_dir = self.fs_dir.read();
+                let inp = Self::resolve_path(&fs_dir, path)?;
+                if !Self::live_path_matches(&locked, &inp) {
+                    continue;
+                }
+                return fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms());
+            }
+            let fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms())
+        })
     }
 }
 
@@ -2832,7 +5084,7 @@ mod tests {
             .is_some());
 
         fs.delete(path, false).unwrap();
-        let mut fs_dir = fs.fs_dir.write();
+        let fs_dir = fs.fs_dir.write();
         assert!(fs_dir.replication_block_state(block_id).unwrap().is_none());
         assert!(!fs_dir
             .add_replication_location_if_needed(block_id, BlockLocation::with_id(200))
@@ -2852,7 +5104,7 @@ mod tests {
         fs.create_with_opts(path, opts, OpenFlags::new_create().set_overwrite(true))
             .unwrap();
 
-        let mut fs_dir = fs.fs_dir.write();
+        let fs_dir = fs.fs_dir.write();
         assert!(fs_dir
             .replication_block_state(old_block_id)
             .unwrap()
@@ -2866,7 +5118,7 @@ mod tests {
     fn replication_location_update_is_idempotent_and_respects_replica_count() {
         let fs = test_fs("replication-location-guard");
         let block_id = replication_file(&fs, "/replication-location-guard.log");
-        let mut fs_dir = fs.fs_dir.write();
+        let fs_dir = fs.fs_dir.write();
 
         assert!(fs_dir
             .add_replication_location_if_needed(block_id, BlockLocation::with_id(200))
@@ -3345,7 +5597,7 @@ mod tests {
 
         // Create a file carrying the atime marker (as the mount merge path
         // would), then try to flip it to mtime via a client-side SetAttr RPC:
-        // both removal and overwrite of the master-owned key must be ignored.
+        // both removal and overwrite of the master-owned key are refused.
         let mut opts = CreateFileOpts::with_create(true);
         opts.storage_policy = StoragePolicy {
             ttl_ms: 100,
@@ -3359,25 +5611,30 @@ mod tests {
         fs.create_with_opts(path, opts, OpenFlags::new_create().set_overwrite(true))
             .unwrap();
 
-        fs.set_attr(
-            path,
-            SetAttrOpts {
-                remove_x_attr: vec![INTERNAL_TTL_TYPE_XATTR.to_string()],
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        fs.set_attr(
-            path,
-            SetAttrOpts {
-                add_x_attr: HashMap::from([(
-                    INTERNAL_TTL_TYPE_XATTR.to_string(),
-                    TtlType::Mtime.to_xattr_value(),
-                )]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let err = fs
+            .set_attr(
+                path,
+                SetAttrOpts {
+                    remove_x_attr: vec![INTERNAL_TTL_TYPE_XATTR.to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
+
+        let err = fs
+            .set_attr(
+                path,
+                SetAttrOpts {
+                    add_x_attr: HashMap::from([(
+                        INTERNAL_TTL_TYPE_XATTR.to_string(),
+                        TtlType::Mtime.to_xattr_value(),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
 
         let marker = file_ttl_type(&fs, path);
         assert_eq!(
@@ -3621,12 +5878,26 @@ mod tests {
         );
     }
 
+    #[path = "complete_file_sharding_test.rs"]
+    mod complete_file_sharding_test;
+    #[path = "create_failure_test.rs"]
+    mod create_failure_test;
     #[path = "expect_gen_test.rs"]
     mod expect_gen_test;
     #[path = "fs_mode_release_gate_test.rs"]
     mod fs_mode_release_gate_test;
     #[path = "get_block_locations_batch_test.rs"]
     mod get_block_locations_batch_test;
+    #[path = "lost_worker_gate_test.rs"]
+    mod lost_worker_gate_test;
+    #[path = "rename_failure_test.rs"]
+    mod rename_failure_test;
+    #[path = "role_epoch_test.rs"]
+    mod role_epoch_test;
+    #[path = "set_attr_lock_test.rs"]
+    mod set_attr_lock_test;
+    #[path = "shared_handles_test.rs"]
+    mod shared_handles_test;
     #[path = "worker_recovery_test.rs"]
     mod worker_recovery_test;
 

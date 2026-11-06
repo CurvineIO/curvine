@@ -22,7 +22,7 @@ mod file_writer;
 pub use self::file_writer::FileWriter;
 
 mod download_handler;
-pub use download_handler::SnapshotDownloadHandler;
+pub use download_handler::{RegisteredSnapshotDir, SnapshotDownloadHandler};
 
 mod download_job;
 pub use download_job::DownloadJob;

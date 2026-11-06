@@ -81,7 +81,7 @@ impl PackedChildren {
     const DIR_VALUE_LEN: usize = Self::DIR_IDX_OFFSET + 4;
     const KIND_FILE: u8 = 0;
     const KIND_DIR: u8 = 1;
-    const NAME_MAX: usize = Self::LAYOUT.max_key_len();
+    pub(super) const NAME_MAX: usize = Self::LAYOUT.max_key_len();
     const HOLE_RATIO: usize = 4;
     const HOLE_LIMIT: usize = 1024;
 
@@ -259,6 +259,33 @@ impl PackedChildren {
 
     pub fn iter(&self) -> PackedIter<'_> {
         PackedIter::new(&self.dirs, self.area.chunks(), self.area.len())
+    }
+
+    /// Move directory boxes without changing their addresses; file edges are
+    /// reconstructed because they are stored inline in the record area.
+    pub(super) fn into_entries(mut self) -> Vec<(String, Box<InodeView>)> {
+        let mut entries = Vec::with_capacity(self.area.len());
+        for chunk in self.area.chunks() {
+            let mut offset = 0;
+            while offset < chunk.used() {
+                let buf = chunk.buf();
+                let name = Self::record_name(buf, offset).to_owned();
+                let view = if Self::record_kind(buf, offset) == Self::KIND_DIR {
+                    let slot = Self::record_dir_idx(buf, offset) as usize;
+                    self.dirs[slot]
+                        .take()
+                        .expect("packed directory slot missing")
+                } else {
+                    Box::new(InodeView::new_entry(
+                        name.clone(),
+                        Self::record_id(buf, offset),
+                    ))
+                };
+                entries.push((name, view));
+                offset += Self::record_len(buf, offset);
+            }
+        }
+        entries
     }
 
     pub fn list_options(&self, opts: &ListOptions) -> Vec<InodePtr> {

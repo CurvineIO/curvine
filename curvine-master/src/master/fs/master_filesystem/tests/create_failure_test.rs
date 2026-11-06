@@ -1,0 +1,199 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#[cfg(feature = "fault-injection")]
+use super::*;
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn create_commit_failure_does_not_publish_to_the_namespace_tree() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+
+    let fs = test_fs("create-commit-failure");
+    fs.mkdir("/parent", false).unwrap();
+    fs.set_attr(
+        "/parent",
+        SetAttrOpts {
+            mtime: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let before = fs.file_status("/parent").unwrap();
+    let name = format!("file-{}", curvine_runtime::common::Utils::rand_str(10));
+    let path = format!("/parent/{name}");
+
+    let runtime = FaultRuntime::process();
+    let rule_id = format!("create-failure-{name}");
+    let rule = FaultRuleBuilder::named("master.metadata.add.before_commit")
+        .matches("child_name", name.as_str())
+        .unwrap()
+        .times(1)
+        .unwrap()
+        .return_error("injected create commit failure")
+        .unwrap();
+    runtime.configure(&rule_id, rule).unwrap();
+    let result = fs.create(&path, false);
+    runtime.remove(&rule_id).unwrap();
+
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("injected create commit failure"));
+    for restored in [false, true] {
+        if restored {
+            fs.restore_from_rocksdb().unwrap();
+        }
+        let parent = fs.file_status("/parent").unwrap();
+        assert_eq!((parent.mtime, parent.nlink), (before.mtime, before.nlink));
+        assert!(!fs.exists(&path).unwrap());
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn mkdir_commit_failure_does_not_publish_to_the_namespace_tree() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+
+    let fs = test_fs("mkdir-commit-failure");
+    fs.mkdir("/parent", false).unwrap();
+    fs.set_attr(
+        "/parent",
+        SetAttrOpts {
+            mtime: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let before = fs.file_status("/parent").unwrap();
+    let name = format!("dir-{}", curvine_runtime::common::Utils::rand_str(10));
+    let path = format!("/parent/{name}");
+
+    let runtime = FaultRuntime::process();
+    let rule_id = format!("mkdir-failure-{name}");
+    let rule = FaultRuleBuilder::named("master.metadata.add.before_commit")
+        .matches("child_name", name.as_str())
+        .unwrap()
+        .times(1)
+        .unwrap()
+        .return_error("injected mkdir commit failure")
+        .unwrap();
+    runtime.configure(&rule_id, rule).unwrap();
+    let result = fs.mkdir(&path, false);
+    runtime.remove(&rule_id).unwrap();
+
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("injected mkdir commit failure"));
+    for restored in [false, true] {
+        if restored {
+            fs.restore_from_rocksdb().unwrap();
+        }
+        let parent = fs.file_status("/parent").unwrap();
+        assert_eq!((parent.mtime, parent.nlink), (before.mtime, before.nlink));
+        assert!(!fs.exists(&path).unwrap());
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn symlink_commit_failure_does_not_publish_to_the_namespace_tree() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+
+    let fs = test_fs("symlink-commit-failure");
+    fs.mkdir("/parent", false).unwrap();
+    fs.set_attr(
+        "/parent",
+        SetAttrOpts {
+            mtime: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let before = fs.file_status("/parent").unwrap();
+    let name = format!("link-{}", curvine_runtime::common::Utils::rand_str(10));
+    let path = format!("/parent/{name}");
+
+    let runtime = FaultRuntime::process();
+    let rule_id = format!("symlink-failure-{name}");
+    let rule = FaultRuleBuilder::named("master.metadata.symlink.before_commit")
+        .matches("child_name", name.as_str())
+        .unwrap()
+        .times(1)
+        .unwrap()
+        .return_error("injected symlink commit failure")
+        .unwrap();
+    runtime.configure(&rule_id, rule).unwrap();
+    let result = fs.symlink("/target".to_string(), path.clone(), false, 0o644);
+    runtime.remove(&rule_id).unwrap();
+
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("injected symlink commit failure"));
+    for restored in [false, true] {
+        if restored {
+            fs.restore_from_rocksdb().unwrap();
+        }
+        let parent = fs.file_status("/parent").unwrap();
+        assert_eq!((parent.mtime, parent.nlink), (before.mtime, before.nlink));
+        assert!(!fs.exists(&path).unwrap());
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn link_commit_failure_does_not_publish_to_the_namespace_tree() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+
+    let fs = test_fs("link-commit-failure");
+    fs.create("/source", false).unwrap();
+    fs.mkdir("/parent", false).unwrap();
+    let before_source = fs.file_status("/source").unwrap();
+    let before_parent = fs.file_status("/parent").unwrap();
+    let name = format!("entry-{}", curvine_runtime::common::Utils::rand_str(10));
+    let path = format!("/parent/{name}");
+
+    let runtime = FaultRuntime::process();
+    let rule_id = format!("link-failure-{name}");
+    let rule = FaultRuleBuilder::named("master.metadata.link.before_commit")
+        .matches("child_name", name.as_str())
+        .unwrap()
+        .times(1)
+        .unwrap()
+        .return_error("injected link commit failure")
+        .unwrap();
+    runtime.configure(&rule_id, rule).unwrap();
+    let result = fs.link("/source".to_string(), path.clone());
+    runtime.remove(&rule_id).unwrap();
+
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("injected link commit failure"));
+    for restored in [false, true] {
+        if restored {
+            fs.restore_from_rocksdb().unwrap();
+        }
+        let source = fs.file_status("/source").unwrap();
+        let parent = fs.file_status("/parent").unwrap();
+        assert_eq!(source.nlink, before_source.nlink);
+        assert_eq!(
+            (parent.mtime, parent.nlink),
+            (before_parent.mtime, before_parent.nlink)
+        );
+        assert!(!fs.exists(&path).unwrap());
+    }
+}

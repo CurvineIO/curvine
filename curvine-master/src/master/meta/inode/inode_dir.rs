@@ -16,11 +16,155 @@ use crate::master::meta::feature::{AclFeature, DirFeature};
 use crate::master::meta::inode::DirectoryChildren;
 use crate::master::meta::inode::{Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID};
 use curvine_codec::{CodecResult, Decode, Encode, Reader, Writer};
-use curvine_core_error::CommonResult;
-use curvine_model::{ListOptions, MkdirOpts, StoragePolicy, INTERNAL_CTIME_XATTR};
+use curvine_core_error::{CommonError, CommonResult};
+use curvine_model::{
+    DirectoryAttributeDelta, DirectoryAttributes, ListOptions, MkdirOpts, StoragePolicy,
+    INTERNAL_CTIME_XATTR,
+};
 use glob::Pattern;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+
+#[derive(Debug)]
+struct DirectoryAttributeState {
+    update_lock: Mutex<()>,
+    initialized: AtomicBool,
+    persisted: AtomicBool,
+    mtime: AtomicI64,
+    ctime: AtomicI64,
+    nlink: AtomicU32,
+    children: AtomicI64,
+    version: AtomicU64,
+    base: OnceLock<DirectoryAttributes>,
+}
+
+impl Default for DirectoryAttributeState {
+    fn default() -> Self {
+        Self {
+            update_lock: Mutex::new(()),
+            initialized: AtomicBool::new(false),
+            persisted: AtomicBool::new(false),
+            mtime: AtomicI64::new(0),
+            ctime: AtomicI64::new(0),
+            nlink: AtomicU32::new(0),
+            children: AtomicI64::new(-1),
+            version: AtomicU64::new(0),
+            base: OnceLock::new(),
+        }
+    }
+}
+
+impl DirectoryAttributeState {
+    fn new(attributes: DirectoryAttributes) -> Self {
+        Self {
+            update_lock: Mutex::new(()),
+            initialized: AtomicBool::new(true),
+            persisted: AtomicBool::new(false),
+            mtime: AtomicI64::new(attributes.mtime),
+            ctime: AtomicI64::new(attributes.ctime),
+            nlink: AtomicU32::new(attributes.nlink),
+            children: AtomicI64::new(attributes.children.map_or(-1, i64::from)),
+            version: AtomicU64::new(attributes.version),
+            base: OnceLock::from(attributes),
+        }
+    }
+
+    fn current(&self) -> Option<DirectoryAttributes> {
+        let _guard = self.update_lock.lock();
+        self.current_locked()
+    }
+
+    fn current_locked(&self) -> Option<DirectoryAttributes> {
+        self.initialized.load(Ordering::Acquire).then(|| {
+            let mut attributes = DirectoryAttributes::new(
+                self.mtime.load(Ordering::Acquire),
+                self.ctime.load(Ordering::Acquire),
+                self.nlink.load(Ordering::Acquire),
+            );
+            attributes.version = self.version.load(Ordering::Acquire);
+            attributes.children = match self.children.load(Ordering::Acquire) {
+                children if children >= 0 => i32::try_from(children).ok(),
+                _ => None,
+            };
+            attributes
+        })
+    }
+
+    fn set_persisted(&self, attributes: DirectoryAttributes) {
+        let _guard = self.update_lock.lock();
+        self.mtime.store(attributes.mtime, Ordering::Release);
+        self.ctime.store(attributes.ctime, Ordering::Release);
+        self.nlink.store(attributes.nlink, Ordering::Release);
+        self.children
+            .store(attributes.children.map_or(-1, i64::from), Ordering::Release);
+        self.version.store(attributes.version, Ordering::Release);
+        let _ = self.base.set(attributes);
+        self.initialized.store(true, Ordering::Release);
+        self.persisted.store(true, Ordering::Release);
+    }
+
+    fn metadata_copy(&self) -> Self {
+        let _guard = self.update_lock.lock();
+        let attributes = self.current_locked();
+        let persisted = self.persisted.load(Ordering::Acquire);
+        match attributes {
+            Some(attributes) => Self {
+                update_lock: Mutex::new(()),
+                initialized: AtomicBool::new(true),
+                persisted: AtomicBool::new(persisted),
+                mtime: AtomicI64::new(attributes.mtime),
+                ctime: AtomicI64::new(attributes.ctime),
+                nlink: AtomicU32::new(attributes.nlink),
+                children: AtomicI64::new(attributes.children.map_or(-1, i64::from)),
+                version: AtomicU64::new(attributes.version),
+                base: OnceLock::from(attributes),
+            },
+            None => Self::default(),
+        }
+    }
+
+    fn delta(
+        &self,
+        fallback: DirectoryAttributes,
+        delta: DirectoryAttributeDelta,
+    ) -> DirectoryAttributeDelta {
+        if self.persisted.load(Ordering::Acquire) {
+            delta
+        } else {
+            delta.with_base(*self.base.get_or_init(|| fallback))
+        }
+    }
+
+    fn apply(&self, delta: DirectoryAttributeDelta) -> CommonResult<()> {
+        let _guard = self.update_lock.lock();
+        let nlink = self
+            .nlink
+            .load(Ordering::Acquire)
+            .checked_add_signed(delta.nlink_delta)
+            .ok_or_else(|| CommonError::from("directory nlink update overflow"))?;
+        let children = self.children.load(Ordering::Acquire);
+        let children = match (children, delta.children_delta) {
+            (children, Some(change)) if children >= 0 => children
+                .checked_add(i64::from(change))
+                .filter(|children| *children >= 0 && *children <= i64::from(i32::MAX))
+                .ok_or_else(|| CommonError::from("directory child count update overflow"))?,
+            (children, _) => children,
+        };
+        let version = self
+            .version
+            .load(Ordering::Acquire)
+            .checked_add(delta.version_delta)
+            .ok_or_else(|| CommonError::from("directory attributes version overflow"))?;
+        self.nlink.store(nlink, Ordering::Release);
+        self.children.store(children, Ordering::Release);
+        self.mtime.fetch_max(delta.mtime, Ordering::AcqRel);
+        self.ctime.fetch_max(delta.ctime, Ordering::AcqRel);
+        self.version.store(version, Ordering::Release);
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeDir {
@@ -35,6 +179,9 @@ pub struct InodeDir {
 
     #[serde(skip)]
     children: Arc<DirectoryChildren>,
+
+    #[serde(skip, default)]
+    attributes: Arc<DirectoryAttributeState>,
 }
 
 impl InodeDir {
@@ -51,6 +198,7 @@ impl InodeDir {
             storage_policy,
             features,
             children: _,
+            ..
         } = self;
         Self {
             id: *id,
@@ -61,6 +209,7 @@ impl InodeDir {
             storage_policy: storage_policy.clone(),
             features: features.clone(),
             children: Arc::new(DirectoryChildren::new()),
+            attributes: Arc::new(self.attributes.metadata_copy()),
         }
     }
 
@@ -85,6 +234,9 @@ impl InodeDir {
             storage_policy: Default::default(),
             features: Default::default(),
             children,
+            attributes: Arc::new(DirectoryAttributeState::new(DirectoryAttributes::new(
+                time, time, 2,
+            ))),
         }
     }
 
@@ -105,7 +257,41 @@ impl InodeDir {
                 x_attr: opts.x_attr,
             },
             children: Arc::new(DirectoryChildren::new()),
+            attributes: Arc::new(DirectoryAttributeState::new(DirectoryAttributes::new(
+                time, time, 2,
+            ))),
         }
+    }
+
+    pub(crate) fn directory_attributes(&self) -> DirectoryAttributes {
+        let mut attributes = DirectoryAttributes::new(self.mtime, self.ctime(), self.nlink);
+        if let Some(current) = self.attributes.current() {
+            attributes.version = current.version;
+            attributes.children = current.children;
+        }
+        attributes
+    }
+
+    pub(crate) fn directory_attribute_delta(
+        &self,
+        delta: DirectoryAttributeDelta,
+    ) -> DirectoryAttributeDelta {
+        self.attributes.delta(self.directory_attributes(), delta)
+    }
+
+    pub(crate) fn mark_directory_attributes_persisted(&self) {
+        self.attributes.persisted.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn apply_directory_attribute_delta(
+        &self,
+        delta: DirectoryAttributeDelta,
+    ) -> CommonResult<()> {
+        self.attributes.apply(delta)
+    }
+
+    pub(crate) fn set_directory_attributes(&self, attributes: DirectoryAttributes) {
+        self.attributes.set_persisted(attributes);
     }
 
     /// Add a word node and return a reference to that word node.
@@ -118,7 +304,7 @@ impl InodeDir {
         self.children.get_child_ptr(name)
     }
 
-    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodePtr> {
+    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodeView> {
         self.children.get_child_by_glob_pattern(glob_pattern)
     }
 
@@ -159,13 +345,25 @@ impl InodeDir {
         self.children_vec().into_iter()
     }
 
-    pub fn list_options(&self, options: &ListOptions) -> Vec<InodePtr> {
+    pub fn list_options(&self, options: &ListOptions) -> Vec<InodeView> {
         self.children.list_options(options)
     }
 
     pub fn children_vec(&self) -> Vec<InodeView> {
-        let children = self.children.read_all();
-        children.iter().map(|item| item.as_ref().clone()).collect()
+        self.children.read_all()
+    }
+
+    pub(crate) fn apply_nlink_delta(&mut self, delta: i32, ctime: i64) -> CommonResult<()> {
+        if delta > 0 {
+            self.nlink = self
+                .nlink
+                .checked_add(delta as u32)
+                .ok_or_else(|| CommonError::from("directory nlink overflow"))?;
+        } else {
+            self.nlink = self.nlink.saturating_sub(delta.unsigned_abs());
+        }
+        self.update_ctime(ctime);
+        Ok(())
     }
 
     pub fn children_len(&self) -> usize {
@@ -248,6 +446,7 @@ impl Decode for InodeDir {
             features: DirFeature::decode(reader)?,
             // Children are persisted as edges, not inside the inode record.
             children: Arc::new(DirectoryChildren::new()),
+            attributes: Arc::default(),
         })
     }
 }
@@ -282,6 +481,7 @@ mod tests {
                 },
             },
             children: Arc::new(DirectoryChildren::new()),
+            attributes: Arc::default(),
         };
 
         let mut writer = Writer::new(1).unwrap();

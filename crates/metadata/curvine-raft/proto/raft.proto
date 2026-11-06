@@ -10,6 +10,10 @@ message SnapshotFileInfo {
     required uint64 mtime = 2;
     required uint64 ctime = 3;
     required uint64 len = 4;
+
+    // Content crc32 computed when the manifest is created. Zero means the
+    // producer did not provide one; consumers then fall back to length checks.
+    optional uint64 checksum = 5;
 }
 
 // List of snapshot files
@@ -66,6 +70,11 @@ message PingRequest {
 message PingResponse {
     required uint64 leader_id = 1;
     repeated RaftPeerProto group = 2;
+
+    // The highest record-format generation the answering process can read.
+    // An older binary leaves the field unset, which a caller negotiating a
+    // newer record format must treat as "cannot read it".
+    optional uint32 reader_format = 3;
 }
 
 //Cluster configuration changes.

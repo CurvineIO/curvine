@@ -45,6 +45,7 @@ use curvine_runtime::common::LocalTime;
 use log::{info, warn};
 
 use crate::master::fs::MasterFilesystem;
+use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::space::scanner::{GlobalScanner, PointScanner, ScanContext, ScanLimits};
 use crate::master::space::store::DirSpaceSnapshotStore;
 use crate::master::space::types::{DirSpaceSnapshot, SnapshotMeta, SnapshotSource};
@@ -94,6 +95,8 @@ pub enum DirSpaceQueryError {
     SnapshotMiss(crate::master::space::store::SnapshotMiss),
     /// The queried path is invalid or does not resolve.
     Path(String),
+    /// Namespace lookup failed, rather than finding a missing path.
+    Storage(String),
 }
 
 /// Scan driver plus query facade over the published snapshot generations.
@@ -453,12 +456,15 @@ impl DirSpaceManager {
         }
     }
 
-    /// Resolve one tracked path to its directory inode id under a short read
-    /// lock. Returns `None` when the path is missing or not a directory.
-    fn resolve_tracked_root(&self, path: &str) -> Option<i64> {
-        let normalized = normalize_tracked_path(path).ok()?;
+    /// Resolve one tracked path from a consistent namespace snapshot.
+    /// Returns `None` when the path is missing or not a directory.
+    fn resolve_tracked_root(&self, path: &str) -> CommonResult<Option<i64>> {
+        let Ok(normalized) = normalize_tracked_path(path) else {
+            return Ok(None);
+        };
         let fs_dir = self.fs.fs_dir.read();
-        resolve_dir_id(&fs_dir, &normalized).ok()
+        let snapshot = InodeStoreSnapshot::new(fs_dir.store_ref().checked_read_snapshot()?);
+        resolve_dir_id(&snapshot, &normalized)
     }
 
     /// Attempt one tracked-point refresh round starting at `start_index` in the
@@ -515,18 +521,27 @@ impl DirSpaceManager {
 
             let path = paths[index].clone();
             self.mark_scan_path(&path);
-            let Some(root_id) = self.resolve_tracked_root(&path) else {
-                warn!(
-                    "dir-space tracked point {} skipped: path missing or not a directory",
-                    path
-                );
-                index = (index + 1) % paths.len();
-                scanned += 1;
-                if scanned >= paths.len() {
-                    self.note_finished(ScanOutcome::Success);
-                    return (ScanOutcome::Success, 0, true);
+            let root_id = match self.resolve_tracked_root(&path) {
+                Ok(Some(root_id)) => root_id,
+                Err(error) => {
+                    warn!("dir-space tracked point {} unavailable: {}", path, error);
+                    self.record_simple_outcome_for_scope("point", ScanOutcome::Failed);
+                    self.note_finished(ScanOutcome::Failed);
+                    return (ScanOutcome::Failed, index, false);
                 }
-                continue;
+                Ok(None) => {
+                    warn!(
+                        "dir-space tracked point {} skipped: path missing or not a directory",
+                        path
+                    );
+                    index = (index + 1) % paths.len();
+                    scanned += 1;
+                    if scanned >= paths.len() {
+                        self.note_finished(ScanOutcome::Success);
+                        return (ScanOutcome::Success, 0, true);
+                    }
+                    continue;
+                }
             };
 
             let started_ms = LocalTime::mills() as i64;
@@ -860,6 +875,12 @@ impl DirSpaceManager {
         }
 
         let fs_dir = self.fs.fs_dir.read();
+        let namespace =
+            InodeStoreSnapshot::new(fs_dir.store_ref().checked_read_snapshot().map_err(|_| {
+                DirSpaceQueryError::SnapshotMiss(
+                    crate::master::space::store::SnapshotMiss::NoSnapshot,
+                )
+            })?);
         let mut candidates: Vec<&String> = points
             .keys()
             .filter(|p| Path::has_prefix(path, p.as_str()))
@@ -868,11 +889,13 @@ impl DirSpaceManager {
 
         for candidate in candidates {
             let snapshot = &points[candidate.as_str()];
-            match resolve_dir_id(&fs_dir, candidate) {
-                Ok(id) if id == snapshot.root_id => {
+            match resolve_dir_id(&namespace, candidate)
+                .map_err(|e| DirSpaceQueryError::Storage(e.to_string()))?
+            {
+                Some(id) if id == snapshot.root_id => {
                     return Ok(Some((candidate.clone(), id)));
                 }
-                Ok(_) | Err(_) => continue,
+                _ => continue,
             }
         }
         Ok(None)
@@ -892,13 +915,20 @@ impl DirSpaceManager {
 
         let normalized = normalize_dir_path(path)?;
 
-        // One short fs_dir read lock covers both the query resolution and the
-        // candidate point root validation.
+        // Resolve the requested path and all point roots from one store view.
         let fs_dir = self.fs.fs_dir.read();
-        let dir_id = resolve_dir_id(&fs_dir, &normalized)
-            .map_err(|_| DirSpaceQueryError::Path(path.to_string()))?;
+        let namespace =
+            InodeStoreSnapshot::new(fs_dir.store_ref().checked_read_snapshot().map_err(|_| {
+                DirSpaceQueryError::SnapshotMiss(
+                    crate::master::space::store::SnapshotMiss::NoSnapshot,
+                )
+            })?);
+        let dir_id = resolve_dir_id(&namespace, &normalized)
+            .map_err(|e| DirSpaceQueryError::Storage(e.to_string()))?
+            .ok_or_else(|| DirSpaceQueryError::Path(path.to_string()))?;
         let points = self.store.points();
-        let validated_point = self.select_point_locked(&fs_dir, &normalized, &points)?;
+        let validated_point = self.select_point_in_snapshot(&namespace, &normalized, &points)?;
+        drop(namespace);
         drop(fs_dir);
 
         self.store
@@ -906,9 +936,9 @@ impl DirSpaceManager {
             .map_err(DirSpaceQueryError::SnapshotMiss)
     }
 
-    fn select_point_locked(
+    fn select_point_in_snapshot(
         &self,
-        fs_dir: &crate::master::meta::FsDir,
+        namespace: &InodeStoreSnapshot<'_>,
         path: &str,
         points: &HashMap<String, Arc<DirSpaceSnapshot>>,
     ) -> Result<Option<String>, DirSpaceQueryError> {
@@ -925,13 +955,15 @@ impl DirSpaceManager {
 
         for candidate in candidates {
             let snapshot = &points[candidate.as_str()];
-            match resolve_dir_id(fs_dir, candidate) {
+            match resolve_dir_id(namespace, candidate)
+                .map_err(|e| DirSpaceQueryError::Storage(e.to_string()))?
+            {
                 // Point root still resolves to the inode id it was published
                 // with: the point generation is a valid candidate.
-                Ok(id) if id == snapshot.root_id => return Ok(Some(candidate.clone())),
+                Some(id) if id == snapshot.root_id => return Ok(Some(candidate.clone())),
                 // Root inode id changed (delete + recreate / rename): the old
                 // generation must no longer be served.
-                Ok(_) | Err(_) => continue,
+                _ => continue,
             }
         }
         Ok(None)
@@ -1001,21 +1033,13 @@ fn normalize_dir_path(path: &str) -> Result<String, DirSpaceQueryError> {
     Ok(trimmed.to_string())
 }
 
-/// Resolve a normalized absolute directory path to its inode id under the
-/// current in-memory tree. Caller must hold the `fs_dir` read lock.
-fn resolve_dir_id(fs_dir: &crate::master::meta::FsDir, path: &str) -> CommonResult<i64> {
-    let root = fs_dir.root_ptr();
-    let inp = crate::master::meta::inode::InodePath::resolve(root, path, fs_dir.store_ref())?;
-    let last = inp.get_last_inode();
-    let last = match last {
-        Some(last) => last,
-        None => return err_box!("path {} does not exist", path),
-    };
-    let view = last.as_ref();
-    if !view.is_dir() {
-        return err_box!("path {} is not a directory", path);
-    }
-    Ok(view.id())
+/// Resolve a normalized absolute directory path within one store snapshot.
+fn resolve_dir_id(namespace: &InodeStoreSnapshot<'_>, path: &str) -> CommonResult<Option<i64>> {
+    let resolved = namespace.resolve_path(path)?;
+    Ok(resolved
+        .target()
+        .filter(|inode| inode.is_dir())
+        .map(|inode| inode.id()))
 }
 
 #[cfg(test)]
@@ -1252,11 +1276,13 @@ mod tests {
 
         let id_a = {
             let fs_dir = fs.fs_dir.read();
-            super::resolve_dir_id(&fs_dir, "/a").unwrap()
+            let snapshot = InodeStoreSnapshot::new(fs_dir.store_ref().store().read_snapshot());
+            super::resolve_dir_id(&snapshot, "/a").unwrap().unwrap()
         };
         let id_ab = {
             let fs_dir = fs.fs_dir.read();
-            super::resolve_dir_id(&fs_dir, "/ab").unwrap()
+            let snapshot = InodeStoreSnapshot::new(fs_dir.store_ref().store().read_snapshot());
+            super::resolve_dir_id(&snapshot, "/ab").unwrap().unwrap()
         };
         assert_ne!(id_a, id_ab);
 
@@ -1298,7 +1324,8 @@ mod tests {
         // Longest prefix wins when nested points exist.
         let id_sub = {
             let fs_dir = fs.fs_dir.read();
-            super::resolve_dir_id(&fs_dir, "/a/sub").unwrap()
+            let snapshot = InodeStoreSnapshot::new(fs_dir.store_ref().store().read_snapshot());
+            super::resolve_dir_id(&snapshot, "/a/sub").unwrap().unwrap()
         };
         let mut nested = points.clone();
         nested.insert("/a/sub".to_string(), Arc::new(mk_point(id_sub)));

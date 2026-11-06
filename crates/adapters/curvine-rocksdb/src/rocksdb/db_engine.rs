@@ -109,6 +109,19 @@ impl DBEngine {
         Ok(())
     }
 
+    /// Write one record and synchronously flush its WAL entry.
+    pub fn put_cf_sync_wal<K, V>(&self, cf: &str, key: K, value: V) -> CommonResult<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let cf = self.cf(cf)?;
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        self.db.put_cf_opt(cf, key, value, &options)?;
+        Ok(())
+    }
+
     pub fn put<K, V>(&self, key: K, value: V) -> CommonResult<()>
     where
         K: AsRef<[u8]>,
@@ -330,6 +343,19 @@ impl DBEngine {
         let end = RocksUtils::calculate_end_bytes(start);
 
         self.db.delete_range_cf(cf, start, &end)?;
+        Ok(())
+    }
+
+    /// Delete every record in a column family.
+    ///
+    /// RocksDB ranges are end-exclusive, so the span `[[], [0xff]]` covers all
+    /// keys below `0xff`; a zero-length prefix computes an empty end range and
+    /// deletes nothing.
+    pub fn clear_cf(&self, cf: &str) -> CommonResult<()> {
+        let cf = self.cf(cf)?;
+        let empty: &[u8] = b"";
+        let end: &[u8] = &[0xff];
+        self.db.delete_range_cf(cf, empty, end)?;
         Ok(())
     }
 
@@ -578,12 +604,21 @@ impl<'a> DbReadSnapshot<'a> {
 
     /// Prefix scan within this snapshot.
     pub fn prefix_scan<K: AsRef<[u8]>>(&self, cf: &str, key: K) -> CommonResult<RocksIterator<'_>> {
+        self.prefix_scan_from(cf, key.as_ref(), key.as_ref())
+    }
+
+    /// Prefix scan starting at a key within the prefix, using the same snapshot.
+    pub fn prefix_scan_from(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        start: &[u8],
+    ) -> CommonResult<RocksIterator<'_>> {
         let mut opt = self.conf.create_read_opt();
         opt.set_prefix_same_as_start(true);
 
-        let start = key.as_ref();
-        let end = RocksUtils::calculate_end_bytes(start);
-        opt.set_iterate_lower_bound(start);
+        let end = RocksUtils::calculate_end_bytes(prefix);
+        opt.set_iterate_lower_bound(prefix);
         opt.set_iterate_upper_bound(end);
         opt.set_snapshot(&self.snapshot);
 

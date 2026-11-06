@@ -20,6 +20,7 @@ use crate::rocksdb::DBEngine;
 use bytes::BytesMut;
 use curvine_core_error::err_box;
 use curvine_runtime::common::{FileUtils, LocalTime};
+use std::io::Read;
 use std::path::PathBuf;
 
 // Some tools and methods of raft.
@@ -43,6 +44,7 @@ impl RaftUtils {
             let join_path = PathBuf::from(dir).join(&path);
             let meta = FileUtils::metadata(&join_path)?;
             list.files.push(SnapshotFileInfo {
+                checksum: Some(Self::file_crc32(&join_path)? as u64),
                 path,
                 mtime: FileUtils::mtime(&meta).unwrap_or(0),
                 ctime: FileUtils::ctime(&meta).unwrap_or(0),
@@ -60,6 +62,21 @@ impl RaftUtils {
         };
 
         Ok(data)
+    }
+
+    /// Stream a file through crc32 so multi-GB checkpoints never buffer.
+    pub fn file_crc32(path: impl AsRef<std::path::Path>) -> RaftResult<u32> {
+        let mut file = std::fs::File::open(path.as_ref())?;
+        let mut hasher = crc32fast::Hasher::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hasher.finalize())
     }
 
     pub fn apply_rocks_snapshot(db: &mut DBEngine, files: &SnapshotFileList) -> RaftResult<()> {

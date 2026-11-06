@@ -16,6 +16,8 @@ use crate::master::journal::{
     CompleteFileEntry, DeleteEntry, JournalEntry, MkdirEntry, RenameEntry,
 };
 use crate::master::meta::inode::InodeView;
+use crate::master::meta::store::InodeStoreSnapshot;
+use crate::master::meta::FsDir;
 use crate::master::{FsModeExport, JobManager, SyncFsDir};
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, CommonResult};
@@ -205,7 +207,8 @@ impl UfsLoader {
         let gen = e.file.gen();
         let path = {
             let fs_dir = self.fs_dir.read();
-            let Some(InodeView::File(file)) = fs_dir.store.get_inode(e.file.id, None)? else {
+            let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+            let Some(InodeView::File(file)) = snapshot.get_inode(e.file.id)? else {
                 return Ok(None);
             };
             if file.gen() != gen
@@ -215,7 +218,7 @@ impl UfsLoader {
             {
                 return Ok(None);
             }
-            match fs_dir.get_inode_path(e.file.id) {
+            match FsDir::inode_path_in_snapshot(&snapshot, e.file.id) {
                 Ok(path) => path,
                 Err(FsError::FileNotFound(_)) => return Ok(None),
                 Err(err) => return Err(err),

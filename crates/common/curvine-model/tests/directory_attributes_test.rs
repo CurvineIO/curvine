@@ -12,7 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_model::{DirectoryAttributeDelta, DirectoryAttributes};
+use curvine_model::{
+    children_count_persisted, encode_matching, persist_children_count, DirectoryAttributeDelta,
+    DirectoryAttributes, RECORD_FORMAT_READABLE,
+};
+use std::sync::Mutex;
+
+static CHILDREN_COUNT_PERSISTENCE: Mutex<()> = Mutex::new(());
+
+struct ResetChildrenCountPersistence;
+
+impl Drop for ResetChildrenCountPersistence {
+    fn drop(&mut self) {
+        persist_children_count(false);
+    }
+}
 
 #[test]
 fn failed_delta_leaves_attributes_unchanged() {
@@ -34,6 +48,15 @@ fn failed_delta_leaves_attributes_unchanged() {
 }
 
 #[test]
+fn negative_persisted_child_counts_are_rejected() {
+    let mut invalid = DirectoryAttributes::new(0, 0, 0);
+    invalid.children = Some(-1);
+    assert_eq!(DirectoryAttributes::decode(&invalid.encode()), None);
+    let delta = DirectoryAttributeDelta::for_child(1).with_base(invalid);
+    assert_eq!(DirectoryAttributeDelta::decode(&delta.encode()), None);
+}
+
+#[test]
 fn directory_attribute_delta_combines_only_safe_updates() {
     let first = DirectoryAttributeDelta::new(10, 12, 1);
     let second = DirectoryAttributeDelta::new(15, 14, 2);
@@ -49,6 +72,11 @@ fn directory_attribute_delta_combines_only_safe_updates() {
     let negative = DirectoryAttributeDelta::new(15, 14, -1);
     assert_eq!(first.combine(negative), None);
     assert_eq!(negative.combine(first), None);
+
+    let add_child = DirectoryAttributeDelta::for_child(15).for_child_entry();
+    let remove_child = DirectoryAttributeDelta::for_child(16).for_child_removal();
+    assert_eq!(add_child.combine(remove_child), None);
+    assert_eq!(remove_child.combine(add_child), None);
 }
 
 #[test]
@@ -69,6 +97,29 @@ fn directory_attribute_encoding_rejects_other_record_types() {
 }
 
 #[test]
+fn delta_base_preserves_known_and_unknown_child_counts() {
+    for children in [None, Some(0), Some(17)] {
+        let mut base = DirectoryAttributes::new(1, 2, 3);
+        base.children = children;
+        let delta = DirectoryAttributeDelta::for_child(4).with_base(base);
+        assert_eq!(
+            DirectoryAttributeDelta::decode(&delta.encode())
+                .unwrap()
+                .base(),
+            Some(base)
+        );
+        assert_eq!(
+            DirectoryAttributeDelta::decode(&delta.encode_legacy())
+                .unwrap()
+                .base()
+                .unwrap()
+                .children,
+            None
+        );
+    }
+}
+
+#[test]
 fn unsupported_record_generations_are_rejected() {
     let mut old_base = vec![0; 24];
     old_base[..4].copy_from_slice(b"CDA1");
@@ -79,12 +130,43 @@ fn unsupported_record_generations_are_rejected() {
     assert_eq!(DirectoryAttributeDelta::decode(&old_delta), None);
 
     let mut newer_base = vec![0; 40];
-    newer_base[..4].copy_from_slice(b"CDA4");
+    newer_base[..4].copy_from_slice(b"CDA5");
     assert_eq!(DirectoryAttributes::decode(&newer_base), None);
 
     let mut newer_delta = vec![0; 80];
-    newer_delta[..4].copy_from_slice(b"CDD4");
+    newer_delta[..4].copy_from_slice(b"CDD5");
     assert_eq!(DirectoryAttributeDelta::decode(&newer_delta), None);
+}
+
+#[test]
+fn child_count_format_preserves_legacy_records_and_merges_current_records() {
+    let _guard = CHILDREN_COUNT_PERSISTENCE.lock().unwrap();
+    let _reset = ResetChildrenCountPersistence;
+    let base = DirectoryAttributes::new(10, 11, 2);
+    let delta = DirectoryAttributeDelta::for_child(12).for_child_entry();
+
+    assert_eq!(RECORD_FORMAT_READABLE, 4);
+    persist_children_count(false);
+    let legacy = encode_matching(None, &base.encode(), &base.encode_legacy());
+    assert_eq!(
+        DirectoryAttributes::decode(&legacy).unwrap().children(),
+        None
+    );
+
+    persist_children_count(true);
+    assert!(children_count_persisted());
+    let current = encode_matching(None, &base.encode(), &base.encode_legacy());
+    let mut attributes = DirectoryAttributes::decode(&current).unwrap();
+    attributes.apply(delta).unwrap();
+    assert_eq!(attributes.children(), Some(1));
+    assert_eq!(
+        encode_matching(
+            Some(&legacy),
+            &attributes.encode(),
+            &attributes.encode_legacy()
+        ),
+        attributes.encode_legacy(),
+    );
 }
 
 #[test]

@@ -66,6 +66,30 @@ impl ObjectLockPool {
         lock
     }
 
+    pub(crate) fn cleanup_lock(&self, key: u64) {
+        let shard = &self.shards[self.shard_index(key)];
+        if shard.read().locks.len() <= self.max_idle_locks_per_shard {
+            return;
+        }
+        let mut shard = shard.write();
+        if shard.locks.len() > self.max_idle_locks_per_shard
+            && shard
+                .locks
+                .get(&key)
+                .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            shard.locks.remove(&key);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_lock_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.read().locks.len())
+            .sum()
+    }
+
     pub(crate) fn cleanup_locks(&self, keys: &[u64]) {
         if keys.is_empty() {
             return;
