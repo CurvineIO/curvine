@@ -342,6 +342,27 @@ impl WriteHandler {
         }
     }
 
+    /// Abort (quarantine if `uncertain`), then latch only if terminal.
+    fn abort_and_latch(&mut self, block: &ExtendedBlock, uncertain: bool, reason: &str) {
+        let abort_result = if uncertain {
+            self.store.abort_block_uncertain(block)
+        } else {
+            self.store.abort_block(block)
+        };
+        if let Err(abort_err) = abort_result {
+            log::warn!(
+                "failed to abort block {} after {}: {}",
+                block.id,
+                reason,
+                abort_err
+            );
+        }
+        if self.block_is_terminal(block.id) {
+            self.is_commit = true;
+            self.lease.take();
+        }
+    }
+
     pub fn complete(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
         if self.is_commit {
             return if !msg.data.is_empty() {
@@ -359,33 +380,25 @@ impl WriteHandler {
 
         let file = self.file.take();
         if let Some(mut file) = file {
-            if let Err(flush_err) = file.flush() {
-                // Uncertain (timed-out) flush: quarantine, don't release.
-                let uncertain = file.has_uncertain_writes();
-                drop(file);
+            let flush_result = file.flush();
+            // Sticky flag from a mid-stream timeout; read it even if flush is Ok.
+            let uncertain = file.has_uncertain_writes();
+            drop(file);
+            if let Err(flush_err) = flush_result {
                 if let Some(dir_id) = write_dir_id {
                     Self::record_write_error(self.metrics, dir_id, &flush_err);
                 }
-                let abort_result = if uncertain {
-                    self.store.abort_block_uncertain(&context.block)
-                } else {
-                    self.store.abort_block(&context.block)
-                };
-                if let Err(abort_err) = abort_result {
-                    log::warn!(
-                        "failed to abort block {} after flush error: {}",
-                        context.block.id,
-                        abort_err
-                    );
-                }
-                // Latch only if terminal; stay retryable otherwise.
-                if self.block_is_terminal(context.block.id) {
-                    self.is_commit = true;
-                    self.lease.take();
-                }
+                self.abort_and_latch(&context.block, uncertain, "flush error");
                 return Err(flush_err.into());
             }
-            drop(file);
+            if uncertain {
+                // Data may still be in flight: never free or publish this extent.
+                self.abort_and_latch(&context.block, true, "uncertain write");
+                return Err(FsError::io(std::io::Error::other(format!(
+                    "block {} write outcome uncertain, extent quarantined",
+                    context.block.id
+                ))));
+            }
         }
 
         if context.block.len > context.block_size {
@@ -461,7 +474,7 @@ mod tests {
     use super::{map_storage_open_error, WriteHandler};
     use crate::worker::block::BlockStore;
     use crate::worker::handler::WriteContext;
-    use crate::worker::storage::BlockWriteContext;
+    use crate::worker::storage::{BlockWriteContext, Dataset};
     use crate::worker::Worker;
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_error::{FsError, FsResult};
@@ -709,6 +722,135 @@ mod tests {
         fn has_uncertain_writes(&self) -> bool {
             true
         }
+    }
+
+    /// A mid-stream write timed out (sticky flag) but the later flush is Ok.
+    struct UncertainFlushOkBlockIO;
+
+    impl BlockIO for UncertainFlushOkBlockIO {
+        fn read_region(
+            &mut self,
+            _enable_send_file: bool,
+            _len: i32,
+        ) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read not supported",
+            )))
+        }
+
+        fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read_all not supported",
+            )))
+        }
+
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            0
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn path(&self) -> &str {
+            "uncertain-flush-ok"
+        }
+
+        fn resize(
+            &mut self,
+            _truncate: bool,
+            _off: i64,
+            _len: i64,
+            _mode: i32,
+        ) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "resize not supported",
+            )))
+        }
+
+        fn has_uncertain_writes(&self) -> bool {
+            true
+        }
+    }
+
+    /// SPDK store + handler whose writer reports uncertain writes but flushes Ok.
+    fn spdk_uncertain_flush_ok_handler(
+        dir_tag: &str,
+        block: &ExtendedBlock,
+    ) -> FsResult<(BlockStore, WriteHandler)> {
+        let _worker = Worker::with_conf(ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                data_dir: vec![format!("[MEM:1KB]../testing/{dir_tag}")],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        })?;
+        let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)
+            .map_err(FsError::from)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        store.open_block(block).map_err(FsError::from)?;
+        let handler = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size: block.len,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                UncertainFlushOkBlockIO,
+                0,
+                block.len,
+                0,
+            )?),
+            lease: None,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+        Ok((store, handler))
+    }
+
+    fn spdk_complete_msg(block: &ExtendedBlock) -> Message {
+        Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size: block.len,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build()
     }
 
     // Regression test for GH#1673: a data-bearing Running frame with flush=true
@@ -1042,6 +1184,61 @@ mod tests {
             "uncertain flush failure on SPDK must quarantine the block, not remove it"
         );
 
+        Ok(())
+    }
+
+    /// Mid-stream write timed out, then Cancel with a successful flush: the
+    /// sticky uncertain flag must still quarantine, not free the extent.
+    #[test]
+    fn cancel_after_uncertain_write_with_ok_flush_quarantines() -> FsResult<()> {
+        let block = ExtendedBlock::new(50, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) =
+            spdk_uncertain_flush_ok_handler("write-handler-cancel-uncertain-ok-flush", &block)?;
+        let available_before = store.read().map_err(FsError::from)?.available();
+
+        let err = handler
+            .complete(&spdk_complete_msg(&block), false)
+            .unwrap_err();
+        assert!(err.to_string().contains("uncertain"), "{err}");
+
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+            "Cancel after an uncertain write must quarantine, not free"
+        );
+        assert_eq!(
+            store.read().map_err(FsError::from)?.available(),
+            available_before,
+            "quarantine must keep the extent reserved"
+        );
+        assert!(handler.is_commit, "quarantine is terminal: must latch");
+        Ok(())
+    }
+
+    /// Same with Complete(commit=true): quarantine, never finalize.
+    #[test]
+    fn complete_after_uncertain_write_with_ok_flush_never_finalizes() -> FsResult<()> {
+        let block = ExtendedBlock::new(51, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) =
+            spdk_uncertain_flush_ok_handler("write-handler-commit-uncertain-ok-flush", &block)?;
+
+        let err = handler
+            .complete(&spdk_complete_msg(&block), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("uncertain"), "{err}");
+
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+            "Complete after an uncertain write must quarantine, not finalize"
+        );
+        assert!(handler.is_commit, "quarantine is terminal: must latch");
         Ok(())
     }
 
