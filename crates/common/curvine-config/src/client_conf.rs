@@ -62,6 +62,12 @@ pub struct ClientConf {
     pub read_chunk_size_str: String,
     #[client_cli]
     pub read_chunk_num: usize,
+    // Chunk requests kept in flight per remote block read. The worker answers
+    // a connection's requests in order, so a depth above 1 overlaps each
+    // chunk's transfer with the next request instead of idling a round trip
+    // per chunk. Default is 1 (one request at a time).
+    #[client_cli]
+    pub read_pipeline_depth: usize,
 
     // These 2 parameters are used to improve the speed of reading a single file.
     // Read the parallelism of a file, default is 1
@@ -465,6 +471,7 @@ impl Default for ClientConf {
             read_chunk_size: 0,
             read_chunk_size_str: "128KB".to_owned(),
             read_chunk_num: 8,
+            read_pipeline_depth: 1,
             read_parallel: Self::DEFAULT_READ_PARALLEL,
             read_slice_size: 0,
             read_slice_size_str: "0".to_owned(),

@@ -271,6 +271,8 @@ pub struct FsReaderBuffer {
 
     slice_size: i64,
     absorb_window: i64,
+    // Caller's read end, shared with every lane's FsReaderBase.
+    read_end: Arc<AtomicI64>,
 
     read_detector: ReadDetector,
 }
@@ -293,9 +295,15 @@ impl FsReaderBuffer {
 
         let pos = 0;
         let len = file_blocks.status.len;
+        let read_end = Arc::new(AtomicI64::new(len));
 
         let base = FsReaderParallel::from_base(
-            FsReaderBase::new(path.clone(), fs_context.clone(), file_blocks.clone()),
+            FsReaderBase::new(
+                path.clone(),
+                fs_context.clone(),
+                file_blocks.clone(),
+                read_end.clone(),
+            ),
             read_detector.read_parallel() as usize,
             slice_size,
             vec![FileSlice::new(0, len)],
@@ -309,6 +317,7 @@ impl FsReaderBuffer {
             read_detector.read_parallel(),
             slice_size,
             chunk_size,
+            read_end.clone(),
         )?;
 
         let mut readers = Vec::with_capacity(all.len() + 1);
@@ -351,6 +360,7 @@ impl FsReaderBuffer {
             len,
             slice_size,
             absorb_window,
+            read_end,
             read_detector,
         };
         Ok(reader)
@@ -378,6 +388,12 @@ impl FsReaderBuffer {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// See [`FsReader::set_read_end`](crate::file::FsReader::set_read_end).
+    pub fn set_read_end(&self, end: i64) {
+        self.read_end
+            .store(end.clamp(0, self.len), Ordering::Relaxed);
     }
 
     fn select_reader_index(

@@ -94,39 +94,67 @@ impl RpcClient {
         let req_id = msg.req_id();
         let seq_id = msg.seq_id();
 
-        let rep_msg = match &self.sender {
-            BoxSender::Frame(f) => {
-                let frame = f.as_mut();
-                if let Err(e) = frame.send(msg).await {
-                    self.set_closed();
-                    return Err(e);
-                }
-
-                let msg = match frame.receive().await {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        self.set_closed();
-                        return Err(e);
-                    }
-                };
-
-                if msg.is_empty() {
-                    self.set_closed();
-                    return err_box!("Connection {} is closed", self.state.conn_info());
-                } else {
-                    msg
-                }
+        match &self.sender {
+            BoxSender::Frame(_) => {
+                self.send(msg).await?;
+                self.receive(req_id, seq_id).await
             }
 
             BoxSender::Channel(c) => {
                 let (tx, rx) = oneshot::channel();
                 try_err!(c.send(Envelope::new(msg.into_box(), tx)).await);
-                try_err!(rx.await)?
+                let rep_msg = try_err!(rx.await)?;
+                RawClient::check_response(req_id, seq_id, &rep_msg)?;
+                Ok(rep_msg)
+            }
+        }
+    }
+
+    /// Send a request without waiting for its response. Raw clients only: the
+    /// server answers a connection's requests in order, so pair every send with
+    /// a later [`Self::receive`], in the same order.
+    pub async fn send(&self, msg: impl RefMessage) -> IOResult<()> {
+        let BoxSender::Frame(f) = &self.sender else {
+            return err_box!("pipelined send needs a raw client");
+        };
+        if let Err(e) = f.as_mut().send(msg).await {
+            self.set_closed();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Receive the response to the oldest request sent with [`Self::send`].
+    pub async fn receive(&self, req_id: i64, seq_id: i32) -> IOResult<Message> {
+        let BoxSender::Frame(f) = &self.sender else {
+            return err_box!("pipelined receive needs a raw client");
+        };
+        let msg = match f.as_mut().receive().await {
+            Ok(msg) => msg,
+            Err(e) => {
+                self.set_closed();
+                return Err(e);
             }
         };
+        if msg.is_empty() {
+            self.set_closed();
+            return err_box!("Connection {} is closed", self.state.conn_info());
+        }
+        RawClient::check_response(req_id, seq_id, &msg)?;
+        Ok(msg)
+    }
 
-        RawClient::check_response(req_id, seq_id, &rep_msg)?;
-        Ok(rep_msg)
+    pub async fn timeout_send(&self, dur: Duration, msg: impl RefMessage) -> IOResult<()> {
+        timeout(dur, self.send(msg)).await?
+    }
+
+    pub async fn timeout_receive(
+        &self,
+        dur: Duration,
+        req_id: i64,
+        seq_id: i32,
+    ) -> IOResult<Message> {
+        timeout(dur, self.receive(req_id, seq_id)).await?
     }
 
     pub async fn timeout_rpc(&self, dur: Duration, msg: impl RefMessage) -> IOResult<Message> {
@@ -311,5 +339,78 @@ mod idle_raw_client_tests {
         let (client, _peer) = connected_pair().await;
         client.set_closed();
         assert!(!client.is_active());
+    }
+}
+
+#[cfg(test)]
+mod pipelined_tests {
+    use super::*;
+    use crate::message::Builder;
+    use crate::test::SimpleServer;
+    use curvine_io::DataSlice;
+    use curvine_runtime::runtime::RpcRuntime;
+
+    /// Requests sent back to back on one raw connection are answered in order,
+    /// each matched to its own req/seq id.
+    #[test]
+    fn pipelined_requests_are_answered_in_order() {
+        let server = SimpleServer::default();
+        let addr = server.bind_addr().clone();
+        server.start(0);
+        let conf = ClientConf::default();
+        let rt = Arc::new(conf.create_runtime());
+        rt.block_on(async move {
+            let mut client = None;
+            for _ in 0..50 {
+                if let Ok(c) = RpcClient::with_raw(&addr, &conf).await {
+                    client = Some(c);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let client = client.expect("server failed to start");
+
+            // SimpleHandler fails the first request of each req_id to exercise
+            // retries; spend it before pipelining.
+            let warmup = Builder::new_rpc(1).req_id(7).seq_id(-1).build();
+            let _ = client.rpc(warmup).await;
+
+            let words = ["a", "bb", "ccc"];
+            for (i, w) in words.iter().enumerate() {
+                let msg = Builder::new_rpc(1)
+                    .req_id(7)
+                    .seq_id(i as i32)
+                    .data(DataSlice::from_str(w))
+                    .build();
+                client.send(msg).await.unwrap();
+            }
+            for (i, w) in words.iter().enumerate() {
+                let rep = client.receive(7, i as i32).await.unwrap();
+                assert_eq!(rep.data.as_slice(), w.to_uppercase().as_bytes());
+            }
+        });
+    }
+
+    #[test]
+    fn pipelined_send_rejects_buffer_client() {
+        let server = SimpleServer::default();
+        let addr = server.bind_addr().clone();
+        server.start(0);
+        let conf = ClientConf::default();
+        let rt = Arc::new(conf.create_runtime());
+        let rt2 = rt.clone();
+        rt.block_on(async move {
+            let mut client = None;
+            for _ in 0..50 {
+                if let Ok(c) = RpcClient::with_buffer(rt2.clone(), &addr, &conf).await {
+                    client = Some(c);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let client = client.expect("server failed to start");
+            let msg = Builder::new_rpc(1).req_id(8).seq_id(0).build();
+            assert!(client.send(msg).await.is_err());
+        });
     }
 }
