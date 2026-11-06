@@ -14,6 +14,9 @@
 
 use serde::{Deserialize, Serialize};
 
+mod cached_status;
+pub use self::cached_status::CachedStatus;
+
 mod inode;
 pub use self::inode::Inode;
 

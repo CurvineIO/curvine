@@ -14,6 +14,8 @@
 
 #![allow(unused_variables)]
 
+use crate::{AttrSource, CachedStatusView};
+use crate::fs::dcache::CachedStatus;
 use crate::fs::operator::{Create, MkDir, MkNod};
 use crate::raw::fuse_abi::{
     fuse_attr, fuse_entry_out, fuse_ioctl_iovec, fuse_ioctl_out, fuse_setattr_in, FUSE_IOCTL_RETRY,
@@ -115,14 +117,30 @@ impl FuseUtils {
 
     // Decide reported permission bits, including symlink and synthetic `.`/`..` defaults.
     pub fn effective_perm(status: &FileStatus, umask: u32) -> u32 {
-        if status.file_type == FileType::Link {
+        Self::effective_perm_bits(
+            status.file_type,
+            status.id as u64,
+            &status.name,
+            status.mode,
+            umask,
+        )
+    }
+
+    fn effective_perm_bits(
+        file_type: FileType,
+        ino: u64,
+        name: &str,
+        mode: u32,
+        umask: u32,
+    ) -> u32 {
+        if file_type == FileType::Link {
             return FUSE_DEFAULT_SYMLINK_MODE;
         }
 
-        if status.id == FUSE_UNKNOWN_INO as i64 && FuseUtils.is_dot(&status.name) {
-            Self::default_mode(status.file_type) & !umask
+        if ino == FUSE_UNKNOWN_INO as u64 && FuseUtils.is_dot(name) {
+            Self::default_mode(file_type) & !umask
         } else {
-            status.mode & 0o7777
+            mode & 0o7777
         }
     }
 
@@ -161,9 +179,11 @@ impl FuseUtils {
     }
 
     pub fn rdev_from_status(status: &FileStatus) -> u32 {
-        status
-            .x_attr
-            .get(MKNOD_RDEV_XATTR)
+        Self::rdev_from_xattr(status.x_attr.get(MKNOD_RDEV_XATTR).map(Vec::as_slice))
+    }
+
+    fn rdev_from_xattr(value: Option<&[u8]>) -> u32 {
+        value
             .and_then(|bytes| {
                 let arr: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
                 Some(u32::from_le_bytes(arr))
@@ -253,24 +273,39 @@ impl FuseUtils {
     }
 
     pub fn fuse_st_size(status: &FileStatus) -> FuseResult<u64> {
-        let size = match status.file_type {
-            FileType::Link => status.target.as_ref().map(|x| x.len()).unwrap_or(0) as u64,
-            FileType::Dir => FUSE_DEFAULT_PAGE_SIZE as u64,
-            FileType::Fifo | FileType::Char | FileType::Block | FileType::Socket => 0,
+        Self::st_size(
+            status.file_type,
+            status.target.as_deref(),
+            status.len,
+            status.id as u64,
+        )
+    }
+
+    /// Report the same size for both status representations, so the `fuse_attr`
+    /// layout cannot drift between the backend status and the dcache copy.
+    pub(crate) fn st_size(
+        file_type: FileType,
+        target: Option<&str>,
+        len: i64,
+        ino: u64,
+    ) -> FuseResult<u64> {
+        match file_type {
+            FileType::Link => Ok(target.map(|x| x.len()).unwrap_or(0) as u64),
+            FileType::Dir => Ok(FUSE_DEFAULT_PAGE_SIZE as u64),
+            FileType::Fifo | FileType::Char | FileType::Block | FileType::Socket => Ok(0),
             // Reject negative backend lengths before converting regular-file size.
             _ => {
-                if status.len < 0 {
+                if len < 0 {
                     return err_fuse!(
                         libc::EINVAL,
                         "negative file length {} for ino {}",
-                        status.len,
-                        status.id
+                        len,
+                        ino
                     );
                 }
-                status.len as u64
+                Ok(len as u64)
             }
-        };
-        Ok(size)
+        }
     }
 
     pub fn is_dot(&self, name: &str) -> bool {
@@ -489,49 +524,77 @@ impl FuseUtils {
     }
 
     pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> FuseResult<fuse_attr> {
+        Self::attr_from_source(conf, status)
+    }
+
+    pub fn cached_status_to_attr(
+        conf: &FuseConf,
+        status: &CachedStatus,
+        ino: u64,
+        name: &str,
+    ) -> FuseResult<fuse_attr> {
+        Self::attr_from_source(conf, &CachedStatusView { status, ino, name })
+    }
+
+    fn attr_from_source<S: AttrSource + ?Sized>(
+        conf: &FuseConf,
+        source: &S,
+    ) -> FuseResult<fuse_attr> {
         // Derive blocks from reported size so size and blocks stay consistent.
-        let size = FuseUtils::fuse_st_size(status)?;
+        let size = source.size()?;
         let blocks = size.div_ceil(512);
 
-        let (mtime_sec, mtime_nsec) = Self::millis_to_fuse_timestamp(status.mtime);
-        let (atime_sec, atime_nsec) = Self::millis_to_fuse_timestamp(status.atime);
+        let (mtime_sec, mtime_nsec) = Self::millis_to_fuse_timestamp(source.mtime());
+        let (atime_sec, atime_nsec) = Self::millis_to_fuse_timestamp(source.atime());
 
         // Legacy/object-store statuses may not provide ctime yet. Falling back to mtime
         // preserves the previous behavior without hiding a real independent ctime.
-        let (ctime_sec, ctime_nsec) = Self::millis_to_fuse_timestamp(status.ctime());
+        let (ctime_sec, ctime_nsec) = Self::millis_to_fuse_timestamp(source.ctime());
 
-        let uid = if status.owner.is_empty() {
+        let owner = source.owner();
+        let uid = if owner.is_empty() {
             conf.uid
-        } else if let Ok(numeric_uid) = status.owner.parse::<u32>() {
+        } else if let Ok(numeric_uid) = owner.parse::<u32>() {
             numeric_uid
         } else {
-            match sys::get_uid_by_name(&status.owner) {
+            match sys::get_uid_by_name(owner) {
                 Some(uid) => uid,
                 None => conf.uid,
             }
         };
 
-        let gid = if status.group.is_empty() {
+        let group = source.group();
+        let gid = if group.is_empty() {
             conf.gid
-        } else if let Ok(numeric_gid) = status.group.parse::<u32>() {
+        } else if let Ok(numeric_gid) = group.parse::<u32>() {
             numeric_gid
         } else {
-            match sys::get_gid_by_name(&status.group) {
+            match sys::get_gid_by_name(group) {
                 Some(gid) => gid,
                 None => conf.gid,
             }
         };
 
-        let perm = FuseUtils::effective_perm(status, conf.umask);
-        let mode = FuseUtils::get_mode(perm, status.file_type);
-        let rdev = FuseUtils::rdev_from_status(status);
+        let perm = Self::effective_perm_bits(
+            source.file_type(),
+            source.ino(),
+            source.name(),
+            source.mode(),
+            conf.umask,
+        );
+        let mode = FuseUtils::get_mode(perm, source.file_type());
+        let rdev = FuseUtils::rdev_from_xattr(source.xattr(MKNOD_RDEV_XATTR));
 
         // A regular file/dir has at least one link; some backends (UFS/object
         // store) do not populate nlink, leaving it 0. Report at least 1.
-        let nlink = if status.nlink == 0 { 1 } else { status.nlink };
+        let nlink = if source.nlink() == 0 {
+            1
+        } else {
+            source.nlink()
+        };
 
         Ok(fuse_attr {
-            ino: status.id as u64,
+            ino: source.ino(),
             size,
             blocks,
             atime: atime_sec,

@@ -18,8 +18,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Deserialize, Serialize, Default, Clone, Debug)]
 pub struct DirEntry {
     pub scan_complete: bool,
-    pub children: BTreeMap<String, u64>,
-    pub deleted_children: BTreeSet<String>,
+    pub children: BTreeMap<Box<str>, u64>,
+    pub deleted_children: BTreeSet<Box<str>>,
 }
 
 impl DirEntry {
@@ -31,13 +31,13 @@ impl DirEntry {
         self.children.remove(name);
     }
 
-    pub fn add_child(&mut self, name: String, ino: u64) {
+    pub fn add_child(&mut self, name: Box<str>, ino: u64) {
         self.deleted_children.remove(&name);
         self.children.insert(name, ino);
     }
 
     pub fn mark_deleted_child(&mut self, name: &str) {
-        self.deleted_children.insert(name.to_owned());
+        self.deleted_children.insert(Box::<str>::from(name));
     }
 
     pub fn clear_deleted_child(&mut self, name: &str) {

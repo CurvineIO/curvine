@@ -37,6 +37,9 @@ pub use self::fuse_error::FuseError;
 pub mod fuse_metrics;
 pub use self::fuse_metrics::FuseMetrics;
 
+mod attr_source;
+pub(crate) use self::attr_source::*;
+
 mod fuse_utils;
 pub use self::fuse_utils::{FuseUtils, XattrOp};
 

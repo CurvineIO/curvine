@@ -25,7 +25,6 @@ use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{FileStatus, SetAttrOpts};
 use curvine_runtime::common::{FastHashMap, LocalTime};
 use curvine_runtime::sync::AtomicCounter;
-use std::collections::hash_map::Iter;
 
 /// Snapshot of dentry state before `unlink`, used to roll back local mutations when
 /// the master delete fails.
@@ -33,15 +32,15 @@ use std::collections::hash_map::Iter;
 pub struct UnlinkRollback {
     pub ino: u64,
     pub parent: u64,
-    pub name: String,
+    pub name: Box<str>,
     pub set_inode_mark_delete: bool,
     pub canonical_parent: u64,
-    pub canonical_name: String,
+    pub canonical_name: Box<str>,
     pub repointed: bool,
 }
 
 pub struct DirTree {
-    inodes: FastHashMap<u64, Inode>,
+    inodes: FastHashMap<u64, Box<Inode>>,
     id_creator: AtomicCounter,
     conf: FuseConf,
     cache_ttl: u64,
@@ -56,7 +55,7 @@ impl DirTree {
             conf,
             cache_ttl,
         };
-        tree.inodes.insert(FUSE_ROOT_ID, Inode::new_root());
+        tree.inodes.insert(FUSE_ROOT_ID, Box::new(Inode::new_root()));
         tree
     }
 
@@ -86,7 +85,7 @@ impl DirTree {
 
     pub fn get_inode(&self, ino: u64, name: Option<&str>) -> Option<&Inode> {
         let ino = self.get_ino(ino, name)?;
-        self.inodes.get(&ino)
+        self.inodes.get(&ino).map(Box::as_ref)
     }
 
     pub fn get_inode_check(&self, ino: u64, name: Option<&str>) -> FuseResult<&Inode> {
@@ -98,7 +97,7 @@ impl DirTree {
 
     pub fn get_inode_mut(&mut self, ino: u64, name: Option<&str>) -> Option<&mut Inode> {
         let ino = self.get_ino(ino, name)?;
-        self.inodes.get_mut(&ino)
+        self.inodes.get_mut(&ino).map(Box::as_mut)
     }
 
     pub fn get_inode_mut_check(&mut self, ino: u64, name: Option<&str>) -> FuseResult<&mut Inode> {
@@ -259,7 +258,7 @@ impl DirTree {
                         inode.add_ref(1);
                         inode.update_status(status);
                         inode.parent = parent;
-                        inode.name = name.to_owned();
+                        inode.name = Box::<str>::from(name);
                         ino
                     }
 
@@ -269,8 +268,14 @@ impl DirTree {
                         // Real LOOKUP / READDIRPLUS take a kernel lookup ref
                         // (n_lookup=1); plain READDIR takes none (n_lookup=0).
                         let n_lookup = if bump_kref { 1 } else { 0 };
-                        let inode = Inode::with_status(ino, parent, name, status, n_lookup);
-                        self.inodes.insert(ino, inode);
+                        let inode = Inode::with_status(
+                            ino,
+                            parent,
+                            Box::<str>::from(name),
+                            status,
+                            n_lookup,
+                        );
+                        self.inodes.insert(ino, Box::new(inode));
                         ino
                     }
                 }
@@ -279,7 +284,7 @@ impl DirTree {
 
         // Link child name under parent directory.
         let dir = self.get_dir_mut_check(parent)?;
-        dir.add_child(name.to_owned(), ino);
+        dir.add_child(Box::<str>::from(name), ino);
 
         self.get_inode_mut_check(ino, None)
     }
@@ -293,7 +298,7 @@ impl DirTree {
         let ino = self.get_ino_check(parent, Some(name))?;
         let (canonical_parent, canonical_name, was_canonical) = {
             let inode = self.get_inode_check(ino, None)?;
-            let was_canonical = inode.parent == parent && inode.name == name;
+            let was_canonical = inode.parent == parent && &*inode.name == name;
             (inode.parent, inode.name.clone(), was_canonical)
         };
         let (last_link, should_remove, set_inode_mark_delete) = {
@@ -344,7 +349,7 @@ impl DirTree {
         let rollback = UnlinkRollback {
             ino,
             parent,
-            name: name.to_owned(),
+            name: Box::<str>::from(name),
             set_inode_mark_delete,
             canonical_parent,
             canonical_name,
@@ -361,7 +366,7 @@ impl DirTree {
         if rb.repointed {
             let inode = self.get_inode_mut_check(rb.ino, None)?;
             inode.parent = rb.canonical_parent;
-            inode.name = rb.canonical_name.clone();
+            inode.name = rb.canonical_name;
         }
 
         {
@@ -378,13 +383,13 @@ impl DirTree {
 
     pub fn canonical_matches(&self, ino: u64, parent: u64, name: &str) -> bool {
         self.get_inode(ino, None)
-            .is_some_and(|inode| inode.parent == parent && inode.name == name)
+            .is_some_and(|inode| inode.parent == parent && &*inode.name == name)
     }
 
     pub fn repoint_canonical(&mut self, ino: u64, parent: u64, name: String) -> FuseResult<()> {
         let inode = self.get_inode_mut_check(ino, None)?;
         inode.parent = parent;
-        inode.name = name;
+        inode.name = name.into_boxed_str();
         Ok(())
     }
 
@@ -474,19 +479,19 @@ impl DirTree {
         self.get_dir_mut_check(old_id)?.remove_child(old_name);
         self.get_dir_mut_check(new_id)?.remove_child(new_name);
         self.get_dir_mut_check(old_id)?
-            .add_child(old_name.to_string(), new_ino);
+            .add_child(Box::<str>::from(old_name), new_ino);
         self.get_dir_mut_check(new_id)?
-            .add_child(new_name.to_string(), old_ino);
+            .add_child(Box::<str>::from(new_name), old_ino);
 
         {
             let inode = self.get_inode_mut_check(old_ino, None)?;
             inode.parent = new_id;
-            inode.name = new_name.to_string();
+            inode.name = Box::<str>::from(new_name);
         }
         {
             let inode = self.get_inode_mut_check(new_ino, None)?;
             inode.parent = old_id;
-            inode.name = old_name.to_string();
+            inode.name = Box::<str>::from(old_name);
         }
         Ok(())
     }
@@ -525,11 +530,11 @@ impl DirTree {
 
         // Insert new directory entry.
         let new_dir = self.get_dir_mut_check(new_id)?;
-        new_dir.add_child(new_name.to_string(), old_ino);
+        new_dir.add_child(Box::<str>::from(new_name), old_ino);
 
         let inode = self.get_inode_mut_check(old_ino, None)?;
         inode.parent = new_id;
-        inode.name = new_name.to_string();
+        inode.name = Box::<str>::from(new_name);
 
         Ok(())
     }
@@ -542,7 +547,7 @@ impl DirTree {
         status: FileStatus,
     ) -> FuseResult<&Inode> {
         let new_dir = self.get_dir_mut_check(new_id)?;
-        new_dir.add_child(new_name.to_string(), old_id);
+        new_dir.add_child(Box::<str>::from(new_name), old_id);
 
         let inode = self.get_inode_mut_check(old_id, None)?;
         inode.add_ref(1);
@@ -569,7 +574,7 @@ impl DirTree {
         let mut inode = self.get_inode_check(parent, None)?;
         while !inode.is_root() {
             seg_bytes += inode.name.len();
-            segments.push(inode.name.as_str());
+            segments.push(&*inode.name);
             inode = self.get_inode_check(inode.parent, None)?;
 
             if segments.len() >= FUSE_PATH_MAX_DEPTH {
@@ -612,7 +617,6 @@ impl DirTree {
             };
             inode.mark_delete = false;
             inode.deferred_delete_path = None;
-            inode.deferred_delete_master_id = None;
             (inode.parent, inode.name.clone())
         };
         // A missing parent directory means there is no deleted_children entry
@@ -661,10 +665,7 @@ impl DirTree {
     /// before deleting it (renames after unlink can reuse the name).
     pub fn set_deferred_delete_path(&mut self, ino: u64, path: String) {
         if let Some(inode) = self.inodes.get_mut(&ino) {
-            inode.deferred_delete_path = Some(path);
-            // The master file id captured when this inode was materialized
-            // (before `status.id` was re-stamped with the FUSE ino).
-            inode.deferred_delete_master_id = inode.master_id;
+            inode.deferred_delete_path = Some(path.into_boxed_str());
         }
     }
 
@@ -672,14 +673,14 @@ impl DirTree {
     pub fn deferred_delete_path(&self, ino: u64) -> Option<String> {
         self.get_inode(ino, None)
             .filter(|inode| inode.is_deleted())
-            .and_then(|inode| inode.deferred_delete_path.clone())
+            .and_then(|inode| inode.deferred_delete_path.as_deref().map(str::to_owned))
     }
 
     /// The recorded master file id of a pending deferred delete, if any.
     pub fn deferred_delete_master_id(&self, ino: u64) -> Option<i64> {
         self.get_inode(ino, None)
             .filter(|inode| inode.is_deleted())
-            .and_then(|inode| inode.deferred_delete_master_id)
+            .and_then(|inode| (inode.master_id > 0).then_some(inode.master_id))
     }
 
     pub fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
@@ -700,7 +701,7 @@ impl DirTree {
         self.inodes.reserve(inodes_count as usize);
         for _ in 0..inodes_count {
             let inode: Inode = reader.read_struct()?;
-            self.inodes.insert(inode.ino, inode);
+            self.inodes.insert(inode.ino, Box::new(inode));
         }
 
         Ok(())
@@ -711,7 +712,7 @@ impl DirTree {
     pub fn list_status(&self, ino: u64) -> FuseResult<Vec<FileStatus>> {
         let inode = self.get_inode_check(ino, None)?;
         if !inode.is_dir {
-            return Ok(vec![inode.status.clone()]);
+            return Ok(vec![inode.clone_status()]);
         }
 
         let dir = try_option_ref!(inode.dir);
@@ -743,8 +744,8 @@ impl DirTree {
         Ok(res)
     }
 
-    pub fn nodes_iter(&self) -> Iter<'_, u64, Inode> {
-        self.inodes.iter()
+    pub fn nodes_iter(&self) -> impl Iterator<Item = (&u64, &Inode)> {
+        self.inodes.iter().map(|(ino, inode)| (ino, inode.as_ref()))
     }
 
     /// Finds expired inodes that may be evicted, returning their inode numbers. Runs under the
@@ -1044,10 +1045,33 @@ mod test {
 
         let inode = t.get_inode_check(i, None).unwrap();
         assert_eq!(inode.parent, 700);
-        assert_eq!(inode.name, "b");
+        assert_eq!(&*inode.name, "b");
         assert_eq!(inode.ref_ctr, 2);
         assert_eq!(inode.n_lookup(), 2);
         assert_eq!(t.try_get_path(i, None).unwrap().full_path(), "/d/b");
+    }
+
+    /// `exchange` swaps both the dentries and the inodes' canonical paths.
+    #[test]
+    fn exchange_swaps_dentries_and_inode_paths() {
+        let mut t = DirTree::default();
+        let d1 = t
+            .lookup(FUSE_ROOT_ID, "d1", dir_st("d1", 800), true)
+            .unwrap()
+            .ino;
+        let d2 = t
+            .lookup(FUSE_ROOT_ID, "d2", dir_st("d2", 801), true)
+            .unwrap()
+            .ino;
+        let a = t.lookup(d1, "a", file_st("a", 900), true).unwrap().ino;
+        let b = t.lookup(d2, "b", file_st("b", 901), true).unwrap().ino;
+
+        t.exchange(d1, "a", d2, "b").unwrap();
+
+        assert_eq!(t.get_inode(d1, Some("a")).unwrap().ino, b);
+        assert_eq!(t.get_inode(d2, Some("b")).unwrap().ino, a);
+        assert_eq!(t.try_get_path(b, None).unwrap().full_path(), "/d1/a");
+        assert_eq!(t.try_get_path(a, None).unwrap().full_path(), "/d2/b");
     }
 
     /// Directory lookup records child names in the directory inode's `dir.children`; children resolve under parent.

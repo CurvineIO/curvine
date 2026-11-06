@@ -12,12 +12,14 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::fs::dcache::{DirEntry, Lifecycle};
+use crate::fs::dcache::{CachedStatus, DirEntry, Lifecycle};
 use crate::raw::fuse_abi::fuse_attr;
 use crate::{err_fuse, FuseResult, FuseUtils, FUSE_PATH_SEPARATOR, FUSE_ROOT_ID};
 use curvine_config::FuseConf;
 use curvine_core_error::try_option_mut;
-use curvine_model::{FileStatus, LocatedBlock, SetAttrOpts, SetAttrOptsBuilder};
+use curvine_model::{
+    FileStatus, LocatedBlock, SetAttrOpts, SetAttrOptsBuilder, INTERNAL_CTIME_XATTR,
+};
 use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
@@ -66,9 +68,9 @@ impl Clone for LookupCount {
 pub struct Inode {
     pub ino: u64,
     pub parent: u64,
-    pub name: String,
+    pub name: Box<str>,
 
-    pub status: FileStatus,
+    pub status: CachedStatus,
     pub locs: Option<Box<Vec<LocatedBlock>>>,
 
     pub lifecycle: Lifecycle,
@@ -88,38 +90,28 @@ pub struct Inode {
     /// be reconstructed. Recording the exact path taken at unlink (which is
     /// protected by `lock_path`) gives release a stable, correct deletion
     /// target even after renames or evictions (#1395).
-    #[serde(default)]
-    pub deferred_delete_path: Option<String>,
-
-    /// Master file id captured at unlink time alongside
-    /// `deferred_delete_path`.
     ///
-    /// `new_handle` overwrites `status.id` with the FUSE ino, so the master
-    /// id must be captured explicitly. Release compares it against a fresh
-    /// `stat` of the recorded path before falling back to a delete: a path
-    /// can be reused after an ancestor rename, and deleting by path alone
-    /// could remove an unrelated file (#1395).
-    #[serde(default)]
-    pub deferred_delete_master_id: Option<i64>,
+    /// `None` (the common case) for every inode that is not pending a
+    /// deferred delete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_delete_path: Option<Box<str>>,
 
     /// Master-side file id captured when this inode first entered the dcache,
-    /// before `status.id` is overwritten with the local FUSE ino.
+    /// before `status.id` is overwritten with the local FUSE ino; 0 when
+    /// unknown.
     ///
     /// Persisted with the dcache so the release-time deferred-delete identity
     /// check can compare a fresh `stat` of the recorded path against the
     /// originally unlinked file even after a FUSE restart (#1395).
-    #[serde(default)]
-    pub master_id: Option<i64>,
+    pub master_id: i64,
 }
 
 impl Inode {
     pub fn new_root() -> Self {
         // Match master `AclFeature::DEFAULT_MODE` (0o777). A mode-0 placeholder would
         // fail-closed on every non-root path traverse that walks the mount root.
-        let root_st = FileStatus {
+        let root_st = CachedStatus {
             is_dir: true,
-            name: FUSE_PATH_SEPARATOR.to_owned(),
-            path: FUSE_PATH_SEPARATOR.to_owned(),
             nlink: 2,
             mode: 0o777,
             ..Default::default()
@@ -128,7 +120,7 @@ impl Inode {
         Inode {
             ino: FUSE_ROOT_ID,
             parent: 0,
-            name: FUSE_PATH_SEPARATOR.to_owned(),
+            name: Box::<str>::from(FUSE_PATH_SEPARATOR),
             status: root_st,
             locs: None,
             lifecycle: Lifecycle::Invalid,
@@ -136,7 +128,9 @@ impl Inode {
             ref_ctr: 0,
             last_access: LocalTime::mills(),
             dir,
-            ..Default::default()
+            mark_delete: false,
+            deferred_delete_path: None,
+            master_id: 0,
         }
     }
 
@@ -146,8 +140,8 @@ impl Inode {
     pub fn with_status(
         ino: u64,
         parent: u64,
-        name: &str,
-        mut status: FileStatus,
+        name: Box<str>,
+        status: FileStatus,
         n_lookup: u64,
     ) -> Self {
         let dir = if status.is_dir {
@@ -156,22 +150,23 @@ impl Inode {
             None
         };
 
-        // Capture the master-side id before overwriting with the FUSE ino.
+        // Capture the master-side id before it is replaced by the FUSE ino in
+        // the cached copy.
         let master_id = status.id;
-        status.id = ino as i64;
         Inode {
             ino,
             parent,
-            name: name.to_owned(),
-            status,
+            name,
+            status: CachedStatus::from_status(status),
             locs: None,
             lifecycle: Lifecycle::Cached,
             n_lookup: LookupCount::new(n_lookup),
             ref_ctr: 1,
             last_access: LocalTime::mills(),
             dir,
-            master_id: (master_id > 0).then_some(master_id),
-            ..Default::default()
+            mark_delete: false,
+            deferred_delete_path: None,
+            master_id: master_id.max(0),
         }
     }
 
@@ -179,15 +174,13 @@ impl Inode {
     /// FUSE ino. Called from `update_status` when a backend status is applied
     /// (#1395).
     fn record_master_id(&mut self, backend_id: i64) {
-        if self.master_id.is_none() && backend_id > 0 {
-            self.master_id = Some(backend_id);
+        if self.master_id <= 0 && backend_id > 0 {
+            self.master_id = backend_id;
         }
     }
 
     pub fn clone_status(&self) -> FileStatus {
-        let mut status = self.status.clone();
-        status.name = self.name.clone();
-        status
+        self.status.to_file_status(self.ino, &self.name)
     }
 
     pub fn update_dirty_len(&mut self, len: i64) -> FuseResult<()> {
@@ -204,7 +197,7 @@ impl Inode {
         self.mark_delete && self.nlink <= 1
     }
 
-    pub fn update_status(&mut self, mut status: FileStatus) {
+    pub fn update_status(&mut self, status: FileStatus) {
         if self.is_dirty() {
             return;
         }
@@ -219,11 +212,11 @@ impl Inode {
         }
 
         // The incoming status still carries the master-side id (callers pass
-        // backend statuses; the local FUSE ino is re-stamped below). Capture
-        // it once for the release-time deferred-delete identity check (#1395).
+        // backend statuses; the FUSE ino lives in `ino` and is stamped back on
+        // the way out). Capture it once for the release-time deferred-delete
+        // identity check (#1395).
         self.record_master_id(status.id);
-        status.id = self.ino as i64;
-        self.status = status;
+        self.status = CachedStatus::from_status(status);
 
         self.lifecycle = Lifecycle::Cached;
         self.last_access = LocalTime::mills();
@@ -357,33 +350,42 @@ impl Inode {
         }
 
         if let Some(owner) = opts.owner {
-            self.owner = owner;
+            self.owner = owner.into_boxed_str();
         }
 
         if let Some(group) = opts.group {
-            self.group = group;
+            self.group = group.into_boxed_str();
         }
 
-        self.x_attr.extend(opts.add_x_attr);
-        self.x_attr.retain(|k, _| !opts.remove_x_attr.contains(k));
+        self.status
+            .apply_xattr_changes(opts.add_x_attr, &opts.remove_x_attr);
 
-        Ok(self.status.clone())
+        Ok(self.clone_status())
     }
 
     pub fn to_attr(&self, conf: &FuseConf) -> FuseResult<fuse_attr> {
-        FuseUtils::status_to_attr(conf, &self.status)
+        FuseUtils::cached_status_to_attr(conf, &self.status, self.ino, &self.name)
     }
 
     pub fn to_set_opts(&self) -> SetAttrOpts {
         let mut builder = SetAttrOptsBuilder::new()
             .mode(self.mode)
-            .owner(self.owner.to_owned())
-            .group(self.group.to_owned())
+            .owner(self.owner.to_string())
+            .group(self.group.to_string())
             .mtime(self.mtime)
             .atime(self.atime);
 
-        for (k, v) in self.x_attr.iter() {
-            builder = builder.add_x_attr(k.to_owned(), v.to_owned());
+        if self.status.ctime != 0 {
+            builder = builder.add_x_attr(
+                INTERNAL_CTIME_XATTR.to_owned(),
+                self.status.ctime.to_le_bytes().to_vec(),
+            );
+        }
+
+        if let Some(x_attr) = self.status.x_attr.as_deref() {
+            for (k, v) in x_attr.iter() {
+                builder = builder.add_x_attr(k.to_owned(), v.to_owned());
+            }
         }
 
         builder.build()
@@ -391,7 +393,7 @@ impl Inode {
 }
 
 impl Deref for Inode {
-    type Target = FileStatus;
+    type Target = CachedStatus;
 
     fn deref(&self) -> &Self::Target {
         &self.status
@@ -411,7 +413,7 @@ mod tests {
 
     #[test]
     fn n_lookup_serializes_as_plain_number() {
-        let inode = Inode::with_status(7, 1, "f", FileStatus::default(), 3);
+        let inode = Inode::with_status(7, 1, Box::<str>::from("f"), FileStatus::default(), 3);
         inode.add_lookup(2);
 
         let json = serde_json::to_value(&inode).unwrap();
@@ -420,5 +422,35 @@ mod tests {
         let restored: Inode = serde_json::from_value(json).unwrap();
         assert_eq!(restored.n_lookup(), 5);
         assert_eq!(restored.clone().n_lookup(), 5);
+    }
+
+    #[test]
+    fn deferred_delete_round_trips_through_serde() {
+        let mut inode = Inode::with_status(7, 1, Box::<str>::from("f"), FileStatus::default(), 1);
+        inode.deferred_delete_path = Some("/a/f".into());
+        inode.master_id = 603;
+
+        // What `persist` writes and `restore` reads back.
+        let json = serde_json::to_value(&inode).unwrap();
+        assert_eq!(
+            json["deferred_delete_path"],
+            serde_json::json!("/a/f")
+        );
+        assert_eq!(json["master_id"], serde_json::json!(603));
+
+        let restored: Inode = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.deferred_delete_path.as_deref(), Some("/a/f"));
+        assert_eq!(restored.master_id, 603);
+    }
+
+    #[test]
+    fn absent_deferred_delete_is_skipped_and_reads_back_as_none() {
+        let inode = Inode::with_status(8, 1, Box::<str>::from("g"), FileStatus::default(), 1);
+
+        let json = serde_json::to_value(&inode).unwrap();
+        assert!(json.get("deferred_delete_path").is_none());
+
+        let restored: Inode = serde_json::from_value(json).unwrap();
+        assert!(restored.deferred_delete_path.is_none());
     }
 }
