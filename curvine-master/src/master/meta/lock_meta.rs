@@ -16,7 +16,7 @@ use curvine_core_error::CommonResult;
 use curvine_model::{FileLock, LockFlags, LockType};
 use curvine_runtime::common::SerdeUtils as Serde;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// `FileLock` as it was persisted before session ownership (#1878).
 ///
@@ -76,8 +76,8 @@ pub(crate) fn decode_persisted_locks(bytes: &[u8]) -> CommonResult<Vec<FileLock>
 ///   it. Liveness is deliberately not consulted here, so a leader change can
 ///   never hand a healthy client's lock to a contender.
 /// * `session_owned` lock, gate off -> historical `lock_expire_time` from
-///   `acquire_time`, exactly like a legacy lock. This is the default until the
-///   reaper exists, so a crashed client's lock still expires.
+///   `acquire_time`, exactly like a legacy lock. Opt-out only; the default is on
+///   since the reaper exists.
 /// * legacy lock (`session_owned == false`) -> historical `lock_expire_time`
 ///   from `acquire_time`, unchanged, so pre-#1878 clients and their persisted
 ///   locks keep working.
@@ -90,7 +90,7 @@ pub struct LockValidity {
     /// `session_lock_lease` is off.
     legacy_expire_ms: u64,
     /// `master.client_session_lock_lease`: exempt session-owned locks from the
-    /// legacy TTL. Off by default until the session reaper (#1884) exists.
+    /// legacy TTL. On by default since the session reaper (#1884) exists.
     session_lock_lease: bool,
 }
 
@@ -113,6 +113,18 @@ impl LockValidity {
         }
         now.saturating_sub(lock.acquire_time) > self.legacy_expire_ms
     }
+}
+
+/// Distinct client ids holding a session-owned lock in `locks`.
+///
+/// Only these need an entry in the client ownership index (#1880): legacy locks
+/// keep the `lock_expire_time` path and are never reclaimed per client.
+pub(crate) fn session_owned_clients(locks: &[FileLock]) -> HashSet<String> {
+    locks
+        .iter()
+        .filter(|lock| lock.session_owned)
+        .map(|lock| lock.client_id.clone())
+        .collect()
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -172,6 +184,18 @@ impl LockMeta {
 
     pub fn locks(&self) -> (&HashMap<String, Vec<FileLock>>, &HashMap<String, FileLock>) {
         (&self.plock, &self.flock)
+    }
+
+    /// Session-owned client ids holding a lock here, taken by reference so the
+    /// lock records themselves are not cloned.
+    pub(crate) fn session_owned_clients(&self) -> HashSet<String> {
+        self.plock
+            .values()
+            .flatten()
+            .chain(self.flock.values())
+            .filter(|lock| lock.session_owned)
+            .map(|lock| lock.client_id.clone())
+            .collect()
     }
 
     fn regions_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {

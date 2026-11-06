@@ -37,6 +37,7 @@ pub struct ClientMetrics {
     pub write_time_us: Counter,
     pub read_bytes: Counter,
     pub read_time_us: Counter,
+    pub read_discarded_bytes: Counter,
     pub seek_absorbed_total: Counter,
     pub block_idle_conn: Gauge,
 }
@@ -74,6 +75,10 @@ impl ClientMetrics {
             write_time_us: m::new_counter("client_write_time_us", "write time us total")?,
             read_bytes: m::new_counter("client_read_bytes", "read bytes total")?,
             read_time_us: m::new_counter("client_read_time_us", "read time us total")?,
+            read_discarded_bytes: m::new_counter(
+                "client_read_discarded_bytes",
+                "pipelined read bytes received but dropped after a seek or close",
+            )?,
             seek_absorbed_total: m::new_counter(
                 "client_seek_absorbed_total",
                 "forward seeks absorbed by prefetch buffer",

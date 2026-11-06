@@ -482,6 +482,8 @@ impl ObjectStoreTrait for CurvineObjectStore {
             None => 0..meta.size,
         };
 
+        // Stop pipelined prefetch at the range end instead of reading past it.
+        reader.set_read_end(range.end as i64);
         if range.start > 0 {
             reader
                 .seek(range.start as i64)

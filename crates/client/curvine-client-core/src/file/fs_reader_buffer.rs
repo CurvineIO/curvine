@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::file::CallCtx;
 use crate::file::{FsContext, FsReaderBase, FsReaderParallel, ReadDetector};
 use crate::{FileChunk, FileSlice};
 use curvine_core_error::err_box;
@@ -73,7 +74,7 @@ struct BufferChannel {
     prefetch: Option<PrefetchArgs>,
     chunk_receiver: AsyncReceiver<FileChunk>,
     task_sender: AsyncSender<ReadTask>,
-    err_monitor: Arc<ErrorMonitor<FsError>>,
+    ctx: CallCtx,
     produced_end: Arc<AtomicI64>,
     // True between a successful absorb and the next full seek: only then may
     // read() drain residual below-pos chunks. Outside absorbed seeks, chunks
@@ -87,16 +88,12 @@ struct BufferChannel {
 }
 
 impl BufferChannel {
-    fn check_error(&self, e: impl Into<FsError>) -> FsError {
-        self.err_monitor.take_error().unwrap_or(e.into())
-    }
-
     fn start_prefetch(&mut self) {
         let Some(args) = self.prefetch.take() else {
             return;
         };
 
-        let monitor = self.err_monitor.clone();
+        let monitor = self.ctx.monitor();
         let parallel_id = args.reader.parallel_id();
 
         args.rt.spawn(async move {
@@ -139,16 +136,19 @@ impl BufferChannel {
             // (error-retry, restart, refactor) be silently drained into a hang
             // instead of tripping "read data error". A subsequent absorb
             // re-arms the flag.
-            let chunk = recv_skipping_below(&mut self.chunk_receiver, want_pos)
-                .await
-                .map_err(|e| self.check_error(e))?;
+            let chunk = self
+                .ctx
+                .call(
+                    "read_skip",
+                    recv_skipping_below(&mut self.chunk_receiver, want_pos),
+                )
+                .await?;
             self.needs_drain = false;
             Ok(chunk)
         } else {
-            self.chunk_receiver
-                .recv_check()
+            self.ctx
+                .call("read", self.chunk_receiver.recv_check())
                 .await
-                .map_err(|e| self.check_error(e))
         }
     }
 
@@ -192,7 +192,12 @@ impl BufferChannel {
 
             Ok::<(), FsError>(())
         };
-        fun.await.map_err(|e| self.check_error(e))
+        let res = self.ctx.call("seek", fun).await;
+        if res.is_err() {
+            self.produced_end.store(0, Ordering::Release);
+            self.needs_drain = true;
+        }
+        res
     }
 
     async fn complete(&mut self) -> FsResult<()> {
@@ -208,7 +213,7 @@ impl BufferChannel {
             rx.receive().await?;
             Ok::<(), FsError>(())
         };
-        fun.await.map_err(|e| self.check_error(e))
+        self.ctx.call("complete", fun).await
     }
 
     async fn pause(&self, pos: i64, pause: bool) -> FsResult<()> {
@@ -216,7 +221,7 @@ impl BufferChannel {
             return Ok(());
         }
         let fun = async { self.task_sender.send(ReadTask::Pause((pos, pause))).await };
-        fun.await.map_err(|e| self.check_error(e))
+        self.ctx.call("pause", fun).await
     }
 }
 
@@ -266,6 +271,8 @@ pub struct FsReaderBuffer {
 
     slice_size: i64,
     absorb_window: i64,
+    // Caller's read end, shared with every lane's FsReaderBase.
+    read_end: Arc<AtomicI64>,
 
     read_detector: ReadDetector,
 }
@@ -288,9 +295,15 @@ impl FsReaderBuffer {
 
         let pos = 0;
         let len = file_blocks.status.len;
+        let read_end = Arc::new(AtomicI64::new(len));
 
         let base = FsReaderParallel::from_base(
-            FsReaderBase::new(path.clone(), fs_context.clone(), file_blocks.clone()),
+            FsReaderBase::new(
+                path.clone(),
+                fs_context.clone(),
+                file_blocks.clone(),
+                read_end.clone(),
+            ),
             read_detector.read_parallel() as usize,
             slice_size,
             vec![FileSlice::new(0, len)],
@@ -304,6 +317,7 @@ impl FsReaderBuffer {
             read_detector.read_parallel(),
             slice_size,
             chunk_size,
+            read_end.clone(),
         )?;
 
         let mut readers = Vec::with_capacity(all.len() + 1);
@@ -324,7 +338,7 @@ impl FsReaderBuffer {
                     }),
                     chunk_receiver,
                     task_sender,
-                    err_monitor: err_monitor.clone(),
+                    ctx: CallCtx::reader(path.path().to_string(), err_monitor.clone()),
                     produced_end,
                     needs_drain: false,
                     #[cfg(test)]
@@ -346,6 +360,7 @@ impl FsReaderBuffer {
             len,
             slice_size,
             absorb_window,
+            read_end,
             read_detector,
         };
         Ok(reader)
@@ -373,6 +388,12 @@ impl FsReaderBuffer {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// See [`FsReader::set_read_end`](crate::file::FsReader::set_read_end).
+    pub fn set_read_end(&self, end: i64) {
+        self.read_end
+            .store(end.clamp(0, self.len), Ordering::Relaxed);
     }
 
     fn select_reader_index(
@@ -477,7 +498,7 @@ impl FsReaderBuffer {
         if self.slice_size <= 0 || pos / self.slice_size != self.pos / self.slice_size {
             return false;
         }
-        // 随机模式选中的是 base reader(无缓冲 channel),不可吸收。
+
         let Some(id) = Self::select_reader_index(
             self.read_detector.is_random(),
             pos,
@@ -488,12 +509,12 @@ impl FsReaderBuffer {
             return false;
         };
         let Some(ReaderAdapter::Buffer(ch)) = self.readers.get_mut(id) else {
-            return false; // base reader 或未初始化
+            return false;
         };
-        ch.start_prefetch(); // 保证预取任务已启动(否则水位必为 0,自然拒绝)
+        ch.start_prefetch();
         let absorbed = ch.can_absorb(pos);
         if absorbed {
-            ch.mark_absorbed(); // 后续 read 需要 drain 掉 pos 之下的残留 chunk
+            ch.mark_absorbed();
         }
         absorbed
     }
@@ -503,7 +524,6 @@ impl FsReaderBuffer {
             return Ok(());
         }
 
-        // 前向小跳且落在目标 lane 的已生产数据内:本地吸收,零后端交互。
         if pos > self.pos && self.try_absorb(pos) {
             debug!(
                 "seek absorbed: path={}, from={}, to={}, skipped={} bytes",
@@ -528,9 +548,6 @@ impl FsReaderBuffer {
         let was_random = self.read_detector.is_random();
         self.read_detector.record_seek(&self.path);
         if self.read_detector.enabled && was_random && self.absorb_window > 0 {
-            // 随机模式且吸收特性开启:只有 base reader 服务读;lane 在翻转 seek
-            // 时已 pause/drain,由 Random→Sequential 的 pause(pos, false) 循环
-            // 统一重定位。window=0 时走全量循环,与上游逐字节一致。
             if let Some(base) = self.readers.get_mut(self.base_reader_index) {
                 base.seek(pos).await?;
             }
@@ -1269,10 +1286,10 @@ mod tests {
         assert_eq!(reader.pos(), 6);
 
         // First read: the drain cycle starts but the channel is empty, so the
-        // future parks inside the receive — cancel it right there. The manual
-        // poll needs no runtime: channel receives park without an ambient
-        // executor.
-        {
+        // future parks inside the receive — cancel it right there. The noop
+        // waker never wakes the task, so a single poll must still return
+        // Pending.
+        rt.block_on(async {
             let mut fut = Box::pin(reader.read());
             let waker = std::task::Waker::noop();
             let mut cx = std::task::Context::from_waker(waker);
@@ -1280,7 +1297,7 @@ mod tests {
                 matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Pending),
                 "the read must park on the empty channel"
             );
-        } // dropped here: cancelled mid-receive
+        });
 
         // The lane now delivers the residual below-pos chunk and the covering
         // chunk.
@@ -1378,5 +1395,50 @@ mod tests {
         let data = rt.block_on(reader.read()).unwrap();
         assert_eq!(data.as_slice(), b"bb");
         assert_eq!(reader.pos(), 8);
+    }
+
+    // A failed seek (timeout, dead task) must not leave the lane's local state
+    // behind: the drain and the watermark reset run INSIDE the task, so a failed
+    // handshake skips them. A stale-high watermark lets can_absorb accept a target
+    // whose chunk never arrives (the read then waits out its own timeout), and a
+    // queued residual below pos would trip the alignment guard instead of draining.
+    #[tokio::test]
+    async fn failed_seek_resets_the_lane_watermark() {
+        let (chunk_sender, chunk_receiver) = AsyncChannel::<FileChunk>::new(2).split();
+        let (task_sender, task_receiver) = AsyncChannel::<ReadTask>::new(2).split();
+        let produced_end = Arc::new(AtomicI64::new(4096));
+
+        // The background task is already gone, so the seek handshake fails.
+        drop(task_receiver);
+
+        let mut channel = BufferChannel {
+            prefetch: None,
+            chunk_receiver,
+            task_sender,
+            ctx: CallCtx::reader(
+                "/gh-1908-failed-seek".to_string(),
+                Arc::new(ErrorMonitor::new()),
+            ),
+            produced_end: produced_end.clone(),
+            needs_drain: false,
+            #[cfg(test)]
+            fail_seek: false,
+        };
+        drop(chunk_sender);
+
+        assert!(channel.seek(1024).await.is_err());
+        assert_eq!(
+            produced_end.load(Ordering::Acquire),
+            0,
+            "a failed seek must reset the produced watermark"
+        );
+        assert!(
+            !channel.can_absorb(1024),
+            "a failed seek must not let a later seek false-absorb against the old watermark"
+        );
+        assert!(
+            channel.needs_drain,
+            "a failed seek must leave the residual chunks draining"
+        );
     }
 }

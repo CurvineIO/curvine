@@ -858,8 +858,8 @@ impl Dataset for VfsDataset {
 mod test {
     use super::{normalize_free_ratio, MAX_FREE_RATIO};
     use crate::{
-        BlockChecksum, BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore,
-        StorageVersion, VfsDataset, VfsDir, DEFAULT_CHECKSUM_CHUNK_SIZE,
+        BlockChecksum, BlockLayout, BlockTruncated, Dataset, DirList, DirState, FileLayout,
+        SpdkMetaStore, StorageVersion, VfsDataset, VfsDir, DEFAULT_CHECKSUM_CHUNK_SIZE,
     };
     use crate::{BlockMeta, BlockState, ChecksumHeader, ChecksumVerify};
     use curvine_config::{ClusterConf, WorkerConf};
@@ -1473,8 +1473,14 @@ mod test {
         let dir = ds.find_dir(finalized.dir_id())?;
         let err = match FileLayout.open_reader(dir, &finalized, 0, 50, ChecksumVerify::Off) {
             Ok(_) => panic!("truncated block must not be served as a sparse tail"),
-            Err(e) => e.to_string(),
+            Err(e) => e,
         };
+        // Callers tell a truncated block from other open failures by type.
+        assert!(
+            BlockTruncated::from_error(&err).is_some(),
+            "unexpected error: {err}"
+        );
+        let err = err.to_string();
         assert!(err.contains("is truncated"), "unexpected error: {err}");
         // The message reaches the client; it must not expose worker paths.
         let path_str = path.to_string_lossy();
@@ -1483,9 +1489,25 @@ mod test {
         // A read bounded below the committed length but beyond the surviving
         // bytes is also rejected.
         let dir = ds.find_dir(finalized.dir_id())?;
-        assert!(FileLayout
+        let err = FileLayout
             .open_reader(dir, &finalized, 0, 30, ChecksumVerify::Off)
-            .is_err());
+            .err()
+            .expect("read beyond the surviving bytes must fail");
+        assert!(
+            BlockTruncated::from_error(&err).is_some(),
+            "unexpected error: {err}"
+        );
+
+        // Other open failures are not reported as truncation.
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let err = FileLayout
+            .open_reader(dir, &finalized, 21, 20, ChecksumVerify::Off)
+            .err()
+            .expect("an offset past the logical length must fail");
+        assert!(
+            BlockTruncated::from_error(&err).is_none(),
+            "unexpected error: {err}"
+        );
 
         // Master-side truncate down to the surviving bytes stays readable:
         // only min(meta.len, logical_len) bytes must be present.

@@ -35,6 +35,8 @@ public class FilesystemConf {
 
     public String read_chunk_size = "128KB";
     public int read_chunk_num = 8;
+    // Chunk requests kept in flight per remote block read; 1 sends one at a time.
+    public int read_pipeline_depth = 1;
     public int read_parallel = 1;
     public String read_slice_size = "0";
 
@@ -60,12 +62,13 @@ public class FilesystemConf {
     //Configuration of timeout for a request.
     public long conn_timeout_ms = 30 * 1000;
     public long rpc_timeout_ms = 120 * 1000;
-    public long data_timeout_ms = 120 * 1000;
-
-    // Maximum time to wait for one write-buffer request/response handshake
-    // (data enqueue, flush, complete, cancel, seek, resize), in milliseconds.
-    // 0 keeps the native default (120s).
-    public long write_buffer_timeout_ms = 0;
+    // One fixed deadline for the data path, mirroring
+    // ClientConf::DEFAULT_DATA_TIMEOUT_MS (300s). The writer buffer handshake is
+    // bounded by it, and that handshake must outlast a Complete/Flush that drains
+    // the queued writes and then retries the master through a failover
+    // (rpc_timeout_ms + rpc_retry_max_duration_ms = 240s), otherwise a
+    // slow-but-healthy closeWriter is reported as failed (#1908).
+    public long data_timeout_ms = 300 * 1000;
 
     // Number of fs master connections.
     // Pool size 3 reaches the highest QPS. Pool size 1 supports the most clients, so the default is 1.
@@ -321,6 +324,7 @@ public class FilesystemConf {
                 ", write_chunk_num=" + write_chunk_num +
                 ", read_chunk_size='" + read_chunk_size + '\'' +
                 ", read_chunk_num=" + read_chunk_num +
+                ", read_pipeline_depth=" + read_pipeline_depth +
                 ", read_parallel=" + read_parallel +
                 ", read_slice_size='" + read_slice_size + '\'' +
                 ", max_cache_block_handles=" + max_cache_block_handles +
@@ -337,7 +341,6 @@ public class FilesystemConf {
                 ", conn_timeout_ms=" + conn_timeout_ms +
                 ", rpc_timeout_ms=" + rpc_timeout_ms +
                 ", data_timeout_ms=" + data_timeout_ms +
-                ", write_buffer_timeout_ms=" + write_buffer_timeout_ms +
                 ", master_conn_pool_size=" + master_conn_pool_size +
                 ", enable_read_ahead=" + enable_read_ahead +
                 ", read_ahead_len='" + read_ahead_len + '\'' +

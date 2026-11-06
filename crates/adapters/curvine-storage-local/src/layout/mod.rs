@@ -22,8 +22,10 @@ pub use self::file_layout::{FileLayout, SidecarSync};
 use crate::{BlockMeta, ChecksumVerify};
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
-use curvine_io::IOResult;
+use curvine_io::{IOError, IOResult};
 use curvine_model::{ExtendedBlock, StorageType};
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
 
 fn validate_open_offset(meta: &BlockMeta, off: i64) -> IOResult<()> {
@@ -32,6 +34,35 @@ fn validate_open_offset(meta: &BlockMeta, off: i64) -> IOResult<()> {
     }
     Ok(())
 }
+
+/// A block with a committed length whose file holds fewer bytes than that
+/// length. [`BlockLayout::open_reader`] fails with this error, so callers can
+/// tell a block that can no longer be trusted from a transient open failure.
+#[derive(Debug)]
+pub struct BlockTruncated {
+    pub id: i64,
+    pub committed_len: i64,
+    pub file_len: i64,
+}
+
+impl BlockTruncated {
+    /// The truncation behind `error`, if `error` reports one.
+    pub fn from_error(error: &IOError) -> Option<&Self> {
+        error.get_ref()?.downcast_ref()
+    }
+}
+
+impl fmt::Display for BlockTruncated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Block {} is truncated: committed length {}, file length {}",
+            self.id, self.committed_len, self.file_len
+        )
+    }
+}
+
+impl Error for BlockTruncated {}
 
 pub trait BlockLayout {
     /// Whether rewriting a finalized block keeps the committed allocation
@@ -69,7 +100,8 @@ pub trait BlockLayout {
     fn open_writer(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext>;
 
     /// `verify` asks layouts with checksum sidecars to verify reads; others
-    /// ignore it.
+    /// ignore it. A layout that finds the block file shorter than the
+    /// committed length fails with [`BlockTruncated`].
     fn open_reader(
         &self,
         dir: &VfsDir,

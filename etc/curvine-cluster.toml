@@ -82,6 +82,14 @@ meta_dir = "testing/meta"
 # trash_purge_interval = "1s"
 # delete_stage_min_children = 4096
 
+# S3 UFS mounts. `s3.credentials.type = role` and `= auto` resolve the credential from the node
+# environment (instance role, IRSA, AWS_* variables), i.e. from the cluster's own cloud identity
+# rather than from a key the caller supplies. The mount RPC is not authenticated, so any client
+# that can reach the master could mount a bucket with that identity; the capability is therefore
+# off by default. Static AK/SK, sts, and role mounts that carry their own source key are not
+# affected. Enable only where the mount RPC is restricted to trusted operators.
+# s3_allow_env_credentials = false
+
 # Client session lease. Every client (FUSE, SDK, CLI) registers a session with
 # ClientHeartbeat; a session whose lease lapses is reaped together with the locks
 # and writer markers it owns. client_session_timeout is that lease (default 60s)
@@ -90,11 +98,18 @@ meta_dir = "testing/meta"
 # client_session_timeout = "60s"
 # client_session_lock_lease exempts session-owned locks from lock_expire_time:
 # while it is on, only the owning client or the session reaper releases them.
+# With the gate on, the reaper releases a session-owned lock about 2x
+# client_session_timeout after a master becomes active (the tick adds up to
+# half of that), so lock_expire_time no longer bounds session-owned locks; and
+# a lapsed session's open file is marked complete - on an fs-mode mount it is
+# exported to the UFS.
 # Lock lifetime is decided from each master's local config, so every master in
 # the group must run the same value. A gate-off leader would still expire a
 # healthy client's lock after lock_expire_time, which is the regression #1879
-# fixes. Default false; #1884 enables it once the reaper exists.
-# client_session_lock_lease = false
+# fixes. Default true: the session reaper releases a dead client's locks once
+# its lease lapses. With it off, session-owned locks fall back to
+# lock_expire_time and the reaper only releases writer markers.
+# client_session_lock_lease = true
 # Log rotation applies when log_dir is a directory; stdout and stderr are not rotated.
 # max_file_size_mb: rotate when the file reaches this size in MB (default 100, 0 = no size limit).
 # time_rotation: "daily" or "hourly" (default none). Combined with max_file_size_mb, whichever

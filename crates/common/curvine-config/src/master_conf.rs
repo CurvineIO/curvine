@@ -153,6 +153,15 @@ pub struct MasterConf {
     #[serde(skip)]
     pub trash_purge_interval_unit: DurationUnit,
 
+    // Whether an S3 UFS mount may name a credential source that resolves the identity from the
+    // node environment: `s3.credentials.type = role` (assume the role from the node identity,
+    // IRSA or AWS_* variables) or `auto` (whatever the SDK default chain finds). Off by default:
+    // the mount RPC is not authenticated (#1972), so enabling it lets any client that can reach
+    // the master mount a bucket with the cluster's own cloud identity, and workers then read it
+    // with that identity. Turn it on deliberately in deployments that treat the master RPC as
+    // admin-only.
+    pub s3_allow_env_credentials: bool,
+
     // Eviction configuration
     pub enable_quota_eviction: bool,
     pub quota_eviction_mode: String,
@@ -178,9 +187,10 @@ pub struct MasterConf {
     pub lock_expire_time_unit: DurationUnit,
 
     // Whether `session_owned` locks are released only by their owner or the
-    // session reaper instead of `lock_expire_time` (#1879). Defaults to false:
-    // until the reaper (#1884) exists, a crashed client's lock must still expire
-    // on the legacy TTL. #1884 flips this default to true.
+    // session reaper instead of `lock_expire_time` (#1879). Defaults to true since
+    // the reaper (#1884) releases a dead client's locks. Turning it off returns
+    // session-owned locks to the legacy TTL; the reaper then only releases writer
+    // markers.
     pub client_session_lock_lease: bool,
 
     // Client session lease: a client session that has not sent a ClientHeartbeat
@@ -440,6 +450,8 @@ impl Default for MasterConf {
             audit_logging_enabled: true,
             audit_log: Default::default(),
 
+            s3_allow_env_credentials: false,
+
             block_replication_enabled: false,
             block_replication_concurrency_limit: 1000,
             block_replication_retry_interval: "5s".to_string(),
@@ -495,7 +507,7 @@ impl Default for MasterConf {
             lock_expire_time: "5m".to_string(),
             lock_expire_time_unit: Default::default(),
 
-            client_session_lock_lease: false,
+            client_session_lock_lease: true,
 
             client_session_timeout: "60s".to_string(),
             client_session_timeout_unit: Default::default(),
@@ -646,13 +658,13 @@ mod tests {
     }
 
     #[test]
-    fn client_session_lock_lease_defaults_off() {
+    fn client_session_lock_lease_defaults_on() {
         let mut conf = MasterConf::default();
         conf.init().unwrap();
 
         assert!(
-            !conf.client_session_lock_lease,
-            "session-owned locks must keep the legacy TTL until the reaper exists"
+            conf.client_session_lock_lease,
+            "the session reaper (#1884) releases dead clients' locks, so the lease is on"
         );
     }
 

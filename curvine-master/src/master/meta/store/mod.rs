@@ -13,7 +13,10 @@
 // limitations under the License.
 
 mod inode_store;
-pub use self::inode_store::{InodeStore, PurgeItem, PurgeTarget};
+pub use self::inode_store::{InodeStore, OwnerKind, PurgeItem, PurgeTarget};
 
 mod rocks_inode_store;
 pub use self::rocks_inode_store::*;
+
+#[cfg(test)]
+mod client_owner_tests;

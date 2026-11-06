@@ -40,6 +40,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 async-stream = "0.3"
 urlencoding = "2.1"
 
+curvine-alloc = { workspace = true }
 curvine-config = { workspace = true }
 curvine-core-error = { workspace = true }
 curvine-error = { workspace = true }

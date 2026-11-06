@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::master::meta::inode::InodeView;
+use crate::master::meta::store::OwnerKind;
 use crate::master::meta::LockMeta;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{BlockLocation, FileLock, MountInfo};
 use curvine_rocksdb::{DBConf, DBEngine, ReadOptions, RocksIterator, RocksUtils};
 use curvine_rocksdb::{
@@ -41,6 +42,12 @@ impl RocksInodeStore {
 
     pub const PREFIX_MOUNT: u8 = 0x01;
     pub const PREFIX_LOCK: u8 = 0x02;
+    /// Client ownership index: which inodes a client owns lock/writer state on
+    /// (#1880). Key layout:
+    /// `[PREFIX_CLIENT_OWNER][client_id len u16 BE][client_id][kind u8][inode id i64]`.
+    /// The length prefix keeps the client-id prefix unambiguous for ids that are
+    /// not fixed width (uuid, `curvine-lancedb:<pid>`, ...).
+    pub const PREFIX_CLIENT_OWNER: u8 = 0x03;
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
@@ -287,14 +294,137 @@ impl RocksInodeStore {
         }
     }
 
-    pub fn set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
-        let key = RocksUtils::u8_i64_to_bytes(Self::PREFIX_LOCK, id);
-        if lock.is_empty() {
-            self.db.delete_cf(RocksInodeStore::CF_COMMON, key)
-        } else {
-            let value = Serde::serialize(&lock)?;
-            self.db.put_cf(RocksInodeStore::CF_COMMON, key, value)
+    fn client_owner_prefix(client_id: &str, kind: Option<OwnerKind>) -> CommonResult<Vec<u8>> {
+        let bytes = client_id.as_bytes();
+        let Ok(len) = u16::try_from(bytes.len()) else {
+            return err_box!("client id length {} exceeds u16::MAX", bytes.len());
+        };
+        let mut key = Vec::with_capacity(bytes.len() + 5);
+        key.push(Self::PREFIX_CLIENT_OWNER);
+        key.extend_from_slice(&len.to_be_bytes());
+        key.extend_from_slice(bytes);
+        if let Some(kind) = kind {
+            key.push(kind.as_u8());
         }
+        Ok(key)
+    }
+
+    pub(crate) fn client_owner_key(
+        client_id: &str,
+        kind: OwnerKind,
+        ino: i64,
+    ) -> CommonResult<Vec<u8>> {
+        let mut key = Self::client_owner_prefix(client_id, Some(kind))?;
+        key.extend_from_slice(&ino.to_be_bytes());
+        Ok(key)
+    }
+
+    /// Record that `client_id` owns `kind` state on `ino`. Idempotent.
+    pub fn add_client_owner(&self, client_id: &str, kind: OwnerKind, ino: i64) -> CommonResult<()> {
+        let key = Self::client_owner_key(client_id, kind, ino)?;
+        self.db.put_cf(Self::CF_COMMON, key, [])
+    }
+
+    /// Drop one ownership hint. Idempotent.
+    pub fn remove_client_owner(
+        &self,
+        client_id: &str,
+        kind: OwnerKind,
+        ino: i64,
+    ) -> CommonResult<()> {
+        let key = Self::client_owner_key(client_id, kind, ino)?;
+        self.db.delete_cf(Self::CF_COMMON, key)
+    }
+
+    /// Every ownership hint held by `client_id`, in key order.
+    pub fn get_client_owners(&self, client_id: &str) -> CommonResult<Vec<(OwnerKind, i64)>> {
+        self.get_client_owners_limited(client_id, None, usize::MAX)
+    }
+
+    /// At most `limit` ownership hints held by `client_id`, in key order,
+    /// optionally restricted to one `kind`. The session reaper reads only what
+    /// one tick can act on, so a client with a large backlog costs O(budget) per
+    /// tick instead of a full rescan (#1884).
+    pub fn get_client_owners_limited(
+        &self,
+        client_id: &str,
+        kind: Option<OwnerKind>,
+        limit: usize,
+    ) -> CommonResult<Vec<(OwnerKind, i64)>> {
+        // With a kind the prefix already includes the kind byte; without one the
+        // kind byte is the first byte after the prefix.
+        let client_prefix_len = Self::client_owner_prefix(client_id, None)?.len();
+        let prefix = Self::client_owner_prefix(client_id, kind)?;
+        let iter = self.db.prefix_scan(Self::CF_COMMON, prefix.as_slice())?;
+        let mut owners = Vec::new();
+        for item in iter {
+            if owners.len() >= limit {
+                break;
+            }
+            let (key, _) = item?;
+            if let Some(owner) = Self::decode_owner_suffix(&key, client_prefix_len) {
+                owners.push(owner);
+            }
+        }
+        Ok(owners)
+    }
+
+    /// Lock-kind ownership hints of *every* client, in key order, starting at
+    /// `cursor` (inclusive; `None` = from the first hint). Visits at most `limit`
+    /// index keys of any kind, so the cost is bounded even across long runs of
+    /// writer hints, and returns the lock hints among them as `(client_id, ino,
+    /// key)` plus the key to resume from, or `None` once the index is exhausted.
+    ///
+    /// Used by the session reaper to find locks whose owner is absent from the
+    /// session map after a failover (#1884): such a client never heartbeats the
+    /// new leader, so it is never in the map that drives normal reaping.
+    #[allow(clippy::type_complexity)]
+    pub fn scan_lock_owners(
+        &self,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> CommonResult<(Vec<(String, i64, Vec<u8>)>, Option<Vec<u8>>)> {
+        let lower = [Self::PREFIX_CLIENT_OWNER];
+        let upper = [Self::PREFIX_CLIENT_OWNER + 1];
+        let start: &[u8] = cursor.unwrap_or(&lower);
+        let iter = self.db.range_scan(Self::CF_COMMON, start, &upper[..])?;
+
+        let mut hints = Vec::new();
+        for (visited, item) in iter.enumerate() {
+            let (key, _) = item?;
+            if visited >= limit {
+                return Ok((hints, Some(key.to_vec())));
+            }
+            let Some((client_id, prefix_len)) = Self::decode_owner_client(&key) else {
+                continue;
+            };
+            if let Some((OwnerKind::Lock, ino)) = Self::decode_owner_suffix(&key, prefix_len) {
+                hints.push((client_id, ino, key.to_vec()));
+            }
+        }
+        Ok((hints, None))
+    }
+
+    /// Client id and client-prefix length of an ownership key.
+    fn decode_owner_client(key: &[u8]) -> Option<(String, usize)> {
+        if key.len() < 3 || key[0] != Self::PREFIX_CLIENT_OWNER {
+            return None;
+        }
+        let len = u16::from_be_bytes([key[1], key[2]]) as usize;
+        let id = key.get(3..3 + len)?;
+        let id = std::str::from_utf8(id).ok()?.to_string();
+        Some((id, 3 + len))
+    }
+
+    /// `(kind, ino)` of an ownership key whose client prefix is `prefix_len` bytes.
+    fn decode_owner_suffix(key: &[u8], prefix_len: usize) -> Option<(OwnerKind, i64)> {
+        if key.len() != prefix_len + 1 + 8 {
+            return None;
+        }
+        let kind = OwnerKind::from_u8(key[prefix_len])?;
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&key[prefix_len + 1..prefix_len + 9]);
+        Some((kind, i64::from_be_bytes(raw)))
     }
 
     pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
@@ -373,6 +503,36 @@ impl<'a> InodeWriteBatch<'a> {
     }
 
     // Add an inode.
+    pub fn add_client_owner(
+        &mut self,
+        client_id: &str,
+        kind: OwnerKind,
+        ino: i64,
+    ) -> CommonResult<()> {
+        let key = RocksInodeStore::client_owner_key(client_id, kind, ino)?;
+        self.put_cf(RocksInodeStore::CF_COMMON, key, [])
+    }
+
+    pub fn remove_client_owner(
+        &mut self,
+        client_id: &str,
+        kind: OwnerKind,
+        ino: i64,
+    ) -> CommonResult<()> {
+        let key = RocksInodeStore::client_owner_key(client_id, kind, ino)?;
+        self.delete_cf(RocksInodeStore::CF_COMMON, key)
+    }
+
+    pub fn set_locks(&mut self, id: i64, locks: &[FileLock]) -> CommonResult<()> {
+        let key = RocksUtils::u8_i64_to_bytes(RocksInodeStore::PREFIX_LOCK, id);
+        if locks.is_empty() {
+            self.delete_cf(RocksInodeStore::CF_COMMON, key)
+        } else {
+            let value = Serde::serialize(&locks)?;
+            self.put_cf(RocksInodeStore::CF_COMMON, key, value)
+        }
+    }
+
     pub fn write_inode(&mut self, inode: &InodeView) -> CommonResult<()> {
         let key = RocksUtils::i64_to_bytes(inode.id());
         let value = Serde::serialize(inode)?;
@@ -422,6 +582,48 @@ mod tests {
     use curvine_model::StorageType;
     use curvine_rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
     use curvine_runtime::common::Utils;
+
+    fn test_store(name: &str) -> RocksInodeStore {
+        let conf = DBConf::new(Utils::test_sub_dir(format!(
+            "{}-{}",
+            name,
+            Utils::rand_str(8)
+        )));
+        RocksInodeStore::new(conf, true).unwrap()
+    }
+
+    #[test]
+    fn client_owner_keys_distinguish_long_ids_with_a_shared_prefix() {
+        let store = test_store("client-owner-long-id");
+        let base = "client-".repeat(50);
+        let first = format!("{}-a", base);
+        let second = format!("{}-b", base);
+
+        store
+            .add_client_owner(&first, OwnerKind::Writer, 11)
+            .unwrap();
+        store
+            .add_client_owner(&second, OwnerKind::Writer, 22)
+            .unwrap();
+
+        assert_eq!(
+            store.get_client_owners(&first).unwrap(),
+            vec![(OwnerKind::Writer, 11)]
+        );
+        assert_eq!(
+            store.get_client_owners(&second).unwrap(),
+            vec![(OwnerKind::Writer, 22)]
+        );
+
+        let too_long = "x".repeat(u16::MAX as usize + 1);
+        assert!(
+            store
+                .add_client_owner(&too_long, OwnerKind::Writer, 33)
+                .is_err(),
+            "a client id that cannot be length-prefixed must be rejected, not \
+             silently truncated"
+        );
+    }
 
     #[test]
     fn reused_location_iterator_does_not_expand_corrupt_sst_scope() {

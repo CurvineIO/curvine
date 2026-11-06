@@ -165,6 +165,50 @@ fn corrupt_block_is_removed_and_reported_as_corrupted() -> CommonResult<()> {
 }
 
 #[test]
+fn truncated_block_is_removed_and_reported_as_corrupted() -> CommonResult<()> {
+    let conf = ClusterConf {
+        format_worker: true,
+        worker: WorkerConf {
+            dir_reserved: "0".to_string(),
+            data_dir: vec!["[MEM:4MB]../testing/heartbeat-task-truncated".to_string()],
+            ..WorkerConf::default()
+        },
+        ..ClusterConf::default()
+    };
+    let store = BlockStore::new("test", &conf)?;
+    let mut block = ExtendedBlock::with_mem(9, "1MB")?;
+    let meta = store.open_block(&block)?;
+    let mut writer = store.open_writer(&meta, 0)?;
+    writer.write_region(&DataSlice::Buffer(BytesMut::from(&[9u8; 4096][..])))?;
+    writer.flush()?;
+    drop(writer);
+    block.len = 4096;
+    let finalized = store.finalize_block(&block)?;
+    let path = store.short_circuit(&finalized)?.unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)?
+        .set_len(100)?;
+
+    // A failed read open is all it takes to queue the block.
+    assert!(store.open_reader_by_id(9, 0, 4096).is_err());
+
+    let executor = Arc::new(GroupExecutor::new("heartbeat-truncated-test", 1, 2));
+    let reports = Arc::new(DashMap::new());
+    HeartbeatTask::invalidate_corrupt_task(executor.clone(), store.clone(), reports.clone());
+    drain(&executor);
+
+    let (_, report) = reports.remove(&9).expect("missing corrupted report");
+    assert_eq!(report.status, BlockReportStatus::Deleted);
+    assert!(report.corrupted);
+    assert_eq!(report.block_size, 4096);
+    assert!(store.get_block(9).is_err());
+    assert!(!std::path::Path::new(&path).exists());
+    std::mem::forget(executor);
+    Ok(())
+}
+
+#[test]
 fn corrupt_block_held_by_a_writer_is_cleaned_up_once_released() -> CommonResult<()> {
     let (store, _) = corrupt_checksummed_block("heartbeat-task-corrupt-writer", 8)?;
     store.report_corrupt(8, "test");

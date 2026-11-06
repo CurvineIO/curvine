@@ -107,9 +107,10 @@ impl HeartbeatTask {
         }
     }
 
-    /// Re-check blocks whose reads failed a chunk CRC. A block that fails
-    /// again is removed and reported as a corrupted deletion, so master drops
-    /// the location and restores the replica count.
+    /// Re-check blocks whose reads failed a chunk CRC or found the file
+    /// truncated. A block whose damage is confirmed is removed and reported as
+    /// a corrupted deletion, so master drops the location and restores the
+    /// replica count.
     pub(crate) fn invalidate_corrupt_task(
         executor: Arc<GroupExecutor>,
         store: BlockStore,

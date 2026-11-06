@@ -99,7 +99,7 @@ impl Default for ClientConf {
 
             conn_timeout_ms: 30 * 1000,
             rpc_timeout_ms: 2 * 60 * 1000,
-            data_timeout_ms: 2 * 60 * 1000,
+            data_timeout_ms: 5 * 60 * 1000,
 
             conn_size: 1,
 

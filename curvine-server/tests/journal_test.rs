@@ -28,7 +28,8 @@ use curvine_runtime::common::{CommonUtils, FileUtils, Logger, TimeSpent, Utils};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{
-    CompleteFileEntry, JournalBatch, JournalEntry, JournalLoader, JournalSystem, UfsLoader,
+    CompleteFileEntry, JournalBatch, JournalEntry, JournalLoader, JournalSystem,
+    ReleaseWriterEntry, UfsLoader,
 };
 use curvine_server::master::{Master, MountManager};
 use log::info;
@@ -36,9 +37,21 @@ use prost::Message;
 use raft::eraftpb::{ConfChange, Entry, EntryType};
 use raft::StateRole;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
+
+/// Master file counts live in a process-global metrics registry, and every
+/// `JournalSystem` a test creates resets it. Every test in this file builds a
+/// master, so they all take this lock; otherwise a concurrent load resets the
+/// counts under `test_apply_snapshot_refuses_empty_over_populated_files`.
+static METRICS_SENSITIVE_TESTS: Mutex<()> = Mutex::new(());
+
+fn serialize_metrics_sensitive_test() -> MutexGuard<'static, ()> {
+    METRICS_SENSITIVE_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn replay_entries(
     loader: &JournalLoader,
@@ -102,6 +115,7 @@ fn new_test_ufs_uri(name: &str) -> CommonResult<CurvineURI> {
 
 #[test]
 fn leader_promotion_applies_committed_metadata_before_returning() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     Master::init_test_metrics();
 
     let mut source_conf = ClusterConf {
@@ -145,6 +159,7 @@ fn leader_promotion_applies_committed_metadata_before_returning() -> CommonResul
 
 #[test]
 fn leader_promotion_advances_applied_index_over_committed_noop() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     Master::init_test_metrics();
 
     let mut source_conf = ClusterConf {
@@ -202,6 +217,7 @@ fn leader_promotion_advances_applied_index_over_committed_noop() -> CommonResult
 
 #[test]
 fn leader_promotion_advances_over_committed_configuration_entry() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     Master::init_test_metrics();
 
     let mut conf = ClusterConf {
@@ -231,6 +247,7 @@ fn leader_promotion_advances_over_committed_configuration_entry() -> CommonResul
 
 #[test]
 fn follower_replay_allows_inode_id_below_allocator_watermark() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     Master::init_test_metrics();
 
     let mut source_conf = ClusterConf {
@@ -286,6 +303,7 @@ fn follower_replay_allows_inode_id_below_allocator_watermark() -> CommonResult<(
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.
 #[test]
 fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     Master::init_test_metrics();
 
     let mut conf = ClusterConf {
@@ -330,6 +348,7 @@ fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult
 // Start 2 masters at the same time to check the correctness of log playback.
 #[test]
 fn test_raft_consensus_and_state_synchronization_between_two_masters() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     Logger::default();
     Master::init_test_metrics();
 
@@ -539,6 +558,7 @@ fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
 
 #[test]
 fn test_ufs_loader_mkdir_recreates_missing_ufs_parent() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     Master::init_test_metrics();
 
     let mut conf = ClusterConf {
@@ -669,6 +689,22 @@ fn take_complete_file_entry(journal_system: &JournalSystem) -> CommonResult<Comp
     }
 }
 
+fn take_release_writer_entry(journal_system: &JournalSystem) -> CommonResult<ReleaseWriterEntry> {
+    match journal_system
+        .fs()
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .find_map(|entry| match entry {
+            JournalEntry::ReleaseWriter(e) => Some(e),
+            _ => None,
+        }) {
+        Some(entry) => Ok(entry),
+        None => err_box!("missing release_writer journal entry"),
+    }
+}
+
 fn collect_ufs_rel_files(dir: &std::path::Path) -> Vec<String> {
     let mut files = Vec::new();
     fn walk(root: &std::path::Path, dir: &std::path::Path, files: &mut Vec<String>) {
@@ -691,6 +727,7 @@ fn collect_ufs_rel_files(dir: &std::path::Path) -> Vec<String> {
 
 #[test]
 fn test_ufs_loader_complete_file_skips_non_mount() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     let (conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("skip-non-mount")?;
 
     fs.create("/plain.log", true)?;
@@ -731,6 +768,7 @@ fn test_ufs_loader_complete_file_skips_non_mount() -> CommonResult<()> {
 
 #[test]
 fn test_ufs_loader_complete_file_rename_within_mount_exports_live_path() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     let (conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("rename-within-mount")?;
 
     let created = fs.create("/mnt/old.log", true)?;
@@ -795,9 +833,89 @@ fn test_ufs_loader_complete_file_rename_within_mount_exports_live_path() -> Comm
     Ok(())
 }
 
+#[test]
+fn test_ufs_loader_release_writer_exports_after_last_writer() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    let (conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("release-writer")?;
+
+    let mut opts = CreateFileOpts::with_create(false);
+    opts.client_name = "client-a".to_string();
+    let created = fs.create_with_opts(
+        "/mnt/two-writers.log",
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+    let ino = created.id;
+
+    let mut open_opts = CreateFileOpts::with_create(false);
+    open_opts.client_name = "client-b".to_string();
+    fs.open_file("/mnt/two-writers.log", open_opts, OpenFlags::new_create())?;
+
+    journal_system.fs().fs_dir.read().take_entries();
+    fs.complete_file(
+        "/mnt/two-writers.log",
+        Some(ino),
+        0,
+        vec![],
+        "client-b",
+        false,
+        None,
+    )?;
+    let complete_entry = take_complete_file_entry(&journal_system)?;
+
+    let loader = UfsLoader::new(
+        journal_system.job_manager(),
+        journal_system.fs().fs_dir.clone(),
+        &conf.journal,
+    );
+    let rt = AsyncRuntime::single();
+    rt.block_on(async { loader.complete_file(&complete_entry).await })?;
+
+    let live = Path::from_str("/mnt/two-writers.log")?;
+    assert!(
+        journal_system
+            .job_manager()
+            .get_job_status(CommonUtils::create_job_id(live.clone_uri()))
+            .is_err(),
+        "completing one writer while another remains must not export"
+    );
+    assert!(
+        collect_ufs_rel_files(&ufs_dir).is_empty(),
+        "no UFS object may appear while a writer remains: {:?}",
+        collect_ufs_rel_files(&ufs_dir)
+    );
+
+    assert!(fs.release_writer(ino, "client-a")?);
+    let release_entry = take_release_writer_entry(&journal_system)?;
+    // The harness has no RPC server for the export to read from, so the job is
+    // expected to fail after submission; what matters is that it was submitted.
+    let _export = rt.block_on(async { loader.release_writer(&release_entry).await });
+
+    let job = match journal_system
+        .job_manager()
+        .get_job_status(CommonUtils::create_job_id(live.clone_uri()))
+    {
+        Ok(job) => job,
+        Err(status_err) => {
+            return err_box!(
+                "releasing the last writer must submit an export job; status={}",
+                status_err
+            );
+        }
+    };
+    assert!(
+        job.source_path.ends_with("/mnt/two-writers.log"),
+        "export source should be the live CV path, got {}",
+        job.source_path
+    );
+    let _ = std::fs::remove_dir_all(&ufs_dir);
+    Ok(())
+}
+
 // Test snapshot restart
 #[test]
 fn test_master_restart_with_snapshot_recovery() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     Logger::default();
     Master::init_test_metrics();
     let mut conf = ClusterConf {
@@ -876,6 +994,7 @@ fn empty_checkpoint_snapshot(empty_dir: &str) -> SnapshotData {
 // checkpoint must be refused over existing metadata, including directories.
 #[test]
 fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
     Logger::default();
     Master::init_test_metrics();
 

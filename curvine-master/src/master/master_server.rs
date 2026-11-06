@@ -300,6 +300,24 @@ impl Master {
         let _ = Self::get_metrics();
     }
 
+    /// Serialize the tests that publish through the process-global
+    /// `MASTER_METRICS` (#1885 review).
+    ///
+    /// Session metrics are deliberately a singleton, so a test that asserts an
+    /// exact counter delta (session reaper) can be blurred by any other test's
+    /// heartbeat or reap landing between its reads. Every test that publishes
+    /// (heartbeat handlers, reaper ticks) takes this guard; the session-reap
+    /// tests take it for their whole body.
+    #[cfg(test)]
+    pub(crate) fn metric_test_serial() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+        SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     // for test
     pub fn get_fs(&self) -> MasterFilesystem {
         self.rpc_server

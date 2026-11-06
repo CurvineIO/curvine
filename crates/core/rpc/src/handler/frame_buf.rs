@@ -75,6 +75,17 @@ impl FrameBuf {
         buf
     }
 
+    /// Drops the backing allocation when it has grown past
+    /// `buf_size * MAX_FACTOR`. Only call with no buffered bytes, otherwise
+    /// they are discarded along with the allocation.
+    pub fn maybe_shrink(&mut self) {
+        if self.inner.is_empty()
+            && self.inner.capacity() > self.buf_size.saturating_mul(Self::MAX_FACTOR)
+        {
+            self.inner = BytesMut::new();
+        }
+    }
+
     pub fn into_inner(self) -> BytesMut {
         self.inner
     }
