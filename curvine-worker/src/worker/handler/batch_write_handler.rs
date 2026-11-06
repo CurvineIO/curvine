@@ -390,9 +390,10 @@ impl BatchWriteHandler {
         let mut files_iter = files_drain.into_iter();
         let mut contexts_iter = contexts_drain.into_iter();
 
-        for (i, file_data) in header.files.iter().enumerate() {
-            // Convert bytes to DataSlice
-            let data_slice = DataSlice::Bytes(bytes::Bytes::from(file_data.clone().content));
+        let file_count = header.files.len();
+        for (i, file_data) in header.files.into_iter().enumerate() {
+            // Take the decoded content; Bytes::from(Vec<u8>) does not copy.
+            let data_slice = DataSlice::Bytes(bytes::Bytes::from(file_data.content));
 
             let unique_req_id = header.req_id + i as i64;
             // Create a temporary message for each file
@@ -450,7 +451,7 @@ impl BatchWriteHandler {
         }
 
         let batch_response = FilesBatchWriteResponse {
-            results: vec![true; header.files.len()],
+            results: vec![true; file_count],
         };
         Ok(Builder::success(msg).proto_header(batch_response).build())
     }
