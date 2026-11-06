@@ -1176,14 +1176,14 @@ mod tests {
         let fs = test_fs("summary");
         let ino = create_file(&fs, "/summary.log", "watched-client");
         set_lock(&fs, "/summary.log", "watched-client", true);
-        // The summary judges liveness against the real clock, so register now.
-        register(
-            &fs,
-            "watched-client",
-            curvine_runtime::common::LocalTime::mills(),
-        );
+        // Register on the clock the heartbeat RPC uses. A wall-clock `now` here hid
+        // a bug where `live` compared epoch ms with monotonic deadlines (#1885
+        // review).
+        register(&fs, "watched-client", monotonic_ms());
 
+        let wall_before = curvine_runtime::common::LocalTime::mills();
         let summary = fs.session_summary().unwrap();
+        let wall_after = curvine_runtime::common::LocalTime::mills();
         assert_eq!(summary.len(), 1);
         let entry = &summary[0];
         assert_eq!(entry.client_id, "watched-client");
@@ -1194,6 +1194,19 @@ mod tests {
         assert_eq!(entry.writer_hints, 1);
         assert_eq!(entry.lock_hints + entry.writer_hints, 2);
         assert!(entry.expire_at > entry.last_heartbeat);
+        // Times are reported as Unix epoch ms, not process-local monotonic ms.
+        assert!(
+            entry.last_heartbeat + 5_000 >= wall_before && entry.last_heartbeat <= wall_after,
+            "last_heartbeat {} must be the wall clock of the renewal ({}..={})",
+            entry.last_heartbeat,
+            wall_before,
+            wall_after
+        );
+        assert!(entry.started_at <= entry.last_heartbeat);
+        assert!(
+            entry.expire_at > wall_after,
+            "the lease runs into the future"
+        );
         assert_eq!(
             owners(&fs, "watched-client"),
             vec![(OwnerKind::Lock, ino), (OwnerKind::Writer, ino)]

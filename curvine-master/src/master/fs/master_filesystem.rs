@@ -22,7 +22,7 @@ use crate::master::meta::{
     TrashScanPage,
 };
 
-use crate::master::fs::state::{ClientSession, SessionHeartbeat, SessionMap};
+use crate::master::fs::state::{monotonic_ms, ClientSession, SessionHeartbeat, SessionMap};
 use crate::master::fs::worker_manager::WorkerManager;
 use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
@@ -84,10 +84,16 @@ pub struct SessionSummary {
     pub mount_point: Option<String>,
     pub client_version: Option<String>,
     pub heartbeat_interval_ms: u64,
+    /// Unix epoch milliseconds, converted from the session map's process-local
+    /// `monotonic_ms` clock at snapshot time. Accurate to the wall clock at the
+    /// moment of the request; not stable across master restarts.
     pub started_at: u64,
+    /// Unix epoch milliseconds, same conversion as `started_at`.
     pub last_heartbeat: u64,
+    /// Unix epoch milliseconds, same conversion as `started_at`.
     pub expire_at: u64,
-    /// Whether the lease is still valid at the time of the snapshot.
+    /// Whether the lease is still valid at the time of the snapshot (judged on
+    /// the monotonic clock, so it does not depend on the conversion above).
     pub live: bool,
     /// Locks this client owns that are indexed for reclamation.
     pub lock_hints: usize,
@@ -2565,8 +2571,24 @@ impl MasterFilesystem {
     ///
     /// Hint counts come from the ownership index, so a session that owns a lot of
     /// state is visible *before* it expires.
+    ///
+    /// Cost: one `fs_dir.read()` and one unbounded ownership-index prefix scan per
+    /// session, on every call. That suits polling with fleets of hundreds of
+    /// mounts; a caller that needs more must page or cap. The read guard is taken
+    /// per session on purpose, so metadata writers can run between scans instead
+    /// of waiting for the whole fleet.
     pub fn session_summary(&self) -> FsResult<Vec<SessionSummary>> {
-        let now = LocalTime::mills();
+        // Session times are `monotonic_ms` values: judge `live` on that clock and
+        // convert to epoch ms against one (monotonic, wall) pair for the output.
+        let mono_now = monotonic_ms();
+        let wall_now = LocalTime::mills();
+        let to_wall = |t: u64| {
+            if t >= mono_now {
+                wall_now.saturating_add(t - mono_now)
+            } else {
+                wall_now.saturating_sub(mono_now - t)
+            }
+        };
         // Snapshot under the read guard, then scan the ownership index without
         // it: renewals need the write side, so a status request must not hold
         // the session map across per-session index reads (#1885 review).
@@ -2587,10 +2609,10 @@ impl MasterFilesystem {
                 mount_point: session.mount_point.clone(),
                 client_version: session.client_version.clone(),
                 heartbeat_interval_ms: session.heartbeat_interval_ms,
-                started_at: session.started_at,
-                last_heartbeat: session.last_heartbeat,
-                expire_at: session.expire_at,
-                live: !session.is_expired_at(now),
+                started_at: to_wall(session.started_at),
+                last_heartbeat: to_wall(session.last_heartbeat),
+                expire_at: to_wall(session.expire_at),
+                live: !session.is_expired_at(mono_now),
                 lock_hints: 0,
                 writer_hints: 0,
             };
