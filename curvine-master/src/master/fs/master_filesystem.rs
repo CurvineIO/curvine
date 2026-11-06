@@ -18,7 +18,9 @@ use crate::master::fs::full_block_report::{
 };
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
-use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
+use crate::master::meta::inode::{
+    DirectoryChildrenSharedVersion, InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR,
+};
 use crate::master::meta::store::{InodeStoreSnapshot, StoreResolvedPath};
 use crate::master::meta::{
     trash, BlockLocationLockManager, CacheInvalidationResult, CommitGate, FsDir, InodeLockManager,
@@ -44,6 +46,7 @@ use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -421,6 +424,64 @@ impl MasterFilesystem {
         Ok((ids, inp.components.len(), full, epoch))
     }
 
+    /// Resolves the live path and snapshots the fencing values: the restore
+    /// epoch plus every directory child-index version along the walk. After
+    /// the inode locks are taken, unchanged versions prove no mutation touched
+    /// any directory on the chain, so the returned `InodePath` — whose nodes
+    /// are held stable by those same locks — can be used directly instead of
+    /// resolving a second time.
+    fn resolve_live_path(&self, path: &str) -> FsResult<(InodePath, u64)> {
+        let fs_dir = self.fs_dir.read();
+        let control = fs_dir.store.scan_control();
+        if control.is_restoring() {
+            return err_box!(
+                "metadata scan lease rejected: snapshot restore is pending or in progress"
+            );
+        }
+        let epoch = control.cancel_epoch();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+        Ok((inp, epoch))
+    }
+
+    /// Whether the pre-lock walk is still authoritative. The restore epoch
+    /// fences store replacement; each chain entry is re-checked by id inside
+    /// its parent's child index, which is the same identity check the second
+    /// full resolution performed — without rebuilding the path. The held
+    /// inode locks keep every chain node stable during the verification.
+    fn namespace_unchanged(&self, epoch: u64, inp: &InodePath) -> bool {
+        let fs_dir = self.fs_dir.read();
+        if fs_dir.store.scan_control().cancel_epoch() != epoch {
+            return false;
+        }
+        // components[i] names inodes[i]'s parent edge; entries beyond the
+        // resolved prefix (a create target) must still be absent.
+        for depth in 1..inp.inodes.len() {
+            let Ok(parent) = inp.inodes[depth - 1].as_dir_ref() else {
+                return false;
+            };
+            let handle = parent.children_handle();
+            let (child, version) = handle.read_child_view(&inp.components[depth]);
+            let current = child.is_some_and(|view| view.id() == inp.inodes[depth].id())
+                && version.is_current();
+            if !current {
+                return false;
+            }
+        }
+        if inp.inodes.len() < inp.components.len() && !inp.inodes.is_empty() {
+            // Partial walk: the trailing component must still be missing.
+            let Ok(parent) = inp.inodes[inp.inodes.len() - 1].as_dir_ref() else {
+                return false;
+            };
+            let handle = parent.children_handle();
+            let (child, _) =
+                handle.read_child_view(inp.components.last().expect("components non-empty"));
+            if child.is_some() {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Live-tree counterpart of [`Self::resolve_store_path`]: resolves over
     /// the shared namespace guard and returns the same comparison shape. The
     /// per-directory child locks make the result authoritative while the
@@ -476,7 +537,7 @@ impl MasterFilesystem {
             }
 
             let parent_index = ids.len().saturating_sub(1);
-            let requests: Vec<_> = ids
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
                 .map(|(depth, inode_id)| {
@@ -548,12 +609,14 @@ impl MasterFilesystem {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
-            let (ids, components_len, full, restore_epoch) = self.resolve_live_ids(path)?;
+            let (inp, restore_epoch) = self.resolve_live_path(path)?;
+            let ids: Vec<i64> = inp.inodes.iter().map(|inode| inode.id()).collect();
             Self::check_not_pending_path(path)?;
             Self::check_not_reserved_path(path)?;
-            if ids.len() + 1 < components_len {
+            if ids.len() + 1 < inp.components.len() {
                 return self.create_with_global_lock(path, opts, flags);
             }
+            let full = inp.is_full();
             if full {
                 if flags.overwrite() && !flags.exclusive() {
                     if let Some(result) = self.overwrite_file_sharded(path, opts.clone())? {
@@ -564,7 +627,7 @@ impl MasterFilesystem {
             }
 
             let parent_index = ids.len().saturating_sub(1);
-            let requests: Vec<_> = ids
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
                 .map(|(depth, inode_id)| {
@@ -576,31 +639,21 @@ impl MasterFilesystem {
                 })
                 .collect();
             let _locks = self.inode_locks.lock_many(&requests);
-            let locked_epoch = {
-                let fs_dir = self.fs_dir.read();
-                fs_dir.store.scan_control().cancel_epoch()
-            };
-            if restore_epoch != locked_epoch {
+            if !self.namespace_unchanged(restore_epoch, &inp) {
                 continue;
             }
 
+            // The pre-lock InodePath is still authoritative: the sequence
+            // check proves no mutation ran between resolve and lock, and the
+            // held locks keep every node on the chain stable from here on.
             let fs_dir = self.fs_dir.read();
-            let inp = Self::resolve_path(&fs_dir, path)?;
+            let inp = inp;
             if inp.is_full() {
                 // A concurrent creator won (or the target appeared): route
                 // through the same overwrite / conflict handling a full
                 // pre-lock resolution would take.
                 drop(fs_dir);
                 return self.create_with_global_lock(path, opts, flags);
-            }
-            if inp.inodes.len() != ids.len()
-                || inp
-                    .inodes
-                    .iter()
-                    .zip(&ids)
-                    .any(|(live, expected)| live.id() != *expected)
-            {
-                continue;
             }
             debug_assert!(!inp.is_full());
             if !opts.create_parent {
@@ -646,7 +699,7 @@ impl MasterFilesystem {
                 }
                 worker_ids.into_iter().collect::<Vec<_>>()
             };
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -743,18 +796,29 @@ impl MasterFilesystem {
         Ok((fs_dir.file_status(&inp)?, deleted))
     }
 
-    fn delete_single_parent_sharded(&self, path: &str) -> FsResult<DeleteResult> {
+    /// The caller resolves once in `delete_with_mode`; this function reuses
+    /// that result for the lock request set instead of walking the tree again.
+    fn delete_single_parent_sharded(
+        &self,
+        path: &str,
+        inp: InodePath,
+        restore_epoch: u64,
+    ) -> FsResult<DeleteResult> {
         const MAX_RETRIES: usize = 3;
+        let mut inp = Some(inp);
 
         for _ in 0..MAX_RETRIES {
-            let (ids, _components, full, restore_epoch) = self.resolve_live_ids(path)?;
-            if !full || ids.len() < 2 {
+            let Some(inp) = inp.take() else {
+                return self.delete_with_global_lock(path);
+            };
+            let ids: Vec<i64> = inp.inodes.iter().map(|inode| inode.id()).collect();
+            if !inp.is_full() || ids.len() < 2 {
                 return self.delete_with_global_lock(path);
             }
 
             let target_index = ids.len() - 1;
             let parent_index = target_index - 1;
-            let requests: Vec<_> = ids
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
                 .map(|(depth, inode_id)| {
@@ -766,29 +830,15 @@ impl MasterFilesystem {
                 })
                 .collect();
             let _locks = self.inode_locks.lock_many(&requests);
-            let locked_epoch = {
-                let fs_dir = self.fs_dir.read();
-                fs_dir.store.scan_control().cancel_epoch()
-            };
-            if restore_epoch != locked_epoch {
+            if !self.namespace_unchanged(restore_epoch, &inp) {
                 continue;
             }
 
-            // Under the inode write locks the target body is authoritative:
-            // the single post-lock walk doubles as the id re-verification and
-            // the location sample input.
+            // Under the inode write locks the pre-lock walk is authoritative:
+            // the unchanged sequence proves no mutation ran between resolve
+            // and lock, and the held locks keep the chain stable from here on.
             let fs_dir = self.fs_dir.read();
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if inp.inodes.len() != ids.len()
-                || inp
-                    .inodes
-                    .iter()
-                    .zip(&ids)
-                    .any(|(live, expected)| live.id() != *expected)
-                || inp.inodes.len() != inp.components.len()
-            {
-                continue;
-            }
+            let inp = inp;
             let Some(target) = inp.get_last_inode() else {
                 return self.delete_with_global_lock(path);
             };
@@ -797,6 +847,11 @@ impl MasterFilesystem {
                 .ok()
                 .map(|file| file.block_ids())
                 .unwrap_or_default();
+            // An empty block list has no locations to fence: sampling would
+            // build two empty sets and take the same no-op locks.
+            if block_ids.is_empty() {
+                return fs_dir.delete(&inp, false);
+            }
             let worker_ids = {
                 let mut worker_ids = HashSet::new();
                 for block_id in &block_ids {
@@ -861,13 +916,17 @@ impl MasterFilesystem {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
-            let (source_ids, _source_components, source_full, source_epoch) =
-                self.resolve_live_ids(src)?;
-            let (destination_ids, destination_components, destination_full, destination_epoch) =
-                self.resolve_live_ids(dst)?;
-            if !source_full
-                || destination_full
-                || destination_ids.len() + 1 < destination_components
+            let (source_path, source_epoch) = self.resolve_live_path(src)?;
+            let (destination_path, destination_epoch) = self.resolve_live_path(dst)?;
+            let source_ids: Vec<i64> = source_path.inodes.iter().map(|inode| inode.id()).collect();
+            let destination_ids: Vec<i64> = destination_path
+                .inodes
+                .iter()
+                .map(|inode| inode.id())
+                .collect();
+            if !source_path.is_full()
+                || destination_path.is_full()
+                || destination_ids.len() + 1 < destination_path.components.len()
                 || source_ids.len() < 2
             {
                 return self.rename_with_global_lock(src, dst, flags);
@@ -876,7 +935,9 @@ impl MasterFilesystem {
             let source_parent = source_ids.len() - 2;
             let source_target = source_ids.len() - 1;
             let destination_parent = destination_ids.len().saturating_sub(1);
-            let mut requests = Vec::with_capacity(source_ids.len() + destination_ids.len());
+            let mut requests = SmallVec::<[InodeLockRequest; 8]>::with_capacity(
+                source_ids.len() + destination_ids.len(),
+            );
             requests.extend(source_ids.iter().enumerate().map(|(depth, inode_id)| {
                 if depth == source_parent || depth == source_target {
                     InodeLockRequest::write(depth, *inode_id)
@@ -893,33 +954,20 @@ impl MasterFilesystem {
             }));
             let _locks = self.inode_locks.lock_many(&requests);
 
-            let (source_epoch_now, destination_epoch_now) = {
-                let fs_dir = self.fs_dir.read();
-                let control = fs_dir.store.scan_control();
-                (control.cancel_epoch(), control.cancel_epoch())
-            };
-            if source_epoch != source_epoch_now || destination_epoch != destination_epoch_now {
-                continue;
-            }
-
-            let fs_dir = self.fs_dir.read();
-            let source_path = Self::resolve_path(&fs_dir, src)?;
-            let destination_path = Self::resolve_path(&fs_dir, dst)?;
-            if source_path.inodes.len() != source_ids.len()
-                || source_path
-                    .inodes
-                    .iter()
-                    .zip(&source_ids)
-                    .any(|(live, expected)| live.id() != *expected)
-                || destination_path.inodes.len() != destination_ids.len()
-                || destination_path
-                    .inodes
-                    .iter()
-                    .zip(&destination_ids)
-                    .any(|(live, expected)| live.id() != *expected)
+            // Both sides resolved under one namespace guard; the epoch plus
+            // the mutation sequence covers both pre-lock walks.
+            if !self.namespace_unchanged(source_epoch, &source_path)
+                || !self.namespace_unchanged(destination_epoch, &destination_path)
             {
                 continue;
             }
+
+            // Reuse the pre-lock walks: the unchanged sequence proves no
+            // mutation ran between resolve and lock, and the held locks keep
+            // both chains stable from here on.
+            let fs_dir = self.fs_dir.read();
+            let source_path = source_path;
+            let destination_path = destination_path;
             if destination_path.is_full() {
                 drop(fs_dir);
                 drop(_locks);
@@ -955,7 +1003,7 @@ impl MasterFilesystem {
             }
 
             let target_depth = resolved.inodes().len() - 1;
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -1030,7 +1078,7 @@ impl MasterFilesystem {
             }
 
             let target_depth = resolved.inodes().len() - 1;
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -1150,7 +1198,7 @@ impl MasterFilesystem {
             }
 
             let target_depth = resolved.inodes().len() - 1;
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -1205,7 +1253,7 @@ impl MasterFilesystem {
             }
 
             let parent_index = resolved.inodes().len() - 1;
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -1367,15 +1415,15 @@ impl MasterFilesystem {
     ) -> FsResult<DeleteResult> {
         let mut delete_res = self.run_metadata_write(|| {
             let path = path.as_ref();
-            let (resolved, _) = self.resolve_live_store_view(path)?;
+            let (inp, restore_epoch) = self.resolve_live_path(path)?;
             Self::check_not_pending_path(path)?;
             let sharded = matches!(mode, DeleteMode::SkipTrash)
                 && !recursive
-                && resolved.is_full()
-                && resolved.components().len() > 1
+                && inp.is_full()
+                && inp.components.len() > 1
                 && path != trash::TRASH_ROOT;
             if sharded {
-                self.delete_single_parent_sharded(path)
+                self.delete_single_parent_sharded(path, inp, restore_epoch)
             } else {
                 let mut fs_dir = self.fs_dir.write();
                 self.delete_locked(&mut fs_dir, path, recursive, mode)
@@ -1478,7 +1526,7 @@ impl MasterFilesystem {
                 description: "Worker locations sampled before inode locks",
                 context: {"path" => path},
             }
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -1982,7 +2030,7 @@ impl MasterFilesystem {
                 context: {"path" => path},
             }
             let target_depth = resolved.inodes().len() - 1;
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -2186,7 +2234,7 @@ impl MasterFilesystem {
                 context: {"path" => path},
             }
             let target_depth = resolved.inodes().len() - 1;
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -2507,7 +2555,7 @@ impl MasterFilesystem {
                 return err_box!("{} is not a regular file", path);
             }
             let target_depth = resolved.inodes().len() - 1;
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -2953,7 +3001,7 @@ impl MasterFilesystem {
                 return Ok(None);
             }
             let target_depth = resolved.inodes().len() - 1;
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -3256,7 +3304,7 @@ impl MasterFilesystem {
             if !resolved.is_full() {
                 break;
             }
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -3329,7 +3377,7 @@ impl MasterFilesystem {
             }
 
             let target_depth = resolved.inodes().len() - 1;
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -4542,7 +4590,7 @@ impl MasterFilesystem {
             Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
             let block_ids = file.block_ids();
             let target_depth = resolved.inodes().len() - 1;
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -4698,7 +4746,7 @@ impl MasterFilesystem {
             }
 
             let target_depth = resolved.inodes().len() - 1;
-            let requests: Vec<_> = resolved
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                 .inodes()
                 .iter()
                 .enumerate()
@@ -4798,7 +4846,7 @@ impl MasterFilesystem {
                     break;
                 }
                 let target_depth = resolved.inodes().len() - 1;
-                let requests: Vec<_> = resolved
+                let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
                     .inodes()
                     .iter()
                     .enumerate()

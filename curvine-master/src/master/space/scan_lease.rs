@@ -39,6 +39,7 @@
 
 use curvine_core_error::{err_box, CommonResult};
 use parking_lot::{Condvar, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,6 +72,10 @@ impl ScanControlState {
 pub struct MetadataScanControl {
     state: Mutex<ScanControlState>,
     idle: Condvar,
+    /// Hot-path mirror of `state.cancel_epoch`. Writers bump both under the
+    /// state lock; readers load this atomically, so the sharded write paths
+    /// check restore cancellation without taking the state mutex.
+    cancel_epoch_cache: AtomicU64,
 }
 
 impl MetadataScanControl {
@@ -78,13 +83,14 @@ impl MetadataScanControl {
         Self {
             state: Mutex::new(ScanControlState::new()),
             idle: Condvar::new(),
+            cancel_epoch_cache: AtomicU64::new(0),
         }
     }
 
     /// Current cancel epoch. A lease created under epoch N is cancelled as
     /// soon as the epoch differs from N.
     pub fn cancel_epoch(&self) -> u64 {
-        self.state.lock().cancel_epoch
+        self.cancel_epoch_cache.load(Ordering::Acquire)
     }
 
     /// True while a restore is pending or in progress.
@@ -131,6 +137,8 @@ impl MetadataScanControl {
 
         state.restoring = true;
         state.cancel_epoch = state.cancel_epoch.wrapping_add(1);
+        self.cancel_epoch_cache
+            .store(state.cancel_epoch, Ordering::Release);
 
         let wait_start = std::time::Instant::now();
         while state.active_leases > 0 {
