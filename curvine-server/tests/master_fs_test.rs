@@ -33,7 +33,7 @@ use curvine_proto::{
     EmptyTrashRequest, EmptyTrashResponse, GetFilesystemInfoRequest, LinkRequest, ListTrashRequest,
     ListTrashResponse, MkdirOptsProto, MkdirRequest, MountRequest, OpenFileRequest,
     OpenFileResponse, RenameRequest, RestoreTrashRequest, RestoreTrashResponse, SetAttrRequest,
-    SymlinkRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
+    SetAttrResponse, SymlinkRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -1626,6 +1626,16 @@ fn retry_of_succeeded_setattr_symlink_link_is_not_in_progress() -> CommonResult<
         retry.check_error_ext::<FsError>().unwrap_or_else(|e| {
             panic!("{name} retry of a succeeded request failed: {e}");
         });
+
+        // A setattr retry must report the file's real status, not a default.
+        if name == "set_attr" {
+            let first_status = first.parse_header::<SetAttrResponse>()?.status;
+            let retry_status = retry.parse_header::<SetAttrResponse>()?.status;
+            assert_ne!(retry_status.id, 0, "set_attr retry returned default status");
+            assert_eq!(retry_status.id, first_status.id);
+            assert_eq!(retry_status.mode, first_status.mode);
+            assert_eq!(retry_status.path, first_status.path);
+        }
     }
     Ok(())
 }

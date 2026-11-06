@@ -1036,9 +1036,16 @@ impl MasterHandler {
         let header: SetAttrRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
+        let path = header.path.clone();
         let rep = self.with_retry_cache(
             ctx.msg.req_id(),
-            || Ok(SetAttrResponse::default()),
+            // The mutation already took effect; re-query the status (as
+            // create_file0 does) instead of returning an all-zero default.
+            || {
+                Ok(SetAttrResponse {
+                    status: ProtoUtils::file_status_to_pb(self.fs.file_status(&path)?),
+                })
+            },
             || {
                 let opts = ProtoUtils::set_attr_opts_from_pb(header.opts);
                 let status = self.fs.set_attr(header.path, opts)?;
