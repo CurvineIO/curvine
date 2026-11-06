@@ -21,7 +21,7 @@ use crate::IOUtils;
 use curvine_io::{IOError, IOResult};
 use curvine_net::net::InetAddr;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -126,17 +126,6 @@ impl BufferClient {
                 Some(v) => v,
             };
 
-            let req_id = env.msg.req_id();
-            if env.is_canceled() {
-                // The callback has been cancelled, and the next request is executed.
-                info!(
-                    "Request({},{}) has been canceled",
-                    req_id,
-                    client_state.conn_info()
-                );
-                continue;
-            }
-
             if client_state.is_closed() {
                 let error: IOResult<Message> =
                     err_box!("connection {} closed", client_state.conn_info());
@@ -144,39 +133,56 @@ impl BufferClient {
                 break;
             }
 
-            // Set the callback.
-            call_map.insert(req_id, env.cb);
-
-            if let Err(e) = write_frame.send_timeout(&env.msg, dur).await {
-                // send failed, send a failed callback notification directly.
-                match call_map.remove(req_id) {
-                    None => {
-                        warn!(
-                            "Request({},{}) not found callback",
-                            req_id,
-                            client_state.conn_info()
-                        );
-                    }
-
-                    Some(cb) => {
-                        let error: IOResult<Message> = err_box!(
-                            "Request({},{}) send failed:  {}",
-                            req_id,
-                            client_state.conn_info(),
-                            e
-                        );
-                        if let Err(e) = cb.send(error) {
-                            debug!(
-                                "Request({},{}) caller cancelled the request, drop send-failure notice: {:?}",
-                                req_id,
-                                client_state.conn_info(),
-                                e
+            // Drain whatever else is already queued so one write can carry
+            // several requests; metadata workloads arrive in bursts, so this
+            // turns N writer wakeups + N syscalls into one. Cancelled
+            // envelopes count toward the limit too: callers may time out in
+            // bulk, and those must not keep this loop running unbounded.
+            let mut batch: Vec<Envelope> = Vec::with_capacity(8);
+            let mut dequeued = 1;
+            if env.is_canceled() {
+                info!(
+                    "Request({},{}) has been canceled",
+                    env.msg.req_id(),
+                    client_state.conn_info()
+                );
+            } else {
+                batch.push(env);
+            }
+            while dequeued < 8 {
+                dequeued += 1;
+                match receiver.try_recv() {
+                    Ok(next) => {
+                        if next.is_canceled() {
+                            info!(
+                                "Request({},{}) has been canceled",
+                                next.msg.req_id(),
+                                client_state.conn_info()
                             );
+                        } else {
+                            batch.push(next);
                         }
                     }
+                    Err(_) => break,
                 }
+            }
+            if batch.is_empty() {
+                continue;
+            }
 
-                // Network exception, setting connection has been closed.
+            // Set the callbacks before the first byte goes out, so the reader
+            // task can never see a response ahead of its registration.
+            let mut msgs: Vec<BoxMessage> = Vec::with_capacity(batch.len());
+            for item in batch {
+                call_map.insert(item.msg.req_id(), item.cb);
+                msgs.push(item.msg);
+            }
+
+            let refs: Vec<&Message> = msgs.iter().map(|m| m.as_ref()).collect();
+            if let Err(e) = write_frame.send_batch_timeout(&refs, dur).await {
+                // Network exception, setting connection has been closed. All
+                // in-flight callbacks, including this batch's, are failed by
+                // check_calls when the loop exits.
                 client_state.set_error(e);
                 break;
             }
