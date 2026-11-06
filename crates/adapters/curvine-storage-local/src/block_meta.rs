@@ -47,6 +47,23 @@ impl BlockState {
     }
 }
 
+/// Refusal to remove a quarantined block; permanent until released.
+#[derive(Debug)]
+pub struct QuarantinedBlockError(pub i64);
+
+impl fmt::Display for QuarantinedBlockError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "block {} is quarantined; refusing to remove", self.0)
+    }
+}
+
+impl std::error::Error for QuarantinedBlockError {}
+
+/// True if `e` is a [`QuarantinedBlockError`]; callers can park the block instead of retrying.
+pub fn is_quarantined_error(e: &curvine_core_error::CommonError) -> bool {
+    e.downcast_ref::<QuarantinedBlockError>().is_some()
+}
+
 /// Metadata information of the worker block.
 /// The len field has 3 meanings:
 /// 1. The value of block in writing, len is block_size.

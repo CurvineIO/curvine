@@ -570,7 +570,7 @@ impl VfsDataset {
         };
         if meta.is_quarantined() {
             // Write may still be in flight; keep the extent reserved.
-            return err_box!("block {} is quarantined; refusing to remove", id);
+            return Err(Box::new(crate::QuarantinedBlockError(id)));
         }
         let layout = self.layouts.get(meta.storage_type()).clone();
         let dir = match self.dir_list.get_dir(meta.dir_id()) {
@@ -2171,11 +2171,17 @@ mod test {
         ds.open_block(&b1)?;
         ds.abort_block_uncertain(&b1)?;
 
-        // Simulates async_remove_block's route.
+        // Simulates async_remove_block's route. The error must be the typed
+        // variant so the worker can park the block instead of retrying.
+        let err = match ds.remove_block_state_by_id(1) {
+            Err(e) => e,
+            Ok(_) => panic!("removal of a quarantined block must be rejected"),
+        };
         assert!(
-            ds.remove_block_state_by_id(1).is_err(),
-            "removal of a quarantined block must be rejected"
+            crate::is_quarantined_error(&err),
+            "must be QuarantinedBlockError, got: {err}"
         );
+        assert!(err.to_string().contains("quarantined"), "{err}");
 
         let meta = ds
             .get_block(1)
