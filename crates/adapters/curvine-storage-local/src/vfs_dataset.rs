@@ -330,7 +330,13 @@ impl VfsDataset {
             return Some(committed);
         }
         let meta = self.meta.get(id)?;
-        (meta.state() != &BlockState::Allocating).then_some(meta)
+        // Quarantined content is unknown (a timed-out write may still land):
+        // never serve it; readers fall back to another replica.
+        (!matches!(
+            meta.state(),
+            BlockState::Allocating | BlockState::Quarantined
+        ))
+        .then_some(meta)
     }
 
     pub fn reserve_file_open(
@@ -2159,6 +2165,32 @@ mod test {
         let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
         let m2 = ds.open_block(&b2)?;
         assert_eq!(m2.bdev_offset, 4096, "must not reuse quarantined offset 0");
+        Ok(())
+    }
+
+    /// A quarantined block's content is unknown; it must not be readable.
+    /// The raw view still sees it, so it is not mistaken for a missing block.
+    #[test]
+    fn quarantined_block_is_not_readable() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        assert!(
+            ds.get_readable_block(1).is_some(),
+            "setup: Writing is readable"
+        );
+
+        ds.abort_block_uncertain(&b1)?;
+
+        assert!(
+            ds.get_readable_block(1).is_none(),
+            "quarantined block must not be served to readers"
+        );
+        assert_eq!(
+            ds.get_block(1).map(|m| *m.state()),
+            Some(BlockState::Quarantined),
+            "raw view must still see the quarantined block"
+        );
         Ok(())
     }
 

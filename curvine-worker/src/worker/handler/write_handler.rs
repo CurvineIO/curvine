@@ -1262,11 +1262,19 @@ mod tests {
         );
 
         // Block must be quarantined, not removed: extent stays reserved.
-        let meta_after = store.get_block(meta.id).map_err(FsError::from)?;
+        // Raw view: a quarantined block is deliberately not readable.
+        let meta_after = store
+            .get_raw_block_opt(meta.id)
+            .map_err(FsError::from)?
+            .expect("quarantined block must still exist");
         assert_eq!(
             meta_after.state(),
             &curvine_storage_local::BlockState::Quarantined,
             "uncertain flush failure on SPDK must quarantine the block, not remove it"
+        );
+        assert!(
+            store.get_block(meta.id).is_err(),
+            "quarantined block must not be readable"
         );
 
         Ok(())
@@ -1490,8 +1498,11 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(
-            store.get_block(meta.id).map_err(FsError::from)?.state(),
-            &curvine_storage_local::BlockState::Quarantined,
+            store
+                .get_raw_block_opt(meta.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
         );
 
         // RPC 2: simulates the client's cancel()-on-failure cleanup, reusing
@@ -1523,8 +1534,11 @@ mod tests {
 
         // Must still be quarantined: the re-entrant call must not have reached commit_block() again.
         assert_eq!(
-            store.get_block(meta.id).map_err(FsError::from)?.state(),
-            &curvine_storage_local::BlockState::Quarantined,
+            store
+                .get_raw_block_opt(meta.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
             "re-entrant completion call must not force-release the quarantined extent"
         );
 
