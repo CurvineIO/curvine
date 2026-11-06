@@ -710,31 +710,16 @@ impl LoadJobRunner {
         Ok(PlannedLoadJob { tasks, total_size })
     }
 
+    /// Send cancel to every assigned worker. The caller has already marked the
+    /// job Canceled, and a repeated cancel is a no-op on a terminal job, so an
+    /// unreachable worker must not stop the remaining workers from being told.
     pub async fn cancel_job(
         &self,
         job_id: impl AsRef<str>,
         assigned_workers: FastHashSet<WorkerAddress>,
     ) -> FsResult<()> {
-        let job_id = job_id.as_ref();
-        for worker in assigned_workers.iter() {
-            let client = self.factory.get_worker_client(worker).await?;
-            let res = client.cancel_job(job_id).await;
-
-            if let Err(e) = res {
-                error!("failed to send cancel request to worker {}: {}", worker, e);
-                if let Err(update_err) = self.jobs.update_state(
-                    job_id,
-                    JobTaskState::Canceled,
-                    format!("failed to send cancel request to worker {}: {}", worker, e),
-                ) {
-                    error!(
-                        "failed to mark load job {} as canceled after worker cancel error: {}",
-                        job_id, update_err
-                    );
-                }
-            }
-        }
-
+        self.cancel_workers_best_effort(job_id.as_ref(), &assigned_workers)
+            .await;
         Ok(())
     }
 
@@ -762,5 +747,87 @@ impl LoadJobRunner {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::journal::JournalSystem;
+    use crate::Master;
+    use curvine_config::ClusterConf;
+    use curvine_runtime::common::Utils;
+    use curvine_runtime::runtime::RpcRuntime;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    fn worker(id: u32, port: u16) -> WorkerAddress {
+        WorkerAddress {
+            worker_id: id,
+            hostname: "localhost".to_string(),
+            ip_addr: "127.0.0.1".to_string(),
+            rpc_port: port as u32,
+            web_port: 0,
+        }
+    }
+
+    /// One unreachable worker must not stop cancel from reaching the others,
+    /// and must not fail a cancel the caller already recorded.
+    #[test]
+    fn cancel_job_reaches_live_workers_when_one_is_unreachable() {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            ..Default::default()
+        };
+        conf.journal.enable = false;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("job-runner/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("job-runner/journal-{}", Utils::rand_str(6)));
+        conf.client.conn_retry_max_duration_ms = 100;
+        conf.client.conn_timeout_ms = 100;
+        conf.client.rpc_retry_max_duration_ms = 100;
+        conf.client.rpc_timeout_ms = 200;
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+
+        // Bind then drop: nothing listens on `dead_port`, so connect is refused.
+        let dead_port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // Accepts the connection but never answers; seeing a connection is
+        // enough to prove the cancel was attempted on this worker.
+        let live = TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        live.set_nonblocking(true).unwrap();
+
+        let rt = conf.journal.create_runtime();
+        let runner = LoadJobRunner::new(
+            JobStore::new(),
+            fs,
+            Arc::new(UfsFactory::with_rt(&conf.client, rt.clone())),
+            1,
+            Arc::new(AtomicCounter::new(0)),
+        );
+
+        let mut workers = FastHashSet::default();
+        workers.insert(worker(1, dead_port));
+        workers.insert(worker(2, live_port));
+
+        let res = rt.block_on(runner.cancel_job("job-1", workers));
+        assert!(res.is_ok(), "unreachable worker failed cancel: {:?}", res);
+
+        let mut reached = false;
+        for _ in 0..50 {
+            if live.accept().is_ok() {
+                reached = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reached, "live worker never received the cancel request");
     }
 }
