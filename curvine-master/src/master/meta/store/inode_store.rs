@@ -524,6 +524,7 @@ impl InodeStore {
         src_name: &str,
         dst_parent: &InodeView,
         dst_inode: &InodeView,
+        parents_equal: bool,
     ) -> CommonResult<()> {
         if src_inode.id() != dst_inode.id() {
             return err_box!(
@@ -571,9 +572,13 @@ impl InodeStore {
             )?;
         }
 
-        // Update the modification time of the previous node.
+        // Update the modification time of the previous node. A plain
+        // same-directory rename stages two equal parent views; one row write
+        // carries their shared value.
         batch.write_inode(src_parent)?;
-        batch.write_inode(dst_parent)?;
+        if !parents_equal {
+            batch.write_inode(dst_parent)?;
+        }
 
         crate::fault_point! {
             sync,
@@ -1854,6 +1859,7 @@ mod tests {
             "edge-name",
             &dst_parent,
             &dst_inode,
+            false,
         )?;
 
         let (_, restored) = store.create_tree()?;

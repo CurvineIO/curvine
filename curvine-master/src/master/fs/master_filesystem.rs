@@ -912,12 +912,49 @@ impl MasterFilesystem {
         self.delete_locked(&mut fs_dir, path, false, DeleteMode::SkipTrash)
     }
 
-    fn rename_sharded(&self, src: &str, dst: &str, flags: RenameFlags) -> FsResult<bool> {
+    fn rename_sharded_prelocked(
+        &self,
+        src: &str,
+        dst: &str,
+        flags: RenameFlags,
+        prelocked_source: InodePath,
+        source_epoch: u64,
+        prelocked_destination: InodePath,
+        destination_epoch: u64,
+    ) -> FsResult<bool> {
+        let mut prelocked = Some((
+            prelocked_source,
+            source_epoch,
+            prelocked_destination,
+            destination_epoch,
+        ));
+        self.rename_sharded(src, dst, flags, &mut prelocked)
+    }
+
+    fn rename_sharded(
+        &self,
+        src: &str,
+        dst: &str,
+        flags: RenameFlags,
+        prelocked: &mut Option<(InodePath, u64, InodePath, u64)>,
+    ) -> FsResult<bool> {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
-            let (source_path, source_epoch) = self.resolve_live_path(src)?;
-            let (destination_path, destination_epoch) = self.resolve_live_path(dst)?;
+            let (source_path, source_epoch, destination_path, destination_epoch) =
+                match prelocked.take() {
+                    Some(prelocked) => prelocked,
+                    None => {
+                        let (source_path, source_epoch) = self.resolve_live_path(src)?;
+                        let (destination_path, destination_epoch) = self.resolve_live_path(dst)?;
+                        (
+                            source_path,
+                            source_epoch,
+                            destination_path,
+                            destination_epoch,
+                        )
+                    }
+                };
             let source_ids: Vec<i64> = source_path.inodes.iter().map(|inode| inode.id()).collect();
             let destination_ids: Vec<i64> = destination_path
                 .inodes
@@ -2375,21 +2412,21 @@ impl MasterFilesystem {
         }
 
         let (renamed, deleted) = self.run_metadata_write(|| {
-            let (source, destination) = {
-                let fs_dir = self.fs_dir.read();
-                let lease = fs_dir.store.begin_snapshot_scan()?;
-                let reader = lease.snapshot_reader()?;
-                let source = reader.resolve_path(src)?;
-                Self::check_not_pending_path(src)?;
-                let destination = reader.resolve_path(dst)?;
-                Self::check_not_pending_path(dst)?;
-                (source, destination)
-            };
+            // Live-tree pre-check. The store-snapshot read this replaces cost
+            // two RocksDB walk rounds per rename and only fed the sharded
+            // routing decision, which the sharded loop re-resolves live
+            // anyway. A live view can briefly lag a committed store batch
+            // (durable-before-live), so a misjudgment here degrades to the
+            // global-lock path — never to an incorrect rename.
+            let (source_inp, source_epoch) = self.resolve_live_path(src)?;
+            Self::check_not_pending_path(src)?;
+            let (destination_inp, destination_epoch) = self.resolve_live_path(dst)?;
+            Self::check_not_pending_path(dst)?;
 
             Self::check_not_reserved_path(src)?;
             Self::check_not_reserved_path(dst)?;
 
-            if source.components().len() <= 1 {
+            if source_inp.components.len() <= 1 {
                 return err_box!("Cannot rename root path");
             }
 
@@ -2401,7 +2438,13 @@ impl MasterFilesystem {
             // Keep NO_REPLACE's existing destination-exists error and leave
             // journal replay unchanged for entries written by older leaders.
             if !flags.no_replace() && !flags.exchange_mode() {
-                if let (Some(source), Some(target)) = (source.target(), destination.target()) {
+                if let (Some(source), Some(target)) = (
+                    source_inp.inodes.last().filter(|_| source_inp.is_full()),
+                    destination_inp
+                        .inodes
+                        .last()
+                        .filter(|_| destination_inp.is_full()),
+                ) {
                     if source.id() == target.id() {
                         return Ok((true, None));
                     }
@@ -2411,12 +2454,23 @@ impl MasterFilesystem {
             let sharded = !flags.exchange_mode()
                 && !flags.trash()
                 && !flags.restore()
-                && source.is_full()
-                && !destination.is_full()
-                && source.inodes().len() >= 2
-                && destination.inodes().len() + 1 >= destination.components().len();
+                && source_inp.is_full()
+                && !destination_inp.is_full()
+                && source_inp.inodes.len() >= 2
+                && destination_inp.inodes.len() + 1 >= destination_inp.components.len();
             if sharded {
-                return Ok((self.rename_sharded(src, dst, flags)?, None));
+                return Ok((
+                    self.rename_sharded_prelocked(
+                        src,
+                        dst,
+                        flags,
+                        source_inp,
+                        source_epoch,
+                        destination_inp,
+                        destination_epoch,
+                    )?,
+                    None,
+                ));
             }
 
             let fs_dir = self.fs_dir.write();

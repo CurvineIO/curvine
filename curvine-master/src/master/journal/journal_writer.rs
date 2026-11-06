@@ -387,11 +387,19 @@ impl JournalWriter {
     /// Within a commit scope the wait is deferred to the scope. Local metadata
     /// may already be materialized before this wait; crash isolation is not
     /// provided by this method.
-    pub(crate) fn send_and_wait(&self, _fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
-        self.enqueue_and_wait(entry)?;
-        if self.enable {
-            self.record_snapshot_entry();
+    pub(crate) fn send_and_wait(
+        &self,
+        _fs_dir: &FsDir,
+        entry: impl FnOnce() -> JournalEntry,
+    ) -> FsResult<()> {
+        // Build the entry lazily: with the journal disabled (tests, safe-mode
+        // fallback) the caller skips the path/name string clones entirely.
+        if !self.enable {
+            return Ok(());
         }
+        let entry = entry();
+        self.enqueue_and_wait(entry)?;
+        self.record_snapshot_entry();
         Ok(())
     }
 

@@ -76,6 +76,8 @@ pub struct MetadataScanControl {
     /// state lock; readers load this atomically, so the sharded write paths
     /// check restore cancellation without taking the state mutex.
     cancel_epoch_cache: AtomicU64,
+    /// Hot-path mirror of `state.restoring` (same write protocol).
+    restoring_cache: std::sync::atomic::AtomicBool,
 }
 
 impl MetadataScanControl {
@@ -84,6 +86,7 @@ impl MetadataScanControl {
             state: Mutex::new(ScanControlState::new()),
             idle: Condvar::new(),
             cancel_epoch_cache: AtomicU64::new(0),
+            restoring_cache: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -95,7 +98,7 @@ impl MetadataScanControl {
 
     /// True while a restore is pending or in progress.
     pub fn is_restoring(&self) -> bool {
-        self.state.lock().restoring
+        self.restoring_cache.load(Ordering::Acquire)
     }
 
     /// Wait until an active restore has finished before inspecting its data directory.
@@ -136,6 +139,7 @@ impl MetadataScanControl {
         }
 
         state.restoring = true;
+        self.restoring_cache.store(true, Ordering::Release);
         state.cancel_epoch = state.cancel_epoch.wrapping_add(1);
         self.cancel_epoch_cache
             .store(state.cancel_epoch, Ordering::Release);
@@ -146,6 +150,7 @@ impl MetadataScanControl {
             if now >= deadline {
                 // Roll back so the store stays usable for scans.
                 state.restoring = false;
+                self.restoring_cache.store(false, Ordering::Release);
                 self.idle.notify_all();
                 return err_box!(
                     "metadata snapshot restore timed out after {:?} waiting for {} active scan lease(s) to finish",
@@ -170,6 +175,7 @@ impl MetadataScanControl {
     fn end_restore(&self) {
         let mut state = self.state.lock();
         state.restoring = false;
+        self.restoring_cache.store(false, Ordering::Release);
         self.idle.notify_all();
     }
 }

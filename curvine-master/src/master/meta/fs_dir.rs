@@ -336,15 +336,14 @@ impl FsDir {
         inp = self.add_last_inode(inp, InodeView::new_dir(name.clone(), dir.clone()))?;
 
         let parent_path = inp.get_valid_parent_path();
-        self.journal_writer.send_and_wait(
-            self,
+        self.journal_writer.send_and_wait(self, || {
             JournalEntry::Mkdir(MkdirEntry {
                 op_id: self.next_op_id(),
                 rpc_id: 0,
                 path: parent_path,
                 dir,
-            }),
-        )?;
+            })
+        })?;
 
         Ok(inp)
     }
@@ -419,15 +418,14 @@ impl FsDir {
         }
 
         let del_res = self.unprotected_delete(inp, op_ms as i64)?;
-        self.journal_writer.send_and_wait(
-            self,
+        self.journal_writer.send_and_wait(self, || {
             JournalEntry::Delete(DeleteEntry {
                 op_id: self.next_op_id(),
                 rpc_id: 0,
                 path: inp.path().to_string(),
                 mtime: op_ms as i64,
-            }),
-        )?;
+            })
+        })?;
 
         Ok(del_res)
     }
@@ -1421,8 +1419,7 @@ impl FsDir {
         };
         let res = self.unprotected_rename(src_inp, dst_inp, op_ms, flags, exchange_pre_swap_ids)?;
         let (src_inode_id, dst_inode_id) = exchange_pre_swap_ids.unwrap_or((0, 0));
-        self.journal_writer.send_and_wait(
-            self,
+        self.journal_writer.send_and_wait(self, || {
             JournalEntry::Rename(RenameEntry {
                 op_id: self.next_op_id(),
                 rpc_id: 0,
@@ -1432,8 +1429,8 @@ impl FsDir {
                 flags: flags.value(),
                 src_inode_id,
                 dst_inode_id,
-            }),
-        )?;
+            })
+        })?;
         Ok(res)
     }
 
@@ -1531,10 +1528,20 @@ impl FsDir {
 
         // Stage parent metadata separately: a failed store write must not
         // publish a new mtime or link count into the live namespace.
+        // A plain same-directory rename stages one parent copy: both sides
+        // only get the same mtime bump, so the two clones would be equal.
+        let same_parent_plain =
+            src_parent.id() == dst_parent.id() && replaced.is_none() && !src_inode.is_dir();
         let mut new_src_parent = src_parent.as_ref().clone_metadata();
-        let mut new_dst_parent = dst_parent.as_ref().clone_metadata();
         new_src_parent.update_mtime(mtime);
-        new_dst_parent.update_mtime(mtime);
+        let new_dst_parent = if same_parent_plain {
+            new_src_parent.clone_metadata()
+        } else {
+            let mut cloned = dst_parent.as_ref().clone_metadata();
+            cloned.update_mtime(mtime);
+            cloned
+        };
+        let mut new_dst_parent = new_dst_parent;
         let move_dir = src_parent.id() != dst_parent.id() && src_inode.is_dir();
         if move_dir {
             new_src_parent.dec_nlink(mtime);
@@ -1563,6 +1570,7 @@ impl FsDir {
                 src_inp.name(),
                 &new_dst_parent,
                 &new_inode,
+                same_parent_plain,
             )?;
         }
 
@@ -1770,15 +1778,15 @@ impl FsDir {
         // Create an inode file node.
         let file = InodeFile::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
         inp = self.add_last_inode(inp, InodeView::new_file(name, file))?;
-        self.journal_writer.send_and_wait(
-            self,
+        let last_file = inp.clone_last_file()?;
+        self.journal_writer.send_and_wait(self, || {
             JournalEntry::CreateFile(CreateFileEntry {
                 op_id: self.next_op_id(),
                 rpc_id: 0,
                 path: inp.path().to_string(),
-                file: inp.clone_last_file()?,
-            }),
-        )?;
+                file: last_file.clone(),
+            })
+        })?;
 
         Ok(inp)
     }
