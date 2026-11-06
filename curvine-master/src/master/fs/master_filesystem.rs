@@ -2620,12 +2620,6 @@ impl MasterFilesystem {
         }
     }
 
-    /// Release one client's session-owned locks on `ino`, journalled as `SetLocks`.
-    pub fn release_client_locks(&self, ino: i64, client_id: &str) -> FsResult<bool> {
-        let fs_dir = self.fs_dir.write();
-        fs_dir.release_client_locks(ino, client_id)
-    }
-
     /// Lock lifetime policy for this request (#1879).
     ///
     /// Config-only: session-owned locks are exempted from the legacy TTL while

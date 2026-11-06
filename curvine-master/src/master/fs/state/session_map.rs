@@ -252,6 +252,11 @@ impl SessionMap {
     /// `started_at` identifies the lease generation: a client that re-registers
     /// after expiring gets a new entry with a later `started_at`, so the reaper
     /// can tell its fresh session apart from the one it set out to drain.
+    ///
+    /// `limit` caps the result, not the scan: when fewer than `limit` sessions
+    /// have expired, every session is visited, so a call is O(sessions). That is
+    /// paid once per reaper tick (`client_session_timeout / 2`); an expiry-ordered
+    /// index would instead cost an update on every heartbeat.
     pub fn expired_sessions(&self, now: u64, limit: usize) -> Vec<(String, u64)> {
         self.sessions
             .values()

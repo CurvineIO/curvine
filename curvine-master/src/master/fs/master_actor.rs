@@ -86,9 +86,15 @@ impl MasterActor {
         let reaper = SessionReaper::new(self.fs.clone(), self.master_monitor.clone());
         let scheduler = ScheduledExecutor::new("session-reaper", interval_ms);
         scheduler.start(reaper)?;
+        // The grace window is `SessionMap::reclaim_after`: twice the timeout after
+        // this master adopts its term.
         info!(
-            "session reaper started, interval {} ms, session timeout {} ms",
-            interval_ms, timeout_ms
+            "session reaper started, interval {} ms, session timeout {} ms, \
+             lock lease {}, grace {} ms",
+            interval_ms,
+            timeout_ms,
+            self.fs.conf.client_session_lock_lease,
+            timeout_ms.saturating_mul(2)
         );
         Ok(())
     }
