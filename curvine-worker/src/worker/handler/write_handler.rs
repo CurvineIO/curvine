@@ -273,6 +273,24 @@ impl WriteHandler {
         Ok(false)
     }
 
+    /// Quarantine as soon as a write is known uncertain, so the state lives in
+    /// the dataset even if the client never sends Complete/Cancel.
+    fn quarantine_if_uncertain(
+        store: &BlockStore,
+        block: &ExtendedBlock,
+        file: &BlockWriteContext,
+    ) {
+        if !file.has_uncertain_writes() {
+            return;
+        }
+        if let Err(e) = store.abort_block_uncertain(block) {
+            warn!(
+                "failed to quarantine block {} after uncertain write: {}",
+                block.id, e
+            );
+        }
+    }
+
     pub fn write(&mut self, msg: &Message) -> FsResult<Message> {
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
@@ -289,6 +307,7 @@ impl WriteHandler {
             let spend = TimeSpent::new();
             if let Err(e) = file.write_region(&msg.data) {
                 Self::record_write_error(self.metrics, context.dir_id, &e);
+                Self::quarantine_if_uncertain(&self.store, &context.block, file);
                 return Err(e.into());
             }
 
@@ -316,6 +335,7 @@ impl WriteHandler {
         if need_flush {
             if let Err(e) = file.flush() {
                 Self::record_write_error(self.metrics, context.dir_id, &e);
+                Self::quarantine_if_uncertain(&self.store, &context.block, file);
                 return Err(e.into());
             }
         }
@@ -789,10 +809,80 @@ mod tests {
         }
     }
 
-    /// SPDK store + handler whose writer reports uncertain writes but flushes Ok.
-    fn spdk_uncertain_flush_ok_handler(
+    /// A mid-stream write times out: write_region fails and the flag is set.
+    struct UncertainWriteBlockIO;
+
+    impl BlockIO for UncertainWriteBlockIO {
+        fn read_region(
+            &mut self,
+            _enable_send_file: bool,
+            _len: i32,
+        ) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read not supported",
+            )))
+        }
+
+        fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write timed out",
+            )))
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write timed out",
+            )))
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read_all not supported",
+            )))
+        }
+
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            0
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn path(&self) -> &str {
+            "uncertain-write"
+        }
+
+        fn resize(
+            &mut self,
+            _truncate: bool,
+            _off: i64,
+            _len: i64,
+            _mode: i32,
+        ) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "resize not supported",
+            )))
+        }
+
+        fn has_uncertain_writes(&self) -> bool {
+            true
+        }
+    }
+
+    /// SPDK store + handler over the given writer fake.
+    fn spdk_handler<IO: BlockIO + 'static>(
         dir_tag: &str,
         block: &ExtendedBlock,
+        io: IO,
     ) -> FsResult<(BlockStore, WriteHandler)> {
         let _worker = Worker::with_conf(ClusterConf {
             format_worker: true,
@@ -818,12 +908,7 @@ mod tests {
                 dir_id: 0,
                 dir_metrics: None,
             }),
-            file: Some(BlockWriteContext::new(
-                UncertainFlushOkBlockIO,
-                0,
-                block.len,
-                0,
-            )?),
+            file: Some(BlockWriteContext::new(io, 0, block.len, 0)?),
             lease: None,
             is_commit: false,
             io_slow_us: 0,
@@ -1192,8 +1277,11 @@ mod tests {
     #[test]
     fn cancel_after_uncertain_write_with_ok_flush_quarantines() -> FsResult<()> {
         let block = ExtendedBlock::new(50, 4096, StorageType::SpdkDisk, FileType::File);
-        let (store, mut handler) =
-            spdk_uncertain_flush_ok_handler("write-handler-cancel-uncertain-ok-flush", &block)?;
+        let (store, mut handler) = spdk_handler(
+            "write-handler-cancel-uncertain-ok-flush",
+            &block,
+            UncertainFlushOkBlockIO,
+        )?;
         let available_before = store.read().map_err(FsError::from)?.available();
 
         let err = handler
@@ -1222,8 +1310,11 @@ mod tests {
     #[test]
     fn complete_after_uncertain_write_with_ok_flush_never_finalizes() -> FsResult<()> {
         let block = ExtendedBlock::new(51, 4096, StorageType::SpdkDisk, FileType::File);
-        let (store, mut handler) =
-            spdk_uncertain_flush_ok_handler("write-handler-commit-uncertain-ok-flush", &block)?;
+        let (store, mut handler) = spdk_handler(
+            "write-handler-commit-uncertain-ok-flush",
+            &block,
+            UncertainFlushOkBlockIO,
+        )?;
 
         let err = handler
             .complete(&spdk_complete_msg(&block), true)
@@ -1239,6 +1330,94 @@ mod tests {
             "Complete after an uncertain write must quarantine, not finalize"
         );
         assert!(handler.is_commit, "quarantine is terminal: must latch");
+        Ok(())
+    }
+
+    fn spdk_data_frame() -> Message {
+        Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(DataHeaderProto {
+                offset: 0,
+                flush: false,
+                is_last: false,
+            })
+            .data(DataSlice::Buffer(prost::bytes::BytesMut::from(&b"x"[..])))
+            .build()
+    }
+
+    /// A timed-out write must quarantine immediately, before any
+    /// Complete/Cancel: the state must not depend on the client coming back.
+    #[test]
+    fn uncertain_write_quarantines_eagerly_before_complete() -> FsResult<()> {
+        let block = ExtendedBlock::new(52, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) = spdk_handler(
+            "write-handler-eager-quarantine",
+            &block,
+            UncertainWriteBlockIO,
+        )?;
+        let available_before = store.read().map_err(FsError::from)?.available();
+
+        let err = handler.write(&spdk_data_frame()).unwrap_err();
+        assert!(err.to_string().contains("write timed out"), "{err}");
+
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+            "block must be quarantined as soon as the write is uncertain"
+        );
+        assert_eq!(
+            store.read().map_err(FsError::from)?.available(),
+            available_before,
+            "extent must stay reserved"
+        );
+
+        // Client disconnects: handler is dropped. A later master delete must
+        // still be refused, not free the extent.
+        drop(handler);
+        let remove_err = store.async_remove_block(block.id).unwrap_err();
+        assert!(
+            curvine_storage_local::is_quarantined_error(&remove_err),
+            "{remove_err}"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+        );
+        Ok(())
+    }
+
+    /// Eager quarantine, then the client does send Cancel: idempotent, latches.
+    #[test]
+    fn cancel_after_eager_quarantine_is_idempotent() -> FsResult<()> {
+        let block = ExtendedBlock::new(53, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) = spdk_handler(
+            "write-handler-eager-then-cancel",
+            &block,
+            UncertainWriteBlockIO,
+        )?;
+        handler.write(&spdk_data_frame()).unwrap_err();
+
+        let err = handler
+            .complete(&spdk_complete_msg(&block), false)
+            .unwrap_err();
+        assert!(err.to_string().contains("uncertain"), "{err}");
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+        );
+        assert!(handler.is_commit, "must latch");
         Ok(())
     }
 
