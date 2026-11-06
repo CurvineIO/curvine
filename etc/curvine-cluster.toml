@@ -98,6 +98,11 @@ meta_dir = "testing/meta"
 # client_session_timeout = "60s"
 # client_session_lock_lease exempts session-owned locks from lock_expire_time:
 # while it is on, only the owning client or the session reaper releases them.
+# With the gate on, the reaper releases a session-owned lock about 2x
+# client_session_timeout after a master becomes active (the tick adds up to
+# half of that), so lock_expire_time no longer bounds session-owned locks; and
+# a lapsed session's open file is marked complete - on an fs-mode mount it is
+# exported to the UFS.
 # Lock lifetime is decided from each master's local config, so every master in
 # the group must run the same value. A gate-off leader would still expire a
 # healthy client's lock after lock_expire_time, which is the regression #1879
