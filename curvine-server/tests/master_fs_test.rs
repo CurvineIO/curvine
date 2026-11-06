@@ -30,10 +30,10 @@ use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, ClientAddressProto, ClientHeartbeatRequest,
     ClientHeartbeatResponse, CompleteFileRequest, CompleteFileResponse, CreateFileRequest,
     CreateFileResponse, CreateLeaderSnapshotRequest, CreateLeaderSnapshotResponse, DeleteRequest,
-    EmptyTrashRequest, EmptyTrashResponse, GetFilesystemInfoRequest, ListTrashRequest,
+    EmptyTrashRequest, EmptyTrashResponse, GetFilesystemInfoRequest, LinkRequest, ListTrashRequest,
     ListTrashResponse, MkdirOptsProto, MkdirRequest, MountRequest, OpenFileRequest,
-    OpenFileResponse, RenameRequest, RestoreTrashRequest, RestoreTrashResponse,
-    WorkerHeartbeatRequest, WorkerHeartbeatResponse,
+    OpenFileResponse, RenameRequest, RestoreTrashRequest, RestoreTrashResponse, SetAttrRequest,
+    SymlinkRequest, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -1576,6 +1576,80 @@ fn test_rpc_retry_cache_for_idempotent_operations() -> CommonResult<()> {
     delete_file_retry(&mut handler).unwrap();
     rename_retry(&mut handler).unwrap();
 
+    Ok(())
+}
+
+/// A handler that succeeds without recording its outcome leaves the req_id
+/// `Init`, so the client's same-req_id resend after a lost reply is rejected
+/// as in-progress even though the operation already took effect.
+#[test]
+fn retry_of_succeeded_setattr_symlink_link_is_not_in_progress() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_active_master("retry-record-outcome", |_| {});
+    let fs = handler.clone_fs();
+    fs.create("/retry_outcome_src", false)?;
+
+    let set_attr = Builder::new_rpc(RpcCode::SetAttr)
+        .proto_header(SetAttrRequest {
+            path: "/retry_outcome_src".to_string(),
+            opts: ProtoUtils::set_attr_opts_to_pb(SetAttrOptsBuilder::new().mode(0o600).build()),
+        })
+        .build();
+    let symlink = Builder::new_rpc(RpcCode::Symlink)
+        .proto_header(SymlinkRequest {
+            target: "/retry_outcome_src".to_string(),
+            link: "/retry_outcome_symlink".to_string(),
+            force: false,
+            mode: 0o777,
+            owner: None,
+            group: None,
+        })
+        .build();
+    let link = Builder::new_rpc(RpcCode::Link)
+        .proto_header(LinkRequest {
+            src_path: "/retry_outcome_src".to_string(),
+            dst_path: "/retry_outcome_link".to_string(),
+        })
+        .build();
+
+    for (name, msg) in [
+        ("set_attr", &set_attr),
+        ("symlink", &symlink),
+        ("link", &link),
+    ] {
+        let first = handler.handle(msg)?;
+        first.check_error_ext::<FsError>().unwrap_or_else(|e| {
+            panic!("{name} first attempt failed: {e}");
+        });
+        // Same message, same req_id: the resend after a lost reply.
+        let retry = handler.handle(msg)?;
+        retry.check_error_ext::<FsError>().unwrap_or_else(|e| {
+            panic!("{name} retry of a succeeded request failed: {e}");
+        });
+    }
+    Ok(())
+}
+
+/// An early error return must still record the outcome, so a retry sees the
+/// real error again instead of a stuck in-progress state.
+#[test]
+fn retry_after_early_error_returns_the_error_not_in_progress() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler();
+    let id = Utils::req_id();
+    let req = RenameRequest {
+        src: "/retry_early_err_src".to_string(),
+        dst: "/retry_early_err_dst".to_string(),
+        flags: RenameFlags::internal_mask().value(),
+    };
+
+    for attempt in ["first", "retry"] {
+        let err = handler.rename0(id, req.clone()).unwrap_err();
+        assert!(
+            matches!(err, FsError::InvalidArgument(_)),
+            "{attempt} attempt: expected InvalidArgument, got {err:?}"
+        );
+    }
     Ok(())
 }
 
