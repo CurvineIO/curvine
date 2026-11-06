@@ -76,8 +76,8 @@ pub(crate) fn decode_persisted_locks(bytes: &[u8]) -> CommonResult<Vec<FileLock>
 ///   it. Liveness is deliberately not consulted here, so a leader change can
 ///   never hand a healthy client's lock to a contender.
 /// * `session_owned` lock, gate off -> historical `lock_expire_time` from
-///   `acquire_time`, exactly like a legacy lock. This is the default until the
-///   reaper exists, so a crashed client's lock still expires.
+///   `acquire_time`, exactly like a legacy lock. Opt-out only; the default is on
+///   since the reaper exists.
 /// * legacy lock (`session_owned == false`) -> historical `lock_expire_time`
 ///   from `acquire_time`, unchanged, so pre-#1878 clients and their persisted
 ///   locks keep working.
@@ -90,7 +90,7 @@ pub struct LockValidity {
     /// `session_lock_lease` is off.
     legacy_expire_ms: u64,
     /// `master.client_session_lock_lease`: exempt session-owned locks from the
-    /// legacy TTL. Off by default until the session reaper (#1884) exists.
+    /// legacy TTL. On by default since the session reaper (#1884) exists.
     session_lock_lease: bool,
 }
 

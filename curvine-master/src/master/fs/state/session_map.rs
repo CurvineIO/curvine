@@ -90,6 +90,12 @@ pub struct SessionHeartbeat {
 /// live client ids and releases this map before touching any inode, so the
 /// heartbeat handler, the lock path and the session reaper can never take the two
 /// locks in opposite orders.
+///
+/// The one exception is the session reaper's per-release claim check
+/// (`MasterFilesystem::reap_client_owner`): it holds `fs_dir` and calls
+/// `try_read` on this map, never a blocking acquire. A busy map makes the reaper
+/// skip the hint until the next tick, so no thread can wait on this map while
+/// holding `fs_dir`, and the cycle above cannot form.
 pub struct SessionMap {
     sessions: HashMap<String, ClientSession>,
     session_timeout_ms: u64,
@@ -132,6 +138,18 @@ impl SessionMap {
     /// call [`SessionMap::adopt`] with the current raft term before reading this.
     pub fn created_at(&self) -> u64 {
         self.created_at
+    }
+
+    /// Earliest instant at which state owned by a client that is *not* live may be
+    /// reclaimed (#1884).
+    ///
+    /// Two full lease windows from the start of the epoch: the first gives every
+    /// client time to re-register after a leader change, the second absorbs a
+    /// dropped heartbeat. Like [`SessionMap::created_at`], it is only meaningful
+    /// after [`SessionMap::adopt`] has observed the current term.
+    pub fn reclaim_after(&self) -> u64 {
+        self.created_at
+            .saturating_add(self.session_timeout_ms.saturating_mul(2))
     }
 
     /// Adopt the map for `term`, the raft term this master is serving (#1883 review).
@@ -223,11 +241,54 @@ impl SessionMap {
 
     /// Client ids whose lease has expired at `now`.
     pub fn expired_at(&self, now: u64) -> Vec<String> {
+        self.expired_sessions(now, usize::MAX)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// At most `limit` expired sessions at `now`, as `(client_id, started_at)`.
+    ///
+    /// `started_at` identifies the lease generation: a client that re-registers
+    /// after expiring gets a new entry with a later `started_at`, so the reaper
+    /// can tell its fresh session apart from the one it set out to drain.
+    ///
+    /// `limit` caps the result, not the scan: when fewer than `limit` sessions
+    /// have expired, every session is visited, so a call is O(sessions). That is
+    /// paid once per reaper tick (`client_session_timeout / 2`); an expiry-ordered
+    /// index would instead cost an update on every heartbeat.
+    pub fn expired_sessions(&self, now: u64, limit: usize) -> Vec<(String, u64)> {
         self.sessions
             .values()
             .filter(|s| s.is_expired_at(now))
-            .map(|s| s.client_id().to_string())
+            .take(limit)
+            .map(|s| (s.client_id().to_string(), s.started_at))
             .collect()
+    }
+
+    /// True when `client_id` still holds the lease generation `started_at` and
+    /// that lease is expired at `now`. Anything else (renewed, re-registered,
+    /// already removed) means the reaper must not act on the client.
+    pub fn is_expired_generation(&self, client_id: &str, started_at: u64, now: u64) -> bool {
+        self.sessions
+            .get(client_id)
+            .is_some_and(|s| s.started_at == started_at && s.is_expired_at(now))
+    }
+
+    /// Remove `client_id` only if it still holds the expired lease generation
+    /// `started_at`. A session renewed or re-registered after the reaper's
+    /// snapshot survives, so the client is not silently dropped from the map.
+    pub fn remove_expired(&mut self, client_id: &str, started_at: u64, now: u64) -> bool {
+        if !self.is_expired_generation(client_id, started_at, now) {
+            return false;
+        }
+        self.sessions.remove(client_id).is_some()
+    }
+
+    /// Raft term the current epoch was adopted for, `None` before the first
+    /// [`SessionMap::adopt`].
+    pub fn term(&self) -> Option<u64> {
+        self.term
     }
 
     pub fn remove(&mut self, client_id: &str) -> Option<ClientSession> {
@@ -331,6 +392,41 @@ mod tests {
         assert_eq!(session.last_heartbeat, renewed_at);
         assert_eq!(session.expire_at, renewed_at + TIMEOUT);
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn remove_expired_spares_a_renewed_or_re_registered_session() {
+        let mut map = SessionMap::new(TIMEOUT);
+        map.heartbeat_in_epoch(hb("c1"), 1, 1_000);
+        let expired_now = 1_000 + TIMEOUT + 1;
+        assert_eq!(
+            map.expired_sessions(expired_now, 8),
+            vec![("c1".to_string(), 1_000)]
+        );
+        assert!(map.is_expired_generation("c1", 1_000, expired_now));
+
+        // The client re-registered after the reaper's snapshot: a new generation.
+        map.heartbeat_in_epoch(hb("c1"), 1, expired_now);
+        assert!(!map.is_expired_generation("c1", 1_000, expired_now));
+        assert!(!map.remove_expired("c1", 1_000, expired_now));
+        assert!(map.get("c1").is_some());
+
+        // The same generation, still expired, is removed.
+        let later = expired_now + TIMEOUT + 1;
+        assert!(map.remove_expired("c1", expired_now, later));
+        assert!(map.get("c1").is_none());
+        assert!(!map.remove_expired("c1", expired_now, later));
+    }
+
+    #[test]
+    fn expired_sessions_stops_at_the_limit() {
+        let mut map = SessionMap::new(TIMEOUT);
+        for c in ["c1", "c2", "c3"] {
+            map.heartbeat(hb(c), 0);
+        }
+        assert_eq!(map.expired_sessions(TIMEOUT + 1, 2).len(), 2);
+        assert_eq!(map.expired_sessions(TIMEOUT + 1, 8).len(), 3);
+        assert!(map.expired_sessions(TIMEOUT, 8).is_empty());
     }
 
     #[test]
