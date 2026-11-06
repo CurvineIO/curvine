@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockStore, MasterClient};
+use crate::worker::block::{BlockStore, CorruptCheck, MasterClient};
 use crate::worker::storage::Dataset;
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -22,8 +22,12 @@ use curvine_rpc::server::ServerState;
 use curvine_runtime::runtime::{GroupExecutor, LoopTask};
 use curvine_runtime::sync::StateCtl;
 use dashmap::{DashMap, DashSet};
-use log::{error, warn};
+use log::{error, info, warn};
 use std::sync::Arc;
+
+/// Re-checks of a corrupt block that may fail with an error before it is
+/// dropped. A later failing read queues it again.
+const MAX_CORRUPT_CHECK_ERRORS: u32 = 3;
 
 pub struct HeartbeatTask {
     pub(crate) executor: Arc<GroupExecutor>,
@@ -95,6 +99,57 @@ impl HeartbeatTask {
         }
     }
 
+    /// Re-check blocks whose reads failed a chunk CRC or found the file
+    /// truncated. A block whose damage is confirmed is removed and reported as
+    /// a corrupted deletion, so master drops the location and restores the
+    /// replica count.
+    pub(crate) fn invalidate_corrupt_task(
+        executor: Arc<GroupExecutor>,
+        store: BlockStore,
+        report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
+    ) {
+        let blocks = store.take_corrupt_blocks();
+        if blocks.is_empty() {
+            return;
+        }
+        let store1 = store.clone();
+        let blocks_back = blocks.clone();
+        let res = executor.spawn(move || {
+            for (block, failed_checks) in blocks {
+                match store1.invalidate_corrupt_block(block) {
+                    Ok(CorruptCheck::Removed(meta)) => {
+                        report_blocks
+                            .insert(block, BlockReportInfo::with_corrupted(block, meta.len));
+                    }
+                    Ok(CorruptCheck::Kept(reason)) => {
+                        info!("keep block {} reported corrupt: {}", block, reason);
+                    }
+                    Ok(CorruptCheck::Retry(reason)) => {
+                        info!("defer re-check of corrupt block {}: {}", block, reason);
+                        store1.requeue_corrupt(block, failed_checks);
+                    }
+                    Err(e) if failed_checks + 1 < MAX_CORRUPT_CHECK_ERRORS => {
+                        warn!(
+                            "re-check of corrupt block {} failed, will retry: {}",
+                            block, e
+                        );
+                        store1.requeue_corrupt(block, failed_checks + 1);
+                    }
+                    Err(e) => error!(
+                        "re-check of corrupt block {} failed {} times, giving up: {}",
+                        block, MAX_CORRUPT_CHECK_ERRORS, e
+                    ),
+                }
+            }
+        });
+        if let Err(e) = res {
+            warn!("failed to schedule corrupt block re-check: {}", e);
+            for (block, failed_checks) in blocks_back {
+                store.requeue_corrupt(block, failed_checks);
+            }
+        }
+    }
+
     pub fn get_report_blocks(&self) -> Vec<BlockReportInfo> {
         let mut vec = vec![];
         let blocks = self
@@ -118,9 +173,20 @@ impl HeartbeatTask {
     }
 
     fn acknowledge_reports(&self, blocks: &[BlockReportInfo]) {
+        Self::acknowledge(&self.store, &self.pending_deletes, blocks);
+    }
+
+    /// Master applied `blocks`: forget their pending deletes and let corrupt
+    /// block ids be recreated.
+    pub(crate) fn acknowledge(
+        store: &BlockStore,
+        pending_deletes: &DashSet<i64>,
+        blocks: &[BlockReportInfo],
+    ) {
         for block in blocks {
             if block.status == curvine_model::BlockReportStatus::Deleted {
-                self.pending_deletes.remove(&block.id);
+                pending_deletes.remove(&block.id);
+                store.unfence(block.id);
             }
         }
     }
@@ -148,6 +214,11 @@ impl LoopTask for HeartbeatTask {
                     cmds,
                     self.report_blocks.clone(),
                     self.pending_deletes.clone(),
+                );
+                Self::invalidate_corrupt_task(
+                    self.executor.clone(),
+                    self.store.clone(),
+                    self.report_blocks.clone(),
                 );
             }
 

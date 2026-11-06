@@ -16,9 +16,11 @@ use crate::conf::JournalConf;
 use crate::proto::raft::SnapshotData;
 use crate::raft::storage::{LogStorage, RocksStorageCore};
 use crate::raft::{LibRaftResult, RaftError, RaftResult};
+use curvine_core_error::CommonResult;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::util::limit_size;
 use raft::{GetEntriesContext, RaftState, Storage};
+use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -66,6 +68,13 @@ impl RocksLogStorage {
 
     pub fn hard_state(&self) -> HardState {
         self.core.read().unwrap().hard_state().clone()
+    }
+
+    // RocksDB metrics of the journal DB. Takes only the read lock: a scrape runs
+    // alongside other readers and holds off log writes only while it reads the
+    // RocksDB properties.
+    pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
+        self.read().get_rocksdb_metrics()
     }
 }
 
@@ -286,6 +295,24 @@ mod tests {
         store.compact(70).unwrap();
         assert_eq!(store.first_index().unwrap(), 70);
         assert_eq!(store.last_index().unwrap(), 100);
+    }
+
+    #[test]
+    fn rocksdb_metrics_cover_both_journal_column_families() {
+        let store = test_store("metrics", 0, 0);
+        store.append(&indexed_entries(1, 10)).unwrap();
+
+        let metrics = store.get_rocksdb_metrics().unwrap();
+        for cf in [RocksStorageCore::CF_ENTRIES, RocksStorageCore::CF_META] {
+            let key = format!("cf_{}_rocksdb_num-files-at-level0", cf);
+            assert!(
+                metrics.contains_key(&key),
+                "missing {} in {:?}",
+                key,
+                metrics
+            );
+        }
+        assert_eq!(metrics.get("db_rocksdb_is-write-stopped"), Some(&0));
     }
 
     fn snapshot_at(index: u64, term: u64) -> Snapshot {

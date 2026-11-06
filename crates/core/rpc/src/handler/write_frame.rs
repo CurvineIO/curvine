@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::time::Duration;
 use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::net::TcpStream;
 
 use crate::handler::FrameBuf;
 use crate::message::Message;
+use crate::IOUtils;
 use curvine_io::IOResult;
 
 pub struct WriteFrame {
@@ -31,6 +33,13 @@ impl WriteFrame {
 
     pub(crate) fn new(io: WriteHalf<TcpStream>, buf: FrameBuf) -> Self {
         Self { io, buf }
+    }
+
+    /// Half-close the connection. The peer reads EOF and closes its end, so
+    /// the read half sees EOF too and the socket is released.
+    pub async fn shutdown(&mut self) -> IOResult<()> {
+        self.io.shutdown().await?;
+        Ok(())
     }
 
     pub async fn send(&mut self, msg: &Message) -> IOResult<()> {
@@ -115,6 +124,14 @@ impl WriteFrame {
         }
 
         Ok(())
+    }
+
+    pub async fn send_timeout(&mut self, msg: &Message, dur: Duration) -> IOResult<()> {
+        IOUtils::timeout_io("frame send", dur, self.send(msg)).await
+    }
+
+    pub async fn send_batch_timeout(&mut self, msgs: &[&Message], dur: Duration) -> IOResult<()> {
+        IOUtils::timeout_io("frame send", dur, self.send_batch(msgs)).await
     }
 }
 

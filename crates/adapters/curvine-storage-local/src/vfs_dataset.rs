@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::layout::FileFinalizePlan;
+use crate::layout::{FileFinalizePlan, SidecarSync};
 use crate::{
     BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirFreeRatio, DirList, FileLayout,
     SpdkMetaStore, StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
@@ -464,7 +464,7 @@ impl VfsDataset {
         &mut self,
         reservation: &FileFinalizeReservation,
         plan: FileFinalizePlan,
-    ) -> CommonResult<BlockMeta> {
+    ) -> CommonResult<(BlockMeta, Option<SidecarSync>)> {
         let pending = self.get_block_check(reservation.pending.id())?.clone();
         if pending.state() != &BlockState::Finalizing {
             return err_box!(
@@ -483,7 +483,8 @@ impl VfsDataset {
 
         // The plan already performed stat and directory preparation. Hold this
         // lock only while the rename becomes visible and metadata is published.
-        let final_meta = FileLayout::publish_finalize(plan)?;
+        // The returned sidecar sync is left to the caller, outside this lock.
+        let (final_meta, sync) = FileLayout::publish_finalize(plan)?;
         if let Some(committed) = self.committed_rewrites.remove(&pending.id()) {
             reservation
                 .dir
@@ -496,7 +497,7 @@ impl VfsDataset {
             .dir
             .reserve_space(true, final_meta.physical_bytes());
         self.meta.put(final_meta.clone());
-        Ok(final_meta)
+        Ok((final_meta, sync))
     }
 
     pub fn rollback_file_finalize(
@@ -796,8 +797,8 @@ impl Dataset for VfsDataset {
 mod test {
     use super::{normalize_free_ratio, MAX_FREE_RATIO};
     use crate::{
-        BlockChecksum, BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore,
-        StorageVersion, VfsDataset, VfsDir, DEFAULT_CHECKSUM_CHUNK_SIZE,
+        BlockChecksum, BlockLayout, BlockTruncated, Dataset, DirList, DirState, FileLayout,
+        SpdkMetaStore, StorageVersion, VfsDataset, VfsDir, DEFAULT_CHECKSUM_CHUNK_SIZE,
     };
     use crate::{BlockMeta, BlockState, ChecksumHeader, ChecksumVerify};
     use curvine_config::{ClusterConf, WorkerConf};
@@ -1412,8 +1413,14 @@ mod test {
         let dir = ds.find_dir(finalized.dir_id())?;
         let err = match FileLayout.open_reader(dir, &finalized, 0, 50, ChecksumVerify::Off) {
             Ok(_) => panic!("truncated block must not be served as a sparse tail"),
-            Err(e) => e.to_string(),
+            Err(e) => e,
         };
+        // Callers tell a truncated block from other open failures by type.
+        assert!(
+            BlockTruncated::from_error(&err).is_some(),
+            "unexpected error: {err}"
+        );
+        let err = err.to_string();
         assert!(err.contains("is truncated"), "unexpected error: {err}");
         // The message reaches the client; it must not expose worker paths.
         let path_str = path.to_string_lossy();
@@ -1422,9 +1429,25 @@ mod test {
         // A read bounded below the committed length but beyond the surviving
         // bytes is also rejected.
         let dir = ds.find_dir(finalized.dir_id())?;
-        assert!(FileLayout
+        let err = FileLayout
             .open_reader(dir, &finalized, 0, 30, ChecksumVerify::Off)
-            .is_err());
+            .err()
+            .expect("read beyond the surviving bytes must fail");
+        assert!(
+            BlockTruncated::from_error(&err).is_some(),
+            "unexpected error: {err}"
+        );
+
+        // Other open failures are not reported as truncation.
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let err = FileLayout
+            .open_reader(dir, &finalized, 21, 20, ChecksumVerify::Off)
+            .err()
+            .expect("an offset past the logical length must fail");
+        assert!(
+            BlockTruncated::from_error(&err).is_none(),
+            "unexpected error: {err}"
+        );
 
         // Master-side truncate down to the surviving bytes stays readable:
         // only min(meta.len, logical_len) bytes must be present.
@@ -1437,6 +1460,38 @@ mod test {
         };
         assert_eq!(bytes.len(), 20);
         assert_eq!(&bytes[..], b"A".repeat(20).as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn file_reader_serves_written_bytes_of_unfinalized_block() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "reader-unfinalized-block");
+        let block = ExtendedBlock::with_mem(1, "50B")?;
+        let writing = ds.open_block(&block)?;
+        // Only 20 of the 50 reserved bytes have been written and flushed.
+        ds.write_test_data(&writing, "20B")?;
+
+        // While the block is being written or finalized, its len is the reserved
+        // block size, not a committed length (#1938).
+        let readable = ds.get_readable_block(1).cloned().expect("readable block");
+        assert_eq!(readable.state(), &BlockState::Writing);
+        let _reservation = ds.reserve_file_finalize(&block)?;
+        let finalizing = ds.get_readable_block(1).cloned().expect("readable block");
+        assert_eq!(finalizing.state(), &BlockState::Finalizing);
+
+        for meta in [readable, finalizing] {
+            assert_eq!(meta.len(), 50);
+            assert_eq!(meta.committed_len(), None);
+            let dir = ds.find_dir(meta.dir_id())?;
+            let mut reader = FileLayout.open_reader(dir, &meta, 0, 50, ChecksumVerify::Off)?;
+            let region = reader.read_region(false, 50)?;
+            let bytes = match region {
+                DataSlice::Buffer(bytes) => bytes,
+                other => panic!("expected buffered read, got {other:?}"),
+            };
+            assert_eq!(&bytes[..20], b"A".repeat(20).as_slice());
+            assert!(bytes[20..].iter().all(|byte| *byte == 0));
+        }
         Ok(())
     }
 
@@ -1518,7 +1573,13 @@ mod test {
             .reserve_file_finalize(block)?
             .expect("file block must use reservation");
         match reservation.prepare(block.len) {
-            Ok(plan) => ds.publish_file_finalize(&reservation, plan),
+            Ok(plan) => {
+                let (meta, sync) = ds.publish_file_finalize(&reservation, plan)?;
+                if let Some(sync) = sync {
+                    sync.finish();
+                }
+                Ok(meta)
+            }
             Err(e) => {
                 ds.rollback_file_finalize(&reservation)?;
                 Err(e)

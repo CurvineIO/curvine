@@ -126,6 +126,29 @@ jobs:
           echo "After etcd service discovery tests, disk usage:"
           df -h
 
+      # `clippy --all-targets` only compiles these tests. Without this step an
+      # auth or multipart regression in the gateway would land green and only
+      # surface in the daily coverage workflow.
+      - name: Run S3 gateway unit tests
+        run: |
+          echo "Running curvine-s3-gateway unit tests"
+          cargo test -p curvine-s3-gateway --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After S3 gateway tests, disk usage:"
+          df -h
+
+      - name: S3 UFS credential tests
+        run: |
+          # S3OperatorSettings and tests/s3_sts_wire.rs live behind `opendal-s3`, which the default
+          # build never enables, so without this step dropping the session token from the operator
+          # builder would keep every gate green. The wire test targets a loopback S3 stand-in and
+          # the pre-existing s3_fs.rs self-skips without credentials, so no cloud access is needed.
+          cargo test -p curvine-ufs-api --jobs ${{ env.CARGO_BUILD_JOBS }}
+          cargo test -p curvine-ufs-opendal --features opendal-s3 --tests --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After S3 UFS credential tests, disk usage:"
+          df -h
+
       - name: Replication lifecycle regression tests
         run: |
           # Exercise the real Master/Worker submit, dropped-report, reaper and

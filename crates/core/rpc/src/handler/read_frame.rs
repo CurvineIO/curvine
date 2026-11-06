@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io;
 use std::ops::DerefMut;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, ReadHalf};
 use tokio::net::TcpStream;
@@ -20,6 +22,7 @@ use tokio::net::TcpStream;
 use crate::handler::FrameBuf;
 use crate::message;
 use crate::message::{Message, Protocol};
+use crate::IOUtils;
 use curvine_io::{DataSlice, IOResult};
 
 pub struct ReadFrame {
@@ -111,16 +114,51 @@ impl ReadFrame {
             self.buf.reserve(want.max(1));
             let n = self.io.read_buf(self.buf.deref_mut()).await?;
             if n == 0 {
-                // Peer EOF before any frame body: clean close, matches the
-                // exact-read path's Head-state EOF contract.
-                if self.pending.is_none() {
+                // A clean close (no buffered bytes) keeps the empty-message
+                // contract; any buffered partial frame is a truncation and
+                // must surface as UnexpectedEof so callers drop the
+                // connection instead of treating it as a clean EOF.
+                if self.pending.is_none() && self.buf.is_empty() {
                     return Ok(Message::empty());
                 }
-                return err_box!(
-                    "connection closed mid-frame: {} buffered bytes",
-                    self.buf.len()
-                );
+                let what = if self.pending.is_none() {
+                    "frame head"
+                } else {
+                    "frame body"
+                };
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "connection closed mid-{} with {} buffered bytes",
+                        what,
+                        self.buf.len()
+                    ),
+                )
+                .into());
             }
+        }
+    }
+
+    pub async fn receive_timeout(&mut self, dur: Duration) -> IOResult<Message> {
+        let res = IOUtils::timeout_io("frame receive", dur, self.receive()).await;
+        match res {
+            // Any buffered but unconsumed bytes mean a frame is in progress,
+            // so a timeout leaves the stream desynced and the connection must
+            // be dropped instead of resuming it.
+            Err(e)
+                if IOUtils::is_timeout(&e) && (self.pending.is_some() || !self.buf.is_empty()) =>
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    format!(
+                        "frame receive timed out after {dur:?} in the middle of a frame, \
+                     the stream is desynced and the connection must be dropped"
+                    ),
+                )
+                .into())
+            }
+
+            other => other,
         }
     }
 }
@@ -276,5 +314,41 @@ mod tests {
         writer.await.unwrap();
         let header = got.header.expect("header must round-trip");
         assert_eq!(header.len(), message::MAX_DATE_SIZE as usize + 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn receive_errors_on_truncated_frame_head() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+
+        // Send fewer than a full frame head, then close, to simulate a truncated head.
+        let head_len = crate::message::PROTOCOL_SIZE as usize;
+        let (_, mut client_write) = tokio::io::split(client);
+        client_write
+            .write_all(&vec![0u8; head_len - 1])
+            .await
+            .unwrap();
+        client_write.shutdown().await.unwrap();
+
+        let (read_half, _) = tokio::io::split(server_stream);
+        let mut read_frame = ReadFrame::new(read_half, FrameBuf::new(0));
+
+        let err = match read_frame.receive().await {
+            Ok(_) => panic!("truncated frame head must be an error, not a clean EOF"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "truncated frame head must surface as UnexpectedEof, not {:?}",
+            err.kind()
+        );
+        assert!(
+            err.to_string().contains("frame head"),
+            "expected a frame-head truncation error, got: {err}"
+        );
     }
 }

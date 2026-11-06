@@ -48,6 +48,113 @@ fn storage_error(
     }
 }
 
+#[cfg(all(test, feature = "opendal-s3"))]
+mod s3_settings_tests {
+    use super::S3OperatorSettings;
+    use std::collections::HashMap;
+
+    fn config(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut conf = HashMap::from([
+            (
+                "s3.endpoint_url".to_string(),
+                "http://s3.example.com".to_string(),
+            ),
+            ("s3.region_name".to_string(), "cn-test-1".to_string()),
+        ]);
+        for (key, value) in entries {
+            conf.insert((*key).to_string(), (*value).to_string());
+        }
+        conf
+    }
+
+    #[test]
+    fn static_credentials_are_forwarded() {
+        let settings = S3OperatorSettings::from_conf(&config(&[
+            ("s3.credentials.access", "ak"),
+            ("s3.credentials.secret", "sk"),
+        ]))
+        .expect("static credentials must resolve");
+
+        assert_eq!(settings.access_key_id.as_deref(), Some("ak"));
+        assert_eq!(settings.secret_access_key.as_deref(), Some("sk"));
+        assert_eq!(settings.session_token, None);
+        assert_eq!(settings.role_arn, None);
+        assert!(settings.force_path_style);
+        assert!(!settings.disable_config_load);
+        assert!(!settings.disable_ec2_metadata);
+    }
+
+    #[test]
+    fn sts_credentials_forward_the_session_token() {
+        let settings = S3OperatorSettings::from_conf(&config(&[
+            ("s3.credentials.type", "sts"),
+            ("s3.credentials.access", "ak"),
+            ("s3.credentials.secret", "sk"),
+            ("s3.credentials.token", "token"),
+        ]))
+        .expect("sts credentials must resolve");
+
+        assert_eq!(settings.access_key_id.as_deref(), Some("ak"));
+        assert_eq!(settings.session_token.as_deref(), Some("token"));
+        assert_eq!(settings.role_arn, None);
+    }
+
+    #[test]
+    fn role_credentials_leave_the_keys_unset() {
+        let settings = S3OperatorSettings::from_conf(&config(&[
+            ("s3.credentials.type", "role"),
+            ("s3.credentials.role_arn", "arn:aws:iam::1:role/ufs"),
+            ("s3.credentials.role_session_name", "curvine"),
+            ("s3.credentials.external_id", "ext"),
+            ("s3.credentials.disable_ec2_metadata", "true"),
+        ]))
+        .expect("a role mount needs no key");
+
+        assert_eq!(settings.access_key_id, None);
+        assert_eq!(settings.secret_access_key, None);
+        assert_eq!(
+            settings.role_arn.as_deref(),
+            Some("arn:aws:iam::1:role/ufs")
+        );
+        assert_eq!(settings.role_session_name.as_deref(), Some("curvine"));
+        assert_eq!(settings.external_id.as_deref(), Some("ext"));
+        assert!(settings.disable_ec2_metadata);
+    }
+
+    #[test]
+    fn auto_credentials_leave_every_credential_field_unset() {
+        let settings = S3OperatorSettings::from_conf(&config(&[("s3.credentials.type", "auto")]))
+            .expect("auto must resolve without any credential field");
+
+        assert_eq!(settings.access_key_id, None);
+        assert_eq!(settings.secret_access_key, None);
+        assert_eq!(settings.session_token, None);
+        assert_eq!(settings.role_arn, None);
+        assert_eq!(settings.endpoint.as_deref(), Some("http://s3.example.com"));
+        assert_eq!(settings.region.as_deref(), Some("cn-test-1"));
+    }
+
+    #[test]
+    fn path_style_and_list_object_switches_are_preserved() {
+        let settings = S3OperatorSettings::from_conf(&config(&[
+            ("s3.credentials.type", "auto"),
+            ("s3.force.path.style", "false"),
+            ("s3.list_objects_version", "v1"),
+        ]))
+        .expect("switches must resolve");
+
+        assert!(!settings.force_path_style);
+        assert!(settings.disable_list_objects_v2);
+    }
+
+    #[test]
+    fn invalid_credential_configuration_surfaces_as_an_error() {
+        let err = S3OperatorSettings::from_conf(&config(&[("s3.credentials.type", "role")]))
+            .expect_err("role without role_arn must fail before an operator is built");
+        assert!(err.to_string().contains("s3.credentials.role_arn"), "{err}");
+    }
+}
+
 #[cfg(all(test, any(feature = "opendal-hdfs", feature = "opendal-hdfs-native")))]
 mod tests {
     use super::OpendalFileSystem;
@@ -110,6 +217,105 @@ fn opendal_io_error(
 ) -> FsError {
     let not_found = e.kind() == std::io::ErrorKind::NotFound;
     storage_error(operation, path, e, not_found)
+}
+
+/// Everything the S3 backend needs from the mount configuration, resolved from the shared
+/// [`curvine_ufs_api::S3Conf`] credential plan.
+///
+/// Kept separate from the builder wiring so the mapping can be unit-tested: which builder calls an
+/// operator is only observable through a signed request, which a unit test cannot see.
+#[cfg(feature = "opendal-s3")]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct S3OperatorSettings {
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    /// Defaults to true for backward compatibility (MinIO, Ceph RGW, localstack, ...). Object
+    /// stores that only support virtual-host style opt in with `s3.force.path.style=false`.
+    pub force_path_style: bool,
+    pub disable_list_objects_v2: bool,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
+    pub role_arn: Option<String>,
+    pub external_id: Option<String>,
+    pub role_session_name: Option<String>,
+    pub disable_config_load: bool,
+    pub disable_ec2_metadata: bool,
+}
+
+#[cfg(feature = "opendal-s3")]
+impl S3OperatorSettings {
+    pub(crate) fn from_conf(conf: &HashMap<String, String>) -> FsResult<Self> {
+        let credential = curvine_ufs_api::S3Conf::credential_plan(conf)?;
+
+        Ok(Self {
+            endpoint: conf.get("s3.endpoint_url").cloned(),
+            region: conf.get("s3.region_name").cloned(),
+            force_path_style: conf
+                .get("s3.force.path.style")
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true),
+            disable_list_objects_v2: curvine_ufs_api::S3Conf::uses_list_objects_v1(conf)?,
+            access_key_id: credential.access_key,
+            secret_access_key: credential.secret_key,
+            session_token: credential.session_token,
+            role_arn: credential.role_arn,
+            external_id: credential.external_id,
+            role_session_name: credential.role_session_name,
+            disable_config_load: credential.disable_config_load,
+            disable_ec2_metadata: credential.disable_ec2_metadata,
+        })
+    }
+
+    pub(crate) fn apply(self, mut builder: S3) -> S3 {
+        if let Some(endpoint) = &self.endpoint {
+            builder = builder.endpoint(endpoint);
+        }
+        if let Some(region) = &self.region {
+            builder = builder.region(region);
+        }
+
+        // Static keys and STS temporary credentials. `None` leaves the field unset so the SDK
+        // default chain (env, ~/.aws/*, IMDSv2, web identity token file) can resolve it.
+        if let Some(access_key) = &self.access_key_id {
+            builder = builder.access_key_id(access_key);
+        }
+        if let Some(secret_key) = &self.secret_access_key {
+            builder = builder.secret_access_key(secret_key);
+        }
+        if let Some(token) = &self.session_token {
+            builder = builder.session_token(token);
+        }
+
+        // AssumeRole: the source credential is either the key pair above or whatever the default
+        // chain resolves.
+        if let Some(role_arn) = &self.role_arn {
+            builder = builder.role_arn(role_arn);
+        }
+        if let Some(external_id) = &self.external_id {
+            builder = builder.external_id(external_id);
+        }
+        if let Some(role_session_name) = &self.role_session_name {
+            builder = builder.role_session_name(role_session_name);
+        }
+
+        if self.disable_config_load {
+            builder = builder.disable_config_load();
+        }
+        if self.disable_ec2_metadata {
+            builder = builder.disable_ec2_metadata();
+        }
+
+        if !self.force_path_style {
+            builder = builder.enable_virtual_host_style();
+        }
+
+        if self.disable_list_objects_v2 {
+            builder = builder.disable_list_objects_v2();
+        }
+
+        builder
+    }
 }
 
 pub enum ReadPolicy {
@@ -483,44 +689,22 @@ impl OpendalFileSystem {
 
             #[cfg(feature = "opendal-s3")]
             "s3" | "s3a" => {
-                let mut builder = S3::default();
-                builder = builder.bucket(&bucket_or_container);
-
-                if let Some(endpoint) = conf.get("s3.endpoint_url") {
-                    builder = builder.endpoint(endpoint);
-                }
-                if let Some(region) = conf.get("s3.region_name") {
-                    builder = builder.region(region);
-                }
-                if let Some(access_key) = conf.get("s3.credentials.access") {
-                    builder = builder.access_key_id(access_key);
-                }
-                if let Some(secret_key) = conf.get("s3.credentials.secret") {
-                    builder = builder.secret_access_key(secret_key);
-                }
-
-                // Default to path-style for backward compatibility (MinIO, Ceph RGW, localstack, etc.).
-                // Object stores like TOS/OSS only support virtual-host-style and must opt in by
-                // setting `s3.force.path.style=false`.
-                let force_path_style = conf
-                    .get("s3.force.path.style")
-                    .map(|v| v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(true);
-                if !force_path_style {
-                    builder = builder.enable_virtual_host_style();
-                }
-
-                // Select the S3 ListObjects API version via `s3.list_objects_version`.
+                // Every credential shape (static key, STS temporary credential, AssumeRole, or the
+                // SDK default chain) is resolved by the shared `S3Conf` plan, so a mount can carry
+                // an identity instead of a long-lived key.
                 //
-                // Defaults to v2 (OpenDAL's default). Some S3-compatible services (e.g. Baidu
-                // BOS) return `is_truncated=true` in a ListObjectsV2 response but omit the
+                // `s3.force.path.style` defaults to true for backward compatibility; object stores
+                // like TOS/OSS only support virtual-host style and must opt in with `=false`.
+                //
+                // Select the S3 ListObjects API version via `s3.list_objects_version`.
+                // Defaults to v2 (OpenDAL's default). Some S3-compatible services (e.g. Baidu BOS)
+                // return `is_truncated=true` in a ListObjectsV2 response but omit the
                 // `NextContinuationToken`; OpenDAL's v2 lister then resends the request with an
                 // empty token, gets the same page back, and loops forever (mount/list hangs).
                 // Setting `s3.list_objects_version=v1` switches to ListObjects v1, whose lister
                 // falls back to using the last object key as the marker and advances correctly.
-                if curvine_ufs_api::S3Conf::uses_list_objects_v1(&conf)? {
-                    builder = builder.disable_list_objects_v2();
-                }
+                let settings = S3OperatorSettings::from_conf(&conf)?;
+                let builder = settings.apply(S3::default().bucket(&bucket_or_container));
 
                 let base_op = Operator::new(builder)
                     .map_err(|e| FsError::common(format!("Failed to create S3 operator: {}", e)))?
