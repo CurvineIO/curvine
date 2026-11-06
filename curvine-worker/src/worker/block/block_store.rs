@@ -542,15 +542,9 @@ impl BlockStore {
         Ok(b.clone())
     }
 
-    /// Like get_block(), but "not found" is Ok(None), not an Err.
-    pub fn get_block_opt(&self, id: i64) -> CommonResult<Option<BlockMeta>> {
-        let state = self.read()?;
-        Ok(state.get_readable_block(id).cloned())
-    }
-
-    /// The raw pending meta, unlike get_block_opt() which can return a
-    /// stale committed_rewrites entry during a rewrite. Use this to check
-    /// if a pending write/finalize is terminal.
+    /// The raw pending meta, unlike the readable view (get_block()) which can
+    /// return a stale committed_rewrites entry during a rewrite. Use this to
+    /// check if a pending write/finalize is terminal.
     pub fn get_raw_block_opt(&self, id: i64) -> CommonResult<Option<BlockMeta>> {
         let state = self.read()?;
         Ok(state.get_block(id).cloned())

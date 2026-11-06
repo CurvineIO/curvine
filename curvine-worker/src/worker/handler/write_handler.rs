@@ -449,7 +449,7 @@ impl WriteHandler {
                 commit_err
             );
             // Only latch is_commit if truly terminal; stay retryable
-            // otherwise. Use the raw pending meta, not get_block_opt():
+            // otherwise. Use the raw pending meta, not the readable view:
             // during a rewrite it can mask a transient rollback.
             if self.block_is_terminal(context.block.id) {
                 self.is_commit = true;
@@ -1899,7 +1899,7 @@ mod tests {
         );
 
         // The fix: get_raw_block_opt() sees Writing, not the stale
-        // Finalized entry get_block_opt() would resolve via committed_rewrites.
+        // Finalized entry the readable view resolves via committed_rewrites.
         assert!(
             !handler.is_commit,
             "is_commit must stay false after a transient finalize failure on a rewrite"
