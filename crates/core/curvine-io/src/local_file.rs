@@ -14,7 +14,7 @@
 
 use crate::{CacheManager, DataSlice, IOError, IOResult, ReadAheadTask};
 use bytes::BytesMut;
-use curvine_sys::{self};
+use curvine_sys::{self, RawIOSlice};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fmt::{Display, Formatter};
@@ -131,7 +131,7 @@ impl LocalFile {
         }
     }
 
-    pub fn read_region(&mut self, _enable_send_file: bool, len: i32) -> IOResult<DataSlice> {
+    pub fn read_region(&mut self, enable_send_file: bool, len: i32) -> IOResult<DataSlice> {
         let chunk = (len as i64).min(self.len - self.pos);
         if chunk <= 0 {
             return err_box!(
