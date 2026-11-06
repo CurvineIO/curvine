@@ -22,7 +22,7 @@ use crate::master::meta::{
     TrashScanPage,
 };
 
-use crate::master::fs::state::{SessionHeartbeat, SessionMap};
+use crate::master::fs::state::{ClientSession, SessionHeartbeat, SessionMap};
 use crate::master::fs::worker_manager::WorkerManager;
 use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
@@ -320,9 +320,12 @@ impl MasterFilesystem {
         // Publish the gauge on every renewal too (#1885): the count is what the
         // status graph shows, and a renewal that follows a lapsed lease must move
         // it once the session is re-registered.
+        //
+        // Read `len` and set the gauge inside the write guard (#1885 review), so
+        // publication order is the registration order and a stale count can never
+        // overwrite a newer one.
         let active = sessions.len() as i64;
         let session_timeout_ms = sessions.session_timeout_ms();
-        drop(sessions);
         if let Ok(metrics) = Master::get_metrics() {
             metrics.active_sessions.set(active);
         }
@@ -2563,11 +2566,14 @@ impl MasterFilesystem {
     /// Hint counts come from the ownership index, so a session that owns a lot of
     /// state is visible *before* it expires.
     pub fn session_summary(&self) -> FsResult<Vec<SessionSummary>> {
-        let sessions = self.session_map.read();
         let now = LocalTime::mills();
+        // Snapshot under the read guard, then scan the ownership index without
+        // it: renewals need the write side, so a status request must not hold
+        // the session map across per-session index reads (#1885 review).
+        let sessions: Vec<ClientSession> = self.session_map.read().sessions().cloned().collect();
         let mut summary = Vec::with_capacity(sessions.len());
 
-        for session in sessions.sessions() {
+        for session in sessions {
             let owners = self
                 .fs_dir
                 .read()
