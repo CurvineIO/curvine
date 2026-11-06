@@ -55,7 +55,8 @@ impl DirTree {
             conf,
             cache_ttl,
         };
-        tree.inodes.insert(FUSE_ROOT_ID, Box::new(Inode::new_root()));
+        tree.inodes
+            .insert(FUSE_ROOT_ID, Box::new(Inode::new_root()));
         tree
     }
 

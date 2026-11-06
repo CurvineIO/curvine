@@ -432,10 +432,7 @@ mod tests {
 
         // What `persist` writes and `restore` reads back.
         let json = serde_json::to_value(&inode).unwrap();
-        assert_eq!(
-            json["deferred_delete_path"],
-            serde_json::json!("/a/f")
-        );
+        assert_eq!(json["deferred_delete_path"], serde_json::json!("/a/f"));
         assert_eq!(json["master_id"], serde_json::json!(603));
 
         let restored: Inode = serde_json::from_value(json).unwrap();

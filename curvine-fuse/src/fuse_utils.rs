@@ -14,13 +14,13 @@
 
 #![allow(unused_variables)]
 
-use crate::{AttrSource, CachedStatusView};
 use crate::fs::dcache::CachedStatus;
 use crate::fs::operator::{Create, MkDir, MkNod};
 use crate::raw::fuse_abi::{
     fuse_attr, fuse_entry_out, fuse_ioctl_iovec, fuse_ioctl_out, fuse_setattr_in, FUSE_IOCTL_RETRY,
 };
 use crate::*;
+use crate::{AttrSource, CachedStatusView};
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_config::FuseConf;
@@ -296,12 +296,7 @@ impl FuseUtils {
             // Reject negative backend lengths before converting regular-file size.
             _ => {
                 if len < 0 {
-                    return err_fuse!(
-                        libc::EINVAL,
-                        "negative file length {} for ino {}",
-                        len,
-                        ino
-                    );
+                    return err_fuse!(libc::EINVAL, "negative file length {} for ino {}", len, ino);
                 }
                 Ok(len as u64)
             }

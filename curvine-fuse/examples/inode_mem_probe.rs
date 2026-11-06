@@ -336,7 +336,10 @@ fn report(label: &str, count: usize, fanout: usize, before: &Rss, start: Instant
         after.rss_kb / 1024,
         delta / 1024
     );
-    println!("VmHWM (peak, incl. table growth) = {} MB", after.hwm_kb / 1024);
+    println!(
+        "VmHWM (peak, incl. table growth) = {} MB",
+        after.hwm_kb / 1024
+    );
     println!(
         "per inode: {:.1} B (VmRSS delta / count)",
         (delta as f64 * 1024.0) / count as f64
