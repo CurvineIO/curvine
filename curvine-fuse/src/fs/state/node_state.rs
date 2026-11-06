@@ -523,8 +523,16 @@ impl NodeState {
                 );
                 None
             } else {
-                let reader = self.new_reader(path).await?;
-                Some(Arc::new(reader))
+                match self.new_reader(path).await {
+                    Ok(reader) => Some(Arc::new(reader)),
+                    Err(e) => {
+                        // No handle is created, so no RELEASE will drop the writer
+                        // reference taken above; release it here or the writer is
+                        // never completed and stays in the map.
+                        self.release_writer_ref(ino, &writer).await;
+                        return Err(e);
+                    }
+                }
             }
         } else {
             None
@@ -538,6 +546,25 @@ impl NodeState {
             .await;
 
         Ok(handle)
+    }
+
+    /// Drop one writer reference taken by an open that failed before a handle
+    /// existed, with the same flush/complete cleanup RELEASE would run.
+    async fn release_writer_ref(&self, ino: u64, writer: &Arc<FuseWriter>) {
+        let writer = writer.clone();
+        let (_, res) = self
+            .writers
+            .release_with_cleanup(ino, move |last| async move {
+                if last {
+                    writer.complete(None).await
+                } else {
+                    writer.flush(None).await
+                }
+            })
+            .await;
+        if let Err(e) = res {
+            warn!("cleanup writer for ino {} after failed open: {}", ino, e);
+        }
     }
 
     /// Test-only: register a shared writer without going through `new_handle`
@@ -2471,6 +2498,62 @@ mod test {
             assert!(!state.has_open_handles(ino));
             assert!(state.find_writer(ino).await.is_none());
             assert!(state.find_handle(ino, handle.fh()).is_err());
+        });
+    }
+
+    /// An O_RDWR open whose reader fails after the writer reference was taken
+    /// must give that reference back; otherwise the writer never completes.
+    #[test]
+    fn rdwr_open_releases_writer_ref_when_reader_open_fails() {
+        use curvine_client::unified::UnifiedWriter;
+        use curvine_fs_api::local::LocalWriter;
+        use curvine_model::{CreateFileOptsBuilder, OpenFlags};
+
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            // No master is running: keep the reader's RPC retries short.
+            let mut conf = ClusterConf::default();
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            let fs = UnifiedFileSystem::with_rt(conf, task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let local_path = Utils::temp_file();
+            let path = Path::from_str(&local_path).unwrap();
+            let local_writer = LocalWriter::new(&path, 1).unwrap();
+            let fuse_writer = Arc::new(crate::fs::FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
+            ));
+            assert!(!fuse_writer.is_ufs(), "reader open must be attempted");
+
+            let ino = 42;
+            state.insert_shared_writer_for_test(ino, fuse_writer).await;
+
+            let opts = CreateFileOptsBuilder::with_conf(state.client_conf()).build();
+            let res = state
+                .new_handle(Some(ino), &path, OpenFlags::new(libc::O_RDWR as u32), opts)
+                .await;
+            assert!(res.is_err(), "reader open must fail without a master");
+            assert!(!state.has_open_handles(ino));
+
+            // Only the pre-registered reference may remain: releasing it once
+            // must be the last release.
+            let (last, cleanup) = state
+                .writers
+                .release_with_cleanup(ino, |_| async { Ok::<(), FsError>(()) })
+                .await;
+            assert!(last, "failed open leaked a writer reference");
+            assert!(cleanup.is_ok());
+            assert!(state.find_writer(ino).await.is_none());
+
+            let _ = std::fs::remove_file(&local_path);
         });
     }
 }
