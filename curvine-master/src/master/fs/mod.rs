@@ -39,6 +39,7 @@ mod master_filesystem;
 pub(crate) use self::master_filesystem::BlockInodeState;
 pub use self::master_filesystem::{
     BlockReportResult, CompleteFileOptions, DeleteMode, MasterFilesystem, ReapClaim, ReapStep,
+    SessionSummary,
 };
 
 mod delete_result;

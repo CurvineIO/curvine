@@ -1618,6 +1618,10 @@ mod tests {
 
     #[test]
     fn process_client_heartbeat_registers_then_renews_session() {
+        // Publishes the process-global session gauge (heartbeats reach
+        // `MasterFilesystem::heartbeat_in_epoch`): serialize against the
+        // session-reap tests' exact assertions (#1885 review).
+        let _metric_serial = crate::master::Master::metric_test_serial();
         let fs = client_heartbeat_fs(&Utils::rand_str(6));
 
         let first =
@@ -1649,6 +1653,8 @@ mod tests {
     fn client_heartbeat_starts_a_new_lease_epoch_after_demotion() {
         use curvine_raft::raft::RoleState;
 
+        // Publishes the process-global session gauge (#1885 review).
+        let _metric_serial = crate::master::Master::metric_test_serial();
         let fs = client_heartbeat_fs(&Utils::rand_str(6));
 
         fs.master_monitor.set_role_for_test(RoleState::Leader);
@@ -1701,6 +1707,8 @@ mod tests {
 
     #[test]
     fn process_client_heartbeat_lease_comes_from_the_master_timeout() {
+        // Publishes the process-global session gauge (#1885 review).
+        let _metric_serial = crate::master::Master::metric_test_serial();
         let fs = client_heartbeat_fs(&Utils::rand_str(6));
 
         // The client asks for a lease far longer than the master allows; the

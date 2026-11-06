@@ -22,7 +22,7 @@ use crate::master::meta::{
     TrashScanPage,
 };
 
-use crate::master::fs::state::{SessionHeartbeat, SessionMap};
+use crate::master::fs::state::{monotonic_ms, ClientSession, SessionHeartbeat, SessionMap};
 use crate::master::fs::worker_manager::WorkerManager;
 use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
@@ -39,6 +39,7 @@ use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
 use parking_lot::Mutex;
+use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -71,6 +72,33 @@ pub struct CvMetadataSnapshotPage {
     pub entries: Vec<CvMetadataSnapshotEntry>,
     pub next_page_token: Option<String>,
     pub epoch: u64,
+}
+
+/// One client session as reported by the master status surface (#1885).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SessionSummary {
+    pub client_id: String,
+    pub hostname: String,
+    pub ip_addr: String,
+    pub pid: Option<u32>,
+    pub mount_point: Option<String>,
+    pub client_version: Option<String>,
+    pub heartbeat_interval_ms: u64,
+    /// Unix epoch milliseconds, converted from the session map's process-local
+    /// `monotonic_ms` clock at snapshot time. Accurate to the wall clock at the
+    /// moment of the request; not stable across master restarts.
+    pub started_at: u64,
+    /// Unix epoch milliseconds, same conversion as `started_at`.
+    pub last_heartbeat: u64,
+    /// Unix epoch milliseconds, same conversion as `started_at`.
+    pub expire_at: u64,
+    /// Whether the lease is still valid at the time of the snapshot (judged on
+    /// the monotonic clock, so it does not depend on the conversion above).
+    pub live: bool,
+    /// Locks this client owns that are indexed for reclamation.
+    pub lock_hints: usize,
+    /// Writer markers this client owns.
+    pub writer_hints: usize,
 }
 
 #[derive(Default)]
@@ -295,7 +323,19 @@ impl MasterFilesystem {
         let term = self.master_monitor.term();
         let mut sessions = self.session_map.write();
         let new_session = sessions.heartbeat_in_epoch(hb, term, now);
-        (new_session, sessions.session_timeout_ms())
+        // Publish the gauge on every renewal too (#1885): the count is what the
+        // status graph shows, and a renewal that follows a lapsed lease must move
+        // it once the session is re-registered.
+        //
+        // Read `len` and set the gauge inside the write guard (#1885 review), so
+        // publication order is the registration order and a stale count can never
+        // overwrite a newer one.
+        let active = sessions.len() as i64;
+        let session_timeout_ms = sessions.session_timeout_ms();
+        if let Ok(metrics) = Master::get_metrics() {
+            metrics.active_sessions.set(active);
+        }
+        (new_session, session_timeout_ms)
     }
 
     pub fn check_parent(path: &InodePath) -> FsResult<()> {
@@ -2525,6 +2565,67 @@ impl MasterFilesystem {
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         fs_dir.set_lock(inp, lock, &validity)
+    }
+
+    /// Point-in-time view of the client sessions for the status surface (#1885).
+    ///
+    /// Hint counts come from the ownership index, so a session that owns a lot of
+    /// state is visible *before* it expires.
+    ///
+    /// Cost: one `fs_dir.read()` and one unbounded ownership-index prefix scan per
+    /// session, on every call. That suits polling with fleets of hundreds of
+    /// mounts; a caller that needs more must page or cap. The read guard is taken
+    /// per session on purpose, so metadata writers can run between scans instead
+    /// of waiting for the whole fleet.
+    pub fn session_summary(&self) -> FsResult<Vec<SessionSummary>> {
+        // Session times are `monotonic_ms` values: judge `live` on that clock and
+        // convert to epoch ms against one (monotonic, wall) pair for the output.
+        let mono_now = monotonic_ms();
+        let wall_now = LocalTime::mills();
+        let to_wall = |t: u64| {
+            if t >= mono_now {
+                wall_now.saturating_add(t - mono_now)
+            } else {
+                wall_now.saturating_sub(mono_now - t)
+            }
+        };
+        // Snapshot under the read guard, then scan the ownership index without
+        // it: renewals need the write side, so a status request must not hold
+        // the session map across per-session index reads (#1885 review).
+        let sessions: Vec<ClientSession> = self.session_map.read().sessions().cloned().collect();
+        let mut summary = Vec::with_capacity(sessions.len());
+
+        for session in sessions {
+            let owners = self
+                .fs_dir
+                .read()
+                .store
+                .get_client_owners(session.client_id())?;
+            let mut summary_entry = SessionSummary {
+                client_id: session.client_id().to_string(),
+                hostname: session.address.hostname.clone(),
+                ip_addr: session.address.ip_addr.clone(),
+                pid: session.pid,
+                mount_point: session.mount_point.clone(),
+                client_version: session.client_version.clone(),
+                heartbeat_interval_ms: session.heartbeat_interval_ms,
+                started_at: to_wall(session.started_at),
+                last_heartbeat: to_wall(session.last_heartbeat),
+                expire_at: to_wall(session.expire_at),
+                live: !session.is_expired_at(mono_now),
+                lock_hints: 0,
+                writer_hints: 0,
+            };
+            for (kind, _) in owners {
+                match kind {
+                    OwnerKind::Lock => summary_entry.lock_hints += 1,
+                    OwnerKind::Writer => summary_entry.writer_hints += 1,
+                }
+            }
+            summary.push(summary_entry);
+        }
+
+        Ok(summary)
     }
 
     /// Ownership hints held by `client_id`, used by the session reaper (#1884).
