@@ -424,12 +424,10 @@ impl MasterFilesystem {
         Ok((ids, inp.components.len(), full, epoch))
     }
 
-    /// Resolves the live path and snapshots the fencing values: the restore
-    /// epoch plus every directory child-index version along the walk. After
-    /// the inode locks are taken, unchanged versions prove no mutation touched
-    /// any directory on the chain, so the returned `InodePath` — whose nodes
-    /// are held stable by those same locks — can be used directly instead of
-    /// resolving a second time.
+    /// Resolve the live path and capture the restore epoch for revalidation.
+    /// The returned path may contain borrowed pointers. A concurrent delete
+    /// can free them before inode locks are acquired; identity checks after
+    /// acquisition do not make such pointers safe to dereference.
     fn resolve_live_path(&self, path: &str) -> FsResult<(InodePath, u64)> {
         let fs_dir = self.fs_dir.read();
         let control = fs_dir.store.scan_control();
@@ -445,9 +443,9 @@ impl MasterFilesystem {
 
     /// Whether the pre-lock walk is still authoritative. The restore epoch
     /// fences store replacement; each chain entry is re-checked by id inside
-    /// its parent's child index, which is the same identity check the second
-    /// full resolution performed — without rebuilding the path. The held
-    /// inode locks keep every chain node stable during the verification.
+    /// its parent's child index. This check assumes the path pointers remain
+    /// valid until the locks are acquired; concurrent deletion can violate
+    /// that assumption.
     fn namespace_unchanged(&self, epoch: u64, inp: &InodePath) -> bool {
         let fs_dir = self.fs_dir.read();
         if fs_dir.store.scan_control().cancel_epoch() != epoch {
@@ -468,13 +466,12 @@ impl MasterFilesystem {
             }
         }
         if inp.inodes.len() < inp.components.len() && !inp.inodes.is_empty() {
-            // Partial walk: the trailing component must still be missing.
+            // Partial walk: the first unresolved edge must still be missing.
             let Ok(parent) = inp.inodes[inp.inodes.len() - 1].as_dir_ref() else {
                 return false;
             };
             let handle = parent.children_handle();
-            let (child, _) =
-                handle.read_child_view(inp.components.last().expect("components non-empty"));
+            let (child, _) = handle.read_child_view(&inp.components[inp.inodes.len()]);
             if child.is_some() {
                 return false;
             }
@@ -482,11 +479,9 @@ impl MasterFilesystem {
         true
     }
 
-    /// Live-tree counterpart of [`Self::resolve_store_path`]: resolves over
-    /// the shared namespace guard and returns the same comparison shape. The
-    /// per-directory child locks make the result authoritative while the
-    /// sharded write locks are held, and the restore epoch still fences store
-    /// replacement.
+    /// Resolve a comparable live-tree view and capture the restore epoch.
+    /// The underlying path walk has the same borrowed-pointer lifetime risk
+    /// as `resolve_live_path` when it runs before inode locks are acquired.
     fn resolve_live_store_view(&self, path: &str) -> FsResult<(StoreResolvedPath, u64)> {
         let fs_dir = self.fs_dir.read();
         let control = fs_dir.store.scan_control();
@@ -643,9 +638,8 @@ impl MasterFilesystem {
                 continue;
             }
 
-            // The pre-lock InodePath is still authoritative: the sequence
-            // check proves no mutation ran between resolve and lock, and the
-            // held locks keep every node on the chain stable from here on.
+            // Reusing the pre-lock path relies on its pointers still being
+            // valid; the identity check cannot protect an already-freed node.
             let fs_dir = self.fs_dir.read();
             let inp = inp;
             if inp.is_full() {
@@ -834,9 +828,8 @@ impl MasterFilesystem {
                 continue;
             }
 
-            // Under the inode write locks the pre-lock walk is authoritative:
-            // the unchanged sequence proves no mutation ran between resolve
-            // and lock, and the held locks keep the chain stable from here on.
+            // Reusing the pre-lock path relies on its pointers still being
+            // valid; the identity check cannot protect an already-freed node.
             let fs_dir = self.fs_dir.read();
             let inp = inp;
             let Some(target) = inp.get_last_inode() else {
@@ -991,17 +984,16 @@ impl MasterFilesystem {
             }));
             let _locks = self.inode_locks.lock_many(&requests);
 
-            // Both sides resolved under one namespace guard; the epoch plus
-            // the mutation sequence covers both pre-lock walks.
+            // Epoch and identity checks do not protect pointers freed before
+            // the inode locks were acquired.
             if !self.namespace_unchanged(source_epoch, &source_path)
                 || !self.namespace_unchanged(destination_epoch, &destination_path)
             {
                 continue;
             }
 
-            // Reuse the pre-lock walks: the unchanged sequence proves no
-            // mutation ran between resolve and lock, and the held locks keep
-            // both chains stable from here on.
+            // These pre-lock paths may already contain freed pointers if a
+            // concurrent mutation removed an inode before lock acquisition.
             let fs_dir = self.fs_dir.read();
             let source_path = source_path;
             let destination_path = destination_path;

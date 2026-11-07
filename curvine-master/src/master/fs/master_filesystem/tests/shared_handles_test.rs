@@ -11,6 +11,17 @@ impl Drop for ResetChildrenCountPersistence {
 }
 
 #[test]
+fn namespace_validation_checks_first_missing_component() {
+    let fs = test_fs("validate-first-missing-component");
+    fs.mkdir("/parent", false).unwrap();
+    let (path, epoch) = fs.resolve_live_path("/parent/missing/leaf").unwrap();
+    assert!(fs.namespace_unchanged(epoch, &path));
+
+    fs.mkdir("/parent/missing", false).unwrap();
+    assert!(!fs.namespace_unchanged(epoch, &path));
+}
+
+#[test]
 fn topology_reads_wait_for_shared_namespace_writers() {
     let fs = test_fs("status-list-exclusive");
     fs.create("/dir/file", true).unwrap();
