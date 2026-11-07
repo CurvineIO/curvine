@@ -24,8 +24,8 @@ use curvine_core_error::{CommonErrorExt, CommonResultExt};
 use curvine_io::DataSlice;
 use curvine_net::net::{ConnState, InetAddr, NetUtils};
 use curvine_rpc::client::{ClientConf, RpcClient};
-use curvine_rpc::handler::{HandlerService, LimitConf, MessageHandler};
-use curvine_rpc::message::{Builder, Message};
+use curvine_rpc::handler::{Frame, HandlerService, LimitConf, MessageHandler, RpcFrame};
+use curvine_rpc::message::{Builder, Message, ResponseStatus};
 use curvine_rpc::server::{RpcServer, ServerConf};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -313,29 +313,88 @@ fn buffer_handler_releases_permits_when_client_disconnects_mid_request() {
 }
 
 #[test]
-fn buffer_handler_closes_connection_when_permit_wait_times_out() {
+fn buffer_handler_admits_a_waiting_request_once_the_permit_is_released() {
     // One global permit held by a slow request on c1. A request on c2 waits
-    // for that permit; after the server timeout (300ms) c2's connection must
-    // close, well before the slow request finishes. Idle close is off so only
-    // the permit deadline can close it.
+    // for that permit inside the connection's request set instead of blocking
+    // c2's read loop, so the server timeout must not close c2's connection: the
+    // request is admitted as soon as c1 releases the permit.
     let server = start_server_with(false, 8, 1, |conf| {
         conf.timeout_ms = 300;
         conf.close_idle = false;
     });
     server.rt.block_on(async {
         let c1 = connect(&server).await;
-        let slow = tokio::spawn(async move { c1.rpc(sleep_request(1500)).await });
+        let slow = tokio::spawn(async move { c1.rpc(sleep_request(600)).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let c2 = connect(&server).await;
-        let res = tokio::time::timeout(Duration::from_millis(1000), c2.rpc(sleep_request(0)))
+        let res = tokio::time::timeout(Duration::from_secs(5), c2.rpc(sleep_request(0)))
             .await
-            .expect("waiting for a permit must not hang past the server timeout");
-        assert!(res.is_err(), "undispatched request must fail");
+            .expect("a request waiting for a permit must be admitted, not hang");
+        res.expect("the queued request must succeed once the permit is free");
 
         // The slow request on the other connection is unaffected.
         slow.await
             .unwrap()
             .expect("slow request must still complete");
+    });
+}
+
+#[test]
+fn buffer_handler_answers_a_parked_request_when_the_permit_wait_times_out() {
+    // One connection slot and one global permit: c2's only in-flight slot is
+    // parked on the global permit, so the reactor cannot read c2's socket. The
+    // wait must end with an error response instead of pinning the connection
+    // until an unrelated request finishes.
+    let server = start_server_with(false, 1, 1, |conf| {
+        conf.timeout_ms = 200;
+        conf.close_idle = false;
+    });
+    server.rt.block_on(async {
+        let c1 = connect(&server).await;
+        let slow = tokio::spawn(async move { c1.rpc(sleep_request(700)).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let c2 = connect(&server).await;
+        let response = tokio::time::timeout(Duration::from_secs(2), c2.rpc(sleep_request(0)))
+            .await
+            .expect("a parked request must not hang")
+            .expect("the server must answer instead of dropping the request");
+        assert_eq!(response.response_status(), ResponseStatus::Error);
+
+        slow.await
+            .unwrap()
+            .expect("slow request must still complete");
+
+        // The timed-out request released its slot, so the connection is usable.
+        c2.rpc(sleep_request(0))
+            .await
+            .expect("connection must stay usable after the permit-wait timeout");
+    });
+}
+
+#[test]
+fn buffer_handler_drains_replies_after_the_client_half_closes() {
+    // A client that pipelines requests and then shuts down its sending half is
+    // still waiting for the replies. EOF must stop admission, not discard them.
+    let server = start_server(false, 8, 4096);
+    server.rt.block_on(async {
+        let stream = std::net::TcpStream::connect(server.addr.as_pair()).unwrap();
+        let shutdown = stream.try_clone().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let stream = tokio::net::TcpStream::from_std(stream).unwrap();
+        let mut frame = RpcFrame::with_client(stream, 128 * 1024);
+
+        frame.send(sleep_request(100)).await.unwrap();
+        frame.send(sleep_request(0)).await.unwrap();
+        shutdown.shutdown(std::net::Shutdown::Write).unwrap();
+
+        for _ in 0..2 {
+            let reply = tokio::time::timeout(Duration::from_secs(2), frame.receive())
+                .await
+                .expect("half-closed client must still receive its replies")
+                .expect("drained reply must be readable");
+            assert!(reply.not_empty(), "drained reply must carry a response");
+        }
     });
 }

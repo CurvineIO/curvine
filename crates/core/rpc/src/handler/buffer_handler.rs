@@ -12,190 +12,370 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::handler::stream_handler::dispatch;
-use crate::handler::{LimitConf, MessageHandler, ReadFrame, WriteFrame};
+use crate::handler::stream_handler::dispatch_with_guard;
+use crate::handler::{Frame, LimitConf, MessageHandler, ReadFrame, WriteFrame};
 use crate::message::Message;
 use crate::ServerConf;
+use curvine_core_error::CommonErrorExt;
 use curvine_io::{IOError, IOResult};
-use curvine_runtime::runtime::{RpcRuntime, Runtime};
-use log::warn;
+use curvine_metrics::{Gauge, Metrics};
+use curvine_runtime::runtime::Runtime;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+use once_cell::sync::Lazy;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
-use tokio::time::{sleep_until, timeout, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::time::{sleep, timeout};
 
-/// A finished request and the connection permit it holds until written.
-type Reply = (IOResult<Message>, OwnedSemaphorePermit);
+static BLOCKED_REQUESTS: Lazy<Gauge> = Lazy::new(|| {
+    Metrics::new_gauge(
+        "buffer_handler_blocked_requests",
+        "Current number of BufferHandler requests waiting for the global concurrency limit",
+    )
+    .expect("buffer handler blocked requests metric must be valid")
+});
 
-/// Connection handler that processes requests of one connection concurrently.
-///
-/// [`StreamHandler`](crate::handler::StreamHandler) finishes one request before
-/// reading the next, so a slow request blocks every later request on the same
-/// connection. `BufferHandler` instead:
-///
-/// 1. reads requests in a loop and spawns one task per request;
-/// 2. bounds work with two semaphores: `LimitConf::conn_limit` per connection
-///    covers a request from dispatch until its reply is written, and the shared
-///    `LimitConf::global_limit` covers execution only, so a peer that stops
-///    reading holds just its own connection's permits;
-/// 3. sends responses from a single writer task as soon as they are ready, so
-///    responses can be out of order. Clients must match responses by `req_id`
-///    (as `BufferClient` does).
-///
-/// Only use it for services whose requests are independent of each other on a
-/// connection (e.g. master metadata RPC). Stateful streams such as worker block
-/// reads/writes must keep using `StreamHandler`.
-///
-/// The read side is buffered (`ReadFrame`/`WriteFrame`), so splice and sendfile
-/// are not used.
-pub struct BufferHandler<M> {
-    rt: Arc<Runtime>,
-    read_frame: ReadFrame,
-    write_frame: Option<WriteFrame>,
-    handler: Arc<M>,
-    conn_limit: Arc<Semaphore>,
-    global_limit: Arc<Semaphore>,
-    queue_size: usize,
-    close_idle: bool,
-    timeout: Duration,
+struct BlockedRequestGuard;
+
+impl BlockedRequestGuard {
+    fn new() -> Self {
+        BLOCKED_REQUESTS.inc();
+        Self
+    }
 }
 
-impl<M: MessageHandler> BufferHandler<M> {
+impl Drop for BlockedRequestGuard {
+    fn drop(&mut self) {
+        BLOCKED_REQUESTS.dec();
+    }
+}
+
+/// Connection-local reactor for RPC services that explicitly support
+/// concurrent request dispatch.
+///
+/// The read and write halves remain owned by this task. Request futures are
+/// polled through `FuturesUnordered`, so responses are written in completion
+/// order while each frame is still serialized by a single writer.
+pub struct BufferHandler<F, M> {
+    rt: Arc<Runtime>,
+    frame: F,
+    handler: Arc<M>,
+    close_idle: bool,
+    timeout: Duration,
+    limit: LimitConf,
+}
+
+impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
     pub fn new(
         rt: Arc<Runtime>,
-        frames: (ReadFrame, WriteFrame),
+        frame: F,
         handler: M,
-        limit: LimitConf,
         conf: &ServerConf,
+        limit: LimitConf,
     ) -> Self {
-        let (read_frame, write_frame) = frames;
-        BufferHandler {
+        Lazy::force(&BLOCKED_REQUESTS);
+        Self {
             rt,
-            read_frame,
-            write_frame: Some(write_frame),
+            frame,
             handler: Arc::new(handler),
-            conn_limit: Arc::new(Semaphore::new(limit.conn_limit)),
-            global_limit: limit.global_limit,
-            queue_size: limit.conn_limit,
             close_idle: conf.close_idle,
             timeout: Duration::from_millis(conf.timeout_ms),
+            limit,
         }
     }
 
-    pub async fn run(&mut self) -> IOResult<()> {
-        let write_frame = match self.write_frame.take() {
-            Some(v) => v,
-            None => return Ok(()),
+    async fn process_request(
+        rt: &Arc<Runtime>,
+        handler: &Arc<M>,
+        global_limit: &Arc<Semaphore>,
+        permit_timeout: Duration,
+        request: Message,
+    ) -> IOResult<Message> {
+        let permit = match timeout(permit_timeout, Self::acquire_limit(global_limit)).await {
+            Ok(permit) => permit?,
+            Err(_) => {
+                // The in-flight slot is what keeps the reactor polling the
+                // socket, so it must not be parked for as long as an unrelated
+                // connection holds the permit. Answer this request instead.
+                let err =
+                    CommonErrorExt::from(format!("no global permit within {:?}", permit_timeout));
+                return Ok(request.error_ext(&err));
+            }
         };
 
-        let (tx, rx) = mpsc::channel(self.queue_size);
-        let writer = self.rt.spawn(Self::write_loop(write_frame, rx));
-
-        let read_res = self.read_loop(tx).await;
-
-        // `read_loop` dropped its sender. The writer exits after in-flight
-        // requests have sent their responses, or right away if it failed.
-        let write_res = writer.await?;
-        read_res.and(write_res)
+        dispatch_with_guard(rt, handler, request, permit).await
     }
 
-    fn permit_timeout(&self, kind: &str) -> IOResult<()> {
-        warn!(
-            "no {} permit within {:?}, closing connection",
-            kind, self.timeout
-        );
+    async fn acquire_limit(global_limit: &Arc<Semaphore>) -> IOResult<OwnedSemaphorePermit> {
+        match global_limit.clone().try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(TryAcquireError::NoPermits) => {
+                let _blocked = BlockedRequestGuard::new();
+                global_limit
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| IOError::create(e.to_string()))
+            }
+            Err(TryAcquireError::Closed) => err_box!("global limit is closed"),
+        }
+    }
+
+    async fn send_response(
+        writer: &mut WriteFrame,
+        response: IOResult<Message>,
+        timeout: Duration,
+    ) -> IOResult<()> {
+        let response = response?;
+        if response.not_empty() {
+            // Without a deadline a peer that stops reading freezes the reactor,
+            // and the in-flight futures (with their global permits) are never
+            // polled again.
+            writer.send_timeout(&response, timeout).await?;
+        }
         Ok(())
     }
 
-    async fn read_loop(&mut self, tx: mpsc::Sender<Reply>) -> IOResult<()> {
-        loop {
-            let res = tokio::select! {
-                // The writer stopped (write error or failed request task):
-                // stop reading so the connection closes.
-                _ = tx.closed() => return Ok(()),
-                res = timeout(self.timeout, self.read_frame.receive()) => res,
-            };
+    async fn receive_request<R>(
+        reader: &mut ReadFrame,
+        writer: &mut WriteFrame,
+        inflight: &mut FuturesUnordered<R>,
+        conn_limit: usize,
+        close_idle: bool,
+        timeout: Duration,
+    ) -> IOResult<Message>
+    where
+        R: Future<Output = IOResult<Message>>,
+    {
+        let receive = reader.receive();
+        tokio::pin!(receive);
 
-            let request = match res {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => return Err(e),
-                Err(_) if self.close_idle => return Ok(()),
-                Err(_) => continue,
-            };
+        loop {
+            tokio::select! {
+                response = inflight.next(), if !inflight.is_empty() => {
+                    if let Some(response) = response {
+                        Self::send_response(writer, response, timeout).await?;
+                    }
+                }
+
+                received = &mut receive, if inflight.len() < conn_limit => return received,
+
+                _ = sleep(timeout), if close_idle && inflight.is_empty() => {
+                    return Ok(Message::empty());
+                }
+            }
+        }
+    }
+
+    pub async fn run(self) -> IOResult<()> {
+        let Self {
+            rt,
+            frame,
+            handler,
+            close_idle,
+            timeout,
+            limit,
+        } = self;
+
+        let (mut reader, mut writer) = frame.split();
+        let global_limit = limit.global_limit().clone();
+        let conn_limit = limit.conn_limit();
+        let mut inflight = FuturesUnordered::new();
+
+        loop {
+            let request = Self::receive_request(
+                &mut reader,
+                &mut writer,
+                &mut inflight,
+                conn_limit,
+                close_idle,
+                timeout,
+            )
+            .await?;
+
             if request.is_empty() {
+                // A clean read-side EOF only means the peer closed its sending
+                // half: it can still be waiting for the replies of requests it
+                // already pipelined, so finish those before closing.
+                while let Some(response) = inflight.next().await {
+                    Self::send_response(&mut writer, response, timeout).await?;
+                }
                 return Ok(());
             }
 
-            // Acquire the connection permit first so one busy connection waits
-            // on its own limit instead of holding global permits.
-            //
-            // While waiting, this loop does not read the socket, so it cannot
-            // see the peer close the connection. Bound the wait: when it
-            // expires, stop reading and close the connection. In-flight
-            // requests still write their replies first; the caller fails the
-            // undispatched request and can retry on a new connection.
-            let deadline = Instant::now() + self.timeout;
-            let conn_permit = tokio::select! {
-                _ = tx.closed() => return Ok(()),
-                _ = sleep_until(deadline) => return self.permit_timeout("connection"),
-                v = self.conn_limit.clone().acquire_owned() => v,
-            };
-            let global_permit = tokio::select! {
-                _ = tx.closed() => return Ok(()),
-                _ = sleep_until(deadline) => return self.permit_timeout("global"),
-                v = self.global_limit.clone().acquire_owned() => v,
-            };
-            // The semaphores are never closed.
-            let (conn_permit, global_permit) = (conn_permit.unwrap(), global_permit.unwrap());
+            inflight.push(Self::process_request(
+                &rt,
+                &handler,
+                &global_limit,
+                timeout,
+                request,
+            ));
+        }
+    }
+}
 
-            let rt = self.rt.clone();
-            let handler = self.handler.clone();
-            let tx = tx.clone();
-            self.rt.spawn(async move {
-                // Run dispatch in its own task so a panic anywhere in the
-                // handler (is_sync, get_rt, handle, async_handle) becomes an
-                // `Err` that closes the connection, instead of leaving the
-                // caller waiting for a reply that never comes.
-                let task_rt = rt.clone();
-                let response = rt
-                    .spawn(async move { dispatch(&task_rt, &handler, request).await })
-                    .await
-                    .map_err(IOError::from)
-                    .and_then(|v| v);
+#[cfg(test)]
+mod tests {
+    use super::{BlockedRequestGuard, BufferHandler, BLOCKED_REQUESTS};
+    use crate::handler::{MessageHandler, RpcFrame, TestMessageHandler};
+    use crate::message::{Message, ResponseStatus};
+    use curvine_core_error::CommonErrorExt;
+    use curvine_runtime::runtime::{RpcRuntime, Runtime};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::{oneshot, Semaphore};
 
-                // Execution is done: free the global slot before queueing, so
-                // a peer that stops reading cannot hold slots other
-                // connections need.
-                drop(global_permit);
+    struct BlockingHandler {
+        started: Mutex<Option<oneshot::Sender<()>>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
 
-                // The connection permit travels with the reply and is released
-                // after it is written (or dropped). That bounds queued plus
-                // writing replies per connection to `conn_limit`.
-                // `send` fails only when the writer already stopped.
-                let _ = tx.send((response, conn_permit)).await;
-            });
+    struct RuntimeRoutingHandler {
+        rt: Runtime,
+        executed_on: mpsc::Sender<String>,
+    }
+
+    impl MessageHandler for RuntimeRoutingHandler {
+        type Error = CommonErrorExt;
+
+        fn handle(&self, _msg: &Message) -> Result<Message, Self::Error> {
+            let thread_name = std::thread::current()
+                .name()
+                .unwrap_or_default()
+                .to_string();
+            self.executed_on.send(thread_name).unwrap();
+            Ok(Message::empty())
+        }
+
+        fn get_rt(&self, _msg: &Message) -> Option<&Runtime> {
+            Some(&self.rt)
         }
     }
 
-    async fn write_loop(
-        mut write_frame: WriteFrame,
-        mut rx: mpsc::Receiver<Reply>,
-    ) -> IOResult<()> {
-        while let Some((response, _conn_permit)) = rx.recv().await {
-            let response = match response {
-                Ok(v) => v,
-                Err(e) => {
-                    // Same as StreamHandler: a failed handler task closes the
-                    // connection and the client fails its in-flight calls.
-                    warn!("request task failed, closing connection: {}", e);
-                    return Err(e);
-                }
-            };
+    impl MessageHandler for BlockingHandler {
+        type Error = CommonErrorExt;
 
-            if response.not_empty() {
-                write_frame.send(&response).await?;
+        fn handle(&self, _msg: &Message) -> Result<Message, Self::Error> {
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(());
             }
+            self.release.lock().unwrap().recv().unwrap();
+            Ok(Message::empty())
         }
-        Ok(())
+    }
+
+    #[test]
+    fn blocked_request_guard_tracks_current_waiters() {
+        let initial = BLOCKED_REQUESTS.get();
+        {
+            let _blocked = BlockedRequestGuard::new();
+            assert_eq!(BLOCKED_REQUESTS.get(), initial + 1);
+        }
+        assert_eq!(BLOCKED_REQUESTS.get(), initial);
+    }
+
+    #[test]
+    fn closed_global_limit_returns_error() {
+        let runtime = Runtime::current_thread("closed-global-limit-test");
+        let limit = Arc::new(Semaphore::new(1));
+        limit.close();
+
+        let result =
+            runtime.block_on(BufferHandler::<RpcFrame, TestMessageHandler>::acquire_limit(&limit));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn permit_wait_timeout_answers_with_an_error_instead_of_parking() {
+        let runtime = Arc::new(Runtime::current_thread("permit-wait-timeout-test"));
+        let limit = Arc::new(Semaphore::new(1));
+        let held = limit.clone().try_acquire_owned().unwrap();
+        let handler = Arc::new(TestMessageHandler);
+
+        runtime.clone().block_on(async {
+            let response = BufferHandler::<RpcFrame, TestMessageHandler>::process_request(
+                &runtime,
+                &handler,
+                &limit,
+                Duration::from_millis(50),
+                Message::empty(),
+            )
+            .await
+            .expect("a permit-wait timeout must produce an error response");
+            assert_ne!(response.response_status(), ResponseStatus::Success);
+        });
+
+        drop(held);
+    }
+
+    #[test]
+    fn sync_task_keeps_permit_after_outer_future_is_cancelled() {
+        let runtime = Arc::new(Runtime::current_thread("sync-permit-cancellation-test"));
+        let limit = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handler = Arc::new(BlockingHandler {
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(release_rx),
+        });
+
+        runtime.clone().block_on(async move {
+            let task_runtime = runtime.clone();
+            let task_limit = limit.clone();
+            let task = tokio::spawn(async move {
+                BufferHandler::<RpcFrame, BlockingHandler>::process_request(
+                    &task_runtime,
+                    &handler,
+                    &task_limit,
+                    Duration::from_secs(60),
+                    Message::empty(),
+                )
+                .await
+            });
+
+            started_rx.await.unwrap();
+            task.abort();
+            tokio::task::yield_now().await;
+            assert_eq!(limit.available_permits(), 0);
+
+            release_tx.send(()).unwrap();
+            for _ in 0..100 {
+                if limit.available_permits() == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            panic!("blocking task did not release its permit after completion");
+        });
+    }
+
+    #[test]
+    fn sync_request_uses_handler_runtime() {
+        let runtime = Arc::new(Runtime::current_thread("buffer-handler-default-runtime"));
+        let (executed_on_tx, executed_on_rx) = mpsc::channel();
+        let handler = Arc::new(RuntimeRoutingHandler {
+            rt: Runtime::new("buffer-handler-selected-runtime", 1, 1),
+            executed_on: executed_on_tx,
+        });
+        let limit = Arc::new(Semaphore::new(1));
+
+        runtime.block_on(async {
+            BufferHandler::<RpcFrame, RuntimeRoutingHandler>::process_request(
+                &runtime,
+                &handler,
+                &limit,
+                Duration::from_secs(60),
+                Message::empty(),
+            )
+            .await
+            .unwrap();
+        });
+
+        assert!(executed_on_rx
+            .recv()
+            .unwrap()
+            .starts_with("buffer-handler-selected-runtime"));
     }
 }
