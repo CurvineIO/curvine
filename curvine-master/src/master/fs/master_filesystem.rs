@@ -1171,14 +1171,12 @@ impl MasterFilesystem {
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
 
-            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
-            if restore_epoch != locked_epoch || !resolved.same_resolution(&locked) {
+            let fs_dir = self.fs_dir.read();
+            if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-
-            let fs_dir = self.fs_dir.read();
             let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&locked, &inp) {
+            if !Self::live_path_matches(&resolved, &inp) {
                 continue;
             }
             let mut inode = inp
