@@ -34,12 +34,24 @@ impl BlockLocationLockManager {
     /// Best-effort lock-acquire duration in microseconds (design doc §11.2);
     /// metric registration failure is ignored on the hot path.
     fn record_acquire_us(mode: &'static str, started: std::time::Instant) {
-        if let Ok(metrics) = crate::master::Master::get_metrics() {
-            metrics
-                .block_lock_acquire_us
-                .with_label_values(&[mode])
-                .observe(started.elapsed().as_micros() as f64);
-        }
+        use std::sync::OnceLock;
+        static READ: OnceLock<curvine_metrics::Histogram> = OnceLock::new();
+        static WRITE: OnceLock<curvine_metrics::Histogram> = OnceLock::new();
+        let cache = match mode {
+            "read" => &READ,
+            "write" => &WRITE,
+            _ => unreachable!("unknown block lock mode"),
+        };
+        let histogram = match cache.get() {
+            Some(histogram) => histogram,
+            None => match crate::master::Master::get_metrics() {
+                Ok(metrics) => {
+                    cache.get_or_init(|| metrics.block_lock_acquire_us.with_label_values(&[mode]))
+                }
+                Err(_) => return,
+            },
+        };
+        histogram.observe(started.elapsed().as_micros() as f64);
     }
 
     pub fn new(block_shards: usize, worker_shards: usize) -> Self {
