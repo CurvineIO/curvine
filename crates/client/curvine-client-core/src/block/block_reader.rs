@@ -264,18 +264,37 @@ impl BlockReader {
                         self.inner.worker_address(),
                         e
                     );
-                    self.locs.retain(|x| x != self.inner.worker_address());
-                    self.inner = Self::get_reader(
-                        &self.locs,
-                        self.block.clone(),
-                        self.fs_context.clone(),
-                        self.pos(),
-                        self.len(),
-                    )
-                    .await?;
+                    self.fail_over(e).await?;
                 }
             }
         }
+    }
+
+    /// Replace the reader that just failed with one on another replica.
+    ///
+    /// The block was located on workers, so its bytes live there. Once every
+    /// replica has failed the read error is returned: handing the empty list
+    /// to `get_reader` would open a hole reader for a block that still carries
+    /// `alloc_opts` and silently return zeros in place of the data.
+    async fn fail_over(&mut self, err: FsError) -> FsResult<()> {
+        let failed = self.inner.worker_address().clone();
+        self.locs.retain(|x| x != &failed);
+        if self.locs.is_empty() {
+            return Err(err.ctx(format!(
+                "failed to read block {} on {}, no replica left",
+                self.block_id(),
+                failed
+            )));
+        }
+        self.inner = Self::get_reader(
+            &self.locs,
+            self.block.clone(),
+            self.fs_context.clone(),
+            self.pos(),
+            self.len(),
+        )
+        .await?;
+        Ok(())
     }
 
     pub fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
@@ -325,5 +344,45 @@ impl BlockReader {
 
     pub fn block_id(&self) -> i64 {
         self.inner.block_id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_config::ClusterConf;
+    use curvine_model::{FileAllocOpts, FileType, StorageType};
+
+    #[test]
+    fn fail_over_on_last_replica_returns_error_not_hole() {
+        let fs_context = Arc::new(FsContext::new(ClusterConf::default()).unwrap());
+        // A sparse block that a writer has been assigned to: it carries both
+        // replica locations and `alloc_opts` until the write is committed.
+        let mut block = ExtendedBlock::new(1, 4096, StorageType::Disk, FileType::File);
+        block.alloc_opts = Some(FileAllocOpts::with_truncate(4096));
+        let failed = WorkerAddress::default();
+
+        // The failing reader only needs to report the replica it was reading
+        // from; a hole reader on that address stands in for the remote one.
+        let inner = BlockReaderHole::new(fs_context.clone(), block.clone(), 0, 4096).unwrap();
+        let mut reader = BlockReader {
+            inner: Hole(inner),
+            locs: vec![failed],
+            block,
+            fs_context,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let res = rt.block_on(reader.fail_over(FsError::common("injected read failure")));
+
+        assert!(
+            res.is_err(),
+            "losing the last replica must surface the read error"
+        );
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("injected read failure"), "{msg}");
+        assert!(msg.contains("no replica left"), "{msg}");
     }
 }
