@@ -1725,7 +1725,7 @@ impl<'a> InodeStoreSnapshot<'a> {
     pub fn get_child_id(&self, parent_id: i64, name: &str) -> CommonResult<Option<i64>> {
         let key = RocksUtils::i64_str_to_bytes(parent_id, name);
         self.snapshot
-            .get_cf(RocksInodeStore::CF_EDGES, key)?
+            .get_pinned_cf(RocksInodeStore::CF_EDGES, key)?
             .map(|value| RocksUtils::i64_from_bytes(&value))
             .transpose()
     }
