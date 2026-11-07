@@ -63,6 +63,52 @@ fn delete_child_returns_owned_inode_and_keeps_handle_consistent() {
 }
 
 #[test]
+fn listing_is_ordered_and_paginated_before_and_after_sharding() {
+    use curvine_config::ChildrenContainer;
+    use curvine_master::master::meta::inode::InodeChildren;
+    use curvine_model::ListOptions;
+
+    for container in [
+        ChildrenContainer::List,
+        ChildrenContainer::Map,
+        ChildrenContainer::Packed,
+    ] {
+        let children = DirectoryChildren::with_container(InodeChildren::new(container));
+        for id in [9, 1, 12, 2, 10] {
+            children.add_child(file_edge(id)).unwrap();
+        }
+        let check = || {
+            let names = |options: &ListOptions| {
+                children
+                    .list_options(options)
+                    .iter()
+                    .map(|child| child.name().to_owned())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                names(&ListOptions::default()),
+                ["f1", "f10", "f12", "f2", "f9"]
+            );
+            assert_eq!(
+                names(&ListOptions {
+                    limit: Some(2),
+                    start_after: Some("f10".into()),
+                }),
+                ["f12", "f2"]
+            );
+            assert!(names(&ListOptions {
+                limit: Some(0),
+                start_after: None
+            })
+            .is_empty());
+        };
+        check();
+        children.seed_shards_for_bulk_load(4096);
+        check();
+    }
+}
+
+#[test]
 fn mismatched_child_id_does_not_remove_the_edge() {
     use curvine_config::ChildrenContainer;
     use curvine_master::master::meta::inode::InodeChildren;

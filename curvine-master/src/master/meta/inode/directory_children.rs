@@ -434,6 +434,18 @@ impl DirectoryChildren {
         if opts.limit == Some(0) {
             return Vec::new();
         }
+        if self.sharded().is_none() {
+            let children = self.children.read();
+            // Each container returns names in order; recheck promotion while
+            // holding its read lock before skipping the global shard sort.
+            if self.sharded().is_none() {
+                return children
+                    .list_options(opts)
+                    .into_iter()
+                    .map(|child| child.as_ref().clone())
+                    .collect();
+            }
+        }
         let mut out: Vec<InodeView> = self
             .read_all_guards(|children| {
                 children
