@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_config::ChildrenContainer;
 use curvine_master::master::journal::JournalSystem;
 use curvine_master::master::meta::inode::InodePath;
 use curvine_master::Master;
@@ -20,8 +21,33 @@ use curvine_runtime::common::{LocalTime, Utils};
 
 #[test]
 fn get_lock_matches_full_path_resolution() {
+    const CONTAINER_ENV: &str = "CURVINE_TEST_LOCK_PATH_CONTAINER";
+    let container = match std::env::var(CONTAINER_ENV).as_deref() {
+        Ok("list") => ChildrenContainer::List,
+        Ok("map") => ChildrenContainer::Map,
+        Ok("packed") => ChildrenContainer::Packed,
+        Ok(other) => panic!("unknown container {other}"),
+        Err(_) => {
+            // The container is fixed process-wide on first use.
+            for name in ["list", "map", "packed"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .env(CONTAINER_ENV, name)
+                    .args(["--exact", "get_lock_matches_full_path_resolution"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "container {name}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+    };
     Master::init_test_metrics();
     let mut conf = curvine_config::ClusterConf::format();
+    conf.master.children_container = container;
     conf.testing = true;
     conf.journal.enable = false;
     conf.master.meta_dir = Utils::test_sub_dir(format!("get-lock-path-{}", Utils::rand_str(8)));
@@ -87,6 +113,9 @@ fn get_lock_matches_full_path_resolution() {
     assert!(fs.get_lock("/dir/file", query.clone()).unwrap().is_some());
     assert!(fs.get_lock("/.Trash/.pending/file", query.clone()).is_err());
 
+    if container != ChildrenContainer::Packed {
+        return;
+    }
     let file_id = fs.file_status("/dir/file").unwrap().id;
     {
         let guard = fs.fs_dir.write();
