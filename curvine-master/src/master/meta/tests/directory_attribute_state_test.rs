@@ -46,9 +46,9 @@ fn concurrent_directory_deltas_keep_all_updates() {
         for _ in 0..8 {
             let dir = dir.clone();
             scope.spawn(move || {
-                for _ in 0..100 {
+                for time in (0..100).rev() {
                     dir.apply_directory_attribute_delta(
-                        DirectoryAttributeDelta::for_child(1).for_child_entry(),
+                        DirectoryAttributeDelta::new(time, time * 2, 0).for_child_entry(),
                     )
                     .unwrap();
                 }
@@ -57,4 +57,10 @@ fn concurrent_directory_deltas_keep_all_updates() {
     });
     let current = dir.directory_attributes();
     assert_eq!((current.children, current.version), (Some(800), 800));
+    let metadata_copy = dir.clone_metadata();
+    let base = metadata_copy
+        .directory_attribute_delta(DirectoryAttributeDelta::for_child(0))
+        .base()
+        .unwrap();
+    assert_eq!((base.mtime, base.ctime), (99, 198));
 }

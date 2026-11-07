@@ -159,8 +159,15 @@ impl DirectoryAttributeState {
             .ok_or_else(|| CommonError::from("directory attributes version overflow"))?;
         self.nlink.store(nlink, Ordering::Release);
         self.children.store(children, Ordering::Release);
-        self.mtime.fetch_max(delta.mtime, Ordering::AcqRel);
-        self.ctime.fetch_max(delta.ctime, Ordering::AcqRel);
+        // All accesses to these state timestamps hold update_lock.
+        self.mtime.store(
+            self.mtime.load(Ordering::Relaxed).max(delta.mtime),
+            Ordering::Relaxed,
+        );
+        self.ctime.store(
+            self.ctime.load(Ordering::Relaxed).max(delta.ctime),
+            Ordering::Relaxed,
+        );
         self.version.store(version, Ordering::Release);
         Ok(())
     }
