@@ -66,6 +66,41 @@ fn pending_entries(fs: &MasterFilesystem) -> Vec<String> {
 }
 
 #[test]
+fn pending_paths_reject_client_mutations() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let fs = fs_with("pending-mutations", false);
+    fs.create("/victim", false).unwrap();
+    fs.delete_with_mode("/victim", false, DeleteMode::AsyncPurge)
+        .unwrap();
+    fs.create("/visible", false).unwrap();
+    let entries = pending_entries(&fs);
+    assert_eq!(entries.len(), 1);
+    let pending = format!("/.Trash/.pending/{}", entries[0]);
+    let child = format!("{pending}/child");
+
+    assert!(fs.create(&child, true).is_err());
+    assert!(fs
+        .delete_with_mode(&pending, false, DeleteMode::SkipTrash)
+        .is_err());
+    assert!(fs
+        .rename(
+            pending.as_str(),
+            "/moved",
+            curvine_model::RenameFlags::empty()
+        )
+        .is_err());
+    assert!(fs
+        .rename(
+            "/visible",
+            pending.as_str(),
+            curvine_model::RenameFlags::empty()
+        )
+        .is_err());
+    assert!(fs.exists("/visible").unwrap());
+    assert_eq!(pending_entries(&fs), entries);
+}
+
+#[test]
 fn background_delete_waits_for_metadata_gate() {
     let _serial = TEST_LOCK.lock().unwrap();
     let fs = fs_with("background-gate", false);

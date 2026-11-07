@@ -607,7 +607,6 @@ impl MasterFilesystem {
         for _ in 0..MAX_RETRIES {
             let (inp, restore_epoch) = self.resolve_live_path(path)?;
             let ids: Vec<i64> = inp.inodes.iter().map(|inode| inode.id()).collect();
-            Self::check_not_pending_path(path)?;
             Self::check_not_reserved_path(path)?;
             if ids.len() + 1 < inp.components.len() {
                 return self.create_with_global_lock(path, opts, flags);
@@ -1446,7 +1445,6 @@ impl MasterFilesystem {
         let mut delete_res = self.run_metadata_write(|| {
             let path = path.as_ref();
             let (inp, restore_epoch) = self.resolve_live_path(path)?;
-            Self::check_not_pending_path(path)?;
             let sharded = matches!(mode, DeleteMode::SkipTrash)
                 && !recursive
                 && inp.is_full()
@@ -2412,9 +2410,7 @@ impl MasterFilesystem {
             // (durable-before-live), so a misjudgment here degrades to the
             // global-lock path — never to an incorrect rename.
             let (source_inp, source_epoch) = self.resolve_live_path(src)?;
-            Self::check_not_pending_path(src)?;
             let (destination_inp, destination_epoch) = self.resolve_live_path(dst)?;
-            Self::check_not_pending_path(dst)?;
 
             Self::check_not_reserved_path(src)?;
             Self::check_not_reserved_path(dst)?;
