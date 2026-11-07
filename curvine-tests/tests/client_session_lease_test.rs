@@ -77,6 +77,24 @@ fn session_registered(cluster: &MiniCluster, client_id: &str) -> bool {
         .is_some()
 }
 
+/// `(started_at, last_heartbeat)` of a registered session.
+fn session_times(cluster: &MiniCluster, client_id: &str) -> (u64, u64) {
+    let master = cluster.get_active_master_fs();
+    let sessions = master.session_map.read();
+    let session = sessions
+        .get(client_id)
+        .unwrap_or_else(|| panic!("session {client_id} is not registered"));
+    (session.started_at, session.last_heartbeat)
+}
+
+/// Wait until the client itself has seen a heartbeat acknowledged. Only then does
+/// it stamp its locks `session_owned`; a lock taken earlier keeps the legacy
+/// `lock_expire_time` path and the reaper would never release it.
+fn wait_session_active(fs: &CurvineFileSystem, what: &str) {
+    let context = fs.fs_context_ref().clone();
+    wait_until(what, Duration::from_secs(20), || context.session_active());
+}
+
 fn get_status(fs: &CurvineFileSystem, path: &Path) -> curvine_model::FileStatus {
     fs.clone_runtime()
         .block_on(async { fs.get_status(path).await })
@@ -116,9 +134,17 @@ fn find_conflict(fs: &CurvineFileSystem, path: &Path, probe: FileLock) -> Option
         .unwrap()
 }
 
-fn probe() -> FileLock {
-    // A different owner, so it conflicts with anything the crashed client held.
-    lock("probe-client", 999, LockType::WriteLock, LockFlags::Plock)
+/// A different owner, so it conflicts with anything the crashed client held.
+/// POSIX and BSD locks live in separate tables, so each needs its own probe.
+fn probe(flags: LockFlags) -> FileLock {
+    lock("probe-client", 999, LockType::WriteLock, flags)
+}
+
+fn conflicts(fs: &CurvineFileSystem, path: &Path) -> (bool, bool) {
+    (
+        find_conflict(fs, path, probe(LockFlags::Plock)).is_some(),
+        find_conflict(fs, path, probe(LockFlags::Flock)).is_some(),
+    )
 }
 
 /// Crash a client holding a POSIX lock and a BSD lock. Both must be released once
@@ -133,6 +159,7 @@ fn crashed_client_locks_are_released_after_its_lease_expires() {
         Duration::from_secs(20),
         || session_registered(&cluster, &crashed_id),
     );
+    wait_session_active(&crashed, "the first client to see its lease confirmed");
 
     let path = Path::from_str(format!("/crashed-locks-{}", std::process::id())).unwrap();
     create_file(&crashed, &path);
@@ -156,18 +183,28 @@ fn crashed_client_locks_are_released_after_its_lease_expires() {
         Duration::from_secs(20),
         || session_registered(&cluster, &survivor_id),
     );
-    assert!(
-        find_conflict(&survivor, &path, probe()).is_some(),
-        "while the owner is alive its lock must be enforced"
+    assert_eq!(
+        conflicts(&survivor, &path),
+        (true, true),
+        "while the owner is alive both its POSIX and its BSD lock must be enforced"
     );
 
     // Crash: dropping the last FsContext stops the heartbeat task (#1878).
     drop(crashed);
 
+    // Session-owned locks never expire by time while the lock lease is on, so
+    // only the reaper can clear these conflicts.
     wait_until(
         "the crashed client's locks to be released",
         Duration::from_secs(40),
-        || find_conflict(&survivor, &path, probe()).is_none(),
+        || conflicts(&survivor, &path) == (false, false),
+    );
+    // The reaper drains a session before it forgets it, so the session leaving
+    // the map ties the release to the reaper rather than to any other path.
+    wait_until(
+        "the reaper to forget the crashed session",
+        Duration::from_secs(40),
+        || !session_registered(&cluster, &crashed_id),
     );
 
     // And the survivor can take both of them.
@@ -247,10 +284,26 @@ fn idle_clients_stay_live_without_reclamation_work() {
         Duration::from_secs(30),
         || ids.iter().all(|id| session_registered(&cluster, id)),
     );
+    let before: Vec<(u64, u64)> = ids.iter().map(|id| session_times(&cluster, id)).collect();
 
     // Several lease windows later nothing may have expired: a heartbeat inside the
     // lease must be enough to keep a session (and everything it owns) alive.
     std::thread::sleep(Duration::from_millis(3 * SESSION_TIMEOUT_MS));
+
+    // A reaped session re-registers on its next heartbeat with a new
+    // `started_at`, so an unchanged `started_at` proves no reap happened, and an
+    // advanced `last_heartbeat` proves the sessions were renewed meanwhile.
+    for (id, (started_at, last_heartbeat)) in ids.iter().zip(&before) {
+        let (started_now, heartbeat_now) = session_times(&cluster, id);
+        assert_eq!(
+            started_now, *started_at,
+            "session {id} was reaped and re-registered while heartbeating"
+        );
+        assert!(
+            heartbeat_now > *last_heartbeat,
+            "session {id} was not renewed during the wait"
+        );
+    }
 
     let master = cluster.get_active_master_fs();
     let summary = master.session_summary().unwrap();
