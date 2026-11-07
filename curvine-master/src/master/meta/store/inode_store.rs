@@ -420,8 +420,19 @@ impl InodeStore {
 
         if !del.is_dir() {
             batch.delete_child(parent.id(), del_name)?;
-            del_res =
-                self.decrement_inode_nlink(del.id(), 1, ctime, &mut batch, &mut ttl_removals)?;
+            // EXPERIMENT: the caller holds the namespace write path, so the
+            // in-memory inode already matches the store row; skip the point
+            // lookup and clone the view instead.
+            let mut staged: HashMap<i64, Option<InodeView>> = HashMap::new();
+            staged.insert(del.id(), Some(del.clone()));
+            del_res = self.stage_decrement_nlink(
+                del.id(),
+                1,
+                ctime,
+                &mut batch,
+                Some(&mut staged),
+                &mut ttl_removals,
+            )?;
             deleted_files = 1;
         } else {
             let mut stack = LinkedList::new();
