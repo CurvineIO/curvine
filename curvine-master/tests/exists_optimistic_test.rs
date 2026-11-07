@@ -526,6 +526,27 @@ fn link_under_distinct_parents_remains_consistent_after_reload() {
 }
 
 #[test]
+fn symlink_rejects_restore_admission_without_publishing_entry() {
+    let fs = test_fs("symlink-restore-admission");
+    fs.mkdir("/dir", false).unwrap();
+    let restore = fs
+        .fs_dir
+        .read()
+        .store_ref()
+        .begin_restore(std::time::Duration::from_secs(1))
+        .unwrap();
+    let error = fs
+        .symlink("/target", "/dir/link", false, 0o777)
+        .unwrap_err();
+    assert!(error.to_string().contains("snapshot restore"));
+    drop(restore);
+    assert!(!fs.exists("/dir/link").unwrap());
+    fs.symlink("/target", "/dir/link", false, 0o777).unwrap();
+    fs.restore_from_rocksdb().unwrap();
+    assert!(fs.exists("/dir/link").unwrap());
+}
+
+#[test]
 fn symlink_under_distinct_parents_remains_consistent_after_reload() {
     let fs = test_fs("symlink-distinct-parents");
     const PARENTS: usize = 4;
