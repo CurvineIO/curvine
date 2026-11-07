@@ -4,6 +4,38 @@ use std::thread;
 use std::time::Duration;
 
 #[test]
+fn single_inode_lock_many_records_one_acquisition() {
+    const ENV: &str = "CURVINE_INODE_LOCK_METRIC_TEST";
+    if std::env::var_os(ENV).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "master::meta::tests::inode_lock_pool_test::single_inode_lock_many_records_one_acquisition",
+            ])
+            .env(ENV, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated metric test failed: {status}");
+        return;
+    }
+
+    crate::master::Master::init_test_metrics();
+    let histogram = crate::master::Master::get_metrics()
+        .unwrap()
+        .inode_lock_acquire_us
+        .with_label_values(&["write"]);
+    let before = histogram.get_sample_count();
+    let manager = InodeLockManager::new(4);
+    drop(manager.lock_many(&[InodeLockRequest::write(0, 42)]));
+    drop(manager.write_inode(43));
+    drop(manager.lock_many(&[
+        InodeLockRequest::read(0, 44),
+        InodeLockRequest::write(1, 45),
+    ]));
+    assert_eq!(histogram.get_sample_count() - before, 3);
+}
+
+#[test]
 fn released_inode_locks_are_reclaimed_after_a_concurrent_peak() {
     let manager = InodeLockManager::new(1);
     let guards: Vec<_> = (0..128).map(|id| manager.write_inode(id)).collect();

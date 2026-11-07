@@ -124,9 +124,7 @@ impl InodeLockManager {
         let started = std::time::Instant::now();
         let normalized = Self::normalize_requests(requests);
         if normalized.len() == 1 {
-            let result = self.lock_normalized_one(normalized[0]);
-            Self::record_acquire_us(normalized[0].mode, started);
-            return result;
+            return self.lock_normalized_one(normalized[0], started);
         }
 
         let inode_ids = normalized
@@ -173,23 +171,32 @@ impl InodeLockManager {
     }
 
     pub fn read_inode(&self, inode_id: i64) -> InodeLockSet<'_> {
-        self.lock_normalized_one(NormalizedInodeLock {
-            depth: 0,
-            inode_id,
-            mode: InodeLockMode::Read,
-        })
+        self.lock_normalized_one(
+            NormalizedInodeLock {
+                depth: 0,
+                inode_id,
+                mode: InodeLockMode::Read,
+            },
+            std::time::Instant::now(),
+        )
     }
 
     pub fn write_inode(&self, inode_id: i64) -> InodeLockSet<'_> {
-        self.lock_normalized_one(NormalizedInodeLock {
-            depth: 0,
-            inode_id,
-            mode: InodeLockMode::Write,
-        })
+        self.lock_normalized_one(
+            NormalizedInodeLock {
+                depth: 0,
+                inode_id,
+                mode: InodeLockMode::Write,
+            },
+            std::time::Instant::now(),
+        )
     }
 
-    fn lock_normalized_one<'a>(&'a self, request: NormalizedInodeLock) -> InodeLockSet<'a> {
-        let started = std::time::Instant::now();
+    fn lock_normalized_one<'a>(
+        &'a self,
+        request: NormalizedInodeLock,
+        started: std::time::Instant,
+    ) -> InodeLockSet<'a> {
         assert_no_reentrant_lock(self, request.inode_id);
         let guard = self.lock_one_guard(request);
         mark_lock_held(self, request.inode_id);
