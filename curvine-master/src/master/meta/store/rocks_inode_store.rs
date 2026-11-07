@@ -677,6 +677,22 @@ impl<'a> InodeWriteBatch<'a> {
         )
     }
 
+    /// Write a directory attribute row for an inode minted in this process
+    /// (monotonic id, never materialised before): no prior row can exist, so
+    /// the read-and-validate step is skipped. Callers must only pass
+    /// freshly allocated directory ids.
+    pub fn write_fresh_directory_attributes(
+        &mut self,
+        id: i64,
+        attributes: DirectoryAttributes,
+    ) -> CommonResult<()> {
+        self.put_cf(
+            RocksInodeStore::CF_DIR_ATTRS,
+            RocksUtils::i64_to_bytes(id),
+            attributes.encode(),
+        )
+    }
+
     /// Backfills an attribute row for an existing database without claiming a
     /// child count that was never stored. Migration records must remain
     /// readable by older replicas even if a newer process has enabled CDA4.

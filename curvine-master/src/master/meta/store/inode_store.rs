@@ -283,7 +283,7 @@ impl InodeStore {
                 .for_child_entry(),
         )?;
         if child.is_dir() {
-            batch.write_directory_attributes(child.id(), child.directory_attributes())?;
+            batch.write_fresh_directory_attributes(child.id(), child.directory_attributes())?;
         }
         batch.add_child(parent.id(), child.name(), child.id())?;
 
