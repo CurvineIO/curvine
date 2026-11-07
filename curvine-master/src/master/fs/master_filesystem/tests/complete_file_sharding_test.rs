@@ -668,12 +668,62 @@ fn assert_stale_worker_set_retry(
 #[cfg(feature = "fault-injection")]
 #[test]
 fn delete_retries_when_replication_changes_sampled_worker_set() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
     let fs = test_fs("delete-stale-worker-set");
     let path = "/delete-stale-worker-set-file";
     let block_id = replication_file(&fs, path);
-    assert_stale_worker_set_retry(&fs, path, block_id, move |fs| {
-        Ok(fs.delete(path, false)?.inodes == 1)
-    });
+    fs.complete_file(
+        path,
+        None,
+        1,
+        vec![CommitBlock {
+            block_id,
+            block_len: 1,
+            locations: vec![BlockLocation::with_id(100)],
+        }],
+        "",
+        false,
+        None,
+    )
+    .unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "delete-stale-worker-set";
+    let rule = FaultRuleBuilder::named("master.metadata.locations_sampled")
+        .matches("path", path)
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    // Delete samples locations under the inode lock, then waits for this
+    // worker lock. Replication to another worker can change the sampled set.
+    let held = fs.block_location_locks.write_worker(100);
+    let delete_fs = fs.clone();
+    let delete = std::thread::spawn(move || delete_fs.delete(path, false));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let sampled = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let updated = fs.commit_replication_location(block_id, BlockLocation::with_id(200), "");
+    drop(held);
+    let deleted = delete.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+
+    assert!(sampled, "delete did not sample its worker set");
+    assert!(updated.unwrap(), "replication did not add the new location");
+    assert_eq!(deleted.unwrap().inodes, 1);
+    for worker_id in [100, 200] {
+        let commands = fs
+            .worker_manager
+            .write()
+            .block_map
+            .handle_heartbeat(worker_id);
+        assert!(commands.iter().any(|command| match command {
+            WorkerCommand::DeleteBlock(command) => command.blocks.contains(&block_id),
+        }));
+    }
     assert!(fs.file_status(path).is_err());
 }
 
@@ -833,6 +883,54 @@ fn delete_serializes_with_a_concurrent_block_report() {
         .copied()
         .collect::<HashSet<_>>();
     assert!(deleted.contains(&block_id));
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn delete_does_not_hold_namespace_read_while_waiting_for_block_lock() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("delete-block-lock-namespace-order");
+    let path = "/delete-block-lock-file";
+    let block_id = replication_file(&fs, path);
+    let held = fs
+        .block_location_locks
+        .write_worker_blocks(100, &[block_id]);
+    let runtime = FaultRuntime::process();
+    let rule_id = "delete-block-lock-namespace-order";
+    let rule = FaultRuleBuilder::named("master.metadata.locations_sampled")
+        .matches("path", path)
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+
+    let delete_fs = fs.clone();
+    let delete = std::thread::spawn(move || delete_fs.delete(path, false));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let sampled = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let writer_fs = fs.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let _guard = writer_fs.fs_dir.write();
+        tx.send(()).unwrap();
+    });
+    let writer_entered = rx.recv_timeout(Duration::from_millis(500)).is_ok();
+    drop(held);
+    let deleted = delete.join().unwrap();
+    writer.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+
+    assert!(sampled, "delete did not reach the block-lock boundary");
+    assert!(
+        writer_entered,
+        "delete held the namespace lock while waiting for a block lock"
+    );
+    assert_eq!(deleted.unwrap().inodes, 1);
 }
 
 #[test]

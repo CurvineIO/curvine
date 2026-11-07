@@ -841,6 +841,8 @@ impl MasterFilesystem {
             let fs_dir = self.fs_dir.read();
             let inp = inp;
             let Some(target) = inp.get_last_inode() else {
+                drop(fs_dir);
+                drop(_locks);
                 return self.delete_with_global_lock(path);
             };
             let block_ids = target
@@ -868,6 +870,9 @@ impl MasterFilesystem {
                 }
                 worker_ids.into_iter().collect::<Vec<_>>()
             };
+            // Never wait for a location lock while holding the namespace read
+            // guard: worker cleanup takes these locks before the write guard.
+            drop(fs_dir);
             #[cfg(test)]
             crate::fault_point! {
                 sync,
@@ -878,6 +883,33 @@ impl MasterFilesystem {
             let _location_locks = self
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
+            let fs_dir = self.fs_dir.read();
+            if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
+                continue;
+            }
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if inp.inodes.len() != ids.len()
+                || inp
+                    .inodes
+                    .iter()
+                    .zip(&ids)
+                    .any(|(inode, id)| inode.id() != *id)
+                || !inp.is_full()
+            {
+                continue;
+            }
+            let Some(target) = inp.get_last_inode() else {
+                continue;
+            };
+            if target
+                .as_file_ref()
+                .ok()
+                .map(|file| file.block_ids())
+                .unwrap_or_default()
+                != block_ids
+            {
+                continue;
+            }
             let current_workers = {
                 let mut current_workers = HashSet::new();
                 for block_id in &block_ids {
