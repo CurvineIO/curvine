@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_master::master::meta::inode::{
-    DirectoryChildren, InodeDir, InodeFile, InodePath, InodeView,
+    DirectoryChildren, InodeDir, InodeFile, InodePath, InodePtr, InodeView,
 };
 use curvine_master::master::meta::store::InodeStore;
 use std::sync::Arc;
@@ -28,6 +28,27 @@ fn root_with_children() -> (InodeView, Arc<DirectoryChildren>) {
         .add_child(InodeView::new_file("leaf".into(), InodeFile::new(1002, 1)))
         .unwrap();
     (root, handle)
+}
+
+#[test]
+fn resolve_retains_owned_root_until_path_is_dropped() {
+    let (root, handle) = root_with_children();
+    let weak = Arc::downgrade(&handle);
+    drop(handle);
+    let store = test_store("owned-root");
+    let path = InodePath::resolve(InodePtr::from_owned(root), "/", &store).unwrap();
+    assert!(weak.upgrade().is_some(), "resolved root was dropped early");
+    drop(path);
+    assert!(weak.upgrade().is_none());
+
+    let (root, handle) = root_with_children();
+    let weak = Arc::downgrade(&handle);
+    drop(handle);
+    let path = InodePath::resolve(InodePtr::from_owned(root), "/sub", &store).unwrap();
+    assert!(weak.upgrade().is_some());
+    assert_eq!(path.inodes[1].id(), 1001);
+    drop(path);
+    assert!(weak.upgrade().is_none());
 }
 
 #[test]

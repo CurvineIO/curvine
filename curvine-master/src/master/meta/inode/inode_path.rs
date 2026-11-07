@@ -136,39 +136,31 @@ impl InodePath {
         let mut index = 0;
 
         while index < components.len() {
-            //make sure resolved_inode is not a FileEntry
-            //if it is a FileEntry, load the complete file data from store
-            let resolved_inode = match cur_inode.as_ref() {
-                FileEntry(f) => {
-                    // If it is a FileEntry, load the complete object from store
-                    match store.get_inode(f.id(), Some(f.name()))? {
-                        Some(full_inode) => InodePtr::from_owned(full_inode),
-                        None => return err_box!("Failed to load inode {} from store", f.id()),
-                    }
+            let next = if index + 1 < components.len() {
+                match cur_inode.as_ref() {
+                    Dir(dir) => dir.get_child(&components[index + 1]),
+                    _ => None,
                 }
-                _ => cur_inode.clone(),
+            } else {
+                None
             };
 
+            let resolved_inode = match cur_inode.as_ref() {
+                FileEntry(f) => match store.get_inode(f.id(), Some(f.name()))? {
+                    Some(full_inode) => InodePtr::from_owned(full_inode),
+                    None => return err_box!("Failed to load inode {} from store", f.id()),
+                },
+                _ => cur_inode,
+            };
+            // Preserve ownership when a caller passes an owned root or a
+            // child container returns an owned inode.
             inodes.push(resolved_inode);
 
-            if index == components.len() - 1 {
-                break;
+            match next {
+                Some(child) => cur_inode = child,
+                None => break,
             }
-
             index += 1;
-            let child_name: &str = components[index].as_str();
-            match cur_inode.as_ref() {
-                Dir(d) => {
-                    if let Some(child) = d.get_child(child_name) {
-                        cur_inode = child;
-                    } else {
-                        // The directory has not been created, so there is no need to search again.
-                        break;
-                    }
-                }
-
-                _ => break,
-            }
         }
 
         let inode_path = Self {
