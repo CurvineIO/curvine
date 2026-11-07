@@ -4907,11 +4907,42 @@ impl MasterFilesystem {
     pub fn get_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
+        // Retain the original exclusive namespace guard while walking borrowed
+        // child pointers; the lock query only needs the target inode id.
         let fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-        let expire_ms = self.conf.lock_expire_time_ms();
+        if !InodeView::is_full_path(path)
+            || (path != PATH_SEPARATOR && path.ends_with(PATH_SEPARATOR))
+        {
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            return fs_dir.get_lock(inp, &lock, self.conf.lock_expire_time_ms());
+        }
+        fs_dir.store.ensure_available()?;
 
-        fs_dir.get_lock(inp, &lock, expire_ms)
+        let mut inode = fs_dir.root_ptr();
+        let mut full = true;
+        if path != PATH_SEPARATOR {
+            for component in path.split(PATH_SEPARATOR).skip(1) {
+                let Some(child) = inode.as_ref().get_child(component) else {
+                    full = false;
+                    break;
+                };
+                inode = match child.as_ref() {
+                    InodeView::FileEntry(entry) => InodePtr::from_owned(try_option!(
+                        fs_dir.store.get_inode(entry.id(), Some(entry.name()))?,
+                        "Failed to load inode {} from store",
+                        entry.id()
+                    )),
+                    _ => child,
+                };
+            }
+        }
+        Self::check_not_pending_path(path)?;
+        if !full {
+            return err_ext!(FsError::file_not_found(path));
+        }
+
+        let mut meta = fs_dir.store.get_locks(inode.id())?;
+        Ok(meta.check_conflict(&lock, self.conf.lock_expire_time_ms()))
     }
 
     pub fn set_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
