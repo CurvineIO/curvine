@@ -31,6 +31,12 @@ use std::time::{Duration, Instant};
 /// 200ms beats inside a 1s lease: five missed beats before a session expires.
 const HEARTBEAT_MS: u64 = 200;
 const SESSION_TIMEOUT: &str = "1s";
+/// `client_session_timeout` above, in milliseconds, so a change of units or of
+/// the lease fails loudly in one place.
+/// Budget for a multi-step wait whose resolution is one lease + one reaper tick,
+/// with headroom for CI slowness. Kept named so a flake points at a duration
+/// rather than a magic number.
+const REAP_TIMEOUT: Duration = Duration::from_millis(SESSION_TIMEOUT_MS * 40);
 
 fn start_cluster() -> (Testing, Arc<MiniCluster>) {
     let testing = Testing::builder()
@@ -196,14 +202,14 @@ fn crashed_client_locks_are_released_after_its_lease_expires() {
     // only the reaper can clear these conflicts.
     wait_until(
         "the crashed client's locks to be released",
-        Duration::from_secs(40),
+        REAP_TIMEOUT,
         || conflicts(&survivor, &path) == (false, false),
     );
     // The reaper drains a session before it forgets it, so the session leaving
     // the map ties the release to the reaper rather than to any other path.
     wait_until(
         "the reaper to forget the crashed session",
-        Duration::from_secs(40),
+        REAP_TIMEOUT,
         || !session_registered(&cluster, &crashed_id),
     );
 
@@ -255,7 +261,7 @@ fn crashed_writer_is_reaped_and_the_file_becomes_completable() {
     let rescuer = client_fs(&testing);
     wait_until(
         "the crashed writer's marker to be reaped",
-        Duration::from_secs(40),
+        REAP_TIMEOUT,
         || get_status(&rescuer, &path).is_complete,
     );
 
@@ -288,7 +294,13 @@ fn idle_clients_stay_live_without_reclamation_work() {
 
     // Several lease windows later nothing may have expired: a heartbeat inside the
     // lease must be enough to keep a session (and everything it owns) alive.
-    std::thread::sleep(Duration::from_millis(3 * SESSION_TIMEOUT_MS));
+    // Poll for renewal instead of sleeping a fixed span: a slow, loaded runner
+    // that descheduled the master would otherwise be reported as a reap.
+    wait_until("idle sessions to renew", Duration::from_secs(20), || {
+        ids.iter()
+            .zip(&before)
+            .all(|(id, (_, last))| session_times(&cluster, id).1 > *last)
+    });
 
     // A reaped session re-registers on its next heartbeat with a new
     // `started_at`, so an unchanged `started_at` proves no reap happened, and an
