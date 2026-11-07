@@ -4829,36 +4829,29 @@ impl MasterFilesystem {
                 })
                 .collect();
             let _inode_locks = self.inode_locks.lock_many(&requests);
-
-            let (locked, locked_epoch) = match self.resolve_live_store_view(path) {
-                Ok(value) => value,
+            let _location_lock = self.block_location_locks.write_blocks(&[block.id]);
+            let fs_dir = self.fs_dir.read();
+            let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
+                Ok(epoch) => epoch,
                 Err(_) if expected_id.is_some() => return Ok(None),
                 Err(error) => return Err(error),
             };
-            if locked_epoch != restore_epoch || !resolved.same_resolution(&locked) {
+            if locked_epoch != restore_epoch {
                 continue;
             }
-            let Some(locked_target) = locked.target() else {
-                continue;
+            let inp = match Self::resolve_path(&fs_dir, path) {
+                Ok(inp) => inp,
+                Err(_) if expected_id.is_some() => return Ok(None),
+                Err(error) => return Err(error),
             };
-            if expected_id.is_some_and(|id| id != locked_target.id()) || !locked_target.is_file() {
-                return Ok(None);
-            }
-
-            let _location_lock = self.block_location_locks.write_blocks(&[block.id]);
-            let fs_dir = self.fs_dir.read();
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&locked, &inp) {
+            if !Self::live_path_matches(&resolved, &inp) {
                 continue;
             }
             let Some(live_inode) = inp.get_last_inode() else {
                 continue;
             };
-            if live_inode.id() != locked_target.id()
-                || expected_id.is_some_and(|id| id != live_inode.id())
-                || !live_inode.is_file()
-            {
-                continue;
+            if expected_id.is_some_and(|id| id != live_inode.id()) || !live_inode.is_file() {
+                return Ok(None);
             }
 
             let file = live_inode.as_file_ref()?;
