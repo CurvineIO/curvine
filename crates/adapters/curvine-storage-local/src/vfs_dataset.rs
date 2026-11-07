@@ -834,12 +834,6 @@ impl Dataset for VfsDataset {
             return Ok(());
         }
 
-        // Ordinary leases are not exclusive: another writer may have
-        // finalized this block meanwhile. Never quarantine an acked replica.
-        if meta.is_final() {
-            return Ok(());
-        }
-
         if meta.storage_type() != StorageType::SpdkDisk {
             return self.abort_block(block);
         }
@@ -2144,23 +2138,6 @@ mod test {
         let meta = ds.get_block(1).unwrap();
         assert_eq!(meta.state(), &BlockState::Quarantined);
         assert_eq!(ds.available(), available - 4096);
-        Ok(())
-    }
-
-    #[test]
-    fn abort_block_uncertain_skips_finalized_block() -> CommonResult<()> {
-        let mut ds = spdk_dataset()?;
-        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
-        ds.open_block(&block)?;
-        ds.finalize_block(&block)?;
-        let available = ds.available();
-
-        // Another writer's acked replica: a late uncertain abort must not quarantine it.
-        ds.abort_block_uncertain(&block)?;
-
-        let meta = ds.get_block(1).unwrap();
-        assert_eq!(meta.state(), &BlockState::Finalized);
-        assert_eq!(ds.available(), available);
         Ok(())
     }
 

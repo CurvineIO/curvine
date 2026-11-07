@@ -475,28 +475,24 @@ impl BlockStore {
     }
 
     pub fn abort_block(&self, block: &ExtendedBlock) -> CommonResult<()> {
-        let _block_lock = self.block_lock(block.id, "abort");
-        self.check_replication_owner(block.id)?;
-        #[cfg(test)]
-        if self
-            .force_transient_abort_failure
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
-            return curvine_core_error::err_box!("injected transient abort failure for test");
-        }
-        self.with_dataset_write("abort", |state| {
-            // Ordinary leases are not exclusive: another writer may have
-            // finalized this block meanwhile. Never delete an acked replica.
-            if state.get_block(block.id).is_some_and(|m| m.is_final()) {
-                return Ok(());
-            }
-            state.abort_block(block)
-        })
+        self.abort_with(block, "abort", false)
     }
 
     /// Abort with an uncertain (timed-out) write/flush outcome; see `Dataset::abort_block_uncertain`.
     pub fn abort_block_uncertain(&self, block: &ExtendedBlock) -> CommonResult<()> {
-        let _block_lock = self.block_lock(block.id, "abort_uncertain");
+        self.abort_with(block, "abort_uncertain", true)
+    }
+
+    /// Every abort variant goes through here: take the block stripe lock,
+    /// check the replication owner, then inside one `with_dataset_write` skip
+    /// blocks already in the committed, finalized generation and dispatch to
+    /// `abort_block` or `abort_block_uncertain`. Ordinary leases are not
+    /// exclusive and error paths may have rolled back to an old committed
+    /// generation, so a late abort must never delete or quarantine an acked
+    /// replica. Uses the raw meta, never the readable view. Missing blocks
+    /// (already aborted) return `Ok(())`.
+    fn abort_with(&self, block: &ExtendedBlock, op: &str, uncertain: bool) -> CommonResult<()> {
+        let _block_lock = self.block_lock(block.id, op);
         self.check_replication_owner(block.id)?;
         #[cfg(test)]
         if self
@@ -505,40 +501,30 @@ impl BlockStore {
         {
             return curvine_core_error::err_box!("injected transient abort failure for test");
         }
-        self.with_dataset_write("abort_uncertain", |state| {
-            state.abort_block_uncertain(block)
-        })
-    }
-
-    /// Aborts a block unless it is in the committed, finalized generation:
-    /// takes the block stripe lock, checks the replication owner, then aborts
-    /// the raw current generation only if `!is_final()`, all inside one
-    /// `with_dataset_write`. Complete/open error paths may already have rolled
-    /// back to an old committed generation — a second abort must not delete
-    /// that finalized replica — so this never goes through the readable view.
-    /// Missing blocks (already aborted) are fine and return `Ok(())`.
-    fn abort_unless_final(&self, block_id: i64, op: &str) -> CommonResult<()> {
-        let _lock = self.block_lock(block_id, op);
-        self.check_replication_owner(block_id)?;
         self.with_dataset_write(op, |state| {
-            if state
-                .get_block(block_id)
-                .is_some_and(|meta| !meta.is_final())
-            {
-                state.abort_block(&ExtendedBlock::with_id(block_id))?;
+            if state.get_block(block.id).is_some_and(|m| m.is_final()) {
+                return Ok(());
             }
-            Ok(())
+            if uncertain {
+                state.abort_block_uncertain(block)
+            } else {
+                state.abort_block(block)
+            }
         })
     }
 
     pub(crate) fn abort_replication_write(&self, block_id: i64) -> CommonResult<()> {
-        self.abort_unless_final(block_id, "abort_replication")
+        self.abort_with(
+            &ExtendedBlock::with_id(block_id),
+            "abort_replication",
+            false,
+        )
     }
 
     /// Aborts a batch-opened block unless it is already finalized; see
-    /// [`BlockStore::abort_unless_final`] for the check-and-abort contract.
+    /// [`BlockStore::abort_with`] for the check-and-abort contract.
     pub(crate) fn abort_batch_write(&self, block_id: i64) -> CommonResult<()> {
-        self.abort_unless_final(block_id, "abort_batch")
+        self.abort_with(&ExtendedBlock::with_id(block_id), "abort_batch", false)
     }
 
     pub fn get_block(&self, id: i64) -> CommonResult<BlockMeta> {
