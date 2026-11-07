@@ -21,7 +21,7 @@
 
 use crate::master::meta::inode::PackedChildren;
 use crate::master::meta::inode::PackedIter;
-use crate::master::meta::inode::{InodePtr, InodeView};
+use crate::master::meta::inode::{ChildItem, InodePtr, InodeView};
 use curvine_config::ChildrenContainer;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::ListOptions;
@@ -122,15 +122,18 @@ impl InodeChildren {
         }
     }
 
-    pub fn get_child(&self, name: &str) -> Option<InodePtr> {
+    pub(crate) fn get_child_item(&self, name: &str) -> Option<ChildItem<'_>> {
         match self {
-            InodeChildren::List(list) => {
-                let index = Self::search_by_name(list, name).ok()?;
-                Some(InodePtr::from_ref(list[index].as_ref()))
-            }
-            InodeChildren::Map(map) => map.get(name).map(|view| InodePtr::from_ref(view.as_ref())),
-            InodeChildren::Packed(packed) => packed.get_child(name),
+            Self::List(list) => Self::search_by_name(list, name)
+                .ok()
+                .map(|index| ChildItem::View(list[index].as_ref())),
+            Self::Map(map) => map.get(name).map(|view| ChildItem::View(view.as_ref())),
+            Self::Packed(packed) => packed.get_child_item(name),
         }
+    }
+
+    pub fn get_child(&self, name: &str) -> Option<InodePtr> {
+        self.get_child_item(name).map(|item| item.as_ptr())
     }
 
     pub fn delete_child(&mut self, child_id: i64, child_name: &str) -> CommonResult<InodeView> {

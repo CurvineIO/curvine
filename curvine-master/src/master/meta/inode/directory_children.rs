@@ -327,8 +327,8 @@ impl DirectoryChildren {
         self.with_children_for_name(name, |children, name| {
             let version = self.sequence.version();
             let matches = children
-                .get_child(name)
-                .is_some_and(|ptr| ptr.as_ref().id() == expected_id);
+                .get_child_item(name)
+                .is_some_and(|item| item.id() == expected_id);
             (
                 matches,
                 DirectoryReadVersion {
@@ -345,7 +345,7 @@ impl DirectoryChildren {
         let (view, version) = self.with_children_for_name(name, |children, name| {
             let version = self.sequence.version();
             (
-                children.get_child(name).map(|ptr| ptr.as_ref().clone()),
+                children.get_child_item(name).map(|item| item.into_view()),
                 version,
             )
         });
@@ -367,7 +367,7 @@ impl DirectoryChildren {
     ) -> (Option<InodeView>, DirectoryChildrenSharedVersion) {
         let (view, version) = self.with_children_for_name(name, |children, name| {
             (
-                children.get_child(name).map(|ptr| ptr.as_ref().clone()),
+                children.get_child_item(name).map(|item| item.into_view()),
                 self.sequence.version(),
             )
         });

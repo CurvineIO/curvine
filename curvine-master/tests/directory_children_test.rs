@@ -109,6 +109,43 @@ fn listing_is_ordered_and_paginated_before_and_after_sharding() {
 }
 
 #[test]
+fn point_reads_and_identity_checks_match_all_containers() {
+    use curvine_config::ChildrenContainer;
+    use curvine_master::master::meta::inode::InodeChildren;
+
+    for container in [
+        ChildrenContainer::List,
+        ChildrenContainer::Map,
+        ChildrenContainer::Packed,
+    ] {
+        let children = Arc::new(DirectoryChildren::with_container(InodeChildren::new(
+            container,
+        )));
+        children.add_child(file_edge(2)).unwrap();
+        children
+            .add_child(InodeView::new_dir("sub".into(), InodeDir::new(3, 1)))
+            .unwrap();
+        for sharded in [false, true] {
+            if sharded {
+                children.seed_shards_for_bulk_load(4096);
+            }
+            for (name, id) in [("f2", 2), ("sub", 3)] {
+                let (view, version) = children.read_child_view(name);
+                let (shared, shared_version) = children.read_child_shared(name);
+                assert_eq!((view.unwrap().id(), shared.unwrap().id()), (id, id));
+                assert!(version.is_current());
+                assert!(shared_version.is_current());
+                assert!(children.child_id_matches_version(name, id).0);
+                assert!(!children.child_id_matches_version(name, id + 1).0);
+            }
+            assert!(children.read_child_view("missing").0.is_none());
+            assert!(children.read_child_shared("missing").0.is_none());
+            assert!(!children.child_id_matches_version("missing", 2).0);
+        }
+    }
+}
+
+#[test]
 fn mismatched_child_id_does_not_remove_the_edge() {
     use curvine_config::ChildrenContainer;
     use curvine_master::master::meta::inode::InodeChildren;

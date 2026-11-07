@@ -171,9 +171,13 @@ impl PackedChildren {
         }
     }
 
-    pub fn get_child(&self, name: &str) -> Option<InodePtr> {
+    pub(crate) fn get_child_item(&self, name: &str) -> Option<ChildItem<'_>> {
         let (ci, off) = self.area.find(name.as_bytes()).ok()?;
-        Some(Self::packed_item(&self.dirs, &self.area.chunks()[ci], off).as_ptr())
+        Some(Self::packed_item(&self.dirs, &self.area.chunks()[ci], off))
+    }
+
+    pub fn get_child(&self, name: &str) -> Option<InodePtr> {
+        self.get_child_item(name).map(|item| item.as_ptr())
     }
 
     pub fn add_child(&mut self, inode: InodeView) -> CommonResult<InodePtr> {
