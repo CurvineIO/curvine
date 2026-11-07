@@ -503,6 +503,14 @@ impl DirectoryChildren {
 
     /// Owned snapshot of the children, sorted by name across shards.
     pub(crate) fn read_all(&self) -> Vec<InodeView> {
+        if self.sharded().is_none() {
+            let children = self.children.read();
+            // The single container is already ordered; promotion must not
+            // happen between this check and the snapshot.
+            if self.sharded().is_none() {
+                return children.all_views();
+            }
+        }
         let mut out: Vec<InodeView> = self
             .read_all_guards(|children| children.all_views())
             .into_iter()

@@ -73,11 +73,21 @@ fn listing_is_ordered_and_paginated_before_and_after_sharding() {
         ChildrenContainer::Map,
         ChildrenContainer::Packed,
     ] {
-        let children = DirectoryChildren::with_container(InodeChildren::new(container));
+        let children = Arc::new(DirectoryChildren::with_container(InodeChildren::new(
+            container,
+        )));
+        let dir = InodeDir::with_children(100, 1, children.clone());
         for id in [9, 1, 12, 2, 10] {
             children.add_child(file_edge(id)).unwrap();
         }
         let check = || {
+            assert_eq!(
+                dir.children_vec()
+                    .iter()
+                    .map(|child| child.name().to_owned())
+                    .collect::<Vec<_>>(),
+                ["f1", "f10", "f12", "f2", "f9"]
+            );
             let names = |options: &ListOptions| {
                 children
                     .list_options(options)
