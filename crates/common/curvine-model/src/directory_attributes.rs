@@ -39,6 +39,7 @@ pub fn persist_children_count(enabled: bool) {
 }
 
 /// Returns whether an encoded attribute or delta record uses the legacy format.
+#[inline]
 pub fn is_legacy_record(bytes: &[u8]) -> bool {
     (bytes.len() == ATTRIBUTE_ENCODED_LEN && bytes[..4] == BASE_TAG)
         || (bytes.len() == DELTA_ENCODED_LEN && bytes[..4] == DELTA_TAG)
@@ -144,6 +145,7 @@ impl DirectoryAttributes {
         }
     }
 
+    #[inline]
     pub fn apply(&mut self, delta: DirectoryAttributeDelta) -> Option<()> {
         let nlink = self.nlink.checked_add_signed(delta.nlink_delta)?;
         let version = self.version.checked_add(delta.version_delta)?;
