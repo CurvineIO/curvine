@@ -19,6 +19,26 @@ fn filesystem(name: &str) -> MasterFilesystem {
     JournalSystem::fs_only_for_test(&conf).unwrap()
 }
 
+#[test]
+fn setattr_missing_and_reserved_paths_do_not_change_existing_directory() {
+    let fs = filesystem("missing-reserved-attrs");
+    fs.mkdir("/parent", false).unwrap();
+    let before = fs.file_status("/parent").unwrap();
+    for path in ["/parent/missing", "/.Trash/.pending/hidden"] {
+        assert!(fs
+            .set_attr(
+                path,
+                SetAttrOpts {
+                    mode: Some(0o600),
+                    ..Default::default()
+                },
+            )
+            .is_err());
+    }
+    let after = fs.file_status("/parent").unwrap();
+    assert_eq!((before.id, before.mode), (after.id, after.mode));
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn failed_recursive_setattr_keeps_memory_and_store_unchanged() {

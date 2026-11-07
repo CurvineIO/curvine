@@ -1020,11 +1020,20 @@ impl MasterFilesystem {
         Ok(true)
     }
 
-    fn set_attr_single_path_sharded(&self, path: &str, opts: SetAttrOpts) -> FsResult<FileStatus> {
+    fn set_attr_single_path_sharded(
+        &self,
+        path: &str,
+        opts: SetAttrOpts,
+        initial: (StoreResolvedPath, u64),
+    ) -> FsResult<FileStatus> {
         const MAX_RETRIES: usize = 3;
+        let mut initial = Some(initial);
 
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
+            let (resolved, restore_epoch) = match initial.take() {
+                Some(resolved) => resolved,
+                None => self.resolve_live_store_view(path)?,
+            };
             if !resolved.is_full() {
                 let fs_dir = self.fs_dir.write();
                 let inp = Self::resolve_path(&fs_dir, path)?;
@@ -4459,17 +4468,10 @@ impl MasterFilesystem {
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
         self.run_metadata_write(|| {
             let path = path.as_ref();
-            let (resolved, _) = self.resolve_live_store_view(path)?;
+            let resolved = self.resolve_live_store_view(path)?;
             Self::check_not_pending_path(path)?;
             Self::check_not_reserved_path(path)?;
-            let sharded = resolved.is_full();
-            if sharded {
-                self.set_attr_single_path_sharded(path, opts)
-            } else {
-                let fs_dir = self.fs_dir.write();
-                let inp = Self::resolve_path(&fs_dir, path)?;
-                fs_dir.set_attr(inp, opts)
-            }
+            self.set_attr_single_path_sharded(path, opts, resolved)
         })
     }
 
