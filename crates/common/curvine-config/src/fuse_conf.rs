@@ -286,7 +286,7 @@ pub struct FuseConf {
     /// When enabled, the receiver uses splice(/dev/fuse → pipe → buf) and the
     /// sender uses vmsplice + splice (pipe → /dev/fuse) for large responses.
     /// When disabled, both use plain read/writev (extra memory copy but no
-    /// pipe management overhead). Default: true.
+    /// pipe management overhead). Default: false.
     pub enable_splice: bool,
 
     pub path_lock_stripes: usize,
@@ -720,7 +720,7 @@ impl Default for FuseConf {
             meta_cache_ttl: Default::default(),
 
             list_limit: 1000,
-            enable_splice: true,
+            enable_splice: false,
 
             path_lock_stripes: 1024,
 
