@@ -39,6 +39,30 @@ fn legacy_attributes(mtime: i64, ctime: i64, nlink: u32) -> DirectoryAttributes 
 }
 
 #[test]
+fn directory_merge_preserves_selected_record_format() {
+    let _guard = CHILDREN_COUNT_PERSISTENCE.lock().unwrap();
+    let _reset = ResetChildrenCountPersistence;
+    let path = Utils::test_sub_dir(format!("dir_attrs_merge_format_{}", Utils::rand_str(12)));
+    let store = RocksInodeStore::new(DBConf::new(&path), true).unwrap();
+
+    for (id, enabled) in [(1, false), (2, true)] {
+        curvine_model::persist_children_count(enabled);
+        let mut batch = store.new_batch();
+        batch
+            .write_directory_attributes(id, DirectoryAttributes::new(1, 1, 2))
+            .unwrap();
+        batch
+            .merge_directory_attributes(id, DirectoryAttributeDelta::for_child(2).for_child_entry())
+            .unwrap();
+        batch.commit().unwrap();
+        let attributes = store.get_directory_attributes(id).unwrap().unwrap();
+        assert_eq!(attributes.children(), enabled.then_some(1));
+    }
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn existing_count_becomes_unknown_after_disabling_new_format_writes() {
     let _guard = CHILDREN_COUNT_PERSISTENCE.lock().unwrap();
     let _reset = ResetChildrenCountPersistence;
