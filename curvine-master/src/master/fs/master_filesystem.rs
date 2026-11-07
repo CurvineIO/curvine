@@ -4678,39 +4678,34 @@ impl MasterFilesystem {
                 })
                 .collect();
             let _inode_locks = self.inode_locks.lock_many(&requests);
-
-            let (locked, locked_epoch) = match self.resolve_live_store_view(path) {
-                Ok(value) => value,
+            let _location_locks = self.block_location_locks.write_blocks(&block_ids);
+            let fs_dir = self.fs_dir.read();
+            let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
+                Ok(epoch) => epoch,
                 Err(_) if expected_id.is_some() => return Ok(None),
                 Err(error) => return Err(error),
             };
-            let Some(locked_target) = locked.target() else {
-                continue;
-            };
-            let Ok(locked_file) = locked_target.as_file_ref() else {
-                continue;
-            };
-            if locked_epoch != restore_epoch
-                || !resolved.same_resolution(&locked)
-                || expected_id.is_some_and(|id| id != locked_target.id())
-                || locked_file.block_ids() != block_ids
-            {
+            if locked_epoch != restore_epoch {
                 continue;
             }
-            Self::validate_alloc_capacity(locked_file.len, locked_file.replicas, &opts, available)?;
-            let _location_locks = self.block_location_locks.write_blocks(&block_ids);
-
-            let fs_dir = self.fs_dir.read();
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&locked, &inp) {
+            let inp = match Self::resolve_path(&fs_dir, path) {
+                Ok(inp) => inp,
+                Err(_) if expected_id.is_some() => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if !Self::live_path_matches(&resolved, &inp) {
                 continue;
             }
             let Some(inode) = inp.get_last_inode() else {
                 continue;
             };
-            if inode.id() != locked_target.id() || expected_id.is_some_and(|id| id != inode.id()) {
+            let Ok(file) = inode.as_file_ref() else {
+                continue;
+            };
+            if expected_id.is_some_and(|id| id != inode.id()) || file.block_ids() != block_ids {
                 continue;
             }
+            Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
             let inode_id = inode.id();
             let mut inode = inode;
             let del_res = fs_dir.resize_inode(path, &mut inode, opts.clone())?;
