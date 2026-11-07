@@ -54,7 +54,10 @@ pub struct PackedChildren {
 impl Default for PackedChildren {
     fn default() -> Self {
         Self {
-            area: Record::new(Self::LAYOUT),
+            // Smaller chunks bound the memmove cost of insert/delete at the
+            // middle of a chunk; 4096-byte chunks move ~130 records per write
+            // on a full directory, 512-byte chunks ~16.
+            area: Record::with_chunk_size(Self::LAYOUT, 512),
             dirs: Vec::new(),
             free_slots: Vec::new(),
         }
