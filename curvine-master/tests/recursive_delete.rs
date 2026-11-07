@@ -130,6 +130,21 @@ fn rejected_delete_does_not_change_tree() {
 }
 
 #[test]
+fn single_file_delete_reports_bytes_and_survives_restore() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let fs = filesystem();
+    prepare(&fs, "/victim/file", 4);
+    let result = fs.delete("/victim/file", false).unwrap();
+    assert_eq!(result.inodes, 1);
+    assert_eq!(result.bytes, 3 * 1048576 + 513);
+    assert!(fs.get_block_locations("/victim/file").is_err());
+    assert_eq!(fs.get_file_counts(), (1, 0));
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.get_file_counts(), (1, 0));
+    assert!(!fs.exists("/victim/file").unwrap());
+}
+
+#[test]
 fn recursive_delete_collects_nonempty_blocks_before_detaching_tree() {
     let _serial = TEST_LOCK.lock().unwrap();
     let fs = filesystem();

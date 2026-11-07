@@ -413,57 +413,61 @@ impl InodeStore {
                 .for_child_removal(),
         )?;
 
-        let mut stack = LinkedList::new();
-        // The caller keeps the namespace stable until this batch commits.
-        // Borrow nodes while walking instead of repeatedly cloning subtrees:
-        stack.push_back((parent.id(), del_name.to_string(), InodePtr::from_ref(del)));
         let mut del_res = DeleteResult::new();
         let mut deleted_files = 0i64;
         let mut deleted_dirs = 0i64;
-        let mut file_link_counts: HashMap<i64, u32> = HashMap::new();
         let mut ttl_removals = Vec::new();
 
-        while let Some((parent_id, edge_name, item)) = stack.pop_front() {
-            // Delete inode edges
-            batch.delete_child(parent_id, &edge_name)?;
-
-            let inode_id = item.id();
-            match item.as_ref() {
-                InodeView::Dir(dir) => {
-                    batch.delete_inode(inode_id)?;
-                    batch.delete_directory_attributes(inode_id)?;
-                    ttl_removals.push(item.as_ref().clone_metadata());
-
-                    // Don't count root directory
-                    if dir.id != ROOT_INODE_ID {
-                        deleted_dirs += 1;
+        if !del.is_dir() {
+            batch.delete_child(parent.id(), del_name)?;
+            del_res =
+                self.decrement_inode_nlink(del.id(), 1, ctime, &mut batch, &mut ttl_removals)?;
+            deleted_files = 1;
+        } else {
+            let mut stack = LinkedList::new();
+            // The caller keeps the namespace stable until this batch commits.
+            stack.push_back((parent.id(), del_name.to_string(), InodePtr::from_ref(del)));
+            let mut file_link_counts: HashMap<i64, u32> = HashMap::new();
+            while let Some((parent_id, edge_name, item)) = stack.pop_front() {
+                batch.delete_child(parent_id, &edge_name)?;
+                let inode_id = item.id();
+                match item.as_ref() {
+                    InodeView::Dir(dir) => {
+                        batch.delete_inode(inode_id)?;
+                        batch.delete_directory_attributes(inode_id)?;
+                        ttl_removals.push(item.as_ref().clone_metadata());
+                        if dir.id != ROOT_INODE_ID {
+                            deleted_dirs += 1;
+                        }
+                        for child in dir.children_vec() {
+                            stack.push_back((
+                                inode_id,
+                                child.name().to_string(),
+                                InodePtr::from_owned(child),
+                            ));
+                        }
                     }
-                    for child in dir.children_vec() {
-                        stack.push_back((
-                            inode_id,
-                            child.name().to_string(),
-                            InodePtr::from_owned(child),
-                        ));
+                    _ => {
+                        deleted_files += 1;
+                        let links = file_link_counts.entry(inode_id).or_default();
+                        *links = links.saturating_add(1);
                     }
-                }
-
-                _ => {
-                    deleted_files += 1;
-                    let links = file_link_counts.entry(inode_id).or_default();
-                    *links = links.saturating_add(1);
                 }
             }
-        }
 
-        // Multiple hard-link edges can point at the same inode. Aggregate all
-        // removals in this traversal so every edge decrements the persisted
-        // nlink count exactly once.
-        for (inode_id, links) in file_link_counts {
-            let res =
-                self.decrement_inode_nlink(inode_id, links, ctime, &mut batch, &mut ttl_removals)?;
-            del_res.inodes += res.inodes;
-            del_res.bytes += res.bytes;
-            del_res.blocks.extend(res.blocks);
+            // Multiple edges may reference the same inode.
+            for (inode_id, links) in file_link_counts {
+                let res = self.decrement_inode_nlink(
+                    inode_id,
+                    links,
+                    ctime,
+                    &mut batch,
+                    &mut ttl_removals,
+                )?;
+                del_res.inodes += res.inodes;
+                del_res.bytes += res.bytes;
+                del_res.blocks.extend(res.blocks);
+            }
         }
 
         crate::fault_point! {
