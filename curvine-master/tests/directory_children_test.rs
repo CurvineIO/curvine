@@ -106,6 +106,18 @@ fn listing_is_ordered_and_paginated_before_and_after_sharding() {
                 }),
                 ["f12", "f2"]
             );
+            assert_eq!(
+                names(&ListOptions {
+                    limit: Some(2),
+                    start_after: Some("f11".into()),
+                }),
+                ["f12", "f2"]
+            );
+            assert!(names(&ListOptions {
+                limit: Some(2),
+                start_after: Some("fz".into()),
+            })
+            .is_empty());
             assert!(names(&ListOptions {
                 limit: Some(0),
                 start_after: None
