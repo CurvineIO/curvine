@@ -39,6 +39,33 @@ fn legacy_attributes(mtime: i64, ctime: i64, nlink: u32) -> DirectoryAttributes 
 }
 
 #[test]
+fn batch_round_trips_multiple_inode_records() {
+    let path = Utils::test_sub_dir(format!("inode_batch_codec_{}", Utils::rand_str(12)));
+    let store = RocksInodeStore::new(DBConf::new(&path), true).unwrap();
+    let mut batch = store.new_batch();
+    batch
+        .write_inode(&InodeView::new_file(
+            "long-name".repeat(60),
+            InodeFile::new(1, 10),
+        ))
+        .unwrap();
+    batch
+        .write_inode(&InodeView::new_dir("short".into(), InodeDir::new(2, 20)))
+        .unwrap();
+    batch.commit().unwrap();
+    let long = store.get_inode(1).unwrap().unwrap();
+    let short = store.get_inode(2).unwrap().unwrap();
+    assert_eq!(
+        (long.id(), long.name()),
+        (1, "long-name".repeat(60).as_str())
+    );
+    assert_eq!((short.id(), short.name()), (2, "short"));
+    assert!(short.is_dir());
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn directory_merge_preserves_selected_record_format() {
     let _guard = CHILDREN_COUNT_PERSISTENCE.lock().unwrap();
     let _reset = ResetChildrenCountPersistence;
