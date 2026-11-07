@@ -313,25 +313,25 @@ fn buffer_handler_releases_permits_when_client_disconnects_mid_request() {
 }
 
 #[test]
-fn buffer_handler_closes_connection_when_permit_wait_times_out() {
+fn buffer_handler_admits_a_waiting_request_once_the_permit_is_released() {
     // One global permit held by a slow request on c1. A request on c2 waits
-    // for that permit; after the server timeout (300ms) c2's connection must
-    // close, well before the slow request finishes. Idle close is off so only
-    // the permit deadline can close it.
+    // for that permit inside the connection's request set instead of blocking
+    // c2's read loop, so the server timeout must not close c2's connection: the
+    // request is admitted as soon as c1 releases the permit.
     let server = start_server_with(false, 8, 1, |conf| {
         conf.timeout_ms = 300;
         conf.close_idle = false;
     });
     server.rt.block_on(async {
         let c1 = connect(&server).await;
-        let slow = tokio::spawn(async move { c1.rpc(sleep_request(1500)).await });
+        let slow = tokio::spawn(async move { c1.rpc(sleep_request(600)).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let c2 = connect(&server).await;
-        let res = tokio::time::timeout(Duration::from_millis(1000), c2.rpc(sleep_request(0)))
+        let res = tokio::time::timeout(Duration::from_secs(5), c2.rpc(sleep_request(0)))
             .await
-            .expect("waiting for a permit must not hang past the server timeout");
-        assert!(res.is_err(), "undispatched request must fail");
+            .expect("a request waiting for a permit must be admitted, not hang");
+        res.expect("the queued request must succeed once the permit is free");
 
         // The slow request on the other connection is unaffected.
         slow.await
