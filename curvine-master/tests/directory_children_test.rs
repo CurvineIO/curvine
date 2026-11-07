@@ -81,6 +81,61 @@ fn mismatched_child_id_does_not_remove_the_edge() {
 }
 
 #[test]
+fn sharded_count_waits_for_inflight_mutation() {
+    use std::time::Duration;
+    let children = Arc::new(DirectoryChildren::new());
+    children.seed_shards_for_bulk_load(4096);
+    children.add_child(file_edge(1)).unwrap();
+    let mut mutation = children.begin_mutation("f2");
+    let reader = children.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        result_tx.send(reader.iter_len()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let early = result_rx.recv_timeout(Duration::from_millis(100)).ok();
+    mutation.add_child(file_edge(2)).unwrap();
+    drop(mutation);
+    thread.join().unwrap();
+    assert_eq!(early, None, "count bypassed an active mutation");
+    assert_eq!(result_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
+}
+
+#[test]
+fn sharded_count_remains_consistent_during_concurrent_renames() {
+    let children = Arc::new(DirectoryChildren::new());
+    children.seed_shards_for_bulk_load(4096);
+    for id in 0..4 {
+        children.add_child(file_edge(id)).unwrap();
+    }
+    std::thread::scope(|scope| {
+        for id in 0..4 {
+            let children = children.clone();
+            scope.spawn(move || {
+                let first = format!("f{id}");
+                let second = format!("moved-{id}");
+                for _ in 0..2000 {
+                    children
+                        .begin_rename_mutation(&first, &second)
+                        .rename_child(id, &first, None, &second)
+                        .unwrap();
+                    children
+                        .begin_rename_mutation(&second, &first)
+                        .rename_child(id, &second, None, &first)
+                        .unwrap();
+                }
+            });
+        }
+        for _ in 0..2000 {
+            assert_eq!(children.iter_len(), 4);
+        }
+    });
+    assert_eq!(children.iter_len(), 4);
+}
+
+#[test]
 fn child_snapshots_survive_concurrent_deletes() {
     let children = Arc::new(DirectoryChildren::new());
     let dir = InodeDir::with_children(1, 1, children.clone());
