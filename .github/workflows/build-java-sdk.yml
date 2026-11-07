@@ -1,18 +1,34 @@
 name: Build Java SDK
 
 on:
-  push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
+  # Called by release.yml as a reusable workflow.
+  workflow_call:
     inputs:
-      version:
-        description: 'Version to build (e.g., 0.1.0), defaults to 0.1.0 if empty'
+      tag:
+        description: 'Release tag (e.g. v0.3.0). Required when called or dispatched manually.'
         required: false
         type: string
+      publish:
+        description: 'Upload JARs to the GitHub Release (call from release.yml sets this)'
+        required: false
+        default: false
+        type: boolean
+  # Standalone dispatch for rescue/rerun scenarios. Note: this workflow no
+  # longer triggers on tag push; it runs as part of the release.yml chain.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.3.0) used for versioning; leave empty to default to 0.1.0'
+        required: false
+        type: string
+      publish:
+        description: 'Upload JARs to the GitHub Release (requires tag input like v0.1.0)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
   packages: write
 
 env:
@@ -156,11 +172,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Validate release tag vs Cargo version
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        run: |
-          bash build/validate-release-version.sh "${GITHUB_REF_NAME}"
-
       - name: Download all native library artifacts
         uses: actions/download-artifact@v4
         with:
@@ -183,11 +194,12 @@ jobs:
       - name: Set version
         id: version
         run: |
-          if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            VERSION="${{ github.ref_name }}"
+          if [ -n "${{ inputs.tag }}" ]; then
+            # Version derived from the release tag (with or without v prefix)
+            VERSION="${{ inputs.tag }}"
             VERSION="${VERSION#v}"
           else
-            VERSION="${{ inputs.version || '0.1.0' }}"
+            VERSION="0.1.0"
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Building version: $VERSION"
@@ -220,16 +232,14 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
 
-  # Publish to GitHub Release and GitHub Packages
+  # Publish to GitHub Release (Maven publishing is intentionally not done;
+  # JARs are distributed as release assets only).
   publish:
     needs: package-jar
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: inputs.publish == true
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Download JAR artifacts
         uses: actions/download-artifact@v4
         with:
@@ -244,6 +254,7 @@ jobs:
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag: ${{ inputs.tag }}
           files: jars/*.jar
           generate_release_notes: false
           append_body: true
@@ -277,76 +288,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up JDK for Maven
-        uses: actions/setup-java@v4
-        with:
-          java-version: '8'
-          distribution: 'temurin'
-
-      - name: Publish to GitHub Packages
-        run: |
-          cd curvine-libsdk/java
-          
-          # Download all native libraries again for the publish
-          mkdir -p native
-          
-          # We need to rebuild with the native libs for publishing
-          # First download the artifacts
-          echo "Downloading native artifacts for publishing..."
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Download native artifacts for publish
-        uses: actions/download-artifact@v4
-        with:
-          path: native-artifacts
-          pattern: native-*
-          merge-multiple: true
-
-      - name: Publish JAR to GitHub Packages
-        run: |
-          # Copy native libraries
-          mkdir -p curvine-libsdk/java/native
-          cp native-artifacts/*.so curvine-libsdk/java/native/
-          
-          # Inject the release version into pom.xml (same helper as the package
-          # step; set_pom_version is idempotent).
-          . ./build/version.sh
-          VERSION="${{ needs.package-jar.outputs.version }}"
-          set_pom_version curvine-libsdk/java/pom.xml "${VERSION}"
-          
-          cd curvine-libsdk/java
-          
-          # Add distribution management for GitHub Packages
-          sed -i '/<\/project>/i \
-            <distributionManagement>\
-              <repository>\
-                <id>github</id>\
-                <name>GitHub CurvineIO Apache Maven Packages</name>\
-                <url>https://maven.pkg.github.com/CurvineIO/curvine</url>\
-              </repository>\
-            </distributionManagement>' pom.xml
-          
-          # Create settings.xml for GitHub Packages authentication
-          mkdir -p ~/.m2
-          cat > ~/.m2/settings.xml << EOF
-          <settings>
-            <servers>
-              <server>
-                <id>github</id>
-                <username>\${env.GITHUB_ACTOR}</username>
-                <password>\${env.GITHUB_TOKEN}</password>
-              </server>
-            </servers>
-          </settings>
-          EOF
-          
-          # Build and deploy
-          mvn protobuf:compile deploy -DskipTests -B
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_ACTOR: ${{ github.actor }}
-
   # Build summary
   summary:
     needs: [build-native, package-jar, publish]
@@ -370,10 +311,9 @@ jobs:
           echo "| Amazon Linux 2 | ✅ | ✅ |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          if [ "${{ inputs.publish }}" = "true" ]; then
             echo "**Published to:**" >> $GITHUB_STEP_SUMMARY
-            echo "- GitHub Release" >> $GITHUB_STEP_SUMMARY
-            echo "- GitHub Packages (Maven)" >> $GITHUB_STEP_SUMMARY
+            echo "- GitHub Release (${{ inputs.tag }})" >> $GITHUB_STEP_SUMMARY
           else
             echo "**Note:** Manual trigger - artifacts uploaded but not published to release" >> $GITHUB_STEP_SUMMARY
           fi

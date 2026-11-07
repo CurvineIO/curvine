@@ -1,9 +1,22 @@
 name: Trigger Helm Release
 
+# Dispatches the CurvineIO/curvine-helm chart release after all release
+# artifacts (images, binaries, SDK JARs) are verified by the release.yml
+# orchestrator. Also runnable standalone via workflow_dispatch as a rescue
+# path (e.g. re-dispatch after a failed helm sync).
+
 on:
-  push:
-    tags:
-      - 'v*'
+  # Called by release.yml as a reusable workflow.
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to sync to curvine-helm (e.g. v0.3.0)'
+        required: true
+        type: string
+      commit_sha:
+        description: 'Curvine commit SHA for the release (optional)'
+        required: false
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -21,27 +34,26 @@ permissions:
   packages: read
 
 concurrency:
-  group: trigger-helm-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  group: trigger-helm-release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
   trigger-helm-release:
-    name: Wait for images and dispatch helm release
+    name: Dispatch helm release
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - name: Resolve release metadata
         id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
-            SHA="${{ inputs.commit_sha }}"
-            if [ -z "$SHA" ]; then
-              SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq '.sha')"
-            fi
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
-            SHA="${GITHUB_SHA}"
+          set -euo pipefail
+
+          TAG="${{ inputs.tag }}"
+          SHA="${{ inputs.commit_sha }}"
+          if [ -z "$SHA" ]; then
+            SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq '.sha')"
           fi
 
           if [[ ! "$TAG" =~ ^v ]]; then
@@ -64,65 +76,6 @@ jobs:
         run: |
           bash build/validate-release-version.sh "${{ steps.meta.outputs.tag }}"
           echo "Release tag ${{ steps.meta.outputs.tag }} matches Cargo workspace version"
-
-      - name: Wait for runtime and CSI image workflows
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          SHA="${{ steps.meta.outputs.sha }}"
-          WORKFLOWS=(
-            "build-runtime-image.yml:push"
-            "build-csi-image.yml:push"
-          )
-          DEADLINE=$((SECONDS + 7200))
-
-          wait_for_workflow() {
-            local workflow_file="$1"
-            local expected_event="$2"
-            local status conclusion
-
-            while [ "$SECONDS" -lt "$DEADLINE" ]; do
-              local query
-              query='first(.workflow_runs[] | select(.event == "'"${expected_event}"'") | "\(.status) \(.conclusion // "null")") // "null null"'
-
-              read -r status conclusion < <(
-                gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_file}/runs" \
-                  -f head_sha="$SHA" \
-                  -f per_page=10 \
-                  --jq "$query" \
-                  | awk '{print $1, $2}'
-              )
-
-              if [ -z "${status:-}" ] || [ "$status" = "null" ]; then
-                echo "Waiting for ${workflow_file} (${expected_event}) to start..."
-                sleep 30
-                continue
-              fi
-
-              if [ "$status" = "completed" ]; then
-                if [ "$conclusion" = "success" ]; then
-                  echo "${workflow_file} completed successfully"
-                  return 0
-                fi
-
-                echo "::error::${workflow_file} completed with conclusion: ${conclusion}"
-                return 1
-              fi
-
-              echo "${workflow_file} (${expected_event}) status: ${status}"
-              sleep 30
-            done
-
-            echo "::error::Timed out waiting for ${workflow_file}"
-            return 1
-          }
-
-          for workflow in "${WORKFLOWS[@]}"; do
-            IFS=: read -r workflow_file expected_event <<< "$workflow"
-            wait_for_workflow "$workflow_file" "$expected_event"
-          done
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3

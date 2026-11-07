@@ -1,107 +1,291 @@
 name: Release
 
+# Single release orchestrator. Pushing a v* tag runs the whole release chain:
+#
+#   prepare -> binaries -> create-release -> java-sdk (appends JARs)
+#          -> runtime-image / csi-image (reusable, parallel with above)
+#          -> verify (GHCR images + release assets)
+#          -> helm-dispatch (curvine-helm chart release)
+#
+# Each sub-pipeline remains runnable standalone via its own workflow_dispatch
+# for rescue/rerun scenarios.
+
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to release (e.g. v0.3.0). Required when dispatching manually.'
+        required: false
+        type: string
 
 permissions:
   contents: write
-  packages: read
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Build Rocky Linux 9 binary file
-  build:
+  # Resolve release metadata and validate tag vs Cargo workspace version once
+  # for the whole release chain.
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      build_version: ${{ steps.meta.outputs.build_version }}
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - name: Resolve release metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            SHA="${GITHUB_SHA}"
+          else
+            TAG="${{ inputs.tag }}"
+            if [ -z "$TAG" ]; then
+              echo "::error::'tag' input is required when dispatching manually"
+              exit 1
+            fi
+            SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq '.sha')"
+          fi
+
+          if [[ ! "$TAG" =~ ^v ]]; then
+            echo "::error::Release tag must start with v, got: $TAG"
+            exit 1
+          fi
+
+          BUILD_VERSION="${TAG#v}"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "build_version=${BUILD_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${TAG} (build version ${BUILD_VERSION}, commit ${SHA})"
+
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+
+      - name: Validate release tag vs Cargo version
+        run: |
+          bash build/validate-release-version.sh "${{ steps.meta.outputs.tag }}"
+          echo "Release tag ${{ steps.meta.outputs.tag }} matches Cargo workspace version"
+
+  # Build Rocky Linux 9 binary tarball.
+  binaries:
     name: Build for Rocky Linux 9
+    needs: prepare
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/curvineio/curvine-compile:rocky9
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
-    # hdfs-sys (opendal-hdfs) uses java-locator which shells out to `which`
-    - name: Ensure which is available for hdfs-sys build
-      run: |
-        if ! command -v which >/dev/null 2>&1; then
-          dnf install -y which
-        fi
+      # hdfs-sys (opendal-hdfs) uses java-locator which shells out to `which`
+      - name: Ensure which is available for hdfs-sys build
+        run: |
+          if ! command -v which >/dev/null 2>&1; then
+            dnf install -y which
+          fi
 
-    - name: Cache cargo registry
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: rocky9-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rocky9-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Validate release tag vs Cargo version
-      if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-      run: |
-        bash build/validate-release-version.sh "${GITHUB_REF_NAME}"
-        echo "Release tag ${GITHUB_REF_NAME} matches Cargo workspace version"
+      - name: Build and package
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.tag }}
+        run: |
+          BUILD_VERSION="${RELEASE_VERSION#v}"
+          export BUILD_VERSION
+          make dist ARGS='--ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs --ufs opendal-webhdfs --ufs oss-hdfs'
 
-    - name: Build and package
-      env:
-        RELEASE_VERSION: ${{ github.ref_name }}
-      run: |
-        BUILD_VERSION="${RELEASE_VERSION#v}"
-        export BUILD_VERSION
-        make dist ARGS='--ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs --ufs opendal-webhdfs --ufs oss-hdfs'
+      - name: Verify injected artifact versions
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.tag }}
+        run: |
+          BUILD_VERSION="${RELEASE_VERSION#v}"
+          # build.sh injects BUILD_VERSION into the java pom when the SDK jar is
+          # built; the dist build-version file is written from the same value.
+          bash build/validate-release-version.sh "${RELEASE_VERSION}" \
+            --pom curvine-libsdk/java/pom.xml
+          grep -qx "version=${BUILD_VERSION}" build/dist/build-version \
+            && echo "build-version file: ok (version=${BUILD_VERSION})"
+          echo "Injected artifact versions verified for ${RELEASE_VERSION}"
 
-    - name: Verify injected artifact versions
-      env:
-        RELEASE_VERSION: ${{ github.ref_name }}
-      run: |
-        BUILD_VERSION="${RELEASE_VERSION#v}"
-        # build.sh injects BUILD_VERSION into the java pom when the SDK jar is
-        # built; the dist build-version file is written from the same value.
-        bash build/validate-release-version.sh "${RELEASE_VERSION}" \
-          --pom curvine-libsdk/java/pom.xml
-        grep -qx "version=${BUILD_VERSION}" build/dist/build-version \
-          && echo "build-version file: ok (version=${BUILD_VERSION})"
-        echo "Injected artifact versions verified for ${RELEASE_VERSION}"
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: curvine-rocky9-x86_64
+          path: curvine-*.tar.gz
 
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: curvine-rocky9-x86_64
-        path: curvine-*.tar.gz
-
-  # Create GitHub Release
-  release:
+  # Create the GitHub Release with the binary tarball. Subsequent artifacts
+  # (Java SDK JARs) are appended by their pipelines, which run after this job.
+  create-release:
     name: Create Release
-    needs: build
+    needs: [prepare, binaries]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: artifacts
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/*/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(needs.prepare.outputs.tag, 'beta') || contains(needs.prepare.outputs.tag, 'alpha') || contains(needs.prepare.outputs.tag, 'rc') }}
+          body: |
+            ## Binary Downloads
 
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      with:
-        files: artifacts/*/*
-        generate_release_notes: true
-        draft: false
-        prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') || contains(github.ref, 'rc') }}
-        body: |
-          ## Binary Downloads
-          
-          ### Rocky Linux 9
-          - **x86_64**: Download the `.tar.gz` file from the assets below
-          
-          ### Installation
-          1. Download the binary package
-          2. Extract: `tar -xzf curvine-*.tar.gz`
-          3. Follow the [quick start](https://curvineio.github.io/docs/Deploy/quick-start/#download-release-binary-package) to deploy
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            ### Rocky Linux 9
+            - **x86_64**: Download the `.tar.gz` file from the assets below
+
+            ### Installation
+            1. Download the binary package
+            2. Extract: `tar -xzf curvine-*.tar.gz`
+            3. Follow the [quick start](https://curvineio.github.io/docs/Deploy/quick-start/#download-release-binary-package) to deploy
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Multi-arch runtime image (reusable workflow). Runs in this workflow run.
+  runtime-image:
+    name: Runtime image
+    needs: prepare
+    uses: ./.github/workflows/build-runtime-image.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+      push_image: true
+    secrets: inherit
+
+  # Multi-arch CSI image (reusable workflow). Runs in this workflow run.
+  csi-image:
+    name: CSI image
+    needs: prepare
+    uses: ./.github/workflows/build-csi-image.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+      push_image: true
+    secrets: inherit
+
+  # Java SDK JARs (reusable workflow). Depends on create-release so the JAR
+  # section is appended to the release body in a deterministic order.
+  java-sdk:
+    name: Java SDK
+    needs: create-release
+    uses: ./.github/workflows/build-java-sdk.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+      publish: true
+    secrets: inherit
+
+  # Gate before helm release: images published to GHCR and release assets
+  # (binary tarball + Java SDK JARs) are all present.
+  verify:
+    name: Verify release artifacts
+    needs: [prepare, create-release, runtime-image, csi-image, java-sdk]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify release images in GHCR
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          for image in ghcr.io/curvineio/curvine ghcr.io/curvineio/curvine-csi; do
+            echo "Inspecting ${image}:${TAG}"
+            docker buildx imagetools inspect "${image}:${TAG}"
+          done
+
+      - name: Verify release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          assets="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.assets[].name')"
+          echo "Release assets:"
+          echo "${assets}"
+
+          echo "${assets}" | grep -q '^curvine-.*\.tar\.gz$' \
+            || { echo "::error::binary tarball missing from release ${TAG}"; exit 1; }
+          echo "${assets}" | grep -q '^curvine-hadoop-.*\.jar$' \
+            || { echo "::error::curvine-hadoop JAR missing from release ${TAG}"; exit 1; }
+          echo "${assets}" | grep -q '^curvine-hadoop-.*-client\.jar$' \
+            || { echo "::error::curvine-hadoop client JAR missing from release ${TAG}"; exit 1; }
+
+          echo "All expected release assets are present"
+
+  # Dispatch curvine-helm chart release (reusable workflow).
+  helm-dispatch:
+    name: Helm release dispatch
+    needs: verify
+    uses: ./.github/workflows/trigger-helm-release.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+      commit_sha: ${{ needs.prepare.outputs.sha }}
+    secrets: inherit
+
+  summary:
+    name: Release summary
+    needs: [prepare, binaries, create-release, runtime-image, csi-image, java-sdk, verify, helm-dispatch]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Release summary
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          RESULT_BINARIES: ${{ needs.binaries.result }}
+          RESULT_RELEASE: ${{ needs.create-release.result }}
+          RESULT_RUNTIME: ${{ needs.runtime-image.result }}
+          RESULT_CSI: ${{ needs.csi-image.result }}
+          RESULT_SDK: ${{ needs.java-sdk.result }}
+          RESULT_VERIFY: ${{ needs.verify.result }}
+          RESULT_HELM: ${{ needs.helm-dispatch.result }}
+        run: |
+          {
+            echo "### Release ${TAG} Summary"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|-------|--------|"
+            echo "| Binary tarball | ${RESULT_BINARIES} |"
+            echo "| GitHub Release | ${RESULT_RELEASE} |"
+            echo "| Runtime image | ${RESULT_RUNTIME} |"
+            echo "| CSI image | ${RESULT_CSI} |"
+            echo "| Java SDK | ${RESULT_SDK} |"
+            echo "| Verify artifacts | ${RESULT_VERIFY} |"
+            echo "| Helm dispatch | ${RESULT_HELM} |"
+          } >> "$GITHUB_STEP_SUMMARY"
