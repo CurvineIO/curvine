@@ -2717,9 +2717,9 @@ impl MasterFilesystem {
         }
 
         Self::check_not_pending_path(path)?;
-        // Baseline protocol: shared namespace read over the live tree.
+        // The pending-path check above also covers resolve_path's check.
         let fs_dir = self.fs_dir.read();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let inp = Self::resolve_path_raw(&fs_dir, path)?;
         fs_dir.file_status(&inp)
     }
 

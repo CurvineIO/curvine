@@ -175,6 +175,12 @@ fn staged_entries_are_not_restorable() {
 
     let entry = pending_entries(&fs).remove(0);
     let entry_path = format!("{}/{}", trash::TRASH_PENDING_ROOT, entry);
+    for path in [trash::TRASH_PENDING_ROOT, entry_path.as_str()] {
+        assert!(matches!(
+            fs.file_status(path).unwrap_err().kind(),
+            curvine_error::ErrorKind::FileNotFound
+        ));
+    }
     assert!(fs.restore_trash(&entry_path, None, false).is_err());
     assert!(fs.list_trash().unwrap().is_empty());
 }
