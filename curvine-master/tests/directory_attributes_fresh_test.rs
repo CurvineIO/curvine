@@ -16,6 +16,18 @@ use curvine_config::DBConf;
 use curvine_master::master::meta::store::RocksInodeStore;
 use curvine_runtime::common::Utils;
 use curvine_model::{DirectoryAttributes, persist_children_count};
+use std::sync::Mutex;
+
+// `persist_children_count` is process-wide state shared by every test in
+// this binary; serialise the two format cases behind one lock and always
+// restore the default on exit.
+static FRESH_FORMAT_LOCK: Mutex<()> = Mutex::new(());
+struct ResetChildrenCount;
+impl Drop for ResetChildrenCount {
+    fn drop(&mut self) {
+        persist_children_count(false);
+    }
+}
 
 // A freshly minted directory writes its attribute row with the format the
 // merge path will use (legacy when child counts are not persisted). Writing a
@@ -24,6 +36,9 @@ use curvine_model::{DirectoryAttributes, persist_children_count};
 // format mismatch introduced by the fresh-write fast path.
 #[test]
 fn fresh_directory_attributes_match_merge_format() {
+    let _guard = FRESH_FORMAT_LOCK.lock().unwrap();
+    let _reset = ResetChildrenCount;
+    persist_children_count(false);
     let path = Utils::test_sub_dir(format!("dir-attrs-fresh-{}", Utils::rand_str(8)));
     let store = RocksInodeStore::new(DBConf::new(&path), true).unwrap();
     let mut batch = store.new_batch();
@@ -41,11 +56,8 @@ fn fresh_directory_attributes_match_merge_format() {
     );
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
-}
 
-// With the format switch on, fresh rows carry the persisted child count.
-#[test]
-fn fresh_directory_attributes_persist_count_when_enabled() {
+    // With the format switch on, fresh rows carry the persisted child count.
     persist_children_count(true);
     let path = Utils::test_sub_dir(format!("dir-attrs-fresh-v4-{}", Utils::rand_str(8)));
     let store = RocksInodeStore::new(DBConf::new(&path), true).unwrap();
@@ -64,5 +76,4 @@ fn fresh_directory_attributes_persist_count_when_enabled() {
     );
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
-    persist_children_count(false);
 }
