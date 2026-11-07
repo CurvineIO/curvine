@@ -111,6 +111,9 @@ impl DBConfExt for DBConf {
     fn create_db_opts(&self) -> Options {
         let mut opts = Options::default();
         opts.set_allow_concurrent_memtable_write(true);
+        // Separate WAL and memtable writer queues so a slow memtable write
+        // cannot block concurrent WAL writers; improves p99 under load.
+        opts.set_enable_pipelined_write(true);
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
         opts.set_max_open_files(-1);
