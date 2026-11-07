@@ -273,6 +273,24 @@ impl WriteHandler {
         Ok(false)
     }
 
+    /// Quarantine as soon as a write is known uncertain, so the state lives in
+    /// the dataset even if the client never sends Complete/Cancel.
+    fn quarantine_if_uncertain(
+        store: &BlockStore,
+        block: &ExtendedBlock,
+        file: &BlockWriteContext,
+    ) {
+        if !file.has_uncertain_writes() {
+            return;
+        }
+        if let Err(e) = store.abort_block_uncertain(block) {
+            warn!(
+                "failed to quarantine block {} after uncertain write: {}",
+                block.id, e
+            );
+        }
+    }
+
     pub fn write(&mut self, msg: &Message) -> FsResult<Message> {
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
@@ -289,6 +307,7 @@ impl WriteHandler {
             let spend = TimeSpent::new();
             if let Err(e) = file.write_region(&msg.data) {
                 Self::record_write_error(self.metrics, context.dir_id, &e);
+                Self::quarantine_if_uncertain(&self.store, &context.block, file);
                 return Err(e.into());
             }
 
@@ -316,6 +335,7 @@ impl WriteHandler {
         if need_flush {
             if let Err(e) = file.flush() {
                 Self::record_write_error(self.metrics, context.dir_id, &e);
+                Self::quarantine_if_uncertain(&self.store, &context.block, file);
                 return Err(e.into());
             }
         }
@@ -330,6 +350,37 @@ impl WriteHandler {
             self.store.abort_block(block)?;
         }
         Ok(())
+    }
+
+    /// True if safe to latch is_commit (removed/quarantined/finalized);
+    /// false if still Writing or unreadable (stay retryable).
+    fn block_is_terminal(&self, block_id: i64) -> bool {
+        match self.store.get_raw_block_opt(block_id) {
+            Ok(Some(meta)) => meta.is_quarantined() || meta.is_final(),
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// Abort (quarantine if `uncertain`), then latch only if terminal.
+    fn abort_and_latch(&mut self, block: &ExtendedBlock, uncertain: bool, reason: &str) {
+        let abort_result = if uncertain {
+            self.store.abort_block_uncertain(block)
+        } else {
+            self.store.abort_block(block)
+        };
+        if let Err(abort_err) = abort_result {
+            log::warn!(
+                "failed to abort block {} after {}: {}",
+                block.id,
+                reason,
+                abort_err
+            );
+        }
+        if self.block_is_terminal(block.id) {
+            self.is_commit = true;
+            self.lease.take();
+        }
     }
 
     pub fn complete(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
@@ -349,21 +400,25 @@ impl WriteHandler {
 
         let file = self.file.take();
         if let Some(mut file) = file {
-            if let Err(flush_err) = file.flush() {
-                drop(file);
+            let flush_result = file.flush();
+            // Sticky flag from a mid-stream timeout; read it even if flush is Ok.
+            let uncertain = file.has_uncertain_writes();
+            drop(file);
+            if let Err(flush_err) = flush_result {
                 if let Some(dir_id) = write_dir_id {
                     Self::record_write_error(self.metrics, dir_id, &flush_err);
                 }
-                if let Err(abort_err) = self.store.abort_block(&context.block) {
-                    log::warn!(
-                        "failed to abort block {} after flush error: {}",
-                        context.block.id,
-                        abort_err
-                    );
-                }
+                self.abort_and_latch(&context.block, uncertain, "flush error");
                 return Err(flush_err.into());
             }
-            drop(file);
+            if uncertain {
+                // Data may still be in flight: never free or publish this extent.
+                self.abort_and_latch(&context.block, true, "uncertain write");
+                return Err(FsError::io(std::io::Error::other(format!(
+                    "block {} write outcome uncertain, extent quarantined",
+                    context.block.id
+                ))));
+            }
         }
 
         if context.block.len > context.block_size {
@@ -374,6 +429,11 @@ impl WriteHandler {
                     abort_err
                 );
             }
+            // Same as above.
+            if self.block_is_terminal(context.block.id) {
+                self.is_commit = true;
+                self.lease.take();
+            }
             return err_box!(
                 "Invalid block length: {}, block size: {}",
                 context.block.len,
@@ -381,7 +441,22 @@ impl WriteHandler {
             );
         }
 
-        self.commit_block(&context.block, commit)?;
+        if let Err(commit_err) = self.commit_block(&context.block, commit) {
+            log::warn!(
+                "failed to commit block {} (commit={}): {}",
+                context.block.id,
+                commit,
+                commit_err
+            );
+            // Only latch is_commit if truly terminal; stay retryable
+            // otherwise. Use the raw pending meta, not the readable view:
+            // during a rewrite it can mask a transient rollback.
+            if self.block_is_terminal(context.block.id) {
+                self.is_commit = true;
+                self.lease.take();
+            }
+            return Err(commit_err);
+        }
         self.is_commit = true;
         self.lease.take();
 
@@ -419,7 +494,7 @@ mod tests {
     use super::{map_storage_open_error, WriteHandler};
     use crate::worker::block::BlockStore;
     use crate::worker::handler::WriteContext;
-    use crate::worker::storage::BlockWriteContext;
+    use crate::worker::storage::{BlockWriteContext, Dataset};
     use crate::worker::Worker;
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_error::{FsError, FsResult};
@@ -598,6 +673,269 @@ mod tests {
                 "resize not supported",
             )))
         }
+    }
+
+    /// Reports uncertain writes, to exercise `abort_block_uncertain` routing.
+    struct FailingFlushUncertainBlockIO;
+
+    impl BlockIO for FailingFlushUncertainBlockIO {
+        fn read_region(
+            &mut self,
+            _enable_send_file: bool,
+            _len: i32,
+        ) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read not supported",
+            )))
+        }
+
+        fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write_all not supported",
+            )))
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read_all not supported",
+            )))
+        }
+
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "flush timed out",
+            )))
+        }
+
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            0
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn path(&self) -> &str {
+            "failing-flush-uncertain"
+        }
+
+        fn resize(
+            &mut self,
+            _truncate: bool,
+            _off: i64,
+            _len: i64,
+            _mode: i32,
+        ) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "resize not supported",
+            )))
+        }
+
+        fn has_uncertain_writes(&self) -> bool {
+            true
+        }
+    }
+
+    /// A mid-stream write timed out (sticky flag) but the later flush is Ok.
+    struct UncertainFlushOkBlockIO;
+
+    impl BlockIO for UncertainFlushOkBlockIO {
+        fn read_region(
+            &mut self,
+            _enable_send_file: bool,
+            _len: i32,
+        ) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read not supported",
+            )))
+        }
+
+        fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read_all not supported",
+            )))
+        }
+
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            0
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn path(&self) -> &str {
+            "uncertain-flush-ok"
+        }
+
+        fn resize(
+            &mut self,
+            _truncate: bool,
+            _off: i64,
+            _len: i64,
+            _mode: i32,
+        ) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "resize not supported",
+            )))
+        }
+
+        fn has_uncertain_writes(&self) -> bool {
+            true
+        }
+    }
+
+    /// A mid-stream write times out: write_region fails and the flag is set.
+    struct UncertainWriteBlockIO;
+
+    impl BlockIO for UncertainWriteBlockIO {
+        fn read_region(
+            &mut self,
+            _enable_send_file: bool,
+            _len: i32,
+        ) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read not supported",
+            )))
+        }
+
+        fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write timed out",
+            )))
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write timed out",
+            )))
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read_all not supported",
+            )))
+        }
+
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            0
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn path(&self) -> &str {
+            "uncertain-write"
+        }
+
+        fn resize(
+            &mut self,
+            _truncate: bool,
+            _off: i64,
+            _len: i64,
+            _mode: i32,
+        ) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "resize not supported",
+            )))
+        }
+
+        fn has_uncertain_writes(&self) -> bool {
+            true
+        }
+    }
+
+    /// SPDK store + handler over the given writer fake.
+    fn spdk_handler<IO: BlockIO + 'static>(
+        dir_tag: &str,
+        block: &ExtendedBlock,
+        io: IO,
+    ) -> FsResult<(BlockStore, WriteHandler)> {
+        let _worker = Worker::with_conf(ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                data_dir: vec![format!("[MEM:1KB]../testing/{dir_tag}")],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        })?;
+        let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)
+            .map_err(FsError::from)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        store.open_block(block).map_err(FsError::from)?;
+        let handler = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size: block.len,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(io, 0, block.len, 0)?),
+            lease: None,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+        Ok((store, handler))
+    }
+
+    fn spdk_complete_msg(block: &ExtendedBlock) -> Message {
+        Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size: block.len,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build()
     }
 
     // Regression test for GH#1673: a data-bearing Running frame with flush=true
@@ -780,6 +1118,1070 @@ mod tests {
         assert!(
             context.dir_metrics.is_some(),
             "open must resolve the per-dir counters"
+        );
+
+        Ok(())
+    }
+
+    // On non-SPDK storage, `abort_block_uncertain` degrades to a plain
+    // `abort_block`, so this only proves error propagation + cleanup, not
+    // quarantine routing itself (see the SPDK-specific test below for that).
+    #[test]
+    fn complete_routes_uncertain_flush_failure_removes_block_on_non_spdk_storage() -> FsResult<()> {
+        let block_size = 1024_i64;
+        let block = ExtendedBlock::new(42, 0, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("complete-uncertain-flush")?;
+        let meta = store.open_block(&block).map_err(FsError::from)?;
+        assert!(store.get_block(meta.id).is_ok());
+
+        let file = BlockWriteContext::new(FailingFlushUncertainBlockIO, 0, block_size, 0)?;
+        let context = WriteContext {
+            block: block.clone(),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+            dir_id: 0,
+            dir_metrics: None,
+        };
+
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(context),
+            file: Some(file),
+            lease: None,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        let err = handler.complete(&msg, true).unwrap_err();
+        assert!(
+            err.to_string().contains("flush timed out"),
+            "unexpected error: {err}"
+        );
+
+        // Block must be cleaned up, not left dangling.
+        assert!(
+            store.get_block(meta.id).is_err(),
+            "block must be cleaned up after uncertain flush failure"
+        );
+
+        Ok(())
+    }
+
+    // SPDK: uncertain flush must quarantine, not remove the block.
+    // Detector itself is tested separately in curvine-storage-spdk::spdk_bdev.
+    #[test]
+    fn complete_routes_uncertain_flush_failure_to_quarantine_on_spdk() -> FsResult<()> {
+        let block_size = 4096_i64;
+        let block = ExtendedBlock::new(42, block_size, StorageType::SpdkDisk, FileType::File);
+
+        // Just to init worker metrics; dataset/store below bypass this conf.
+        let _worker = Worker::with_conf(ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                data_dir: vec!["[MEM:1KB]../testing/write-handler-spdk-quarantine".to_string()],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        })?;
+
+        let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)
+            .map_err(FsError::from)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        let meta = store.open_block(&block).map_err(FsError::from)?;
+        assert!(store.get_block(meta.id).is_ok());
+
+        let file = BlockWriteContext::new(FailingFlushUncertainBlockIO, 0, block_size, 0)?;
+        let context = WriteContext {
+            block: block.clone(),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+            dir_id: 0,
+            dir_metrics: None,
+        };
+
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(context),
+            file: Some(file),
+            lease: None,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        let err = handler.complete(&msg, true).unwrap_err();
+        assert!(
+            err.to_string().contains("flush timed out"),
+            "unexpected error: {err}"
+        );
+
+        // Block must be quarantined, not removed: extent stays reserved.
+        // Raw view: a quarantined block is deliberately not readable.
+        let meta_after = store
+            .get_raw_block_opt(meta.id)
+            .map_err(FsError::from)?
+            .expect("quarantined block must still exist");
+        assert_eq!(
+            meta_after.state(),
+            &curvine_storage_local::BlockState::Quarantined,
+            "uncertain flush failure on SPDK must quarantine the block, not remove it"
+        );
+        assert!(
+            store.get_block(meta.id).is_err(),
+            "quarantined block must not be readable"
+        );
+
+        Ok(())
+    }
+
+    /// Mid-stream write timed out, then Cancel with a successful flush: the
+    /// sticky uncertain flag must still quarantine, not free the extent.
+    #[test]
+    fn cancel_after_uncertain_write_with_ok_flush_quarantines() -> FsResult<()> {
+        let block = ExtendedBlock::new(50, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) = spdk_handler(
+            "write-handler-cancel-uncertain-ok-flush",
+            &block,
+            UncertainFlushOkBlockIO,
+        )?;
+        let available_before = store.read().map_err(FsError::from)?.available();
+
+        let err = handler
+            .complete(&spdk_complete_msg(&block), false)
+            .unwrap_err();
+        assert!(err.to_string().contains("uncertain"), "{err}");
+
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+            "Cancel after an uncertain write must quarantine, not free"
+        );
+        assert_eq!(
+            store.read().map_err(FsError::from)?.available(),
+            available_before,
+            "quarantine must keep the extent reserved"
+        );
+        assert!(handler.is_commit, "quarantine is terminal: must latch");
+        Ok(())
+    }
+
+    /// Same with Complete(commit=true): quarantine, never finalize.
+    #[test]
+    fn complete_after_uncertain_write_with_ok_flush_never_finalizes() -> FsResult<()> {
+        let block = ExtendedBlock::new(51, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) = spdk_handler(
+            "write-handler-commit-uncertain-ok-flush",
+            &block,
+            UncertainFlushOkBlockIO,
+        )?;
+
+        let err = handler
+            .complete(&spdk_complete_msg(&block), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("uncertain"), "{err}");
+
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+            "Complete after an uncertain write must quarantine, not finalize"
+        );
+        assert!(handler.is_commit, "quarantine is terminal: must latch");
+        Ok(())
+    }
+
+    fn spdk_data_frame() -> Message {
+        Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(DataHeaderProto {
+                offset: 0,
+                flush: false,
+                is_last: false,
+            })
+            .data(DataSlice::Buffer(prost::bytes::BytesMut::from(&b"x"[..])))
+            .build()
+    }
+
+    /// A timed-out write must quarantine immediately, before any
+    /// Complete/Cancel: the state must not depend on the client coming back.
+    #[test]
+    fn uncertain_write_quarantines_eagerly_before_complete() -> FsResult<()> {
+        let block = ExtendedBlock::new(52, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) = spdk_handler(
+            "write-handler-eager-quarantine",
+            &block,
+            UncertainWriteBlockIO,
+        )?;
+        let available_before = store.read().map_err(FsError::from)?.available();
+
+        let err = handler.write(&spdk_data_frame()).unwrap_err();
+        assert!(err.to_string().contains("write timed out"), "{err}");
+
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+            "block must be quarantined as soon as the write is uncertain"
+        );
+        assert_eq!(
+            store.read().map_err(FsError::from)?.available(),
+            available_before,
+            "extent must stay reserved"
+        );
+
+        // Client disconnects: handler is dropped. A later master delete must
+        // still be refused, not free the extent.
+        drop(handler);
+        let remove_err = store.async_remove_block(block.id).unwrap_err();
+        assert!(
+            curvine_storage_local::is_quarantined_error(&remove_err),
+            "{remove_err}"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+        );
+        Ok(())
+    }
+
+    /// Eager quarantine, then the client does send Cancel: idempotent, latches.
+    #[test]
+    fn cancel_after_eager_quarantine_is_idempotent() -> FsResult<()> {
+        let block = ExtendedBlock::new(53, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) = spdk_handler(
+            "write-handler-eager-then-cancel",
+            &block,
+            UncertainWriteBlockIO,
+        )?;
+        handler.write(&spdk_data_frame()).unwrap_err();
+
+        let err = handler
+            .complete(&spdk_complete_msg(&block), false)
+            .unwrap_err();
+        assert!(err.to_string().contains("uncertain"), "{err}");
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+        );
+        assert!(handler.is_commit, "must latch");
+        Ok(())
+    }
+
+    // Regression: a re-entrant completion call must not force-release a quarantined block.
+    #[test]
+    fn complete_rejects_reentrant_call_after_uncertain_flush_quarantines_block() -> FsResult<()> {
+        let block_size = 4096_i64;
+        let block = ExtendedBlock::new(42, block_size, StorageType::SpdkDisk, FileType::File);
+
+        let _worker = Worker::with_conf(ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                data_dir: vec!["[MEM:1KB]../testing/write-handler-spdk-reentrancy".to_string()],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        })?;
+
+        let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)
+            .map_err(FsError::from)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        let meta = store.open_block(&block).map_err(FsError::from)?;
+
+        let file = BlockWriteContext::new(FailingFlushUncertainBlockIO, 0, block_size, 0)?;
+        let context = WriteContext {
+            block: block.clone(),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+            dir_id: 0,
+            dir_metrics: None,
+        };
+
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(context),
+            file: Some(file),
+            lease: None,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        // RPC 1: the client's normal completion attempt; flush times out,
+        // uncertain -> quarantine.
+        let err = handler.complete(&msg, true).unwrap_err();
+        assert!(
+            err.to_string().contains("flush timed out"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(meta.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+        );
+
+        // RPC 2: simulates the client's cancel()-on-failure cleanup, reusing
+        // the same handler instance on the same connection (commit=false).
+        let cancel_msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(2)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+        let second = handler.complete(&cancel_msg, false);
+        // Must be an idempotent no-op success, not reach commit_block() again.
+        assert!(
+            second.is_ok(),
+            "re-entrant call with empty data should be treated as an idempotent \
+             no-op by the is_commit guard: {second:?}"
+        );
+
+        // Must still be quarantined: the re-entrant call must not have reached commit_block() again.
+        assert_eq!(
+            store
+                .get_raw_block_opt(meta.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+            "re-entrant completion call must not force-release the quarantined extent"
+        );
+
+        Ok(())
+    }
+
+    // Regression test: commit_block() failing must still set is_commit/take the lease, forced deterministically via an out-of-band pre-finalize length mismatch.
+    #[test]
+    fn complete_guards_is_commit_and_lease_even_when_commit_block_itself_fails() -> FsResult<()> {
+        let block_size = 1024_i64;
+        let block = ExtendedBlock::new(42, block_size, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("complete-commit-block-fails")?;
+        store.open_block(&block).map_err(FsError::from)?;
+
+        // Pre-finalize with len=0 so the handler's own finalize below deterministically hits a length mismatch.
+        let prefinalize_block = ExtendedBlock {
+            len: 0,
+            ..block.clone()
+        };
+        store
+            .finalize_block(&prefinalize_block)
+            .map_err(FsError::from)?;
+
+        let handler_block = ExtendedBlock {
+            len: block_size,
+            ..block.clone()
+        };
+
+        // A flush that succeeds, to exercise the success-path commit_block() call.
+        let file = BlockWriteContext::new(
+            RecordingBlockIO {
+                operations: Arc::new(Mutex::new(Vec::new())),
+            },
+            0,
+            block_size,
+            0,
+        )?;
+        let context = WriteContext {
+            block: handler_block.clone(),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+            dir_id: 0,
+            dir_metrics: None,
+        };
+
+        let lease = store
+            .ordinary_write_lease(handler_block.id)
+            .map_err(FsError::from)?;
+
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(context),
+            file: Some(file),
+            lease,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(handler_block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        let err = handler.complete(&msg, true).unwrap_err();
+        assert!(
+            err.to_string().contains("length mismatch"),
+            "unexpected error: {err}"
+        );
+
+        // The guard must be set even though commit_block() itself failed.
+        assert!(
+            handler.is_commit,
+            "is_commit must be set to true even when commit_block() fails, \
+             to prevent a re-entrant completion call from reaching it again"
+        );
+        assert!(
+            handler.lease.is_none(),
+            "the write lease must be released even when commit_block() fails"
+        );
+
+        // A re-entrant completion call on the same handler must now be a
+        // safe no-op instead of re-attempting commit_block().
+        let second = handler.complete(&msg, true);
+        assert!(
+            second.is_ok(),
+            "re-entrant call after a commit_block() failure should be treated as an \
+             idempotent no-op by the is_commit guard: {second:?}"
+        );
+
+        Ok(())
+    }
+
+    // Transient finalize failure: not terminal, handler must stay open.
+    #[test]
+    fn complete_keeps_handler_open_after_transient_finalize_failure() -> FsResult<()> {
+        // 0 len: RecordingBlockIO writes no real bytes, so the file stays
+        // empty - avoids a real length mismatch masking the injected one.
+        let block_size = 0_i64;
+        let block = ExtendedBlock::new(43, block_size, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("complete-transient-finalize-failure")?;
+        store.open_block(&block).map_err(FsError::from)?;
+
+        let file = BlockWriteContext::new(
+            RecordingBlockIO {
+                operations: Arc::new(Mutex::new(Vec::new())),
+            },
+            0,
+            block_size,
+            0,
+        )?;
+        let context = WriteContext {
+            block: block.clone(),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+            dir_id: 0,
+            dir_metrics: None,
+        };
+
+        let lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(context),
+            file: Some(file),
+            lease,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        store.set_force_transient_finalize_failure_for_test(true);
+        let err = handler.complete(&msg, true).unwrap_err();
+        store.set_force_transient_finalize_failure_for_test(false);
+        assert!(
+            err.to_string()
+                .contains("injected transient finalize failure"),
+            "unexpected error: {err}"
+        );
+
+        // Must NOT be latched: the block rolled back to Writing, not terminal.
+        assert!(
+            !handler.is_commit,
+            "is_commit must stay false after a transient (retryable) finalize failure"
+        );
+        assert!(
+            handler.lease.is_some(),
+            "the write lease must stay held after a transient finalize failure"
+        );
+        let meta = store.get_block(block.id).map_err(FsError::from)?;
+        assert_eq!(
+            meta.state(),
+            &curvine_storage_local::BlockState::Writing,
+            "block must be rolled back to Writing, not left in some other state"
+        );
+
+        // A retried Complete on the same handler must reach commit_block()
+        // again (not report false success), and now succeed since the fault
+        // injection is disabled.
+        let retried = handler.complete(&msg, true);
+        assert!(
+            retried.is_ok(),
+            "retried completion must actually finalize the block: {retried:?}"
+        );
+        assert!(
+            handler.is_commit,
+            "is_commit must be set once the retry actually finalizes the block"
+        );
+        assert!(
+            handler.lease.is_none(),
+            "the write lease must be released once the block is actually finalized"
+        );
+        let meta = store.get_block(block.id).map_err(FsError::from)?;
+        assert!(
+            meta.is_final(),
+            "block must be finalized after the successful retry"
+        );
+
+        Ok(())
+    }
+
+    /// Same scenario, but on a rewrite of an already-finalized block: the
+    /// terminal check must use the raw pending meta, not the readable
+    /// (committed_rewrites) one, or a transient failure looks terminal.
+    #[test]
+    fn complete_keeps_handler_open_after_transient_finalize_failure_on_rewrite() -> FsResult<()> {
+        let block_size = 0_i64;
+        let block = ExtendedBlock::new(44, block_size, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("complete-transient-finalize-failure-rewrite")?;
+        store.open_block(&block).map_err(FsError::from)?;
+
+        // First write: finalize so the block has a committed generation.
+        let first_lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        let mut first_handler = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                RecordingBlockIO {
+                    operations: Arc::new(Mutex::new(Vec::new())),
+                },
+                0,
+                block_size,
+                0,
+            )?),
+            lease: first_lease,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+        let first_msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+        first_handler.complete(&first_msg, true)?;
+        assert!(
+            store.get_block(block.id).map_err(FsError::from)?.is_final(),
+            "setup: first write must be finalized"
+        );
+
+        // Reopen for a rewrite: old copy moves to committed_rewrites.
+        store.open_block(&block).map_err(FsError::from)?;
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Writing),
+            "setup: rewrite pending copy must be Writing"
+        );
+        assert!(
+            store.get_block(block.id).map_err(FsError::from)?.is_final(),
+            "setup: readable copy must still be the old Finalized generation"
+        );
+
+        let lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 2,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                RecordingBlockIO {
+                    operations: Arc::new(Mutex::new(Vec::new())),
+                },
+                0,
+                block_size,
+                0,
+            )?),
+            lease,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(2)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        store.set_force_transient_finalize_failure_for_test(true);
+        let err = handler.complete(&msg, true).unwrap_err();
+        store.set_force_transient_finalize_failure_for_test(false);
+        assert!(
+            err.to_string()
+                .contains("injected transient finalize failure"),
+            "unexpected error: {err}"
+        );
+
+        // The fix: get_raw_block_opt() sees Writing, not the stale
+        // Finalized entry the readable view resolves via committed_rewrites.
+        assert!(
+            !handler.is_commit,
+            "is_commit must stay false after a transient finalize failure on a rewrite"
+        );
+        assert!(
+            handler.lease.is_some(),
+            "the write lease must stay held after a transient finalize failure on a rewrite"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Writing),
+            "pending copy must be rolled back to Writing, not left in some other state"
+        );
+        assert!(
+            store.get_block(block.id).map_err(FsError::from)?.is_final(),
+            "the readable copy stays the old Finalized generation while the rewrite is pending"
+        );
+
+        // Retry must actually finalize the rewrite now.
+        let retried = handler.complete(&msg, true);
+        assert!(
+            retried.is_ok(),
+            "retried completion must actually finalize the rewrite: {retried:?}"
+        );
+        assert!(
+            handler.is_commit,
+            "is_commit must be set once the retry actually finalizes the rewrite"
+        );
+        assert!(
+            handler.lease.is_none(),
+            "the write lease must be released once the rewrite is actually finalized"
+        );
+        // The rewrite must be published: pending copy finalized, no stale
+        // committed_rewrites entry left for readers.
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Finalized),
+            "pending copy must be Finalized after the retry, not still Writing"
+        );
+        assert!(
+            store.get_block(block.id).map_err(FsError::from)?.is_final(),
+            "readers must see the finalized rewrite"
+        );
+
+        Ok(())
+    }
+
+    /// A transient abort failure must not latch is_commit; stay retryable.
+    #[test]
+    fn complete_keeps_handler_open_after_transient_abort_failure_on_flush_error() -> FsResult<()> {
+        let block_size = 1024_i64;
+        let block = ExtendedBlock::new(45, block_size, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("complete-transient-abort-failure-flush")?;
+        store.open_block(&block).map_err(FsError::from)?;
+
+        let file = BlockWriteContext::new(FailingFlushBlockIO, 0, block_size, 0)?;
+        let context = WriteContext {
+            block: block.clone(),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+            dir_id: 0,
+            dir_metrics: None,
+        };
+        let lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(context),
+            file: Some(file),
+            lease,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        store.set_force_transient_abort_failure_for_test(true);
+        let err = handler.complete(&msg, true).unwrap_err();
+        store.set_force_transient_abort_failure_for_test(false);
+        assert!(
+            err.to_string().contains("flush failed"),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            !handler.is_commit,
+            "is_commit must stay false after a transient abort failure"
+        );
+        assert!(
+            handler.lease.is_some(),
+            "the write lease must stay held after a transient abort failure"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Writing),
+            "block must remain Writing, not left in some other state"
+        );
+
+        // Cancel-on-failure cleanup, fault injection now disabled.
+        let cancel_msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(2)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+        let second = handler.complete(&cancel_msg, false);
+        assert!(
+            second.is_ok(),
+            "retried cancel must actually abort the block: {second:?}"
+        );
+        assert!(
+            handler.is_commit,
+            "is_commit must be set once the retry actually aborts the block"
+        );
+        assert!(
+            handler.lease.is_none(),
+            "the write lease must be released once the block is actually aborted"
+        );
+        assert!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .is_none(),
+            "block must be fully removed after a successful abort"
+        );
+
+        Ok(())
+    }
+
+    /// Same scenario, but on the length-mismatch abort path.
+    #[test]
+    fn complete_keeps_handler_open_after_transient_abort_failure_on_length_mismatch() -> FsResult<()>
+    {
+        let block_size = 1024_i64;
+        let block = ExtendedBlock::new(46, block_size, StorageType::Disk, FileType::File);
+        // Oversized: triggers the length-check branch, not commit_block().
+        let oversized_block = ExtendedBlock {
+            len: block_size + 1,
+            ..block.clone()
+        };
+
+        let store = create_test_store("complete-transient-abort-failure-length")?;
+        store.open_block(&block).map_err(FsError::from)?;
+
+        let file = BlockWriteContext::new(
+            RecordingBlockIO {
+                operations: Arc::new(Mutex::new(Vec::new())),
+            },
+            0,
+            block_size,
+            0,
+        )?;
+        let context = WriteContext {
+            block: oversized_block.clone(),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+            dir_id: 0,
+            dir_metrics: None,
+        };
+        let lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(context),
+            file: Some(file),
+            lease,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(oversized_block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        store.set_force_transient_abort_failure_for_test(true);
+        let err = handler.complete(&msg, true).unwrap_err();
+        store.set_force_transient_abort_failure_for_test(false);
+        assert!(
+            err.to_string().contains("Invalid block length"),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            !handler.is_commit,
+            "is_commit must stay false after a transient abort failure"
+        );
+        assert!(
+            handler.lease.is_some(),
+            "the write lease must stay held after a transient abort failure"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Writing),
+            "block must remain Writing, not left in some other state"
+        );
+
+        // Retry: abort now succeeds, same error but terminal this time.
+        let retried = handler.complete(&msg, true);
+        assert!(
+            retried.is_err(),
+            "the length-mismatch error is reported on every attempt"
+        );
+        assert!(
+            handler.is_commit,
+            "is_commit must be set once the retry actually aborts the block"
+        );
+        assert!(
+            handler.lease.is_none(),
+            "the write lease must be released once the block is actually aborted"
+        );
+        assert!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .is_none(),
+            "block must be fully removed after a successful abort"
         );
 
         Ok(())

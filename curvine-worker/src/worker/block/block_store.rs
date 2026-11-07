@@ -114,6 +114,12 @@ pub struct BlockStore {
     /// `open_block` refuses them: a replacement finalized before the report
     /// lands would otherwise lose its location to that stale report.
     fenced_blocks: Arc<DashSet<i64>>,
+    /// Test-only: forces the next finalize prepare to fail (one-shot).
+    #[cfg(test)]
+    force_transient_finalize_failure: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only: forces the next abort to fail (one-shot).
+    #[cfg(test)]
+    force_transient_abort_failure: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BlockStore {
@@ -130,9 +136,45 @@ impl BlockStore {
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
             corrupt_blocks: Arc::new(DashMap::new()),
             fenced_blocks: Arc::new(DashSet::new()),
+            #[cfg(test)]
+            force_transient_finalize_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            force_transient_abort_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         Ok(block_store)
+    }
+
+    /// Wraps a pre-built dataset, bypassing `ClusterConf` (for synthetic
+    /// SPDK test datasets, which have no config-string form).
+    #[cfg(test)]
+    pub fn from_dataset_for_test(dataset: BlockDataset) -> Self {
+        BlockStore {
+            state: Arc::new(RwLock::new(dataset)),
+            uses: Arc::new(
+                (0..BLOCK_LOCK_STRIPES)
+                    .map(|_| Mutex::new(HashMap::new()))
+                    .collect(),
+            ),
+            replication_owner: None,
+            block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
+            corrupt_blocks: Arc::new(DashMap::new()),
+            fenced_blocks: Arc::new(DashSet::new()),
+            force_transient_finalize_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            force_transient_abort_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_force_transient_finalize_failure_for_test(&self, enabled: bool) {
+        self.force_transient_finalize_failure
+            .store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_force_transient_abort_failure_for_test(&self, enabled: bool) {
+        self.force_transient_abort_failure
+            .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
     fn block_uses(&self, block_id: i64) -> &Mutex<HashMap<i64, BlockUse>> {
@@ -354,6 +396,15 @@ impl BlockStore {
 
         let started = Instant::now();
         let plan = reservation.prepare(block.len);
+        #[cfg(test)]
+        let plan = if self
+            .force_transient_finalize_failure
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            curvine_core_error::err_box!("injected transient finalize failure for test")
+        } else {
+            plan
+        };
         self.observe_file_layout_operation("finalize", started.elapsed());
         let plan = match plan {
             Ok(plan) => plan,
@@ -426,7 +477,30 @@ impl BlockStore {
     pub fn abort_block(&self, block: &ExtendedBlock) -> CommonResult<()> {
         let _block_lock = self.block_lock(block.id, "abort");
         self.check_replication_owner(block.id)?;
+        #[cfg(test)]
+        if self
+            .force_transient_abort_failure
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return curvine_core_error::err_box!("injected transient abort failure for test");
+        }
         self.with_dataset_write("abort", |state| state.abort_block(block))
+    }
+
+    /// Abort with an uncertain (timed-out) write/flush outcome; see `Dataset::abort_block_uncertain`.
+    pub fn abort_block_uncertain(&self, block: &ExtendedBlock) -> CommonResult<()> {
+        let _block_lock = self.block_lock(block.id, "abort_uncertain");
+        self.check_replication_owner(block.id)?;
+        #[cfg(test)]
+        if self
+            .force_transient_abort_failure
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return curvine_core_error::err_box!("injected transient abort failure for test");
+        }
+        self.with_dataset_write("abort_uncertain", |state| {
+            state.abort_block_uncertain(block)
+        })
     }
 
     /// Aborts a block unless it is in the committed, finalized generation:
@@ -466,6 +540,14 @@ impl BlockStore {
             .get_readable_block(id)
             .ok_or_else(|| curvine_core_error::err_msg!(format!("block {} not exists", id)))?;
         Ok(b.clone())
+    }
+
+    /// The raw pending meta, unlike the readable view (get_block()) which can
+    /// return a stale committed_rewrites entry during a rewrite. Use this to
+    /// check if a pending write/finalize is terminal.
+    pub fn get_raw_block_opt(&self, id: i64) -> CommonResult<Option<BlockMeta>> {
+        let state = self.read()?;
+        Ok(state.get_block(id).cloned())
     }
 
     pub fn open_writer(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockWriteContext> {
