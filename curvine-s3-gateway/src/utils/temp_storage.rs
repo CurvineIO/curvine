@@ -345,6 +345,15 @@ impl LocalTempStorage {
             .unwrap_or(false)
     }
 
+    /// Recorded size of a staged part, read from the file itself so the value
+    /// cannot drift from the bytes on disk.
+    pub async fn part_size(&self, upload_id: &str, part_number: u32) -> Option<usize> {
+        tokio::fs::metadata(self.part_path(upload_id, part_number))
+            .await
+            .ok()
+            .map(|metadata| metadata.len() as usize)
+    }
+
     /// Copy a staged part into the destination, verifying it on the way out.
     ///
     /// The MD5 is recomputed while streaming and compared with the ETag the
@@ -613,6 +622,16 @@ impl CurvineTempStorage {
         }
     }
 
+    /// Recorded size of a staged part.
+    pub async fn part_size(&self, upload_id: &str, part_number: u32) -> Option<usize> {
+        let path = self.part_path(upload_id, part_number).ok()?;
+        self.fs
+            .get_status(&path)
+            .await
+            .ok()
+            .and_then(|status| usize::try_from(status.len).ok())
+    }
+
     /// Copy a staged part into the destination, verifying it on the way out.
     ///
     /// Same contract as the local backend: the MD5 is recomputed while
@@ -820,6 +839,14 @@ impl TempStorageEnum {
         match self {
             TempStorageEnum::Local(s) => s.part_exists(upload_id, part_number).await,
             TempStorageEnum::Curvine(s) => s.part_exists(upload_id, part_number).await,
+        }
+    }
+
+    /// Recorded size of a staged part, in either backend.
+    pub async fn part_size(&self, upload_id: &str, part_number: u32) -> Option<usize> {
+        match self {
+            TempStorageEnum::Local(s) => s.part_size(upload_id, part_number).await,
+            TempStorageEnum::Curvine(s) => s.part_size(upload_id, part_number).await,
         }
     }
 

@@ -2128,6 +2128,8 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         404
     } else if err.starts_with("PreconditionFailed") {
         412
+    } else if err.starts_with("EntityTooSmall") {
+        400
     } else {
         500
     }

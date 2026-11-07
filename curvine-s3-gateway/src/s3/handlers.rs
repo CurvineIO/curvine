@@ -835,6 +835,9 @@ impl S3Handlers {
     }
 }
 
+/// S3 minimum size for a part other than the last one.
+const MIN_PART_BYTES: usize = 5 << 20;
+
 impl crate::s3::s3_api::ListBucketHandler for S3Handlers {
     fn handle(
         &self,
@@ -939,6 +942,30 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                 return Err(format!(
                     "NoSuchUpload: part {part_num} of upload {upload_id} is not staged"
                 ));
+            }
+        }
+
+        // S3 requires every part except the last to be at least 5 MiB. Enforcing
+        // it here turns a length violation into a 400 instead of publishing an
+        // object with an undersized non-final part. A single-part upload is the
+        // last part, so it is exempt.
+        let part_count = part_list.len();
+        for (index, (_, part_num)) in part_list.iter().enumerate() {
+            if index + 1 == part_count {
+                continue;
+            }
+            match self.temp_storage.part_size(&upload_id, *part_num).await {
+                Some(size) if size >= MIN_PART_BYTES => {}
+                Some(size) => {
+                    return Err(format!(
+                        "EntityTooSmall: part {part_num} is {size} bytes, below the 5 MiB minimum for a non-final part"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "NoSuchUpload: part {part_num} of upload {upload_id} is not staged"
+                    ));
+                }
             }
         }
 
@@ -1493,5 +1520,18 @@ mod put_destination_condition_tests {
             evaluate_precondition_headers(&cond(None, Some("*")), None, None),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod part_size_tests {
+    use super::MIN_PART_BYTES;
+
+    /// The S3 rule, restated: every part other than the last must reach 5 MiB.
+    /// Whether a given part index is the last one is decided by the caller;
+    /// this pins the constant used for that decision.
+    #[test]
+    fn minimum_part_size_is_five_mebibytes() {
+        assert_eq!(MIN_PART_BYTES, 5 * 1024 * 1024);
     }
 }
