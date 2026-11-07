@@ -364,6 +364,63 @@ fn rename_under_distinct_parents_remains_consistent_after_reload() {
 }
 
 #[test]
+fn reopen_existing_file_and_reject_invalid_paths() {
+    use curvine_model::{CreateFileOpts, OpenFlags};
+
+    let fs = test_fs("reopen-existing");
+    fs.mkdir("/dir", false).unwrap();
+    let original = fs.create("/dir/file", false).unwrap();
+    let mut opts = CreateFileOpts::with_create(false);
+    opts.client_name = "reopen-client".into();
+    for _ in 0..2 {
+        fs.open_file("/dir/file", opts.clone(), OpenFlags::WRONLY)
+            .unwrap();
+        fs.close_file("/dir/file", "reopen-client").unwrap();
+    }
+    for path in ["/dir/missing", "/dir", "/.Trash/.pending/hidden"] {
+        assert!(fs.open_file(path, opts.clone(), OpenFlags::WRONLY).is_err());
+    }
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/dir/file").unwrap().id, original.id);
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn reopen_commit_failure_does_not_publish_writer_state() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use curvine_model::{CreateFileOpts, OpenFlags};
+
+    let fs = test_fs("reopen-commit-failure");
+    let file = fs.create("/file", false).unwrap();
+    fs.close_file("/file", "").unwrap();
+    assert!(fs.file_status("/file").unwrap().is_complete);
+
+    let runtime = FaultRuntime::process();
+    let rule_id = format!("reopen-failure-{}", file.id);
+    let rule = FaultRuleBuilder::named("master.metadata.writer.before_commit")
+        .matches("inode_id", file.id)
+        .unwrap()
+        .times(1)
+        .unwrap()
+        .return_error("injected reopen failure")
+        .unwrap();
+    runtime.configure(&rule_id, rule).unwrap();
+    let result = fs.open_file(
+        "/file",
+        CreateFileOpts::with_create(false),
+        OpenFlags::WRONLY,
+    );
+    runtime.remove(&rule_id).unwrap();
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("injected reopen failure"));
+    assert!(fs.file_status("/file").unwrap().is_complete);
+    fs.restore_from_rocksdb().unwrap();
+    assert!(fs.file_status("/file").unwrap().is_complete);
+}
+
+#[test]
 fn link_fallbacks_preserve_existing_entries() {
     let fs = test_fs("link-fallbacks");
     fs.create("/source", false).unwrap();

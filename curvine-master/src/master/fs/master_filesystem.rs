@@ -2552,11 +2552,11 @@ impl MasterFilesystem {
         }
 
         let opened = self.run_metadata_write(|| {
-            let (resolved, _) = self.resolve_live_store_view(path)?;
+            let resolved = self.resolve_live_store_view(path)?;
             Self::check_not_pending_path(path)?;
             Self::check_not_reserved_path(path)?;
 
-            match resolved.target() {
+            match resolved.0.target() {
                 None => {
                     return if flags.create() {
                         Ok(Err(opts))
@@ -2571,7 +2571,7 @@ impl MasterFilesystem {
             }
 
             if !flags.truncate() {
-                let blocks = self.reopen_file_sharded(path, &opts.client_name)?;
+                let blocks = self.reopen_file_sharded(path, &opts.client_name, resolved)?;
                 return Ok(Ok((blocks, None)));
             }
 
@@ -2600,11 +2600,20 @@ impl MasterFilesystem {
         }
     }
 
-    fn reopen_file_sharded(&self, path: &str, client_name: &str) -> FsResult<FileBlocks> {
+    fn reopen_file_sharded(
+        &self,
+        path: &str,
+        client_name: &str,
+        initial: (StoreResolvedPath, u64),
+    ) -> FsResult<FileBlocks> {
         const MAX_RETRIES: usize = 3;
+        let mut initial = Some(initial);
 
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
+            let (resolved, restore_epoch) = match initial.take() {
+                Some(resolved) => resolved,
+                None => self.resolve_live_store_view(path)?,
+            };
             let Some(target) = resolved.target() else {
                 return err_ext!(FsError::file_not_found(path));
             };
