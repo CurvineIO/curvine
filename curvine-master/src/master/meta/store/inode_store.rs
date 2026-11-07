@@ -1152,8 +1152,7 @@ impl InodeStore {
         for item in self.store.scan_directory_attributes()? {
             let (key, value) = try_err!(item);
             let id = RocksUtils::i64_from_bytes(&key)?;
-            let attributes =
-                RocksInodeStore::decode_directory_attributes(id, Some(value.to_vec()))?;
+            let attributes = RocksInodeStore::decode_directory_attributes(id, Some(&value))?;
             if let Some(attributes) = attributes {
                 dir_attrs.insert(id, attributes);
             }
@@ -1707,7 +1706,7 @@ impl<'a> InodeStoreSnapshot<'a> {
     pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
         let bytes = self
             .snapshot
-            .get_cf(RocksInodeStore::CF_INODES, RocksUtils::i64_to_bytes(id))?;
+            .get_pinned_cf(RocksInodeStore::CF_INODES, RocksUtils::i64_to_bytes(id))?;
         match bytes {
             None => Ok(None),
             Some(v) => Ok(Some(RocksInodeStore::decode_inode(id, &v)?)),
@@ -1718,8 +1717,8 @@ impl<'a> InodeStoreSnapshot<'a> {
     pub fn get_directory_attributes(&self, id: i64) -> CommonResult<Option<DirectoryAttributes>> {
         let value = self
             .snapshot
-            .get_cf(RocksInodeStore::CF_DIR_ATTRS, RocksUtils::i64_to_bytes(id))?;
-        RocksInodeStore::decode_directory_attributes(id, value)
+            .get_pinned_cf(RocksInodeStore::CF_DIR_ATTRS, RocksUtils::i64_to_bytes(id))?;
+        RocksInodeStore::decode_directory_attributes(id, value.as_deref())
     }
 
     /// Read a child inode ID from the same snapshot without exposing an in-memory pointer.

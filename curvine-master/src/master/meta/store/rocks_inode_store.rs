@@ -228,8 +228,8 @@ impl RocksInodeStore {
     pub fn get_directory_attributes(&self, id: i64) -> CommonResult<Option<DirectoryAttributes>> {
         let value = self
             .db
-            .get_cf(Self::CF_DIR_ATTRS, RocksUtils::i64_to_bytes(id))?;
-        Self::decode_directory_attributes(id, value)
+            .get_pinned_cf(Self::CF_DIR_ATTRS, RocksUtils::i64_to_bytes(id))?;
+        Self::decode_directory_attributes(id, value.as_deref())
     }
 
     pub fn initialize_root_directory_attributes(&self) -> CommonResult<()> {
@@ -271,10 +271,10 @@ impl RocksInodeStore {
 
     pub(super) fn decode_directory_attributes(
         id: i64,
-        value: Option<Vec<u8>>,
+        value: Option<&[u8]>,
     ) -> CommonResult<Option<DirectoryAttributes>> {
         match value {
-            Some(value) => match DirectoryAttributes::decode(&value) {
+            Some(value) => match DirectoryAttributes::decode(value) {
                 Some(attributes) => Ok(Some(attributes)),
                 None => err_box!("invalid directory attributes for inode {}", id),
             },
@@ -297,7 +297,7 @@ impl RocksInodeStore {
     pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
         let bytes = self
             .db
-            .get_cf(Self::CF_INODES, RocksUtils::i64_to_bytes(id))?;
+            .get_pinned_cf(Self::CF_INODES, RocksUtils::i64_to_bytes(id))?;
         match bytes {
             None => Ok(None),
 

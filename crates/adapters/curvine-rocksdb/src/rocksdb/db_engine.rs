@@ -140,6 +140,14 @@ impl DBEngine {
         Ok(cf_bytes)
     }
 
+    pub fn get_pinned_cf<K: AsRef<[u8]>>(
+        &self,
+        cf: &str,
+        key: K,
+    ) -> CommonResult<Option<DBPinnableSlice<'_>>> {
+        Ok(self.db.get_pinned_cf(self.cf(cf)?, key)?)
+    }
+
     pub fn batched_multi_get_cf<'a, K, I>(
         &'a self,
         cf: &str,
@@ -600,6 +608,15 @@ impl<'a> DbReadSnapshot<'a> {
         let cf = self.cf(cf)?;
         let bytes = try_err!(self.snapshot.get_cf(cf, key));
         Ok(bytes)
+    }
+
+    /// Point read within this snapshot using a pinnable value when possible.
+    pub fn get_pinned_cf<K: AsRef<[u8]>>(
+        &self,
+        cf: &str,
+        key: K,
+    ) -> CommonResult<Option<DBPinnableSlice<'_>>> {
+        Ok(self.snapshot.get_pinned_cf(self.cf(cf)?, key)?)
     }
 
     /// Prefix scan within this snapshot.

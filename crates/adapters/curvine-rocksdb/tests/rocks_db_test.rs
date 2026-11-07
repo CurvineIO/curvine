@@ -88,6 +88,28 @@ fn test_rocksdb_checkpoint_flushes_all_column_families() -> CommonResult<()> {
     Ok(())
 }
 
+#[test]
+fn pinned_reads_keep_snapshot_and_value_lifetimes() -> CommonResult<()> {
+    let path = Utils::test_sub_dir(format!("rocks_pinned_{}", Utils::rand_str(12)));
+    let db = DBEngine::new(DBConf::new(&path).add_cf("cf"), true)?;
+    db.put_cf("cf", b"key", b"old")?;
+    let snapshot = db.read_snapshot();
+    let pinned = db.get_pinned_cf("cf", b"key")?.unwrap();
+    db.put_cf("cf", b"key", b"new")?;
+    assert_eq!(&*pinned, b"old");
+    assert_eq!(&*snapshot.get_pinned_cf("cf", b"key")?.unwrap(), b"old");
+    assert_eq!(&*db.get_pinned_cf("cf", b"key")?.unwrap(), b"new");
+    db.delete_cf("cf", b"key")?;
+    assert!(db.get_pinned_cf("cf", b"key")?.is_none());
+    assert_eq!(&*snapshot.get_pinned_cf("cf", b"key")?.unwrap(), b"old");
+    assert!(db.get_pinned_cf("missing", b"key").is_err());
+    drop(pinned);
+    drop(snapshot);
+    drop(db);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
 fn to_vec(iter: RocksIterator) -> Vec<String> {
     let mut vec = vec![];
     for item in iter {
