@@ -415,13 +415,7 @@ impl DirectoryChildren {
 
     pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodeView> {
         let mut out: Vec<InodeView> = self
-            .read_all_guards(|children| {
-                children
-                    .get_child_by_glob_pattern(glob_pattern)
-                    .into_iter()
-                    .map(|child| child.as_ref().clone())
-                    .collect::<Vec<_>>()
-            })
+            .read_all_guards(|children| children.matching_views(glob_pattern))
             .into_iter()
             .flatten()
             .collect();
@@ -502,12 +496,7 @@ impl DirectoryChildren {
     /// Owned snapshot of the children, sorted by name across shards.
     pub(crate) fn read_all(&self) -> Vec<InodeView> {
         let mut out: Vec<InodeView> = self
-            .read_all_guards(|children| {
-                children
-                    .iter()
-                    .map(|child| child.as_ref().clone())
-                    .collect::<Vec<_>>()
-            })
+            .read_all_guards(|children| children.all_views())
             .into_iter()
             .flatten()
             .collect();

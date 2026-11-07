@@ -38,6 +38,14 @@ impl<'a> ChildItem<'a> {
     }
 
     #[inline]
+    pub(crate) fn into_view(self) -> InodeView {
+        match self {
+            ChildItem::View(view) => view.clone(),
+            ChildItem::FileEntry { name, id } => InodeView::new_entry(name.to_owned(), id),
+        }
+    }
+
+    #[inline]
     pub fn as_ptr(self) -> InodePtr {
         match self {
             ChildItem::View(view) => InodePtr::from_ref(view),

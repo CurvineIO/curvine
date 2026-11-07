@@ -259,8 +259,8 @@ fn child_snapshots_outlive_removed_entries() {
         assert_eq!((point_snapshot.id(), point_snapshot.name()), (3, "sub"));
         assert!(!version.is_current());
         assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].name(), "f2");
-        assert_eq!(matches[1].name(), "sub");
+        assert_eq!((matches[0].id(), matches[0].name()), (2, "f2"));
+        assert_eq!((matches[1].id(), matches[1].name()), (3, "sub"));
         assert_eq!((page[0].id(), page[0].name()), (2, "f2"));
         assert_eq!((page[1].id(), page[1].name()), (3, "sub"));
         assert_eq!(copied_page.len(), 2);

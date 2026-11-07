@@ -293,10 +293,7 @@ impl PackedChildren {
     }
 
     pub(crate) fn list_views(&self, opts: &ListOptions) -> Vec<InodeView> {
-        self.list_map(opts, |item| match item {
-            ChildItem::View(view) => view.clone(),
-            ChildItem::FileEntry { name, id } => InodeView::new_entry(name.to_owned(), id),
-        })
+        self.list_map(opts, |item| item.into_view())
     }
 
     fn list_map<T>(&self, opts: &ListOptions, mut map: impl FnMut(ChildItem<'_>) -> T) -> Vec<T> {

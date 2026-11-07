@@ -100,6 +100,28 @@ impl InodeChildren {
         }
     }
 
+    pub(crate) fn matching_views(&self, pattern: &Pattern) -> Vec<InodeView> {
+        match self {
+            Self::Packed(packed) => packed
+                .iter()
+                .filter(|item| pattern.matches(item.name()))
+                .map(|item| item.into_view())
+                .collect(),
+            _ => self
+                .get_child_by_glob_pattern(pattern)
+                .into_iter()
+                .map(|child| child.as_ref().clone())
+                .collect(),
+        }
+    }
+
+    pub(crate) fn all_views(&self) -> Vec<InodeView> {
+        match self {
+            Self::Packed(packed) => packed.iter().map(|item| item.into_view()).collect(),
+            _ => self.iter().map(|child| child.as_ref().clone()).collect(),
+        }
+    }
+
     pub fn get_child(&self, name: &str) -> Option<InodePtr> {
         match self {
             InodeChildren::List(list) => {
