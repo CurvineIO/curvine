@@ -2763,25 +2763,22 @@ impl MasterFilesystem {
             Ok(all_statuses)
         } else {
             Self::check_not_pending_path(path)?;
-            // Baseline protocol: shared namespace read over the live tree. A
-            // sharded rename mutates the directory in two child mutations, so
-            // the walk versions gate the result: any writer active during the
-            // read makes the listing stale and triggers a retry.
-            for attempt in 0..Self::LIVE_READ_RETRIES {
+            // Validate the captured directory versions after reading the
+            // listing, not before it.
+            for _ in 0..Self::LIVE_READ_RETRIES {
                 let fs_dir = self.fs_dir.read();
-                let inp = Self::resolve_path(&fs_dir, path)?;
-                let current = inp.walk_is_current();
-                let statuses = fs_dir.list_status(&inp)?;
+                let inp = InodePath::resolve_versioned(fs_dir.root_ptr(), path, &fs_dir.store)?;
+                let statuses = fs_dir.list_status(&inp);
+                if inp.walk_is_current() {
+                    return statuses.map(|statuses| Self::hide_pending(path, statuses));
+                }
                 drop(fs_dir);
-                if current {
-                    return Ok(Self::hide_pending(path, statuses));
-                }
-                if attempt + 1 == Self::LIVE_READ_RETRIES {
-                    return Ok(Self::hide_pending(path, statuses));
-                }
                 std::thread::sleep(std::time::Duration::from_micros(50));
             }
-            unreachable!("retry loop returns on every branch")
+            err_ext!(FsError::common(format!(
+                "namespace changed while listing {}",
+                path
+            )))
         }
     }
 
@@ -2796,36 +2793,33 @@ impl MasterFilesystem {
             return err_box!("list_options does not support glob pattern, path {}", path);
         }
         Self::check_not_pending_path(path)?;
-        // Baseline protocol over the live tree; walk versions gate the page
-        // against concurrent renames (see list_status). The pending trash
-        // entry must not consume a client-visible page slot, so the trash
-        // root over-fetches one entry and hide_pending removes it again.
-        for attempt in 0..Self::LIVE_READ_RETRIES {
+        // Version checks detect overlapping directory mutations. The pending
+        // trash entry must not consume a client-visible page slot, so the
+        // trash root over-fetches one entry and hide_pending removes it again.
+        let extended_opts;
+        let page_opts = if path == trash::TRASH_ROOT && opts.limit.is_some_and(|limit| limit > 0) {
+            extended_opts = ListOptions {
+                limit: opts.limit.map(|limit| limit.saturating_add(1)),
+                start_after: opts.start_after.clone(),
+            };
+            &extended_opts
+        } else {
+            &opts
+        };
+        for _ in 0..Self::LIVE_READ_RETRIES {
             let fs_dir = self.fs_dir.read();
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            let current = inp.walk_is_current();
-            let extended_opts;
-            let page_opts =
-                if path == trash::TRASH_ROOT && opts.limit.is_some_and(|limit| limit > 0) {
-                    extended_opts = ListOptions {
-                        limit: opts.limit.map(|limit| limit.saturating_add(1)),
-                        start_after: opts.start_after.clone(),
-                    };
-                    &extended_opts
-                } else {
-                    &opts
-                };
-            let statuses = fs_dir.list_options(&inp, page_opts)?;
+            let inp = InodePath::resolve_versioned(fs_dir.root_ptr(), path, &fs_dir.store)?;
+            let statuses = fs_dir.list_options(&inp, page_opts);
+            if inp.walk_is_current() {
+                return statuses.map(|statuses| Self::hide_pending(path, statuses));
+            }
             drop(fs_dir);
-            if current {
-                return Ok(Self::hide_pending(path, statuses));
-            }
-            if attempt + 1 == Self::LIVE_READ_RETRIES {
-                return Ok(Self::hide_pending(path, statuses));
-            }
             std::thread::sleep(std::time::Duration::from_micros(50));
         }
-        unreachable!("retry loop returns on every branch")
+        err_ext!(FsError::common(format!(
+            "namespace changed while listing {}",
+            path
+        )))
     }
 
     /// Resolves a client-supplied path. `/.Trash/.pending` is master-owned

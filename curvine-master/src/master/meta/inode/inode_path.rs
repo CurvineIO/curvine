@@ -119,6 +119,24 @@ impl InodePath {
         path: T,
         store: &InodeStore,
     ) -> CommonResult<Self> {
+        Self::resolve_inner::<T, false>(root, path, store)
+    }
+
+    /// Capture directory versions before each traversal step and before the
+    /// caller reads the final directory's children.
+    pub fn resolve_versioned<T: AsRef<str>>(
+        root: InodePtr,
+        path: T,
+        store: &InodeStore,
+    ) -> CommonResult<Self> {
+        Self::resolve_inner::<T, true>(root, path, store)
+    }
+
+    fn resolve_inner<T: AsRef<str>, const TRACK_VERSIONS: bool>(
+        root: InodePtr,
+        path: T,
+        store: &InodeStore,
+    ) -> CommonResult<Self> {
         store.ensure_available()?;
         let components = InodeView::path_components(path.as_ref())?;
         let name = try_option!(
@@ -132,10 +150,16 @@ impl InodePath {
         }
 
         let mut inodes: Vec<InodePtr> = Vec::with_capacity(components.len());
+        let mut versions = Vec::new();
         let mut cur_inode = root;
         let mut index = 0;
 
         while index < components.len() {
+            if TRACK_VERSIONS {
+                if let Some(children) = cur_inode.as_ref().children_handle() {
+                    versions.push(children.shared_version());
+                }
+            }
             let next = if index + 1 < components.len() {
                 match cur_inode.as_ref() {
                     Dir(dir) => dir.get_child(&components[index + 1]),
@@ -168,7 +192,7 @@ impl InodePath {
             name: name.to_string(),
             components,
             inodes,
-            versions: Vec::new(),
+            versions,
         };
 
         Ok(inode_path)

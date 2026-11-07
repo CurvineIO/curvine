@@ -52,6 +52,27 @@ fn resolve_retains_owned_root_until_path_is_dropped() {
 }
 
 #[test]
+fn versioned_walk_detects_ancestor_and_target_changes() {
+    let (root, root_children) = root_with_children();
+    let store = test_store("versioned-walk");
+    let path = InodePath::resolve_versioned(InodePtr::from_ref(&root), "/sub", &store).unwrap();
+    assert!(path.walk_is_current());
+    let sub = root_children.read_child_view("sub").0.unwrap();
+    sub.children_handle()
+        .unwrap()
+        .add_child(InodeView::new_file("new".into(), InodeFile::new(1004, 1)))
+        .unwrap();
+    assert!(!path.walk_is_current());
+
+    let path = InodePath::resolve_versioned(InodePtr::from_ref(&root), "/sub", &store).unwrap();
+    assert!(path.walk_is_current());
+    root_children
+        .add_child(InodeView::new_file("other".into(), InodeFile::new(1005, 1)))
+        .unwrap();
+    assert!(!path.walk_is_current());
+}
+
+#[test]
 fn shared_walk_resolves_depth_two_and_reports_version() {
     Master::init_test_metrics();
     let (root, _) = root_with_children();
