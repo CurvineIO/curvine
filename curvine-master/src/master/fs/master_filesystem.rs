@@ -2123,21 +2123,24 @@ impl MasterFilesystem {
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
 
-            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
-            let Some(locked_target) = locked.target() else {
+            let fs_dir = self.fs_dir.read();
+            if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
+                continue;
+            }
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if !Self::live_path_matches(&resolved, &inp) {
+                continue;
+            }
+            let Some(live_inode) = inp.get_last_inode() else {
                 continue;
             };
-            let Ok(locked_file) = locked_target.as_file_ref() else {
+            let Ok(live_file) = live_inode.as_file_ref() else {
                 continue;
             };
-            if restore_epoch != locked_epoch
-                || !resolved.same_resolution(&locked)
-                || locked_file.block_ids() != block_ids
-            {
+            if live_file.block_ids() != block_ids {
                 continue;
             }
 
-            let fs_dir = self.fs_dir.read();
             let current_workers = {
                 let mut current_workers = HashSet::new();
                 for block_id in &block_ids {
@@ -2157,21 +2160,7 @@ impl MasterFilesystem {
             {
                 continue;
             }
-            let inp = Self::resolve_path(&fs_dir, path)?;
             Self::check_not_reserved_path(inp.path())?;
-            if !Self::live_path_matches(&locked, &inp) {
-                continue;
-            }
-            let Some(live_inode) = inp.get_last_inode() else {
-                continue;
-            };
-            let Ok(live_file) = live_inode.as_file_ref() else {
-                continue;
-            };
-            if live_inode.id() != locked_target.id() || live_file.block_ids() != block_ids {
-                continue;
-            }
-
             let original = live_inode.as_ref().clone_metadata();
             let free_res = fs_dir.free_file(&inp, LocalTime::mills() as i64)?;
             return Ok(Some((free_res, original)));
