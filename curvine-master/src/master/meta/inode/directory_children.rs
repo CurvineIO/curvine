@@ -434,10 +434,14 @@ impl DirectoryChildren {
 
     pub fn iter_len(&self) -> usize {
         if let Some(shards) = self.sharded() {
-            // Bulk-seeded directories can have many uninitialized shards.
-            // Limit the optimistic path to sparse indexes: holding each lock
-            // separately is costly under contention on dense indexes. The
-            // sequence validation rejects any overlapping mutation.
+            {
+                let cached = shards.count_cache.read();
+                if self.sequence.is_current(cached.0) {
+                    return cached.1;
+                }
+            }
+            // The version validates both sparse optimistic counts and cached
+            // counts without adding synchronization to the mutation path.
             const MAX_OPTIMISTIC_SHARDS: usize = 8;
             let version = self.sequence.version();
             if version & SequenceState::WRITER_MASK == 0 {
@@ -447,15 +451,20 @@ impl DirectoryChildren {
                 {
                     let count = initialized.map(|shard| shard.children.read().len()).sum();
                     if self.sequence.is_current(version) {
+                        *shards.count_cache.write() = (version, count);
                         return count;
                     }
                 }
             }
-            return shards
+            let count = shards
                 .read_all()
                 .iter()
                 .map(|children| children.len())
                 .sum();
+            if self.sequence.is_current(version) {
+                *shards.count_cache.write() = (version, count);
+            }
+            return count;
         }
         let children = self.children.read();
         if self.sharded().is_some() {

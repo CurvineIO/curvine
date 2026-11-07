@@ -86,6 +86,7 @@ fn sharded_count_waits_for_inflight_mutation() {
     let children = Arc::new(DirectoryChildren::new());
     children.seed_shards_for_bulk_load(4096);
     children.add_child(file_edge(1)).unwrap();
+    assert_eq!(children.iter_len(), 1); // Populate the count cache.
     let mut mutation = children.begin_mutation("f2");
     let reader = children.clone();
     let (started_tx, started_rx) = mpsc::channel();
@@ -101,6 +102,21 @@ fn sharded_count_waits_for_inflight_mutation() {
     thread.join().unwrap();
     assert_eq!(early, None, "count bypassed an active mutation");
     assert_eq!(result_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
+}
+
+#[test]
+fn sharded_count_cache_invalidates_after_each_mutation() {
+    let children = DirectoryChildren::new();
+    children.seed_shards_for_bulk_load(4096);
+    for id in 0..512 {
+        children.add_child(file_edge(id)).unwrap();
+    }
+    for id in 0..512 {
+        assert_eq!(children.iter_len(), 512 - id as usize);
+        assert_eq!(children.iter_len(), 512 - id as usize);
+        children.delete_child(id, &format!("f{id}")).unwrap();
+    }
+    assert_eq!(children.iter_len(), 0);
 }
 
 #[test]

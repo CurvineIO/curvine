@@ -38,6 +38,7 @@ pub(crate) struct DirectoryShard {
 pub(crate) struct ShardedChildren {
     pub(crate) ready: AtomicBool,
     pub(crate) shards: Box<[OnceLock<DirectoryShard>]>,
+    pub(crate) count_cache: RwLock<(u64, usize)>,
 }
 
 impl ShardedChildren {
@@ -47,6 +48,8 @@ impl ShardedChildren {
         Self {
             ready: AtomicBool::new(false),
             shards,
+            // An odd sequence is never current.
+            count_cache: RwLock::new((1, 0)),
         }
     }
 
