@@ -98,15 +98,23 @@ impl InodeLockManager {
     /// (design doc §11.2). Best-effort: metric registration failure is
     /// ignored on the hot path.
     fn record_acquire_us(mode: InodeLockMode, started: std::time::Instant) {
-        if let Ok(metrics) = crate::master::Master::get_metrics() {
-            metrics
-                .inode_lock_acquire_us
-                .with_label_values(&[match mode {
-                    InodeLockMode::Read => "read",
-                    InodeLockMode::Write => "write",
-                }])
-                .observe(started.elapsed().as_micros() as f64);
-        }
+        use std::sync::OnceLock;
+        static READ: OnceLock<curvine_metrics::Histogram> = OnceLock::new();
+        static WRITE: OnceLock<curvine_metrics::Histogram> = OnceLock::new();
+        let (cache, label) = match mode {
+            InodeLockMode::Read => (&READ, "read"),
+            InodeLockMode::Write => (&WRITE, "write"),
+        };
+        let histogram = match cache.get() {
+            Some(histogram) => histogram,
+            None => match crate::master::Master::get_metrics() {
+                Ok(metrics) => {
+                    cache.get_or_init(|| metrics.inode_lock_acquire_us.with_label_values(&[label]))
+                }
+                Err(_) => return,
+            },
+        };
+        histogram.observe(started.elapsed().as_micros() as f64);
     }
 
     pub fn new(shard_count: usize) -> Self {

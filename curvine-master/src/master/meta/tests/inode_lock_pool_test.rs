@@ -25,14 +25,27 @@ fn single_inode_lock_many_records_one_acquisition() {
         .inode_lock_acquire_us
         .with_label_values(&["write"]);
     let before = histogram.get_sample_count();
+    let read_histogram = crate::master::Master::get_metrics()
+        .unwrap()
+        .inode_lock_acquire_us
+        .with_label_values(&["read"]);
+    let read_before = read_histogram.get_sample_count();
     let manager = InodeLockManager::new(4);
+    thread::scope(|scope| {
+        for id in 0..8 {
+            let manager = &manager;
+            scope.spawn(move || drop(manager.write_inode(id)));
+        }
+    });
+    drop(manager.lock_many(&[InodeLockRequest::read(0, 41)]));
     drop(manager.lock_many(&[InodeLockRequest::write(0, 42)]));
     drop(manager.write_inode(43));
     drop(manager.lock_many(&[
         InodeLockRequest::read(0, 44),
         InodeLockRequest::write(1, 45),
     ]));
-    assert_eq!(histogram.get_sample_count() - before, 3);
+    assert_eq!(histogram.get_sample_count() - before, 11);
+    assert_eq!(read_histogram.get_sample_count() - read_before, 1);
 }
 
 #[test]
