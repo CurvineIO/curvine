@@ -101,6 +101,11 @@ fn listing_is_ordered_and_paginated_before_and_after_sharding() {
                 start_after: None
             })
             .is_empty());
+            let matches = children.get_child_by_glob_pattern(&glob::Pattern::new("f1*").unwrap());
+            assert_eq!(
+                matches.iter().map(|child| child.name()).collect::<Vec<_>>(),
+                ["f1", "f10", "f12"]
+            );
         };
         check();
         children.seed_shards_for_bulk_load(4096);

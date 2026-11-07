@@ -414,6 +414,14 @@ impl DirectoryChildren {
     }
 
     pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodeView> {
+        if self.sharded().is_none() {
+            let children = self.children.read();
+            // The underlying containers iterate in name order. Recheck
+            // promotion under the lock before skipping the shard sort.
+            if self.sharded().is_none() {
+                return children.matching_views(glob_pattern);
+            }
+        }
         let mut out: Vec<InodeView> = self
             .read_all_guards(|children| children.matching_views(glob_pattern))
             .into_iter()
