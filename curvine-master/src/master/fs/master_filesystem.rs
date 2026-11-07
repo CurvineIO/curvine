@@ -458,10 +458,9 @@ impl MasterFilesystem {
                 return false;
             };
             let handle = parent.children_handle();
-            let (child, version) = handle.read_child_view(&inp.components[depth]);
-            let current = child.is_some_and(|view| view.id() == inp.inodes[depth].id())
-                && version.is_current();
-            if !current {
+            let (matched, version) =
+                handle.child_id_matches_version(&inp.components[depth], inp.inodes[depth].id());
+            if !(matched && version.is_current()) {
                 return false;
             }
         }
@@ -471,8 +470,10 @@ impl MasterFilesystem {
                 return false;
             };
             let handle = parent.children_handle();
-            let (child, _) = handle.read_child_view(&inp.components[inp.inodes.len()]);
-            if child.is_some() {
+            if handle
+                .get_child_ptr(&inp.components[inp.inodes.len()])
+                .is_some()
+            {
                 return false;
             }
         }

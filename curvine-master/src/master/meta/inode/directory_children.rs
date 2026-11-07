@@ -316,7 +316,30 @@ impl DirectoryChildren {
         }
     }
 
-    /// Read a child together with the version needed to validate the read
+    /// Reads whether a child exists with the expected id, plus the version
+    /// needed to validate the check later. Avoids cloning the inode body:
+    /// identity re-verification only needs the id.
+    pub fn child_id_matches_version(
+        &self,
+        name: &str,
+        expected_id: i64,
+    ) -> (bool, DirectoryReadVersion<'_>) {
+        self.with_children_for_name(name, |children, name| {
+            let version = self.sequence.version();
+            let matches = children
+                .get_child(name)
+                .is_some_and(|ptr| ptr.as_ref().id() == expected_id);
+            (
+                matches,
+                DirectoryReadVersion {
+                    children: self,
+                    version,
+                },
+            )
+        })
+    }
+
+    /// Reads one child together with the version needed to validate the read
     /// later via [`Self::version_is`].
     pub fn read_child_view(&self, name: &str) -> (Option<InodeView>, DirectoryReadVersion<'_>) {
         let (view, version) = self.with_children_for_name(name, |children, name| {
