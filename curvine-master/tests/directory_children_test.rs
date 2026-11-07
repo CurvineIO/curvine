@@ -136,6 +136,37 @@ fn listing_is_ordered_and_paginated_before_and_after_sharding() {
 }
 
 #[test]
+fn paginated_listing_selects_global_page_across_shards() {
+    use curvine_model::ListOptions;
+
+    let children = DirectoryChildren::new();
+    for id in (0..1024).rev() {
+        children
+            .add_child(InodeView::new_file(
+                format!("f{id:04}"),
+                curvine_master::master::meta::inode::InodeFile::new(id, 1),
+            ))
+            .unwrap();
+    }
+    let options = ListOptions {
+        limit: Some(64),
+        start_after: Some("f0500".into()),
+    };
+    let expected: Vec<_> = (501..565).map(|id| format!("f{id:04}")).collect();
+    for sharded in [false, true] {
+        if sharded {
+            children.seed_shards_for_bulk_load(4096);
+        }
+        let names: Vec<_> = children
+            .list_options(&options)
+            .into_iter()
+            .map(|child| child.name().to_owned())
+            .collect();
+        assert_eq!(names, expected);
+    }
+}
+
+#[test]
 fn point_reads_and_identity_checks_match_all_containers() {
     use curvine_config::ChildrenContainer;
     use curvine_master::master::meta::inode::InodeChildren;
