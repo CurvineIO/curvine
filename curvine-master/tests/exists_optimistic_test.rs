@@ -364,6 +364,41 @@ fn rename_under_distinct_parents_remains_consistent_after_reload() {
 }
 
 #[test]
+fn link_fallbacks_preserve_existing_entries() {
+    let fs = test_fs("link-fallbacks");
+    fs.create("/source", false).unwrap();
+    fs.mkdir("/dir", false).unwrap();
+    fs.link("/source", "/dir/existing").unwrap();
+    assert!(fs.link("/source", "/dir/existing").is_err());
+    assert!(fs.link("/missing", "/dir/alias").is_err());
+    assert!(fs
+        .symlink("/target", "/dir/existing", false, 0o777)
+        .is_err());
+    assert!(fs
+        .symlink("/target", "/missing/alias", false, 0o777)
+        .is_err());
+    assert!(fs.link("/source", "/.Trash/.pending/hidden").is_err());
+    assert!(fs
+        .symlink("/target", "/.Trash/.pending/hidden", false, 0o777)
+        .is_err());
+
+    fs.link("/source", "/missing/alias").unwrap();
+    let original = fs.file_status("/source").unwrap();
+    for restored in [false, true] {
+        if restored {
+            fs.restore_from_rocksdb().unwrap();
+        }
+        let source = fs.file_status("/source").unwrap();
+        let existing = fs.file_status("/dir/existing").unwrap();
+        let nested = fs.file_status("/missing/alias").unwrap();
+        assert_eq!((source.id, source.nlink), (original.id, original.nlink));
+        assert_eq!(existing.id, original.id);
+        assert_eq!(nested.id, original.id);
+        assert!(!fs.exists("/dir/alias").unwrap());
+    }
+}
+
+#[test]
 fn link_under_distinct_parents_remains_consistent_after_reload() {
     let fs = test_fs("link-distinct-parents");
     const PARENTS: usize = 4;

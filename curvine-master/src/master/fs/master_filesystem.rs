@@ -1281,11 +1281,16 @@ impl MasterFilesystem {
         mode: u32,
         owner: Option<String>,
         group: Option<String>,
+        initial: (StoreResolvedPath, u64),
     ) -> FsResult<()> {
         const MAX_RETRIES: usize = 3;
+        let mut initial = Some(initial);
 
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = self.resolve_live_store_view(link)?;
+            let (resolved, restore_epoch) = match initial.take() {
+                Some(resolved) => resolved,
+                None => self.resolve_live_store_view(link)?,
+            };
             if resolved.is_full() || resolved.inodes().len() + 1 < resolved.components().len() {
                 return self.symlink_with_global_lock(target, link, false, mode, owner, group);
             }
@@ -4497,12 +4502,12 @@ impl MasterFilesystem {
         let target = target.as_ref().to_string();
         let link = link.as_ref().to_string();
         self.run_metadata_write(|| {
-            let (resolved, _) = self.resolve_live_store_view(&link)?;
+            let resolved = self.resolve_live_store_view(&link)?;
             Self::check_not_pending_path(&link)?;
             Self::check_not_reserved_path(&link)?;
             let single_parent = !force
-                && !resolved.is_full()
-                && resolved.inodes().len() + 1 >= resolved.components().len();
+                && !resolved.0.is_full()
+                && resolved.0.inodes().len() + 1 >= resolved.0.components().len();
             if single_parent {
                 self.symlink_single_parent_sharded(
                     &target,
@@ -4510,6 +4515,7 @@ impl MasterFilesystem {
                     mode,
                     owner.clone(),
                     group.clone(),
+                    resolved,
                 )
             } else {
                 self.symlink_with_global_lock(&target, &link, force, mode, owner, group)
