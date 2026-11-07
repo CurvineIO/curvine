@@ -89,6 +89,41 @@ fn test_rocksdb_checkpoint_flushes_all_column_families() -> CommonResult<()> {
 }
 
 #[test]
+fn clear_cf_removes_keys_at_and_above_ff() -> CommonResult<()> {
+    let path = Utils::test_sub_dir(format!("rocks_clear_cf_{}", Utils::rand_str(12)));
+    let conf = DBConf::new(&path).add_cf("target").add_cf("other");
+    let db = DBEngine::new(conf.clone(), true)?;
+    let keys: &[&[u8]] = &[b"", b"a", &[0xfe, 0xff], &[0xff], &[0xff, 0], &[0xff, 0xff]];
+    for key in keys {
+        db.put_cf("target", key, b"value")?;
+    }
+    db.put_cf("other", [0xff], b"other")?;
+    let snapshot = db.read_snapshot();
+    db.clear_cf("target")?;
+    for key in keys {
+        assert!(db.get_cf("target", key)?.is_none(), "key {key:?} survived");
+        assert_eq!(
+            snapshot.get_pinned_cf("target", key)?.as_deref(),
+            Some(&b"value"[..])
+        );
+    }
+    assert_eq!(db.get_cf("other", [0xff])?, Some(b"other".to_vec()));
+    db.clear_cf("target")?;
+    drop(snapshot);
+    drop(db);
+    let db = DBEngine::new(conf, false)?;
+    for key in keys {
+        assert!(
+            db.get_cf("target", key)?.is_none(),
+            "key {key:?} survived reopen"
+        );
+    }
+    drop(db);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
 fn pinned_reads_keep_snapshot_and_value_lifetimes() -> CommonResult<()> {
     let path = Utils::test_sub_dir(format!("rocks_pinned_{}", Utils::rand_str(12)));
     let db = DBEngine::new(DBConf::new(&path).add_cf("cf"), true)?;

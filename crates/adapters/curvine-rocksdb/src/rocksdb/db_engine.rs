@@ -354,16 +354,26 @@ impl DBEngine {
         Ok(())
     }
 
-    /// Delete every record in a column family.
-    ///
-    /// RocksDB ranges are end-exclusive, so the span `[[], [0xff]]` covers all
-    /// keys below `0xff`; a zero-length prefix computes an empty end range and
-    /// deletes nothing.
+    /// Delete every record in a column family. Callers must exclude concurrent
+    /// writes: keys in the unbounded tail are enumerated before committing.
     pub fn clear_cf(&self, cf: &str) -> CommonResult<()> {
         let cf = self.cf(cf)?;
-        let empty: &[u8] = b"";
-        let end: &[u8] = &[0xff];
-        self.db.delete_range_cf(cf, empty, end)?;
+        let end = [0xff];
+        let mut batch = WriteBatchWithTransaction::<false>::default();
+        batch.delete_range_cf(cf, &b""[..], &end[..]);
+
+        // No finite exclusive upper bound covers all byte strings. Delete the
+        // remaining 0xff-prefixed keys individually in the same write batch.
+        let mut options = ReadOptions::default();
+        options.set_total_order_seek(true);
+        for entry in
+            self.db
+                .iterator_cf_opt(cf, options, IteratorMode::From(&end, Direction::Forward))
+        {
+            let (key, _) = entry?;
+            batch.delete_cf(cf, key);
+        }
+        self.db.write(batch)?;
         Ok(())
     }
 
