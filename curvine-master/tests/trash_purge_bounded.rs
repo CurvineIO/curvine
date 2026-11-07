@@ -67,6 +67,25 @@ fn purger(fs: &MasterFilesystem) -> TrashPurger {
 }
 
 #[test]
+fn purge_batch_preserves_external_hard_link() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let fs = trash_fs("hard-links", 32, 0);
+    let original = fs.create("/victim/file", true).unwrap();
+    fs.link("/victim/file", "/victim/alias").unwrap();
+    fs.link("/victim/file", "/survivor").unwrap();
+    fs.delete_with_mode("/victim", true, DeleteMode::Default)
+        .unwrap();
+    let entry = fs.list_trash().unwrap().remove(0).path;
+    purger(&fs).purge_entry(&entry).unwrap().unwrap();
+    let survivor = fs.file_status("/survivor").unwrap();
+    assert_eq!(survivor.id, original.id);
+    assert_eq!(survivor.nlink, 1);
+    fs.restore_from_rocksdb().unwrap();
+    let restored = fs.file_status("/survivor").unwrap();
+    assert_eq!((restored.id, restored.nlink), (original.id, 1));
+}
+
+#[test]
 fn missing_entry_walk_waits_for_namespace_readers() {
     let _serial = TEST_LOCK.lock().unwrap();
     let fs = trash_fs("walk-lock", 8, 0);

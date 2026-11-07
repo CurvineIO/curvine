@@ -371,7 +371,7 @@ impl InodeStore {
                         1,
                         ctime,
                         &mut batch,
-                        &mut staged,
+                        Some(&mut staged),
                         &mut ttl_removals,
                     )?;
                     del_res.inodes += res.inodes;
@@ -1053,8 +1053,7 @@ impl InodeStore {
         batch: &mut InodeWriteBatch<'_>,
         ttl_removals: &mut Vec<InodeView>,
     ) -> CommonResult<DeleteResult> {
-        let mut staged = HashMap::new();
-        self.stage_decrement_nlink(inode_id, links, ctime, batch, &mut staged, ttl_removals)
+        self.stage_decrement_nlink(inode_id, links, ctime, batch, None, ttl_removals)
     }
 
     // Stages link removal, reading through `staged` so repeated names of the
@@ -1065,11 +1064,11 @@ impl InodeStore {
         links: u32,
         ctime: i64,
         batch: &mut InodeWriteBatch<'_>,
-        staged: &mut HashMap<i64, Option<InodeView>>,
+        mut staged: Option<&mut HashMap<i64, Option<InodeView>>>,
         ttl_removals: &mut Vec<InodeView>,
     ) -> CommonResult<DeleteResult> {
         let mut del_res = DeleteResult::new();
-        let mut inode_view = match staged.remove(&inode_id) {
+        let mut inode_view = match staged.as_mut().and_then(|staged| staged.remove(&inode_id)) {
             Some(Some(inode)) => inode,
             Some(None) => return err_box!("Inode {} not found when decrementing nlink", inode_id),
             None => match self.get_inode(inode_id, None)? {
@@ -1099,11 +1098,15 @@ impl InodeStore {
         if last_link {
             batch.delete_inode(inode_id)?;
             ttl_removals.push(inode_view);
-            staged.insert(inode_id, None);
+            if let Some(staged) = staged {
+                staged.insert(inode_id, None);
+            }
         } else {
             // Write the updated inode back to storage
             batch.write_inode(&inode_view)?;
-            staged.insert(inode_id, Some(inode_view));
+            if let Some(staged) = staged {
+                staged.insert(inode_id, Some(inode_view));
+            }
         }
 
         Ok(del_res)
