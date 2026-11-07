@@ -385,6 +385,30 @@ fn reopen_existing_file_and_reject_invalid_paths() {
 }
 
 #[test]
+fn reopen_rejects_restore_admission_without_changing_writer_state() {
+    use curvine_model::{CreateFileOpts, OpenFlags};
+
+    let fs = test_fs("reopen-restore-admission");
+    fs.create("/file", false).unwrap();
+    fs.close_file("/file", "").unwrap();
+    assert!(fs.file_status("/file").unwrap().is_complete);
+    let restore = fs
+        .fs_dir
+        .read()
+        .store_ref()
+        .begin_restore(std::time::Duration::from_secs(1))
+        .unwrap();
+    let result = fs.open_file(
+        "/file",
+        CreateFileOpts::with_create(false),
+        OpenFlags::WRONLY,
+    );
+    assert!(result.unwrap_err().to_string().contains("snapshot restore"));
+    drop(restore);
+    assert!(fs.file_status("/file").unwrap().is_complete);
+}
+
+#[test]
 fn truncate_open_and_create_overwrite_keep_inode_identity() {
     use curvine_model::{CreateFileOpts, OpenFlags};
 

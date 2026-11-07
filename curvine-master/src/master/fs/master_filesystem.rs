@@ -480,20 +480,25 @@ impl MasterFilesystem {
         true
     }
 
-    /// Resolve a comparable live-tree view and capture the restore epoch.
-    /// The underlying path walk has the same borrowed-pointer lifetime risk
-    /// as `resolve_live_path` when it runs before inode locks are acquired.
-    fn resolve_live_store_view(&self, path: &str) -> FsResult<(StoreResolvedPath, u64)> {
-        let fs_dir = self.fs_dir.read();
+    #[inline]
+    fn checked_live_epoch(fs_dir: &FsDir) -> FsResult<u64> {
         let control = fs_dir.store.scan_control();
-        // Mirror the snapshot-scan admission gate: mutations are rejected
-        // while a Raft snapshot restore is pending or in progress.
         if control.is_restoring() {
             return err_box!(
                 "metadata scan lease rejected: snapshot restore is pending or in progress"
             );
         }
-        let epoch = control.cancel_epoch();
+        Ok(control.cancel_epoch())
+    }
+
+    /// Resolve a comparable live-tree view and capture the restore epoch.
+    /// The underlying path walk has the same borrowed-pointer lifetime risk
+    /// as `resolve_live_path` when it runs before inode locks are acquired.
+    fn resolve_live_store_view(&self, path: &str) -> FsResult<(StoreResolvedPath, u64)> {
+        let fs_dir = self.fs_dir.read();
+        // Mirror the snapshot-scan admission gate: mutations are rejected
+        // while a Raft snapshot restore is pending or in progress.
+        let epoch = Self::checked_live_epoch(&fs_dir)?;
         let inp = Self::resolve_path(&fs_dir, path)?;
         Ok((StoreResolvedPath::from_live(&inp), epoch))
     }
@@ -1059,13 +1064,7 @@ impl MasterFilesystem {
                 .collect();
             let _locks = self.inode_locks.lock_many(&requests);
             let fs_dir = self.fs_dir.read();
-            let control = fs_dir.store.scan_control();
-            if control.is_restoring() {
-                return err_box!(
-                    "metadata scan lease rejected: snapshot restore is pending or in progress"
-                );
-            }
-            if restore_epoch != control.cancel_epoch() {
+            if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
             let inp = Self::resolve_path(&fs_dir, path)?;
@@ -1318,13 +1317,7 @@ impl MasterFilesystem {
                 .collect();
             let _locks = self.inode_locks.lock_many(&requests);
             let fs_dir = self.fs_dir.read();
-            let control = fs_dir.store.scan_control();
-            if control.is_restoring() {
-                return err_box!(
-                    "metadata scan lease rejected: snapshot restore is pending or in progress"
-                );
-            }
-            if restore_epoch != control.cancel_epoch() {
+            if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
             let inp = Self::resolve_path(&fs_dir, link)?;
@@ -2649,13 +2642,12 @@ impl MasterFilesystem {
                 .collect();
             let _locks = self.inode_locks.lock_many(&requests);
 
-            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
-            if locked_epoch != restore_epoch || !resolved.same_resolution(&locked) {
+            let fs_dir = self.fs_dir.read();
+            if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-            let fs_dir = self.fs_dir.read();
             let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&locked, &inp) {
+            if !Self::live_path_matches(&resolved, &inp) {
                 continue;
             }
             let Some(inode) = inp.get_last_inode() else {
