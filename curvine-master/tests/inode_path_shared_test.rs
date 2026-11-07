@@ -31,6 +31,20 @@ fn root_with_children() -> (InodeView, Arc<DirectoryChildren>) {
 }
 
 #[test]
+fn resolved_path_name_handles_root_and_unicode() {
+    let (root, _) = root_with_children();
+    let store = test_store("name-boundaries");
+    for (path, expected) in [("/", "/"), ("/sub", "sub"), ("/sub/目录", "目录")] {
+        let resolved = InodePath::resolve(InodePtr::from_ref(&root), path, &store).unwrap();
+        assert_eq!(resolved.path(), path);
+        assert_eq!(resolved.name(), expected);
+        let shared = InodePath::resolve_shared(&root, path, &store).unwrap();
+        assert_eq!(shared.name(), expected);
+    }
+    assert!(InodePath::resolve(InodePtr::from_ref(&root), "/sub/", &store).is_err());
+}
+
+#[test]
 fn resolve_retains_owned_root_until_path_is_dropped() {
     let (root, handle) = root_with_children();
     let weak = Arc::downgrade(&handle);
