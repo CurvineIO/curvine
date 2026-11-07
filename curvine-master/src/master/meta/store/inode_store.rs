@@ -420,19 +420,25 @@ impl InodeStore {
 
         if !del.is_dir() {
             batch.delete_child(parent.id(), del_name)?;
-            // EXPERIMENT: the caller holds the namespace write path, so the
-            // in-memory inode already matches the store row; skip the point
-            // lookup and clone the view instead.
-            let mut staged: HashMap<i64, Option<InodeView>> = HashMap::new();
-            staged.insert(del.id(), Some(del.clone()));
-            del_res = self.stage_decrement_nlink(
-                del.id(),
-                1,
-                ctime,
-                &mut batch,
-                Some(&mut staged),
-                &mut ttl_removals,
-            )?;
+            // The caller holds the namespace write path, so an in-memory file
+            // inode already matches the store row; skip the point lookup and
+            // clone the view instead. A FileEntry edge (no full inode in
+            // memory) must still go through the store lookup, which skips
+            // missing rows.
+            del_res = if let InodeView::File(_) = del {
+                let mut staged: HashMap<i64, Option<InodeView>> = HashMap::new();
+                staged.insert(del.id(), Some(del.clone()));
+                self.stage_decrement_nlink(
+                    del.id(),
+                    1,
+                    ctime,
+                    &mut batch,
+                    Some(&mut staged),
+                    &mut ttl_removals,
+                )?
+            } else {
+                self.decrement_inode_nlink(del.id(), 1, ctime, &mut batch, &mut ttl_removals)?
+            };
             deleted_files = 1;
         } else {
             let mut stack = LinkedList::new();
