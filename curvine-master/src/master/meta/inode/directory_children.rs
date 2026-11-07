@@ -439,21 +439,11 @@ impl DirectoryChildren {
             // Each container returns names in order; recheck promotion while
             // holding its read lock before skipping the global shard sort.
             if self.sharded().is_none() {
-                return children
-                    .list_options(opts)
-                    .into_iter()
-                    .map(|child| child.as_ref().clone())
-                    .collect();
+                return children.list_views(opts);
             }
         }
         let mut out: Vec<InodeView> = self
-            .read_all_guards(|children| {
-                children
-                    .list_options(opts)
-                    .into_iter()
-                    .map(|child| child.as_ref().clone())
-                    .collect::<Vec<_>>()
-            })
+            .read_all_guards(|children| children.list_views(opts))
             .into_iter()
             .flatten()
             .collect();

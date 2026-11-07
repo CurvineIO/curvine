@@ -289,6 +289,17 @@ impl PackedChildren {
     }
 
     pub fn list_options(&self, opts: &ListOptions) -> Vec<InodePtr> {
+        self.list_map(opts, |item| item.as_ptr())
+    }
+
+    pub(crate) fn list_views(&self, opts: &ListOptions) -> Vec<InodeView> {
+        self.list_map(opts, |item| match item {
+            ChildItem::View(view) => view.clone(),
+            ChildItem::FileEntry { name, id } => InodeView::new_entry(name.to_owned(), id),
+        })
+    }
+
+    fn list_map<T>(&self, opts: &ListOptions, mut map: impl FnMut(ChildItem<'_>) -> T) -> Vec<T> {
         let mut out = Vec::new();
         let limit = opts.limit.unwrap_or(usize::MAX);
         let chunks = self.area.chunks();
@@ -308,7 +319,7 @@ impl PackedChildren {
                 off = 0;
                 continue;
             }
-            out.push(Self::packed_item(&self.dirs, chunk, off).as_ptr());
+            out.push(map(Self::packed_item(&self.dirs, chunk, off)));
             off += Self::record_len(chunk.buf(), off);
         }
         out

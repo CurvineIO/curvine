@@ -155,6 +155,17 @@ impl InodeChildren {
         }
     }
 
+    pub(crate) fn list_views(&self, opts: &ListOptions) -> Vec<InodeView> {
+        match self {
+            Self::Packed(packed) => packed.list_views(opts),
+            _ => self
+                .list_options(opts)
+                .into_iter()
+                .map(|child| child.as_ref().clone())
+                .collect(),
+        }
+    }
+
     pub fn list_options(&self, opts: &ListOptions) -> Vec<InodePtr> {
         match self {
             InodeChildren::List(list) => {

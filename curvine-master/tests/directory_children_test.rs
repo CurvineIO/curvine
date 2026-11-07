@@ -253,7 +253,6 @@ fn child_snapshots_outlive_removed_entries() {
         let page = dir.list_options(&Default::default());
         let matches = dir.get_child_by_glob_pattern(&glob::Pattern::new("*").unwrap());
         let copied_page = page.clone();
-        drop(page);
         children.delete_child(2, "f2").unwrap();
         children.delete_child(3, "sub").unwrap();
         let point_snapshot = point_snapshot.unwrap();
@@ -262,6 +261,8 @@ fn child_snapshots_outlive_removed_entries() {
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].name(), "f2");
         assert_eq!(matches[1].name(), "sub");
+        assert_eq!((page[0].id(), page[0].name()), (2, "f2"));
+        assert_eq!((page[1].id(), page[1].name()), (3, "sub"));
         assert_eq!(copied_page.len(), 2);
         assert_eq!(copied_page[0].name(), "f2");
         assert_eq!(copied_page[1].name(), "sub");
