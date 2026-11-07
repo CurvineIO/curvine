@@ -48,6 +48,8 @@ fn map_storage_open_error(e: curvine_core_error::CommonError) -> FsError {
 
 /// An abort that failed non-terminally and must be retried as-is on the
 /// next Complete/Cancel, instead of falling through to commit_block().
+/// A replay that lands answers Ok to Cancel and the original error to
+/// Complete; the handler then refuses any later Complete.
 pub(crate) struct PendingAbort {
     pub(crate) block: ExtendedBlock,
     /// Retry with abort_block_uncertain() instead of abort_block().
@@ -85,6 +87,8 @@ pub struct WriteHandler {
     pub(crate) metrics: &'static WorkerMetrics,
     pub(crate) client_addr: String,
     pub(crate) pending_abort: Option<PendingAbort>,
+    /// is_commit came from an abort, not a commit: refuse a later Complete.
+    pub(crate) latched_by_abort: bool,
 }
 
 impl WriteHandler {
@@ -101,6 +105,7 @@ impl WriteHandler {
             metrics,
             client_addr,
             pending_abort: None,
+            latched_by_abort: false,
         })
     }
 
@@ -413,6 +418,7 @@ impl WriteHandler {
         let error = pending.to_error();
         if self.block_is_terminal(pending.block.id) {
             self.is_commit = true;
+            self.latched_by_abort = true;
             self.lease.take();
         } else {
             self.pending_abort = Some(pending);
@@ -424,6 +430,9 @@ impl WriteHandler {
         if self.is_commit {
             return if !msg.data.is_empty() {
                 err_box!("The block has been committed and data cannot be written anymore.")
+            } else if self.latched_by_abort && commit {
+                // Closed by an abort: never let a Complete read as "committed".
+                err_box!("The block has been aborted and cannot be committed.")
             } else {
                 Ok(msg.success())
             };
@@ -432,7 +441,14 @@ impl WriteHandler {
         // A prior abort failed non-terminally: self.file is already gone, so
         // retry only that abort. Never fall through to commit_block().
         if let Some(pending) = self.pending_abort.take() {
-            return Err(self.abort_or_defer(pending));
+            let error = self.abort_or_defer(pending);
+            // Terminal replay answers by intent: a Cancel got what it asked
+            // for; a Complete did not.
+            return if self.is_commit && !commit {
+                Ok(msg.success())
+            } else {
+                Err(error)
+            };
         }
 
         let write_dir_id = self.context.as_ref().map(|c| c.dir_id);
@@ -949,6 +965,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
         Ok((store, handler))
     }
@@ -1012,6 +1029,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
 
         let header = DataHeaderProto {
@@ -1073,6 +1091,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
 
         let header = DataHeaderProto {
@@ -1194,6 +1213,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
 
         let msg = Builder::new()
@@ -1274,6 +1294,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
 
         let msg = Builder::new()
@@ -1510,6 +1531,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
 
         let msg = Builder::new()
@@ -1642,6 +1664,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
 
         let msg = Builder::new()
@@ -1735,6 +1758,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
 
         let msg = Builder::new()
@@ -1846,6 +1870,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
         let first_msg = Builder::new()
             .code(curvine_fs_api::RpcCode::WriteBlock)
@@ -1914,6 +1939,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
         let msg = Builder::new()
             .code(curvine_fs_api::RpcCode::WriteBlock)
@@ -2030,6 +2056,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
 
         let msg = Builder::new()
@@ -2093,14 +2120,11 @@ mod tests {
             })
             .data(DataSlice::Empty)
             .build();
-        let second = handler.complete(&cancel_msg, false);
-        // The abort is retried and now succeeds, but the call must still
-        // report the original flush failure, not success.
-        let err = second.expect_err("retry after a failed flush must not report success");
-        assert!(
-            err.to_string().contains("flush failed"),
-            "retry must re-report the original flush error: {err}"
-        );
+        // The abort is retried and now succeeds: a Cancel got what it asked
+        // for, so the terminal replay answers Ok.
+        handler
+            .complete(&cancel_msg, false)
+            .expect("terminal Cancel replay must report success");
         assert!(
             handler.is_commit,
             "is_commit must be set once the retry actually aborts the block"
@@ -2166,6 +2190,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
 
         let msg = Builder::new()
@@ -2303,6 +2328,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
 
         // RPC 1: uncertain flush, and the quarantine-abort itself fails.
@@ -2325,14 +2351,11 @@ mod tests {
         );
 
         // RPC 2: client Cancel. Must retry the uncertain abort, NOT fall
-        // through to commit_block(_, false) -> plain abort_block.
-        let err = handler
+        // through to commit_block(_, false) -> plain abort_block. The
+        // quarantine lands, so the Cancel is answered Ok.
+        handler
             .complete(&complete_msg(&block, block_size, 2), false)
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("flush timed out"),
-            "retry must re-report the original flush error: {err}"
-        );
+            .expect("terminal Cancel replay must report success");
         assert!(handler.is_commit, "quarantine is terminal: must latch");
         assert!(
             handler.pending_abort.is_none(),
@@ -2394,6 +2417,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
 
         // RPC 1: flush fails, abort fails too.
@@ -2479,6 +2503,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
 
         store.set_force_transient_abort_failure_for_test(true);
@@ -2493,13 +2518,113 @@ mod tests {
             !handler.is_commit,
             "second abort also failed: stay retryable"
         );
-        let third = handler
+        // Third abort succeeds: the Cancel is answered Ok and the handler latches.
+        handler
             .complete(&complete_msg(&block, block_size, 3), false)
-            .unwrap_err();
+            .expect("terminal Cancel replay must report success");
         assert!(handler.is_commit, "third abort succeeded: latch");
 
         assert_eq!(second.to_string(), first.to_string());
-        assert_eq!(third.to_string(), first.to_string());
+        Ok(())
+    }
+
+    /// Disk block whose flush fails.
+    fn failing_flush_handler(
+        tag: &str,
+        id: i64,
+    ) -> FsResult<(BlockStore, ExtendedBlock, WriteHandler)> {
+        let block_size = 0_i64;
+        let block = ExtendedBlock::new(id, block_size, StorageType::Disk, FileType::File);
+        let store = create_test_store(tag)?;
+        store.open_block(&block).map_err(FsError::from)?;
+        let handler = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                FailingFlushBlockIO,
+                0,
+                block_size,
+                0,
+            )?),
+            lease: store
+                .ordinary_write_lease(block.id)
+                .map_err(FsError::from)?,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+            pending_abort: None,
+            latched_by_abort: false,
+        };
+        Ok((store, block, handler))
+    }
+
+    /// Terminal Cancel replay answers Ok.
+    #[test]
+    fn cancel_replay_that_reaches_terminal_returns_ok() -> FsResult<()> {
+        let (store, block, mut handler) = failing_flush_handler("cancel-replay-terminal", 54)?;
+
+        store.set_force_transient_abort_failure_for_test(true);
+        handler
+            .complete(&complete_msg(&block, 0, 1), false)
+            .unwrap_err();
+        assert!(handler.pending_abort.is_some());
+
+        handler
+            .complete(&complete_msg(&block, 0, 2), false)
+            .expect("terminal Cancel replay must report success");
+
+        assert!(handler.is_commit && handler.latched_by_abort);
+        assert!(handler.lease.is_none());
+        assert!(store
+            .get_raw_block_opt(block.id)
+            .map_err(FsError::from)?
+            .is_none());
+        Ok(())
+    }
+
+    /// Terminal Complete replay keeps its error; a later Complete is refused,
+    /// a later Cancel is Ok.
+    #[test]
+    fn complete_after_abort_latch_is_rejected() -> FsResult<()> {
+        let (store, block, mut handler) = failing_flush_handler("complete-after-abort-latch", 55)?;
+
+        store.set_force_transient_abort_failure_for_test(true);
+        let first = handler
+            .complete(&complete_msg(&block, 0, 1), true)
+            .unwrap_err();
+
+        // Replay lands: block removed, but the caller asked to commit.
+        let second = handler
+            .complete(&complete_msg(&block, 0, 2), true)
+            .unwrap_err();
+        assert_eq!(second.to_string(), first.to_string());
+        assert!(handler.is_commit && handler.latched_by_abort);
+
+        // Third Complete must not take the is_commit Ok path.
+        let third = handler
+            .complete(&complete_msg(&block, 0, 3), true)
+            .unwrap_err();
+        assert!(
+            third
+                .to_string()
+                .contains("aborted and cannot be committed"),
+            "{third}"
+        );
+
+        // A Cancel on the same closed handler is idempotent Ok.
+        handler
+            .complete(&complete_msg(&block, 0, 4), false)
+            .expect("Cancel after abort latch is Ok");
         Ok(())
     }
 
@@ -2542,6 +2667,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "writer-a".to_string(),
             pending_abort: None,
+            latched_by_abort: false,
         };
         store.set_force_transient_abort_failure_for_test(true);
         handler_a
@@ -2628,14 +2754,11 @@ mod tests {
         store.finalize_block(&block).map_err(FsError::from)?;
         let available = store.read().map_err(FsError::from)?.available();
 
-        // Writer A retries. The replayed quarantine must not touch B's replica.
-        let err = handler_a
+        // Writer A retries. The replayed quarantine must not touch B's
+        // replica; the block is terminal, so A's Cancel is answered Ok.
+        handler_a
             .complete(&spdk_complete_msg(&block), false)
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("flush timed out"),
-            "A must still get its original error: {err}"
-        );
+            .expect("terminal Cancel replay must report success");
         assert_eq!(
             store
                 .get_raw_block_opt(block.id)
