@@ -997,7 +997,18 @@ impl InodeStore {
         // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
         let mut ttl_removals = Vec::new();
         let del_res = if let InodeView::File(_) = child {
-            self.decrement_inode_nlink(child.id(), 1, ctime, &mut batch, &mut ttl_removals)?
+            // The caller holds the namespace write path, so the in-memory
+            // child already matches the store row; skip the point lookup.
+            let mut staged: HashMap<i64, Option<InodeView>> = HashMap::new();
+            staged.insert(child.id(), Some(child.clone()));
+            self.stage_decrement_nlink(
+                child.id(),
+                1,
+                ctime,
+                &mut batch,
+                Some(&mut staged),
+                &mut ttl_removals,
+            )?
         } else {
             DeleteResult::new()
         };
