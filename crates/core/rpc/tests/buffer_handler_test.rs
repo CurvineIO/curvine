@@ -24,8 +24,8 @@ use curvine_core_error::{CommonErrorExt, CommonResultExt};
 use curvine_io::DataSlice;
 use curvine_net::net::{ConnState, InetAddr, NetUtils};
 use curvine_rpc::client::{ClientConf, RpcClient};
-use curvine_rpc::handler::{HandlerService, LimitConf, MessageHandler};
-use curvine_rpc::message::{Builder, Message};
+use curvine_rpc::handler::{Frame, HandlerService, LimitConf, MessageHandler, RpcFrame};
+use curvine_rpc::message::{Builder, Message, ResponseStatus};
 use curvine_rpc::server::{RpcServer, ServerConf};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -337,5 +337,64 @@ fn buffer_handler_admits_a_waiting_request_once_the_permit_is_released() {
         slow.await
             .unwrap()
             .expect("slow request must still complete");
+    });
+}
+
+#[test]
+fn buffer_handler_answers_a_parked_request_when_the_permit_wait_times_out() {
+    // One connection slot and one global permit: c2's only in-flight slot is
+    // parked on the global permit, so the reactor cannot read c2's socket. The
+    // wait must end with an error response instead of pinning the connection
+    // until an unrelated request finishes.
+    let server = start_server_with(false, 1, 1, |conf| {
+        conf.timeout_ms = 200;
+        conf.close_idle = false;
+    });
+    server.rt.block_on(async {
+        let c1 = connect(&server).await;
+        let slow = tokio::spawn(async move { c1.rpc(sleep_request(700)).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let c2 = connect(&server).await;
+        let response = tokio::time::timeout(Duration::from_secs(2), c2.rpc(sleep_request(0)))
+            .await
+            .expect("a parked request must not hang")
+            .expect("the server must answer instead of dropping the request");
+        assert_eq!(response.response_status(), ResponseStatus::Error);
+
+        slow.await
+            .unwrap()
+            .expect("slow request must still complete");
+
+        // The timed-out request released its slot, so the connection is usable.
+        c2.rpc(sleep_request(0))
+            .await
+            .expect("connection must stay usable after the permit-wait timeout");
+    });
+}
+
+#[test]
+fn buffer_handler_drains_replies_after_the_client_half_closes() {
+    // A client that pipelines requests and then shuts down its sending half is
+    // still waiting for the replies. EOF must stop admission, not discard them.
+    let server = start_server(false, 8, 4096);
+    server.rt.block_on(async {
+        let stream = std::net::TcpStream::connect(server.addr.as_pair()).unwrap();
+        let shutdown = stream.try_clone().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let stream = tokio::net::TcpStream::from_std(stream).unwrap();
+        let mut frame = RpcFrame::with_client(stream, 128 * 1024);
+
+        frame.send(sleep_request(100)).await.unwrap();
+        frame.send(sleep_request(0)).await.unwrap();
+        shutdown.shutdown(std::net::Shutdown::Write).unwrap();
+
+        for _ in 0..2 {
+            let reply = tokio::time::timeout(Duration::from_secs(2), frame.receive())
+                .await
+                .expect("half-closed client must still receive its replies")
+                .expect("drained reply must be readable");
+            assert!(reply.not_empty(), "drained reply must carry a response");
+        }
     });
 }
