@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod rpc_frame;
-pub use self::rpc_frame::RpcFrame;
+pub use self::rpc_frame::*;
 
 mod message_handler;
 pub use self::message_handler::*;

@@ -34,6 +34,7 @@ pub struct WorkerMetrics {
     pub(crate) read_blocks: CounterVec,
     pub(crate) read_error_count: CounterVec,
     pub(crate) checksum_invalidated_count: Counter,
+    pub(crate) truncated_invalidated_count: Counter,
 
     pub(crate) block_store_stripe_lock_wait_us: HistogramVec,
     pub(crate) block_dataset_write_lock_wait_us: HistogramVec,
@@ -98,6 +99,10 @@ impl WorkerMetrics {
             checksum_invalidated_count: m::new_counter(
                 "checksum_invalidated_count",
                 "Blocks removed after failing checksum verification",
+            )?,
+            truncated_invalidated_count: m::new_counter(
+                "truncated_invalidated_count",
+                "Blocks removed because their file is shorter than the committed length",
             )?,
 
             block_store_stripe_lock_wait_us: m::new_histogram_vec(

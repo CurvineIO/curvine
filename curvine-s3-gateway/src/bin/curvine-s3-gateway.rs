@@ -17,6 +17,7 @@
 #![recursion_limit = "256"]
 
 use clap::{Parser, Subcommand};
+use curvine_alloc as _;
 use curvine_config::ClusterConf;
 use curvine_core_error::CommonResult;
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
@@ -131,6 +132,7 @@ fn serve_gateway(args: ObjectArgs, conf: ClusterConf) -> CommonResult<()> {
         listen,
         region
     );
+    tracing::info!("allocator: {}", curvine_alloc::allocator_type_name());
 
     let rt = Arc::new(AsyncRuntime::new(
         "curvine-s3-gateway",

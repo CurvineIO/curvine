@@ -269,6 +269,44 @@ fn trash_purge_variant_is_appended_after_existing_discriminants() {
         18u32.to_le_bytes(),
         "TrashPurge must be appended as variant 18"
     );
+
+    let release = SerdeUtils::serialize(&JournalEntry::ReleaseWriter(ReleaseWriterEntry {
+        op_id: 8,
+        rpc_id: 0,
+        ino: 9,
+        client: "client-a".to_string(),
+    }))
+    .unwrap();
+    assert_eq!(
+        release[..4],
+        19u32.to_le_bytes(),
+        "ReleaseWriter must be appended as variant 19"
+    );
+}
+
+/// A replayed `ReleaseWriter` drops exactly one client's marker and is idempotent,
+/// so a duplicated entry cannot clear a healthy writer's ownership (#1880).
+#[test]
+fn release_writer_batch_round_trips_and_keeps_other_clients() {
+    let current = JournalBatch {
+        seq_id: 46,
+        batch: vec![JournalEntry::ReleaseWriter(ReleaseWriterEntry {
+            op_id: 21,
+            rpc_id: 0,
+            ino: 33,
+            client: "crashed-client".to_string(),
+        })],
+    };
+    let bytes = SerdeUtils::serialize(&current).unwrap();
+
+    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let JournalEntry::ReleaseWriter(entry) = &batch.batch[0] else {
+        panic!("expected release-writer journal entry");
+    };
+    assert_eq!(entry.ino, 33);
+    assert_eq!(entry.client, "crashed-client");
+    assert_eq!(entry.op_id, 21);
+    assert_eq!(batch.batch[0].inode_id(), Some(33));
 }
 
 #[test]

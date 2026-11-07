@@ -295,6 +295,24 @@ impl WriteHandler {
         Ok(false)
     }
 
+    /// Quarantine as soon as a write is known uncertain, so the state lives in
+    /// the dataset even if the client never sends Complete/Cancel.
+    fn quarantine_if_uncertain(
+        store: &BlockStore,
+        block: &ExtendedBlock,
+        file: &BlockWriteContext,
+    ) {
+        if !file.has_uncertain_writes() {
+            return;
+        }
+        if let Err(e) = store.abort_block_uncertain(block) {
+            warn!(
+                "failed to quarantine block {} after uncertain write: {}",
+                block.id, e
+            );
+        }
+    }
+
     pub fn write(&mut self, msg: &Message) -> FsResult<Message> {
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
@@ -311,6 +329,7 @@ impl WriteHandler {
             let spend = TimeSpent::new();
             if let Err(e) = file.write_region(&msg.data) {
                 Self::record_write_error(self.metrics, context.dir_id, &e);
+                Self::quarantine_if_uncertain(&self.store, &context.block, file);
                 return Err(e.into());
             }
 
@@ -338,6 +357,7 @@ impl WriteHandler {
         if need_flush {
             if let Err(e) = file.flush() {
                 Self::record_write_error(self.metrics, context.dir_id, &e);
+                Self::quarantine_if_uncertain(&self.store, &context.block, file);
                 return Err(e.into());
             }
         }
@@ -364,9 +384,10 @@ impl WriteHandler {
         }
     }
 
-    /// Abort the block, then either latch is_commit (terminal) or record a
-    /// PendingAbort so the next Complete/Cancel retries this exact abort
-    /// instead of reaching commit_block() with the flush context lost.
+    /// Abort the block (quarantine if `uncertain`), then either latch
+    /// is_commit (terminal) or record a PendingAbort so the next
+    /// Complete/Cancel retries this exact abort instead of reaching
+    /// commit_block() with the flush context lost.
     fn abort_or_defer(&mut self, block: &ExtendedBlock, uncertain: bool, error: &FsError) {
         let abort_result = if uncertain {
             self.store.abort_block_uncertain(block)
@@ -420,10 +441,11 @@ impl WriteHandler {
 
         let file = self.file.take();
         if let Some(mut file) = file {
-            if let Err(flush_err) = file.flush() {
-                // Uncertain (timed-out) flush: quarantine, don't release.
-                let uncertain = file.has_uncertain_writes();
-                drop(file);
+            let flush_result = file.flush();
+            // Sticky flag from a mid-stream timeout; read it even if flush is Ok.
+            let uncertain = file.has_uncertain_writes();
+            drop(file);
+            if let Err(flush_err) = flush_result {
                 if let Some(dir_id) = write_dir_id {
                     Self::record_write_error(self.metrics, dir_id, &flush_err);
                 }
@@ -431,7 +453,15 @@ impl WriteHandler {
                 self.abort_or_defer(&context.block, uncertain, &error);
                 return Err(error);
             }
-            drop(file);
+            if uncertain {
+                // Data may still be in flight: never free or publish this extent.
+                let error = FsError::io(std::io::Error::other(format!(
+                    "block {} write outcome uncertain, extent quarantined",
+                    context.block.id
+                )));
+                self.abort_or_defer(&context.block, true, &error);
+                return Err(error);
+            }
         }
 
         if context.block.len > context.block_size {
@@ -451,7 +481,7 @@ impl WriteHandler {
                 commit_err
             );
             // Only latch is_commit if truly terminal; stay retryable
-            // otherwise. Use the raw pending meta, not get_block_opt():
+            // otherwise. Use the raw pending meta, not the readable view:
             // during a rewrite it can mask a transient rollback.
             if self.block_is_terminal(context.block.id) {
                 self.is_commit = true;
@@ -744,6 +774,201 @@ mod tests {
         fn has_uncertain_writes(&self) -> bool {
             true
         }
+    }
+
+    /// A mid-stream write timed out (sticky flag) but the later flush is Ok.
+    struct UncertainFlushOkBlockIO;
+
+    impl BlockIO for UncertainFlushOkBlockIO {
+        fn read_region(
+            &mut self,
+            _enable_send_file: bool,
+            _len: i32,
+        ) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read not supported",
+            )))
+        }
+
+        fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read_all not supported",
+            )))
+        }
+
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            0
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn path(&self) -> &str {
+            "uncertain-flush-ok"
+        }
+
+        fn resize(
+            &mut self,
+            _truncate: bool,
+            _off: i64,
+            _len: i64,
+            _mode: i32,
+        ) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "resize not supported",
+            )))
+        }
+
+        fn has_uncertain_writes(&self) -> bool {
+            true
+        }
+    }
+
+    /// A mid-stream write times out: write_region fails and the flag is set.
+    struct UncertainWriteBlockIO;
+
+    impl BlockIO for UncertainWriteBlockIO {
+        fn read_region(
+            &mut self,
+            _enable_send_file: bool,
+            _len: i32,
+        ) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read not supported",
+            )))
+        }
+
+        fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write timed out",
+            )))
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write timed out",
+            )))
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read_all not supported",
+            )))
+        }
+
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            0
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn path(&self) -> &str {
+            "uncertain-write"
+        }
+
+        fn resize(
+            &mut self,
+            _truncate: bool,
+            _off: i64,
+            _len: i64,
+            _mode: i32,
+        ) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "resize not supported",
+            )))
+        }
+
+        fn has_uncertain_writes(&self) -> bool {
+            true
+        }
+    }
+
+    /// SPDK store + handler over the given writer fake.
+    fn spdk_handler<IO: BlockIO + 'static>(
+        dir_tag: &str,
+        block: &ExtendedBlock,
+        io: IO,
+    ) -> FsResult<(BlockStore, WriteHandler)> {
+        let _worker = Worker::with_conf(ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                data_dir: vec![format!("[MEM:1KB]../testing/{dir_tag}")],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        })?;
+        let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)
+            .map_err(FsError::from)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        store.open_block(block).map_err(FsError::from)?;
+        let handler = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size: block.len,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(io, 0, block.len, 0)?),
+            lease: None,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+            pending_abort: None,
+        };
+        Ok((store, handler))
+    }
+
+    fn spdk_complete_msg(block: &ExtendedBlock) -> Message {
+        Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size: block.len,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build()
     }
 
     // Regression test for GH#1673: a data-bearing Running frame with flush=true
@@ -1074,13 +1299,170 @@ mod tests {
         );
 
         // Block must be quarantined, not removed: extent stays reserved.
-        let meta_after = store.get_block(meta.id).map_err(FsError::from)?;
+        // Raw view: a quarantined block is deliberately not readable.
+        let meta_after = store
+            .get_raw_block_opt(meta.id)
+            .map_err(FsError::from)?
+            .expect("quarantined block must still exist");
         assert_eq!(
             meta_after.state(),
             &curvine_storage_local::BlockState::Quarantined,
             "uncertain flush failure on SPDK must quarantine the block, not remove it"
         );
+        assert!(
+            store.get_block(meta.id).is_err(),
+            "quarantined block must not be readable"
+        );
 
+        Ok(())
+    }
+
+    /// Mid-stream write timed out, then Cancel with a successful flush: the
+    /// sticky uncertain flag must still quarantine, not free the extent.
+    #[test]
+    fn cancel_after_uncertain_write_with_ok_flush_quarantines() -> FsResult<()> {
+        let block = ExtendedBlock::new(50, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) = spdk_handler(
+            "write-handler-cancel-uncertain-ok-flush",
+            &block,
+            UncertainFlushOkBlockIO,
+        )?;
+        let available_before = store.read().map_err(FsError::from)?.available();
+
+        let err = handler
+            .complete(&spdk_complete_msg(&block), false)
+            .unwrap_err();
+        assert!(err.to_string().contains("uncertain"), "{err}");
+
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+            "Cancel after an uncertain write must quarantine, not free"
+        );
+        assert_eq!(
+            store.read().map_err(FsError::from)?.available(),
+            available_before,
+            "quarantine must keep the extent reserved"
+        );
+        assert!(handler.is_commit, "quarantine is terminal: must latch");
+        Ok(())
+    }
+
+    /// Same with Complete(commit=true): quarantine, never finalize.
+    #[test]
+    fn complete_after_uncertain_write_with_ok_flush_never_finalizes() -> FsResult<()> {
+        let block = ExtendedBlock::new(51, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) = spdk_handler(
+            "write-handler-commit-uncertain-ok-flush",
+            &block,
+            UncertainFlushOkBlockIO,
+        )?;
+
+        let err = handler
+            .complete(&spdk_complete_msg(&block), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("uncertain"), "{err}");
+
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+            "Complete after an uncertain write must quarantine, not finalize"
+        );
+        assert!(handler.is_commit, "quarantine is terminal: must latch");
+        Ok(())
+    }
+
+    fn spdk_data_frame() -> Message {
+        Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(DataHeaderProto {
+                offset: 0,
+                flush: false,
+                is_last: false,
+            })
+            .data(DataSlice::Buffer(prost::bytes::BytesMut::from(&b"x"[..])))
+            .build()
+    }
+
+    /// A timed-out write must quarantine immediately, before any
+    /// Complete/Cancel: the state must not depend on the client coming back.
+    #[test]
+    fn uncertain_write_quarantines_eagerly_before_complete() -> FsResult<()> {
+        let block = ExtendedBlock::new(52, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) = spdk_handler(
+            "write-handler-eager-quarantine",
+            &block,
+            UncertainWriteBlockIO,
+        )?;
+        let available_before = store.read().map_err(FsError::from)?.available();
+
+        let err = handler.write(&spdk_data_frame()).unwrap_err();
+        assert!(err.to_string().contains("write timed out"), "{err}");
+
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+            "block must be quarantined as soon as the write is uncertain"
+        );
+        assert_eq!(
+            store.read().map_err(FsError::from)?.available(),
+            available_before,
+            "extent must stay reserved"
+        );
+
+        // Client disconnects: handler is dropped. A later master delete must
+        // still be refused, not free the extent.
+        drop(handler);
+        let remove_err = store.async_remove_block(block.id).unwrap_err();
+        assert!(
+            curvine_storage_local::is_quarantined_error(&remove_err),
+            "{remove_err}"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+        );
+        Ok(())
+    }
+
+    /// Eager quarantine, then the client does send Cancel: idempotent, latches.
+    #[test]
+    fn cancel_after_eager_quarantine_is_idempotent() -> FsResult<()> {
+        let block = ExtendedBlock::new(53, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) = spdk_handler(
+            "write-handler-eager-then-cancel",
+            &block,
+            UncertainWriteBlockIO,
+        )?;
+        handler.write(&spdk_data_frame()).unwrap_err();
+
+        let err = handler
+            .complete(&spdk_complete_msg(&block), false)
+            .unwrap_err();
+        assert!(err.to_string().contains("uncertain"), "{err}");
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+        );
+        assert!(handler.is_commit, "must latch");
         Ok(())
     }
 
@@ -1154,8 +1536,11 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(
-            store.get_block(meta.id).map_err(FsError::from)?.state(),
-            &curvine_storage_local::BlockState::Quarantined,
+            store
+                .get_raw_block_opt(meta.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
         );
 
         // RPC 2: simulates the client's cancel()-on-failure cleanup, reusing
@@ -1187,8 +1572,11 @@ mod tests {
 
         // Must still be quarantined: the re-entrant call must not have reached commit_block() again.
         assert_eq!(
-            store.get_block(meta.id).map_err(FsError::from)?.state(),
-            &curvine_storage_local::BlockState::Quarantined,
+            store
+                .get_raw_block_opt(meta.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
             "re-entrant completion call must not force-release the quarantined extent"
         );
 
@@ -1553,7 +1941,7 @@ mod tests {
         );
 
         // The fix: get_raw_block_opt() sees Writing, not the stale
-        // Finalized entry get_block_opt() would resolve via committed_rewrites.
+        // Finalized entry the readable view resolves via committed_rewrites.
         assert!(
             !handler.is_commit,
             "is_commit must stay false after a transient finalize failure on a rewrite"

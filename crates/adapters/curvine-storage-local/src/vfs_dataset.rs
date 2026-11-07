@@ -330,7 +330,13 @@ impl VfsDataset {
             return Some(committed);
         }
         let meta = self.meta.get(id)?;
-        (meta.state() != &BlockState::Allocating).then_some(meta)
+        // Quarantined content is unknown (a timed-out write may still land):
+        // never serve it; readers fall back to another replica.
+        (!matches!(
+            meta.state(),
+            BlockState::Allocating | BlockState::Quarantined
+        ))
+        .then_some(meta)
     }
 
     pub fn reserve_file_open(
@@ -570,7 +576,7 @@ impl VfsDataset {
         };
         if meta.is_quarantined() {
             // Write may still be in flight; keep the extent reserved.
-            return err_box!("block {} is quarantined; refusing to remove", id);
+            return Err(Box::new(crate::QuarantinedBlockError(id)));
         }
         let layout = self.layouts.get(meta.storage_type()).clone();
         let dir = match self.dir_list.get_dir(meta.dir_id()) {
@@ -852,8 +858,8 @@ impl Dataset for VfsDataset {
 mod test {
     use super::{normalize_free_ratio, MAX_FREE_RATIO};
     use crate::{
-        BlockChecksum, BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore,
-        StorageVersion, VfsDataset, VfsDir, DEFAULT_CHECKSUM_CHUNK_SIZE,
+        BlockChecksum, BlockLayout, BlockTruncated, Dataset, DirList, DirState, FileLayout,
+        SpdkMetaStore, StorageVersion, VfsDataset, VfsDir, DEFAULT_CHECKSUM_CHUNK_SIZE,
     };
     use crate::{BlockMeta, BlockState, ChecksumHeader, ChecksumVerify};
     use curvine_config::{ClusterConf, WorkerConf};
@@ -1467,8 +1473,14 @@ mod test {
         let dir = ds.find_dir(finalized.dir_id())?;
         let err = match FileLayout.open_reader(dir, &finalized, 0, 50, ChecksumVerify::Off) {
             Ok(_) => panic!("truncated block must not be served as a sparse tail"),
-            Err(e) => e.to_string(),
+            Err(e) => e,
         };
+        // Callers tell a truncated block from other open failures by type.
+        assert!(
+            BlockTruncated::from_error(&err).is_some(),
+            "unexpected error: {err}"
+        );
+        let err = err.to_string();
         assert!(err.contains("is truncated"), "unexpected error: {err}");
         // The message reaches the client; it must not expose worker paths.
         let path_str = path.to_string_lossy();
@@ -1477,9 +1489,25 @@ mod test {
         // A read bounded below the committed length but beyond the surviving
         // bytes is also rejected.
         let dir = ds.find_dir(finalized.dir_id())?;
-        assert!(FileLayout
+        let err = FileLayout
             .open_reader(dir, &finalized, 0, 30, ChecksumVerify::Off)
-            .is_err());
+            .err()
+            .expect("read beyond the surviving bytes must fail");
+        assert!(
+            BlockTruncated::from_error(&err).is_some(),
+            "unexpected error: {err}"
+        );
+
+        // Other open failures are not reported as truncation.
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let err = FileLayout
+            .open_reader(dir, &finalized, 21, 20, ChecksumVerify::Off)
+            .err()
+            .expect("an offset past the logical length must fail");
+        assert!(
+            BlockTruncated::from_error(&err).is_none(),
+            "unexpected error: {err}"
+        );
 
         // Master-side truncate down to the surviving bytes stays readable:
         // only min(meta.len, logical_len) bytes must be present.
@@ -2162,6 +2190,32 @@ mod test {
         Ok(())
     }
 
+    /// A quarantined block's content is unknown; it must not be readable.
+    /// The raw view still sees it, so it is not mistaken for a missing block.
+    #[test]
+    fn quarantined_block_is_not_readable() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        assert!(
+            ds.get_readable_block(1).is_some(),
+            "setup: Writing is readable"
+        );
+
+        ds.abort_block_uncertain(&b1)?;
+
+        assert!(
+            ds.get_readable_block(1).is_none(),
+            "quarantined block must not be served to readers"
+        );
+        assert_eq!(
+            ds.get_block(1).map(|m| *m.state()),
+            Some(BlockState::Quarantined),
+            "raw view must still see the quarantined block"
+        );
+        Ok(())
+    }
+
     /// Async deletion (async_remove_block's route) on a quarantined block
     /// must be rejected, not release the extent.
     #[test]
@@ -2171,11 +2225,17 @@ mod test {
         ds.open_block(&b1)?;
         ds.abort_block_uncertain(&b1)?;
 
-        // Simulates async_remove_block's route.
+        // Simulates async_remove_block's route. The error must be the typed
+        // variant so the worker can park the block instead of retrying.
+        let err = match ds.remove_block_state_by_id(1) {
+            Err(e) => e,
+            Ok(_) => panic!("removal of a quarantined block must be rejected"),
+        };
         assert!(
-            ds.remove_block_state_by_id(1).is_err(),
-            "removal of a quarantined block must be rejected"
+            crate::is_quarantined_error(&err),
+            "must be QuarantinedBlockError, got: {err}"
         );
+        assert!(err.to_string().contains("quarantined"), "{err}");
 
         let meta = ds
             .get_block(1)

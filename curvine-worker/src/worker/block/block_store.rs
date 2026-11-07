@@ -14,11 +14,13 @@
 
 use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{
-    BlockDataset, BlockLayout, BlockReadContext, BlockWriteContext, ChecksumVerify, Dataset,
+    BlockDataset, BlockLayout, BlockReadContext, BlockTruncated, BlockWriteContext, ChecksumVerify,
+    Dataset,
 };
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
+use curvine_io::IOError;
 use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
 use dashmap::{DashMap, DashSet};
 use parking_lot::{Mutex, MutexGuard};
@@ -63,13 +65,14 @@ impl Drop for BlockWriteLease {
     }
 }
 
-/// Outcome of re-checking a block whose read failed checksum verification.
+/// Outcome of re-checking a block whose read failed checksum verification
+/// or found the block file truncated.
 #[derive(Debug)]
 pub enum CorruptCheck {
-    /// The second full verification failed too; block and sidecar are gone.
+    /// The re-check confirmed the damage; block and sidecar are gone.
     Removed(BlockMeta),
-    /// The block was kept for good: it is already gone, has no sidecar, or
-    /// the second verification did not confirm the corruption.
+    /// The block was kept for good: it is already gone, or it is not
+    /// truncated and has no sidecar or passed the second verification.
     Kept(String),
     /// The block cannot be checked yet because a writer holds it or it is
     /// not finalized. The caller requeues it for a later heartbeat.
@@ -103,8 +106,9 @@ pub struct BlockStore {
     block_locks: Arc<Vec<Mutex<()>>>,
     uses: Arc<Vec<Mutex<HashMap<i64, BlockUse>>>>,
     replication_owner: Option<String>,
-    /// Blocks whose read failed a chunk CRC, waiting to be re-checked, with
-    /// the number of re-checks that already failed with an error.
+    /// Blocks whose read failed a chunk CRC or found the file truncated,
+    /// waiting to be re-checked, with the number of re-checks that already
+    /// failed with an error.
     corrupt_blocks: Arc<DashMap<i64, u32>>,
     /// Blocks removed as corrupt whose deletion master has not acknowledged.
     /// `open_block` refuses them: a replacement finalized before the report
@@ -545,15 +549,9 @@ impl BlockStore {
         Ok(b.clone())
     }
 
-    /// Like get_block(), but "not found" is Ok(None), not an Err.
-    pub fn get_block_opt(&self, id: i64) -> CommonResult<Option<BlockMeta>> {
-        let state = self.read()?;
-        Ok(state.get_readable_block(id).cloned())
-    }
-
-    /// The raw pending meta, unlike get_block_opt() which can return a
-    /// stale committed_rewrites entry during a rewrite. Use this to check
-    /// if a pending write/finalize is terminal.
+    /// The raw pending meta, unlike the readable view (get_block()) which can
+    /// return a stale committed_rewrites entry during a rewrite. Use this to
+    /// check if a pending write/finalize is terminal.
     pub fn get_raw_block_opt(&self, id: i64) -> CommonResult<Option<BlockMeta>> {
         let state = self.read()?;
         Ok(state.get_block(id).cloned())
@@ -579,6 +577,7 @@ impl BlockStore {
         let (layout, dir) = state.layout_for(meta)?;
         layout
             .open_reader(&dir, meta, off, logical_len, state.checksum_verify())
+            .inspect_err(|e| self.report_if_truncated(meta, e))
             .map_err(Into::into)
     }
 
@@ -618,7 +617,9 @@ impl BlockStore {
             .clone();
         let logical_len = logical_len.unwrap_or_else(|| meta.len());
         let (layout, dir) = state.layout_for(&meta)?;
-        let reader = layout.open_reader(&dir, &meta, off, logical_len, state.checksum_verify())?;
+        let reader = layout
+            .open_reader(&dir, &meta, off, logical_len, state.checksum_verify())
+            .inspect_err(|e| self.report_if_truncated(&meta, e))?;
         Ok((meta, reader))
     }
 
@@ -726,6 +727,21 @@ impl BlockStore {
         }
     }
 
+    /// Queue a finalized block whose open failed because its file is shorter
+    /// than the committed length. Like a CRC failure, the heartbeat re-checks
+    /// it under the stripe lock before removing anything.
+    fn report_if_truncated(&self, meta: &BlockMeta, error: &IOError) {
+        if !meta.is_final() {
+            return;
+        }
+        let Some(truncated) = BlockTruncated::from_error(error) else {
+            return;
+        };
+        if self.corrupt_blocks.insert(meta.id, 0).is_none() {
+            log::error!("{}; queued for invalidation", truncated);
+        }
+    }
+
     /// Drain the queued blocks with their count of failed re-checks.
     pub fn take_corrupt_blocks(&self) -> Vec<(i64, u32)> {
         let ids: Vec<i64> = self.corrupt_blocks.iter().map(|e| *e.key()).collect();
@@ -804,15 +820,17 @@ impl BlockStore {
         self.fenced_blocks.remove(&id);
     }
 
-    /// Re-verify a block reported corrupt and remove it with its sidecar only
-    /// when the whole block fails again. Holding the stripe lock keeps
-    /// finalize, abort and delete out while the block is read.
+    /// Re-check a block reported corrupt and remove it with its sidecar only
+    /// when the damage is confirmed: its file is still shorter than the
+    /// committed length, or the whole block fails checksum verification again.
+    /// Holding the stripe lock keeps finalize, abort and delete out while the
+    /// block is read.
     pub fn invalidate_corrupt_block(&self, id: i64) -> CommonResult<CorruptCheck> {
         let _block_lock = self.block_lock(id, "invalidate");
         if self.block_uses(id).lock().contains_key(&id) {
             return Ok(CorruptCheck::Retry("block has an active writer".into()));
         }
-        let (block_len, mut reader) = {
+        let (block_len, opened) = {
             let state = self.read()?;
             let Some(meta) = state.get_block(id).cloned() else {
                 return Ok(CorruptCheck::Kept("block no longer exists".into()));
@@ -824,29 +842,30 @@ impl BlockStore {
                 )));
             }
             let (layout, dir) = state.layout_for(&meta)?;
-            let reader =
-                layout.open_reader(&dir, &meta, 0, meta.len(), ChecksumVerify::AllowMissing)?;
-            (meta.len(), reader)
+            let opened =
+                layout.open_reader(&dir, &meta, 0, meta.len(), ChecksumVerify::AllowMissing);
+            (meta.len(), opened)
         };
-        if !reader.is_verified() {
-            return Ok(CorruptCheck::Kept("block has no checksum sidecar".into()));
-        }
 
-        let mut confirmed = false;
-        while reader.block_pos() < block_len {
-            if let Err(e) = reader.read_region(false, REVERIFY_READ_LEN) {
-                if !reader.checksum_mismatch() {
-                    return Err(e.into());
+        // A truncated file is damage on its own; any other block must fail
+        // a second full checksum verification.
+        let truncation = match opened {
+            Ok(reader) => {
+                if !reader.is_verified() {
+                    return Ok(CorruptCheck::Kept("block has no checksum sidecar".into()));
                 }
-                confirmed = true;
-                break;
+                if !Self::reverify_finds_mismatch(reader, block_len)? {
+                    return Ok(CorruptCheck::Kept(
+                        "second verification found no mismatch".into(),
+                    ));
+                }
+                None
             }
-        }
-        if !confirmed {
-            return Ok(CorruptCheck::Kept(
-                "second verification found no mismatch".into(),
-            ));
-        }
+            Err(e) => match BlockTruncated::from_error(&e) {
+                Some(truncated) => Some(truncated.to_string()),
+                None => return Err(e.into()),
+            },
+        };
 
         let removed = self.with_dataset_write("invalidate", |state| {
             match state.get_block(id).map(BlockMeta::state) {
@@ -867,14 +886,38 @@ impl BlockStore {
         removed.release();
         // Still under the stripe lock, so no open_block slips in between.
         self.fenced_blocks.insert(id);
-        if let Ok(metrics) = Worker::get_metrics() {
-            metrics.checksum_invalidated_count.inc();
+        match truncation {
+            Some(truncation) => {
+                if let Ok(metrics) = Worker::get_metrics() {
+                    metrics.truncated_invalidated_count.inc();
+                }
+                log::error!("removed block {}: {}", id, truncation);
+            }
+            None => {
+                if let Ok(metrics) = Worker::get_metrics() {
+                    metrics.checksum_invalidated_count.inc();
+                }
+                log::error!(
+                    "removed block {} after it failed checksum verification twice",
+                    id
+                );
+            }
         }
-        log::error!(
-            "removed block {} after it failed checksum verification twice",
-            id
-        );
         Ok(CorruptCheck::Removed(removed.meta))
+    }
+
+    /// Read the whole block through its checksum and report whether a chunk
+    /// fails its CRC. Other read errors are returned.
+    fn reverify_finds_mismatch(mut reader: BlockReadContext, block_len: i64) -> CommonResult<bool> {
+        while reader.block_pos() < block_len {
+            if let Err(e) = reader.read_region(false, REVERIFY_READ_LEN) {
+                if !reader.checksum_mismatch() {
+                    return Err(e.into());
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     // Get all storage information and check whether the storage directory is normal.
@@ -1433,6 +1476,118 @@ mod tests {
         };
         assert!(reason.contains("no checksum sidecar"), "{reason}");
         assert!(plain.get_block(unsummed.id).is_ok());
+        Ok(())
+    }
+
+    /// Cut the file of a finalized block to `len` bytes behind the worker.
+    fn truncate_block_file(store: &BlockStore, meta: &BlockMeta, len: u64) -> CommonResult<()> {
+        let path = store.short_circuit(meta)?.unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_len(len)?;
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_block_is_queued_and_removed() -> CommonResult<()> {
+        // No sidecar: truncation is confirmed by the file length alone.
+        let store = create_checksum_store_with("truncated-invalidate", false, false)?;
+        let data = vec![5u8; 4096];
+        let finalized = finalize_with_data(&store, 1, &data)?;
+        let path = store.short_circuit(&finalized)?.unwrap();
+        truncate_block_file(&store, &finalized, 1000)?;
+
+        // Client reads and replication reads queue the block, once per id.
+        let err = store
+            .open_reader_by_id(finalized.id, 0, 4096)
+            .err()
+            .expect("a truncated block must not open");
+        assert!(err.to_string().contains("is truncated"), "{err}");
+        assert!(store
+            .open_reader_by_id_at_stored_len(finalized.id, 0)
+            .is_err());
+        assert_eq!(store.take_corrupt_blocks(), vec![(finalized.id, 0)]);
+        assert!(store.get_block(finalized.id).is_ok());
+
+        match store.invalidate_corrupt_block(finalized.id)? {
+            CorruptCheck::Removed(meta) => assert_eq!(meta.len, data.len() as i64),
+            other => panic!("expected removal, got {other:?}"),
+        }
+        assert!(store.get_block(finalized.id).is_err());
+        assert!(!std::path::Path::new(&path).exists());
+
+        // Until master acknowledges the deletion, the id cannot be recreated.
+        let block = ExtendedBlock::with_mem(finalized.id, "1MB")?;
+        let err = store.open_block(&block).unwrap_err();
+        assert!(err.to_string().contains("removed as corrupt"), "{err}");
+        store.unfence(finalized.id);
+        store.open_block(&block)?;
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_checksummed_block_is_removed_with_its_sidecar() -> CommonResult<()> {
+        let store = create_checksum_store_with("truncated-invalidate-sidecar", true, true)?;
+        let (finalized, _) = finalize_checksummed(&store, 1)?;
+        let path = store.short_circuit(&finalized)?.unwrap();
+        let sidecar = FileLayout::checksum_path_of(std::path::Path::new(&path));
+        assert!(sidecar.exists());
+        truncate_block_file(&store, &finalized, 1000)?;
+
+        assert!(store
+            .open_reader_by_id(finalized.id, 0, finalized.len)
+            .is_err());
+        assert_eq!(store.take_corrupt_blocks(), vec![(finalized.id, 0)]);
+        assert!(matches!(
+            store.invalidate_corrupt_block(finalized.id)?,
+            CorruptCheck::Removed(_)
+        ));
+        assert!(!std::path::Path::new(&path).exists());
+        assert!(!sidecar.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn only_truncated_finalized_blocks_are_queued() -> CommonResult<()> {
+        let store = create_checksum_store_with("truncated-queue-only", false, false)?;
+        let finalized = finalize_with_data(&store, 1, &[5u8; 4096])?;
+
+        // An open that fails for another reason does not queue the block.
+        assert!(store.open_reader_by_id(finalized.id, 4097, 4096).is_err());
+        assert!(store.take_corrupt_blocks().is_empty());
+
+        // A block being written holds fewer bytes than its reservation.
+        let writing = store.open_block(&ExtendedBlock::with_mem(2, "1MB")?)?;
+        let mut writer = store.open_writer(&writing, 0)?;
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&[6u8; 100][..])))?;
+        writer.flush()?;
+        drop(writer);
+        let (_, mut reader) = store.open_reader_by_id(writing.id, 0, 100)?;
+        assert_eq!(read_bytes(&mut reader, 100)?, vec![6u8; 100]);
+        assert!(store.take_corrupt_blocks().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_block_restored_before_recheck_is_kept() -> CommonResult<()> {
+        let store = create_checksum_store_with("truncated-restored", false, false)?;
+        let data = vec![5u8; 4096];
+        let finalized = finalize_with_data(&store, 1, &data)?;
+        let path = store.short_circuit(&finalized)?.unwrap();
+        truncate_block_file(&store, &finalized, 1000)?;
+        assert!(store.open_reader_by_id(finalized.id, 0, 4096).is_err());
+        assert_eq!(store.take_corrupt_blocks(), vec![(finalized.id, 0)]);
+
+        // The re-check, not the failed read, decides: a file that holds its
+        // committed length again is kept.
+        std::fs::write(&path, &data)?;
+        assert!(matches!(
+            store.invalidate_corrupt_block(finalized.id)?,
+            CorruptCheck::Kept(_)
+        ));
+        let (_, mut reader) = store.open_reader_by_id(finalized.id, 0, 4096)?;
+        assert_eq!(read_bytes(&mut reader, 4096)?, data);
         Ok(())
     }
 

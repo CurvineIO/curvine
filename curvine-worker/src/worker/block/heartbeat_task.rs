@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockStore, CorruptCheck, MasterClient};
-use crate::worker::storage::Dataset;
+use crate::worker::storage::{is_quarantined_error, Dataset};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::ProtoUtils;
@@ -35,6 +35,9 @@ pub struct HeartbeatTask {
     pub(crate) client: MasterClient,
     pub(crate) store: BlockStore,
     pub(crate) report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
+    /// Also parks quarantined ids (see `delete_block_task`). The release path
+    /// must remove the id, or report Deleted itself, so master's pending
+    /// delete can complete.
     pub(crate) pending_deletes: Arc<DashSet<i64>>,
 }
 
@@ -76,6 +79,11 @@ impl HeartbeatTask {
                                 report_blocks1
                                     .insert(block, BlockReportInfo::with_deleted(block, 0));
                             }
+                            // Permanent until released: keep the id so later
+                            // heartbeats skip it instead of rescheduling.
+                            Err(e) if is_quarantined_error(&e) => {
+                                info!("block {} is quarantined; delete deferred", block);
+                            }
                             Err(e) => {
                                 warn!("async_remove_block {}: {}", block, e);
                                 pending_deletes1.remove(&block);
@@ -99,9 +107,10 @@ impl HeartbeatTask {
         }
     }
 
-    /// Re-check blocks whose reads failed a chunk CRC. A block that fails
-    /// again is removed and reported as a corrupted deletion, so master drops
-    /// the location and restores the replica count.
+    /// Re-check blocks whose reads failed a chunk CRC or found the file
+    /// truncated. A block whose damage is confirmed is removed and reported as
+    /// a corrupted deletion, so master drops the location and restores the
+    /// replica count.
     pub(crate) fn invalidate_corrupt_task(
         executor: Arc<GroupExecutor>,
         store: BlockStore,

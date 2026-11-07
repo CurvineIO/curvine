@@ -350,6 +350,14 @@ impl InodeView {
         }
     }
 
+    /// Client ids marked as writing this inode; empty for anything but a file.
+    pub fn writer_clients(&self) -> Vec<String> {
+        match self {
+            InodeView::File(file) => file.writer_clients(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn as_file_ref(&self) -> CommonResult<&InodeFile> {
         match self {
             File(f) => Ok(f),

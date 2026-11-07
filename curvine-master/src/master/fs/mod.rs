@@ -38,7 +38,8 @@ mod full_block_report;
 mod master_filesystem;
 pub(crate) use self::master_filesystem::BlockInodeState;
 pub use self::master_filesystem::{
-    BlockReportResult, CompleteFileOptions, DeleteMode, MasterFilesystem,
+    BlockReportResult, CompleteFileOptions, DeleteMode, MasterFilesystem, ReapClaim, ReapStep,
+    SessionSummary,
 };
 
 mod delete_result;
@@ -49,3 +50,6 @@ pub mod policy;
 pub mod context;
 
 pub mod state;
+
+mod session_reaper;
+pub use self::session_reaper::{ReapReport, SessionReaper};

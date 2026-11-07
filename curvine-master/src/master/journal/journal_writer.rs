@@ -452,6 +452,22 @@ impl JournalWriter {
         Ok(())
     }
 
+    /// Journal the removal of one client's writer marker (#1880).
+    pub fn log_release_writer(
+        &self,
+        fs_dir: &FsDir,
+        ino: i64,
+        client: impl Into<String>,
+    ) -> FsResult<()> {
+        let entry = ReleaseWriterEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            ino,
+            client: client.into(),
+        };
+        self.send(fs_dir, JournalEntry::ReleaseWriter(entry))
+    }
+
     pub fn log_set_locks(&self, fs_dir: &FsDir, ino: i64, locks: Vec<FileLock>) -> FsResult<()> {
         let entry = SetLocksEntry {
             op_id: fs_dir.next_op_id(),

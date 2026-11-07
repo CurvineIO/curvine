@@ -22,10 +22,11 @@ use crate::master::meta::{
     TrashScanPage,
 };
 
-use crate::master::fs::state::{SessionHeartbeat, SessionMap};
+use crate::master::fs::state::{monotonic_ms, ClientSession, SessionHeartbeat, SessionMap};
 use crate::master::fs::worker_manager::WorkerManager;
 use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
+use crate::master::meta::store::OwnerKind;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncSessionMap, SyncWorkerManager};
 use curvine_config::{ClusterConf, MasterConf};
@@ -38,6 +39,7 @@ use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
 use parking_lot::Mutex;
+use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -70,6 +72,33 @@ pub struct CvMetadataSnapshotPage {
     pub entries: Vec<CvMetadataSnapshotEntry>,
     pub next_page_token: Option<String>,
     pub epoch: u64,
+}
+
+/// One client session as reported by the master status surface (#1885).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SessionSummary {
+    pub client_id: String,
+    pub hostname: String,
+    pub ip_addr: String,
+    pub pid: Option<u32>,
+    pub mount_point: Option<String>,
+    pub client_version: Option<String>,
+    pub heartbeat_interval_ms: u64,
+    /// Unix epoch milliseconds, converted from the session map's process-local
+    /// `monotonic_ms` clock at snapshot time. Accurate to the wall clock at the
+    /// moment of the request; not stable across master restarts.
+    pub started_at: u64,
+    /// Unix epoch milliseconds, same conversion as `started_at`.
+    pub last_heartbeat: u64,
+    /// Unix epoch milliseconds, same conversion as `started_at`.
+    pub expire_at: u64,
+    /// Whether the lease is still valid at the time of the snapshot (judged on
+    /// the monotonic clock, so it does not depend on the conversion above).
+    pub live: bool,
+    /// Locks this client owns that are indexed for reclamation.
+    pub lock_hints: usize,
+    /// Writer markers this client owns.
+    pub writer_hints: usize,
 }
 
 #[derive(Default)]
@@ -294,7 +323,19 @@ impl MasterFilesystem {
         let term = self.master_monitor.term();
         let mut sessions = self.session_map.write();
         let new_session = sessions.heartbeat_in_epoch(hb, term, now);
-        (new_session, sessions.session_timeout_ms())
+        // Publish the gauge on every renewal too (#1885): the count is what the
+        // status graph shows, and a renewal that follows a lapsed lease must move
+        // it once the session is re-registered.
+        //
+        // Read `len` and set the gauge inside the write guard (#1885 review), so
+        // publication order is the registration order and a stale count can never
+        // overwrite a newer one.
+        let active = sessions.len() as i64;
+        let session_timeout_ms = sessions.session_timeout_ms();
+        if let Ok(metrics) = Master::get_metrics() {
+            metrics.active_sessions.set(active);
+        }
+        (new_session, session_timeout_ms)
     }
 
     pub fn check_parent(path: &InodePath) -> FsResult<()> {
@@ -2526,6 +2567,160 @@ impl MasterFilesystem {
         fs_dir.set_lock(inp, lock, &validity)
     }
 
+    /// Point-in-time view of the client sessions for the status surface (#1885).
+    ///
+    /// Hint counts come from the ownership index, so a session that owns a lot of
+    /// state is visible *before* it expires.
+    ///
+    /// Cost: one `fs_dir.read()` and one unbounded ownership-index prefix scan per
+    /// session, on every call. That suits polling with fleets of hundreds of
+    /// mounts; a caller that needs more must page or cap. The read guard is taken
+    /// per session on purpose, so metadata writers can run between scans instead
+    /// of waiting for the whole fleet.
+    pub fn session_summary(&self) -> FsResult<Vec<SessionSummary>> {
+        // Session times are `monotonic_ms` values: judge `live` on that clock and
+        // convert to epoch ms against one (monotonic, wall) pair for the output.
+        let mono_now = monotonic_ms();
+        let wall_now = LocalTime::mills();
+        let to_wall = |t: u64| {
+            if t >= mono_now {
+                wall_now.saturating_add(t - mono_now)
+            } else {
+                wall_now.saturating_sub(mono_now - t)
+            }
+        };
+        // Snapshot under the read guard, then scan the ownership index without
+        // it: renewals need the write side, so a status request must not hold
+        // the session map across per-session index reads (#1885 review).
+        let sessions: Vec<ClientSession> = self.session_map.read().sessions().cloned().collect();
+        let mut summary = Vec::with_capacity(sessions.len());
+
+        for session in sessions {
+            let owners = self
+                .fs_dir
+                .read()
+                .store
+                .get_client_owners(session.client_id())?;
+            let mut summary_entry = SessionSummary {
+                client_id: session.client_id().to_string(),
+                hostname: session.address.hostname.clone(),
+                ip_addr: session.address.ip_addr.clone(),
+                pid: session.pid,
+                mount_point: session.mount_point.clone(),
+                client_version: session.client_version.clone(),
+                heartbeat_interval_ms: session.heartbeat_interval_ms,
+                started_at: to_wall(session.started_at),
+                last_heartbeat: to_wall(session.last_heartbeat),
+                expire_at: to_wall(session.expire_at),
+                live: !session.is_expired_at(mono_now),
+                lock_hints: 0,
+                writer_hints: 0,
+            };
+            for (kind, _) in owners {
+                match kind {
+                    OwnerKind::Lock => summary_entry.lock_hints += 1,
+                    OwnerKind::Writer => summary_entry.writer_hints += 1,
+                }
+            }
+            summary.push(summary_entry);
+        }
+
+        Ok(summary)
+    }
+
+    /// Ownership hints held by `client_id`, used by the session reaper (#1884).
+    pub fn get_client_owners(&self, client_id: &str) -> FsResult<Vec<(OwnerKind, i64)>> {
+        Ok(self.fs_dir.read().store.get_client_owners(client_id)?)
+    }
+
+    /// At most `limit` hints of `client_id`, optionally of one `kind`. The reaper
+    /// reads only what its remaining budget can act on.
+    pub fn get_client_owners_limited(
+        &self,
+        client_id: &str,
+        kind: Option<OwnerKind>,
+        limit: usize,
+    ) -> FsResult<Vec<(OwnerKind, i64)>> {
+        Ok(self
+            .fs_dir
+            .read()
+            .store
+            .get_client_owners_limited(client_id, kind, limit)?)
+    }
+
+    /// One bounded slice of the lock hints of every client, for the reaper's
+    /// orphan pass. See `RocksInodeStore::scan_lock_owners`.
+    #[allow(clippy::type_complexity)]
+    pub fn scan_lock_owners(
+        &self,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> FsResult<(Vec<(String, i64, Vec<u8>)>, Option<Vec<u8>>)> {
+        Ok(self.fs_dir.read().store.scan_lock_owners(cursor, limit)?)
+    }
+
+    /// Act on one ownership hint for the session reaper (#1884).
+    ///
+    /// Everything that decides whether the reaper may touch `client_id` is
+    /// re-checked *inside* the `fs_dir` write critical section that performs the
+    /// release, so neither a heartbeat nor a step-down can slip in between the
+    /// decision and the mutation:
+    ///
+    /// * this master is still the leader;
+    /// * the session map is still in `claim.term()`'s epoch and past its grace
+    ///   window;
+    /// * the client is still reclaimable (see [`ReapClaim`]).
+    ///
+    /// The session map is only `try_read` here, never blocking (see the lock
+    /// ordering note on `SessionMap`); a busy map yields [`ReapStep::Skipped`] and
+    /// the hint is retried next tick. A hint that matches no state is dropped in
+    /// the same critical section, so a hint a concurrent `set_lock` just recreated
+    /// cannot be lost.
+    pub fn reap_client_owner(
+        &self,
+        claim: &ReapClaim,
+        kind: OwnerKind,
+        ino: i64,
+        now: u64,
+    ) -> FsResult<ReapStep> {
+        let mut fs_dir = self.fs_dir.write();
+        if !self.master_monitor.is_active() || !self.claim_holds(claim, now) {
+            return Ok(ReapStep::Skipped);
+        }
+
+        let client_id = claim.client_id();
+        let released = match kind {
+            OwnerKind::Lock => fs_dir.release_client_locks(ino, client_id)?,
+            OwnerKind::Writer => Self::release_writer_locked(&mut fs_dir, ino, client_id)?,
+        };
+        if released {
+            return Ok(ReapStep::Released);
+        }
+
+        // The hint is worthless: drop it so it is never revisited. The apply path
+        // only removes hints it actually acted on.
+        fs_dir.store.remove_client_owner(client_id, kind, ino)?;
+        Ok(ReapStep::Stale)
+    }
+
+    /// Whether `claim` still entitles the reaper to act. Caller holds `fs_dir`.
+    fn claim_holds(&self, claim: &ReapClaim, now: u64) -> bool {
+        let Ok(sessions) = self.session_map.try_read() else {
+            return false;
+        };
+        if sessions.term() != Some(claim.term()) || now < sessions.reclaim_after() {
+            return false;
+        }
+        match claim {
+            ReapClaim::Expired {
+                client_id,
+                started_at,
+                ..
+            } => sessions.is_expired_generation(client_id, *started_at, now),
+            ReapClaim::Orphan { client_id, .. } => sessions.get(client_id).is_none(),
+        }
+    }
+
     /// Lock lifetime policy for this request (#1879).
     ///
     /// Config-only: session-owned locks are exempted from the legacy TTL while
@@ -2537,6 +2732,76 @@ impl MasterFilesystem {
             self.conf.client_session_lock_lease,
         )
     }
+
+    /// Release one client's writer marker and journal the fact (#1880).
+    ///
+    /// Idempotent: returns `false` when the marker was already gone, and logs
+    /// nothing in that case, so a retry cannot grow the journal.
+    pub fn release_writer(&self, ino: i64, client_id: &str) -> FsResult<bool> {
+        let mut fs_dir = self.fs_dir.write();
+        Self::release_writer_locked(&mut fs_dir, ino, client_id)
+    }
+
+    /// [`MasterFilesystem::release_writer`] for a caller that already holds the
+    /// `fs_dir` write lock.
+    fn release_writer_locked(fs_dir: &mut FsDir, ino: i64, client_id: &str) -> FsResult<bool> {
+        if !fs_dir.release_writer(ino, client_id)? {
+            return Ok(false);
+        }
+        let fs_dir_view: &FsDir = fs_dir;
+        fs_dir_view
+            .journal_writer
+            .log_release_writer(fs_dir_view, ino, client_id)?;
+        Ok(true)
+    }
+}
+
+/// Why the session reaper believes it may reclaim a client's state (#1884).
+///
+/// The claim is re-validated under `fs_dir` before every release by
+/// [`MasterFilesystem::reap_client_owner`]; both variants are bound to the epoch
+/// (`term`) they were taken in, so a re-election in the middle of a tick voids
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReapClaim {
+    /// The client holds the session generation `started_at`, and it is expired.
+    /// A renewal keeps the lease alive; a re-registration creates a new
+    /// generation. Either voids the claim.
+    Expired {
+        client_id: String,
+        started_at: u64,
+        term: u64,
+    },
+    /// The client has no session at all in this epoch even though the grace
+    /// window has passed: it died before or during a failover and never
+    /// heartbeated this leader. Any registration voids the claim.
+    Orphan { client_id: String, term: u64 },
+}
+
+impl ReapClaim {
+    pub fn client_id(&self) -> &str {
+        match self {
+            ReapClaim::Expired { client_id, .. } | ReapClaim::Orphan { client_id, .. } => client_id,
+        }
+    }
+
+    pub fn term(&self) -> u64 {
+        match self {
+            ReapClaim::Expired { term, .. } | ReapClaim::Orphan { term, .. } => *term,
+        }
+    }
+}
+
+/// Outcome of [`MasterFilesystem::reap_client_owner`] for one hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapStep {
+    /// The state was released and journalled; the apply path dropped the hint.
+    Released,
+    /// The hint matched no state and was dropped.
+    Stale,
+    /// The claim no longer holds (renewed, re-registered, demoted, new epoch, or
+    /// the session map was busy). Nothing changed.
+    Skipped,
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@
 //  limitations under the License.
 
 use crate::master::journal::{
-    CompleteFileEntry, DeleteEntry, JournalEntry, MkdirEntry, RenameEntry,
+    CompleteFileEntry, DeleteEntry, JournalEntry, MkdirEntry, ReleaseWriterEntry, RenameEntry,
 };
 use crate::master::{JobManager, SyncFsDir};
 use curvine_config::JournalConf;
@@ -127,6 +127,7 @@ impl UfsLoader {
             JournalEntry::CompleteFile(e) => self.complete_file(e).await,
             JournalEntry::Rename(e) => self.rename(e).await,
             JournalEntry::Delete(e) => self.delete(e).await,
+            JournalEntry::ReleaseWriter(e) => self.release_writer(e).await,
             _ => Ok(()),
         }
     }
@@ -208,6 +209,39 @@ impl UfsLoader {
         } else {
             Ok(())
         }
+    }
+
+    /// Export a file that became complete because its last writer was released.
+    ///
+    /// The metadata side of the entry is already applied on the leader, so the
+    /// stored inode tells us whether any writer remains. Reading it under the
+    /// guard and exporting outside it keeps the export from stalling metadata
+    /// writes.
+    pub async fn release_writer(&self, e: &ReleaseWriterEntry) -> CommonResult<()> {
+        let exportable = {
+            let fs_dir = self.fs_dir.read();
+            match fs_dir.store.get_inode(e.ino, None)? {
+                Some(inode) => match inode.as_file_ref() {
+                    Ok(file) => file.is_complete() && !file.ufs_only(),
+                    Err(_) => false,
+                },
+                None => false,
+            }
+        };
+        if !exportable {
+            return Ok(());
+        }
+
+        let path = match self.get_real_path(e.ino) {
+            Ok(path) => path,
+            Err(FsError::FileNotFound(_)) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        let Some((_, mnt)) = self.get_mnt(&path)? else {
+            return Ok(());
+        };
+        self.submit_export_task(&path, &mnt).await?;
+        Ok(())
     }
 
     pub async fn delete(&self, e: &DeleteEntry) -> CommonResult<()> {

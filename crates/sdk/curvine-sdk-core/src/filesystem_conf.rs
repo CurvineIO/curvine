@@ -37,6 +37,9 @@ pub struct FilesystemConf {
 
     pub read_chunk_size: String,
     pub read_chunk_num: usize,
+    // Chunk requests kept in flight per remote block read; see
+    // ClientConf::read_pipeline_depth. 1 sends one request at a time.
+    pub read_pipeline_depth: usize,
     pub read_parallel: i64,
     pub read_slice_size: String,
 
@@ -66,11 +69,6 @@ pub struct FilesystemConf {
     pub conn_timeout_ms: u64,
     pub rpc_timeout_ms: u64,
     pub data_timeout_ms: u64,
-
-    /// Maximum time to wait for one write-buffer request/response handshake
-    /// (data enqueue, flush, complete, cancel, seek, resize), in
-    /// milliseconds. 0 means "use the ClientConf default" (120s).
-    pub write_buffer_timeout_ms: u64,
 
     // Number of fs master connections.
     // Pool size 3 reaches the highest QPS. Pool size 1 supports the most clients, so the default is 1.
@@ -179,7 +177,7 @@ impl FilesystemConf {
             master_conn_pool_size: 1,
             conn_timeout_ms: 30_000,
             rpc_timeout_ms: 120_000,
-            data_timeout_ms: 120_000,
+            data_timeout_ms: rpc_defaults.data_timeout_ms,
             conn_retry_max_duration_ms: rpc_defaults.conn_retry_max_duration_ms,
             conn_retry_min_sleep_ms: rpc_defaults.conn_retry_min_sleep_ms,
             conn_retry_max_sleep_ms: rpc_defaults.conn_retry_max_sleep_ms,
@@ -189,6 +187,7 @@ impl FilesystemConf {
             block_size: "128MB".to_string(),
             write_chunk_size: "128KB".to_string(),
             read_chunk_size: "128KB".to_string(),
+            read_pipeline_depth: 1,
             read_slice_size: "0".to_string(),
             read_ahead_len: "1MB".to_string(),
             drop_cache_len: "64MB".to_string(),
@@ -244,6 +243,7 @@ impl FilesystemConf {
             read_chunk_size: 0,
             read_chunk_size_str: self.read_chunk_size,
             read_chunk_num: self.read_chunk_num,
+            read_pipeline_depth: self.read_pipeline_depth,
 
             read_parallel: self.read_parallel,
             read_slice_size: 0,
@@ -262,8 +262,6 @@ impl FilesystemConf {
             conn_timeout_ms: self.conn_timeout_ms,
             rpc_timeout_ms: self.rpc_timeout_ms,
             data_timeout_ms: self.data_timeout_ms,
-            // 0 (unset) falls back to the ClientConf default in init().
-            write_buffer_timeout_ms: self.write_buffer_timeout_ms,
             master_conn_pool_size: self.master_conn_pool_size,
             rpc_close_idle: self.rpc_close_idle,
 
@@ -346,6 +344,7 @@ impl FilesystemConf {
 mod tests {
     use super::{FilesystemConf, TransferClientConf};
     use curvine_config::ClientConf;
+    use std::time::Duration;
 
     #[test]
     fn default_master_conn_pool_size_is_one() {
@@ -465,29 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_write_buffer_timeout_into_client_conf() {
-        // An explicit value flows through to ClientConf unchanged.
-        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
-        conf.write_buffer_timeout_ms = 45_000;
-        let cluster = conf.into_cluster_conf().unwrap();
-        assert_eq!(cluster.client.write_buffer_timeout_ms, 45_000);
-
-        // Unset (0) derives the default from the wrapped RPC budgets:
-        // rpc_timeout_ms + rpc_retry_max_duration_ms + margin.
-        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
-        let cluster = conf.into_cluster_conf().unwrap();
-        let expected = cluster.client.rpc_timeout_ms
-            + cluster.client.rpc_retry_max_duration_ms
-            + ClientConf::DEFAULT_WRITE_BUFFER_TIMEOUT_MARGIN_MS;
-        assert_eq!(cluster.client.write_buffer_timeout_ms, expected);
-        assert!(
-            cluster.client.write_buffer_timeout_ms > cluster.client.rpc_timeout_ms,
-            "default deadline must exceed a single master RPC budget"
-        );
-    }
-
-    #[test]
-    fn parses_write_buffer_timeout_from_java_toml() {
+    fn parses_data_timeout_from_java_toml() {
         let conf = FilesystemConf::from_str(
             r#"
                 master_addrs = "master-0:8995"
@@ -502,12 +479,89 @@ mod tests {
                 ttl_action = "none"
                 small_file_size = "4MB"
                 large_file_size = "10GB"
-                write_buffer_timeout_ms = 45000
+                data_timeout_ms = 45000
             "#,
         )
         .unwrap();
         let cluster = conf.into_cluster_conf().unwrap();
-        assert_eq!(cluster.client.write_buffer_timeout_ms, 45_000);
+        assert_eq!(cluster.client.data_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn maps_read_pipeline_depth_into_client_conf() {
+        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        assert_eq!(conf.read_pipeline_depth, 1);
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.read_pipeline_depth, 1);
+
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.read_pipeline_depth = 4;
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.read_pipeline_depth, 4);
+    }
+
+    #[test]
+    fn parses_read_pipeline_depth_from_java_toml() {
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                read_chunk_size = "128KB"
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+                read_pipeline_depth = 4
+            "#,
+        )
+        .unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.read_pipeline_depth, 4);
+    }
+
+    #[test]
+    fn java_default_data_timeout_outlasts_the_master_failover_budget() {
+        // `FilesystemConf.java` mirrors every field into the toml that
+        // `JavaFilesystem::new` parses, so this is the Java `closeWriter` chain.
+        // The writer handshake is bounded by `data_timeout()`, which must outlast
+        // a Complete/Flush that drains the queued writes and then retries the
+        // master through a failover: rpc_timeout + rpc_retry_max_duration.
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                read_chunk_size = "128KB"
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+                rpc_timeout_ms = 120000
+                rpc_retry_max_duration_ms = 120000
+                data_timeout_ms = 300000
+            "#,
+        )
+        .unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        let failover = Duration::from_millis(
+            cluster.client.rpc_timeout_ms + cluster.client.rpc_retry_max_duration_ms,
+        );
+        assert!(
+            cluster.client.data_timeout() > failover,
+            "the Java SDK handshake deadline {:?} must exceed the failover budget {:?}",
+            cluster.client.data_timeout(),
+            failover
+        );
     }
 
     #[test]
