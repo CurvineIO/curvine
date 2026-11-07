@@ -719,11 +719,15 @@ impl MasterFilesystem {
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
 
-            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
-            if restore_epoch != locked_epoch || !resolved.same_resolution(&locked) {
+            let fs_dir = self.fs_dir.read();
+            if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-            let Some(locked_target) = locked.target() else {
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            if !Self::live_path_matches(&resolved, &inp) {
+                continue;
+            }
+            let Some(locked_target) = inp.get_last_inode() else {
                 continue;
             };
             if locked_target.id() != target.id()
@@ -733,7 +737,6 @@ impl MasterFilesystem {
                 continue;
             }
 
-            let fs_dir = self.fs_dir.read();
             let current_workers = {
                 let mut current_workers = HashSet::new();
                 for block_id in &block_ids {
@@ -754,10 +757,6 @@ impl MasterFilesystem {
                 continue;
             }
 
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&locked, &inp) {
-                continue;
-            }
             let deleted = fs_dir.overwrite_file(&inp, opts.clone())?;
             let status = fs_dir.file_status(&inp)?;
             return Ok(Some((status, deleted)));
