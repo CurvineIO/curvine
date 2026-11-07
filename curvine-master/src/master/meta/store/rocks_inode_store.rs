@@ -65,8 +65,10 @@ impl RocksInodeStore {
     const DIRECTORY_ATTRIBUTE_SCHEMA_VERSION: u8 = 0x01;
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
+        // Cursor WAL sync must also cover earlier namespace batches; writes
+        // without WAL can otherwise disappear while the cursor survives.
         let conf = conf
-            .set_disable_wal(true)
+            .set_disable_wal(false)
             .add_cf(Self::CF_INODES)
             .add_cf(Self::CF_EDGES)
             .add_cf(Self::CF_BLOCK)
