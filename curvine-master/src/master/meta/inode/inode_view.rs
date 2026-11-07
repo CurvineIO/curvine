@@ -664,6 +664,7 @@ impl InodeView {
 
             Dir(d) => {
                 let acl = &d.features.acl;
+                let child_count = d.children_len();
                 Ok(FileStatus {
                     id: self.id(),
                     path: path.to_owned(),
@@ -671,9 +672,9 @@ impl InodeView {
                     is_dir: true,
                     mtime: self.mtime(),
                     atime: self.atime(),
-                    children_num: self.child_len() as i32,
+                    children_num: child_count as i32,
                     is_complete: false,
-                    len: d.children_len() as i64,
+                    len: child_count as i64,
                     replicas: 0,
                     block_size: 0,
                     file_type: FileType::Dir,
