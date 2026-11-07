@@ -52,12 +52,21 @@ pub(crate) struct PendingAbort {
     pub(crate) block: ExtendedBlock,
     /// Retry with abort_block_uncertain() instead of abort_block().
     pub(crate) uncertain: bool,
-    /// The original failure, re-returned with the same kind on every retry.
+    /// The original failure, re-returned with the same kind and message on every retry.
     pub(crate) kind: ErrorKind,
     pub(crate) error: String,
 }
 
 impl PendingAbort {
+    fn new(block: &ExtendedBlock, uncertain: bool, error: &FsError) -> Self {
+        Self {
+            block: block.clone(),
+            uncertain,
+            kind: error.kind(),
+            error: error.to_string(),
+        }
+    }
+
     fn to_error(&self) -> FsError {
         match self.kind {
             ErrorKind::IO => FsError::io(std::io::Error::other(self.error.clone())),
@@ -384,36 +393,31 @@ impl WriteHandler {
         }
     }
 
-    /// Abort the block (quarantine if `uncertain`), then either latch
-    /// is_commit (terminal) or record a PendingAbort so the next
-    /// Complete/Cancel retries this exact abort instead of reaching
-    /// commit_block() with the flush context lost.
-    fn abort_or_defer(&mut self, block: &ExtendedBlock, uncertain: bool, error: &FsError) {
-        let abort_result = if uncertain {
-            self.store.abort_block_uncertain(block)
+    /// Abort (quarantine if `pending.uncertain`), then latch if terminal or
+    /// park `pending` unchanged for the next retry. Returns the client error,
+    /// never re-derived, so the message is stable across retries.
+    fn abort_or_defer(&mut self, pending: PendingAbort) -> FsError {
+        let abort_result = if pending.uncertain {
+            self.store.abort_block_uncertain(&pending.block)
         } else {
-            self.store.abort_block(block)
+            self.store.abort_block(&pending.block)
         };
         if let Err(abort_err) = abort_result {
             log::warn!(
                 "failed to abort block {} after {}: {}",
-                block.id,
-                error,
+                pending.block.id,
+                pending.error,
                 abort_err
             );
         }
-        if self.block_is_terminal(block.id) {
-            self.pending_abort = None;
+        let error = pending.to_error();
+        if self.block_is_terminal(pending.block.id) {
             self.is_commit = true;
             self.lease.take();
         } else {
-            self.pending_abort = Some(PendingAbort {
-                block: block.clone(),
-                uncertain,
-                kind: error.kind(),
-                error: error.to_string(),
-            });
+            self.pending_abort = Some(pending);
         }
+        error
     }
 
     pub fn complete(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
@@ -428,9 +432,7 @@ impl WriteHandler {
         // A prior abort failed non-terminally: self.file is already gone, so
         // retry only that abort. Never fall through to commit_block().
         if let Some(pending) = self.pending_abort.take() {
-            let error = pending.to_error();
-            self.abort_or_defer(&pending.block, pending.uncertain, &error);
-            return Err(error);
+            return Err(self.abort_or_defer(pending));
         }
 
         let write_dir_id = self.context.as_ref().map(|c| c.dir_id);
@@ -450,8 +452,8 @@ impl WriteHandler {
                     Self::record_write_error(self.metrics, dir_id, &flush_err);
                 }
                 let error: FsError = flush_err.into();
-                self.abort_or_defer(&context.block, uncertain, &error);
-                return Err(error);
+                let pending = PendingAbort::new(&context.block, uncertain, &error);
+                return Err(self.abort_or_defer(pending));
             }
             if uncertain {
                 // Data may still be in flight: never free or publish this extent.
@@ -459,8 +461,8 @@ impl WriteHandler {
                     "block {} write outcome uncertain, extent quarantined",
                     context.block.id
                 )));
-                self.abort_or_defer(&context.block, true, &error);
-                return Err(error);
+                let pending = PendingAbort::new(&context.block, true, &error);
+                return Err(self.abort_or_defer(pending));
             }
         }
 
@@ -469,8 +471,8 @@ impl WriteHandler {
                 "Invalid block length: {}, block size: {}",
                 context.block.len, context.block_size
             ));
-            self.abort_or_defer(&context.block, false, &error);
-            return Err(error);
+            let pending = PendingAbort::new(&context.block, false, &error);
+            return Err(self.abort_or_defer(pending));
         }
 
         if let Err(commit_err) = self.commit_block(&context.block, commit) {
@@ -2439,6 +2441,65 @@ mod tests {
             "block must be aborted (removed), never Finalized"
         );
 
+        Ok(())
+    }
+
+    /// Two non-terminal retries in a row: the deferred error must come back
+    /// byte-identical each time, not grow a ": " per round trip.
+    #[test]
+    fn deferred_abort_error_message_is_stable_across_retries() -> FsResult<()> {
+        let block_size = 0_i64;
+        let block = ExtendedBlock::new(53, block_size, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("pending-abort-stable-message")?;
+        store.open_block(&block).map_err(FsError::from)?;
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                FailingFlushBlockIO,
+                0,
+                block_size,
+                0,
+            )?),
+            lease: store
+                .ordinary_write_lease(block.id)
+                .map_err(FsError::from)?,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+            pending_abort: None,
+        };
+
+        store.set_force_transient_abort_failure_for_test(true);
+        let first = handler
+            .complete(&complete_msg(&block, block_size, 1), false)
+            .unwrap_err();
+        store.set_force_transient_abort_failure_for_test(true);
+        let second = handler
+            .complete(&complete_msg(&block, block_size, 2), false)
+            .unwrap_err();
+        assert!(
+            !handler.is_commit,
+            "second abort also failed: stay retryable"
+        );
+        let third = handler
+            .complete(&complete_msg(&block, block_size, 3), false)
+            .unwrap_err();
+        assert!(handler.is_commit, "third abort succeeded: latch");
+
+        assert_eq!(second.to_string(), first.to_string());
+        assert_eq!(third.to_string(), first.to_string());
         Ok(())
     }
 
