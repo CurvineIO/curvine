@@ -16,6 +16,18 @@ use crate::master::meta::inode::InodeDir;
 use curvine_model::{DirectoryAttributeDelta, DirectoryAttributes};
 
 #[test]
+fn directory_delta_uses_base_only_until_persisted() {
+    let dir = InodeDir::new(1, 42);
+    let delta = DirectoryAttributeDelta::for_child(43);
+    assert_eq!(
+        dir.directory_attribute_delta(delta).base().unwrap().mtime,
+        42
+    );
+    dir.mark_directory_attributes_persisted();
+    assert!(dir.directory_attribute_delta(delta).base().is_none());
+}
+
+#[test]
 fn failed_directory_delta_does_not_publish_partial_state() {
     let dir = InodeDir::new(1, 0);
     let mut base = DirectoryAttributes::new(0, 0, 0);
