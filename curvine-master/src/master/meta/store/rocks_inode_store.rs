@@ -53,9 +53,9 @@ impl RocksInodeStore {
     pub const PREFIX_UFS_DEFERRED: u8 = 0x03;
     pub const PREFIX_APPLIED_REQ: u8 = 0x04;
 
-    // Single-key marker for the mount table version (get mount table
-    // negotiation). Must not share PREFIX_MOUNT: the mount table is read via a
-    // prefix scan on that prefix and would pick the version key up as a row.
+    // Single-key marker for mount table version negotiation. It shares the
+    // applied-request prefix but not its nine-byte key layout; prefix-range
+    // deletion must exclude this one-byte key.
     pub const PREFIX_MOUNT_TABLE_VERSION: u8 = 0x04;
 
     /// System row key for the journal applied cursor (see `put_common_kv`).
@@ -103,8 +103,15 @@ impl RocksInodeStore {
         }
         self.db
             .prefix_delete(Self::CF_COMMON, [Self::PREFIX_UFS_DEFERRED])?;
-        self.db
-            .prefix_delete(Self::CF_COMMON, [Self::PREFIX_APPLIED_REQ])?;
+        // Preserve the one-byte mount table version key sharing this prefix.
+        let cf = self.db.cf(Self::CF_COMMON)?;
+        let mut batch = WriteBatchWithTransaction::<false>::default();
+        batch.delete_range_cf(
+            cf,
+            &[Self::PREFIX_APPLIED_REQ, 0][..],
+            &[Self::PREFIX_APPLIED_REQ + 1][..],
+        );
+        self.db.write_batch(batch)?;
         let zero = AppliedIndex::default();
         self.db.put_cf_sync_wal(
             Self::CF_COMMON,
