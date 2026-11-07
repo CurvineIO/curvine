@@ -58,6 +58,27 @@ fn coverage_handles_sorted_lock_ids_and_modes() {
 }
 
 #[test]
+fn large_unsorted_duplicate_requests_keep_strongest_mode() {
+    let locks = InodeLockManager::new(64);
+    let mut requests = Vec::new();
+    for i in 0..64 {
+        let id = (i * 37 % 64) as i64;
+        requests.push(InodeLockRequest::read(i, id));
+        if id % 2 == 0 {
+            requests.push(InodeLockRequest::write(64 - i, id));
+        }
+    }
+    let guard = locks.lock_many(&requests);
+    for id in 0..64 {
+        assert!(guard.covers_request(InodeLockRequest::read(0, id)));
+        assert_eq!(
+            guard.covers_request(InodeLockRequest::write(0, id)),
+            id % 2 == 0
+        );
+    }
+}
+
+#[test]
 fn opposite_path_orders_do_not_deadlock() {
     let locks = Arc::new(InodeLockManager::new(1));
     let start = Arc::new(Barrier::new(3));

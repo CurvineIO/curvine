@@ -243,7 +243,7 @@ impl InodeLockManager {
                 mode: request.mode,
             })
             .collect::<InodeLocks<_>>();
-        normalized.sort_by_key(|request| request.inode_id);
+        normalized.sort_unstable_by_key(|request| request.inode_id);
 
         let mut write_index = 0;
         for read_index in 1..normalized.len() {
