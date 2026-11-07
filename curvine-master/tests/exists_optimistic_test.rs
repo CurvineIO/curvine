@@ -384,6 +384,30 @@ fn reopen_existing_file_and_reject_invalid_paths() {
     assert_eq!(fs.file_status("/dir/file").unwrap().id, original.id);
 }
 
+#[test]
+fn truncate_open_and_create_overwrite_keep_inode_identity() {
+    use curvine_model::{CreateFileOpts, OpenFlags};
+
+    let fs = test_fs("truncate-open");
+    let original = fs.create("/file", false).unwrap();
+    let opts = CreateFileOpts::with_create(false);
+    fs.open_file("/file", opts.clone(), OpenFlags::WRONLY | OpenFlags::TRUNC)
+        .unwrap();
+    fs.create_with_opts(
+        "/file",
+        opts,
+        OpenFlags::WRONLY | OpenFlags::CREAT | OpenFlags::TRUNC,
+    )
+    .unwrap();
+    for restored in [false, true] {
+        if restored {
+            fs.restore_from_rocksdb().unwrap();
+        }
+        let current = fs.file_status("/file").unwrap();
+        assert_eq!((current.id, current.len), (original.id, 0));
+    }
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn reopen_commit_failure_does_not_publish_writer_state() {

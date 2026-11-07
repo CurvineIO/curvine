@@ -614,7 +614,7 @@ impl MasterFilesystem {
             let full = inp.is_full();
             if full {
                 if flags.overwrite() && !flags.exclusive() {
-                    if let Some(result) = self.overwrite_file_sharded(path, opts.clone())? {
+                    if let Some(result) = self.overwrite_file_sharded(path, opts.clone(), None)? {
                         return Ok((result.0, Some(result.1)));
                     }
                 }
@@ -667,11 +667,15 @@ impl MasterFilesystem {
         &self,
         path: &str,
         opts: CreateFileOpts,
+        mut initial: Option<(StoreResolvedPath, u64)>,
     ) -> FsResult<Option<(FileStatus, DeleteResult)>> {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
+            let (resolved, restore_epoch) = match initial.take() {
+                Some(resolved) => resolved,
+                None => self.resolve_live_store_view(path)?,
+            };
             let Some(target) = resolved.target() else {
                 return Ok(None);
             };
@@ -2575,7 +2579,9 @@ impl MasterFilesystem {
                 return Ok(Ok((blocks, None)));
             }
 
-            if let Some((status, deleted)) = self.overwrite_file_sharded(path, opts.clone())? {
+            if let Some((status, deleted)) =
+                self.overwrite_file_sharded(path, opts.clone(), Some(resolved))?
+            {
                 return Ok(Ok((FileBlocks::new(status, vec![]), Some(deleted))));
             }
 
