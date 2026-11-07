@@ -2524,4 +2524,76 @@ mod tests {
 
         Ok(())
     }
+
+    /// Uncertain-path twin: A's failed quarantine is replayed after B
+    /// finalized the same SPDK block; B's replica must stay Finalized.
+    #[test]
+    fn uncertain_retry_after_failed_abort_preserves_replica_finalized_by_other_writer(
+    ) -> FsResult<()> {
+        let block = ExtendedBlock::new(52, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler_a) = spdk_handler(
+            "pending-abort-two-writers-uncertain",
+            &block,
+            FailingFlushUncertainBlockIO,
+        )?;
+        handler_a.lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+
+        // Writer A: uncertain flush fails, quarantine fails too -> pending abort.
+        store.set_force_transient_abort_failure_for_test(true);
+        handler_a
+            .complete(&spdk_complete_msg(&block), false)
+            .unwrap_err();
+        let pending = handler_a
+            .pending_abort
+            .as_ref()
+            .expect("A must defer its abort");
+        assert!(pending.uncertain, "deferred abort must stay uncertain");
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Writing),
+        );
+
+        // Writer B: second ordinary lease is allowed; B finalizes the block.
+        let lease_b = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        assert!(lease_b.is_some(), "ordinary leases are not exclusive");
+        store.open_block(&block).map_err(FsError::from)?;
+        store.finalize_block(&block).map_err(FsError::from)?;
+        let available = store.read().map_err(FsError::from)?.available();
+
+        // Writer A retries. The replayed quarantine must not touch B's replica.
+        let err = handler_a
+            .complete(&spdk_complete_msg(&block), false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("flush timed out"),
+            "A must still get its original error: {err}"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Finalized),
+            "B's finalized replica must not be quarantined by A's retry"
+        );
+        assert_eq!(
+            store.read().map_err(FsError::from)?.available(),
+            available,
+            "B's extent must stay accounted to B"
+        );
+        assert!(
+            handler_a.is_commit,
+            "finalized block is terminal: must latch"
+        );
+        assert!(handler_a.lease.is_none(), "A's lease must be released");
+
+        Ok(())
+    }
 }
