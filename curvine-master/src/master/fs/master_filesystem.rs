@@ -3097,48 +3097,64 @@ impl MasterFilesystem {
                 .collect();
             let _inode_locks = self.inode_locks.lock_many(&requests);
 
-            let (locked, locked_epoch) = match self.resolve_live_store_view(path) {
-                Ok(value) => value,
-                Err(_) if expected_id.is_some() => return Ok(None),
-                Err(error) => return Err(error),
+            let next_id = {
+                let fs_dir = self.fs_dir.read();
+                let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
+                    Ok(epoch) => epoch,
+                    Err(_) if expected_id.is_some() => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                if locked_epoch != restore_epoch {
+                    continue;
+                }
+                let inp = match Self::resolve_path(&fs_dir, path) {
+                    Ok(inp) => inp,
+                    Err(_) if expected_id.is_some() => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                if !Self::live_path_matches(&resolved, &inp) {
+                    continue;
+                }
+                let Some(inode) = inp.get_last_inode() else {
+                    continue;
+                };
+                if expected_id.is_some_and(|id| id != inode.id()) || !inode.is_file() {
+                    return Ok(None);
+                }
+                inode
+                    .as_file_ref()?
+                    .search_next_block(last_block.as_ref().map(|block| block.id))
+                    .map(|block| block.id)
             };
-            if locked_epoch != restore_epoch || !resolved.same_resolution(&locked) {
-                continue;
-            }
-            let Some(locked_target) = locked.target() else {
-                continue;
-            };
-            if expected_id.is_some_and(|id| id != locked_target.id()) || !locked_target.is_file() {
-                return Ok(None);
-            }
-
-            let locked_file = locked_target.as_file_ref()?;
-            let next = locked_file.search_next_block(last_block.as_ref().map(|block| block.id));
             let mut block_ids = commit_block_ids.clone();
-            if let Some(next_block) = &next {
-                block_ids.push(next_block.id);
+            if let Some(next_id) = next_id {
+                block_ids.push(next_id);
             }
             let _location_locks = self
                 .block_location_locks
                 .write_workers_blocks(&commit_worker_ids, &block_ids);
 
             let fs_dir = self.fs_dir.read();
+            if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
+                continue;
+            }
             let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&locked, &inp) {
+            if !Self::live_path_matches(&resolved, &inp) {
                 continue;
             }
             let Some(inode) = inp.get_last_inode() else {
                 continue;
             };
-            if inode.id() != locked_target.id()
-                || expected_id.is_some_and(|id| id != inode.id())
-                || !inode.is_file()
-            {
+            if expected_id.is_some_and(|id| id != inode.id()) || !inode.is_file() {
                 continue;
             }
             let file = inode.as_file_ref()?;
+            let next = file.search_next_block(last_block.as_ref().map(|block| block.id));
+            if next.map(|block| block.id) != next_id {
+                continue;
+            }
 
-            if let Some(next) = file.search_next_block(last_block.as_ref().map(|block| block.id)) {
+            if let Some(next) = next {
                 let locs = fs_dir.get_block_locations(next.id)?;
                 let extend_block = ExtendedBlock {
                     id: next.id,
