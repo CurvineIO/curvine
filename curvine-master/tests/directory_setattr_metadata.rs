@@ -20,6 +20,28 @@ fn filesystem(name: &str) -> MasterFilesystem {
 }
 
 #[test]
+fn setattr_rejects_restore_admission_without_changing_metadata() {
+    let fs = filesystem("restore-admission-attrs");
+    fs.mkdir("/dir", false).unwrap();
+    let before = fs.file_status("/dir").unwrap();
+    let restore = fs
+        .fs_dir
+        .read()
+        .store_ref()
+        .begin_restore(std::time::Duration::from_secs(1))
+        .unwrap();
+    let opts = SetAttrOpts {
+        mode: Some(0o600),
+        ..Default::default()
+    };
+    let error = fs.set_attr("/dir", opts.clone()).unwrap_err();
+    assert!(error.to_string().contains("snapshot restore"));
+    drop(restore);
+    assert_eq!(fs.file_status("/dir").unwrap().mode, before.mode);
+    assert_eq!(fs.set_attr("/dir", opts).unwrap().mode, 0o600);
+}
+
+#[test]
 fn setattr_missing_and_reserved_paths_do_not_change_existing_directory() {
     let fs = filesystem("missing-reserved-attrs");
     fs.mkdir("/parent", false).unwrap();

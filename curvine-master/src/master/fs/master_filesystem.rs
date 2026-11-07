@@ -1058,14 +1058,18 @@ impl MasterFilesystem {
                 })
                 .collect();
             let _locks = self.inode_locks.lock_many(&requests);
-            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
-            if restore_epoch != locked_epoch || !resolved.same_resolution(&locked) {
+            let fs_dir = self.fs_dir.read();
+            let control = fs_dir.store.scan_control();
+            if control.is_restoring() {
+                return err_box!(
+                    "metadata scan lease rejected: snapshot restore is pending or in progress"
+                );
+            }
+            if restore_epoch != control.cancel_epoch() {
                 continue;
             }
-
-            let fs_dir = self.fs_dir.read();
             let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&locked, &inp) {
+            if !Self::live_path_matches(&resolved, &inp) {
                 continue;
             }
             return fs_dir.set_attr(inp, opts);
