@@ -99,6 +99,31 @@ fn add_and_reinsert_hold_list_lock_until_bucket_write_finishes() {
 }
 
 #[test]
+fn drain_respects_inclusive_boundary_and_extreme_times() {
+    let list = ttl_bucket_list();
+    {
+        let mut buckets = list.buckets.lock();
+        for start in [i64::MIN, -1, 0, 1000, i64::MAX] {
+            buckets.insert(start, Arc::new(TtlBucket::new(start, INTERVAL_MS)));
+        }
+    }
+    let starts = |buckets: Vec<Arc<TtlBucket>>| {
+        buckets
+            .iter()
+            .map(|bucket| bucket.interval_start_ms)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(starts(list.get_expired_buckets_at(i64::MIN)), [i64::MIN]);
+    assert_eq!(starts(list.get_expired_buckets_at(1000)), [-1, 0]);
+    assert!(starts(list.get_expired_buckets_at(1000)).is_empty());
+    assert_eq!(starts(list.get_expired_buckets_at(i64::MAX)), [1000]);
+    assert_eq!(
+        list.buckets.lock().keys().copied().collect::<Vec<_>>(),
+        [i64::MAX]
+    );
+}
+
+#[test]
 fn add_skips_when_ttl_disabled() {
     let list = ttl_bucket_list();
     list.add(&file_no_ttl(1, 0));
