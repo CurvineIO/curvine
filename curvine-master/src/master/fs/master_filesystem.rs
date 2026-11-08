@@ -20,6 +20,7 @@ use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
 use crate::master::meta::inode::{
     DirectoryChildrenSharedVersion, InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR,
+    ROOT_INODE_ID,
 };
 use crate::master::meta::store::{InodeStoreSnapshot, StoreResolvedPath};
 use crate::master::meta::{
@@ -480,6 +481,45 @@ impl MasterFilesystem {
         true
     }
 
+    // Plan from directory edges; load the target inode after acquiring its
+    // lock so its metadata cannot be stale when the mutation is applied.
+    // Each ID and child directory handle is read under the child-index lock.
+    // Handles keep subsequent lookups alive across concurrent deletions.
+    // The IDs are only a lock plan; callers must revalidate them after locking.
+    fn resolve_edge_ids(&self, path: &str) -> FsResult<(Vec<i64>, usize, bool, u64)> {
+        let fs_dir = self.fs_dir.read();
+        let control = fs_dir.store.scan_control();
+        if control.is_restoring() {
+            return err_box!(
+                "metadata scan lease rejected: snapshot restore is pending or in progress"
+            );
+        }
+        let epoch = control.cancel_epoch();
+        fs_dir.store.ensure_available()?;
+        let components = InodeView::path_components(path)?;
+        let name = try_option!(components.last(), "Path {} has no components", path);
+        if name.is_empty() {
+            return err_box!("Path {} is invalid", path);
+        }
+        let mut ids = Vec::with_capacity(components.len());
+        let mut directory = match fs_dir.root_dir().children_handle() {
+            Some(handle) => handle,
+            None => return err_box!("root inode is not a directory"),
+        };
+        ids.push(ROOT_INODE_ID);
+        for name in components.iter().skip(1) {
+            let Some((id, next)) = directory.read_child_edge(name) else {
+                break;
+            };
+            ids.push(id);
+            let Some(next) = next else { break };
+            directory = next;
+        }
+        Self::check_not_pending_path(path)?;
+        let full = ids.len() == components.len();
+        Ok((ids, components.len(), full, epoch))
+    }
+
     #[inline]
     fn checked_live_epoch(fs_dir: &FsDir) -> FsResult<u64> {
         let control = fs_dir.store.scan_control();
@@ -501,6 +541,24 @@ impl MasterFilesystem {
         let epoch = Self::checked_live_epoch(&fs_dir)?;
         let inp = Self::resolve_path(&fs_dir, path)?;
         Ok((StoreResolvedPath::from_live(&inp), epoch))
+    }
+
+    // The caller holds every planned inode lock throughout this traversal.
+    fn resolve_locked_path(
+        fs_dir: &FsDir,
+        path: &str,
+        ids: &[i64],
+        components_len: usize,
+    ) -> FsResult<Option<InodePath>> {
+        let result = InodePath::resolve_locked(
+            fs_dir.root_ptr(),
+            path,
+            &fs_dir.store,
+            ids,
+            components_len,
+        )?;
+        Self::check_not_pending_path(path)?;
+        Ok(result)
     }
 
     fn live_path_matches(resolved: &StoreResolvedPath, inp: &InodePath) -> bool {
@@ -1315,30 +1373,29 @@ impl MasterFilesystem {
         mode: u32,
         owner: Option<String>,
         group: Option<String>,
-        initial: (StoreResolvedPath, u64),
+        initial: (Vec<i64>, usize, bool, u64),
     ) -> FsResult<()> {
         const MAX_RETRIES: usize = 3;
         let mut initial = Some(initial);
 
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = match initial.take() {
+            let (ids, components_len, full, restore_epoch) = match initial.take() {
                 Some(resolved) => resolved,
-                None => self.resolve_live_store_view(link)?,
+                None => self.resolve_edge_ids(link)?,
             };
-            if resolved.is_full() || resolved.inodes().len() + 1 < resolved.components().len() {
+            if full || ids.len() + 1 < components_len {
                 return self.symlink_with_global_lock(target, link, false, mode, owner, group);
             }
 
-            let parent_index = resolved.inodes().len() - 1;
-            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
-                .inodes()
+            let parent_index = ids.len() - 1;
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
-                .map(|(depth, inode)| {
+                .map(|(depth, id)| {
                     if depth == parent_index {
-                        InodeLockRequest::write(depth, inode.id())
+                        InodeLockRequest::write(depth, *id)
                     } else {
-                        InodeLockRequest::read(depth, inode.id())
+                        InodeLockRequest::read(depth, *id)
                     }
                 })
                 .collect();
@@ -1347,10 +1404,9 @@ impl MasterFilesystem {
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-            let inp = Self::resolve_path(&fs_dir, link)?;
-            if !Self::live_path_matches(&resolved, &inp) {
+            let Some(inp) = Self::resolve_locked_path(&fs_dir, link, &ids, components_len)? else {
                 continue;
-            }
+            };
             if inp.is_full() {
                 drop(fs_dir);
                 drop(_locks);
@@ -4548,12 +4604,10 @@ impl MasterFilesystem {
         let target = target.as_ref().to_string();
         let link = link.as_ref().to_string();
         self.run_metadata_write(|| {
-            let resolved = self.resolve_live_store_view(&link)?;
+            let resolved = self.resolve_edge_ids(&link)?;
             Self::check_not_pending_path(&link)?;
             Self::check_not_reserved_path(&link)?;
-            let single_parent = !force
-                && !resolved.0.is_full()
-                && resolved.0.inodes().len() + 1 >= resolved.0.components().len();
+            let single_parent = !force && !resolved.2 && resolved.0.len() + 1 >= resolved.1;
             if single_parent {
                 self.symlink_single_parent_sharded(
                     &target,

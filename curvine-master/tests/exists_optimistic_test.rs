@@ -571,6 +571,18 @@ fn symlink_rejects_restore_admission_without_publishing_entry() {
 }
 
 #[test]
+fn symlink_rejects_file_parent_and_survives_restore() {
+    let fs = test_fs("symlink-file-parent");
+    fs.create("/file", false).unwrap();
+    assert!(fs.symlink("/target", "/file/link", false, 0o777).is_err());
+    fs.mkdir("/dir", false).unwrap();
+    fs.symlink("/target", "/dir/link", false, 0o777).unwrap();
+    let link = fs.file_status("/dir/link").unwrap();
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/dir/link").unwrap().id, link.id);
+}
+
+#[test]
 fn symlink_under_distinct_parents_remains_consistent_after_reload() {
     let fs = test_fs("symlink-distinct-parents");
     const PARENTS: usize = 4;

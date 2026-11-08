@@ -22,7 +22,7 @@
 //! Astra promotion protocol.
 
 use super::sharded_children::{min_sharded_children, ShardedChildren};
-use super::{InodeChildren, InodePtr, InodeView};
+use super::{ChildItem, InodeChildren, InodePtr, InodeView};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::ListOptions;
 use glob::Pattern;
@@ -356,6 +356,22 @@ impl DirectoryChildren {
                 version,
             },
         )
+    }
+
+    /// Read only the identity and directory handle needed for lock planning.
+    pub(crate) fn read_child_edge(
+        &self,
+        name: &str,
+    ) -> Option<(i64, Option<std::sync::Arc<DirectoryChildren>>)> {
+        self.with_children_for_name(name, |children, name| {
+            children.get_child_item(name).map(|item| {
+                let next = match item {
+                    ChildItem::View(view) => view.children_handle(),
+                    ChildItem::FileEntry { .. } => None,
+                };
+                (item.id(), next)
+            })
+        })
     }
 
     /// Reads one child with an owned version token that remains valid after

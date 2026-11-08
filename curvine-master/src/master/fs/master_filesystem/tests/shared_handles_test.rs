@@ -22,6 +22,54 @@ fn namespace_validation_checks_first_missing_component() {
 }
 
 #[test]
+fn edge_plan_handles_survive_directory_replacement() {
+    let fs = test_fs("edge-plan-directory-replacement");
+    let old_id = fs.mkdir("/parent", false).unwrap().id;
+    let old_child_id = fs.mkdir("/parent/child", false).unwrap().id;
+    let root = fs.fs_dir.read().root_dir().children_handle().unwrap();
+    let (old_parent, _) = root.read_child_shared("parent");
+    let old_children = old_parent.unwrap().children_handle().unwrap();
+
+    fs.delete("/parent", true).unwrap();
+    let new_id = fs.mkdir("/parent", false).unwrap().id;
+    let new_child_id = fs.mkdir("/parent/child", false).unwrap().id;
+    assert_ne!(old_id, new_id);
+    assert_ne!(old_child_id, new_child_id);
+    {
+        let guard = fs.fs_dir.read();
+        assert!(MasterFilesystem::resolve_locked_path(
+            &guard,
+            "/parent/child",
+            &[ROOT_INODE_ID, old_id, old_child_id],
+            3,
+        )
+        .unwrap()
+        .is_none());
+    }
+    let (old_child, _) = old_children.read_child_shared("child");
+    assert_eq!(old_child.unwrap().id(), old_child_id);
+    let (ids, components, full, _) = fs.resolve_edge_ids("/parent/child").unwrap();
+    assert!(full);
+    assert_eq!(components, ids.len());
+    assert_eq!(&ids[1..], &[new_id, new_child_id]);
+}
+
+#[test]
+fn edge_plan_stops_at_a_file_component() {
+    let fs = test_fs("edge-plan-file-component");
+    let file = fs.create("/file", true).unwrap();
+    let (ids, components, full, _) = fs.resolve_edge_ids("/file/child").unwrap();
+    assert!(!full);
+    assert_eq!(components, 3);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[1], file.id);
+    let guard = fs.fs_dir.read();
+    assert!(MasterFilesystem::resolve_locked_path(&guard, "/file/child", &ids, components)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
 fn topology_reads_wait_for_shared_namespace_writers() {
     let fs = test_fs("status-list-exclusive");
     fs.create("/dir/file", true).unwrap();

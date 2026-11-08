@@ -119,7 +119,20 @@ impl InodePath {
         path: T,
         store: &InodeStore,
     ) -> CommonResult<Self> {
-        Self::resolve_inner::<T, false>(root, path, store)
+        Ok(Self::resolve_inner::<T, false, false>(root, path, store, &[], 0)?
+            .expect("unconditional path resolution always returns a path"))
+    }
+
+    /// Resolve while holding locks for every planned inode. Stop before
+    /// traversing an inode whose identity differs from the lock plan.
+    pub(crate) fn resolve_locked<T: AsRef<str>>(
+        root: InodePtr,
+        path: T,
+        store: &InodeStore,
+        ids: &[i64],
+        components_len: usize,
+    ) -> CommonResult<Option<Self>> {
+        Self::resolve_inner::<T, false, true>(root, path, store, ids, components_len)
     }
 
     /// Capture directory versions before each traversal step and before the
@@ -129,14 +142,17 @@ impl InodePath {
         path: T,
         store: &InodeStore,
     ) -> CommonResult<Self> {
-        Self::resolve_inner::<T, true>(root, path, store)
+        Ok(Self::resolve_inner::<T, true, false>(root, path, store, &[], 0)?
+            .expect("unconditional path resolution always returns a path"))
     }
 
-    fn resolve_inner<T: AsRef<str>, const TRACK_VERSIONS: bool>(
+    fn resolve_inner<T: AsRef<str>, const TRACK_VERSIONS: bool, const CHECK_IDS: bool>(
         root: InodePtr,
         path: T,
         store: &InodeStore,
-    ) -> CommonResult<Self> {
+        ids: &[i64],
+        components_len: usize,
+    ) -> CommonResult<Option<Self>> {
         store.ensure_available()?;
         let components = InodeView::path_components(path.as_ref())?;
         let name = try_option!(
@@ -149,12 +165,18 @@ impl InodePath {
             return err_box!("Path {} is invalid", path.as_ref());
         }
 
+        if CHECK_IDS && components.len() != components_len {
+            return Ok(None);
+        }
         let mut inodes: Vec<InodePtr> = Vec::with_capacity(components.len());
         let mut versions = Vec::new();
         let mut cur_inode = root;
         let mut index = 0;
 
         while index < components.len() {
+            if CHECK_IDS && ids.get(index).is_none_or(|id| cur_inode.id() != *id) {
+                return Ok(None);
+            }
             if TRACK_VERSIONS {
                 if let Some(children) = cur_inode.as_ref().children_handle() {
                     versions.push(children.shared_version());
@@ -187,6 +209,9 @@ impl InodePath {
             index += 1;
         }
 
+        if CHECK_IDS && inodes.len() != ids.len() {
+            return Ok(None);
+        }
         let inode_path = Self {
             path: path.as_ref().to_string(),
             name: name.to_string(),
@@ -195,7 +220,7 @@ impl InodePath {
             versions,
         };
 
-        Ok(inode_path)
+        Ok(Some(inode_path))
     }
 
     fn reconstruct_path_for_match(
