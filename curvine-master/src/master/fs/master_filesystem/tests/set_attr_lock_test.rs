@@ -60,6 +60,66 @@ fn set_lock_replans_after_parent_replacement() {
     assert!(fs.get_lock("/a/file", query).unwrap().is_some());
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn recursive_set_attr_preserves_concurrent_hardlink_update() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("recursive-set-attr-hardlink");
+    fs.create("/tree/file", true).unwrap();
+    fs.link("/tree/file", "/alias").unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "recursive-set-attr-hardlink";
+    let rule = FaultRuleBuilder::named("master.metadata.set_attr.before_commit")
+        .matches("root_name", "tree")
+        .unwrap()
+        .times(1)
+        .unwrap()
+        .delay(1500)
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        worker_fs.set_attr(
+            "/tree",
+            SetAttrOpts {
+                recursive: true,
+                mode: Some(0o600),
+                ..Default::default()
+            },
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let delayed = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let update = if delayed {
+        Some(fs.set_attr(
+            "/alias",
+            SetAttrOpts {
+                mtime: Some(1_234_567),
+                ..Default::default()
+            },
+        ))
+    } else {
+        None
+    };
+    let result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(delayed, "recursive set_attr did not reach the commit point");
+    update.unwrap().unwrap();
+    result.unwrap();
+    let status = fs.file_status("/alias").unwrap();
+    assert_eq!(status.mtime, 1_234_567);
+    assert_eq!(status.mode, 0o600);
+    fs.restore_from_rocksdb().unwrap();
+    let status = fs.file_status("/alias").unwrap();
+    assert_eq!(status.mtime, 1_234_567);
+    assert_eq!(status.mode, 0o600);
+}
+
 #[test]
 fn single_inode_set_attr_does_not_wait_for_fs_dir_readers() {
     let fs = test_fs("set-attr-shared-fs-dir");
@@ -82,7 +142,7 @@ fn single_inode_set_attr_does_not_wait_for_fs_dir_readers() {
 }
 
 #[test]
-fn recursive_set_attr_does_not_wait_for_fs_dir_readers() {
+fn recursive_set_attr_waits_for_shared_namespace_readers() {
     let fs = test_fs("recursive-set-attr-shared-reader");
     fs.create("/tree/dir/file", true).unwrap();
     let read_guard = fs.fs_dir.read();
@@ -102,51 +162,22 @@ fn recursive_set_attr_does_not_wait_for_fs_dir_readers() {
             .unwrap();
     });
 
-    let status = done_rx
-        .recv_timeout(std::time::Duration::from_secs(3))
-        .expect("recursive set_attr was blocked by a shared namespace reader")
-        .unwrap();
-    assert_eq!(status.mode, 0o700);
+    let early = done_rx.recv_timeout(std::time::Duration::from_millis(100));
     drop(read_guard);
+    let status = match early {
+        Ok(result) => {
+            task.join().unwrap();
+            panic!("recursive set_attr bypassed the namespace writer: {result:?}");
+        }
+        Err(_) => done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap(),
+    };
+    assert_eq!(status.mode, 0o700);
     task.join().unwrap();
     assert_eq!(fs.file_status("/tree/dir").unwrap().mode, 0o700);
     assert_eq!(fs.file_status("/tree/dir/file").unwrap().mode, 0o700);
     fs.restore_from_rocksdb().unwrap();
     assert_eq!(fs.file_status("/tree/dir").unwrap().mode, 0o700);
     assert_eq!(fs.file_status("/tree/dir/file").unwrap().mode, 0o700);
-}
-
-#[test]
-fn recursive_set_attr_waits_for_the_recursive_root_lock() {
-    let fs = test_fs("recursive-set-attr-root-lock");
-    fs.create("/tree/dir/file", true).unwrap();
-    let tree_id = fs.file_status("/tree").unwrap().id;
-    let held = fs.inode_locks.write_inode(tree_id);
-    let worker = fs.clone();
-    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-    let task = std::thread::spawn(move || {
-        done_tx
-            .send(
-                worker.set_attr(
-                    "/tree",
-                    SetAttrOptsBuilder::new()
-                        .recursive(true)
-                        .mode(0o700)
-                        .build(),
-                ),
-            )
-            .unwrap();
-    });
-
-    assert!(
-        done_rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err(),
-        "recursive set_attr bypassed the recursive root inode lock"
-    );
-    drop(held);
-    task.join().unwrap();
-    assert_eq!(done_rx.recv().unwrap().unwrap().mode, 0o700);
 }
 
 #[test]

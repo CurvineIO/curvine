@@ -61,6 +61,29 @@ fn setattr_missing_and_reserved_paths_do_not_change_existing_directory() {
     assert_eq!((before.id, before.mode), (after.id, after.mode));
 }
 
+#[test]
+fn setattr_resolves_root_and_hard_link_after_restore() {
+    let fs = filesystem("root-link-attrs");
+    fs.create("/parent/file", true).unwrap();
+    fs.link("/parent/file", "/parent/alias").unwrap();
+    for (path, mode) in [("/", 0o750), ("/parent/alias", 0o640)] {
+        let status = fs
+            .set_attr(
+                path,
+                SetAttrOpts {
+                    mode: Some(mode),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(status.mode, mode);
+    }
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/").unwrap().mode, 0o750);
+    assert_eq!(fs.file_status("/parent/file").unwrap().mode, 0o640);
+    assert_eq!(fs.file_status("/parent/alias").unwrap().mode, 0o640);
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn failed_recursive_setattr_keeps_memory_and_store_unchanged() {

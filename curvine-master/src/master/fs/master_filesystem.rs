@@ -1122,32 +1122,31 @@ impl MasterFilesystem {
         &self,
         path: &str,
         opts: SetAttrOpts,
-        initial: (StoreResolvedPath, u64),
+        initial: (Vec<i64>, usize, bool, u64),
     ) -> FsResult<FileStatus> {
         const MAX_RETRIES: usize = 3;
         let mut initial = Some(initial);
 
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = match initial.take() {
+            let (ids, components_len, full, restore_epoch) = match initial.take() {
                 Some(resolved) => resolved,
-                None => self.resolve_live_store_view(path)?,
+                None => self.resolve_edge_ids(path)?,
             };
-            if !resolved.is_full() {
+            if !full {
                 let fs_dir = self.fs_dir.write();
                 let inp = Self::resolve_path(&fs_dir, path)?;
                 return fs_dir.set_attr(inp, opts);
             }
 
-            let target_depth = resolved.inodes().len() - 1;
-            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
-                .inodes()
+            let target_depth = ids.len() - 1;
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
-                .map(|(depth, inode)| {
+                .map(|(depth, id)| {
                     if depth == target_depth {
-                        InodeLockRequest::write(depth, inode.id())
+                        InodeLockRequest::write(depth, *id)
                     } else {
-                        InodeLockRequest::read(depth, inode.id())
+                        InodeLockRequest::read(depth, *id)
                     }
                 })
                 .collect();
@@ -1156,10 +1155,9 @@ impl MasterFilesystem {
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&resolved, &inp) {
+            let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
                 continue;
-            }
+            };
             return fs_dir.set_attr(inp, opts);
         }
 
@@ -4581,7 +4579,16 @@ impl MasterFilesystem {
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
         self.run_metadata_write(|| {
             let path = path.as_ref();
-            let resolved = self.resolve_live_store_view(path)?;
+            if opts.recursive {
+                // Descendant files may have hard links outside this subtree;
+                // locking only the directory path does not protect them.
+                let fs_dir = self.fs_dir.write();
+                Self::checked_live_epoch(&fs_dir)?;
+                let inp = Self::resolve_path(&fs_dir, path)?;
+                Self::check_not_reserved_path(path)?;
+                return fs_dir.set_attr(inp, opts);
+            }
+            let resolved = self.resolve_edge_ids(path)?;
             Self::check_not_pending_path(path)?;
             Self::check_not_reserved_path(path)?;
             self.set_attr_single_path_sharded(path, opts, resolved)
