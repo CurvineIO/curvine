@@ -1159,40 +1159,41 @@ impl MasterFilesystem {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = match self.resolve_live_store_view(path) {
+            let (ids, components_len, _, restore_epoch) = match self.resolve_edge_ids(path) {
                 Ok(value) => value,
                 Err(error) if matches!(error.kind(), ErrorKind::FileNotFound) => return Ok(()),
                 Err(error) => return Err(error),
             };
-            let Some(target) = resolved.target() else {
-                return Ok(());
-            };
-            if resolved.inodes().len() < 2 || !target.is_file() {
-                return self.close_file_with_global_lock(path, client_name);
-            }
-
-            let target_depth = resolved.inodes().len() - 1;
-            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
-                .inodes()
+            let target_depth = ids.len() - 1;
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
-                .map(|(depth, inode)| {
+                .map(|(depth, id)| {
                     if depth == target_depth {
-                        InodeLockRequest::write(depth, inode.id())
+                        InodeLockRequest::write(depth, *id)
                     } else {
-                        InodeLockRequest::read(depth, inode.id())
+                        InodeLockRequest::read(depth, *id)
                     }
                 })
                 .collect();
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.close_planned",
+                description: "Close path resolved before inode locks",
+                context: {"path" => path},
+            }
             let _locks = self.inode_locks.lock_many(&requests);
             let fs_dir = self.fs_dir.read();
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&resolved, &inp) {
-                continue;
-            }
+            let inp = match Self::resolve_locked_path(&fs_dir, path, &ids, components_len) {
+                Ok(Some(inp)) => inp,
+                Ok(None) => continue,
+                Err(error) if matches!(error.kind(), ErrorKind::FileNotFound) => return Ok(()),
+                Err(error) => return Err(error),
+            };
             fs_dir.close_writer(&inp, client_name)?;
             return Ok(());
         }
