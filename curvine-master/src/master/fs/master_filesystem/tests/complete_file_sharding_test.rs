@@ -226,6 +226,47 @@ fn reopen_replans_after_parent_replacement() {
 
 #[cfg(feature = "fault-injection")]
 #[test]
+fn block_locations_replans_after_parent_replacement() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("locations-read-replaced-parent");
+    let old = fs.create("/a/file", true).unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "locations-read-replaced-parent";
+    let rule = FaultRuleBuilder::named("master.metadata.locations_read_planned")
+        .matches("path", "/a/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(old.id);
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || worker_fs.get_block_locations("/a/file"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let replacement = if planned {
+        fs.delete("/a", true).unwrap();
+        Some(fs.create("/a/file", true).unwrap())
+    } else {
+        None
+    };
+    drop(held);
+    let result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "block location read did not reach lock planning");
+    let replacement = replacement.unwrap();
+    assert_ne!(old.id, replacement.id);
+    assert_eq!(result.unwrap().status.id, replacement.id);
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/a/file").unwrap().id, replacement.id);
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
 fn complete_by_id_survives_parent_replacement() {
     use curvine_fault::{FaultRuleBuilder, FaultRuntime};
     use std::time::{Duration, Instant};

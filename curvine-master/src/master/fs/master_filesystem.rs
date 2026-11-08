@@ -3358,26 +3358,30 @@ impl MasterFilesystem {
         // every resolution step stays in memory (no store-snapshot walks).
         let mut result = None;
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
-            Self::check_not_pending_path(path)?;
-            if !resolved.is_full() {
+            let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
+            if !full {
                 break;
             }
-            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
-                .inodes()
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
-                .map(|(depth, inode)| InodeLockRequest::read(depth, inode.id()))
+                .map(|(depth, id)| InodeLockRequest::read(depth, *id))
                 .collect();
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.locations_read_planned",
+                description: "Block location read path resolved before inode locks",
+                context: {"path" => path},
+            }
             let _locks = self.inode_locks.lock_many(&requests);
             let fs_dir = self.fs_dir.read();
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&resolved, &inp) {
+            let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
                 continue;
-            }
+            };
             result = Some(read(&fs_dir, &inp)?);
             break;
         }
