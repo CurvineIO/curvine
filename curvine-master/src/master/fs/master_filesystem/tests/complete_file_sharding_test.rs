@@ -2315,6 +2315,52 @@ fn atime_refresh_does_not_wait_for_a_shared_namespace_reader() {
     worker.join().unwrap().unwrap();
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn verified_release_does_not_touch_replaced_inode() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("verified-release-replaced-parent");
+    freeable_replication_file(&fs, "/a/file");
+    let id = fs.file_status("/a/file").unwrap().id;
+    let snapshot = fs.fs_mode_snapshot(id).unwrap().unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "verified-release-replaced-parent";
+    let rule = FaultRuleBuilder::named("master.metadata.locations_sampled")
+        .matches("path", "/a/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(id);
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        worker_fs.release_verified(id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime)
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let replacement = if planned {
+        fs.delete("/a", true).unwrap();
+        Some(fs.create("/a/file", true).unwrap())
+    } else {
+        None
+    };
+    drop(held);
+    let result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "verified release did not reach location sampling");
+    let replacement = replacement.unwrap();
+    assert_ne!(id, replacement.id);
+    assert!(!result.unwrap());
+    assert_eq!(fs.file_status("/a/file").unwrap().id, replacement.id);
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/a/file").unwrap().id, replacement.id);
+}
+
 #[test]
 fn verified_release_waits_for_conflicting_worker_location_lock() {
     let fs = test_fs("verified-release-worker-location-lock");
