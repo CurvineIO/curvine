@@ -20,6 +20,51 @@ use curvine_model::{FileLock, LockType};
 use curvine_runtime::common::{LocalTime, Utils};
 
 #[test]
+fn set_lock_resolves_alias_and_rejects_missing_path() {
+    Master::init_test_metrics();
+    let mut conf = curvine_config::ClusterConf::format();
+    conf.testing = true;
+    conf.journal.enable = false;
+    conf.master.meta_dir = Utils::test_sub_dir(format!("set-lock-path-{}", Utils::rand_str(8)));
+    conf.journal.journal_dir =
+        Utils::test_sub_dir(format!("set-lock-journal-{}", Utils::rand_str(8)));
+    let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+    fs.create("/dir/file", true).unwrap();
+    fs.link("/dir/file", "/dir/alias").unwrap();
+    let lock = FileLock {
+        client_id: "owner".into(),
+        owner_id: 1,
+        acquire_time: LocalTime::mills(),
+        lock_type: LockType::WriteLock,
+        end: 100,
+        ..FileLock::default()
+    };
+    assert!(fs.set_lock("/dir/alias", lock.clone()).unwrap().is_none());
+    let query = FileLock {
+        client_id: "other".into(),
+        owner_id: 2,
+        end: 100,
+        ..FileLock::default()
+    };
+    assert!(fs.get_lock("/dir/file", query.clone()).unwrap().is_some());
+    assert!(fs.set_lock("/dir/missing", query.clone()).is_err());
+    assert!(fs.set_lock("/dir/file/child", query).is_err());
+    fs.restore_from_rocksdb().unwrap();
+    assert!(fs
+        .get_lock(
+            "/dir/file",
+            FileLock {
+                client_id: "other".into(),
+                owner_id: 2,
+                end: 100,
+                ..FileLock::default()
+            }
+        )
+        .unwrap()
+        .is_some());
+}
+
+#[test]
 fn get_lock_matches_full_path_resolution() {
     const CONTAINER_ENV: &str = "CURVINE_TEST_LOCK_PATH_CONTAINER";
     let container = match std::env::var(CONTAINER_ENV).as_deref() {

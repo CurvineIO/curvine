@@ -1,6 +1,65 @@
 use super::*;
 use curvine_model::{FileLock, LockFlags, LockType};
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn set_lock_replans_after_parent_replacement() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("set-lock-replaced-parent");
+    let old_file = fs.create("/a/file", true).unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "set-lock-replaced-parent";
+    let rule = FaultRuleBuilder::named("master.metadata.set_lock_planned")
+        .matches("path", "/a/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(old_file.id);
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        worker_fs.set_lock(
+            "/a/file",
+            FileLock {
+                client_id: "owner".into(),
+                owner_id: 1,
+                acquire_time: curvine_runtime::common::LocalTime::mills(),
+                lock_type: LockType::WriteLock,
+                end: 100,
+                ..Default::default()
+            },
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let new_file = if planned {
+        fs.delete("/a", true).unwrap();
+        Some(fs.create("/a/file", true).unwrap())
+    } else {
+        None
+    };
+    drop(held);
+    let result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "set_lock did not reach lock planning");
+    assert_ne!(old_file.id, new_file.unwrap().id);
+    assert!(result.unwrap().is_none());
+    let query = FileLock {
+        client_id: "other".into(),
+        owner_id: 2,
+        end: 100,
+        ..Default::default()
+    };
+    assert!(fs.get_lock("/a/file", query.clone()).unwrap().is_some());
+    fs.restore_from_rocksdb().unwrap();
+    assert!(fs.get_lock("/a/file", query).unwrap().is_some());
+}
+
 #[test]
 fn single_inode_set_attr_does_not_wait_for_fs_dir_readers() {
     let fs = test_fs("set-attr-shared-fs-dir");
