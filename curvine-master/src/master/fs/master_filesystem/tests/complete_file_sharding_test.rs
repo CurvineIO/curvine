@@ -2600,3 +2600,40 @@ fn complete_file_commit_failure_keeps_memory_and_store_unchanged() {
         .unwrap();
     assert!(fs.file_status("/file").unwrap().is_complete);
 }
+
+#[test]
+#[ignore]
+fn status_probe_owned() {
+    let fs = test_fs("status-probe-owned");
+    for i in 0..256 {
+        fs.create(&format!("/parent/file-{i}"), true).unwrap();
+    }
+    let id = fs.file_status("/parent/file-0").unwrap().id;
+    let mut samples = Vec::new();
+    let start = std::time::Instant::now();
+    let mut count = 0;
+    while start.elapsed() < std::time::Duration::from_millis(3500) {
+        let now = std::time::Instant::now();
+        assert_eq!(fs.file_status("/parent/file-0").unwrap().id, id);
+        if start.elapsed() >= std::time::Duration::from_millis(500) && count % 17 == 0 {
+            samples.push(now.elapsed().as_nanos() as u64);
+        }
+        count += 1;
+    }
+    samples.sort_unstable();
+    println!("RESULT kind=status p50={} p99={} n={}", samples[samples.len()/2],samples[samples.len()*99/100],samples.len());
+    let mut samples = Vec::new();
+    let start = std::time::Instant::now();
+    let mut count = 0;
+    while start.elapsed() < std::time::Duration::from_millis(3500) {
+        let now = std::time::Instant::now();
+        let list = fs.list_status("/parent").unwrap();
+        assert_eq!(list.len(), 256);
+        if start.elapsed() >= std::time::Duration::from_millis(500) && count % 17 == 0 {
+            samples.push(now.elapsed().as_nanos() as u64);
+        }
+        count += 1;
+    }
+    samples.sort_unstable();
+    println!("RESULT kind=list p50={} p99={} n={}", samples[samples.len()/2],samples[samples.len()*99/100],samples.len());
+}
