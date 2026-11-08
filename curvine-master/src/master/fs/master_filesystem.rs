@@ -540,7 +540,11 @@ impl MasterFilesystem {
             }
             if full {
                 if flags.overwrite() && !flags.exclusive() {
-                    if let Some(result) = self.overwrite_file_sharded(path, opts.clone(), None)? {
+                    if let Some(result) = self.overwrite_file_sharded(
+                        path,
+                        opts.clone(),
+                        Some((ids, components_len, full, restore_epoch, None)),
+                    )? {
                         return Ok((result.0, Some(result.1)));
                     }
                 }
@@ -584,23 +588,33 @@ impl MasterFilesystem {
         &self,
         path: &str,
         opts: CreateFileOpts,
-        mut initial: Option<(StoreResolvedPath, u64)>,
+        mut initial: Option<(Vec<i64>, usize, bool, u64, Option<InodeView>)>,
     ) -> FsResult<Option<(FileStatus, DeleteResult)>> {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = match initial.take() {
+            let (ids, components_len, full, restore_epoch, target) = match initial.take() {
                 Some(resolved) => resolved,
-                None => self.resolve_live_store_view(path)?,
+                None => {
+                    let (ids, components_len, full, epoch) = self.resolve_edge_ids(path)?;
+                    (ids, components_len, full, epoch, None)
+                }
             };
-            let Some(target) = resolved.target() else {
-                return Ok(None);
-            };
-            if resolved.inodes().len() < 2 || !target.is_file() {
+            if !full || ids.len() < 2 {
                 return Ok(None);
             }
-
-            let target_depth = resolved.inodes().len() - 1;
+            let target_id = *ids.last().expect("full path has a target");
+            let target_depth = ids.len() - 1;
+            let target = match target {
+                Some(target) => Some(target),
+                None => {
+                    let fs_dir = self.fs_dir.read();
+                    fs_dir.store.get_inode(target_id, None)?
+                }
+            };
+            let Some(target) = target.filter(|inode| inode.is_file()) else {
+                return Ok(None);
+            };
             let block_ids = target.as_file_ref()?.block_ids();
             let worker_ids = {
                 let fs_dir = self.fs_dir.read();
@@ -614,18 +628,24 @@ impl MasterFilesystem {
                 }
                 worker_ids.into_iter().collect::<Vec<_>>()
             };
-            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
-                .inodes()
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
-                .map(|(depth, inode)| {
+                .map(|(depth, inode_id)| {
                     if depth == target_depth {
-                        InodeLockRequest::write(depth, inode.id())
+                        InodeLockRequest::write(depth, *inode_id)
                     } else {
-                        InodeLockRequest::read(depth, inode.id())
+                        InodeLockRequest::read(depth, *inode_id)
                     }
                 })
                 .collect();
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.overwrite_planned",
+                description: "Overwrite path resolved before inode locks",
+                context: {"path" => path},
+            }
             let _locks = self.inode_locks.lock_many(&requests);
             let _location_locks = self
                 .block_location_locks
@@ -635,10 +655,9 @@ impl MasterFilesystem {
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&resolved, &inp) {
+            let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
                 continue;
-            }
+            };
             let Some(locked_target) = inp.get_last_inode() else {
                 continue;
             };
@@ -2484,8 +2503,16 @@ impl MasterFilesystem {
                 return Ok(Ok((blocks, None)));
             }
 
+            let ids = resolved.0.inodes().iter().map(|inode| inode.id()).collect();
+            let initial = (
+                ids,
+                resolved.0.components().len(),
+                resolved.0.is_full(),
+                resolved.1,
+                resolved.0.target().cloned(),
+            );
             if let Some((status, deleted)) =
-                self.overwrite_file_sharded(path, opts.clone(), Some(resolved))?
+                self.overwrite_file_sharded(path, opts.clone(), Some(initial))?
             {
                 return Ok(Ok((FileBlocks::new(status, vec![]), Some(deleted))));
             }
