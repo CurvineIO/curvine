@@ -3029,33 +3029,36 @@ impl MasterFilesystem {
         commit_worker_ids.dedup();
 
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = match self.resolve_live_store_view(path) {
+            let (ids, components_len, full, restore_epoch) = match self.resolve_edge_ids(path) {
                 Ok(value) => value,
                 Err(_) if expected_id.is_some() => return Ok(None),
                 Err(error) => return Err(error),
             };
-            let Some(target) = resolved.target() else {
-                return Ok(None);
-            };
-            if resolved.inodes().len() < 2
-                || expected_id.is_some_and(|id| id != target.id())
-                || !target.is_file()
+            if !full
+                || ids.len() < 2
+                || expected_id.is_some_and(|id| ids.last() != Some(&id))
             {
                 return Ok(None);
             }
-            let target_depth = resolved.inodes().len() - 1;
-            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
-                .inodes()
+            let target_depth = ids.len() - 1;
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
-                .map(|(depth, inode)| {
+                .map(|(depth, id)| {
                     if depth == target_depth {
-                        InodeLockRequest::write(depth, inode.id())
+                        InodeLockRequest::write(depth, *id)
                     } else {
-                        InodeLockRequest::read(depth, inode.id())
+                        InodeLockRequest::read(depth, *id)
                     }
                 })
                 .collect();
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.add_block_planned",
+                description: "Block allocation path resolved before inode locks",
+                context: {"path" => path},
+            }
             let _inode_locks = self.inode_locks.lock_many(&requests);
 
             let next_id = {
@@ -3068,14 +3071,12 @@ impl MasterFilesystem {
                 if locked_epoch != restore_epoch {
                     continue;
                 }
-                let inp = match Self::resolve_path(&fs_dir, path) {
-                    Ok(inp) => inp,
+                let inp = match Self::resolve_locked_path(&fs_dir, path, &ids, components_len) {
+                    Ok(Some(inp)) => inp,
+                    Ok(None) => continue,
                     Err(_) if expected_id.is_some() => return Ok(None),
                     Err(error) => return Err(error),
                 };
-                if !Self::live_path_matches(&resolved, &inp) {
-                    continue;
-                }
                 let Some(inode) = inp.get_last_inode() else {
                     continue;
                 };
@@ -3099,10 +3100,9 @@ impl MasterFilesystem {
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&resolved, &inp) {
+            let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
                 continue;
-            }
+            };
             let Some(inode) = inp.get_last_inode() else {
                 continue;
             };

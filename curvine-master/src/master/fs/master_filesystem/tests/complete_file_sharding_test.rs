@@ -329,6 +329,62 @@ fn free_replans_after_parent_replacement() {
     assert_eq!(fs.file_status("/a/file").unwrap().id, replacement.id);
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn add_block_by_id_survives_parent_replacement() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("add-block-replaced-parent");
+    let old_block = replication_file(&fs, "/a/file");
+    let old = fs.file_status("/a/file").unwrap();
+    fs.mkdir("/other", false).unwrap();
+    fs.link("/a/file", "/other/old").unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "add-block-replaced-parent";
+    let rule = FaultRuleBuilder::named("master.metadata.add_block_planned")
+        .matches("path", "/a/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(old.id);
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        worker_fs.add_block(
+            "/a/file",
+            Some(old.id),
+            ClientAddress::default(),
+            vec![],
+            vec![],
+            0,
+            None,
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let replacement = if planned {
+        fs.delete("/a", true).unwrap();
+        Some(fs.create("/a/file", true).unwrap())
+    } else {
+        None
+    };
+    drop(held);
+    let result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "add_block did not reach lock planning");
+    let replacement = replacement.unwrap();
+    assert_ne!(old.id, replacement.id);
+    assert_eq!(result.unwrap().block.id, old_block);
+    assert!(fs.get_block_locations("/a/file").unwrap().block_locs.is_empty());
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/other/old").unwrap().id, old.id);
+    assert!(fs.get_block_locations("/a/file").unwrap().block_locs.is_empty());
+}
+
 #[test]
 fn concurrent_overwrites_of_the_same_target_keep_one_consistent_file_version() {
     let fs = test_fs("overwrite-same-target-race");
