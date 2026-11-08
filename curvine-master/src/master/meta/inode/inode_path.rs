@@ -16,6 +16,7 @@ use crate::master::meta::glob_utils::parse_glob_pattern;
 use crate::master::meta::inode::InodeView::{self, Dir, File, FileEntry};
 use crate::master::meta::inode::{
     DirectoryChildrenSharedVersion, InodeDir, InodeFile, InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR,
+    ROOT_INODE_ID,
 };
 use crate::master::meta::store::InodeStore;
 use curvine_core_error::{err_box, try_option, CommonResult};
@@ -61,41 +62,65 @@ impl InodePath {
         };
 
         // Root level: the version token proves the root index stayed
-        // quiescent for every edge resolved below it. The root view clone
-        // keeps its real persisted fields and shares the live child index.
+        // quiescent for every edge resolved below it. Read callers only
+        // consume the final inode, so non-final levels are lightweight
+        // identity stubs instead of full clones.
         versions.push(directory.shared_version());
-        let mut root_view = root_view.clone();
-        root_view.change_name(components[0].clone());
-        inodes.push(InodePtr::from_owned(root_view));
+        if components.len() == 1 {
+            // The root itself is the read target: callers need its real body.
+            let mut root_view = root_view.clone();
+            root_view.change_name(components[0].clone());
+            inodes.push(InodePtr::from_owned(root_view));
+        } else {
+            inodes.push(InodePtr::from_owned(InodeView::new_entry(
+                components[0].clone(),
+                ROOT_INODE_ID,
+            )));
+        }
 
-        for component in components.iter().skip(1) {
+        let depth = components.len();
+        for (index, component) in components.iter().enumerate().skip(1) {
             let (child, _child_version) = directory.read_child_view(component);
-            match child {
+            let child = match child {
                 None => break,
-                Some(child) => {
-                    // A shared dir child carries its live child index; a file
-                    // edge resolves to the owned inode from the store.
-                    let resolved = match child {
-                        InodeView::FileEntry(entry) => {
-                            let full = store.get_inode(entry.id(), Some(entry.name()))?;
-                            InodePtr::from_owned(try_option!(
-                                full,
-                                "Failed to load inode {} from store",
-                                entry.id()
-                            ))
-                        }
-                        other => InodePtr::from_owned(other),
-                    };
-                    let next_directory = resolved.as_ref().children_handle();
-                    inodes.push(resolved);
-                    match next_directory {
+                Some(child) => child,
+            };
+            let is_final = index + 1 == depth;
+            let resolved = match child {
+                InodeView::FileEntry(entry) => {
+                    let full = store.get_inode(entry.id(), Some(entry.name()))?;
+                    InodePtr::from_owned(try_option!(
+                        full,
+                        "Failed to load inode {} from store",
+                        entry.id()
+                    ))
+                }
+                other if is_final => InodePtr::from_owned(other),
+                // Intermediate directories are walked via the captured
+                // handles below; their bodies are not part of the result.
+                other => {
+                    let next = other.children_handle();
+                    let id = other.id();
+                    let name = other.name().to_string();
+                    inodes.push(InodePtr::from_owned(InodeView::new_entry(name, id)));
+                    match next {
                         Some(next) => {
                             versions.push(next.shared_version());
                             directory = next;
                         }
                         None => break,
                     }
+                    continue;
                 }
+            };
+            let next_directory = resolved.as_ref().children_handle();
+            inodes.push(resolved);
+            match next_directory {
+                Some(next) => {
+                    versions.push(next.shared_version());
+                    directory = next;
+                }
+                None => break,
             }
         }
 
