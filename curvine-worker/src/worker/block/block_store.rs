@@ -1235,6 +1235,41 @@ mod tests {
     }
 
     #[test]
+    fn recovery_truncates_staging_blocks_to_the_durable_watermark() -> CommonResult<()> {
+        let name = "write-watermark-recovery";
+        let store = open_checksum_store(name, false, false, true, true)?;
+        let block = ExtendedBlock::with_mem(1, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let mut writer = store.open_writer(&meta, 0)?;
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&b"durable"[..])))?;
+        writer.flush()?;
+        let flushed = writer.block_pos();
+        let (_, path, _) = store
+            .short_circuit_by_id(block.id)?
+            .expect("file layout must expose a local path");
+        let path = std::path::PathBuf::from(path);
+        // `WriteHandler` records this on every RPC flush; the direct writer
+        // used here does not go through it.
+        crate::worker::storage::write_watermark::write(&path, flushed as u64)?;
+        drop(writer);
+
+        // Simulate an unclean shutdown: the file grew past the last flush, so
+        // its tail was never fsynced.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)?
+            .write_all(&[0xAB; 32])?;
+        assert!(std::fs::metadata(&path)?.len() > flushed as u64);
+        drop(store);
+
+        let restarted = open_checksum_store(name, false, false, true, false)?;
+        let recovered = restarted.get_block(block.id)?;
+        assert_eq!(recovered.len(), flushed);
+        assert_eq!(std::fs::metadata(&path)?.len(), flushed as u64);
+        Ok(())
+    }
+
+    #[test]
     fn verified_reads_detect_corruption_and_disable_short_circuit() -> CommonResult<()> {
         let store = create_checksum_store_with("checksum-verify-read", true, true)?;
         // Three 64 KiB chunks with a partial tail.

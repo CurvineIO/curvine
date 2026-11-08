@@ -14,6 +14,7 @@
 
 use crate::worker::block::{BlockStore, BlockWriteLease};
 use crate::worker::handler::{DirWriteMetrics, WriteContext};
+use crate::worker::storage::write_watermark;
 use crate::worker::storage::BlockWriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_core_error::{err_box, ternary, try_option_mut, CommonResult};
@@ -317,6 +318,21 @@ impl WriteHandler {
             if let Err(e) = file.flush() {
                 Self::record_write_error(self.metrics, context.dir_id, &e);
                 return Err(e.into());
+            }
+            // Record the durable prefix so recovery cannot advertise bytes that
+            // were never fsynced. Losing the watermark only costs the safety
+            // net, so a failure here must not fail an otherwise good flush.
+            // Layout block paths are absolute; a relative one means a test
+            // device, which has no staging file to protect.
+            let path = std::path::Path::new(file.path());
+            if path.is_absolute() {
+                if let Err(e) = write_watermark::write(path, file.block_pos() as u64) {
+                    warn!(
+                        "failed to persist write watermark for {}: {}",
+                        file.path(),
+                        e
+                    );
+                }
             }
         }
 
@@ -736,6 +752,73 @@ mod tests {
             "a failed flush must increment write_error_count for its own dir_id"
         );
 
+        Ok(())
+    }
+
+    // A flush must record how much of the staging block is durable, so a crash
+    // cannot make recovery advertise unsynced bytes.
+    #[test]
+    fn flush_persists_the_durable_write_watermark() -> FsResult<()> {
+        let block_size = 512_i64;
+        let store = create_test_store("flush-watermark")?;
+        let block = ExtendedBlock::new(3, 0, StorageType::Mem, FileType::File);
+        let mut handler = WriteHandler::new(store, "test".to_string())?;
+
+        let open = curvine_proto::BlockWriteRequest {
+            block: curvine_model::ProtoUtils::extend_block_to_pb(ExtendedBlock {
+                len: block_size,
+                ..block.clone()
+            }),
+            off: 0,
+            block_size,
+            short_circuit: false,
+            client_name: "test".to_string(),
+            chunk_size: block_size as i32,
+            pipeline_stream: Vec::new(),
+            component_info: None,
+        };
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Open)
+            .req_id(7)
+            .seq_id(0)
+            .proto_header(open)
+            .build();
+        handler.open(&msg)?;
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .seq_id(1)
+            .data(DataSlice::from_str("hello"))
+            .build();
+        handler.write(&msg)?;
+
+        let header = DataHeaderProto {
+            offset: 0,
+            flush: true,
+            is_last: false,
+        };
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .seq_id(2)
+            .proto_header(header)
+            .build();
+        handler.write(&msg)?;
+
+        let path = handler
+            .file
+            .as_ref()
+            .expect("open must keep the block writer")
+            .path()
+            .to_string();
+        let path = std::path::Path::new(&path);
+        assert_eq!(crate::worker::storage::write_watermark::read(path), Some(5));
+
+        let _ = crate::worker::storage::write_watermark::remove(path);
         Ok(())
     }
 
