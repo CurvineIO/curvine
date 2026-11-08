@@ -15,6 +15,7 @@
 use crate::worker::block::{BlockStore, BlockWriteLease};
 use crate::worker::handler::{DirWriteMetrics, WriteContext};
 use crate::worker::storage::write_watermark;
+use crate::worker::storage::BlockChecksum;
 use crate::worker::storage::BlockWriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_core_error::{err_box, ternary, try_option_mut, CommonResult};
@@ -454,9 +455,15 @@ impl WriteHandler {
         Ok(msg.success())
     }
 
-    fn commit_block(&self, block: &ExtendedBlock, commit: bool) -> FsResult<()> {
+    fn commit_block(
+        &self,
+        block: &ExtendedBlock,
+        commit: bool,
+        checksum_hint: Option<BlockChecksum>,
+    ) -> FsResult<()> {
         if commit {
-            self.store.finalize_block(block)?;
+            self.store
+                .finalize_block_with_checksum(block, checksum_hint)?;
         } else {
             self.store.abort_block(block)?;
         }
@@ -566,10 +573,15 @@ impl WriteHandler {
         let write_dir_id = self.context.as_ref().map(|c| c.dir_id);
 
         let file = self.file.take();
+        // Only a session that wrote the block sequentially from offset 0 has a
+        // checksum covering the published bytes; `take_checksum` returns None
+        // for every other session and finalize falls back to a streaming read.
+        let mut checksum_hint = None;
         if let Some(mut file) = file {
             let flush_result = file.flush();
             // Sticky flag from a mid-stream timeout; read it even if flush is Ok.
             let uncertain = file.has_uncertain_writes();
+            checksum_hint = file.take_checksum();
             drop(file);
             if let Err(flush_err) = flush_result {
                 if let Some(dir_id) = write_dir_id {
@@ -599,7 +611,7 @@ impl WriteHandler {
             return Err(self.abort_or_defer(pending));
         }
 
-        if let Err(commit_err) = self.commit_block(&context.block, commit) {
+        if let Err(commit_err) = self.commit_block(&context.block, commit, checksum_hint) {
             log::warn!(
                 "failed to commit block {} (commit={}): {}",
                 context.block.id,
