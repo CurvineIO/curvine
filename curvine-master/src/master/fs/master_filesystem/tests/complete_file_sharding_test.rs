@@ -1915,6 +1915,64 @@ fn expired_delete_commit_failure_keeps_memory_and_store_unchanged() {
         .is_empty());
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn assign_worker_by_id_survives_parent_replacement() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("assign-worker-replaced-parent");
+    let block = replication_file(&fs, "/a/file");
+    let old = fs.file_status("/a/file").unwrap();
+    fs.mkdir("/other", false).unwrap();
+    fs.link("/a/file", "/other/old").unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "assign-worker-replaced-parent";
+    let rule = FaultRuleBuilder::named("master.metadata.assign_worker_planned")
+        .matches("path", "/a/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(old.id);
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        worker_fs.assign_worker_by_id(
+            "/a/file",
+            Some(old.id),
+            ExtendedBlock {
+                id: block,
+                ..Default::default()
+            },
+            ClientAddress::default(),
+            vec![],
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let replacement = if planned {
+        fs.delete("/a", true).unwrap();
+        Some(fs.create("/a/file", true).unwrap())
+    } else {
+        None
+    };
+    drop(held);
+    let result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "worker assignment did not reach lock planning");
+    let replacement = replacement.unwrap();
+    assert_ne!(old.id, replacement.id);
+    assert_eq!(result.unwrap().block.id, block);
+    assert_eq!(fs.file_status("/other/old").unwrap().id, old.id);
+    assert_eq!(fs.file_status("/a/file").unwrap().id, replacement.id);
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/other/old").unwrap().id, old.id);
+    assert_eq!(fs.file_status("/a/file").unwrap().id, replacement.id);
+}
+
 #[test]
 fn assign_worker_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("assign-worker-shared-reader");
