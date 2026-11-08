@@ -272,6 +272,63 @@ fn complete_by_id_survives_parent_replacement() {
     assert!(!fs.file_status("/a/file").unwrap().is_complete);
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn free_replans_after_parent_replacement() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("free-replaced-parent");
+    let old = fs.create("/a/file", true).unwrap();
+    fs.complete_file("/a/file", None, 0, vec![], "", false, None)
+        .unwrap();
+    fs.set_attr(
+        "/a/file",
+        SetAttrOptsBuilder::new().ufs_mtime(1).ttl_action(TtlAction::Free).build(),
+    )
+    .unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "free-replaced-parent";
+    let rule = FaultRuleBuilder::named("master.metadata.locations_sampled")
+        .matches("path", "/a/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(old.id);
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || worker_fs.free("/a/file", false));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let replacement = if planned {
+        fs.delete("/a", true).unwrap();
+        let replacement = fs.create("/a/file", true).unwrap();
+        fs.complete_file("/a/file", None, 0, vec![], "", false, None)
+            .unwrap();
+        fs.set_attr(
+            "/a/file",
+            SetAttrOptsBuilder::new().ufs_mtime(1).ttl_action(TtlAction::Free).build(),
+        )
+        .unwrap();
+        Some(replacement)
+    } else {
+        None
+    };
+    drop(held);
+    let result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "free did not reach location sampling");
+    let replacement = replacement.unwrap();
+    assert_ne!(old.id, replacement.id);
+    assert_eq!(result.unwrap().inodes, 1);
+    assert_eq!(fs.file_status("/a/file").unwrap().id, replacement.id);
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/a/file").unwrap().id, replacement.id);
+}
+
 #[test]
 fn concurrent_overwrites_of_the_same_target_keep_one_consistent_file_version() {
     let fs = test_fs("overwrite-same-target-race");

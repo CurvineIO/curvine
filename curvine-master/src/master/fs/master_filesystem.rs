@@ -1972,18 +1972,19 @@ impl MasterFilesystem {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
-            let Some(target) = resolved.target() else {
-                return Ok(None);
-            };
-            if resolved.inodes().len() < 2 || !target.is_file() {
+            let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
+            if !full || ids.len() < 2 {
                 return Ok(None);
             }
-
-            let Ok(target_file) = target.as_file_ref() else {
+            let target_id = *ids.last().expect("full path has a target");
+            let target = {
+                let fs_dir = self.fs_dir.read();
+                fs_dir.store.get_inode(target_id, None)?
+            };
+            let Some(target) = target.filter(|inode| inode.is_file()) else {
                 return Ok(None);
             };
-            let block_ids = target_file.block_ids();
+            let block_ids = target.as_file_ref()?.block_ids();
             let worker_ids = {
                 let fs_dir = self.fs_dir.read();
                 let mut worker_ids = HashSet::new();
@@ -2003,16 +2004,15 @@ impl MasterFilesystem {
                 description: "Worker locations sampled before inode locks",
                 context: {"path" => path},
             }
-            let target_depth = resolved.inodes().len() - 1;
-            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
-                .inodes()
+            let target_depth = ids.len() - 1;
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
-                .map(|(depth, inode)| {
+                .map(|(depth, id)| {
                     if depth == target_depth {
-                        InodeLockRequest::write(depth, inode.id())
+                        InodeLockRequest::write(depth, *id)
                     } else {
-                        InodeLockRequest::read(depth, inode.id())
+                        InodeLockRequest::read(depth, *id)
                     }
                 })
                 .collect();
@@ -2025,10 +2025,9 @@ impl MasterFilesystem {
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&resolved, &inp) {
+            let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
                 continue;
-            }
+            };
             let Some(live_inode) = inp.get_last_inode() else {
                 continue;
             };
