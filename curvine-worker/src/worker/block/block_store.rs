@@ -36,6 +36,10 @@ const REVERIFY_READ_LEN: i32 = 1024 * 1024;
 #[derive(Default)]
 struct BlockUse {
     ordinary_writers: usize,
+    /// Set once two ordinary writers held a lease at the same time, and kept
+    /// until the entry is removed. A writer that already exited may have
+    /// rewritten bytes another session's checksum hint claims to cover.
+    overlapped: bool,
     replication: Option<String>,
 }
 
@@ -149,11 +153,14 @@ impl BlockStore {
         }
         let _lock = self.block_lock(block_id, "write_lease");
         self.check_replication_owner(block_id)?;
-        self.block_uses(block_id)
-            .lock()
-            .entry(block_id)
-            .or_default()
-            .ordinary_writers += 1;
+        {
+            let mut uses = self.block_uses(block_id).lock();
+            let entry = uses.entry(block_id).or_default();
+            entry.ordinary_writers += 1;
+            if entry.ordinary_writers > 1 {
+                entry.overlapped = true;
+            }
+        }
         Ok(Some(BlockWriteLease {
             uses: self.uses.clone(),
             block_id,
@@ -194,6 +201,16 @@ impl BlockStore {
             .lock()
             .get(&block_id)
             .is_some_and(|entry| entry.ordinary_writers > 1)
+    }
+
+    /// True when ordinary writers of `block_id` have overlapped since the
+    /// block's lease entry was created, even if the others already exited.
+    /// Same locking contract as [`Self::has_other_ordinary_writers`].
+    fn ordinary_writers_overlapped(&self, block_id: i64) -> bool {
+        self.block_uses(block_id)
+            .lock()
+            .get(&block_id)
+            .is_some_and(|entry| entry.overlapped)
     }
 
     // Called under the block stripe lock, so acquisition cannot race admission/removal.
@@ -344,6 +361,14 @@ impl BlockStore {
     ) -> CommonResult<BlockMeta> {
         let _block_lock = self.block_lock(block.id, "finalize");
         self.check_replication_owner(block.id)?;
+        // A hint covers only this session's writes. If another writer shared
+        // the staging file, it may have rewritten those bytes before exiting,
+        // so fall back to re-reading the file.
+        let checksum_hint = if self.ordinary_writers_overlapped(block.id) {
+            None
+        } else {
+            checksum_hint
+        };
         let reservation = self.with_dataset_write("finalize", move |state| {
             state.reserve_file_finalize_with_checksum(block, checksum_hint)
         })?;
@@ -1279,6 +1304,40 @@ mod tests {
                 &data
             )?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_drops_hint_after_overlapping_writer_exits() -> CommonResult<()> {
+        let store = create_checksum_store("checksum-hint-overlap")?;
+        let mut block = ExtendedBlock::with_mem(1, "1MB")?;
+        let lease_a = store.ordinary_write_lease(block.id)?;
+        let meta = store.open_block(&block)?;
+        let mut writer_a = store.open_writer(&meta, 0)?;
+        writer_a.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&b"AAAA"[..])))?;
+        writer_a.flush()?;
+
+        // Writer B overwrites the same staging bytes and disconnects before A
+        // completes, so the writer count is back to one at A's finalize.
+        let lease_b = store.ordinary_write_lease(block.id)?;
+        let mut writer_b = store.open_writer(&meta, 0)?;
+        writer_b.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&b"BBBB"[..])))?;
+        writer_b.flush()?;
+        drop(writer_b);
+        drop(lease_b);
+
+        let hint = writer_a
+            .take_checksum()
+            .expect("writer A wrote sequentially from offset 0");
+        drop(writer_a);
+        block.len = 4;
+        let finalized = store.finalize_block_with_checksum(&block, Some(hint))?;
+        drop(lease_a);
+
+        // The sidecar must describe B's bytes on disk, not A's stale hint.
+        let path = store.short_circuit(&finalized)?.unwrap();
+        assert_eq!(std::fs::read(&path)?, b"BBBB");
+        assert_sidecar_matches(&path)?;
         Ok(())
     }
 
