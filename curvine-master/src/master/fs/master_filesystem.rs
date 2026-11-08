@@ -2480,15 +2480,19 @@ impl MasterFilesystem {
         }
 
         let opened = self.run_metadata_write(|| {
+            let (ids, components_len, full, epoch) = self.resolve_edge_ids(path)?;
+            Self::check_not_reserved_path(path)?;
             if flags.truncate() {
-                let (ids, components_len, full, epoch) = self.resolve_edge_ids(path)?;
-                Self::check_not_reserved_path(path)?;
                 let initial = (ids, components_len, full, epoch, None);
                 if let Some((status, deleted)) =
                     self.overwrite_file_sharded(path, opts.clone(), Some(initial))?
                 {
                     return Ok(Ok((FileBlocks::new(status, vec![]), Some(deleted))));
                 }
+            } else if full {
+                let initial = (ids, components_len, full, epoch);
+                let blocks = self.reopen_file_sharded(path, &opts.client_name, initial)?;
+                return Ok(Ok((blocks, None)));
             }
             let resolved = self.resolve_live_store_view(path)?;
             Self::check_not_pending_path(path)?;
@@ -2509,7 +2513,8 @@ impl MasterFilesystem {
             }
 
             if !flags.truncate() {
-                let blocks = self.reopen_file_sharded(path, &opts.client_name, resolved)?;
+                let initial = self.resolve_edge_ids(path)?;
+                let blocks = self.reopen_file_sharded(path, &opts.client_name, initial)?;
                 return Ok(Ok((blocks, None)));
             }
 
@@ -2538,50 +2543,55 @@ impl MasterFilesystem {
         &self,
         path: &str,
         client_name: &str,
-        initial: (StoreResolvedPath, u64),
+        initial: (Vec<i64>, usize, bool, u64),
     ) -> FsResult<FileBlocks> {
         const MAX_RETRIES: usize = 3;
         let mut initial = Some(initial);
 
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = match initial.take() {
+            let (ids, components_len, full, restore_epoch) = match initial.take() {
                 Some(resolved) => resolved,
-                None => self.resolve_live_store_view(path)?,
+                None => self.resolve_edge_ids(path)?,
             };
-            let Some(target) = resolved.target() else {
-                return err_ext!(FsError::file_not_found(path));
-            };
-            if resolved.inodes().len() < 2 || !target.is_file() {
-                return err_box!("{} is not a regular file", path);
+            if !full {
+                break;
             }
-            let target_depth = resolved.inodes().len() - 1;
-            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
-                .inodes()
+            let target_depth = ids.len() - 1;
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
-                .map(|(depth, inode)| {
+                .map(|(depth, inode_id)| {
                     if depth == target_depth {
-                        InodeLockRequest::write(depth, inode.id())
+                        InodeLockRequest::write(depth, *inode_id)
                     } else {
-                        InodeLockRequest::read(depth, inode.id())
+                        InodeLockRequest::read(depth, *inode_id)
                     }
                 })
                 .collect();
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.reopen_planned",
+                description: "Reopen path resolved before inode locks",
+                context: {"path" => path},
+            }
             let _locks = self.inode_locks.lock_many(&requests);
 
             let fs_dir = self.fs_dir.read();
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&resolved, &inp) {
+            let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
                 continue;
-            }
+            };
             let Some(inode) = inp.get_last_inode() else {
                 continue;
             };
-            if inode.id() != target.id() || !inode.is_file() {
-                continue;
+            if inode.is_dir() {
+                return err_box!("{} is a directory", path);
+            }
+            if !inode.is_file() {
+                return err_box!("{} is not a regular file", path);
             }
             let status = fs_dir.reopen_file(&inp, client_name)?;
             let file = inode.as_file_ref()?;
