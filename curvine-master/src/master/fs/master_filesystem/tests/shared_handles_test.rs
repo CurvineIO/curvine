@@ -110,18 +110,18 @@ fn topology_reads_wait_for_shared_namespace_writers() {
     let fs = test_fs("status-list-exclusive");
     fs.create("/dir/file", true).unwrap();
     let held = fs.fs_dir.read();
-    let start = Arc::new(std::sync::Barrier::new(11));
+    let start = Arc::new(std::sync::Barrier::new(9));
     let (tx, rx) = std::sync::mpsc::channel();
     let mut threads = Vec::new();
-    for operation in 0..10 {
+    // Listing uses optimistic version validation rather than requiring this
+    // namespace lock; this test only covers the lock-based readers.
+    for operation in 2..10 {
         let fs = fs.clone();
         let start = start.clone();
         let tx = tx.clone();
         threads.push(std::thread::spawn(move || {
             start.wait();
             let success = match operation {
-                0 => fs.list_status("/dir").is_ok(),
-                1 => fs.list_options("/dir", ListOptions::default()).is_ok(),
                 2 => fs.get_file_block_details("/dir/file").is_ok(),
                 3 => fs.cv_metadata_snapshot_page(None, 10).is_ok(),
                 4 => fs.get_lock("/dir/file", FileLock::default()).is_ok(),
@@ -134,18 +134,24 @@ fn topology_reads_wait_for_shared_namespace_writers() {
                     true
                 }
             };
-            tx.send(success).unwrap();
+            tx.send((operation, success)).unwrap();
         }));
     }
     start.wait();
-    let early = rx.recv_timeout(std::time::Duration::from_millis(100));
+    let mut early = Vec::new();
+    while let Ok(result) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
+        early.push(result);
+    }
     drop(held);
     for thread in threads {
         thread.join().unwrap();
     }
-    assert!(early.is_err(), "a read passed a shared namespace lock");
-    for _ in 0..10 {
-        assert!(rx.recv().unwrap());
+    assert!(
+        early.is_empty(),
+        "reads passed a shared namespace lock: {early:?}"
+    );
+    for _ in 0..8 {
+        assert!(rx.recv().unwrap().1);
     }
 }
 
@@ -759,4 +765,3 @@ fn filesystem_handles_share_worker_and_lifecycle_state() {
     );
     journal.shutdown();
 }
-

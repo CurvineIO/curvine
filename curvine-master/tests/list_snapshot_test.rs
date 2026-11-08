@@ -22,6 +22,51 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 #[test]
+fn listing_matches_live_status_fields() {
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("list-fields-{}", Utils::rand_str(8)));
+    conf.journal.enable = false;
+    let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+    fs.mkdir("/parent/dir/nested", true).unwrap();
+    fs.create("/parent/dir/file", false).unwrap();
+    fs.create("/parent/file", false).unwrap();
+    fs.link("/parent/file", "/parent/alias").unwrap();
+    fs.set_attr(
+        "/parent/dir",
+        curvine_model::SetAttrOpts {
+            mode: Some(0o700),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    for path in ["/", "/parent", "/parent/dir", "/parent/file"] {
+        for opts in [ListOptions::default(), ListOptions::with_limit(1)] {
+            let expected = {
+                let dir = fs.fs_dir.write();
+                let inp = curvine_master::master::meta::inode::InodePath::resolve(
+                    dir.root_ptr(),
+                    path,
+                    dir.store_ref(),
+                )
+                .unwrap();
+                dir.list_options(&inp, &opts).unwrap()
+            };
+            let actual = fs.list_options(path, opts).unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "path: {path}"
+            );
+        }
+    }
+}
+
+#[test]
 fn paginated_listing_uses_shared_lock_and_preserves_cursors() {
     Master::init_test_metrics();
     let mut conf = ClusterConf {
@@ -231,6 +276,45 @@ fn listing_uses_owned_snapshot_with_shared_namespace_guard() {
     let page = fs.list_options("/dir", ListOptions::with_limit(1)).unwrap();
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].name, "alias");
+}
+
+#[test]
+fn listing_is_consistent_while_directory_is_recreated() {
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("list-recreate-{}", Utils::rand_str(8)));
+    conf.journal.enable = false;
+    let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+    fs.mkdir("/parent", false).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let worker_fs = fs.clone();
+    let worker_barrier = barrier.clone();
+    let worker = std::thread::spawn(move || {
+        worker_barrier.wait();
+        for _ in 0..200 {
+            worker_fs.mkdir("/parent/dir", false).unwrap();
+            worker_fs.create("/parent/dir/file", false).unwrap();
+            worker_fs.delete("/parent/dir", true).unwrap();
+        }
+    });
+    barrier.wait();
+    for _ in 0..1000 {
+        match fs.list_status("/parent/dir") {
+            Ok(statuses) => {
+                assert!(statuses.len() <= 1);
+                if let Some(status) = statuses.first() {
+                    assert_eq!(status.name, "file");
+                    assert_eq!(status.path, "/parent/dir/file");
+                }
+            }
+            Err(curvine_error::FsError::FileNotFound(_)) => {}
+            Err(error) => panic!("unexpected listing error: {error}"),
+        }
+    }
+    worker.join().unwrap();
 }
 
 #[test]
