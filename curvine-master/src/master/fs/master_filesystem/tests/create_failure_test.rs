@@ -17,6 +17,49 @@ use super::*;
 
 #[cfg(feature = "fault-injection")]
 #[test]
+fn link_replans_after_source_parent_replacement() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("link-replaced-parent");
+    let old_file = fs.create("/a/file", true).unwrap();
+    fs.mkdir("/d", false).unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "link-replaced-parent";
+    let rule = FaultRuleBuilder::named("master.metadata.link_planned")
+        .matches("path", "/a/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(old_file.id);
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || worker_fs.link("/a/file", "/d/alias"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let new_file = if planned {
+        fs.delete("/a", true).unwrap();
+        Some(fs.create("/a/file", true).unwrap())
+    } else {
+        None
+    };
+    drop(held);
+    let result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "link did not reach lock planning");
+    let new_file = new_file.unwrap();
+    assert_ne!(old_file.id, new_file.id);
+    result.unwrap();
+    assert_eq!(fs.file_status("/d/alias").unwrap().id, new_file.id);
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/d/alias").unwrap().id, new_file.id);
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
 fn create_commit_failure_does_not_publish_to_the_namespace_tree() {
     use curvine_fault::{FaultRuleBuilder, FaultRuntime};
 

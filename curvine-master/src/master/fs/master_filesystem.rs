@@ -1444,65 +1444,71 @@ impl MasterFilesystem {
         fs_dir.symlink(target.to_string(), inp, force, mode, owner, group)
     }
 
-    fn link_single_parent_sharded(&self, src: &str, dst: &str) -> FsResult<()> {
+    fn link_single_parent_sharded(
+        &self,
+        src: &str,
+        dst: &str,
+        initial: ((Vec<i64>, usize, bool, u64), (Vec<i64>, usize, bool, u64)),
+    ) -> FsResult<()> {
         const MAX_RETRIES: usize = 3;
+        let mut initial = Some(initial);
 
         for _ in 0..MAX_RETRIES {
-            let (source, source_epoch) = self.resolve_live_store_view(src)?;
-            let (destination, destination_epoch) = self.resolve_live_store_view(dst)?;
-            if !source.is_full()
-                || destination.is_full()
-                || destination.inodes().len() + 1 < destination.components().len()
+            let (
+                (source_ids, source_components, source_full, source_epoch),
+                (destination_ids, destination_components, destination_full, destination_epoch),
+            ) = match initial.take() {
+                Some(resolved) => resolved,
+                None => (self.resolve_edge_ids(src)?, self.resolve_edge_ids(dst)?),
+            };
+            if !source_full
+                || destination_full
+                || destination_ids.len() + 1 < destination_components
             {
                 return self.link_with_global_lock(src, dst);
             }
 
-            let mut requests =
-                Vec::with_capacity(source.inodes().len() + destination.inodes().len());
-            requests.extend(source.inodes().iter().enumerate().map(|(depth, inode)| {
-                if depth + 1 == source.inodes().len() {
-                    InodeLockRequest::write(depth, inode.id())
+            let mut requests = smallvec::SmallVec::<[InodeLockRequest; 8]>::with_capacity(
+                source_ids.len() + destination_ids.len(),
+            );
+            requests.extend(source_ids.iter().enumerate().map(|(depth, id)| {
+                if depth + 1 == source_ids.len() {
+                    InodeLockRequest::write(depth, *id)
                 } else {
-                    InodeLockRequest::read(depth, inode.id())
+                    InodeLockRequest::read(depth, *id)
                 }
             }));
-            let destination_parent = destination.inodes().len() - 1;
-            requests.extend(
-                destination
-                    .inodes()
-                    .iter()
-                    .enumerate()
-                    .map(|(depth, inode)| {
-                        if depth == destination_parent {
-                            InodeLockRequest::write(depth, inode.id())
-                        } else {
-                            InodeLockRequest::read(depth, inode.id())
-                        }
-                    }),
-            );
+            let destination_parent = destination_ids.len() - 1;
+            requests.extend(destination_ids.iter().enumerate().map(|(depth, id)| {
+                if depth == destination_parent {
+                    InodeLockRequest::write(depth, *id)
+                } else {
+                    InodeLockRequest::read(depth, *id)
+                }
+            }));
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.link_planned",
+                description: "Link paths resolved before inode locks",
+                context: {"path" => src},
+            }
             let _locks = self.inode_locks.lock_many(&requests);
-            let (locked_source, locked_source_epoch) = self.resolve_live_store_view(src)?;
-            let (locked_destination, locked_destination_epoch) =
-                self.resolve_live_store_view(dst)?;
-            if source_epoch != locked_source_epoch
-                || destination_epoch != locked_destination_epoch
-                || !source.same_resolution(&locked_source)
-                || !destination.same_resolution(&locked_destination)
-            {
-                continue;
-            }
-
             let fs_dir = self.fs_dir.read();
-            let source_path = Self::resolve_path(&fs_dir, src)?;
-            let destination_path = Self::resolve_path(&fs_dir, dst)?;
-            if !Self::live_path_matches(&locked_source, &source_path)
-                || !Self::live_path_matches(&locked_destination, &destination_path)
-            {
+            let epoch = Self::checked_live_epoch(&fs_dir)?;
+            if source_epoch != epoch || destination_epoch != epoch {
                 continue;
             }
-            if destination_path.is_full() {
-                return err_ext!(FsError::file_exists(dst));
-            }
+            let Some(source_path) =
+                Self::resolve_locked_path(&fs_dir, src, &source_ids, source_components)?
+            else {
+                continue;
+            };
+            let Some(destination_path) =
+                Self::resolve_locked_path(&fs_dir, dst, &destination_ids, destination_components)?
+            else {
+                continue;
+            };
             fs_dir.link(source_path, destination_path)?;
             return Ok(());
         }
@@ -4627,16 +4633,13 @@ impl MasterFilesystem {
         let src_path = src_path.as_ref().to_string();
         let dst_path = dst_path.as_ref().to_string();
         self.run_metadata_write(|| {
-            let (src, _) = self.resolve_live_store_view(&src_path)?;
-            Self::check_not_pending_path(&src_path)?;
-            let (dst, _) = self.resolve_live_store_view(&dst_path)?;
-            Self::check_not_pending_path(&dst_path)?;
+            let src = self.resolve_edge_ids(&src_path)?;
+            let dst = self.resolve_edge_ids(&dst_path)?;
             Self::check_not_reserved_path(&src_path)?;
             Self::check_not_reserved_path(&dst_path)?;
-            let single_parent =
-                src.is_full() && !dst.is_full() && dst.inodes().len() + 1 >= dst.components().len();
+            let single_parent = src.2 && !dst.2 && dst.0.len() + 1 >= dst.1;
             if single_parent {
-                self.link_single_parent_sharded(&src_path, &dst_path)
+                self.link_single_parent_sharded(&src_path, &dst_path, (src, dst))
             } else {
                 self.link_with_global_lock(&src_path, &dst_path)
             }
