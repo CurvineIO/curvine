@@ -271,11 +271,18 @@ impl InodeStore {
         self.ttl_bucket_list.clone()
     }
 
-    pub fn apply_add(&self, parent: &InodeView, child: &InodeView) -> CommonResult<()> {
+    pub fn apply_add(
+        &self,
+        parent: &InodeView,
+        child: &InodeView,
+        write_parent: bool,
+    ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
         batch.write_inode(child)?;
-        batch.write_inode(parent)?;
+        if write_parent {
+            batch.write_inode(parent)?;
+        }
         Self::merge_directory_attributes(
             &mut batch,
             parent,
@@ -403,9 +410,12 @@ impl InodeStore {
         del: &InodeView,
         del_name: &str,
         ctime: i64,
+        write_parent: bool,
     ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
-        batch.write_inode(parent)?;
+        if write_parent {
+            batch.write_inode(parent)?;
+        }
         Self::merge_directory_attributes(
             &mut batch,
             parent,
@@ -2048,7 +2058,7 @@ mod tests {
             batch.commit()?;
         }
 
-        let result = store.apply_delete(&root, &missing, "missing.txt", 100)?;
+        let result = store.apply_delete(&root, &missing, "missing.txt", 100, true)?;
         assert_eq!(result.inodes, 0);
         assert!(store.get_inode(missing_id, None)?.is_none());
         assert_eq!(store.store.edges_iter(ROOT_INODE_ID)?.count(), 0);
@@ -2083,7 +2093,7 @@ mod tests {
         dir.as_mut()
             .add_child(InodeView::new_entry("stale.txt".to_string(), missing_id))?;
 
-        let result = store.apply_delete(&restored, dir.as_ref(), "dir", 100)?;
+        let result = store.apply_delete(&restored, dir.as_ref(), "dir", 100, true)?;
         assert_eq!(result.inodes, 1);
         assert!(store.get_inode(file_id, None)?.is_none());
         assert!(store.get_inode(missing_id, None)?.is_none());
@@ -2121,7 +2131,7 @@ mod tests {
             .as_ref()
             .clone();
 
-        let result = store.apply_delete(&restored, &dir, "dir", 100)?;
+        let result = store.apply_delete(&restored, &dir, "dir", 100, true)?;
         assert_eq!(result.inodes, 1);
         assert!(store.get_inode(file_id, None)?.is_none());
         assert!(store.get_inode(dir_id, None)?.is_none());

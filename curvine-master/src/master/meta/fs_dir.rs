@@ -449,27 +449,41 @@ impl FsDir {
         // mutation until the namespace batch has committed.
         let update_parent_mtime =
             !matches!(parent.as_ref().expiration_ms(), Ok(Some(exp)) if mtime > exp);
-        let mut persisted_parent = parent.as_ref().clone_metadata();
-        if update_parent_mtime {
-            persisted_parent.update_mtime(mtime);
+        let write_parent = parent.id() == ROOT_INODE_ID
+            || child.is_dir()
+            || (update_parent_mtime && mtime > parent.mtime());
+        let mut staged_parent = write_parent.then(|| parent.as_ref().clone_metadata());
+        if let Some(staged) = &mut staged_parent {
+            if update_parent_mtime {
+                staged.update_mtime(mtime);
+            }
+            if child.is_dir() {
+                staged.dec_nlink(mtime);
+            }
         }
+        let persisted_parent = staged_parent.as_ref().unwrap_or_else(|| parent.as_ref());
 
         let del_res = match child {
             File(f) => {
                 if f.nlink() > 1 {
                     self.store
-                        .apply_unlink(&persisted_parent, child, child_name, mtime)?
+                        .apply_unlink(persisted_parent, child, child_name, mtime)?
                 } else {
                     // This is the last link, delete the inode
-                    self.store
-                        .apply_delete(&persisted_parent, child, child_name, mtime)?
+                    self.store.apply_delete(
+                        persisted_parent,
+                        child,
+                        child_name,
+                        mtime,
+                        write_parent,
+                    )?
                 }
             }
             FileEntry(e) => {
                 // This is a link entry, just remove the directory entry
                 // The actual inode's nlink count should be decremented
                 self.store.apply_unlink_file_entry(
-                    &persisted_parent,
+                    persisted_parent,
                     child,
                     child_name,
                     e.id,
@@ -477,10 +491,9 @@ impl FsDir {
                 )?
             }
             Dir(_) => {
-                persisted_parent.dec_nlink(mtime);
                 // Directories are always deleted
                 self.store
-                    .apply_delete(&persisted_parent, child, child_name, mtime)?
+                    .apply_delete(persisted_parent, child, child_name, mtime, write_parent)?
             }
         };
 
@@ -1822,14 +1835,22 @@ impl FsDir {
         // Persist against detached metadata first. Publishing to the live
         // child index before the batch commits would leave the namespace tree
         // visible after a RocksDB failure.
-        let mut persisted_parent = parent.as_ref().clone_metadata();
         child.set_parent_id(parent.id());
-        persisted_parent.update_mtime(child.mtime());
-        if child.is_dir() {
-            persisted_parent.incr_nlink(child.mtime());
+        // A non-root directory already has an inode row. If its fields did
+        // not change, the edge and attribute delta are the only writes needed.
+        // Root may not have an inode row until its first child is created.
+        let write_parent =
+            parent.id() == ROOT_INODE_ID || child.is_dir() || child.mtime() > parent.mtime();
+        let mut staged_parent = write_parent.then(|| parent.as_ref().clone_metadata());
+        if let Some(staged) = &mut staged_parent {
+            staged.update_mtime(child.mtime());
+            if child.is_dir() {
+                staged.incr_nlink(child.mtime());
+            }
         }
-
-        self.store.apply_add(&persisted_parent, &child)?;
+        let persisted_parent = staged_parent.as_ref().unwrap_or_else(|| parent.as_ref());
+        self.store
+            .apply_add(persisted_parent, &child, write_parent)?;
 
         parent.update_mtime(child.mtime());
         if child.is_dir() {
