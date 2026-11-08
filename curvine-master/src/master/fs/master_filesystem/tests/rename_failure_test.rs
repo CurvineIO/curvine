@@ -16,6 +16,99 @@ use super::*;
 
 #[cfg(feature = "fault-injection")]
 #[test]
+fn rename_reloads_inode_after_a_hard_link_is_added() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("rename-reload-hardlink");
+    let original = fs.create("/a/file", true).unwrap();
+    for path in ["/b", "/c", "/d"] {
+        fs.mkdir(path, false).unwrap();
+    }
+    fs.link("/a/file", "/b/alias").unwrap();
+    let parent = fs.file_status("/a").unwrap().id;
+    let runtime = FaultRuntime::process();
+    let rule_id = "rename-reload-hardlink";
+    let rule = FaultRuleBuilder::named("master.metadata.rename_planned")
+        .matches("path", "/a/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(parent);
+    let worker_fs = fs.clone();
+    let worker =
+        std::thread::spawn(move || worker_fs.rename("/a/file", "/d/moved", RenameFlags::empty()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let link_result = if planned {
+        Some(fs.link("/b/alias", "/c/alias"))
+    } else {
+        None
+    };
+    drop(held);
+    let rename_result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "rename did not reach lock planning");
+    link_result.unwrap().unwrap();
+    rename_result.unwrap();
+    fs.delete("/b/alias", false).unwrap();
+    fs.delete("/c/alias", false).unwrap();
+    assert_eq!(fs.file_status("/d/moved").unwrap().id, original.id);
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/d/moved").unwrap().id, original.id);
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn rename_replans_after_source_parent_replacement() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("rename-replaced-parent");
+    let old_file = fs.create("/a/file", true).unwrap();
+    fs.mkdir("/d", false).unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "rename-replaced-parent";
+    let rule = FaultRuleBuilder::named("master.metadata.rename_planned")
+        .matches("path", "/a/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(old_file.id);
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        worker_fs.rename("/a/file", "/d/moved", RenameFlags::empty())
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let new_file = if planned {
+        fs.delete("/a", true).unwrap();
+        Some(fs.create("/a/file", true).unwrap())
+    } else {
+        None
+    };
+    drop(held);
+    let result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "rename did not reach lock planning");
+    let new_file = new_file.unwrap();
+    assert_ne!(old_file.id, new_file.id);
+    result.unwrap();
+    assert_eq!(fs.file_status("/d/moved").unwrap().id, new_file.id);
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/d/moved").unwrap().id, new_file.id);
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
 fn rename_commit_failure_keeps_parent_metadata_and_tree() {
     use curvine_fault::{FaultRuleBuilder, FaultRuntime};
 
