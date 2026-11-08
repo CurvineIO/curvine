@@ -25,6 +25,7 @@ use curvine_io::DataSlice;
 use curvine_model::{
     BlockLocation, CommitBlock, ExtendedBlock, LocatedBlock, StorageType, WorkerAddress,
 };
+use curvine_runtime::common::TimeSpent;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use futures::future::{join_all, try_join_all};
 use log::warn;
@@ -329,7 +330,16 @@ impl BlockWriter {
             }
         });
 
-        if let Err((worker_addr, e)) = try_join_all(futures).await {
+        let metrics = FsContext::get_metrics();
+        let started = TimeSpent::new();
+        metrics.write_inflight.inc();
+        let result = try_join_all(futures).await;
+        metrics.write_inflight.dec();
+        metrics
+            .write_backend_seconds
+            .observe(started.used_us() as f64 / 1_000_000.0);
+
+        if let Err((worker_addr, e)) = result {
             return Err(e.ctx(format!("failed to write block on {}", worker_addr)));
         }
         Ok(())

@@ -30,6 +30,9 @@ pub use self::batch_block_writer::BatchBlockWriter;
 mod block_writer;
 pub use self::block_writer::BlockWriter;
 
+mod write_limiter;
+pub use self::write_limiter::WriteLimiter;
+
 mod context;
 pub use self::context::*;
 

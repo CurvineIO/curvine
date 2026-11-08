@@ -14,6 +14,7 @@
 
 use crate::file::CallCtx;
 use crate::file::FsWriterBase;
+use crate::QueuedWrites;
 use curvine_error::FsResult;
 use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::Path;
@@ -133,6 +134,8 @@ pub struct FsWriterBuffer {
     file_blocks: FileBlocks,
     writer: BufferChannel,
     pos: i64,
+    /// Bytes accepted by this writer but not yet handed to the block layer.
+    queued: Arc<QueuedWrites>,
 }
 
 impl FsWriterBuffer {
@@ -146,10 +149,16 @@ impl FsWriterBuffer {
         let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
         let (task_sender, task_receiver) = AsyncChannel::new(2).split();
         let monitor = err_monitor.clone();
+        let queued = QueuedWrites::new(
+            crate::file::FsContext::get_metrics()
+                .write_queued_bytes
+                .clone(),
+        );
+        let task_queued = queued.clone();
 
         let rt = writer.fs_context().clone_runtime();
         let task = rt.spawn(async move {
-            let res = Self::write_future(chunk_receiver, task_receiver, writer).await;
+            let res = Self::write_future(chunk_receiver, task_receiver, writer, task_queued).await;
             match res {
                 Ok(_) => {}
                 Err(e) => {
@@ -177,6 +186,7 @@ impl FsWriterBuffer {
             file_blocks,
             writer,
             pos,
+            queued,
         }
     }
 
@@ -209,7 +219,12 @@ impl FsWriterBuffer {
         if len == 0 {
             return Ok(());
         }
-        self.writer.write(data).await?;
+        self.queued.push(len);
+        if let Err(e) = self.writer.write(data).await {
+            // The chunk never reached the queue, so it must not stay counted.
+            self.queued.pop(len);
+            return Err(e);
+        }
         self.pos += len as i64;
         Ok(())
     }
@@ -247,6 +262,7 @@ impl FsWriterBuffer {
         mut chunk_receiver: AsyncReceiver<DataSlice>,
         mut task_receiver: AsyncReceiver<WriterTask>,
         mut writer: FsWriterBase,
+        queued: Arc<QueuedWrites>,
     ) -> FsResult<()> {
         loop {
             // The queue can be written and controlled to complete any future.
@@ -259,6 +275,7 @@ impl FsWriterBuffer {
                 SelectTask::Control(task) => match task {
                     WriterTask::Flush(cx) => {
                         while let Some(chunk) = chunk_receiver.try_recv()? {
+                            queued.pop(chunk.len());
                             writer.write(chunk).await?;
                         }
                         writer.flush().await?;
@@ -267,6 +284,7 @@ impl FsWriterBuffer {
 
                     WriterTask::Complete((_, opts, tx)) => {
                         while let Some(chunk) = chunk_receiver.try_recv()? {
+                            queued.pop(chunk.len());
                             writer.write(chunk).await?;
                         }
                         writer.complete_with_attr(opts).await?;
@@ -275,10 +293,14 @@ impl FsWriterBuffer {
                     }
 
                     WriterTask::Cancel(tx) => {
-                        // Do not drain chunk_receiver: queued chunks are
-                        // uncommitted data and cancellation intentionally drops
-                        // them. FsWriterBase::cancel attempts every active block
-                        // writer before returning its first error.
+                        // Queued chunks are uncommitted data and cancellation
+                        // intentionally drops them, but they must still leave
+                        // the queued-bytes gauge. FsWriterBase::cancel attempts
+                        // every active block writer before returning its first
+                        // error.
+                        while let Some(chunk) = chunk_receiver.try_recv()? {
+                            queued.pop(chunk.len());
+                        }
                         let res = writer.cancel().await;
                         tx.send(res)?;
                         return Ok(());
@@ -287,6 +309,7 @@ impl FsWriterBuffer {
                     WriterTask::Seek((pos, tx)) => {
                         // Process all buffered data first
                         while let Some(chunk) = chunk_receiver.try_recv()? {
+                            queued.pop(chunk.len());
                             writer.write(chunk).await?
                         }
 
@@ -300,6 +323,7 @@ impl FsWriterBuffer {
 
                     WriterTask::Resize((opts, tx)) => {
                         while let Some(chunk) = chunk_receiver.try_recv()? {
+                            queued.pop(chunk.len());
                             writer.write(chunk).await?
                         }
 
@@ -312,6 +336,7 @@ impl FsWriterBuffer {
                 },
 
                 SelectTask::Data(chunk) => {
+                    queued.pop(chunk.len());
                     writer.write(chunk).await?;
                 }
             }
