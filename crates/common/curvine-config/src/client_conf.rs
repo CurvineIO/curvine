@@ -83,6 +83,15 @@ pub struct ClientConf {
     #[client_cli]
     pub read_slice_size_str: String,
 
+    // Total bytes the buffered writers of this client may queue before new
+    // writes wait. Bounds queued write memory across files; "0" disables the
+    // budget, which leaves only the per-file chunk count as a bound.
+    #[serde(skip)]
+    pub write_buffer_size: usize,
+    #[serde(alias = "write_buffer_size")]
+    #[client_cli]
+    pub write_buffer_size_str: String,
+
     // Maximum number of open block handles (readers and writers).
     // When the limit is reached, FIFO eviction will close the oldest (first opened) handle.
     // This limits memory usage and connection count in random read/write scenarios.
@@ -346,6 +355,11 @@ impl ClientConf {
     /// Falls back to the built-in default when the field is 0, so an
     /// uninitialised conf never yields `Duration::ZERO` and makes every
     /// `timeout(..)` fire immediately.
+    /// Configured queued-write budget in bytes, `0` when disabled.
+    pub fn write_buffer_bytes(&self) -> usize {
+        self.write_buffer_size
+    }
+
     pub fn data_timeout(&self) -> Duration {
         let millis = if self.data_timeout_ms > 0 {
             self.data_timeout_ms
@@ -371,6 +385,8 @@ impl ClientConf {
         self.block_size = ByteUnit::from_str(&self.block_size_str)?.as_byte() as i64;
 
         self.write_chunk_size = ByteUnit::from_str(&self.write_chunk_size_str)?.as_byte() as usize;
+        self.write_buffer_size =
+            ByteUnit::from_str(&self.write_buffer_size_str)?.as_byte() as usize;
         self.read_chunk_size = ByteUnit::from_str(&self.read_chunk_size_str)?.as_byte() as usize;
 
         // Handle read_slice
@@ -475,6 +491,8 @@ impl Default for ClientConf {
             read_parallel: Self::DEFAULT_READ_PARALLEL,
             read_slice_size: 0,
             read_slice_size_str: "0".to_owned(),
+            write_buffer_size: 0,
+            write_buffer_size_str: "256MB".to_owned(),
             max_cache_block_handles: 10,
 
             short_circuit: true,

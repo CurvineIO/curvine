@@ -128,7 +128,9 @@ pub struct FuseConf {
     #[client_cli]
     pub fuse_channel_size: usize,
 
-    // Read and write file request queue size, default is 0
+    // Read and write file request queue size. 0 selects
+    // `DEFAULT_STREAM_CHANNEL_SIZE` during `init`; it never means "unbounded",
+    // so a fast writer cannot grow the queue without limit.
     #[client_cli]
     pub stream_channel_size: usize,
 
@@ -314,6 +316,9 @@ impl FuseConf {
     /// (`1024` KB). Not applied by default — see [`FuseConf::max_readahead_kb`].
     pub const DEFAULT_MAX_READAHEAD_KB: u32 = 1024;
 
+    /// Queue depth used when `stream_channel_size` is left at 0.
+    pub const DEFAULT_STREAM_CHANNEL_SIZE: usize = 64;
+
     pub fn init(&mut self) -> CommonResult<()> {
         if self.io_threads == 0 {
             return err_box!("fuse.io_threads must be > 0");
@@ -323,6 +328,12 @@ impl FuseConf {
         }
         if self.list_limit == 0 {
             return err_box!("fuse.list_limit must be > 0");
+        }
+        // `AsyncChannel::new(0)` builds an unbounded channel, which would let a
+        // writer that outruns the cluster queue chunks without a memory bound.
+        // Treat an unset/zero queue size as "use the default" instead.
+        if self.stream_channel_size == 0 {
+            self.stream_channel_size = Self::DEFAULT_STREAM_CHANNEL_SIZE;
         }
         // path_lock_stripes is used as the modulus in NodeState::lock_path
         // (hash % path_locks.len()); 0 stripes => empty vec => divide-by-zero
@@ -767,6 +778,29 @@ mod tests {
         // default must still name the file instead of falling back to "curvine".
         let conf: FuseConf = toml::from_str("io_threads = 1").unwrap();
         assert_eq!(conf.log.file_name, "fuse.log");
+    }
+
+    #[test]
+    fn init_bounds_the_zero_stream_queue() {
+        // `FuseConf::default` already runs `init`, so start from an explicit
+        // zero to exercise the normalization.
+        let mut conf = FuseConf {
+            stream_channel_size: 0,
+            ..Default::default()
+        };
+        conf.init().unwrap();
+        assert_eq!(
+            conf.stream_channel_size,
+            FuseConf::DEFAULT_STREAM_CHANNEL_SIZE
+        );
+
+        // An explicit queue size is kept as configured.
+        let mut conf = FuseConf {
+            stream_channel_size: 8,
+            ..Default::default()
+        };
+        conf.init().unwrap();
+        assert_eq!(conf.stream_channel_size, 8);
     }
 
     #[test]
