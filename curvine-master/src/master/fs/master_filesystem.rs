@@ -19,8 +19,7 @@ use crate::master::fs::full_block_report::{
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
 use crate::master::meta::inode::{
-    DirectoryChildrenSharedVersion, InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR,
-    ROOT_INODE_ID,
+    InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
 };
 use crate::master::meta::store::{InodeStoreSnapshot, StoreResolvedPath};
 use crate::master::meta::{
@@ -407,80 +406,6 @@ impl MasterFilesystem {
             .unwrap_or(0)
     }
 
-    /// Lock-planning variant of [`Self::resolve_live_store_view`]: returns the
-    /// resolved inode-id chain without cloning inode bodies. The retry
-    /// comparisons only need ids, so the hot write loops use this.
-    fn resolve_live_ids(&self, path: &str) -> FsResult<(Vec<i64>, usize, bool, u64)> {
-        let fs_dir = self.fs_dir.read();
-        let control = fs_dir.store.scan_control();
-        if control.is_restoring() {
-            return err_box!(
-                "metadata scan lease rejected: snapshot restore is pending or in progress"
-            );
-        }
-        let epoch = control.cancel_epoch();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-        let full = inp.inodes.len() == inp.components.len();
-        let ids = inp.inodes.iter().map(|inode| inode.id()).collect();
-        Ok((ids, inp.components.len(), full, epoch))
-    }
-
-    /// Resolve the live path and capture the restore epoch for revalidation.
-    /// The returned path may contain borrowed pointers. A concurrent delete
-    /// can free them before inode locks are acquired; identity checks after
-    /// acquisition do not make such pointers safe to dereference.
-    fn resolve_live_path(&self, path: &str) -> FsResult<(InodePath, u64)> {
-        let fs_dir = self.fs_dir.read();
-        let control = fs_dir.store.scan_control();
-        if control.is_restoring() {
-            return err_box!(
-                "metadata scan lease rejected: snapshot restore is pending or in progress"
-            );
-        }
-        let epoch = control.cancel_epoch();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-        Ok((inp, epoch))
-    }
-
-    /// Whether the pre-lock walk is still authoritative. The restore epoch
-    /// fences store replacement; each chain entry is re-checked by id inside
-    /// its parent's child index. This check assumes the path pointers remain
-    /// valid until the locks are acquired; concurrent deletion can violate
-    /// that assumption.
-    fn namespace_unchanged(&self, epoch: u64, inp: &InodePath) -> bool {
-        let fs_dir = self.fs_dir.read();
-        if fs_dir.store.scan_control().cancel_epoch() != epoch {
-            return false;
-        }
-        // components[i] names inodes[i]'s parent edge; entries beyond the
-        // resolved prefix (a create target) must still be absent.
-        for depth in 1..inp.inodes.len() {
-            let Ok(parent) = inp.inodes[depth - 1].as_dir_ref() else {
-                return false;
-            };
-            let handle = parent.children_handle();
-            let (matched, version) =
-                handle.child_id_matches_version(&inp.components[depth], inp.inodes[depth].id());
-            if !(matched && version.is_current()) {
-                return false;
-            }
-        }
-        if inp.inodes.len() < inp.components.len() && !inp.inodes.is_empty() {
-            // Partial walk: the first unresolved edge must still be missing.
-            let Ok(parent) = inp.inodes[inp.inodes.len() - 1].as_dir_ref() else {
-                return false;
-            };
-            let handle = parent.children_handle();
-            if handle
-                .get_child_ptr(&inp.components[inp.inodes.len()])
-                .is_some()
-            {
-                return false;
-            }
-        }
-        true
-    }
-
     // Plan from directory edges; load the target inode after acquiring its
     // lock so its metadata cannot be stale when the mutation is applied.
     // Each ID and child directory handle is read under the child-index lock.
@@ -575,26 +500,12 @@ impl MasterFilesystem {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
-            let (ids, components_len, full, restore_epoch) = self.resolve_live_ids(path)?;
+            let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
             Self::check_not_pending_path(path)?;
             Self::check_not_reserved_path(path)?;
             if components_len <= 1 {
                 return err_box!("Not allowed to create existing root path: {}", path);
             }
-            if full {
-                // A concurrent creator won the race, or the target already
-                // exists: mkdir is idempotent only with create_parent.
-                let fs_dir = self.fs_dir.read();
-                let inp = Self::resolve_path(&fs_dir, path)?;
-                let inode = inp
-                    .get_last_inode()
-                    .ok_or_else(|| FsError::file_not_found(path))?;
-                if opts.create_parent && inode.is_dir() {
-                    return Ok(inode.to_file_status(path)?);
-                }
-                return err_ext!(FsError::file_exists(path));
-            }
-
             let parent_index = ids.len().saturating_sub(1);
             let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
@@ -608,33 +519,13 @@ impl MasterFilesystem {
                 })
                 .collect();
             let _locks = self.inode_locks.lock_many(&requests);
-            // Post-lock verification needs only the restore epoch (a single
-            // atomic read — it moves exactly when a restore begins) plus the
-            // one walk that doubles as the mutation input. A second full
-            // traversal here would duplicate the one below.
-            let locked_epoch = {
-                let fs_dir = self.fs_dir.read();
-                fs_dir.store.scan_control().cancel_epoch()
-            };
-            if restore_epoch != locked_epoch {
-                continue;
-            }
-
-            // Single post-lock walk: the inode chain doubles as the
-            // re-verification and the mutation input. A mkdir input is
-            // deliberately partial — the missing trailing level is what the
-            // mutation creates.
             let fs_dir = self.fs_dir.read();
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if inp.inodes.len() != ids.len()
-                || inp
-                    .inodes
-                    .iter()
-                    .zip(&ids)
-                    .any(|(live, expected)| live.id() != *expected)
-            {
+            if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
+            let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
+                continue;
+            };
             if inp.is_full() {
                 if opts.create_parent {
                     let inode = inp
@@ -668,13 +559,11 @@ impl MasterFilesystem {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
-            let (inp, restore_epoch) = self.resolve_live_path(path)?;
-            let ids: Vec<i64> = inp.inodes.iter().map(|inode| inode.id()).collect();
+            let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
             Self::check_not_reserved_path(path)?;
-            if ids.len() + 1 < inp.components.len() {
+            if ids.len() + 1 < components_len {
                 return self.create_with_global_lock(path, opts, flags);
             }
-            let full = inp.is_full();
             if full {
                 if flags.overwrite() && !flags.exclusive() {
                     if let Some(result) = self.overwrite_file_sharded(path, opts.clone(), None)? {
@@ -697,22 +586,13 @@ impl MasterFilesystem {
                 })
                 .collect();
             let _locks = self.inode_locks.lock_many(&requests);
-            if !self.namespace_unchanged(restore_epoch, &inp) {
+            let fs_dir = self.fs_dir.read();
+            if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-
-            // Reusing the pre-lock path relies on its pointers still being
-            // valid; the identity check cannot protect an already-freed node.
-            let fs_dir = self.fs_dir.read();
-            let inp = inp;
-            if inp.is_full() {
-                // A concurrent creator won (or the target appeared): route
-                // through the same overwrite / conflict handling a full
-                // pre-lock resolution would take.
-                drop(fs_dir);
-                return self.create_with_global_lock(path, opts, flags);
-            }
-            debug_assert!(!inp.is_full());
+            let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
+                continue;
+            };
             if !opts.create_parent {
                 Self::check_parent(&inp)?;
             }

@@ -11,14 +11,29 @@ impl Drop for ResetChildrenCountPersistence {
 }
 
 #[test]
-fn namespace_validation_checks_first_missing_component() {
-    let fs = test_fs("validate-first-missing-component");
-    fs.mkdir("/parent", false).unwrap();
-    let (path, epoch) = fs.resolve_live_path("/parent/missing/leaf").unwrap();
-    assert!(fs.namespace_unchanged(epoch, &path));
-
-    fs.mkdir("/parent/missing", false).unwrap();
-    assert!(!fs.namespace_unchanged(epoch, &path));
+fn existing_mkdir_waits_for_target_inode_lock() {
+    let fs = test_fs("mkdir-existing-inode-lock");
+    let id = fs.mkdir("/dir", false).unwrap().id;
+    let held = fs.inode_locks.write_inode(id);
+    let worker_fs = fs.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        tx.send(worker_fs.mkdir("/dir", true)).unwrap();
+    });
+    started_rx.recv().unwrap();
+    let early = rx.recv_timeout(std::time::Duration::from_millis(100));
+    drop(held);
+    let result = match early {
+        Ok(result) => {
+            worker.join().unwrap();
+            panic!("mkdir bypassed the target inode lock: {result:?}");
+        }
+        Err(_) => rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+    };
+    worker.join().unwrap();
+    assert_eq!(result.unwrap().id, id);
 }
 
 #[test]
@@ -67,6 +82,27 @@ fn edge_plan_stops_at_a_file_component() {
     assert!(MasterFilesystem::resolve_locked_path(&guard, "/file/child", &ids, components)
         .unwrap()
         .is_some());
+}
+
+#[test]
+fn namespace_validation_checks_first_missing_component() {
+    let fs = test_fs("validate-first-missing-component");
+    fs.mkdir("/parent", false).unwrap();
+    let path = "/parent/missing/leaf";
+    let (ids, components, full, _) = fs.resolve_edge_ids(path).unwrap();
+    assert!(!full);
+    {
+        let guard = fs.fs_dir.read();
+        assert!(MasterFilesystem::resolve_locked_path(&guard, path, &ids, components)
+            .unwrap()
+            .is_some());
+    }
+
+    fs.mkdir("/parent/missing", false).unwrap();
+    let guard = fs.fs_dir.read();
+    assert!(MasterFilesystem::resolve_locked_path(&guard, path, &ids, components)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
