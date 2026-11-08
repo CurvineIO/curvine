@@ -640,6 +640,52 @@ fn mkdir_checks_existing_targets_and_recursive_parents() {
         .is_err());
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn open_missing_path_fallback_excludes_namespace_readers() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("open-missing-exclusive");
+    fs.mkdir("/parent", false).unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "open-missing-exclusive";
+    let rule = FaultRuleBuilder::named("master.metadata.open_fallback")
+        .matches("path", "/parent/missing")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.fs_dir.read();
+    let worker_fs = fs.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tx.send(worker_fs.open_file(
+            "/parent/missing",
+            CreateFileOpts::with_create(false),
+            OpenFlags::new_write_only(),
+        ))
+        .unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let early = rx.recv_timeout(Duration::from_millis(100));
+    drop(held);
+    let blocked = early.is_err();
+    let result = match early {
+        Ok(result) => result,
+        Err(_) => rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+    };
+    worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "open did not reach the fallback");
+    assert!(blocked, "fallback did not exclude namespace readers");
+    assert!(result.is_err());
+}
+
 #[test]
 fn create_and_open_preserve_path_and_flag_validation() {
     let fs = test_fs("create-open-snapshot-precheck");

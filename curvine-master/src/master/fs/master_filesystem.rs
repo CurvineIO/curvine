@@ -430,18 +430,6 @@ impl MasterFilesystem {
         Ok(control.cancel_epoch())
     }
 
-    /// Resolve a comparable live-tree view and capture the restore epoch.
-    /// The underlying path walk has the same borrowed-pointer lifetime risk
-    /// as `resolve_live_path` when it runs before inode locks are acquired.
-    fn resolve_live_store_view(&self, path: &str) -> FsResult<(StoreResolvedPath, u64)> {
-        let fs_dir = self.fs_dir.read();
-        // Mirror the snapshot-scan admission gate: mutations are rejected
-        // while a Raft snapshot restore is pending or in progress.
-        let epoch = Self::checked_live_epoch(&fs_dir)?;
-        let inp = Self::resolve_path(&fs_dir, path)?;
-        Ok((StoreResolvedPath::from_live(&inp), epoch))
-    }
-
     // The caller holds every planned inode lock throughout this traversal.
     fn resolve_locked_path(
         fs_dir: &FsDir,
@@ -2467,11 +2455,19 @@ impl MasterFilesystem {
                 let blocks = self.reopen_file_sharded(path, &opts.client_name, initial)?;
                 return Ok(Ok((blocks, None)));
             }
-            let resolved = self.resolve_live_store_view(path)?;
-            Self::check_not_pending_path(path)?;
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.open_fallback",
+                description: "Open fallback before taking the namespace write lock",
+                context: {"path" => path},
+            }
+            let fs_dir = self.fs_dir.write();
+            Self::checked_live_epoch(&fs_dir)?;
+            let inp = Self::resolve_path(&fs_dir, path)?;
             Self::check_not_reserved_path(path)?;
 
-            match resolved.0.target() {
+            match inp.get_last_inode().filter(|_| inp.is_full()) {
                 None => {
                     return if flags.create() {
                         Ok(Err(opts))
@@ -2486,13 +2482,13 @@ impl MasterFilesystem {
             }
 
             if !flags.truncate() {
+                drop(inp);
+                drop(fs_dir);
                 let initial = self.resolve_edge_ids(path)?;
                 let blocks = self.reopen_file_sharded(path, &opts.client_name, initial)?;
                 return Ok(Ok((blocks, None)));
             }
 
-            let fs_dir = self.fs_dir.write();
-            let inp = Self::resolve_path(&fs_dir, path)?;
             Self::check_not_reserved_path(inp.path())?;
             let deleted = fs_dir.overwrite_file(&inp, opts)?;
             let status = fs_dir.file_status(&inp)?;

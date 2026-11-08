@@ -25,20 +25,6 @@ pub struct StoreResolvedPath {
 }
 
 impl StoreResolvedPath {
-    /// Build the same view from a live-tree walk, so write paths can resolve
-    /// over memory instead of store snapshots while keeping the identical
-    /// comparison helpers.
-    pub(crate) fn from_live(inp: &crate::master::meta::inode::InodePath) -> Self {
-        let mut inodes = Vec::with_capacity(inp.inodes.len());
-        for inode in &inp.inodes {
-            inodes.push(inode.as_ref().clone_metadata());
-        }
-        Self {
-            components: inp.components.clone(),
-            inodes,
-        }
-    }
-
     pub fn is_full(&self) -> bool {
         self.components.len() == self.inodes.len()
     }
