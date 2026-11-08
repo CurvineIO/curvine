@@ -861,18 +861,18 @@ impl MasterFilesystem {
     fn delete_single_parent_sharded(
         &self,
         path: &str,
-        inp: InodePath,
+        ids: Vec<i64>,
+        components_len: usize,
         restore_epoch: u64,
     ) -> FsResult<DeleteResult> {
         const MAX_RETRIES: usize = 3;
-        let mut inp = Some(inp);
+        let mut ids = Some(ids);
 
         for _ in 0..MAX_RETRIES {
-            let Some(inp) = inp.take() else {
+            let Some(ids) = ids.take() else {
                 return self.delete_with_global_lock(path);
             };
-            let ids: Vec<i64> = inp.inodes.iter().map(|inode| inode.id()).collect();
-            if !inp.is_full() || ids.len() < 2 {
+            if ids.len() != components_len || ids.len() < 2 {
                 return self.delete_with_global_lock(path);
             }
 
@@ -889,15 +889,21 @@ impl MasterFilesystem {
                     }
                 })
                 .collect();
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.delete_planned",
+                description: "Delete path resolved before inode locks",
+                context: {"path" => path},
+            }
             let _locks = self.inode_locks.lock_many(&requests);
-            if !self.namespace_unchanged(restore_epoch, &inp) {
+            let fs_dir = self.fs_dir.read();
+            if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-
-            // Reusing the pre-lock path relies on its pointers still being
-            // valid; the identity check cannot protect an already-freed node.
-            let fs_dir = self.fs_dir.read();
-            let inp = inp;
+            let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
+                continue;
+            };
             let Some(target) = inp.get_last_inode() else {
                 drop(fs_dir);
                 drop(_locks);
@@ -945,17 +951,9 @@ impl MasterFilesystem {
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if inp.inodes.len() != ids.len()
-                || inp
-                    .inodes
-                    .iter()
-                    .zip(&ids)
-                    .any(|(inode, id)| inode.id() != *id)
-                || !inp.is_full()
-            {
+            let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
                 continue;
-            }
+            };
             let Some(target) = inp.get_last_inode() else {
                 continue;
             };
@@ -1523,14 +1521,14 @@ impl MasterFilesystem {
     ) -> FsResult<DeleteResult> {
         let mut delete_res = self.run_metadata_write(|| {
             let path = path.as_ref();
-            let (inp, restore_epoch) = self.resolve_live_path(path)?;
+            let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
             let sharded = matches!(mode, DeleteMode::SkipTrash)
                 && !recursive
-                && inp.is_full()
-                && inp.components.len() > 1
+                && full
+                && components_len > 1
                 && path != trash::TRASH_ROOT;
             if sharded {
-                self.delete_single_parent_sharded(path, inp, restore_epoch)
+                self.delete_single_parent_sharded(path, ids, components_len, restore_epoch)
             } else {
                 let mut fs_dir = self.fs_dir.write();
                 self.delete_locked(&mut fs_dir, path, recursive, mode)

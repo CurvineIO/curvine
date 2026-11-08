@@ -1,5 +1,50 @@
 use super::*;
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn delete_reloads_inode_after_a_hard_link_is_added() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("delete-reload-hardlink");
+    let original = fs.create("/a/file", true).unwrap();
+    fs.mkdir("/b", false).unwrap();
+    fs.mkdir("/c", false).unwrap();
+    fs.link("/a/file", "/b/alias").unwrap();
+    let parent = fs.file_status("/a").unwrap().id;
+    let runtime = FaultRuntime::process();
+    let rule_id = "delete-reload-hardlink";
+    let rule = FaultRuleBuilder::named("master.metadata.delete_planned")
+        .matches("path", "/a/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(parent);
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || worker_fs.delete("/a/file", false));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let link_result = if planned {
+        Some(fs.link("/b/alias", "/c/alias"))
+    } else {
+        None
+    };
+    drop(held);
+    let delete_result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "delete did not reach lock planning");
+    link_result.unwrap().unwrap();
+    delete_result.unwrap();
+    fs.delete("/b/alias", false).unwrap();
+    assert_eq!(fs.file_status("/c/alias").unwrap().id, original.id);
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/c/alias").unwrap().id, original.id);
+}
+
 #[test]
 fn concurrent_overwrites_of_the_same_target_keep_one_consistent_file_version() {
     let fs = test_fs("overwrite-same-target-race");
