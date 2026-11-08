@@ -2033,6 +2033,51 @@ fn resize_waits_for_conflicting_block_location_lock() {
     worker.join().unwrap().unwrap();
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn resize_replans_after_parent_replacement() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("resize-replaced-parent");
+    let old = fs.create("/a/file", true).unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "resize-replaced-parent";
+    let rule = FaultRuleBuilder::named("master.metadata.resize_planned")
+        .matches("path", "/a/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(old.id);
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        worker_fs.resize("/a/file", FileAllocOpts::with_truncate(128))
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let replacement = if planned {
+        fs.delete("/a", true).unwrap();
+        Some(fs.create("/a/file", true).unwrap())
+    } else {
+        None
+    };
+    drop(held);
+    let result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "resize did not reach lock planning");
+    let replacement = replacement.unwrap();
+    assert_ne!(old.id, replacement.id);
+    let status = result.unwrap().status;
+    assert_eq!((status.id, status.len), (replacement.id, 128));
+    fs.restore_from_rocksdb().unwrap();
+    let status = fs.file_status("/a/file").unwrap();
+    assert_eq!((status.id, status.len), (replacement.id, 128));
+}
+
 #[test]
 fn resize_by_id_falls_back_for_a_stale_path() {
     let fs = test_fs("resize-by-id-stale-path");
