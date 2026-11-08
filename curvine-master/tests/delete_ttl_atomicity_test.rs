@@ -41,8 +41,8 @@ fn replace_rename_updates_ttl_only_after_commit() {
         ..Default::default()
     };
     let target = InodeView::new_dir("target".into(), InodeDir::with_opts(3, 1, opts));
-    store.apply_add(&root, &source).unwrap();
-    store.apply_add(&root, &target).unwrap();
+    store.apply_add(&root, &source, true).unwrap();
+    store.apply_add(&root, &target, true).unwrap();
     let mut renamed = source.clone();
     renamed.change_name("target".into());
     assert_eq!(buckets.total_inodes(), 1);
@@ -93,8 +93,8 @@ fn replace_hard_link_keeps_surviving_inode_in_ttl_index() {
         ..Default::default()
     };
     let target = InodeView::new_file("target".into(), InodeFile::with_opts(3, 0, opts));
-    store.apply_add(&root, &source).unwrap();
-    store.apply_add(&root, &target).unwrap();
+    store.apply_add(&root, &source, true).unwrap();
+    store.apply_add(&root, &target, true).unwrap();
     store
         .apply_link(&root, &InodeView::new_entry("alias".into(), 3), 3, 1)
         .unwrap();
@@ -127,7 +127,7 @@ fn failed_delete_keeps_ttl_index() {
         ..Default::default()
     };
     let mut dir = InodeView::new_dir("dir".into(), InodeDir::with_opts(2, 1, opts));
-    store.apply_add(&root, &dir).unwrap();
+    store.apply_add(&root, &dir, true).unwrap();
     assert_eq!(buckets.total_inodes(), 1);
     // This corrupt edge points to a directory, so staging its file nlink
     // decrement fails after the parent directory has been visited.
@@ -135,11 +135,11 @@ fn failed_delete_keeps_ttl_index() {
         .unwrap()
         .add_child(InodeView::new_entry("bad".into(), 2))
         .unwrap();
-    assert!(store.apply_delete(&root, &dir, "dir", 10).is_err());
+    assert!(store.apply_delete(&root, &dir, "dir", 10, true).is_err());
     assert_eq!(buckets.total_inodes(), 1);
     assert!(store.get_inode(2, None).unwrap().is_some());
     dir.as_dir_mut().unwrap().delete_child(2, "bad").unwrap();
-    store.apply_delete(&root, &dir, "dir", 10).unwrap();
+    store.apply_delete(&root, &dir, "dir", 10, true).unwrap();
     assert_eq!(buckets.total_inodes(), 0);
     assert!(store.get_inode(2, None).unwrap().is_none());
     drop(store);
