@@ -14,8 +14,8 @@
 
 use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{
-    BlockDataset, BlockLayout, BlockReadContext, BlockTruncated, BlockWriteContext, ChecksumVerify,
-    Dataset,
+    BlockChecksum, BlockDataset, BlockLayout, BlockReadContext, BlockTruncated, BlockWriteContext,
+    ChecksumVerify, Dataset,
 };
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
@@ -332,10 +332,21 @@ impl BlockStore {
     }
 
     pub fn finalize_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        self.finalize_block_with_checksum(block, None)
+    }
+
+    /// Finalize a block, optionally reusing the checksum a write session
+    /// accumulated, so the sidecar does not re-read the staging file.
+    pub fn finalize_block_with_checksum(
+        &self,
+        block: &ExtendedBlock,
+        checksum_hint: Option<BlockChecksum>,
+    ) -> CommonResult<BlockMeta> {
         let _block_lock = self.block_lock(block.id, "finalize");
         self.check_replication_owner(block.id)?;
-        let reservation =
-            self.with_dataset_write("finalize", |state| state.reserve_file_finalize(block))?;
+        let reservation = self.with_dataset_write("finalize", move |state| {
+            state.reserve_file_finalize_with_checksum(block, checksum_hint)
+        })?;
 
         let Some(mut reservation) = reservation else {
             return self.with_dataset_write("finalize", |state| state.finalize_block(block));
@@ -469,11 +480,14 @@ impl BlockStore {
     }
 
     pub fn open_writer(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockWriteContext> {
-        let (layout, dir) = {
+        let (layout, dir, checksum) = {
             let state = self.read()?;
-            state.layout_for(meta)?
+            let (layout, dir) = state.layout_for(meta)?;
+            (layout, dir, state.block_checksum())
         };
-        layout.open_writer(&dir, meta, off).map_err(Into::into)
+        layout
+            .open_writer_with_checksum(&dir, meta, off, checksum)
+            .map_err(Into::into)
     }
 
     pub fn open_reader(
@@ -1162,7 +1176,7 @@ mod tests {
             .short_circuit(&rewrite)?
             .expect("file layout must expose a local path");
         std::fs::write(rewrite_path, b"new!")?;
-        let reservation = store
+        let mut reservation = store
             .write()?
             .reserve_file_finalize(&block)?
             .expect("rewrite finalize must reserve");
@@ -1232,6 +1246,40 @@ mod tests {
         drop(writer);
         block.len = data.len() as i64;
         store.finalize_block(&block)
+    }
+
+    #[test]
+    fn finalize_uses_write_session_checksum() -> CommonResult<()> {
+        let store = create_checksum_store("checksum-write-hint")?;
+        let mut block = ExtendedBlock::with_mem(1, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let mut writer = store.open_writer(&meta, 0)?;
+        let data: Vec<u8> = (0..(150 * 1024 + 17)).map(|i| (i % 251) as u8).collect();
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(data.as_slice())))?;
+        writer.flush()?;
+        let hint = writer
+            .take_checksum()
+            .expect("a sequential write session has a checksum");
+        drop(writer);
+        block.len = data.len() as i64;
+
+        let finalized = store.finalize_block_with_checksum(&block, Some(hint.clone()))?;
+        let (_, path, _) = store
+            .short_circuit_by_id(finalized.id)?
+            .expect("file layout must expose a local path");
+        let sidecar = std::fs::read(FileLayout::checksum_path_of(std::path::Path::new(&path)))?;
+        assert_eq!(
+            crate::worker::storage::BlockChecksum::decode(&sidecar)?,
+            hint
+        );
+        assert_eq!(
+            hint,
+            crate::worker::storage::BlockChecksum::compute(
+                crate::worker::storage::DEFAULT_CHECKSUM_CHUNK_SIZE,
+                &data
+            )?
+        );
+        Ok(())
     }
 
     #[test]

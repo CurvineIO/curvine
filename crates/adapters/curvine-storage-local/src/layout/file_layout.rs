@@ -239,19 +239,39 @@ impl FileLayout {
 
     /// Compute the sidecar for `block_path` and write it, synced, next to it.
     /// `expected_len` guards against the file changing under the read.
-    fn write_checksum(block_path: &Path, expected_len: i64) -> CommonResult<PathBuf> {
+    ///
+    /// `incremental` is the checksum a write session accumulated while writing
+    /// the block. It is used only when it covers exactly `expected_len` bytes
+    /// with the canonical chunk size; otherwise the file is streamed again, so
+    /// the published sidecar always describes the bytes that were published.
+    fn write_checksum(
+        block_path: &Path,
+        expected_len: i64,
+        incremental: Option<BlockChecksum>,
+    ) -> CommonResult<PathBuf> {
         let path = Self::checksum_path_of(block_path);
         let result = (|| -> CommonResult<()> {
-            let sum =
-                BlockChecksum::from_reader(DEFAULT_CHECKSUM_CHUNK_SIZE, File::open(block_path)?)?;
-            if sum.data_len() != expected_len as u64 {
-                return err_box!(
-                    "checksum of {} covered {} bytes, expected {}",
-                    block_path.display(),
-                    sum.data_len(),
-                    expected_len
-                );
-            }
+            let incremental = incremental
+                .filter(|sum| sum.chunk_size() == DEFAULT_CHECKSUM_CHUNK_SIZE)
+                .filter(|sum| expected_len >= 0 && sum.data_len() == expected_len as u64);
+            let sum = match incremental {
+                Some(sum) => sum,
+                None => {
+                    let sum = BlockChecksum::from_reader(
+                        DEFAULT_CHECKSUM_CHUNK_SIZE,
+                        File::open(block_path)?,
+                    )?;
+                    if sum.data_len() != expected_len as u64 {
+                        return err_box!(
+                            "checksum of {} covered {} bytes, expected {}",
+                            block_path.display(),
+                            sum.data_len(),
+                            expected_len
+                        );
+                    }
+                    sum
+                }
+            };
             let mut file = File::create(&path)?;
             file.write_all(&sum.encode())?;
             file.sync_all()?;
@@ -265,11 +285,14 @@ impl FileLayout {
     }
 
     /// `checksum` writes a synced sidecar for the staging file before publish.
+    /// `incremental` optionally supplies the checksum of the bytes the write
+    /// session wrote, which lets finalize skip re-reading the staging file.
     pub(crate) fn prepare_finalize(
         dir: &VfsDir,
         meta: &BlockMeta,
         committed_len: i64,
         checksum: bool,
+        incremental: Option<BlockChecksum>,
     ) -> CommonResult<FileFinalizePlan> {
         let staging_path = Self::block_path(dir, meta)?;
         // Sparse seek-past-EOF resize can raise a committed block's logical
@@ -302,7 +325,11 @@ impl FileLayout {
 
         let active_path = Self::block_path(dir, &final_meta)?;
         let staging_checksum = if checksum {
-            Some(Self::write_checksum(&staging_path, committed_len)?)
+            Some(Self::write_checksum(
+                &staging_path,
+                committed_len,
+                incremental,
+            )?)
         } else {
             None
         };
@@ -444,7 +471,7 @@ impl BlockLayout for FileLayout {
         committed_len: i64,
         checksum: bool,
     ) -> CommonResult<BlockMeta> {
-        let plan = Self::prepare_finalize(dir, meta, committed_len, checksum)?;
+        let plan = Self::prepare_finalize(dir, meta, committed_len, checksum, None)?;
         let (meta, sync) = Self::publish_finalize(plan)?;
         if let Some(sync) = sync {
             sync.finish();
@@ -520,6 +547,20 @@ impl BlockLayout for FileLayout {
         let file = Self::block_file(dir, meta)?;
         let device = LocalFile::with_write_offset(file, false, off)?;
         BlockWriteContext::new(device, 0, meta.len, off)
+    }
+
+    fn open_writer_with_checksum(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        off: i64,
+        checksum: bool,
+    ) -> IOResult<BlockWriteContext> {
+        let mut context = self.open_writer(dir, meta, off)?;
+        if checksum {
+            context.enable_checksum(DEFAULT_CHECKSUM_CHUNK_SIZE);
+        }
+        Ok(context)
     }
 
     fn open_reader(

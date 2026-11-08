@@ -332,13 +332,22 @@ impl BatchWriteHandler {
             self.rollback_batch();
             return Err(e.into());
         }
+        // Keep each block's write-session checksum before dropping the
+        // contexts, so finalize can publish the sidecar without re-reading.
+        let checksum_hints: Vec<_> = files
+            .iter_mut()
+            .map(|file| file.as_mut().and_then(BlockWriteContext::take_checksum))
+            .collect();
         for file in files.iter_mut() {
             file.take();
         }
 
         for (i, block) in commit_blocks.into_iter().enumerate() {
             let result = if commit {
-                self.store.finalize_block(&block).map(|_| ())
+                let checksum_hint = checksum_hints.get(i).cloned().flatten();
+                self.store
+                    .finalize_block_with_checksum(&block, checksum_hint)
+                    .map(|_| ())
             } else {
                 self.store.abort_block(&block)
             };

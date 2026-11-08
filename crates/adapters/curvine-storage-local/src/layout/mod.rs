@@ -99,6 +99,20 @@ pub trait BlockLayout {
 
     fn open_writer(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext>;
 
+    /// Open a writer that also tracks a per-chunk checksum of the written
+    /// bytes when `checksum` is set. Layouts without checksum sidecars ignore
+    /// the flag and return the plain writer.
+    fn open_writer_with_checksum(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        off: i64,
+        checksum: bool,
+    ) -> IOResult<BlockWriteContext> {
+        let _ = checksum;
+        self.open_writer(dir, meta, off)
+    }
+
     /// `verify` asks layouts with checksum sidecars to verify reads; others
     /// ignore it. A layout that finds the block file shorter than the
     /// committed length fails with [`BlockTruncated`].
@@ -220,6 +234,19 @@ impl BlockLayout for BlockLayoutKind {
         match self {
             Self::File(layout) => layout.open_writer(dir, meta, off),
             Self::Bdev(layout) => layout.open_writer(dir, meta, off),
+        }
+    }
+
+    fn open_writer_with_checksum(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        off: i64,
+        checksum: bool,
+    ) -> IOResult<BlockWriteContext> {
+        match self {
+            Self::File(layout) => layout.open_writer_with_checksum(dir, meta, off, checksum),
+            Self::Bdev(layout) => layout.open_writer_with_checksum(dir, meta, off, checksum),
         }
     }
 
