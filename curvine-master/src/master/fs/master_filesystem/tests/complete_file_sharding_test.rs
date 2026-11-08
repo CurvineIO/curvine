@@ -224,6 +224,54 @@ fn reopen_replans_after_parent_replacement() {
     assert_eq!(fs.file_status("/a/file").unwrap().id, replacement.id);
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn complete_by_id_survives_parent_replacement() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("complete-replaced-parent");
+    let old = fs.create("/a/file", true).unwrap();
+    fs.mkdir("/other", false).unwrap();
+    fs.link("/a/file", "/other/old").unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "complete-replaced-parent";
+    let rule = FaultRuleBuilder::named("master.metadata.complete_planned")
+        .matches("path", "/a/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(old.id);
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        worker_fs.complete_file("/a/file", Some(old.id), 0, vec![], "", false, None)
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let replacement = if planned {
+        fs.delete("/a", true).unwrap();
+        Some(fs.create("/a/file", true).unwrap())
+    } else {
+        None
+    };
+    drop(held);
+    let result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "complete did not reach lock planning");
+    let replacement = replacement.unwrap();
+    assert_ne!(old.id, replacement.id);
+    result.unwrap();
+    assert!(fs.file_status("/other/old").unwrap().is_complete);
+    assert!(!fs.file_status("/a/file").unwrap().is_complete);
+    fs.restore_from_rocksdb().unwrap();
+    assert!(fs.file_status("/other/old").unwrap().is_complete);
+    assert!(!fs.file_status("/a/file").unwrap().is_complete);
+}
+
 #[test]
 fn concurrent_overwrites_of_the_same_target_keep_one_consistent_file_version() {
     let fs = test_fs("overwrite-same-target-race");

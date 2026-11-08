@@ -1028,20 +1028,10 @@ impl MasterFilesystem {
             .collect();
 
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
-            let Some(target) = resolved.target() else {
-                return self.complete_file_with_global_lock(
-                    path,
-                    inode_id,
-                    len,
-                    commit_blocks,
-                    client_name,
-                    options,
-                );
-            };
-            if resolved.inodes().len() < 2
-                || inode_id.is_some_and(|id| id != target.id())
-                || !target.is_file()
+            let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
+            if !full
+                || ids.len() < 2
+                || inode_id.is_some_and(|id| ids.last() != Some(&id))
             {
                 return self.complete_file_with_global_lock(
                     path,
@@ -1053,19 +1043,25 @@ impl MasterFilesystem {
                 );
             }
 
-            let target_depth = resolved.inodes().len() - 1;
-            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
-                .inodes()
+            let target_depth = ids.len() - 1;
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
-                .map(|(depth, inode)| {
+                .map(|(depth, id)| {
                     if depth == target_depth {
-                        InodeLockRequest::write(depth, inode.id())
+                        InodeLockRequest::write(depth, *id)
                     } else {
-                        InodeLockRequest::read(depth, inode.id())
+                        InodeLockRequest::read(depth, *id)
                     }
                 })
                 .collect();
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.complete_planned",
+                description: "Complete path resolved before inode locks",
+                context: {"path" => path},
+            }
             let _inode_locks = self.inode_locks.lock_many(&requests);
             let _location_locks = self
                 .block_location_locks
@@ -1075,14 +1071,13 @@ impl MasterFilesystem {
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&resolved, &inp) {
+            let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
                 continue;
-            }
+            };
             let mut inode = inp
                 .get_last_inode()
                 .ok_or_else(|| FsError::file_not_found(path))?;
-            if inode_id.is_some_and(|id| id != inode.id()) {
+            if !inode.is_file() || inode_id.is_some_and(|id| id != inode.id()) {
                 drop(fs_dir);
                 drop(_location_locks);
                 drop(_inode_locks);
