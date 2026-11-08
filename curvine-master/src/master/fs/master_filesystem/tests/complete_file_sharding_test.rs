@@ -2188,6 +2188,72 @@ fn block_location_read_waits_for_inode_writer() {
     assert_eq!(rx.recv().unwrap().unwrap().status.id, inode_id);
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn atime_refresh_does_not_touch_replaced_inode() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("atime-replaced-parent");
+    atime_ttl_file_due(&fs, "a/file");
+    let old = fs.file_status("/a/file").unwrap();
+    let epoch = fs.fs_dir.read().store.scan_control().cancel_epoch();
+    let runtime = FaultRuntime::process();
+    let rule_id = "atime-replaced-parent";
+    let rule = FaultRuleBuilder::named("master.metadata.atime_planned")
+        .matches("path", "/a/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(old.id);
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || worker_fs.touch_atime_sharded("/a/file", old.id, epoch));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let replacement = if planned {
+        fs.delete("/a", true).unwrap();
+        atime_ttl_file_due(&fs, "a/file");
+        Some(fs.file_status("/a/file").unwrap())
+    } else {
+        None
+    };
+    drop(held);
+    let result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "atime update did not reach lock planning");
+    let replacement = replacement.unwrap();
+    assert_ne!(old.id, replacement.id);
+    result.unwrap();
+    let status = fs.file_status("/a/file").unwrap();
+    assert_eq!((status.id, status.atime), (replacement.id, replacement.atime));
+    fs.restore_from_rocksdb().unwrap();
+    let status = fs.file_status("/a/file").unwrap();
+    assert_eq!((status.id, status.atime), (replacement.id, replacement.atime));
+}
+
+#[test]
+fn atime_refresh_ignores_previous_restore_epoch() {
+    let fs = test_fs("atime-restore-epoch");
+    atime_ttl_file_due(&fs, "file");
+    let original = fs.file_status("/file").unwrap();
+    let epoch = fs.fs_dir.read().store.scan_control().cancel_epoch();
+    let guard = fs
+        .fs_dir
+        .read()
+        .store
+        .begin_restore(std::time::Duration::from_secs(1))
+        .unwrap();
+    drop(guard);
+    assert_ne!(fs.fs_dir.read().store.scan_control().cancel_epoch(), epoch);
+    fs.touch_atime_sharded("/file", original.id, epoch).unwrap();
+    let status = fs.file_status("/file").unwrap();
+    assert_eq!((status.id, status.atime), (original.id, original.atime));
+}
+
 #[test]
 fn atime_refresh_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("atime-refresh-shared-reader");

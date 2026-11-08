@@ -3425,48 +3425,50 @@ impl MasterFilesystem {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
-            let Ok((resolved, restore_epoch)) = self.resolve_live_store_view(path) else {
+            let Ok((ids, components_len, full, restore_epoch)) = self.resolve_edge_ids(path) else {
                 return Ok(());
             };
-            if restore_epoch != expected_epoch {
-                return Ok(());
-            }
-            let Some(target) = resolved.target() else {
-                return Ok(());
-            };
-            if target.id() != expected_id || !target.is_file() || resolved.inodes().len() < 2 {
+            if restore_epoch != expected_epoch
+                || !full
+                || ids.len() < 2
+                || ids.last() != Some(&expected_id)
+            {
                 return Ok(());
             }
 
-            let target_depth = resolved.inodes().len() - 1;
-            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
-                .inodes()
+            let target_depth = ids.len() - 1;
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
-                .map(|(depth, inode)| {
+                .map(|(depth, id)| {
                     if depth == target_depth {
-                        InodeLockRequest::write(depth, inode.id())
+                        InodeLockRequest::write(depth, *id)
                     } else {
-                        InodeLockRequest::read(depth, inode.id())
+                        InodeLockRequest::read(depth, *id)
                     }
                 })
                 .collect();
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.atime_planned",
+                description: "Atime path resolved before inode locks",
+                context: {"path" => path},
+            }
             let _locks = self.inode_locks.lock_many(&requests);
 
-            let Ok((locked, locked_epoch)) = self.resolve_live_store_view(path) else {
-                return Ok(());
-            };
-            if locked_epoch != expected_epoch || !resolved.same_resolution(&locked) {
-                continue;
-            }
-
             let fs_dir = self.fs_dir.read();
-            let Ok(inp) = Self::resolve_path(&fs_dir, path) else {
+            let Ok(locked_epoch) = Self::checked_live_epoch(&fs_dir) else {
                 return Ok(());
             };
-            if !Self::live_path_matches(&locked, &inp) {
+            if locked_epoch != expected_epoch {
                 continue;
             }
+            let inp = match Self::resolve_locked_path(&fs_dir, path, &ids, components_len) {
+                Ok(Some(inp)) => inp,
+                Ok(None) => continue,
+                Err(_) => return Ok(()),
+            };
             let Some(inode) = inp.get_last_inode() else {
                 return Ok(());
             };
