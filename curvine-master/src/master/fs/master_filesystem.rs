@@ -1461,21 +1461,25 @@ impl MasterFilesystem {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
-            let (resolved, restore_epoch) = self.resolve_live_store_view(path)?;
-            if !resolved.is_full() || resolved.inodes().len() < 2 {
+            let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
+            if !full || ids.len() < 2 || ids.last() != Some(&inode_id) {
                 return Ok(None);
             }
-            let target = resolved.target().expect("full path has a target");
-            if target.id() != inode_id
-                || !target.is_expired()?
+            let target = {
+                let fs_dir = self.fs_dir.read();
+                fs_dir.store.get_inode(inode_id, None)?
+            };
+            let Some(target) = target else {
+                return Ok(None);
+            };
+            if !target.is_expired()?
                 || target.storage_policy()?.ttl_action != TtlAction::Delete
-                || matches!(target, InodeView::File(file) if file.is_writing())
-                || (target.is_dir() && target.child_len() != 0)
+                || matches!(&target, InodeView::File(file) if file.is_writing())
             {
                 return Ok(None);
             }
 
-            let target_index = resolved.inodes().len() - 1;
+            let target_index = ids.len() - 1;
             let parent_index = target_index - 1;
             let block_ids = target
                 .as_file_ref()
@@ -1500,15 +1504,14 @@ impl MasterFilesystem {
                 description: "Worker locations sampled before inode locks",
                 context: {"path" => path},
             }
-            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = resolved
-                .inodes()
+            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
-                .map(|(depth, inode)| {
+                .map(|(depth, id)| {
                     if depth == parent_index || depth == target_index {
-                        InodeLockRequest::write(depth, inode.id())
+                        InodeLockRequest::write(depth, *id)
                     } else {
-                        InodeLockRequest::read(depth, inode.id())
+                        InodeLockRequest::read(depth, *id)
                     }
                 })
                 .collect();
@@ -1517,22 +1520,26 @@ impl MasterFilesystem {
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
 
-            let (locked, locked_epoch) = self.resolve_live_store_view(path)?;
-            if restore_epoch != locked_epoch
-                || !resolved.same_resolution(&locked)
-                || locked.target().is_none_or(|target| {
-                    target.id() != inode_id
-                        || target
-                            .as_file_ref()
-                            .map(|file| file.block_ids())
-                            .unwrap_or_default()
-                            != block_ids
-                })
+            let fs_dir = self.fs_dir.read();
+            if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
+                continue;
+            }
+            let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
+                continue;
+            };
+            let Some(inode) = inp.get_last_inode() else {
+                continue;
+            };
+            if inode.id() != inode_id
+                || inode
+                    .as_file_ref()
+                    .map(|file| file.block_ids())
+                    .unwrap_or_default()
+                    != block_ids
             {
                 continue;
             }
 
-            let fs_dir = self.fs_dir.read();
             let current_workers = {
                 let mut current_workers = HashSet::new();
                 for block_id in &block_ids {
@@ -1550,10 +1557,6 @@ impl MasterFilesystem {
                     .iter()
                     .all(|worker_id| current_workers.contains(worker_id))
             {
-                continue;
-            }
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            if !Self::live_path_matches(&locked, &inp) {
                 continue;
             }
             if inp.path() == trash::TRASH_ROOT {

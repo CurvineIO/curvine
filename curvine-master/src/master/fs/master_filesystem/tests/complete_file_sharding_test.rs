@@ -1594,6 +1594,50 @@ fn expired_trash_root_keeps_reserved_delete_protection() {
     assert_eq!(fs.file_status(trash::TRASH_ROOT).unwrap().id, id);
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn expired_delete_does_not_delete_replaced_inode() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("ttl-delete-replaced-parent");
+    let old_id = expired_delete_file(&fs, "/ttl/file");
+    let runtime = FaultRuntime::process();
+    let rule_id = "ttl-delete-replaced-parent";
+    let rule = FaultRuleBuilder::named("master.metadata.locations_sampled")
+        .matches("path", "/ttl/file")
+        .unwrap()
+        .record()
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let held = fs.inode_locks.write_inode(old_id);
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        worker_fs.delete_expired_inode("/ttl/file", old_id, DeleteMode::SkipTrash)
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    let replacement = if planned {
+        fs.delete("/ttl", true).unwrap();
+        Some(fs.create("/ttl/file", true).unwrap())
+    } else {
+        None
+    };
+    drop(held);
+    let result = worker.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(planned, "TTL delete did not reach location sampling");
+    let replacement = replacement.unwrap();
+    assert_ne!(old_id, replacement.id);
+    assert!(result.unwrap().is_none());
+    assert_eq!(fs.file_status("/ttl/file").unwrap().id, replacement.id);
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/ttl/file").unwrap().id, replacement.id);
+}
+
 #[test]
 fn expired_delete_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("expired-delete-shared-reader");
