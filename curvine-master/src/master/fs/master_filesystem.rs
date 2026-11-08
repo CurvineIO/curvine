@@ -2666,21 +2666,28 @@ impl MasterFilesystem {
         for _ in 0..Self::LIVE_READ_RETRIES {
             let fs_dir = self.fs_dir.read();
             fs_dir.store.ensure_available()?;
-            let mut directory = fs_dir.root_dir().children_handle().ok_or_else(|| {
-                FsError::common("root inode is not a directory".to_string())
-            })?;
+            let root = fs_dir.root_children();
+            let mut directory: Option<Arc<crate::master::meta::inode::DirectoryChildren>> = None;
+            let mut root_version = None;
             let mut versions = smallvec::SmallVec::<[_; 8]>::new();
             let mut found = true;
             let mut hydration = Ok(true);
             for (index, component) in components.iter().enumerate().skip(1) {
-                let (edge, version) = directory.read_child_edge_versioned(component);
-                versions.push(version);
+                let edge = if let Some(dir) = directory.take() {
+                    let (edge, version) = dir.read_child_edge_versioned(component);
+                    versions.push(version);
+                    edge
+                } else {
+                    let (edge, version) = root.read_child_edge_borrowed(component);
+                    root_version = Some(version);
+                    edge
+                };
                 let Some((id, next)) = edge else {
                     found = false;
                     break;
                 };
                 match next {
-                    Some(next) => directory = next,
+                    Some(next) => directory = Some(next),
                     None => {
                         hydration = fs_dir
                             .store
@@ -2691,7 +2698,9 @@ impl MasterFilesystem {
                     }
                 }
             }
-            if versions.iter().all(|version| version.is_current()) {
+            if root_version.as_ref().is_none_or(|version| version.is_current())
+                && versions.iter().all(|version| version.is_current())
+            {
                 match hydration {
                     Ok(true) => return Ok(found),
                     Ok(false) => break,
