@@ -14,6 +14,7 @@
 
 use curvine_master::master::fs::MasterFilesystem;
 use curvine_master::Master;
+use curvine_model::RenameFlags;
 use curvine_runtime::common::Utils;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -319,6 +320,42 @@ fn concurrent_create_same_path_keeps_one_namespace_entry() {
 
     assert_eq!(fs.list_status("/dir").unwrap().len(), 1);
     assert!(fs.exists("/dir/file").unwrap());
+}
+
+#[test]
+fn rename_noop_rejects_dangling_file_inode() {
+    let fs = test_fs("rename-dangling-inode");
+    let file_id = fs.create("/dir/file", true).unwrap().id;
+    fs.link("/dir/file", "/dir/alias").unwrap();
+    {
+        let guard = fs.fs_dir.write();
+        let mut batch = guard.store_ref().new_batch();
+        batch.delete_inode(file_id).unwrap();
+        batch.commit().unwrap();
+    }
+    assert!(fs
+        .rename("/dir/file", "/dir/file", RenameFlags::empty())
+        .is_err());
+    assert!(fs
+        .rename("/dir/file", "/dir/alias", RenameFlags::empty())
+        .is_err());
+}
+
+#[test]
+fn delete_rejects_dangling_file_inode_after_lock_planning() {
+    let fs = test_fs("delete-dangling-inode");
+    let file_id = fs.create("/dir/file", true).unwrap().id;
+    {
+        let guard = fs.fs_dir.write();
+        let mut batch = guard.store_ref().new_batch();
+        batch.delete_inode(file_id).unwrap();
+        batch.commit().unwrap();
+    }
+    let error = fs.delete("/dir/file", false).unwrap_err();
+    assert!(
+        error.to_string().contains("Failed to load inode"),
+        "{error}"
+    );
 }
 
 #[test]
