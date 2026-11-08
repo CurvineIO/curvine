@@ -1802,9 +1802,8 @@ mod tests {
         Ok(())
     }
 
-    /// Fresh block (no committed generation): a deterministic finalize
-    /// mismatch removes it, so the handler is latched by an abort and a
-    /// re-entrant Complete must not read as "committed".
+    /// A finalize mismatch removes a fresh block; the retried Complete must
+    /// not read as "committed".
     #[test]
     fn complete_after_mismatch_removed_fresh_block_is_rejected() -> FsResult<()> {
         let block_size = 1024_i64;
