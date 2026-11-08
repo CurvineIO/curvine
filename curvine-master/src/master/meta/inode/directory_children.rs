@@ -374,6 +374,26 @@ impl DirectoryChildren {
         })
     }
 
+    /// Capture the version before the lookup and retain this directory without
+    /// cloning its handle again for later validation.
+    pub(crate) fn read_child_edge_versioned(
+        self: std::sync::Arc<Self>,
+        name: &str,
+    ) -> (
+        Option<(i64, Option<std::sync::Arc<DirectoryChildren>>)>,
+        DirectoryChildrenSharedVersion,
+    ) {
+        let version = self.sequence.version();
+        let edge = self.read_child_edge(name);
+        (
+            edge,
+            DirectoryChildrenSharedVersion {
+                children: self,
+                version,
+            },
+        )
+    }
+
     /// Reads one child with an owned version token that remains valid after
     /// this call returns. Topology readers use it instead of retaining a raw
     /// child pointer beyond the directory read guard.

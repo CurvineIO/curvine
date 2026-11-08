@@ -469,7 +469,13 @@ fn purge_child_publication_failure_fences_writes() {
         .unwrap_err()
         .to_string()
         .contains("injected purge publication failure"));
-    assert!(!fs.exists(&path).unwrap());
+    // The durable inode is gone but publication failed, so the live edge is
+    // dangling. Reads must report corruption rather than claim it is absent.
+    assert!(fs
+        .exists(&path)
+        .unwrap_err()
+        .to_string()
+        .contains("missing inode"));
     assert!(fs
         .worker_manager
         .write()

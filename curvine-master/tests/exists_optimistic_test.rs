@@ -34,6 +34,43 @@ fn test_fs(name: &str) -> Arc<MasterFilesystem> {
 }
 
 #[test]
+fn exists_waits_for_file_deletion_publication() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let fs = test_fs("exists-delete-publication");
+    let id = fs.create("/dir/file", true).unwrap().id;
+    let guard = fs.fs_dir.read();
+    let inode = guard.store_ref().get_inode(id, None).unwrap().unwrap();
+    let mut batch = guard.store_ref().new_batch();
+    batch.delete_inode(id).unwrap();
+    batch.commit().unwrap();
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        result_tx.send(worker_fs.exists("/dir/file")).unwrap();
+    });
+    started_rx.recv().unwrap();
+    let early = result_rx.recv_timeout(Duration::from_millis(100));
+    let mut batch = guard.store_ref().new_batch();
+    batch.write_inode(&inode).unwrap();
+    batch.commit().unwrap();
+    drop(guard);
+    let result = match early {
+        Ok(result) => {
+            worker.join().unwrap();
+            panic!("exists observed an unpublished deletion: {result:?}");
+        }
+        Err(_) => result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+    };
+    worker.join().unwrap();
+    assert!(result.unwrap());
+}
+
+#[test]
 fn exists_reads_a_store_snapshot_with_a_shared_namespace_guard() {
     let fs = test_fs("shared-snapshot");
     fs.create("/dir/file", true).unwrap();

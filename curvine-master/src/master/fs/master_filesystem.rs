@@ -309,32 +309,6 @@ impl MasterFilesystem {
     /// Live-tree reads retry a hydration race a few times before surfacing.
     const LIVE_READ_RETRIES: usize = 16;
 
-    /// Resolve `path` over the live tree, retrying the transient window where
-    /// a cloned file-edge handle loses its store row to a concurrent delete.
-    fn resolve_live(&self, path: &str) -> FsResult<InodePath> {
-        for attempt in 0..Self::LIVE_READ_RETRIES {
-            let fs_dir = self.fs_dir.read();
-            let result = Self::resolve_path(&fs_dir, path);
-            drop(fs_dir);
-            match result {
-                Ok(inp) => return Ok(inp),
-                Err(error) => {
-                    if !Self::is_transient_hydration_race(&error) {
-                        return Err(error);
-                    }
-                    // Retries exhausted: the edge is persistently dangling
-                    // rather than racing a delete. Surface the same message
-                    // the store-snapshot protocol used for corruption.
-                    if attempt + 1 == Self::LIVE_READ_RETRIES {
-                        return err_box!("directory edge references missing inode: {}", error);
-                    }
-                    std::thread::sleep(std::time::Duration::from_micros(50));
-                }
-            }
-        }
-        unreachable!("retry loop returns on every branch")
-    }
-
     /// Read-barrier precheck before the commit gate. Re-run inside the gate to
     /// reject requests that waited while a role fence was installed.
     pub(crate) fn ensure_metadata_current(&self) -> FsResult<()> {
@@ -2684,21 +2658,57 @@ impl MasterFilesystem {
         if trash::is_pending_path(path) {
             return Ok(false);
         }
+        let components = InodeView::path_components(path)?;
+        if components.last().is_none_or(String::is_empty) {
+            return err_box!("Path {} is invalid", path);
+        }
 
-        // Same protocol as the baseline: a shared namespace read over the live
-        // tree. Per-directory child locks make each traversal step mutually
-        // exclusive with the sharded writers; a FileEdge hydration that races
-        // a concurrent delete retries briefly before surfacing the error.
-        let inp = self.resolve_live(path)?;
-        Ok(inp.get_last_inode().is_some())
-    }
-
-    /// A live-tree read that loaded a file edge from the store can race a
-    /// concurrent delete: the child handle was cloned before the writer took
-    /// the directory lock, and the row is gone by hydration time. Such a miss
-    /// is transient, unlike a persistently dangling edge.
-    fn is_transient_hydration_race(error: &FsError) -> bool {
-        error.to_string().contains("Failed to load inode")
+        for _ in 0..Self::LIVE_READ_RETRIES {
+            let fs_dir = self.fs_dir.read();
+            fs_dir.store.ensure_available()?;
+            let mut directory = fs_dir.root_dir().children_handle().ok_or_else(|| {
+                FsError::common("root inode is not a directory".to_string())
+            })?;
+            let mut versions = smallvec::SmallVec::<[_; 8]>::new();
+            let mut found = true;
+            let mut hydration = Ok(true);
+            for (index, component) in components.iter().enumerate().skip(1) {
+                let (edge, version) = directory.read_child_edge_versioned(component);
+                versions.push(version);
+                let Some((id, next)) = edge else {
+                    found = false;
+                    break;
+                };
+                match next {
+                    Some(next) => directory = next,
+                    None => {
+                        hydration = fs_dir
+                            .store
+                            .get_inode(id, Some(component))
+                            .map(|inode| inode.is_some());
+                        found = index + 1 == components.len();
+                        break;
+                    }
+                }
+            }
+            if versions.iter().all(|version| version.is_current()) {
+                match hydration {
+                    Ok(true) => return Ok(found),
+                    Ok(false) => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        // A file row may disappear before its directory edge is unpublished.
+        // An exclusive guard distinguishes that window from a dangling edge.
+        let fs_dir = self.fs_dir.write();
+        match Self::resolve_path(&fs_dir, path) {
+            Ok(inp) => Ok(inp.get_last_inode().is_some()),
+            Err(error) if error.to_string().contains("Failed to load inode") => {
+                err_box!("directory edge references missing inode: {}", error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn list_status<T: AsRef<str>>(&self, path: T) -> FsResult<Vec<FileStatus>> {
