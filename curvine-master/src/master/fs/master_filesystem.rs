@@ -2480,6 +2480,16 @@ impl MasterFilesystem {
         }
 
         let opened = self.run_metadata_write(|| {
+            if flags.truncate() {
+                let (ids, components_len, full, epoch) = self.resolve_edge_ids(path)?;
+                Self::check_not_reserved_path(path)?;
+                let initial = (ids, components_len, full, epoch, None);
+                if let Some((status, deleted)) =
+                    self.overwrite_file_sharded(path, opts.clone(), Some(initial))?
+                {
+                    return Ok(Ok((FileBlocks::new(status, vec![]), Some(deleted))));
+                }
+            }
             let resolved = self.resolve_live_store_view(path)?;
             Self::check_not_pending_path(path)?;
             Self::check_not_reserved_path(path)?;
@@ -2501,20 +2511,6 @@ impl MasterFilesystem {
             if !flags.truncate() {
                 let blocks = self.reopen_file_sharded(path, &opts.client_name, resolved)?;
                 return Ok(Ok((blocks, None)));
-            }
-
-            let ids = resolved.0.inodes().iter().map(|inode| inode.id()).collect();
-            let initial = (
-                ids,
-                resolved.0.components().len(),
-                resolved.0.is_full(),
-                resolved.1,
-                resolved.0.target().cloned(),
-            );
-            if let Some((status, deleted)) =
-                self.overwrite_file_sharded(path, opts.clone(), Some(initial))?
-            {
-                return Ok(Ok((FileBlocks::new(status, vec![]), Some(deleted))));
             }
 
             let fs_dir = self.fs_dir.write();
