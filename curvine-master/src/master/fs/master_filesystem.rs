@@ -18,9 +18,9 @@ use crate::master::fs::full_block_report::{
 };
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
-use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-#[cfg(test)]
-use crate::master::meta::inode::ROOT_INODE_ID;
+use crate::master::meta::inode::{
+    InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
+};
 use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::meta::{
     trash, BlockLocationLockManager, CacheInvalidationResult, CommitGate, FsDir, InodeLockManager,
@@ -356,22 +356,31 @@ impl MasterFilesystem {
         result
     }
 
-    // Plan from a store snapshot rather than reading live inode fields before
-    // taking their locks. The IDs are only a plan and must be revalidated.
+    // Plan from store edges rather than reading live inode fields before
+    // taking their locks. The IDs are only a plan and are revalidated against
+    // the live tree under the locks, so no RocksDB snapshot (which takes the DB
+    // mutex) or inode decode is needed. Files have no edges, so the walk stops
+    // at a file component.
     fn resolve_edge_ids(&self, path: &str) -> FsResult<(Vec<i64>, usize, bool, u64)> {
-        let fs_dir = self.fs_dir.read();
-        let control = fs_dir.store.scan_control();
-        if control.is_restoring() {
-            return err_box!(
-                "metadata scan lease rejected: snapshot restore is pending or in progress"
-            );
+        let components = InodeView::path_components(path)?;
+        if components.last().is_none_or(String::is_empty) {
+            return err_box!("Path {} is invalid", path);
         }
-        let epoch = control.cancel_epoch();
-        let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
-        let resolved = snapshot.resolve_path(path)?;
         Self::check_not_pending_path(path)?;
-        let ids = resolved.inodes().iter().map(InodeView::id).collect();
-        Ok((ids, resolved.components().len(), resolved.is_full(), epoch))
+        let fs_dir = self.fs_dir.read();
+        let epoch = Self::checked_live_epoch(&fs_dir)?;
+        fs_dir.store.ensure_available()?;
+        let store = &fs_dir.store.store;
+        let mut ids = Vec::with_capacity(components.len());
+        ids.push(ROOT_INODE_ID);
+        for name in &components[1..] {
+            match store.get_child_id(ids[ids.len() - 1], name)? {
+                Some(id) => ids.push(id),
+                None => break,
+            }
+        }
+        let full = ids.len() == components.len();
+        Ok((ids, components.len(), full, epoch))
     }
 
     #[inline]

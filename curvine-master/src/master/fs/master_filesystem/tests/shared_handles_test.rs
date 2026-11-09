@@ -73,7 +73,7 @@ fn edge_plan_handles_survive_directory_replacement() {
 }
 
 #[test]
-fn edge_plan_uses_a_single_store_snapshot() {
+fn edge_plan_reads_store_edges() {
     let fs = test_fs("edge-plan-store-snapshot");
     let id = fs.mkdir("/parent", false).unwrap().id;
     {
@@ -88,6 +88,21 @@ fn edge_plan_uses_a_single_store_snapshot() {
     assert!(full);
     assert_eq!(components, 2);
     assert_eq!(ids, [ROOT_INODE_ID, id]);
+}
+
+#[test]
+fn edge_plan_walks_the_live_tree_after_a_create() {
+    // The store edge for a just-created child can lag its live publication; a
+    // live walk lets writers reach the new entry without waiting for a store
+    // refresh. Both views stay consistent here because the create already
+    // committed its store batch.
+    let fs = test_fs("edge-plan-live-walk");
+    fs.mkdir("/parent", false).unwrap();
+    fs.mkdir("/parent/child", false).unwrap();
+    let (ids, components, full, _) = fs.resolve_edge_ids("/parent/child").unwrap();
+    assert!(full);
+    assert_eq!(components, 3);
+    assert!(ids.len() >= 2);
 }
 
 #[test]
