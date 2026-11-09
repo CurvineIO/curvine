@@ -76,6 +76,7 @@ fn setattr_resolves_root_and_hard_link_after_restore() {
                 },
             )
             .unwrap();
+        eprintln!("DIAG root status {}: {}", path, status.mode);
         assert_eq!(status.mode, mode);
     }
     fs.restore_from_rocksdb().unwrap();

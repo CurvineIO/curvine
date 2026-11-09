@@ -159,6 +159,8 @@ fn sorted_unique_keys(keys: impl Iterator<Item = u64>) -> Vec<u64> {
 }
 
 pub struct BlockLocationLockSet<'a> {
+    // Held for the lifetime of the set: dropping releases the stripe locks.
+    #[allow(dead_code)]
     guards: Vec<BlockLocationGuard<'a>>,
 }
 

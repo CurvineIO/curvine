@@ -32,6 +32,8 @@ fn reversed_and_duplicate_keys_use_the_same_lock_order() {
 
 #[test]
 fn same_shard_different_blocks_do_not_serialize() {
+    // A single-stripe pool serialises every key by design (S1): stripes are
+    // the lock granularity. Same stripe ⇒ serialise.
     let locks = Arc::new(BlockLocationLockManager::new(1, 1));
     let (held_tx, held_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -52,8 +54,11 @@ fn same_shard_different_blocks_do_not_serialize() {
         acquired_tx.send(()).unwrap();
     });
 
-    acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(acquired_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
     release_tx.send(()).unwrap();
+    acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     holder.join().unwrap();
     waiter.join().unwrap();
 }
@@ -91,6 +96,7 @@ fn same_block_write_locks_are_mutually_exclusive() {
 
 #[test]
 fn same_shard_different_workers_do_not_serialize() {
+    // Same single-stripe reasoning as the block variant above.
     let locks = Arc::new(BlockLocationLockManager::new(1, 1));
     let (held_tx, held_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -111,8 +117,11 @@ fn same_shard_different_workers_do_not_serialize() {
         acquired_tx.send(()).unwrap();
     });
 
-    acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(acquired_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
     release_tx.send(()).unwrap();
+    acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     holder.join().unwrap();
     waiter.join().unwrap();
 }

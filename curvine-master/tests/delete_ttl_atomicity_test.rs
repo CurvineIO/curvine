@@ -17,7 +17,7 @@ use curvine_master::master::meta::inode::ttl::TtlBucketList;
 use curvine_master::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use curvine_master::master::meta::store::{InodeStore, RocksInodeStore};
 use curvine_master::master::Master;
-use curvine_model::{CreateFileOpts, MkdirOpts, StoragePolicy, TtlAction};
+use curvine_model::{CreateFileOpts, DirectoryAttributeDelta, MkdirOpts, StoragePolicy, TtlAction};
 use curvine_runtime::common::Utils;
 use std::sync::Arc;
 
@@ -41,8 +41,22 @@ fn replace_rename_updates_ttl_only_after_commit() {
         ..Default::default()
     };
     let target = InodeView::new_dir("target".into(), InodeDir::with_opts(3, 1, opts));
-    store.apply_add(&root, &source, true).unwrap();
-    store.apply_add(&root, &target, true).unwrap();
+    store
+        .apply_add(
+            &root,
+            &source,
+            true,
+            DirectoryAttributeDelta::new(0, 0, 0).for_child_entry(),
+        )
+        .unwrap();
+    store
+        .apply_add(
+            &root,
+            &target,
+            true,
+            DirectoryAttributeDelta::new(0, 0, 0).for_child_entry(),
+        )
+        .unwrap();
     let mut renamed = source.clone();
     renamed.change_name("target".into());
     assert_eq!(buckets.total_inodes(), 1);
@@ -93,15 +107,45 @@ fn replace_hard_link_keeps_surviving_inode_in_ttl_index() {
         ..Default::default()
     };
     let target = InodeView::new_file("target".into(), InodeFile::with_opts(3, 0, opts));
-    store.apply_add(&root, &source, true).unwrap();
-    store.apply_add(&root, &target, true).unwrap();
     store
-        .apply_link(&root, &InodeView::new_entry("alias".into(), 3), 3, 1)
+        .apply_add(
+            &root,
+            &source,
+            true,
+            DirectoryAttributeDelta::new(0, 0, 0).for_child_entry(),
+        )
+        .unwrap();
+    store
+        .apply_add(
+            &root,
+            &target,
+            true,
+            DirectoryAttributeDelta::new(0, 0, 0).for_child_entry(),
+        )
+        .unwrap();
+    store
+        .apply_link(
+            &root,
+            &InodeView::new_entry("alias".into(), 3),
+            3,
+            1,
+            DirectoryAttributeDelta::new(0, 0, 0),
+        )
         .unwrap();
     let mut renamed = source.clone();
     renamed.change_name("target".into());
     store
-        .apply_replace_rename(&root, &source, "source", &root, &renamed, &target, 2)
+        .apply_replace_rename(
+            &root,
+            &source,
+            "source",
+            &root,
+            &renamed,
+            &target,
+            2,
+            DirectoryAttributeDelta::new(0, 0, -1).for_child_removal(),
+            DirectoryAttributeDelta::new(0, 0, 0),
+        )
         .unwrap();
     assert_eq!(buckets.total_inodes(), 1);
     assert_eq!(
@@ -127,7 +171,14 @@ fn failed_delete_keeps_ttl_index() {
         ..Default::default()
     };
     let mut dir = InodeView::new_dir("dir".into(), InodeDir::with_opts(2, 1, opts));
-    store.apply_add(&root, &dir, true).unwrap();
+    store
+        .apply_add(
+            &root,
+            &dir,
+            true,
+            DirectoryAttributeDelta::new(0, 0, 0).for_child_entry(),
+        )
+        .unwrap();
     assert_eq!(buckets.total_inodes(), 1);
     // This corrupt edge points to a directory, so staging its file nlink
     // decrement fails after the parent directory has been visited.
@@ -135,11 +186,29 @@ fn failed_delete_keeps_ttl_index() {
         .unwrap()
         .add_child(InodeView::new_entry("bad".into(), 2))
         .unwrap();
-    assert!(store.apply_delete(&root, &dir, "dir", 10, true).is_err());
+    assert!(store
+        .apply_delete(
+            &root,
+            &dir,
+            "dir",
+            10,
+            true,
+            DirectoryAttributeDelta::new(0, 0, -1).for_child_removal()
+        )
+        .is_err());
     assert_eq!(buckets.total_inodes(), 1);
     assert!(store.get_inode(2, None).unwrap().is_some());
     dir.as_dir_mut().unwrap().delete_child(2, "bad").unwrap();
-    store.apply_delete(&root, &dir, "dir", 10, true).unwrap();
+    store
+        .apply_delete(
+            &root,
+            &dir,
+            "dir",
+            10,
+            true,
+            DirectoryAttributeDelta::new(0, 0, -1).for_child_removal(),
+        )
+        .unwrap();
     assert_eq!(buckets.total_inodes(), 0);
     assert!(store.get_inode(2, None).unwrap().is_none());
     drop(store);

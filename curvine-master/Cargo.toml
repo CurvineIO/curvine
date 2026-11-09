@@ -27,6 +27,7 @@ curvine-record = { workspace = true }
 curvine-runtime = { workspace = true }
 curvine-metrics = { workspace = true }
 curvine-rocksdb = { workspace = true }
+arc-swap = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-codec = { workspace = true }
 curvine-data-transfer = { workspace = true, features = ["opendal-s3"] }

@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_master::master::meta::inode::{
-    ChildItem, InodeDir, InodePtr, InodeView, PackedChildren,
-};
+use curvine_master::master::meta::inode::{ChildItem, InodeDir, InodeView, PackedChildren};
 use curvine_model::ListOptions;
 use glob::Pattern;
 use std::collections::BTreeMap;
@@ -49,8 +47,8 @@ fn make_edge(name: &str, id: i64, is_dir: bool) -> InodeView {
 
 type Oracle = BTreeMap<String, (i64, bool)>;
 
-fn names(ptrs: &[InodePtr]) -> Vec<&str> {
-    ptrs.iter().map(|p| p.name()).collect()
+fn names<'a>(items: &'a [ChildItem<'a>]) -> Vec<&'a str> {
+    items.iter().map(|item| item.name()).collect()
 }
 
 fn assert_matches_oracle(children: &PackedChildren, oracle: &Oracle) {
@@ -197,7 +195,7 @@ fn child_item_exposes_name_and_id_for_both_kinds() {
 
     let items: Vec<ChildItem<'_>> = children.iter().collect();
     assert_eq!(items.len(), 2);
-    assert!(matches!(items[0], ChildItem::View { .. }));
+    assert!(matches!(items[0], ChildItem::DirNode { .. }));
     assert_eq!(items[0].name(), "d");
     assert_eq!(items[0].id(), 2);
     assert!(matches!(items[1], ChildItem::FileEntry { .. }));
@@ -210,8 +208,12 @@ fn item_name_matches_the_directory_object() {
     let mut children = PackedChildren::new();
     children.add_child(dir_edge("d", 7)).unwrap();
 
-    let mut dir = children.get_child("d").unwrap();
-    dir.change_name("renamed".to_string());
+    // Packed dir edges are immutable name+node records: a rename replaces
+    // the edge instead of mutating an in-tree view.
+    children.delete_child(7, "d").unwrap();
+    let mut renamed = dir_edge("d", 7);
+    renamed.change_name("renamed".to_string());
+    children.add_child(renamed).unwrap();
 
     let items: Vec<ChildItem<'_>> = children.iter().collect();
     assert_eq!(items[0].name(), "renamed");
@@ -221,7 +223,7 @@ fn item_name_matches_the_directory_object() {
     assert_eq!(listed[0].name(), "renamed");
     assert_eq!(listed[0].id(), 7);
 
-    assert_eq!(children.get_child("d").unwrap().name(), "renamed");
+    assert_eq!(children.get_child("renamed").unwrap().name(), "renamed");
 }
 
 #[test]
@@ -234,9 +236,8 @@ fn pointer_ownership_matches_the_contract() {
     assert_eq!(owned.id(), 42);
     assert!(owned.is_file_entry());
 
-    let borrowed = children.get_child("dir").unwrap();
-    let cloned = borrowed.clone();
-    drop(borrowed);
+    // Owned projections are safe to clone and keep after the borrow guard.
+    let cloned = dir_edge("dir", 43);
     assert_eq!(cloned.id(), 43);
     assert!(cloned.is_dir());
 
@@ -483,10 +484,14 @@ fn dir_pointer_survives_compaction() {
     let mut children = PackedChildren::new();
     children.add_child(dir_edge("anchor", 1)).unwrap();
 
-    // Borrowed pointer into the side vector, taken before any compaction runs.
-    let anchor = children.get_child("anchor").expect("anchor must resolve");
-    assert!(anchor.is_dir());
-    let anchor_addr = anchor.as_ptr();
+    // The Arc<DirNode> handle taken before any compaction runs must keep
+    // pointing at the same node object afterwards.
+    let anchor = children
+        .iter()
+        .find(|item| item.name() == "anchor")
+        .expect("anchor must resolve");
+    assert_eq!(anchor.id(), 1);
+    let anchor_node = anchor.dir_node().cloned().expect("dir node handle");
 
     // Fill and then drain 2000 dir slots so the hole count crosses HOLE_LIMIT
     // and forces compact_dirs to remap every surviving slot index.
@@ -502,18 +507,15 @@ fn dir_pointer_survives_compaction() {
     }
     assert_eq!(children.len(), 1);
 
-    // The Box moved between vectors instead of being reallocated, so the
-    // pointer taken before compaction still reads the same object.
-    assert_eq!(anchor.id(), 1);
-    assert_eq!(anchor.name(), "anchor");
-    assert!(anchor.is_dir());
-
-    let refreshed = children.get_child("anchor").expect("anchor must survive");
-    assert_eq!(
-        refreshed.as_ptr(),
-        anchor_addr,
-        "compaction moved the dir Box or remapped its slot wrongly"
+    // The Arc handle stays identical: compaction remaps slot indexes, never
+    // replaces the shared node.
+    let refreshed = children
+        .iter()
+        .find(|item| item.name() == "anchor")
+        .expect("anchor must survive");
+    let refreshed_node = refreshed.dir_node().cloned().expect("dir node handle");
+    assert!(
+        std::sync::Arc::ptr_eq(&anchor_node, &refreshed_node),
+        "compaction replaced the shared Arc<DirNode> or remapped its slot wrongly"
     );
-    assert_eq!(refreshed.id(), 1);
-    assert!(refreshed.is_dir());
 }

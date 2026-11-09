@@ -12,12 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::{InodePtr, InodeView};
+use crate::master::meta::inode::{DirNode, InodePtr, InodeView};
+use std::sync::Arc;
 
+/// One resolved child edge. Directory children carry their stable
+/// [`DirNode`](crate::master::meta::inode::DirNode) handle; file children are
+/// either a borrowed view (List/Map containers) or an inline name+id edge
+/// (Packed). The borrow variant exists only for containers that still store
+/// file views and disappears once those containers are directory-node only.
 #[derive(Clone, Copy)]
 pub enum ChildItem<'a> {
     View(&'a InodeView),
-    FileEntry { name: &'a str, id: i64 },
+    DirNode {
+        name: &'a str,
+        node: &'a Arc<DirNode>,
+    },
+    FileEntry {
+        name: &'a str,
+        id: i64,
+    },
 }
 
 impl<'a> ChildItem<'a> {
@@ -25,7 +38,19 @@ impl<'a> ChildItem<'a> {
     pub fn name(&self) -> &'a str {
         match self {
             ChildItem::View(view) => view.name(),
+            ChildItem::DirNode { name, .. } => name,
             ChildItem::FileEntry { name, .. } => name,
+        }
+    }
+
+    /// Whether the edge is a directory (a live node handle or a full
+    /// `InodeView` directory in the borrow variant).
+    #[inline]
+    pub fn is_dir(&self) -> bool {
+        match self {
+            ChildItem::DirNode { .. } => true,
+            ChildItem::View(view) => view.is_dir(),
+            ChildItem::FileEntry { .. } => false,
         }
     }
 
@@ -33,7 +58,16 @@ impl<'a> ChildItem<'a> {
     pub fn id(&self) -> i64 {
         match self {
             ChildItem::View(view) => view.id(),
+            // Immutable identity: safe to read without any lock.
+            ChildItem::DirNode { node, .. } => node.id,
             ChildItem::FileEntry { id, .. } => *id,
+        }
+    }
+
+    pub fn dir_node(&self) -> Option<&Arc<DirNode>> {
+        match self {
+            ChildItem::DirNode { node, .. } => Some(node),
+            _ => None,
         }
     }
 
@@ -41,6 +75,9 @@ impl<'a> ChildItem<'a> {
     pub(crate) fn into_view(self) -> InodeView {
         match self {
             ChildItem::View(view) => view.clone(),
+            ChildItem::DirNode { name, node } => {
+                InodeView::from_dir_node_live(name.to_owned(), (*node).clone())
+            }
             ChildItem::FileEntry { name, id } => InodeView::new_entry(name.to_owned(), id),
         }
     }
@@ -49,6 +86,9 @@ impl<'a> ChildItem<'a> {
     pub fn as_ptr(self) -> InodePtr {
         match self {
             ChildItem::View(view) => InodePtr::from_ref(view),
+            ChildItem::DirNode { name, node } => InodePtr::from_owned(
+                InodeView::from_dir_node_live(name.to_string(), (*node).clone()),
+            ),
             ChildItem::FileEntry { name, id } => {
                 InodePtr::from_owned(InodeView::new_entry(name.to_string(), id))
             }

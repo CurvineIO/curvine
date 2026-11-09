@@ -17,7 +17,7 @@
 use crate::master::meta::feature::AclFeature;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{
-    Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
+    ChildAddResult, DirNode, Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
 use crate::master::MetadataCodec;
 use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, LinkedList};
 use std::fmt::{Debug, Formatter};
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedFile {
@@ -184,12 +185,18 @@ impl InodeView {
     pub(crate) fn adopt_directory_children(&mut self, detached: Self) {
         debug_assert_eq!(self.is_dir(), detached.is_dir());
         if let (Dir(updated), Dir(original)) = (self, detached) {
+            let node = original.dir.node.clone();
             updated.dir.adopt_children(original.dir);
+            updated.dir.node = node;
         }
     }
 
     pub fn new_dir(name: String, dir: InodeDir) -> Self {
         Dir(Box::new(NamedDir::new(name, dir)))
+    }
+
+    pub(crate) fn from_dir_node_live(name: String, node: Arc<DirNode>) -> Self {
+        InodeDir::from_dir_node_live(name, node)
     }
 
     pub fn new_file(name: String, file: InodeFile) -> Self {
@@ -198,6 +205,12 @@ impl InodeView {
 
     pub fn new_entry(name: String, id: i64) -> Self {
         FileEntry(Box::new(NamedEntry::new(name, id)))
+    }
+
+    /// Borrow helper for code that works generically over `InodePtr` and
+    /// owned `InodeView` parents.
+    pub fn as_view(&self) -> &Self {
+        self
     }
 
     pub fn is_dir(&self) -> bool {
@@ -288,7 +301,7 @@ impl InodeView {
     }
 
     // Add child nodes.
-    pub fn add_child(&mut self, child: InodeView) -> CommonResult<InodePtr> {
+    pub fn add_child(&mut self, child: InodeView) -> CommonResult<ChildAddResult> {
         match self {
             File(f) => err_box!("Path not a dir: {}", f.name),
             Dir(d) => d.add_child(child),
@@ -326,6 +339,11 @@ impl InodeView {
             Dir(d) => d.update_mtime(time),
             FileEntry(..) => (),
         }
+    }
+
+    pub(crate) fn update_exchange_delta(&mut self, mtime: i64, delta: i8) -> CommonResult<()> {
+        self.update_exchange_parent(mtime, delta);
+        Ok(())
     }
 
     pub(crate) fn update_exchange_parent(&mut self, mtime: i64, delta: i8) {
@@ -424,16 +442,6 @@ impl InodeView {
         }
     }
 
-    pub(crate) fn directory_attribute_delta(
-        &self,
-        delta: curvine_model::DirectoryAttributeDelta,
-    ) -> curvine_model::DirectoryAttributeDelta {
-        match self {
-            Dir(d) => d.dir.directory_attribute_delta(delta),
-            _ => delta,
-        }
-    }
-
     pub(crate) fn directory_attributes(&self) -> curvine_model::DirectoryAttributes {
         match self {
             Dir(d) => d.dir.directory_attributes(),
@@ -451,20 +459,21 @@ impl InodeView {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn directory_attribute_delta(
+        &self,
+        raw: curvine_model::DirectoryAttributeDelta,
+    ) -> curvine_model::DirectoryAttributeDelta {
+        match self {
+            Dir(d) => d.dir.directory_attribute_delta(raw),
+            _ => panic!("directory_attribute_delta requires a directory inode"),
+        }
+    }
+
     pub(crate) fn mark_directory_attributes_persisted(&self) {
         if let Dir(d) = self {
             d.dir.mark_directory_attributes_persisted();
         }
-    }
-
-    pub(crate) fn apply_directory_attribute_delta(
-        &self,
-        delta: curvine_model::DirectoryAttributeDelta,
-    ) -> CommonResult<()> {
-        if let Dir(d) = self {
-            d.dir.apply_directory_attribute_delta(delta)?;
-        }
-        Ok(())
     }
 
     pub fn as_file_ref(&self) -> CommonResult<&InodeFile> {

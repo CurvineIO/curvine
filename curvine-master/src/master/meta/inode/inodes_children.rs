@@ -14,14 +14,15 @@
 
 //! Directory children containers.
 //!
-//! `List` and `Map` keep a full `Box<InodeView>` per child and are retained for
-//! benchmarks and rollback. `Packed` delegates to [`PackedChildren`], which
-//! inlines file edges as variable-length byte records and keeps directory
-//! objects in a side vector.
+//! All containers store file edges as `FileEntry(name, id)` records and
+//! directory edges as `Arc<DirNode>` handles. There is no `Box<InodeView>`
+//! directory in the live tree: `InodeView` exists only at the store/journal
+//! boundary and inside detached projections. `Packed` inlines file edges as
+//! variable-length byte records and keeps directory handles in a side vector.
 
 use crate::master::meta::inode::PackedChildren;
 use crate::master::meta::inode::PackedIter;
-use crate::master::meta::inode::{ChildItem, InodePtr, InodeView};
+use crate::master::meta::inode::{ChildItem, DirNode, InodeDir, InodeEntry, InodePtr, InodeView};
 use curvine_config::ChildrenContainer;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::ListOptions;
@@ -30,15 +31,120 @@ use std::collections::btree_map::{Entry, Values};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::slice::Iter;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 static CHILDREN_CONTAINER: OnceLock<ChildrenContainer> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub enum InodeChildren {
-    List(Vec<Box<InodeView>>),
-    Map(BTreeMap<String, Box<InodeView>>),
+    List(Vec<ChildSlot>),
+    Map(BTreeMap<String, ChildSlot>),
     Packed(PackedChildren),
+}
+
+/// The live handle returned by `add_child`. Directories carry the slot's
+/// own `Arc<DirNode>` — all later writes must go through it; files carry
+/// nothing (the caller keeps its owned view for the store write).
+pub enum ChildAddResult {
+    Dir { name: String, node: Arc<DirNode> },
+    File(InodeView),
+}
+
+/// One child edge in a `List`/`Map` container. Files carry the inline
+/// `FileEntry` record; directories carry the stable `Arc<DirNode>` handle.
+#[derive(Debug, Clone)]
+pub enum ChildSlot {
+    Dir { name: String, node: Arc<DirNode> },
+    FileEntry { name: String, id: i64 },
+}
+
+impl ChildAddResult {
+    /// The entry a caller appends to its resolved path: directories carry
+    /// the live node handle, files the hydrated view.
+    pub(crate) fn into_entry(self) -> InodeEntry {
+        match self {
+            Self::Dir { name, node } => InodeEntry::Dir { name, node },
+            Self::File(view) => InodeEntry::View(InodePtr::from_owned(view)),
+        }
+    }
+}
+
+impl ChildSlot {
+    #[inline]
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Dir { name, .. } => name,
+            Self::FileEntry { name, .. } => name,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn id(&self) -> i64 {
+        match self {
+            Self::Dir { node, .. } => node.id,
+            Self::FileEntry { id, .. } => *id,
+        }
+    }
+
+    /// Classifies an incoming inode into its edge shape. The owned view is
+    /// kept by the caller for local use; directories keep only the node
+    /// handle, so the projection is detached by construction. A view with a
+    /// node backlink (rename move) reuses that node — the live identity must
+    /// survive the move.
+    pub(crate) fn from_view(inode: &InodeView) -> Self {
+        if inode.is_dir() {
+            Self::Dir {
+                name: inode.name().to_string(),
+                node: inode
+                    .as_dir_ref()
+                    .ok()
+                    .and_then(|dir| dir.node.clone())
+                    .unwrap_or_else(|| DirNode::from_view(inode)),
+            }
+        } else {
+            Self::FileEntry {
+                name: inode.name().to_string(),
+                id: inode.id(),
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_item(&self) -> ChildItem<'_> {
+        match self {
+            Self::Dir { name, node } => ChildItem::DirNode { name, node },
+            Self::FileEntry { name, id } => ChildItem::FileEntry { name, id: *id },
+        }
+    }
+
+    #[inline]
+    /// The live handle a caller must use after the edge lands in the slot:
+    /// directories return the slot's own `Arc<DirNode>`; files return the
+    /// owned view (their live state is the store, not the tree).
+    pub(crate) fn add_result(&self) -> ChildAddResult {
+        match self {
+            Self::Dir { name, node } => ChildAddResult::Dir {
+                name: name.clone(),
+                node: node.clone(),
+            },
+            Self::FileEntry { name, id } => {
+                ChildAddResult::File(InodeView::new_entry(name.clone(), *id))
+            }
+        }
+    }
+
+    /// Detached projection for callers that need the DTO shape; directory
+    /// projections never write back to the tree.
+    // Borrows by design: every caller iterates shared containers and the
+    // slot stays resident; renaming would churn all call sites.
+    #[allow(clippy::wrong_self_convention)]
+    pub(crate) fn into_view(&self) -> InodeView {
+        match self {
+            Self::Dir { name, node } => InodeDir::from_dir_node_live(name.clone(), node.clone()),
+            Self::FileEntry { name, id } => InodeView::new_entry(name.clone(), *id),
+        }
+    }
 }
 
 impl InodeChildren {
@@ -79,24 +185,28 @@ impl InodeChildren {
     }
 
     // Search for whether the current inode name exists.
-    fn search_by_name(list: &[Box<InodeView>], name: &str) -> Result<usize, usize> {
+    fn search_by_name(list: &[ChildSlot], name: &str) -> Result<usize, usize> {
         list.binary_search_by(|f| f.name().cmp(name))
     }
 
     /// Get children matching glob pattern (e.g., "*.txt", "dir*")
-    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodePtr> {
+    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodeView> {
         match self {
             InodeChildren::List(list) => list
                 .iter()
                 .filter(|child| glob_pattern.matches(child.name()))
-                .map(|child| InodePtr::from_ref(child.as_ref()))
+                .map(ChildSlot::into_view)
                 .collect(),
             InodeChildren::Map(map) => map
                 .values()
                 .filter(|child| glob_pattern.matches(child.name()))
-                .map(|child| InodePtr::from_ref(child.as_ref()))
+                .map(ChildSlot::into_view)
                 .collect(),
-            InodeChildren::Packed(packed) => packed.get_child_by_glob_pattern(glob_pattern),
+            InodeChildren::Packed(packed) => packed
+                .get_child_by_glob_pattern(glob_pattern)
+                .into_iter()
+                .map(|item| item.into_view())
+                .collect(),
         }
     }
 
@@ -107,18 +217,18 @@ impl InodeChildren {
                 .filter(|item| pattern.matches(item.name()))
                 .map(|item| item.into_view())
                 .collect(),
-            _ => self
-                .get_child_by_glob_pattern(pattern)
-                .into_iter()
-                .map(|child| child.as_ref().clone())
-                .collect(),
+            _ => self.get_child_by_glob_pattern(pattern),
         }
     }
 
     pub(crate) fn all_views(&self) -> Vec<InodeView> {
         match self {
             Self::Packed(packed) => packed.iter().map(|item| item.into_view()).collect(),
-            _ => self.iter().map(|child| child.as_ref().clone()).collect(),
+            _ => match self {
+                InodeChildren::List(list) => list.iter().map(ChildSlot::into_view).collect(),
+                InodeChildren::Map(map) => map.values().map(ChildSlot::into_view).collect(),
+                InodeChildren::Packed(_) => unreachable!("matched above"),
+            },
         }
     }
 
@@ -126,8 +236,8 @@ impl InodeChildren {
         match self {
             Self::List(list) => Self::search_by_name(list, name)
                 .ok()
-                .map(|index| ChildItem::View(list[index].as_ref())),
-            Self::Map(map) => map.get(name).map(|view| ChildItem::View(view.as_ref())),
+                .map(|index| list[index].as_item()),
+            Self::Map(map) => map.get(name).map(|slot| slot.as_item()),
             Self::Packed(packed) => packed.get_child_item(name),
         }
     }
@@ -150,15 +260,15 @@ impl InodeChildren {
                                 id
                             );
                         }
-                        Some(list.remove(v))
+                        Some(list.remove(v).into_view())
                     }
                     Err(_) => None,
                 }
             }
 
             InodeChildren::Map(map) => {
-                if let Some(inode) = map.get(child_name) {
-                    let id = inode.id();
+                if let Some(slot) = map.get(child_name) {
+                    let id = slot.id();
                     if id != child_id {
                         return err_box!(
                             "Inode status error, expect id {}, actually delete {}",
@@ -167,7 +277,7 @@ impl InodeChildren {
                         );
                     }
                 }
-                map.remove(child_name)
+                map.remove(child_name).map(|slot| slot.into_view())
             }
             InodeChildren::Packed(packed) => {
                 return packed.delete_child(child_id, child_name);
@@ -176,7 +286,7 @@ impl InodeChildren {
 
         match removed {
             None => err_box!("Child {} not exists", child_name),
-            Some(r) => Ok(*r),
+            Some(r) => Ok(r),
         }
     }
 
@@ -186,12 +296,12 @@ impl InodeChildren {
             _ => self
                 .list_options(opts)
                 .into_iter()
-                .map(|child| child.as_ref().clone())
+                .map(|item| item.into_view())
                 .collect(),
         }
     }
 
-    pub fn list_options(&self, opts: &ListOptions) -> Vec<InodePtr> {
+    pub fn list_options(&self, opts: &ListOptions) -> Vec<ChildItem<'_>> {
         match self {
             InodeChildren::List(list) => {
                 let start = opts
@@ -204,11 +314,7 @@ impl InodeChildren {
                     .unwrap_or(0);
                 let slice = &list[start..];
                 let n = opts.limit.unwrap_or(slice.len());
-                slice
-                    .iter()
-                    .take(n)
-                    .map(|b| InodePtr::from_ref(b.as_ref()))
-                    .collect()
+                slice.iter().take(n).map(ChildSlot::as_item).collect()
             }
 
             InodeChildren::Map(map) => {
@@ -217,35 +323,27 @@ impl InodeChildren {
                     |a| map.range::<str, _>((Bound::Excluded(a.as_str()), Bound::Unbounded)),
                 );
                 let n = opts.limit.unwrap_or(usize::MAX);
-                range
-                    .take(n)
-                    .map(|(_, v)| InodePtr::from_ref(v.as_ref()))
-                    .collect()
+                range.take(n).map(|(_, v)| v.as_item()).collect()
             }
 
             InodeChildren::Packed(packed) => packed.list_options(opts),
         }
     }
 
-    pub fn add_child(&mut self, inode: InodeView) -> CommonResult<InodePtr> {
-        // Assert that it should not be FileEntry
+    /// Adds an edge. File inodes are stored as inline `FileEntry` records and
+    /// the owned view is returned for local use. Directory edges live only in
+    /// the slot's `Arc<DirNode>`; the returned handle is the *same* node the
+    /// slot stores, so every later write goes to the live object.
+    pub fn add_child(&mut self, inode: InodeView) -> CommonResult<ChildAddResult> {
         match self {
             InodeChildren::List(list) => {
                 let index = Self::search_by_name(list, inode.name());
                 match index {
                     Err(v) => {
-                        if inode.is_file() {
-                            let entry = Box::new(InodeView::new_entry(
-                                inode.name().to_string(),
-                                inode.id(),
-                            ));
-                            list.insert(v, entry);
-                            Ok(InodePtr::from_owned(inode))
-                        } else {
-                            let boxed = Box::new(inode);
-                            list.insert(v, boxed);
-                            Ok(InodePtr::from_ref(list[v].as_ref()))
-                        }
+                        let slot = ChildSlot::from_view(&inode);
+                        let result = slot.add_result();
+                        list.insert(v, slot);
+                        Ok(result)
                     }
 
                     Ok(_) => err_box!("Child {} already exists", inode.name()),
@@ -254,18 +352,10 @@ impl InodeChildren {
 
             InodeChildren::Map(map) => match map.entry(inode.name().to_owned()) {
                 Entry::Vacant(v) => {
-                    if inode.is_file() {
-                        // Store lightweight FileEntry in map
-                        let name = inode.name().to_string();
-                        let id = inode.id();
-                        v.insert(Box::new(InodeView::new_entry(name, id)));
-                        // But return owned pointer to complete object
-                        Ok(InodePtr::from_owned(inode))
-                    } else {
-                        // Directory: move ownership into the map and return a reference.
-                        let inserted = v.insert(Box::new(inode));
-                        Ok(InodePtr::from_ref(inserted.as_ref()))
-                    }
+                    let slot = ChildSlot::from_view(&inode);
+                    let result = slot.add_result();
+                    v.insert(slot);
+                    Ok(result)
                 }
 
                 Entry::Occupied(_) => err_box!("Child {} already exists", inode.name()),
@@ -314,8 +404,8 @@ impl Default for InodeChildren {
 }
 
 enum InnerIter<'a> {
-    List(Iter<'a, Box<InodeView>>),
-    Map(Values<'a, String, Box<InodeView>>),
+    List(Iter<'a, ChildSlot>),
+    Map(Values<'a, String, ChildSlot>),
     Packed(PackedIter<'a>),
 }
 
@@ -339,8 +429,8 @@ impl Iterator for ChildrenIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.inner {
-            InnerIter::List(list) => list.next().map(|child| InodePtr::from_ref(child.as_ref())),
-            InnerIter::Map(map) => map.next().map(|child| InodePtr::from_ref(child.as_ref())),
+            InnerIter::List(list) => list.next().map(|slot| slot.as_item().as_ptr()),
+            InnerIter::Map(map) => map.next().map(|slot| slot.as_item().as_ptr()),
             InnerIter::Packed(iter) => iter.next().map(|item| item.as_ptr()),
         }
     }
@@ -365,8 +455,8 @@ mod tests {
         InodeView::new_dir(name.to_string(), InodeDir::new(id, 0))
     }
 
-    fn child_names(ptrs: &[InodePtr]) -> Vec<String> {
-        ptrs.iter().map(|ptr| ptr.name().to_string()).collect()
+    fn child_names(items: &[ChildItem<'_>]) -> Vec<String> {
+        items.iter().map(|item| item.name().to_string()).collect()
     }
 
     fn all_names(children: &InodeChildren) -> Vec<String> {
@@ -397,14 +487,18 @@ mod tests {
                 limit: Some(1),
                 start_after: Some("a.txt".to_string()),
             });
-            assert_eq!(child_names(&page), vec!["b.txt"], "{container:?}");
+            let page = page
+                .iter()
+                .map(|item| item.name().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(page, vec!["b.txt"], "{container:?}");
 
             let matched = children.get_child_by_glob_pattern(&Pattern::new("*.txt").unwrap());
-            assert_eq!(
-                child_names(&matched),
-                vec!["a.txt", "b.txt"],
-                "{container:?}"
-            );
+            let matched = matched
+                .iter()
+                .map(|view| view.name().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(matched, vec!["a.txt", "b.txt"], "{container:?}");
 
             assert!(
                 children.add_child(file_edge("a.txt", 9)).is_err(),

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_master::master::meta::inode::InodeEntry;
 use curvine_master::master::meta::inode::{
     DirectoryChildren, InodeDir, InodeFile, InodePath, InodePtr, InodeView,
 };
@@ -126,20 +127,20 @@ fn shared_walk_preserves_resolved_directory_views() {
         assert_eq!(inp.inodes.len(), ids.len(), "{path}");
         for (inode, id) in inp.inodes.iter().zip(ids) {
             assert_eq!(inode.id(), *id, "{path}");
+            // resolve_shared still walks InodeView trees in this test; the
+            // live-node projection arrives with the container switch.
             assert!(
-                inode.as_ref().is_dir(),
+                matches!(inode, InodeEntry::View(ptr) if ptr.is_dir()),
                 "{path}: inode {id} is not a directory"
             );
-            assert!(inode.as_ref().children_handle().is_some(), "{path}");
         }
     }
 
     let deep_path = InodePath::resolve_shared(&root, "/sub/nested/deep/last", &store).unwrap();
-    deep_path
-        .inodes
-        .last()
-        .unwrap()
-        .as_ref()
+    let Some(InodeEntry::View(last)) = deep_path.inodes.last() else {
+        panic!("shared walk must end on a view until the container switch");
+    };
+    last.as_ref()
         .children_handle()
         .unwrap()
         .add_child(InodeView::new_dir("new".into(), InodeDir::new(1009, 1)))

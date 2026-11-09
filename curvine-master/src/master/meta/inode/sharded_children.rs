@@ -21,7 +21,7 @@
 //! that raced the promotion either sees the old single map or the finished
 //! shard table — never a half-filled one.
 
-use super::{InodeChildren, InodeView};
+use super::InodeChildren;
 use fxhash::FxHasher;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
@@ -56,27 +56,27 @@ impl ShardedChildren {
     /// Migrates every child of `children` into the shards. Called while the
     /// single index write lock is held, so the snapshot is complete.
     pub(crate) fn insert_children(&self, children: &mut InodeChildren) {
-        let mut shard_buffers: Vec<BTreeMap<String, Box<InodeView>>> =
+        let mut shard_buffers: Vec<BTreeMap<String, super::ChildSlot>> =
             (0..self.shards.len()).map(|_| BTreeMap::new()).collect();
         let owned = std::mem::replace(children, InodeChildren::new_map());
-        let mut insert = |name: String, view: Box<InodeView>| {
+        let mut insert = |name: String, slot: super::ChildSlot| {
             let index = self.shard_index(&name);
-            shard_buffers[index].insert(name, view);
+            shard_buffers[index].insert(name, slot);
         };
         match owned {
             InodeChildren::List(list) => {
-                for view in list {
-                    insert(view.name().to_owned(), view);
+                for slot in list {
+                    insert(slot.name().to_owned(), slot);
                 }
             }
             InodeChildren::Map(map) => {
-                for (name, view) in map {
-                    insert(name, view);
+                for (name, slot) in map {
+                    insert(name, slot);
                 }
             }
             InodeChildren::Packed(packed) => {
-                for (name, view) in packed.into_entries() {
-                    insert(name, view);
+                for (name, slot) in packed.into_entries() {
+                    insert(name, slot);
                 }
             }
         }

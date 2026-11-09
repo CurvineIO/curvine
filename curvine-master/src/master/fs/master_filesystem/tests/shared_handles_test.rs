@@ -430,6 +430,7 @@ fn same_parent_directory_replacement_persists_link_count() {
         fs.mkdir("/p/a", true).unwrap();
         fs.mkdir("/p/b", false).unwrap();
         assert_eq!(fs.file_status("/p").unwrap().nlink, 4);
+        let pre = fs.file_status("/p").unwrap();
         fs.rename("/p/a", "/p/b", RenameFlags::empty()).unwrap();
         let status = fs.file_status("/p").unwrap();
         assert_eq!((status.nlink, status.children_num), (3, 1));
@@ -456,11 +457,10 @@ fn directory_publication_failure_fences_subsequent_writes() {
     {
         let guard = fs.fs_dir.write();
         let path = MasterFilesystem::resolve_path(&guard, "/parent").unwrap();
-        let parent = path.get_last_inode().unwrap();
-        let dir = parent.as_dir_ref().unwrap();
-        let mut attributes = dir.directory_attributes();
+        let node = path.get_last_dir_node().expect("live dir node");
+        let mut attributes = node.directory_attributes();
         attributes.version = u64::MAX;
-        dir.set_directory_attributes(attributes);
+        node.set_attribute_values(attributes);
     }
 
     let error = fs.create("/parent/child", false).unwrap_err();
@@ -605,11 +605,10 @@ fn delete_and_rename_publication_failures_fence_writes() {
         {
             let guard = fs.fs_dir.write();
             let path = MasterFilesystem::resolve_path(&guard, "/parent").unwrap();
-            let parent = path.get_last_inode().unwrap();
-            let dir = parent.as_dir_ref().unwrap();
-            let mut attributes = dir.directory_attributes();
+            let node = path.get_last_dir_node().expect("live dir node");
+            let mut attributes = node.directory_attributes();
             attributes.version = u64::MAX;
-            dir.set_directory_attributes(attributes);
+            node.set_attribute_values(attributes);
         }
         let result = if operation == "delete" {
             fs.delete("/parent/child", false).map(|_| ())

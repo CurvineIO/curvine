@@ -22,7 +22,7 @@
 //! Astra promotion protocol.
 
 use super::sharded_children::{min_sharded_children, ShardedChildren};
-use super::{InodeChildren, InodePtr, InodeView};
+use super::{ChildAddResult, ChildItem, DirNode, InodeChildren, InodePtr, InodeView};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::ListOptions;
 use glob::Pattern;
@@ -92,6 +92,23 @@ impl Drop for WriteSequence<'_> {
     }
 }
 
+/// Owned child-edge identity captured under the shard guard.
+#[derive(Clone)]
+pub enum ChildEdge {
+    Dir(std::sync::Arc<DirNode>),
+    FileId(i64),
+}
+
+impl ChildEdge {
+    /// Immutable edge identity; safe to read without locking the child.
+    pub fn id(&self) -> i64 {
+        match self {
+            Self::Dir(node) => node.id,
+            Self::FileId(id) => *id,
+        }
+    }
+}
+
 pub struct DirectoryChildren {
     sequence: SequenceState,
     children: RwLock<InodeChildren>,
@@ -142,7 +159,7 @@ enum RenameMutationGuard<'a> {
 /// Write window for a same-directory rename. Same-shard renames take one
 /// lock; cross-shard renames take both in shard-index ascending order, so
 /// two opposite renames can never form an ABBA cycle.
-
+///
 /// Write window over one directory's child index: holds the index write lock
 /// plus the sequence bump for the whole mutation.
 pub struct DirectoryMutation<'a> {
@@ -387,7 +404,7 @@ impl DirectoryChildren {
             && self.sequence.is_current(version.version)
     }
 
-    pub fn add_child(&self, inode: InodeView) -> CommonResult<InodePtr> {
+    pub fn add_child(&self, inode: InodeView) -> CommonResult<ChildAddResult> {
         let name = inode.name().to_owned();
         let mut mutation = self.begin_mutation(&name);
         mutation.add_child(inode)
@@ -411,6 +428,19 @@ impl DirectoryChildren {
 
     pub fn get_child_ptr(&self, name: &str) -> Option<InodePtr> {
         self.with_children_for_name(name, |children, name| children.get_child(name))
+    }
+
+    /// One child edge with its stable identity, captured as owned data:
+    /// directory edges carry the `Arc<DirNode>` handle, file edges the
+    /// inline name+id record. The guard is released before returning.
+    pub fn get_child_edge(&self, name: &str) -> Option<ChildEdge> {
+        self.with_children_for_name(name, |children, name| {
+            children.get_child_item(name).map(|item| match item {
+                ChildItem::DirNode { node, .. } => ChildEdge::Dir(node.clone()),
+                ChildItem::FileEntry { id, .. } => ChildEdge::FileId(id),
+                ChildItem::View(view) => ChildEdge::FileId(view.id()),
+            })
+        })
     }
 
     pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodeView> {
@@ -551,7 +581,7 @@ impl DirectoryMutation<'_> {
         }
     }
 
-    pub fn add_child(&mut self, inode: InodeView) -> CommonResult<InodePtr> {
+    pub fn add_child(&mut self, inode: InodeView) -> CommonResult<ChildAddResult> {
         DirectoryChildren::validate_name(self.packed_names, inode.name())?;
         self.children_for_name(inode.name())?.add_child(inode)
     }
@@ -573,16 +603,17 @@ impl DirectoryRenameMutation<'_> {
     pub fn child_view(&self, name: &str) -> Option<InodeView> {
         match &self.children {
             RenameMutationGuard::Single(children) => {
-                children.get_child(name).map(|ptr| ptr.as_ref().clone())
+                children.get_child_item(name).map(|item| item.into_view())
             }
             RenameMutationGuard::Shards { first, second, .. } => first
-                .get_child(name)
+                .get_child_item(name)
+                .map(|item| item.into_view())
                 .or_else(|| {
                     second
                         .as_ref()
-                        .and_then(|children| children.get_child(name))
-                })
-                .map(|ptr| ptr.as_ref().clone()),
+                        .and_then(|children| children.get_child_item(name))
+                        .map(|item| item.into_view())
+                }),
         }
     }
 

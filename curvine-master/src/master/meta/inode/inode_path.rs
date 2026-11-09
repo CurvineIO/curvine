@@ -15,19 +15,84 @@
 use crate::master::meta::glob_utils::parse_glob_pattern;
 use crate::master::meta::inode::InodeView::{self, Dir, File, FileEntry};
 use crate::master::meta::inode::{
-    DirectoryChildrenSharedVersion, InodeDir, InodeFile, InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR,
+    ChildEdge, DirNode, DirectoryChildren, DirectoryChildrenSharedVersion, InodeDir, InodeFile,
+    InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR,
 };
 use crate::master::meta::store::InodeStore;
 use curvine_core_error::{err_box, try_option, CommonResult};
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 
+/// One resolved path element. Live directories carry the stable
+/// [`DirNode`] handle; files and persistence DTOs carry the legacy
+/// `InodePtr`. Directory live state is only reachable via
+/// [`InodeEntry::dir_node`] — there is no `RawPtr`/`&mut` access to a
+/// directory's `InodeView`.
+pub enum InodeEntry {
+    Dir { name: String, node: Arc<DirNode> },
+    View(InodePtr),
+}
+
+impl Clone for InodeEntry {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Dir { name, node } => Self::Dir {
+                name: name.clone(),
+                node: node.clone(),
+            },
+            // RawPtr::clone never takes ownership, so the copy is a borrow.
+            Self::View(ptr) => Self::View(ptr.clone()),
+        }
+    }
+}
+
+impl fmt::Debug for InodeEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Dir { name, node } => f.debug_tuple("Dir").field(name).field(&node.id).finish(),
+            Self::View(ptr) => f.debug_tuple("View").field(&ptr.id()).finish(),
+        }
+    }
+}
+
+impl InodeEntry {
+    pub fn id(&self) -> i64 {
+        match self {
+            // Immutable identity; safe to read without locks.
+            Self::Dir { node, .. } => node.id,
+            Self::View(ptr) => ptr.id(),
+        }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Dir { name, .. } => name,
+            Self::View(ptr) => ptr.name(),
+        }
+    }
+
+    /// Live directory handle. File entries return `None`; callers that need
+    /// a persistence DTO use [`InodePath::get_inode`].
+    pub(crate) fn dir_node(&self) -> Option<&Arc<DirNode>> {
+        match self {
+            Self::Dir { node, .. } => Some(node),
+            Self::View(_) => None,
+        }
+    }
+}
+
+/// One resolved path element. Live directories carry the stable
+/// [`DirNode`] handle; files and persistence DTOs carry the legacy
+/// `InodePtr`. Directory live state is only reachable via
+/// [`InodeEntry::dir_node`] — there is no `RawPtr`/`&mut` access to a
+/// directory's `InodeView`.
 pub struct InodePath {
     path: String,
     name: String,
     pub components: Vec<String>,
-    pub inodes: Vec<InodePtr>,
+    pub inodes: Vec<InodeEntry>,
     /// Captured (handle, version) per resolved directory level, for callers
     /// that walk shared handles and must validate after reading.
     versions: SmallVec<[DirectoryChildrenSharedVersion; 4]>,
@@ -54,7 +119,7 @@ impl InodePath {
             return err_box!("Path {} is invalid", path.as_ref());
         }
 
-        let mut inodes: Vec<InodePtr> = Vec::with_capacity(components.len());
+        let mut inodes: Vec<InodeEntry> = Vec::with_capacity(components.len());
         let mut versions = SmallVec::new();
         let mut directory = match root_view.children_handle() {
             Some(handle) => handle,
@@ -65,7 +130,7 @@ impl InodePath {
         versions.push(directory.shared_version());
         let mut root_view = root_view.clone();
         root_view.change_name(components[0].clone());
-        inodes.push(InodePtr::from_owned(root_view));
+        inodes.push(InodeEntry::View(InodePtr::from_owned(root_view)));
 
         for component in components.iter().skip(1) {
             let (child, _child_version) = directory.read_child_view(component);
@@ -85,7 +150,7 @@ impl InodePath {
                 other => InodePtr::from_owned(other),
             };
             let next_directory = resolved.as_ref().children_handle();
-            inodes.push(resolved);
+            inodes.push(InodeEntry::View(resolved));
             match next_directory {
                 Some(next) => {
                     versions.push(next.shared_version());
@@ -168,42 +233,77 @@ impl InodePath {
         if CHECK_IDS && components.len() != components_len {
             return Ok(None);
         }
-        let mut inodes: Vec<InodePtr> = Vec::with_capacity(components.len());
+        let mut inodes: Vec<InodeEntry> = Vec::with_capacity(components.len());
         let mut versions = SmallVec::new();
-        let mut cur_inode = root;
+        // `pending` is the child edge captured at the previous level: `None`
+        // means the current element is the root, `Dir` a stable directory
+        // handle, `FileId` a file edge to hydrate through the store.
+        let mut pending: Option<ChildEdge> = None;
+        let mut cur_children: Option<Arc<DirectoryChildren>> = root.as_ref().children_handle();
+        // Holds the caller's root pointer until the first push moves it into
+        // the entry, so an owned root lives as long as the resolved path.
+        let mut owned_root = Some(root);
         let mut index = 0;
 
         while index < components.len() {
-            if CHECK_IDS && ids.get(index).is_none_or(|id| cur_inode.id() != *id) {
+            // Resolve the current element from the pending edge before any
+            // child access; the edge id is the plan-identity source.
+            let (cur_id, resolved_entry) = match &pending {
+                None => {
+                    let id = owned_root.as_ref().expect("root kept for first round").id();
+                    let entry = InodeEntry::View(owned_root.take().expect("root moved once"));
+                    (id, entry)
+                }
+                Some(ChildEdge::Dir(node)) => {
+                    let name = components.get(index).cloned().unwrap_or_default();
+                    (
+                        node.id,
+                        InodeEntry::Dir {
+                            name,
+                            node: node.clone(),
+                        },
+                    )
+                }
+                Some(ChildEdge::FileId(id)) => {
+                    let full = store.get_inode(*id, None)?;
+                    let Some(full) = full else {
+                        return err_box!("Failed to load inode {} from store", id);
+                    };
+                    let id = full.id();
+                    (id, InodeEntry::View(InodePtr::from_owned(full)))
+                }
+            };
+            if CHECK_IDS && ids.get(index).is_none_or(|id| cur_id != *id) {
                 return Ok(None);
             }
             if TRACK_VERSIONS {
-                if let Some(children) = cur_inode.as_ref().children_handle() {
+                if let Some(children) = &cur_children {
                     versions.push(children.shared_version());
                 }
             }
             let next = if index + 1 < components.len() {
-                match cur_inode.as_ref() {
-                    Dir(dir) => dir.get_child(&components[index + 1]),
-                    _ => None,
-                }
+                let edge = cur_children
+                    .as_ref()
+                    .and_then(|children| children.get_child_edge(&components[index + 1]));
+                edge
             } else {
                 None
             };
-
-            let resolved_inode = match cur_inode.as_ref() {
-                FileEntry(f) => match store.get_inode(f.id(), Some(f.name()))? {
-                    Some(full_inode) => InodePtr::from_owned(full_inode),
-                    None => return err_box!("Failed to load inode {} from store", f.id()),
-                },
-                _ => cur_inode,
-            };
-            // Preserve ownership when a caller passes an owned root or a
-            // child container returns an owned inode.
-            inodes.push(resolved_inode);
-
-            match next {
-                Some(child) => cur_inode = child,
+            inodes.push(resolved_entry);
+            // Advance: the captured edge decides the next level's identity.
+            // A missing edge stops the walk, exactly like the previous
+            // traversal: later components stay unresolved in this path. A
+            // file edge continues only so the final component hydrates; it
+            // has no children, so deeper components cannot resolve.
+            match &next {
+                Some(ChildEdge::Dir(node)) => {
+                    pending = next.clone();
+                    cur_children = Some(node.children.clone());
+                }
+                Some(ChildEdge::FileId(_)) => {
+                    pending = next.clone();
+                    cur_children = None;
+                }
                 None => break,
             }
             index += 1;
@@ -236,7 +336,7 @@ impl InodePath {
 
         // Leaf
         match curr_node.as_ref() {
-            File(..) | Dir(..) => path_inodes_rebuild.push(curr_node),
+            File(..) | Dir(..) => path_inodes_rebuild.push(InodeEntry::View(curr_node)),
             FileEntry(e) => {
                 let resolved_leaf_node = match store.get_inode(e.id(), Some(e.name()))? {
                     Some(full_inode) => InodePtr::from_owned(full_inode),
@@ -247,7 +347,7 @@ impl InodePath {
                         )
                     }
                 };
-                path_inodes_rebuild.push(resolved_leaf_node);
+                path_inodes_rebuild.push(InodeEntry::View(resolved_leaf_node));
             }
         }
 
@@ -257,7 +357,7 @@ impl InodePath {
                 Some(full_inode) => InodePtr::from_owned(full_inode),
                 None => return err_box!("Failed to load parent inode {} from store", parent_id),
             };
-            path_inodes_rebuild.push(resolved_parent);
+            path_inodes_rebuild.push(InodeEntry::View(resolved_parent));
             idx -= 1;
             if idx != 0 {
                 parent_id = match parent_map.get(&parent_id) {
@@ -271,7 +371,10 @@ impl InodePath {
 
         let components_result: Vec<String> = path_inodes_rebuild
             .iter()
-            .map(|node| node.as_ref().name().to_string())
+            .map(|node| match node {
+                InodeEntry::View(ptr) => ptr.name().to_string(),
+                InodeEntry::Dir { .. } => String::new(),
+            })
             .collect();
 
         let path_str = components_result
@@ -302,7 +405,6 @@ impl InodePath {
         })
     }
 
-    /// Resolve all paths matching glob pattern using BFS queue traversal
     pub fn resolve_for_glob_pattern(
         root: InodePtr,
         pattern: &str,
@@ -426,11 +528,24 @@ impl InodePath {
         }
     }
 
-    pub fn get_inodes(&self) -> &Vec<InodePtr> {
+    /// Component name at `pos` with the same negative-index semantics as
+    /// [`Self::get_dir_node`].
+    pub(crate) fn get_component_neg(&self, pos: i32) -> CommonResult<&'_ str> {
+        let pos = if pos < 0 {
+            (self.components.len() as i32 + pos) as usize
+        } else {
+            pos as usize
+        };
+        self.get_component(pos)
+    }
+
+    pub fn get_inodes(&self) -> &[InodeEntry] {
         &self.inodes
     }
 
-    // Get the last node that already exists on the path
+    // Get the last node that already exists on the path.
+    // Directory elements project to a detached persistence DTO; live
+    // directory access goes through [`Self::get_last_dir_node`].
     pub fn get_last_inode(&self) -> Option<InodePtr> {
         self.get_inode(-1)
     }
@@ -462,11 +577,36 @@ impl InodePath {
             pos as usize
         };
 
-        if pos < self.inodes.len() {
-            Some(self.inodes[pos].clone())
-        } else {
-            None
+        if pos >= self.inodes.len() {
+            return None;
         }
+        match &self.inodes[pos] {
+            InodeEntry::View(ptr) => Some(ptr.clone()),
+            // Snapshot DTO: the projection detaches children and attribute
+            // state from the live node, so writes on it never reach the tree.
+            InodeEntry::Dir { name, node } => Some(InodePtr::from_owned(
+                InodeDir::from_dir_node_live(name.clone(), node.clone()),
+            )),
+        }
+    }
+
+    /// Live directory handle at `pos` (negative counts from the end).
+    /// Files and DTOs return `None`; all live-directory writes go through
+    /// this handle, never through a projected `InodePtr`.
+    pub fn get_dir_node(&self, pos: i32) -> Option<Arc<DirNode>> {
+        let pos = if pos < 0 {
+            (self.components.len() as i32 + pos) as usize
+        } else {
+            pos as usize
+        };
+        match self.inodes.get(pos) {
+            Some(InodeEntry::Dir { node, .. }) => Some(node.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn get_last_dir_node(&self) -> Option<Arc<DirNode>> {
+        self.get_dir_node(-1)
     }
 
     pub fn len(&self) -> usize {
@@ -481,7 +621,7 @@ impl InodePath {
         self.inodes.len()
     }
 
-    pub fn append(&mut self, inode: InodePtr) -> CommonResult<()> {
+    pub fn append(&mut self, inode: InodeEntry) -> CommonResult<()> {
         if self.components.len() == self.inodes.len() {
             return err_box!(
                 "Path {} is The path is complete, appending nodes is not allowed",
@@ -490,7 +630,7 @@ impl InodePath {
         }
 
         match self.get_component(self.inodes.len()) {
-            Ok(n) if n == inode.name() => (),
+            Ok(n) if n == inode_name(&inode) => (),
             _ => return err_box!("data status  {:?}", self),
         }
 
@@ -500,21 +640,24 @@ impl InodePath {
 
     // Determine whether it is an empty directory.
     pub fn is_empty_dir(&self) -> bool {
-        match self.get_last_inode() {
-            Some(v) => v.child_len() == 0,
-
-            _ => true,
+        match self.get_last_dir_node() {
+            Some(node) => node.children.iter_len() == 0,
+            None => self.get_last_inode().is_none_or(|v| v.child_len() == 0),
         }
     }
 
     // Return the last inode only if the path was fully resolved.
-    pub fn task_last(mut self) -> Option<InodePtr> {
+    pub fn task_last(mut self) -> Option<InodeEntry> {
         if self.inodes.len() == self.components.len() {
             self.inodes.pop()
         } else {
             None
         }
     }
+}
+
+fn inode_name(entry: &InodeEntry) -> &str {
+    entry.name()
 }
 
 impl fmt::Debug for InodePath {

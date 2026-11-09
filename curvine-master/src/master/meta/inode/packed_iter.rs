@@ -13,12 +13,13 @@
 // limitations under the License.
 
 use crate::master::meta::inode::ChildItem;
-use crate::master::meta::inode::InodeView;
+use crate::master::meta::inode::DirNode;
 use crate::master::meta::inode::PackedChildren;
 use curvine_record::Chunk;
+use std::sync::Arc;
 
 pub struct PackedIter<'a> {
-    dirs: &'a [Option<Box<InodeView>>],
+    dirs: &'a [Option<Arc<DirNode>>],
     chunks: &'a [Chunk],
     ci: usize,
     off: usize,
@@ -27,7 +28,7 @@ pub struct PackedIter<'a> {
 
 impl<'a> PackedIter<'a> {
     pub(super) fn new(
-        dirs: &'a [Option<Box<InodeView>>],
+        dirs: &'a [Option<Arc<DirNode>>],
         chunks: &'a [Chunk],
         remaining: usize,
     ) -> Self {

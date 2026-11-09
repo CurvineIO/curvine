@@ -24,6 +24,7 @@ mod inode_view;
 pub use self::inode_view::*;
 
 mod inode_path;
+pub use self::inode_path::InodeEntry;
 pub use self::inode_path::InodePath;
 
 mod inodes_children;
@@ -36,6 +37,10 @@ pub(crate) mod sharded_children;
 
 mod child_item;
 pub use self::child_item::ChildItem;
+
+pub(crate) use self::directory_children::ChildEdge;
+pub use self::inode_dir::{DirMeta, DirNode};
+pub use self::inodes_children::ChildAddResult;
 
 mod packed_iter;
 pub use self::packed_iter::PackedIter;

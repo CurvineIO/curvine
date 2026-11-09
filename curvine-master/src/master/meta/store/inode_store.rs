@@ -14,7 +14,9 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::TtlBucketList;
-use crate::master::meta::inode::{Inode, InodeFile, InodePath, InodePtr, InodeView, ROOT_INODE_ID};
+use crate::master::meta::inode::{
+    ChildAddResult, Inode, InodeDir, InodeFile, InodePath, InodePtr, InodeView, ROOT_INODE_ID,
+};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use crate::master::space::scan_lease::{
@@ -173,12 +175,15 @@ impl InodeStore {
         self.available.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Merges a caller-computed delta. The delta's base decision belongs to
+    /// the live node (fs_dir side); the store never derives it from a
+    /// projected view.
     fn merge_directory_attributes(
         batch: &mut InodeWriteBatch<'_>,
-        parent: &InodeView,
+        parent_id: i64,
         delta: DirectoryAttributeDelta,
     ) -> CommonResult<()> {
-        batch.merge_directory_attributes(parent.id(), parent.directory_attribute_delta(delta))
+        batch.merge_directory_attributes(parent_id, delta)
     }
 
     pub fn new(store: RocksInodeStore, ttl_bucket_list: Arc<TtlBucketList>) -> CommonResult<Self> {
@@ -291,6 +296,7 @@ impl InodeStore {
         parent: &InodeView,
         child: &InodeView,
         write_parent: bool,
+        parent_delta: DirectoryAttributeDelta,
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
@@ -298,12 +304,7 @@ impl InodeStore {
         if write_parent {
             batch.write_inode(parent)?;
         }
-        Self::merge_directory_attributes(
-            &mut batch,
-            parent,
-            DirectoryAttributeDelta::new(parent.mtime(), parent.ctime(), i32::from(child.is_dir()))
-                .for_child_entry(),
-        )?;
+        Self::merge_directory_attributes(&mut batch, parent.id(), parent_delta)?;
         if child.is_dir() {
             batch.write_fresh_directory_attributes(child.id(), child.directory_attributes())?;
         }
@@ -346,7 +347,12 @@ impl InodeStore {
     /// and file counts) and the returned block lists are published only after
     /// the batch commits, so a failed commit applies nothing instead of leaving
     /// paths durable without their reclamation results.
-    pub fn apply_purge(&self, items: Vec<PurgeItem>, ctime: i64) -> CommonResult<DeleteResult> {
+    pub fn apply_purge(
+        &self,
+        items: Vec<PurgeItem>,
+        ctime: i64,
+        parent_deltas: HashMap<i64, DirectoryAttributeDelta>,
+    ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
         // Multiple names (hard links) of one inode may appear in a batch; the
         // cache makes each decrement see the staged value instead of re-reading
@@ -366,16 +372,12 @@ impl InodeStore {
             } = item;
 
             batch.write_inode(&parent)?;
-            Self::merge_directory_attributes(
-                &mut batch,
-                &parent,
-                DirectoryAttributeDelta::new(
-                    parent.mtime(),
-                    parent.ctime(),
-                    -i32::from(matches!(&target, PurgeTarget::Dir(_))),
-                )
-                .for_child_removal(),
-            )?;
+            // The caller (fs_dir) staged these deltas from the live nodes.
+            let delta = parent_deltas
+                .get(&parent.id())
+                .cloned()
+                .unwrap_or_else(|| DirectoryAttributeDelta::new(parent.mtime(), parent.ctime(), 0));
+            Self::merge_directory_attributes(&mut batch, parent.id(), delta)?;
             batch.delete_child(parent.id(), &name)?;
 
             match target {
@@ -426,17 +428,13 @@ impl InodeStore {
         del_name: &str,
         ctime: i64,
         write_parent: bool,
+        parent_delta: DirectoryAttributeDelta,
     ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
         if write_parent {
             batch.write_inode(parent)?;
         }
-        Self::merge_directory_attributes(
-            &mut batch,
-            parent,
-            DirectoryAttributeDelta::new(parent.mtime(), parent.ctime(), -i32::from(del.is_dir()))
-                .for_child_removal(),
-        )?;
+        Self::merge_directory_attributes(&mut batch, parent.id(), parent_delta)?;
 
         let mut del_res = DeleteResult::new();
         let mut deleted_files = 0i64;
@@ -563,6 +561,7 @@ impl InodeStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // rename delta matrix; refactor with RenameDeltas struct later
     pub fn apply_rename(
         &self,
         src_parent: &InodeView,
@@ -571,6 +570,8 @@ impl InodeStore {
         dst_parent: &InodeView,
         dst_inode: &InodeView,
         parents_equal: bool,
+        src_delta: DirectoryAttributeDelta,
+        dst_delta: DirectoryAttributeDelta,
     ) -> CommonResult<()> {
         if src_inode.id() != dst_inode.id() {
             return err_box!(
@@ -589,33 +590,9 @@ impl InodeStore {
         // Add new node.
         batch.write_inode(dst_inode)?;
         batch.add_child(dst_parent.id(), dst_inode.name(), dst_inode.id())?;
-        if src_parent.id() == dst_parent.id() {
-            Self::merge_directory_attributes(
-                &mut batch,
-                src_parent,
-                DirectoryAttributeDelta::new(src_parent.mtime(), src_parent.ctime(), 0),
-            )?;
-        } else {
-            Self::merge_directory_attributes(
-                &mut batch,
-                src_parent,
-                DirectoryAttributeDelta::new(
-                    src_parent.mtime(),
-                    src_parent.ctime(),
-                    -i32::from(src_inode.is_dir()),
-                )
-                .for_child_removal(),
-            )?;
-            Self::merge_directory_attributes(
-                &mut batch,
-                dst_parent,
-                DirectoryAttributeDelta::new(
-                    dst_parent.mtime(),
-                    dst_parent.ctime(),
-                    i32::from(src_inode.is_dir()),
-                )
-                .for_child_entry(),
-            )?;
+        Self::merge_directory_attributes(&mut batch, src_parent.id(), src_delta)?;
+        if src_parent.id() != dst_parent.id() {
+            Self::merge_directory_attributes(&mut batch, dst_parent.id(), dst_delta)?;
         }
 
         // Update the modification time of the previous node. A plain
@@ -641,6 +618,7 @@ impl InodeStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // rename delta matrix; refactor with RenameDeltas struct later
     pub fn apply_replace_rename(
         &self,
         src_parent: &InodeView,
@@ -650,6 +628,8 @@ impl InodeStore {
         dst_inode: &InodeView,
         replaced: &InodeView,
         ctime: i64,
+        src_delta: DirectoryAttributeDelta,
+        dst_delta: DirectoryAttributeDelta,
     ) -> CommonResult<DeleteResult> {
         if src_inode.id() != dst_inode.id() || src_inode.id() == replaced.id() {
             return err_box!("invalid inode identities for replacement rename");
@@ -668,37 +648,9 @@ impl InodeStore {
         };
         batch.write_inode(dst_inode)?;
         batch.add_child(dst_parent.id(), dst_inode.name(), dst_inode.id())?;
-        if src_parent.id() == dst_parent.id() {
-            Self::merge_directory_attributes(
-                &mut batch,
-                src_parent,
-                DirectoryAttributeDelta::new(
-                    src_parent.mtime(),
-                    src_parent.ctime(),
-                    -i32::from(replaced.is_dir()),
-                )
-                .for_child_removal(),
-            )?;
-        } else {
-            Self::merge_directory_attributes(
-                &mut batch,
-                src_parent,
-                DirectoryAttributeDelta::new(
-                    src_parent.mtime(),
-                    src_parent.ctime(),
-                    -i32::from(src_inode.is_dir()),
-                )
-                .for_child_removal(),
-            )?;
-            Self::merge_directory_attributes(
-                &mut batch,
-                dst_parent,
-                DirectoryAttributeDelta::new(
-                    dst_parent.mtime(),
-                    dst_parent.ctime(),
-                    i32::from(src_inode.is_dir()) - i32::from(replaced.is_dir()),
-                ),
-            )?;
+        Self::merge_directory_attributes(&mut batch, src_parent.id(), src_delta)?;
+        if src_parent.id() != dst_parent.id() {
+            Self::merge_directory_attributes(&mut batch, dst_parent.id(), dst_delta)?;
         }
         batch.write_inode(src_parent)?;
         batch.write_inode(dst_parent)?;
@@ -723,6 +675,7 @@ impl InodeStore {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)] // rename delta matrix; refactor with RenameDeltas struct later
     pub fn apply_exchange(
         &self,
         src_parent: &InodeView,
@@ -731,6 +684,8 @@ impl InodeStore {
         dst_name: &str,
         at_src: &InodeView,
         at_dst: &InodeView,
+        src_delta: DirectoryAttributeDelta,
+        dst_delta: DirectoryAttributeDelta,
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
@@ -741,31 +696,10 @@ impl InodeStore {
         batch.add_child(src_parent.id(), at_src.name(), at_src.id())?;
         batch.add_child(dst_parent.id(), at_dst.name(), at_dst.id())?;
         if src_parent.id() == dst_parent.id() {
-            Self::merge_directory_attributes(
-                &mut batch,
-                src_parent,
-                DirectoryAttributeDelta::new(src_parent.mtime(), src_parent.ctime(), 0),
-            )?;
+            Self::merge_directory_attributes(&mut batch, src_parent.id(), src_delta)?;
         } else {
-            let src_nlink_delta = i32::from(at_src.is_dir()) - i32::from(at_dst.is_dir());
-            Self::merge_directory_attributes(
-                &mut batch,
-                src_parent,
-                DirectoryAttributeDelta::new(
-                    src_parent.mtime(),
-                    src_parent.ctime(),
-                    src_nlink_delta,
-                ),
-            )?;
-            Self::merge_directory_attributes(
-                &mut batch,
-                dst_parent,
-                DirectoryAttributeDelta::new(
-                    dst_parent.mtime(),
-                    dst_parent.ctime(),
-                    -src_nlink_delta,
-                ),
-            )?;
+            Self::merge_directory_attributes(&mut batch, src_parent.id(), src_delta)?;
+            Self::merge_directory_attributes(&mut batch, dst_parent.id(), dst_delta)?;
         }
         batch.write_inode(src_parent)?;
         batch.write_inode(dst_parent)?;
@@ -909,6 +843,7 @@ impl InodeStore {
         parent: &InodeView,
         new_inode: &InodeView,
         old_id: Option<i64>,
+        parent_delta: DirectoryAttributeDelta,
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         let mut ttl_removals = Vec::new();
@@ -919,11 +854,7 @@ impl InodeStore {
         batch.write_inode(parent)?;
         batch.write_inode(new_inode)?;
         if old_id.is_none() {
-            Self::merge_directory_attributes(
-                &mut batch,
-                parent,
-                DirectoryAttributeDelta::new(parent.mtime(), parent.ctime(), 0).for_child_entry(),
-            )?;
+            Self::merge_directory_attributes(&mut batch, parent.id(), parent_delta)?;
         } else {
             let mut attributes = parent.directory_attributes();
             attributes.mtime = attributes.mtime.max(parent.mtime());
@@ -958,15 +889,12 @@ impl InodeStore {
         new_entry: &InodeView,
         original_inode_id: i64,
         ctime: i64,
+        parent_delta: DirectoryAttributeDelta,
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
         batch.write_inode(parent)?;
-        Self::merge_directory_attributes(
-            &mut batch,
-            parent,
-            DirectoryAttributeDelta::new(parent.mtime(), parent.ctime(), 0).for_child_entry(),
-        )?;
+        Self::merge_directory_attributes(&mut batch, parent.id(), parent_delta)?;
 
         //link is a edge, link to same inode
         batch.add_child(parent.id(), new_entry.name(), original_inode_id)?;
@@ -1017,16 +945,13 @@ impl InodeStore {
         child: &InodeView,
         child_name: &str,
         ctime: i64,
+        parent_delta: DirectoryAttributeDelta,
     ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
 
         // Write the updated parent directory (child will be removed by the caller)
         batch.write_inode(parent)?;
-        Self::merge_directory_attributes(
-            &mut batch,
-            parent,
-            DirectoryAttributeDelta::new(parent.mtime(), parent.ctime(), 0).for_child_removal(),
-        )?;
+        Self::merge_directory_attributes(&mut batch, parent.id(), parent_delta)?;
 
         // Remove the child from the parent's children list
         batch.delete_child(parent.id(), child_name)?;
@@ -1069,6 +994,7 @@ impl InodeStore {
         child_name: &str,
         inode_id: i64,
         ctime: i64,
+        parent_delta: DirectoryAttributeDelta,
     ) -> CommonResult<DeleteResult> {
         if child.id() != inode_id {
             return err_box!(
@@ -1082,11 +1008,7 @@ impl InodeStore {
 
         // Write the updated parent directory
         batch.write_inode(parent)?;
-        Self::merge_directory_attributes(
-            &mut batch,
-            parent,
-            DirectoryAttributeDelta::new(parent.mtime(), parent.ctime(), 0).for_child_removal(),
-        )?;
+        Self::merge_directory_attributes(&mut batch, parent.id(), parent_delta)?;
 
         // Remove the FileEntry from the parent's children list
         batch.delete_child(parent.id(), child_name)?;
@@ -1217,7 +1139,12 @@ impl InodeStore {
         // --- 1a2. Scan the registered dir_attrs CF ---
         let mut dir_attrs: HashMap<i64, DirectoryAttributes> = HashMap::new();
         for item in self.store.scan_directory_attributes()? {
-            let (key, value) = try_err!(item);
+            let (key, value) = match item {
+                Ok(ok) => ok,
+                Err(e) => {
+                    return err_box!("scan dir_attrs failed: {}", e);
+                }
+            };
             let id = RocksUtils::i64_from_bytes(&key)?;
             let attributes = RocksInodeStore::decode_directory_attributes(id, Some(&value))?;
             if let Some(attributes) = attributes {
@@ -1443,11 +1370,14 @@ impl InodeStore {
                 let child_ptr = parent.add_child(inode)?;
 
                 // If directory, push onto stack for its children
-                if child_ptr.is_dir() {
+                if let ChildAddResult::Dir { node, .. } = child_ptr {
                     // The queue owns its metadata copy instead of retaining a
                     // pointer into the parent's container. The directory's
                     // child index remains shared with the tree entry.
-                    stack.push_back((InodePtr::from_owned(child_ptr.as_ref().clone()), *child_id));
+                    stack.push_back((
+                        InodePtr::from_owned(InodeDir::from_dir_node_live(String::new(), node)),
+                        *child_id,
+                    ));
                 }
             }
         }
@@ -1933,6 +1863,9 @@ mod tests {
             batch.commit()?;
         }
 
+        // The root has no dir_attrs row yet, so the first delta carries the
+        // base exactly as fs_dir computes it from the live directory state.
+        let delta = root.directory_attribute_delta(DirectoryAttributeDelta::new(100, 100, 0));
         store.apply_rename(
             &src_parent,
             &src_inode,
@@ -1940,6 +1873,8 @@ mod tests {
             &dst_parent,
             &dst_inode,
             false,
+            delta,
+            delta,
         )?;
 
         let (_, restored) = store.create_tree()?;
@@ -2094,7 +2029,14 @@ mod tests {
             batch.commit()?;
         }
 
-        let result = store.apply_delete(&root, &missing, "missing.txt", 100, true)?;
+        let result = store.apply_delete(
+            &root,
+            &missing,
+            "missing.txt",
+            100,
+            true,
+            DirectoryAttributeDelta::new(100, 100, 0),
+        )?;
         assert_eq!(result.inodes, 0);
         assert!(store.get_inode(missing_id, None)?.is_none());
         assert_eq!(store.store.edges_iter(ROOT_INODE_ID)?.count(), 0);
@@ -2129,7 +2071,14 @@ mod tests {
         dir.as_mut()
             .add_child(InodeView::new_entry("stale.txt".to_string(), missing_id))?;
 
-        let result = store.apply_delete(&restored, dir.as_ref(), "dir", 100, true)?;
+        let result = store.apply_delete(
+            &restored,
+            dir.as_ref(),
+            "dir",
+            100,
+            true,
+            DirectoryAttributeDelta::new(100, 100, -1).for_child_removal(),
+        )?;
         assert_eq!(result.inodes, 1);
         assert!(store.get_inode(file_id, None)?.is_none());
         assert!(store.get_inode(missing_id, None)?.is_none());
@@ -2167,7 +2116,14 @@ mod tests {
             .as_ref()
             .clone();
 
-        let result = store.apply_delete(&restored, &dir, "dir", 100, true)?;
+        let result = store.apply_delete(
+            &restored,
+            &dir,
+            "dir",
+            100,
+            true,
+            DirectoryAttributeDelta::new(100, 100, -1).for_child_removal(),
+        )?;
         assert_eq!(result.inodes, 1);
         assert!(store.get_inode(file_id, None)?.is_none());
         assert!(store.get_inode(dir_id, None)?.is_none());

@@ -19,7 +19,7 @@ use crate::master::fs::full_block_report::{
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
 use crate::master::meta::inode::{
-    InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
+    InodeEntry, InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
 };
 use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::meta::{
@@ -2893,7 +2893,10 @@ impl MasterFilesystem {
                 // Raw resolution: journal replay addresses `.pending` paths.
                 let inp = Self::resolve_path_raw(fs_dir, path)?;
                 match inp.task_last() {
-                    Some(ptr) => Ok(ptr),
+                    Some(InodeEntry::View(ptr)) => Ok(ptr),
+                    Some(InodeEntry::Dir { .. }) => {
+                        err_ext!(FsError::common("pending path resolved to a directory"))
+                    }
                     None => err_ext!(FsError::file_not_found(path)),
                 }
             }

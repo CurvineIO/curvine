@@ -197,7 +197,15 @@ fn unlink_uses_staged_parent_attributes() {
 
     // TTL cleanup may intentionally leave the expired parent's mtime unchanged.
     // The attributes record must use that staged parent value, not the delete time.
-    store.apply_unlink(&parent, &child, "child", 100).unwrap();
+    store
+        .apply_unlink(
+            &parent,
+            &child,
+            "child",
+            100,
+            DirectoryAttributeDelta::new(0, 0, 0).for_child_removal(),
+        )
+        .unwrap();
 
     let mut expected = legacy_attributes(1, 1, 2);
     expected
@@ -266,12 +274,21 @@ fn explicit_directory_updates_keep_legacy_attributes_legacy() {
         "link".to_owned(),
         InodeFile::with_link(2, 2, "/target", 0o777, None, None),
     );
-    store.apply_symlink(&parent, &link, None).unwrap();
+    store
+        .apply_symlink(&parent, &link, None, DirectoryAttributeDelta::new(0, 0, 0))
+        .unwrap();
     let replacement = InodeView::new_file(
         "link".to_owned(),
         InodeFile::with_link(3, 3, "/replacement", 0o777, None, None),
     );
-    store.apply_symlink(&parent, &replacement, Some(2)).unwrap();
+    store
+        .apply_symlink(
+            &parent,
+            &replacement,
+            Some(2),
+            DirectoryAttributeDelta::new(0, 0, 0),
+        )
+        .unwrap();
 
     assert_eq!(
         store

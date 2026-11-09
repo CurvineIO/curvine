@@ -37,17 +37,20 @@
 
 use crate::master::meta::inode::ChildItem;
 use crate::master::meta::inode::PackedIter;
-use crate::master::meta::inode::{InodePtr, InodeView};
+use crate::master::meta::inode::{
+    ChildAddResult, ChildSlot, DirNode, InodeDir, InodePtr, InodeView,
+};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::ListOptions;
 use curvine_record::{Chunk, InsertOutcome, Layout, Record};
 use glob::Pattern;
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct PackedChildren {
     area: Record,
-    dirs: Vec<Option<Box<InodeView>>>,
+    dirs: Vec<Option<Arc<DirNode>>>,
     free_slots: Vec<u32>,
 }
 
@@ -129,18 +132,20 @@ impl PackedChildren {
 
     #[inline]
     pub(super) fn packed_item<'a>(
-        dirs: &'a [Option<Box<InodeView>>],
+        dirs: &'a [Option<Arc<DirNode>>],
         chunk: &'a Chunk,
         off: usize,
     ) -> ChildItem<'a> {
         let buf = chunk.buf();
         if Self::record_kind(buf, off) == Self::KIND_DIR {
-            match dirs
-                .get(Self::record_dir_idx(buf, off) as usize)
-                .and_then(|slot| slot.as_deref())
-            {
-                Some(view) => return ChildItem::View(view),
-                None => debug_assert!(false, "dir record points at a missing side-vector slot"),
+            match dirs.get(Self::record_dir_idx(buf, off) as usize) {
+                Some(Some(node)) => {
+                    return ChildItem::DirNode {
+                        name: Self::record_name(buf, off),
+                        node,
+                    }
+                }
+                _ => debug_assert!(false, "dir record points at a missing side-vector slot"),
             }
         }
         ChildItem::FileEntry {
@@ -183,7 +188,7 @@ impl PackedChildren {
         self.get_child_item(name).map(|item| item.as_ptr())
     }
 
-    pub fn add_child(&mut self, inode: InodeView) -> CommonResult<InodePtr> {
+    pub fn add_child(&mut self, inode: InodeView) -> CommonResult<ChildAddResult> {
         if inode.name().len() > Self::NAME_MAX {
             return err_box!(
                 "Child name too long: {} bytes (max {})",
@@ -195,9 +200,9 @@ impl PackedChildren {
         let id = inode.id();
 
         if inode.is_dir() {
-            let boxed = Box::new(inode);
+            let node = DirNode::from_view(&inode);
             let slot = self.alloc_slot();
-            self.dirs[slot as usize] = Some(boxed);
+            self.dirs[slot as usize] = Some(node);
             let inserted = matches!(
                 self.area
                     .insert_with(name.as_bytes(), Self::DIR_VALUE_LEN, |value| {
@@ -213,8 +218,11 @@ impl PackedChildren {
                 self.free_slots.push(slot);
                 return err_box!("Child {} already exists", name);
             }
-            match self.dirs[slot as usize].as_deref() {
-                Some(view) => Ok(InodePtr::from_ref(view)),
+            match &self.dirs[slot as usize] {
+                Some(node) => Ok(ChildAddResult::Dir {
+                    name: name.clone(),
+                    node: node.clone(),
+                }),
                 None => err_box!("Packed dir slot {} is empty", slot),
             }
         } else {
@@ -229,7 +237,7 @@ impl PackedChildren {
             if !inserted {
                 return err_box!("Child {} already exists", name);
             }
-            Ok(InodePtr::from_owned(inode))
+            Ok(ChildAddResult::File(inode))
         }
     }
 
@@ -251,13 +259,13 @@ impl PackedChildren {
 
         if Self::record_kind(chunk.buf(), off) == Self::KIND_DIR {
             let slot = Self::record_dir_idx(chunk.buf(), off) as usize;
-            let Some(boxed) = self.dirs.get_mut(slot).and_then(Option::take) else {
+            let Some(node) = self.dirs.get_mut(slot).and_then(Option::take) else {
                 return err_box!("Packed dir slot {} is missing or empty", slot);
             };
             self.free_slots.push(slot as u32);
             self.area.remove(ci, off);
             self.maybe_compact();
-            Ok(*boxed)
+            Ok(InodeDir::from_dir_node_live(child_name.to_string(), node))
         } else {
             self.area.remove(ci, off);
             Ok(InodeView::new_entry(child_name.to_string(), id))
@@ -270,33 +278,59 @@ impl PackedChildren {
 
     /// Move directory boxes without changing their addresses; file edges are
     /// reconstructed because they are stored inline in the record area.
-    pub(super) fn into_entries(mut self) -> Vec<(String, Box<InodeView>)> {
+    pub(super) fn into_entries(mut self) -> Vec<(String, ChildSlot)> {
         let mut entries = Vec::with_capacity(self.area.len());
         for chunk in self.area.chunks() {
             let mut offset = 0;
             while offset < chunk.used() {
                 let buf = chunk.buf();
                 let name = Self::record_name(buf, offset).to_owned();
-                let view = if Self::record_kind(buf, offset) == Self::KIND_DIR {
-                    let slot = Self::record_dir_idx(buf, offset) as usize;
-                    self.dirs[slot]
+                let slot = if Self::record_kind(buf, offset) == Self::KIND_DIR {
+                    let slot_idx = Self::record_dir_idx(buf, offset) as usize;
+                    let node = self.dirs[slot_idx]
                         .take()
-                        .expect("packed directory slot missing")
+                        .expect("packed directory slot missing");
+                    ChildSlot::Dir {
+                        name: name.clone(),
+                        node,
+                    }
                 } else {
-                    Box::new(InodeView::new_entry(
-                        name.clone(),
-                        Self::record_id(buf, offset),
-                    ))
+                    ChildSlot::FileEntry {
+                        name: name.clone(),
+                        id: Self::record_id(buf, offset),
+                    }
                 };
-                entries.push((name, view));
+                entries.push((name, slot));
                 offset += Self::record_len(buf, offset);
             }
         }
         entries
     }
 
-    pub fn list_options(&self, opts: &ListOptions) -> Vec<InodePtr> {
-        self.list_map(opts, |item| item.as_ptr())
+    pub fn list_options(&self, opts: &ListOptions) -> Vec<ChildItem<'_>> {
+        let mut out = Vec::new();
+        let limit = opts.limit.unwrap_or(usize::MAX);
+        let chunks = self.area.chunks();
+
+        let (mut ci, mut off) = match opts.start_after.as_deref() {
+            None => (0, 0),
+            Some(start) => match self.area.find(start.as_bytes()) {
+                Ok((c, o)) => (c, o + Self::record_len(chunks[c].buf(), o)),
+                Err((c, o)) => (c, o),
+            },
+        };
+
+        while ci < chunks.len() && out.len() < limit {
+            let chunk = &chunks[ci];
+            if off >= chunk.used() {
+                ci += 1;
+                off = 0;
+                continue;
+            }
+            out.push(Self::packed_item(&self.dirs, chunk, off));
+            off += Self::record_len(chunk.buf(), off);
+        }
+        out
     }
 
     pub(crate) fn list_views(&self, opts: &ListOptions) -> Vec<InodeView> {
@@ -329,10 +363,9 @@ impl PackedChildren {
         out
     }
 
-    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodePtr> {
+    pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<ChildItem<'_>> {
         self.iter()
             .filter(|item| glob_pattern.matches(item.name()))
-            .map(|item| item.as_ptr())
             .collect()
     }
 
@@ -348,9 +381,9 @@ impl PackedChildren {
         let live = self.dirs.len().saturating_sub(self.free_slots.len());
         let mut dirs = Vec::with_capacity(live);
         for (old_idx, slot) in self.dirs.drain(..).enumerate() {
-            if let Some(boxed) = slot {
+            if let Some(node) = slot {
                 remap[old_idx] = dirs.len() as u32;
-                dirs.push(Some(boxed));
+                dirs.push(Some(node));
             }
         }
         self.dirs = dirs;
