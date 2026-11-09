@@ -12,133 +12,53 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::sync::Arc;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-pub(crate) const DEFAULT_IDLE_LOCKS_PER_SHARD: usize = 64;
-
-pub(crate) type ObjectLock = Arc<RwLock<()>>;
-
+/// Fixed striped table of namespace object locks. Each stripe is one RwLock
+/// guarding a set of objects; concurrent keys sharing a stripe serialise, so
+/// the stripe count must stay well above the expected concurrent-lock width.
+/// Compared with the previous per-key HashMap pool this removes the shard
+/// read guard, SipHash lookup, Arc clone, and idle cleanup passes: locking is
+/// one multiply and one RwLock acquire.
+///
+/// Deadlock-freedom contract: callers must sort requests by stripe index and
+/// deduplicate before acquiring, so every acquisition path takes stripes in
+/// ascending order (see `InodeLockManager::lock_many`).
 pub(crate) struct ObjectLockPool {
-    shards: Vec<RwLock<ObjectLockShard>>,
-    max_idle_locks_per_shard: usize,
-}
-
-#[derive(Default)]
-struct ObjectLockShard {
-    locks: HashMap<u64, ObjectLock>,
+    stripes: Box<[RwLock<()>]>,
 }
 
 impl ObjectLockPool {
     pub(crate) fn new(shard_count: usize) -> Self {
-        let shard_count = shard_count.max(1);
-        let mut shards = Vec::with_capacity(shard_count);
-        for _ in 0..shard_count {
-            shards.push(RwLock::new(ObjectLockShard::default()));
-        }
         Self {
-            shards,
-            max_idle_locks_per_shard: DEFAULT_IDLE_LOCKS_PER_SHARD,
+            stripes: (0..shard_count.max(1)).map(|_| RwLock::new(())).collect(),
         }
     }
 
-    pub(crate) fn get_or_create_lock(&self, key: u64) -> ObjectLock {
-        let shard_index = self.shard_index(key);
-        {
-            let shard = self.shards[shard_index].read();
-            if let Some(lock) = shard.locks.get(&key) {
-                return lock.clone();
-            }
-        }
-
-        let mut shard = self.shards[shard_index].write();
-        let lock = shard
-            .locks
-            .entry(key)
-            .or_insert_with(|| Arc::new(RwLock::new(())))
-            .clone();
-
-        if shard.locks.len() > self.max_idle_locks_per_shard {
-            Self::cleanup_shard(&mut shard, self.max_idle_locks_per_shard);
-        }
-
-        lock
+    /// Map a key to a fixed stripe.
+    #[inline]
+    pub(crate) fn index(&self, key: u64) -> usize {
+        (((key as u128 * 0x9E37_79B9_7F4A_7C15) >> 64) as usize) % self.stripes.len()
     }
 
-    pub(crate) fn cleanup_lock(&self, key: u64) {
-        let shard = &self.shards[self.shard_index(key)];
-        if shard.read().locks.len() <= self.max_idle_locks_per_shard {
-            return;
-        }
-        let mut shard = shard.write();
-        if shard.locks.len() > self.max_idle_locks_per_shard
-            && shard
-                .locks
-                .get(&key)
-                .is_some_and(|lock| Arc::strong_count(lock) == 1)
-        {
-            shard.locks.remove(&key);
-        }
+    /// Acquire an already-computed stripe index. Callers that group keys by
+    /// stripe first (`acquire_stripes`) avoid hashing twice per key.
+    #[inline]
+    pub(crate) fn lock_shared_at(&self, stripe: usize) -> RwLockReadGuard<'_, ()> {
+        self.stripes[stripe].read()
+    }
+
+    #[inline]
+    pub(crate) fn lock_exclusive_at(&self, stripe: usize) -> RwLockWriteGuard<'_, ()> {
+        self.stripes[stripe].write()
     }
 
     #[cfg(test)]
-    pub(crate) fn cached_lock_count(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|shard| shard.read().locks.len())
-            .sum()
-    }
-
-    pub(crate) fn cleanup_locks(&self, keys: &[u64]) {
-        if keys.is_empty() {
-            return;
-        }
-
-        let mut shard_indexes = keys
-            .iter()
-            .map(|key| self.shard_index(*key))
-            .collect::<Vec<_>>();
-        shard_indexes.sort_unstable();
-        shard_indexes.dedup();
-
-        for shard_index in shard_indexes {
-            {
-                let shard = self.shards[shard_index].read();
-                if shard.locks.len() <= self.max_idle_locks_per_shard {
-                    continue;
-                }
-            }
-            let mut shard = self.shards[shard_index].write();
-            Self::cleanup_shard(&mut shard, self.max_idle_locks_per_shard);
-        }
-    }
-
-    fn shard_index(&self, key: u64) -> usize {
-        key as usize % self.shards.len()
-    }
-
-    fn cleanup_shard(shard: &mut ObjectLockShard, max_idle_locks: usize) {
-        if shard.locks.len() <= max_idle_locks {
-            return;
-        }
-
-        let remove_count = shard.locks.len().saturating_sub(max_idle_locks);
-        let removable = shard
-            .locks
-            .iter()
-            .filter_map(|(key, lock)| {
-                if Arc::strong_count(lock) == 1 {
-                    Some(*key)
-                } else {
-                    None
-                }
-            })
-            .take(remove_count)
-            .collect::<Vec<_>>();
-
-        for key in removable {
-            shard.locks.remove(&key);
-        }
+    pub(crate) fn stripe_count(&self) -> usize {
+        self.stripes.len()
     }
 }
+
+#[cfg(test)]
+#[path = "tests/object_lock_pool_test.rs"]
+mod tests;

@@ -13,12 +13,18 @@
 // limitations under the License.
 
 use super::object_lock_pool::ObjectLockPool;
-use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard};
+use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 
 const DEFAULT_BLOCK_LOCK_SHARDS: usize = 4096;
 const DEFAULT_WORKER_LOCK_SHARDS: usize = 1024;
 
 /// Sharded locks for block-location and Worker metadata updates.
+///
+/// Lock-order contract: every acquisition sorts by stripe index and takes
+/// each stripe once in the strongest mode. Cross-pool callers must acquire
+/// worker stripes before block stripes (`write_workers_blocks`), and callers
+/// holding inode locks must acquire this manager after them, matching the
+/// global inode → location order.
 pub struct BlockLocationLockManager {
     block_locks: ObjectLockPool,
     worker_locks: ObjectLockPool,
@@ -61,101 +67,88 @@ impl BlockLocationLockManager {
         }
     }
 
-    pub fn read_blocks<'a>(&'a self, block_ids: &[i64]) -> BlockLocationLockSet<'a> {
+    pub fn read_blocks(&self, block_ids: &[i64]) -> BlockLocationLockSet<'_> {
         let started = std::time::Instant::now();
-        let block_keys = sorted_unique_keys(block_ids.iter().map(|block_id| *block_id as u64));
-        let guards = block_keys
-            .iter()
-            .map(|key| BlockLocationGuard::Read {
-                _guard: self.block_locks.get_or_create_lock(*key).read_arc(),
-            })
-            .collect();
+        let keys = sorted_unique_keys(block_ids.iter().map(|block_id| *block_id as u64));
+        let guards = acquire_stripes(&self.block_locks, &keys, BlockMode::Read);
         Self::record_acquire_us("read", started);
-
-        BlockLocationLockSet {
-            manager: self,
-            guards,
-            block_keys,
-            worker_keys: Vec::new(),
-        }
+        BlockLocationLockSet { guards }
     }
 
-    pub fn write_blocks<'a>(&'a self, block_ids: &[i64]) -> BlockLocationLockSet<'a> {
+    pub fn write_blocks(&self, block_ids: &[i64]) -> BlockLocationLockSet<'_> {
         let started = std::time::Instant::now();
-        let block_keys = sorted_unique_keys(block_ids.iter().map(|block_id| *block_id as u64));
-        let guards = block_keys
-            .iter()
-            .map(|key| BlockLocationGuard::Write {
-                _guard: self.block_locks.get_or_create_lock(*key).write_arc(),
-            })
-            .collect();
+        let keys = sorted_unique_keys(block_ids.iter().map(|block_id| *block_id as u64));
+        let guards = acquire_stripes(&self.block_locks, &keys, BlockMode::Write);
         Self::record_acquire_us("write", started);
-
-        BlockLocationLockSet {
-            manager: self,
-            guards,
-            block_keys,
-            worker_keys: Vec::new(),
-        }
+        BlockLocationLockSet { guards }
     }
 
-    pub fn write_worker<'a>(&'a self, worker_id: u32) -> BlockLocationLockSet<'a> {
+    pub fn write_worker(&self, worker_id: u32) -> BlockLocationLockSet<'_> {
         let started = std::time::Instant::now();
-        let worker_keys = vec![worker_id as u64];
-        let guards = vec![BlockLocationGuard::Write {
-            _guard: self
-                .worker_locks
-                .get_or_create_lock(worker_id as u64)
-                .write_arc(),
-        }];
+        let keys = vec![worker_id as u64];
+        let guards = acquire_stripes(&self.worker_locks, &keys, BlockMode::Write);
         Self::record_acquire_us("write", started);
-
-        BlockLocationLockSet {
-            manager: self,
-            guards,
-            block_keys: Vec::new(),
-            worker_keys,
-        }
+        BlockLocationLockSet { guards }
     }
 
-    pub fn write_worker_blocks<'a>(
-        &'a self,
+    pub fn write_worker_blocks(
+        &self,
         worker_id: u32,
         block_ids: &[i64],
-    ) -> BlockLocationLockSet<'a> {
+    ) -> BlockLocationLockSet<'_> {
         self.write_workers_blocks(&[worker_id], block_ids)
     }
 
-    pub fn write_workers_blocks<'a>(
-        &'a self,
+    pub fn write_workers_blocks(
+        &self,
         worker_ids: &[u32],
         block_ids: &[i64],
-    ) -> BlockLocationLockSet<'a> {
+    ) -> BlockLocationLockSet<'_> {
         let started = std::time::Instant::now();
         let worker_keys = sorted_unique_keys(worker_ids.iter().map(|worker_id| *worker_id as u64));
         let block_keys = sorted_unique_keys(block_ids.iter().map(|block_id| *block_id as u64));
-        let mut guards = Vec::with_capacity(block_keys.len() + worker_keys.len());
-
-        for key in &worker_keys {
-            guards.push(BlockLocationGuard::Write {
-                _guard: self.worker_locks.get_or_create_lock(*key).write_arc(),
-            });
-        }
-
-        for key in &block_keys {
-            guards.push(BlockLocationGuard::Write {
-                _guard: self.block_locks.get_or_create_lock(*key).write_arc(),
-            });
-        }
-
+        // Lock order: worker stripes before block stripes, each pool ascending
+        // by stripe index.
+        let worker_guards = acquire_stripes(&self.worker_locks, &worker_keys, BlockMode::Write);
+        let block_guards = acquire_stripes(&self.block_locks, &block_keys, BlockMode::Write);
         Self::record_acquire_us("write", started);
+
         BlockLocationLockSet {
-            manager: self,
-            guards,
-            block_keys,
-            worker_keys,
+            guards: worker_guards.into_iter().chain(block_guards).collect(),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum BlockMode {
+    Read,
+    Write,
+}
+
+/// Group keys by stripe and acquire each stripe once in the strongest
+/// requested mode, ascending by stripe index. Dedup happens on the stripe
+/// index, not the key pair: two keys sharing a stripe must yield one guard,
+/// otherwise the same thread would take one RwLock twice and self-deadlock.
+fn acquire_stripes<'a>(
+    pool: &'a ObjectLockPool,
+    keys: &[u64],
+    mode: BlockMode,
+) -> Vec<BlockLocationGuard<'a>> {
+    let mut stripes = keys.iter().map(|key| pool.index(*key)).collect::<Vec<_>>();
+    stripes.sort_unstable();
+    stripes.dedup();
+
+    stripes
+        .into_iter()
+        .map(|stripe| match mode {
+            BlockMode::Read => BlockLocationGuard::Read {
+                _guard: pool.lock_shared_at(stripe),
+            },
+            BlockMode::Write => BlockLocationGuard::Write {
+                _guard: pool.lock_exclusive_at(stripe),
+            },
+        })
+        .collect()
 }
 
 fn sorted_unique_keys(keys: impl Iterator<Item = u64>) -> Vec<u64> {
@@ -166,25 +159,14 @@ fn sorted_unique_keys(keys: impl Iterator<Item = u64>) -> Vec<u64> {
 }
 
 pub struct BlockLocationLockSet<'a> {
-    manager: &'a BlockLocationLockManager,
-    guards: Vec<BlockLocationGuard>,
-    block_keys: Vec<u64>,
-    worker_keys: Vec<u64>,
+    guards: Vec<BlockLocationGuard<'a>>,
 }
 
-enum BlockLocationGuard {
-    Read {
-        _guard: ArcRwLockReadGuard<parking_lot::RawRwLock, ()>,
-    },
-    Write {
-        _guard: ArcRwLockWriteGuard<parking_lot::RawRwLock, ()>,
-    },
+enum BlockLocationGuard<'a> {
+    Read { _guard: RwLockReadGuard<'a, ()> },
+    Write { _guard: RwLockWriteGuard<'a, ()> },
 }
 
-impl Drop for BlockLocationLockSet<'_> {
-    fn drop(&mut self) {
-        self.guards.clear();
-        self.manager.block_locks.cleanup_locks(&self.block_keys);
-        self.manager.worker_locks.cleanup_locks(&self.worker_keys);
-    }
-}
+#[cfg(test)]
+#[path = "tests/block_location_lock_manager_test.rs"]
+mod tests;
