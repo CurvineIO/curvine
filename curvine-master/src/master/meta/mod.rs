@@ -34,9 +34,6 @@ pub(crate) use self::fs_dir::{
     CacheInvalidationResult, RestoredTrashEntry, TrashListing, TrashScanPage,
 };
 
-mod metadata_replica_reader;
-pub(crate) use self::metadata_replica_reader::MetadataReplicaReader;
-
 mod fs_stats;
 pub use self::fs_stats::FileSystemStats;
 

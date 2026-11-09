@@ -22,7 +22,7 @@ use crate::master::meta::inode::*;
 use crate::master::meta::store::{
     InodeStore, InodeStoreSnapshot, PurgeItem, PurgeTarget, RocksInodeStore,
 };
-use crate::master::meta::{trash, BlockMeta, InodeId, MetadataReplicaReader};
+use crate::master::meta::{trash, BlockMeta, InodeId};
 use crate::master::quota::eviction::evictor::Evictor;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
@@ -52,7 +52,6 @@ pub struct FsDir {
     pub(crate) journal_writer: Arc<JournalWriter>,
     pub(crate) evictor: Arc<dyn Evictor>,
     pub(crate) op_id: Arc<AtomicCounter>,
-    metadata_reader: Arc<MetadataReplicaReader>,
     /// Max time `restore()` waits for active metadata scan leases to release
     /// the store before aborting (leaves the original DB/tree untouched).
     restore_wait_timeout: std::time::Duration,
@@ -164,7 +163,6 @@ impl FsDir {
         // persisted independently, so this is not a proof of crash consistency.
         let (last_inode_id, root_dir) = state.create_tree()?;
         root_dir.as_dir_ref()?;
-        let metadata_reader = Arc::new(MetadataReplicaReader::new(&root_dir)?);
 
         let fs_dir = Self {
             root_dir,
@@ -173,7 +171,6 @@ impl FsDir {
             journal_writer,
             evictor,
             op_id: Arc::new(AtomicCounter::new(0)),
-            metadata_reader,
             restore_wait_timeout: std::time::Duration::from_millis(
                 conf.master.dir_space.restore_wait_timeout_ms(),
             ),
@@ -194,10 +191,6 @@ impl FsDir {
 
     pub fn root_dir(&self) -> &InodeView {
         &self.root_dir
-    }
-
-    pub(crate) fn metadata_reader(&self) -> Arc<MetadataReplicaReader> {
-        self.metadata_reader.clone()
     }
 
     fn next_inode_id(&self) -> FsResult<i64> {
@@ -2240,7 +2233,6 @@ impl FsDir {
         let (last_inode_id, root_dir) = self.store.create_tree()?;
         root_dir.as_dir_ref()?;
         self.root_dir = root_dir;
-        self.metadata_reader.replace_root(&self.root_dir)?;
         self.update_last_inode_id(last_inode_id)?;
         Ok(())
     }
@@ -2293,13 +2285,6 @@ impl FsDir {
             error
         })?;
         self.root_dir = root_dir;
-        self.metadata_reader
-            .replace_root(&self.root_dir)
-            .map_err(|error| {
-                self.store.invalidate_cursor_store();
-                self.journal_writer.fail_metadata_restore();
-                error
-            })?;
         self.update_last_inode_id(last_inode_id).map_err(|error| {
             self.store.invalidate_cursor_store();
             self.journal_writer.fail_metadata_restore();

@@ -21,7 +21,7 @@ use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
 #[cfg(test)]
 use crate::master::meta::inode::ROOT_INODE_ID;
-use crate::master::meta::store::{InodeStoreSnapshot, StoreResolvedPath};
+use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::meta::{
     trash, BlockLocationLockManager, CacheInvalidationResult, CommitGate, FsDir, InodeLockManager,
     InodeLockRequest, RestoredTrashEntry, TrashListing, TrashScanPage,
@@ -306,12 +306,6 @@ impl MasterFilesystem {
         fs_dir.print_tree();
     }
 
-    /// Read-barrier precheck before the commit gate. Re-run inside the gate to
-    /// reject requests that waited while a role fence was installed.
-    pub(crate) fn ensure_metadata_current(&self) -> FsResult<()> {
-        self.journal_writer.ensure_metadata_current()
-    }
-
     /// Holds the commit gate through mutation and journal confirmation so a
     /// gate-closing snapshot can drain the write. The second role check rejects
     /// requests delayed at admission; it does not drain writers already admitted
@@ -360,21 +354,6 @@ impl MasterFilesystem {
         let result = f();
         scope.wait()?;
         result
-    }
-
-    fn resolve_store_path(&self, path: &str) -> FsResult<(StoreResolvedPath, u64)> {
-        let fs_dir = self.fs_dir.read();
-        let epoch = fs_dir.store.scan_control().cancel_epoch();
-        let lease = fs_dir.store.begin_snapshot_scan()?;
-        let reader = lease.snapshot_reader()?;
-        Ok((reader.resolve_path(path)?, epoch))
-    }
-
-    /// Component count of an absolute path without touching the namespace.
-    fn inp_components_len(path: &str) -> usize {
-        InodeView::path_components(path)
-            .map(|components| components.len())
-            .unwrap_or(0)
     }
 
     // Plan from a store snapshot rather than reading live inode fields before
