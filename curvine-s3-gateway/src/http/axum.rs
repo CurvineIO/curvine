@@ -111,7 +111,12 @@ impl VRequest for Request {
     }
 
     fn url_path(&self) -> String {
-        self.request.uri().path().to_string()
+        // Object keys arrive percent-encoded (e.g. Hive-style `dt%3D2026-11-01`);
+        // decode so they map to the real Curvine path.
+        let raw = self.request.uri().path();
+        urlencoding::decode(raw)
+            .map(|s| s.into_owned())
+            .unwrap_or_else(|_| raw.to_string())
     }
 
     fn get_query(&self, k: &str) -> Option<String> {
@@ -560,7 +565,7 @@ pub async fn handle_authorization_middleware(
                     &v2_args,
                     &secretkey,
                     req.method().as_str(),
-                    req.url_path().as_str(),
+                    req.request.uri().path(),
                     &query_params,
                     &req,
                 ) {
@@ -638,7 +643,8 @@ pub async fn handle_authorization_middleware(
         req.method().as_str(),
         &base_arg.region,
         &base_arg.service,
-        req.url_path().as_str(),
+        // SigV4 canonical URI must use the encoded path as sent by the client
+        req.request.uri().path(),
         &secretkey,
         &base_arg.content_hash,
         &base_arg.signed_headers,
@@ -764,5 +770,52 @@ impl CurvineStreamAdapter {
                 tracing::warn!("Failed to complete reader cleanup in stream adapter: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::s3::s3_api::VRequest;
+
+    fn build(uri: &str) -> Request {
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        Request::from(req)
+    }
+
+    #[test]
+    fn url_path_decodes_percent_encoded_object_key() {
+        // AWS SDKs encode '=' in Hive/Iceberg partition directories as %3D
+        let req = build("/warehouse/db/tbl/data/dt%3D2026-11-01/part-0.parquet");
+        assert_eq!(
+            req.url_path(),
+            "/warehouse/db/tbl/data/dt=2026-11-01/part-0.parquet"
+        );
+    }
+
+    #[test]
+    fn url_path_decodes_space_and_literal_percent() {
+        let req = build("/bucket/a%20b/100%25.txt");
+        assert_eq!(req.url_path(), "/bucket/a b/100%.txt");
+    }
+
+    #[test]
+    fn url_path_keeps_unencoded_path() {
+        let req = build("/bucket/dir/file.txt");
+        assert_eq!(req.url_path(), "/bucket/dir/file.txt");
+    }
+
+    #[test]
+    fn raw_uri_path_stays_encoded_for_signing() {
+        // SigV4/V2 canonical URI must use the path exactly as the client sent it
+        let req = build("/warehouse/dt%3D2026-11-01/f.parquet");
+        assert_eq!(
+            req.request.uri().path(),
+            "/warehouse/dt%3D2026-11-01/f.parquet"
+        );
     }
 }
