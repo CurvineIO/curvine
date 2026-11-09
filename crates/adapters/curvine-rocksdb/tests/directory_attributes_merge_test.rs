@@ -221,6 +221,49 @@ fn concurrent_merges_preserve_all_updates() {
 }
 
 #[test]
+fn concurrent_first_child_merges_keep_one_base_after_reopen() {
+    let path = Utils::test_sub_dir(format!(
+        "directory_first_concurrent_{}",
+        Utils::rand_str(12)
+    ));
+    let mut options = Options::default();
+    options.create_if_missing(true);
+    configure_directory_attributes_merge(&mut options);
+    let db = std::sync::Arc::new(DB::open(&options, &path).unwrap());
+    let base = DirectoryAttributes::new(10, 10, 2);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|thread| {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let delta = DirectoryAttributeDelta::new(20 + thread, 20 + thread, 1)
+                    .for_child_entry()
+                    .with_base(base);
+                db.merge(b"key", delta.encode()).unwrap();
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    db.flush().unwrap();
+    db.compact_range::<&[u8], &[u8]>(None, None);
+    drop(db);
+
+    let db = DB::open(&options, &path).unwrap();
+    let attributes = DirectoryAttributes::decode(&db.get(b"key").unwrap().unwrap()).unwrap();
+    assert_eq!(
+        (attributes.mtime, attributes.ctime, attributes.nlink),
+        (27, 27, 10)
+    );
+    assert_eq!((attributes.version, attributes.children), (8, Some(8)));
+    drop(db);
+    DB::destroy(&options, &path).unwrap();
+}
+
+#[test]
 fn merge_directory_attributes_in_rocksdb() {
     let path = Utils::test_sub_dir(format!("directory_merge_{}", Utils::rand_str(12)));
     let mut options = Options::default();
