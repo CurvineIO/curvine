@@ -2609,12 +2609,14 @@ impl MasterFilesystem {
         };
         let mut status = inode.to_file_status(path)?;
         if let Some(attributes) = attributes {
+            if attributes.ctime != inode.ctime() {
+                status.x_attr.insert(
+                    INTERNAL_CTIME_XATTR.to_string(),
+                    attributes.ctime.to_le_bytes().to_vec(),
+                );
+            }
             status.mtime = attributes.mtime;
             status.nlink = attributes.nlink;
-            status.x_attr.insert(
-                INTERNAL_CTIME_XATTR.to_string(),
-                attributes.ctime.to_le_bytes().to_vec(),
-            );
         }
         status.children_num = child_len;
         status.len = i64::from(child_len);
@@ -2746,24 +2748,7 @@ impl MasterFilesystem {
             }
             Ok(all_statuses)
         } else {
-            Self::check_not_pending_path(path)?;
-            // Validate the captured directory versions after reading the
-            // listing, not before it. Owned views keep borrowed pointers out
-            // of the window where sharded writers may free removed inodes.
-            for _ in 0..Self::LIVE_READ_RETRIES {
-                let fs_dir = self.fs_dir.read();
-                let inp = InodePath::resolve_shared(fs_dir.root_dir(), path, &fs_dir.store)?;
-                let statuses = fs_dir.list_status(&inp);
-                if inp.walk_is_current() {
-                    return statuses.map(|statuses| Self::hide_pending(path, statuses));
-                }
-                drop(fs_dir);
-                std::thread::sleep(std::time::Duration::from_micros(50));
-            }
-            err_ext!(FsError::common(format!(
-                "namespace changed while listing {}",
-                path
-            )))
+            self.list_options(path, ListOptions::default())
         }
     }
 
@@ -2778,9 +2763,8 @@ impl MasterFilesystem {
             return err_box!("list_options does not support glob pattern, path {}", path);
         }
         Self::check_not_pending_path(path)?;
-        // Version checks detect overlapping directory mutations. The pending
-        // trash entry must not consume a client-visible page slot, so the
-        // trash root over-fetches one entry and hide_pending removes it again.
+        // The pending trash entry must not consume a client-visible page slot.
+        // Over-fetch one entry and hide_pending removes it again.
         let extended_opts;
         let page_opts = if path == trash::TRASH_ROOT && opts.limit.is_some_and(|limit| limit > 0) {
             extended_opts = ListOptions {
@@ -2791,20 +2775,42 @@ impl MasterFilesystem {
         } else {
             &opts
         };
-        for _ in 0..Self::LIVE_READ_RETRIES {
-            let fs_dir = self.fs_dir.read();
-            let inp = InodePath::resolve_shared(fs_dir.root_dir(), path, &fs_dir.store)?;
-            let statuses = fs_dir.list_options(&inp, page_opts);
-            if inp.walk_is_current() {
-                return statuses.map(|statuses| Self::hide_pending(path, statuses));
+        let fs_dir = self.fs_dir.read();
+        let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+        let resolved = snapshot.resolve_path(path)?;
+        let inode = resolved
+            .target()
+            .ok_or_else(|| FsError::file_not_found(path))?;
+        if !inode.is_dir() {
+            if page_opts.limit == Some(0)
+                || page_opts
+                    .start_after
+                    .as_ref()
+                    .is_some_and(|cursor| inode.name() <= cursor.as_str())
+            {
+                return Ok(Vec::new());
             }
-            drop(fs_dir);
-            std::thread::sleep(std::time::Duration::from_micros(50));
+            return Ok(vec![Self::file_status_from_snapshot(
+                &snapshot,
+                path,
+                inode.clone(),
+            )?]);
         }
-        err_ext!(FsError::common(format!(
-            "namespace changed while listing {}",
-            path
-        )))
+        let children = snapshot.children_page(inode.id(), page_opts)?;
+        let mut statuses = Vec::with_capacity(children.len());
+        for child in children {
+            let child_path = if resolved.components().len() <= 1 {
+                format!("/{}", child.name())
+            } else {
+                format!("{}/{}", path, child.name())
+            };
+            statuses.push(Self::file_status_from_snapshot(
+                &snapshot,
+                &child_path,
+                child,
+            )?);
+        }
+        Ok(Self::hide_pending(path, statuses))
     }
 
     /// Resolves a client-supplied path. `/.Trash/.pending` is master-owned

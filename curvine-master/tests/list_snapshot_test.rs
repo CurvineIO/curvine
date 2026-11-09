@@ -45,6 +45,21 @@ fn listing_matches_live_status_fields() {
     .unwrap();
 
     for path in ["/", "/parent", "/parent/dir", "/parent/file"] {
+        let expected_status = {
+            let dir = fs.fs_dir.write();
+            let inp = curvine_master::master::meta::inode::InodePath::resolve(
+                dir.root_ptr(),
+                path,
+                dir.store_ref(),
+            )
+            .unwrap();
+            dir.file_status(&inp).unwrap()
+        };
+        assert_eq!(
+            serde_json::to_value(fs.file_status(path).unwrap()).unwrap(),
+            serde_json::to_value(expected_status).unwrap(),
+            "status path: {path}"
+        );
         for opts in [ListOptions::default(), ListOptions::with_limit(1)] {
             let expected = {
                 let dir = fs.fs_dir.write();

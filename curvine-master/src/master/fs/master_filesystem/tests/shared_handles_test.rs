@@ -199,6 +199,11 @@ fn path_status_reads_inode_from_store_snapshot() {
             .unwrap();
     }
     assert_eq!(fs.file_status("/dir").unwrap().mode, 0o700);
+    assert_eq!(fs.list_status("/").unwrap()[0].mode, 0o700);
+    assert_eq!(
+        fs.list_options("/", ListOptions::with_limit(1)).unwrap()[0].mode,
+        0o700
+    );
 }
 
 #[test]
