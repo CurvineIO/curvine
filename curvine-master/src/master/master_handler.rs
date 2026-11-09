@@ -177,16 +177,15 @@ impl MasterHandler {
         opts: CreateFileOpts,
         flags: OpenFlags,
     ) -> FsResult<FileStatus> {
-        if self.check_is_retry(req_id)? {
-            // HDFS retries return the results of the last calculation
-            // Alluxio Retry will re-query the status.
-            // The same solution as alluxio is adopted here. In fact, the hdfs solution is better, but rust requires an additional memory copy to achieve it.
-            // Re-querying the file status may cause the request to be unidempotent.
-            return self.fs.file_status(&path);
-        }
-
-        let res = self.fs.create_with_opts(&path, opts, flags);
-        self.set_req_cache(req_id, res)
+        // HDFS retries return the results of the last calculation
+        // Alluxio Retry will re-query the status.
+        // The same solution as alluxio is adopted here. In fact, the hdfs solution is better, but rust requires an additional memory copy to achieve it.
+        // Re-querying the file status may cause the request to be unidempotent.
+        self.with_retry_cache(
+            req_id,
+            || self.fs.file_status(&path),
+            || self.fs.create_with_opts(&path, opts, flags),
+        )
     }
 
     pub fn retry_check_create_file(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -255,12 +254,11 @@ impl MasterHandler {
             return self.fs.get_block_locations(&path);
         }
 
-        if self.check_is_retry(req_id)? {
-            return self.fs.get_block_locations(&path);
-        }
-
-        let res = self.fs.open_file(path, opts, flags);
-        self.set_req_cache(req_id, res)
+        self.with_retry_cache(
+            req_id,
+            || self.fs.get_block_locations(&path),
+            || self.fs.open_file(&path, opts, flags),
+        )
     }
 
     pub fn file_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -428,17 +426,18 @@ impl MasterHandler {
     }
 
     pub fn empty_trash0(&self, req_id: i64, wait: bool) -> FsResult<(u64, DeleteResult)> {
-        if self.check_is_retry(req_id)? {
-            return Ok((0, DeleteResult::default()));
-        }
-
-        // Both modes stage the entries; only the wait mode blocks for the
-        // reclamation, and both go through the same bounded purger.
-        let res = self.fs.empty_trash0(wait).map(|(accepted, res)| {
-            let res = if wait { res } else { DeleteResult::default() };
-            (accepted, res)
-        });
-        self.set_req_cache(req_id, res)
+        self.with_retry_cache(
+            req_id,
+            || Ok((0, DeleteResult::default())),
+            || {
+                // Both modes stage the entries; only the wait mode blocks for the
+                // reclamation, and both go through the same bounded purger.
+                self.fs.empty_trash0(wait).map(|(accepted, res)| {
+                    let res = if wait { res } else { DeleteResult::default() };
+                    (accepted, res)
+                })
+            },
+        )
     }
 
     pub fn retry_check_empty_trash(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -462,12 +461,11 @@ impl MasterHandler {
     }
 
     pub fn free0(&self, req_id: i64, header: FreeRequest) -> FsResult<FreeResult> {
-        if self.check_is_retry(req_id)? {
-            return Ok(FreeResult::default());
-        }
-
-        let res = self.fs.free(&header.path, header.recursive);
-        self.set_req_cache(req_id, res)
+        self.with_retry_cache(
+            req_id,
+            || Ok(FreeResult::default()),
+            || self.fs.free(&header.path, header.recursive),
+        )
     }
 
     pub fn rename0(&self, req_id: i64, header: RenameRequest) -> FsResult<bool> {
