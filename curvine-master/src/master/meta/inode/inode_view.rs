@@ -176,6 +176,11 @@ impl InodeView {
         }
     }
 
+    pub(crate) fn replace_metadata(&mut self, updated: Self) {
+        let old = std::mem::replace(self, updated);
+        self.adopt_directory_children(old);
+    }
+
     pub(crate) fn adopt_directory_children(&mut self, detached: Self) {
         debug_assert_eq!(self.is_dir(), detached.is_dir());
         if let (Dir(updated), Dir(original)) = (self, detached) {
@@ -320,6 +325,15 @@ impl InodeView {
             File(f) => f.update_mtime(time),
             Dir(d) => d.update_mtime(time),
             FileEntry(..) => (),
+        }
+    }
+
+    pub(crate) fn update_exchange_parent(&mut self, mtime: i64, delta: i8) {
+        self.update_mtime(mtime);
+        match delta {
+            -1 => self.dec_nlink(mtime),
+            1 => self.incr_nlink(mtime),
+            _ => (),
         }
     }
 

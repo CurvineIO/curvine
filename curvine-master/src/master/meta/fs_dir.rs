@@ -1360,7 +1360,7 @@ impl FsDir {
         let mut stack = LinkedList::new();
         stack.push_back(inode);
         while let Some(inode) = stack.pop_front() {
-            match inode.as_mut() {
+            match inode.as_ref() {
                 FileEntry(e) => {
                     if let Some(store_inode) = self.store.get_inode(e.id, Some(&e.name))? {
                         stack.push_back(InodePtr::from_owned(store_inode));
@@ -1378,7 +1378,7 @@ impl FsDir {
                 File(f) => {
                     let locs = f.get_locs(&self.store)?;
                     let bytes = f.get_locs_bytes(&locs);
-                    if f.free(mtime) {
+                    if inode.as_mut().as_file_mut()?.free(mtime) {
                         free_res.add(bytes, locs);
                         change_inodes.push(inode.as_ref().clone());
                     }
@@ -1715,18 +1715,10 @@ impl FsDir {
         } else {
             0
         };
-        let update_parent = |parent: &mut InodeView, delta: i8| {
-            parent.update_mtime(mtime);
-            match delta {
-                -1 => parent.dec_nlink(mtime),
-                1 => parent.incr_nlink(mtime),
-                _ => (),
-            }
-        };
         let mut new_src_parent = src_parent.as_ref().clone_metadata();
         let mut new_dst_parent = dst_parent.as_ref().clone_metadata();
-        update_parent(&mut new_src_parent, src_delta);
-        update_parent(&mut new_dst_parent, -src_delta);
+        new_src_parent.update_exchange_parent(mtime, src_delta);
+        new_dst_parent.update_exchange_parent(mtime, -src_delta);
 
         self.store.apply_exchange(
             &new_src_parent,
@@ -1736,8 +1728,8 @@ impl FsDir {
             &at_src,
             &at_dst,
         )?;
-        update_parent(src_parent.as_mut(), src_delta);
-        update_parent(dst_parent.as_mut(), -src_delta);
+        src_parent.update_exchange_parent(mtime, src_delta);
+        dst_parent.update_exchange_parent(mtime, -src_delta);
         if src_parent.id() == dst_parent.id() {
             self.publish_directory_delta(
                 src_parent.as_ref(),
@@ -2688,8 +2680,7 @@ impl FsDir {
         self.store.apply_set_attr(&change_inodes)?;
         for (target, updated) in targets.into_iter().zip(change_inodes) {
             if let Some(target) = target {
-                let old = std::mem::replace(target.as_mut(), updated);
-                target.as_mut().adopt_directory_children(old);
+                target.as_mut().replace_metadata(updated);
             }
         }
         Ok(())
