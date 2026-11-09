@@ -19,6 +19,7 @@ use crate::master::meta::inode::{
 };
 use crate::master::meta::store::InodeStore;
 use curvine_core_error::{err_box, try_option, CommonResult};
+use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
@@ -29,7 +30,7 @@ pub struct InodePath {
     pub inodes: Vec<InodePtr>,
     /// Captured (handle, version) per resolved directory level, for callers
     /// that walk shared handles and must validate after reading.
-    versions: Vec<crate::master::meta::inode::DirectoryChildrenSharedVersion>,
+    versions: SmallVec<[DirectoryChildrenSharedVersion; 4]>,
 }
 
 impl InodePath {
@@ -54,7 +55,7 @@ impl InodePath {
         }
 
         let mut inodes: Vec<InodePtr> = Vec::with_capacity(components.len());
-        let mut versions: Vec<DirectoryChildrenSharedVersion> = Vec::new();
+        let mut versions = SmallVec::new();
         let mut directory = match root_view.children_handle() {
             Some(handle) => handle,
             None => return err_box!("root inode is not a directory"),
@@ -164,7 +165,7 @@ impl InodePath {
             return Ok(None);
         }
         let mut inodes: Vec<InodePtr> = Vec::with_capacity(components.len());
-        let mut versions = Vec::new();
+        let mut versions = SmallVec::new();
         let mut cur_inode = root;
         let mut index = 0;
 
@@ -284,7 +285,7 @@ impl InodePath {
         }
 
         Ok(Self {
-            versions: Vec::new(),
+            versions: SmallVec::new(),
             path: path_str,
             name: components_result.last().cloned().unwrap_or_else(|| {
                 format!(

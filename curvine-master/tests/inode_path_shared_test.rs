@@ -103,10 +103,14 @@ fn shared_walk_resolves_depth_two_and_reports_version() {
 fn shared_walk_preserves_resolved_directory_views() {
     let (root, root_children) = root_with_children();
     let sub = root_children.read_child_view("sub").0.unwrap();
-    sub.children_handle()
+    let nested = InodeView::new_dir("nested".into(), InodeDir::new(1006, 1));
+    let deep = InodeView::new_dir("deep".into(), InodeDir::new(1007, 1));
+    deep.children_handle()
         .unwrap()
-        .add_child(InodeView::new_dir("nested".into(), InodeDir::new(1006, 1)))
+        .add_child(InodeView::new_dir("last".into(), InodeDir::new(1008, 1)))
         .unwrap();
+    nested.children_handle().unwrap().add_child(deep).unwrap();
+    sub.children_handle().unwrap().add_child(nested).unwrap();
     let store = test_store("shared-directory-views");
 
     for (path, ids) in [
@@ -115,6 +119,7 @@ fn shared_walk_preserves_resolved_directory_views() {
         ("/sub/missing", &[1000, 1001][..]),
         ("/sub/nested/missing", &[1000, 1001, 1006][..]),
         ("/sub/nested", &[1000, 1001, 1006][..]),
+        ("/sub/nested/deep/last", &[1000, 1001, 1006, 1007, 1008][..]),
     ] {
         let inp = InodePath::resolve_shared(&root, path, &store).unwrap();
         assert!(inp.walk_is_current(), "{path}");
@@ -128,6 +133,18 @@ fn shared_walk_preserves_resolved_directory_views() {
             assert!(inode.as_ref().children_handle().is_some(), "{path}");
         }
     }
+
+    let deep_path = InodePath::resolve_shared(&root, "/sub/nested/deep/last", &store).unwrap();
+    deep_path
+        .inodes
+        .last()
+        .unwrap()
+        .as_ref()
+        .children_handle()
+        .unwrap()
+        .add_child(InodeView::new_dir("new".into(), InodeDir::new(1009, 1)))
+        .unwrap();
+    assert!(!deep_path.walk_is_current());
 }
 
 #[test]
