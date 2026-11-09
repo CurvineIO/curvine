@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::fs::operator::Read;
-use crate::fuse_metrics::{mono_now, FuseMetrics, IO_TYPE_READ};
+use crate::fuse_metrics::{
+    mono_now, FuseMetrics, ReadQueueGuard, ReadWaitTimer, IO_TYPE_READ, IO_WAIT_ENQUEUE,
+};
 use crate::session::FuseResponse;
 use curvine_client::unified::UnifiedReader;
 use curvine_config::FuseConf;
@@ -31,7 +33,7 @@ use log::{error, warn};
 use std::sync::Arc;
 
 enum ReadTask {
-    Read(i64, usize, FuseResponse),
+    Read(i64, usize, FuseResponse, Option<ReadQueueGuard>),
     Complete(CallSender<FsResult<()>>, Option<FuseResponse>),
 }
 
@@ -41,6 +43,7 @@ pub struct FuseReader {
     sender: AsyncSender<ReadTask>,
     err_monitor: Arc<ErrorMonitor<FsError>>,
     status: FileStatus,
+    metrics_enabled: bool,
 }
 
 impl FuseReader {
@@ -76,6 +79,7 @@ impl FuseReader {
             sender,
             err_monitor,
             status,
+            metrics_enabled,
         }
     }
 
@@ -100,16 +104,48 @@ impl FuseReader {
     }
 
     pub async fn read(&self, op: Read<'_>, reply: FuseResponse) -> FsResult<()> {
-        let res = self
-            .sender
-            .send(ReadTask::Read(
-                op.arg.offset as i64,
-                op.arg.size as usize,
-                reply,
-            ))
-            .await
-            .map_err(|e| self.check_error(e.into()));
-        res
+        Self::enqueue_read(
+            &self.sender,
+            op.arg.offset as i64,
+            op.arg.size as usize,
+            reply,
+            self.metrics_enabled,
+        )
+        .await
+        .map_err(|e| self.check_error(e))
+    }
+
+    async fn enqueue_read(
+        sender: &AsyncSender<ReadTask>,
+        off: i64,
+        len: usize,
+        reply: FuseResponse,
+        metrics_enabled: bool,
+    ) -> FsResult<()> {
+        if !metrics_enabled {
+            sender.send(ReadTask::Read(off, len, reply, None)).await?;
+            return Ok(());
+        }
+
+        if sender.is_bounded() {
+            let timer = ReadWaitTimer::start(true, IO_WAIT_ENQUEUE);
+            let reserved = sender.reserve().await;
+            if let Some(timer) = timer {
+                timer.finish(reserved.is_ok());
+            }
+            let permit = reserved?;
+            // No suspension between creating the backlog guard and publishing the task.
+            permit.send(ReadTask::Read(off, len, reply, ReadQueueGuard::new(true)));
+        } else {
+            let task = ReadTask::Read(off, len, reply, ReadQueueGuard::new(true));
+            let timer = ReadWaitTimer::start(true, IO_WAIT_ENQUEUE);
+            let result = sender.send(task).await;
+            if let Some(timer) = timer {
+                timer.finish(result.is_ok());
+            }
+            result?;
+        }
+        Ok(())
     }
 
     pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
@@ -132,7 +168,10 @@ impl FuseReader {
     ) -> FsResult<()> {
         while let Some(task) = req_receiver.recv().await {
             match task {
-                ReadTask::Read(off, len, reply) => {
+                ReadTask::Read(off, len, reply, queue) => {
+                    if let Some(queue) = queue {
+                        queue.dequeued();
+                    }
                     let io_start = if metrics_enabled {
                         Some(mono_now())
                     } else {
@@ -227,6 +266,84 @@ mod tests {
             lock_owner: 0,
             flags: 0,
             padding: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_wait_bounded_backpressure_cancellation_and_dequeue() {
+        FuseMetrics::ensure_init().unwrap();
+        let cancelled = FuseMetrics::get().io_wait_duration_us.with_label_values(&[
+            IO_TYPE_READ,
+            IO_WAIT_ENQUEUE,
+            "cancelled",
+        ]);
+        let before = cancelled.get_sample_count();
+        let (tx, mut rx) = AsyncChannel::<ReadTask>::new(1).split();
+        FuseReader::enqueue_read(&tx, 0, 1, closed_reply(101), true)
+            .await
+            .unwrap();
+        {
+            let blocked = FuseReader::enqueue_read(&tx, 1, 1, closed_reply(102), true);
+            tokio::pin!(blocked);
+            assert!(futures::poll!(&mut blocked).is_pending());
+            // Dropping this future while reserve is pending must not create a queued task.
+        }
+        assert!(cancelled.get_sample_count() > before);
+        match rx.recv().await.unwrap() {
+            ReadTask::Read(0, 1, _, Some(queue)) => queue.dequeued(),
+            _ => panic!("expected only the first instrumented read"),
+        }
+        assert!(rx.try_recv().unwrap().is_none());
+
+        // Releasing capacity lets a waiting sender publish exactly one new Read.
+        FuseReader::enqueue_read(&tx, 2, 1, closed_reply(103), true)
+            .await
+            .unwrap();
+        let blocked = FuseReader::enqueue_read(&tx, 3, 1, closed_reply(104), true);
+        tokio::pin!(blocked);
+        assert!(futures::poll!(&mut blocked).is_pending());
+        drop(rx.recv().await.unwrap()); // abandon first queued task; its guard drops
+        blocked.await.unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some(ReadTask::Read(3, 1, _, Some(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_wait_unbounded_disabled_complete_and_closed_channels() {
+        FuseMetrics::ensure_init().unwrap();
+        for capacity in [0, 1] {
+            let (tx, mut rx) = AsyncChannel::<ReadTask>::new(capacity).split();
+            FuseReader::enqueue_read(&tx, 0, 1, closed_reply(201), true)
+                .await
+                .unwrap();
+            match rx.recv().await.unwrap() {
+                ReadTask::Read(_, _, _, Some(queue)) => queue.dequeued(),
+                _ => panic!("enabled Read must carry its backlog guard"),
+            }
+            FuseReader::enqueue_read(&tx, 0, 1, closed_reply(202), false)
+                .await
+                .unwrap();
+            assert!(matches!(
+                rx.recv().await,
+                Some(ReadTask::Read(_, _, _, None))
+            ));
+            let (complete, _) = CallChannel::channel();
+            tx.send(ReadTask::Complete(complete, None)).await.unwrap();
+            assert!(matches!(rx.recv().await, Some(ReadTask::Complete(_, _))));
+
+            let errors = FuseMetrics::get().io_wait_duration_us.with_label_values(&[
+                IO_TYPE_READ,
+                IO_WAIT_ENQUEUE,
+                "error",
+            ]);
+            let before = errors.get_sample_count();
+            drop(rx);
+            assert!(FuseReader::enqueue_read(&tx, 0, 1, closed_reply(203), true)
+                .await
+                .is_err());
+            assert!(errors.get_sample_count() > before);
         }
     }
 

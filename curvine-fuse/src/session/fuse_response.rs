@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::fuse_metrics::{
-    FuseMetrics, FuseReqCtx, FuseReqStatus, FuseRespMetrics, ENQUEUE_REASON_CHANNEL_CLOSED,
-    NOTIFY_ENQUEUE_FAILED, REPLY_TYPE_NO_REPLY,
+    FuseMetrics, FuseReqCtx, FuseReqStatus, FuseRespMetrics, ReadWaitTimer,
+    ENQUEUE_REASON_CHANNEL_CLOSED, IO_WAIT_REPLY, NOTIFY_ENQUEUE_FAILED, REPLY_TYPE_NO_REPLY,
 };
 use crate::raw::fuse_abi::{
     fuse_notify_inval_entry_out, fuse_notify_inval_inode_out, fuse_out_header,
@@ -192,6 +192,13 @@ impl FuseResponse {
         self.metrics.as_ref().and_then(|m| m.lock().op_status)
     }
 
+    fn tracks_read_wait(&self) -> bool {
+        self.metrics.as_ref().is_some_and(|slot| {
+            let metrics = slot.lock();
+            metrics.labels.opcode == "Read" && !metrics.finished
+        })
+    }
+
     fn rep_log(&self, e: &FuseError) {
         if self.debug
             || !matches!(
@@ -256,15 +263,26 @@ impl FuseResponse {
             Some(slot) => slot,
         };
 
+        let track_read_wait = self.tracks_read_wait();
+
         // Reserve first, without touching the slot: a bounded send().await can
         // suspend on a full channel, and a cancel there would drop the ActiveGuard
         // (decrementing active_requests) while emitting NO terminal metric. The
         // reserve is the only suspend point; if cancelled the slot stays unfinished
         // and the guard is dropped cleanly, no half-finished state.
         if self.sender.is_bounded() {
+            let mut wait = ReadWaitTimer::start(track_read_wait, IO_WAIT_REPLY);
             let permit = match self.sender.reserve().await {
-                Ok(p) => p,
+                Ok(p) => {
+                    if let Some(wait) = &mut wait {
+                        wait.stop();
+                    }
+                    p
+                }
                 Err(e) => {
+                    if let Some(wait) = wait {
+                        wait.finish(false);
+                    }
                     // Channel closed before reserve: finish the pending slot now.
                     self.finish_enqueue_failure(slot, status, errno, unsupported_reason);
                     return Err(e.into());
@@ -273,9 +291,17 @@ impl FuseResponse {
             // Permit send is synchronous; commit and enqueue have no await gap.
             let task = match self.commit_reply_task(slot, data, status, errno, unsupported_reason) {
                 Some(task) => task,
-                None => return Ok(()), // double reply: warned/asserted in commit.
+                None => {
+                    if let Some(wait) = wait {
+                        wait.discard();
+                    }
+                    return Ok(()); // double reply: warned/asserted in commit.
+                }
             };
             permit.send(task);
+            if let Some(wait) = wait {
+                wait.finish(true);
+            }
             return Ok(());
         }
 
@@ -285,7 +311,11 @@ impl FuseResponse {
             Some(task) => task,
             None => return Ok(()),
         };
+        let wait = ReadWaitTimer::start(track_read_wait, IO_WAIT_REPLY);
         let send_result = self.sender.send(task).await;
+        if let Some(wait) = wait {
+            wait.finish(send_result.is_ok());
+        }
         if send_result.is_err() {
             self.record_enqueue_failure_metrics(slot, status, errno, unsupported_reason);
         }
@@ -802,6 +832,93 @@ mod tests {
     fn disabled_reply(unique: u64) -> (FuseResponse, AsyncReceiver<FuseTask>) {
         let (tx, rx) = AsyncChannel::new(16).split();
         (FuseResponse::new_reply(unique, tx, false, None), rx)
+    }
+
+    #[tokio::test]
+    async fn read_wait_reply_filters_non_read_and_tracks_error_replies() {
+        let gauge = m::new_gauge("read_wait_reply_filter_active", "test").unwrap();
+        for opcode in ["Write", "Flush", "Release", "GetAttr"] {
+            let (reply, _rx) =
+                reply_with_gauge_opcode_kind(700, &gauge, opcode, FuseReqKind::Stream);
+            assert!(!reply.tracks_read_wait());
+        }
+        assert!(!disabled_reply(701).0.tracks_read_wait());
+        for capacity in [0, 1] {
+            let (mut reply, _unused_rx) =
+                reply_with_gauge_opcode_kind(702, &gauge, "Read", FuseReqKind::Stream);
+            let (tx, mut rx) = AsyncChannel::new(capacity).split();
+            reply.sender = tx;
+            assert!(reply.tracks_read_wait());
+            let hist = FuseMetrics::get().io_wait_duration_us.with_label_values(&[
+                "read",
+                IO_WAIT_REPLY,
+                "success",
+            ]);
+            let before = hist.get_sample_count();
+            // Backend failure is still a successful reply enqueue.
+            reply
+                .send_rep::<(), FuseError>(Err(FuseError::from("read failed")))
+                .await
+                .unwrap();
+            assert!(hist.get_sample_count() > before);
+            assert_eq!(reply.metrics_op_status(), Some(FuseReqStatus::Error));
+            assert!(!reply.tracks_read_wait());
+            assert!(matches!(
+                rx.recv().await,
+                Some(FuseTask::RequestReply { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn read_wait_reply_capacity_cancel_retry_and_closed_channel() {
+        let gauge = m::new_gauge("read_wait_reply_capacity_active", "test").unwrap();
+        let (mut reply, _unused_rx) =
+            reply_with_gauge_opcode_kind(710, &gauge, "Read", FuseReqKind::Stream);
+        let (tx, mut rx) = AsyncChannel::new(1).split();
+        reply.sender = tx.clone();
+        tx.send(FuseTask::Reply(ResponseData::create(0, 0, vec![]).unwrap()))
+            .await
+            .unwrap();
+        let cancelled = FuseMetrics::get().io_wait_duration_us.with_label_values(&[
+            "read",
+            IO_WAIT_REPLY,
+            "cancelled",
+        ]);
+        let before = cancelled.get_sample_count();
+        {
+            let pending = reply.send_rep::<(), FuseError>(Ok(()));
+            tokio::pin!(pending);
+            assert!(futures::poll!(&mut pending).is_pending());
+        }
+        assert!(cancelled.get_sample_count() > before);
+        assert!(!reply.metrics.as_ref().unwrap().lock().finished);
+        assert_eq!(
+            gauge.get(),
+            1,
+            "cancelled reserve must retain the unfinished reply context"
+        );
+        drop(rx.recv().await.unwrap());
+        reply.send_rep::<(), FuseError>(Ok(())).await.unwrap();
+        drop(rx.recv().await.unwrap());
+        assert_eq!(gauge.get(), 0);
+
+        for capacity in [0, 1] {
+            let (mut reply, _unused_rx) =
+                reply_with_gauge_opcode_kind(711, &gauge, "Read", FuseReqKind::Stream);
+            let (tx, rx) = AsyncChannel::new(capacity).split();
+            reply.sender = tx;
+            drop(rx);
+            let error = FuseMetrics::get().io_wait_duration_us.with_label_values(&[
+                "read",
+                IO_WAIT_REPLY,
+                "error",
+            ]);
+            let before = error.get_sample_count();
+            assert!(reply.send_rep::<(), FuseError>(Ok(())).await.is_err());
+            assert!(error.get_sample_count() > before);
+            assert_eq!(gauge.get(), 0);
+        }
     }
 
     #[tokio::test]
