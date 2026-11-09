@@ -47,9 +47,6 @@ const MODE_SETGID: u32 = 0o2000;
 /// filesystem guard or the inode locks owned by the sharded write path.
 pub struct FsDir {
     pub(crate) root_dir: InodeView,
-    // Kept separate from mutable inode metadata; refreshed under the
-    // exclusive filesystem guard whenever the root tree is replaced.
-    root_children: Arc<DirectoryChildren>,
     pub(crate) inode_id: Arc<InodeId>,
     pub(crate) store: InodeStore,
     pub(crate) journal_writer: Arc<JournalWriter>,
@@ -166,12 +163,11 @@ impl FsDir {
         // blank root for a fresh format. Store rows and the journal cursor are
         // persisted independently, so this is not a proof of crash consistency.
         let (last_inode_id, root_dir) = state.create_tree()?;
-        let root_children = root_dir.as_dir_ref()?.children_handle();
+        root_dir.as_dir_ref()?;
         let metadata_reader = Arc::new(MetadataReplicaReader::new(&root_dir)?);
 
         let fs_dir = Self {
             root_dir,
-            root_children,
             inode_id: Arc::new(InodeId::new()),
             store: state,
             journal_writer,
@@ -194,10 +190,6 @@ impl FsDir {
 
     pub fn root_ptr(&self) -> InodePtr {
         InodePtr::from_ref(&self.root_dir)
-    }
-
-    pub(crate) fn root_children(&self) -> &DirectoryChildren {
-        &self.root_children
     }
 
     pub fn root_dir(&self) -> &InodeView {
@@ -2246,7 +2238,7 @@ impl FsDir {
         self.store.migrate_directory_attributes()?;
         self.store.initialize_root_directory_attributes()?;
         let (last_inode_id, root_dir) = self.store.create_tree()?;
-        self.root_children = root_dir.as_dir_ref()?.children_handle();
+        root_dir.as_dir_ref()?;
         self.root_dir = root_dir;
         self.metadata_reader.replace_root(&self.root_dir)?;
         self.update_last_inode_id(last_inode_id)?;
@@ -2295,14 +2287,11 @@ impl FsDir {
         spend.reset();
 
         // Update the directory tree
-        self.root_children = root_dir
-            .as_dir_ref()
-            .map_err(|error| {
-                self.store.invalidate_cursor_store();
-                self.journal_writer.fail_metadata_restore();
-                error
-            })?
-            .children_handle();
+        root_dir.as_dir_ref().map_err(|error| {
+            self.store.invalidate_cursor_store();
+            self.journal_writer.fail_metadata_restore();
+            error
+        })?;
         self.root_dir = root_dir;
         self.metadata_reader
             .replace_root(&self.root_dir)

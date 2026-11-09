@@ -80,15 +80,20 @@ fn exists_reads_a_store_snapshot_with_a_shared_namespace_guard() {
     let worker_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        tx.send((worker_fs.exists("/dir/file"), worker_fs.exists("/missing")))
-            .unwrap();
+        tx.send((
+            worker_fs.exists("/dir/file"),
+            worker_fs.exists("/missing"),
+            worker_fs.exists("/dir/"),
+        ))
+        .unwrap();
     });
     let result = rx.recv_timeout(std::time::Duration::from_secs(3));
     drop(guard);
     worker.join().unwrap();
-    let (existing, missing) = result.unwrap();
+    let (existing, missing, invalid) = result.unwrap();
     assert!(existing.unwrap());
     assert!(!missing.unwrap());
+    assert!(invalid.is_err());
     assert!(fs.exists("/").unwrap());
     assert!(!fs.exists("/dir/file/child").unwrap());
     assert!(fs.exists("relative").is_err());

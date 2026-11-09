@@ -91,6 +91,22 @@ fn edge_plan_uses_a_single_store_snapshot() {
 }
 
 #[test]
+fn exists_reads_topology_from_store_snapshot() {
+    let fs = test_fs("exists-store-snapshot");
+    fs.mkdir("/parent/child", true).unwrap();
+    {
+        // Deliberately detach the live subtree to check the read source; this
+        // is not a valid namespace state or a concurrency test.
+        let guard = fs.fs_dir.write();
+        let path = MasterFilesystem::resolve_path(&guard, "/parent").unwrap();
+        let inode = path.get_last_inode().unwrap();
+        let detached = inode.as_ref().clone_metadata();
+        *inode.as_mut() = detached;
+    }
+    assert!(fs.exists("/parent/child").unwrap());
+}
+
+#[test]
 fn edge_plan_stops_at_a_file_component() {
     let fs = test_fs("edge-plan-file-component");
     let file = fs.create("/file", true).unwrap();

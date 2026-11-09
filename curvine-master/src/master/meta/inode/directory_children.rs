@@ -22,7 +22,7 @@
 //! Astra promotion protocol.
 
 use super::sharded_children::{min_sharded_children, ShardedChildren};
-use super::{ChildItem, InodeChildren, InodePtr, InodeView};
+use super::{InodeChildren, InodePtr, InodeView};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::ListOptions;
 use glob::Pattern;
@@ -352,60 +352,6 @@ impl DirectoryChildren {
         (
             view,
             DirectoryReadVersion {
-                children: self,
-                version,
-            },
-        )
-    }
-
-    /// Read only the identity and directory handle needed for lock planning.
-    pub(crate) fn read_child_edge(
-        &self,
-        name: &str,
-    ) -> Option<(i64, Option<std::sync::Arc<DirectoryChildren>>)> {
-        self.with_children_for_name(name, |children, name| {
-            children.get_child_item(name).map(|item| {
-                let next = match item {
-                    ChildItem::View(view) => view.children_handle(),
-                    ChildItem::FileEntry { .. } => None,
-                };
-                (item.id(), next)
-            })
-        })
-    }
-
-    pub(crate) fn read_child_edge_borrowed(
-        &self,
-        name: &str,
-    ) -> (
-        Option<(i64, Option<std::sync::Arc<DirectoryChildren>>)>,
-        DirectoryReadVersion<'_>,
-    ) {
-        let version = self.sequence.version();
-        let edge = self.read_child_edge(name);
-        (
-            edge,
-            DirectoryReadVersion {
-                children: self,
-                version,
-            },
-        )
-    }
-
-    /// Capture the version before the lookup and retain this directory without
-    /// cloning its handle again for later validation.
-    pub(crate) fn read_child_edge_versioned(
-        self: std::sync::Arc<Self>,
-        name: &str,
-    ) -> (
-        Option<(i64, Option<std::sync::Arc<DirectoryChildren>>)>,
-        DirectoryChildrenSharedVersion,
-    ) {
-        let version = self.sequence.version();
-        let edge = self.read_child_edge(name);
-        (
-            edge,
-            DirectoryChildrenSharedVersion {
                 children: self,
                 version,
             },

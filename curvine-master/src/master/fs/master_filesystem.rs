@@ -306,9 +306,6 @@ impl MasterFilesystem {
         fs_dir.print_tree();
     }
 
-    /// Live-tree reads retry a hydration race a few times before surfacing.
-    const LIVE_READ_RETRIES: usize = 16;
-
     /// Read-barrier precheck before the commit gate. Re-run inside the gate to
     /// reject requests that waited while a role fence was installed.
     pub(crate) fn ensure_metadata_current(&self) -> FsResult<()> {
@@ -2652,61 +2649,33 @@ impl MasterFilesystem {
         if components.last().is_none_or(String::is_empty) {
             return err_box!("Path {} is invalid", path);
         }
-
-        for _ in 0..Self::LIVE_READ_RETRIES {
+        let result = {
             let fs_dir = self.fs_dir.read();
-            fs_dir.store.ensure_available()?;
-            let root = fs_dir.root_children();
-            let mut directory: Option<Arc<crate::master::meta::inode::DirectoryChildren>> = None;
-            let mut root_version = None;
-            let mut versions = smallvec::SmallVec::<[_; 8]>::new();
-            let mut found = true;
-            let mut hydration = Ok(true);
-            for (index, component) in components.iter().enumerate().skip(1) {
-                let edge = if let Some(dir) = directory.take() {
-                    let (edge, version) = dir.read_child_edge_versioned(component);
-                    versions.push(version);
-                    edge
-                } else {
-                    let (edge, version) = root.read_child_edge_borrowed(component);
-                    root_version = Some(version);
-                    edge
-                };
-                let Some((id, next)) = edge else {
-                    found = false;
-                    break;
-                };
-                match next {
-                    Some(next) => directory = Some(next),
-                    None => {
-                        hydration = fs_dir
-                            .store
-                            .get_inode(id, Some(component))
-                            .map(|inode| inode.is_some());
-                        found = index + 1 == components.len();
-                        break;
+            let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+            snapshot.resolve_path(path).map(|resolved| resolved.is_full())
+        };
+        match result {
+            Ok(true) => Ok(true),
+            Ok(false) if self.journal_writer.ensure_metadata_current().is_ok() => Ok(false),
+            Ok(false) | Err(_) => {
+                // Recheck after writers drain: a committed deletion can still
+                // have an unpublished live edge, including after a failure.
+                let fs_dir = self.fs_dir.write();
+                let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+                if snapshot.resolve_path(path)?.is_full() {
+                    return Ok(true);
+                }
+                match Self::resolve_path(&fs_dir, path) {
+                    Ok(inp) if inp.is_full() => {
+                        err_box!("directory edge references missing inode at {}", path)
                     }
+                    Ok(_) => Ok(false),
+                    Err(error) if error.to_string().contains("Failed to load inode") => {
+                        err_box!("directory edge references missing inode: {}", error)
+                    }
+                    Err(error) => Err(error),
                 }
             }
-            if root_version.as_ref().is_none_or(|version| version.is_current())
-                && versions.iter().all(|version| version.is_current())
-            {
-                match hydration {
-                    Ok(true) => return Ok(found),
-                    Ok(false) => break,
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        }
-        // A file row may disappear before its directory edge is unpublished.
-        // An exclusive guard distinguishes that window from a dangling edge.
-        let fs_dir = self.fs_dir.write();
-        match Self::resolve_path(&fs_dir, path) {
-            Ok(inp) => Ok(inp.get_last_inode().is_some()),
-            Err(error) if error.to_string().contains("Failed to load inode") => {
-                err_box!("directory edge references missing inode: {}", error)
-            }
-            Err(error) => Err(error),
         }
     }
 
