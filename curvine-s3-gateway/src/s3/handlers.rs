@@ -835,6 +835,22 @@ impl S3Handlers {
     }
 }
 
+/// Whether two ETag strings denote the same strong validator.
+///
+/// Quoting and a weak prefix are presentation; the digest is what must match.
+fn same_etag(left: &str, right: &str) -> bool {
+    fn value(tag: &str) -> String {
+        tag.trim()
+            .trim_start_matches("W/")
+            .trim_matches('"')
+            .to_ascii_lowercase()
+    }
+    value(left) == value(right)
+}
+
+/// S3 minimum size for a part other than the last one.
+const MIN_PART_BYTES: usize = 5 << 20;
+
 impl crate::s3::s3_api::ListBucketHandler for S3Handlers {
     fn handle(
         &self,
@@ -926,19 +942,68 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             }
         };
 
-        // Sort parts by part number
-        let mut part_list = data;
-        part_list.sort_by_key(|(_, n)| *n);
+        // S3 requires a complete request to list parts in strictly ascending
+        // part-number order, without duplicates. Sorting first would silently
+        // accept both, so the request is validated in the order it arrived.
+        for window in data.windows(2) {
+            if window[1].1 <= window[0].1 {
+                return Err(format!(
+                    "InvalidPartOrder: part numbers must be strictly ascending (got {} then {})",
+                    window[0].1, window[1].1
+                ));
+            }
+        }
+        if data.is_empty() {
+            return Err("InvalidPart: no parts listed".to_string());
+        }
+        let part_list = data;
 
         // Validate the upload before touching the destination. Creating the
         // final object first meant a bad upload id, or a part that is not
         // staged, still left a zero-byte object under the destination key —
         // destroying any previous object and reporting failure afterwards.
-        for (_, part_num) in part_list.iter() {
-            if !self.temp_storage.part_exists(&upload_id, *part_num).await {
+        //
+        // The part ETAG is compared with the record the upload left next to the
+        // part, so a request naming a different digest than the one staged is
+        // rejected here, not discovered while streaming.
+        for (etag, part_num) in part_list.iter() {
+            let recorded = self
+                .temp_storage
+                .part_meta(&upload_id, *part_num)
+                .await
+                .ok_or_else(|| {
+                    // No record means the part was never uploaded under this
+                    // upload id, or was uploaded by an older build.
+                    format!("InvalidPart: part {part_num} of upload {upload_id} is not staged")
+                })?;
+            if !same_etag(&recorded.etag, etag) {
                 return Err(format!(
-                    "NoSuchUpload: part {part_num} of upload {upload_id} is not staged"
+                    "InvalidPart: part {part_num} etag does not match the staged part"
                 ));
+            }
+        }
+
+        // S3 requires every part except the last to be at least 5 MiB. Enforcing
+        // it here turns a length violation into a 400 instead of publishing an
+        // object with an undersized non-final part. A single-part upload is the
+        // last part, so it is exempt.
+        let part_count = part_list.len();
+        for (index, (_, part_num)) in part_list.iter().enumerate() {
+            if index + 1 == part_count {
+                continue;
+            }
+            match self.temp_storage.part_size(&upload_id, *part_num).await {
+                Some(size) if size >= MIN_PART_BYTES => {}
+                Some(size) => {
+                    return Err(format!(
+                        "EntityTooSmall: part {part_num} is {size} bytes, below the 5 MiB minimum for a non-final part"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "NoSuchUpload: part {part_num} of upload {upload_id} is not staged"
+                    ));
+                }
             }
         }
 
@@ -975,10 +1040,11 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                     upload_id,
                     e
                 );
-                // Cleanup on failure
+                // Cleanup on failure. The staged parts are deliberately kept:
+                // a rejected Complete must be retryable with a corrected list,
+                // and deleting them would force the client to re-upload.
                 let _ = writer.cancel().await;
                 let _ = self.fs.delete(&staging, false).await;
-                let _ = self.temp_storage.cleanup(&upload_id).await;
                 // A missing part means the upload id or the part list does not
                 // match what was staged; S3 answers 404 NoSuchUpload.
                 return Err(format!("NoSuchUpload: {e}"));
@@ -988,9 +1054,8 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
 
         if let Err(e) = writer.complete().await {
             tracing::error!("Failed to complete final file write: {}", e);
-            // Cleanup on failure
+            // Cleanup on failure. Parts stay staged so the client can retry.
             let _ = self.fs.delete(&staging, false).await;
-            let _ = self.temp_storage.cleanup(&upload_id).await;
             return Err(format!("Failed to complete final file write: {e}"));
         }
 
@@ -1017,7 +1082,6 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             .await
         {
             let _ = self.fs.delete(&staging, false).await;
-            let _ = self.temp_storage.cleanup(&upload_id).await;
             return Err(format!("Failed to record multipart etag: {e}"));
         }
 
@@ -1025,7 +1089,6 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         // that already carries its metadata.
         if let Err(e) = self.fs.rename(&staging, &final_path).await {
             let _ = self.fs.delete(&staging, false).await;
-            let _ = self.temp_storage.cleanup(&upload_id).await;
             return Err(format!("Failed to publish assembled object: {e}"));
         }
 
@@ -1139,6 +1202,12 @@ impl ListObjectHandler for S3Handlers {
             let mut contents = Vec::new();
 
             for st in list {
+                // Internal staging objects are build artefacts, not objects:
+                // a client listing the bucket must never see them.
+                if st.name.starts_with(".curvine-s3-") {
+                    continue;
+                }
+
                 // Build the S3 key from file status
                 let key = if prefix_dir.is_empty() {
                     st.name.clone()
@@ -1493,5 +1562,37 @@ mod put_destination_condition_tests {
             evaluate_precondition_headers(&cond(None, Some("*")), None, None),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod part_validation_tests {
+    use super::{same_etag, MIN_PART_BYTES};
+
+    /// S3 requires strictly ascending, deduplicated part numbers. Duplicate or
+    /// descending numbers used to be silently accepted because the list was
+    /// sorted before use.
+    #[test]
+    fn part_order_requires_strictly_ascending_numbers() {
+        let ascending = [(0, 1u32), (0, 2), (0, 3)];
+        for window in ascending.windows(2) {
+            assert!(window[1].1 > window[0].1);
+        }
+        let duplicated = [(0, 1u32), (0, 1)];
+        assert!(duplicated.windows(2).any(|w| w[1].1 <= w[0].1));
+        let descending = [(0, 2u32), (0, 1)];
+        assert!(descending.windows(2).any(|w| w[1].1 <= w[0].1));
+    }
+
+    #[test]
+    fn non_final_parts_must_reach_the_minimum() {
+        assert_eq!(MIN_PART_BYTES, 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn etags_compare_as_digests() {
+        assert!(same_etag("abc123", "\"abc123\""));
+        assert!(same_etag("W/\"ABC123\"", "abc123"));
+        assert!(!same_etag("abc123", "other"));
     }
 }

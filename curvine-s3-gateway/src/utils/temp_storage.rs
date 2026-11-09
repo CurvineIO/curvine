@@ -20,6 +20,35 @@ use std::future::Future;
 const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 const MIN_BUFFER_SIZE: usize = 64 * 1024;
 
+/// What an uploaded part recorded about itself, written next to the part
+/// when it is staged.
+///
+/// `size` is taken from the staged bytes themselves rather than remembered from
+/// the request, so the value cannot drift from what is on disk; `etag` is the
+/// MD5 computed while writing. `CompleteMultipartUpload` validates the request
+/// against this record, and a part whose record is missing is treated as never
+/// having been uploaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartMeta {
+    pub etag: String,
+    pub size: usize,
+}
+
+impl PartMeta {
+    /// Encode as `"<etag>:<size>"` for the sidecar file.
+    fn encode(&self) -> String {
+        format!("{}:{}", self.etag.trim_matches('"'), self.size)
+    }
+
+    fn decode(text: &str) -> Option<Self> {
+        let (etag, size) = text.trim().split_once(':')?;
+        Some(Self {
+            etag: etag.to_string(),
+            size: size.parse().ok()?,
+        })
+    }
+}
+
 /// Verification a staged object body must satisfy before it is handed to the
 /// object handler.
 #[derive(Clone, Copy, Debug, Default)]
@@ -173,6 +202,13 @@ impl LocalTempStorage {
         format!("{}/{}/{}", self.config.temp_dir, upload_id, part_number)
     }
 
+    fn part_meta_path(&self, upload_id: &str, part_number: u32) -> String {
+        format!(
+            "{}/{}/{}.meta",
+            self.config.temp_dir, upload_id, part_number
+        )
+    }
+
     #[inline]
     fn dir_path(&self, upload_id: &str) -> String {
         format!("{}/{}", self.config.temp_dir, upload_id)
@@ -279,7 +315,38 @@ impl LocalTempStorage {
         }
 
         let digest = hasher.compute();
-        Ok(format!("\"{:x}\"", digest))
+        let etag = format!("{:x}", digest);
+        // Sidecar next to the part: Complete validates the request against this
+        // record, and a part with no record is treated as never uploaded.
+        let meta_path = self.part_meta_path(upload_id, part_number);
+        tokio::fs::write(
+            &meta_path,
+            PartMeta {
+                etag: etag.clone(),
+                size: staged,
+            }
+            .encode(),
+        )
+        .await
+        .map_err(|e| format!("Failed to record part metadata {}: {}", meta_path, e))?;
+
+        Ok(format!("\"{etag}\""))
+    }
+
+    /// The record `write_part_stream` left next to this part.
+    pub async fn part_meta(&self, upload_id: &str, part_number: u32) -> Option<PartMeta> {
+        let text = tokio::fs::read_to_string(self.part_meta_path(upload_id, part_number))
+            .await
+            .ok()?;
+        PartMeta::decode(&text)
+    }
+
+    /// Recorded size of a staged part, read from the file itself.
+    pub async fn part_size(&self, upload_id: &str, part_number: u32) -> Option<usize> {
+        tokio::fs::metadata(self.part_path(upload_id, part_number))
+            .await
+            .ok()
+            .map(|metadata| metadata.len() as usize)
     }
 
     /// Stages a single-object body on local disk and returns the reader plus
@@ -417,6 +484,14 @@ impl CurvineTempStorage {
         .map_err(|e| format!("Invalid part path: {}", e))
     }
 
+    fn part_meta_path(&self, upload_id: &str, part_number: u32) -> Result<Path, String> {
+        Path::from_str(format!(
+            "{}/{}/{}.meta",
+            self.config.temp_dir, upload_id, part_number
+        ))
+        .map_err(|e| format!("Invalid part metadata path: {}", e))
+    }
+
     #[inline]
     fn dir_path(&self, upload_id: &str) -> Result<Path, String> {
         Path::from_str(format!("{}/{}", self.config.temp_dir, upload_id))
@@ -541,7 +616,59 @@ impl CurvineTempStorage {
         }
 
         let digest = hasher.compute();
-        Ok(format!("\"{:x}\"", digest))
+        let etag = format!("{:x}", digest);
+        // Sidecar next to the part, in the same staging area.
+        let meta_path = self.part_meta_path(upload_id, part_number)?;
+        let mut meta_writer = self
+            .fs
+            .create(&meta_path, true)
+            .await
+            .map_err(|e| format!("Failed to create part metadata {}: {}", meta_path, e))?;
+        meta_writer
+            .write(
+                PartMeta {
+                    etag: etag.clone(),
+                    size: staged,
+                }
+                .encode()
+                .as_bytes(),
+            )
+            .await
+            .map_err(|e| format!("Failed to write part metadata {}: {}", meta_path, e))?;
+        meta_writer
+            .complete()
+            .await
+            .map_err(|e| format!("Failed to complete part metadata {}: {}", meta_path, e))?;
+
+        Ok(format!("\"{etag}\""))
+    }
+
+    /// The record `write_part_stream` left next to this part.
+    /// Recorded size of a staged part.
+    pub async fn part_size(&self, upload_id: &str, part_number: u32) -> Option<usize> {
+        let path = self.part_path(upload_id, part_number).ok()?;
+        self.fs
+            .get_status(&path)
+            .await
+            .ok()
+            .and_then(|status| usize::try_from(status.len).ok())
+    }
+
+    pub async fn part_meta(&self, upload_id: &str, part_number: u32) -> Option<PartMeta> {
+        use curvine_fs_api::Reader;
+
+        let path = self.part_meta_path(upload_id, part_number).ok()?;
+        let mut reader = self.fs.open(&path).await.ok()?;
+        let mut text = String::new();
+        let mut buf = vec![0u8; 256];
+        loop {
+            let n = reader.read(&mut buf).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            text.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        PartMeta::decode(&text)
     }
 
     /// Stages a single-object body in Curvine and returns a reader over it.
@@ -820,6 +947,22 @@ impl TempStorageEnum {
         match self {
             TempStorageEnum::Local(s) => s.part_exists(upload_id, part_number).await,
             TempStorageEnum::Curvine(s) => s.part_exists(upload_id, part_number).await,
+        }
+    }
+
+    /// The record an uploaded part left next to itself, in either backend.
+    pub async fn part_meta(&self, upload_id: &str, part_number: u32) -> Option<PartMeta> {
+        match self {
+            TempStorageEnum::Local(s) => s.part_meta(upload_id, part_number).await,
+            TempStorageEnum::Curvine(s) => s.part_meta(upload_id, part_number).await,
+        }
+    }
+
+    /// Recorded size of a staged part, in either backend.
+    pub async fn part_size(&self, upload_id: &str, part_number: u32) -> Option<usize> {
+        match self {
+            TempStorageEnum::Local(s) => s.part_size(upload_id, part_number).await,
+            TempStorageEnum::Curvine(s) => s.part_size(upload_id, part_number).await,
         }
     }
 
