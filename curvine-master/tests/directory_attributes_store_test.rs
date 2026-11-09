@@ -266,7 +266,12 @@ fn explicit_directory_updates_keep_legacy_attributes_legacy() {
         "link".to_owned(),
         InodeFile::with_link(2, 2, "/target", 0o777, None, None),
     );
-    store.apply_symlink(&parent, &link, false).unwrap();
+    store.apply_symlink(&parent, &link, None).unwrap();
+    let replacement = InodeView::new_file(
+        "link".to_owned(),
+        InodeFile::with_link(3, 3, "/replacement", 0o777, None, None),
+    );
+    store.apply_symlink(&parent, &replacement, Some(2)).unwrap();
 
     assert_eq!(
         store

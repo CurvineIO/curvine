@@ -121,6 +121,15 @@ impl RocksInodeStore {
         Ok(())
     }
 
+    /// Point read of one edge without a snapshot or inode decode.
+    pub fn get_child_id(&self, parent_id: i64, name: &str) -> CommonResult<Option<i64>> {
+        let key = RocksUtils::i64_str_to_bytes(parent_id, name);
+        self.db
+            .get_pinned_cf(Self::CF_EDGES, key)?
+            .map(|value| RocksUtils::i64_from_bytes(&value))
+            .transpose()
+    }
+
     pub fn get_child_ids(
         &self,
         id: i64,

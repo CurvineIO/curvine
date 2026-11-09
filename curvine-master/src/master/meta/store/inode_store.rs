@@ -893,13 +893,17 @@ impl InodeStore {
         &self,
         parent: &InodeView,
         new_inode: &InodeView,
-        is_add: bool,
+        old_id: Option<i64>,
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
+        let mut ttl_removals = Vec::new();
+        if let Some(id) = old_id.filter(|id| *id != new_inode.id()) {
+            self.decrement_inode_nlink(id, 1, new_inode.ctime(), &mut batch, &mut ttl_removals)?;
+        }
 
         batch.write_inode(parent)?;
         batch.write_inode(new_inode)?;
-        if is_add {
+        if old_id.is_none() {
             Self::merge_directory_attributes(
                 &mut batch,
                 parent,
@@ -923,7 +927,10 @@ impl InodeStore {
 
         batch.commit()?;
 
-        if is_add {
+        for inode in &ttl_removals {
+            self.ttl_bucket_list.remove(inode);
+        }
+        if old_id.is_none() {
             self.fs_stats.increment_file_count();
         }
 

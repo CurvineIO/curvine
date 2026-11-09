@@ -554,6 +554,40 @@ fn overwrite_and_ttl_delete_entries_replay_idempotently() -> FsResult<()> {
 }
 
 #[test]
+fn forced_symlink_replay_preserves_hard_links() -> FsResult<()> {
+    use crate::master::journal::{JournalSystem, SymlinkEntry};
+    use crate::master::meta::inode::InodeFile;
+
+    let mut conf = test_conf("symlink-force-replay");
+    conf.journal.enable = false;
+    conf.journal.snapshot_entries = 0;
+    let journal = JournalSystem::from_conf(&conf)?;
+    let fs = journal.fs();
+    fs.symlink("/first", "/link", false, 0o777)?;
+    fs.link("/link", "/old-alias")?;
+    let old_id = fs.file_status("/link")?.id;
+    let new_inode = InodeFile::with_link(old_id + 100_000, 10, "/second", 0o777, None, None);
+    let entry = JournalEntry::Symlink(SymlinkEntry {
+        op_id: 1,
+        rpc_id: 0,
+        link: "/link".to_string(),
+        new_inode,
+        force: true,
+    });
+    let loader = journal.journal_loader();
+    loader.apply_entry(entry.clone())?;
+    assert_eq!(fs.file_status("/old-alias")?.id, old_id);
+    assert_eq!(fs.file_status("/old-alias")?.nlink, 1);
+    fs.link("/link", "/new-alias")?;
+    loader.apply_entry(entry)?;
+    assert_eq!(fs.file_status("/new-alias")?.nlink, 2);
+    fs.delete("/link", false)?;
+    assert_eq!(fs.file_status("/new-alias")?.nlink, 1);
+    journal.shutdown();
+    Ok(())
+}
+
+#[test]
 fn overwrite_defers_worker_deletion_until_commit() -> FsResult<()> {
     verify_overwrite_confirmation(true)?;
     verify_overwrite_confirmation(false)

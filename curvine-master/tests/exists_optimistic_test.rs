@@ -661,6 +661,74 @@ fn symlink_rejects_file_parent_and_survives_restore() {
     assert_eq!(fs.file_status("/dir/link").unwrap().id, link.id);
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn forced_symlink_store_failure_preserves_old_link() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+
+    let fs = test_fs("symlink-force-failure");
+    fs.mkdir("/dir", false).unwrap();
+    fs.symlink("/first", "/dir/link", false, 0o777).unwrap();
+    let old_id = fs.file_status("/dir/link").unwrap().id;
+    fs.link("/dir/link", "/dir/alias").unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = format!("symlink-force-{}", Utils::rand_str(12));
+    let rule = FaultRuleBuilder::named("master.metadata.symlink.before_commit")
+        .matches("child_name", "link")
+        .unwrap()
+        .times(1)
+        .unwrap()
+        .return_error("injected symlink failure")
+        .unwrap();
+    runtime.configure(&rule_id, rule).unwrap();
+    let result = fs.symlink("/second", "/dir/link", true, 0o777);
+    runtime.remove(&rule_id).unwrap();
+    assert!(result.is_err());
+    assert_eq!(fs.file_status("/dir/link").unwrap().id, old_id);
+    assert_eq!(fs.file_status("/dir/alias").unwrap().nlink, 2);
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/dir/link").unwrap().id, old_id);
+    assert_eq!(fs.file_status("/dir/alias").unwrap().nlink, 2);
+}
+
+#[test]
+fn forced_symlink_rejects_regular_file_target() {
+    let fs = test_fs("symlink-force-regular-file");
+    fs.mkdir("/dir", false).unwrap();
+    fs.create("/dir/link", false).unwrap();
+    assert!(fs.symlink("/second", "/dir/link", true, 0o777).is_err());
+    assert_eq!(
+        fs.file_status("/dir/link").unwrap().file_type,
+        curvine_model::FileType::File
+    );
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(
+        fs.file_status("/dir/link").unwrap().file_type,
+        curvine_model::FileType::File
+    );
+}
+
+#[test]
+fn forced_symlink_replacement_preserves_other_hard_links() {
+    let fs = test_fs("symlink-force-hard-link");
+    fs.mkdir("/dir", false).unwrap();
+    fs.symlink("/first", "/dir/link", false, 0o777).unwrap();
+    let old_id = fs.file_status("/dir/link").unwrap().id;
+    fs.link("/dir/link", "/dir/alias").unwrap();
+    fs.symlink("/second", "/dir/link", true, 0o777).unwrap();
+    let new_id = fs.file_status("/dir/link").unwrap().id;
+    assert_ne!(old_id, new_id);
+    assert_eq!(fs.file_status("/dir/alias").unwrap().id, old_id);
+    assert_eq!(fs.file_status("/dir/alias").unwrap().nlink, 1);
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/dir/alias").unwrap().id, old_id);
+    assert_eq!(fs.file_status("/dir/link").unwrap().id, new_id);
+    fs.delete("/dir/link", false).unwrap();
+    fs.delete("/dir/alias", false).unwrap();
+    assert!(fs.file_status_by_id("/dir/link", Some(new_id)).is_err());
+    assert!(fs.file_status_by_id("/dir/alias", Some(old_id)).is_err());
+}
+
 #[test]
 fn symlink_under_distinct_parents_remains_consistent_after_reload() {
     let fs = test_fs("symlink-distinct-parents");

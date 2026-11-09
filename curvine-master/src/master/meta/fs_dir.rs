@@ -38,7 +38,6 @@ use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::AtomicCounter;
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, LinkedList};
-use std::mem;
 use std::sync::Arc;
 
 const MODE_SETGID: u32 = 0o2000;
@@ -2751,10 +2750,25 @@ impl FsDir {
             .validate_child_name(&name)?;
         let is_add = old_inode.is_none();
         let new_inode = InodeView::new_file(name, new_inode);
+        // Replay may deliver the same inode twice; a distinct id means the old
+        // link inode loses one hard link in the same store batch.
+        if old_inode.as_ref().is_some_and(|inode| inode.id() == new_inode.id()) {
+            return Ok(link);
+        }
+        if let Some(inode) = old_inode.as_ref() {
+            // A link inode never owns blocks; any block list means it is a
+            // regular file, not a replaceable symlink.
+            if !inode.as_file_ref()?.block_ids().is_empty() {
+                return err_ext!(FsError::file_exists(link.path()));
+            }
+        }
         let mut persisted_parent = parent.as_ref().clone_metadata();
         persisted_parent.update_mtime(new_inode.mtime());
-        self.store
-            .apply_symlink(&persisted_parent, &new_inode, is_add)?;
+        self.store.apply_symlink(
+            &persisted_parent,
+            &new_inode,
+            old_inode.as_ref().map(|inode| inode.id()),
+        )?;
 
         parent.update_mtime(new_inode.mtime());
         if is_add {
@@ -2771,7 +2785,9 @@ impl FsDir {
         parent.mark_directory_attributes_persisted();
         match old_inode {
             Some(v) => {
-                let _ = mem::replace(v.as_mut(), new_inode);
+                self.publish_metadata(parent.delete_child(v.id(), link.name()))?;
+                let added = self.publish_metadata(parent.add_child(new_inode))?;
+                *link.inodes.last_mut().expect("existing symlink has an inode") = added;
             }
             None => {
                 let added = self.publish_metadata(parent.add_child(new_inode))?;
