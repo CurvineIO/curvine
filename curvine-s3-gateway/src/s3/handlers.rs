@@ -636,10 +636,6 @@ impl PutObjectHandler for S3Handlers {
             Ok(format!("\"{md5}\""))
         }
     }
-
-    fn temp_storage(&self) -> std::sync::Arc<TempStorageEnum> {
-        self.temp_storage.clone()
-    }
 }
 
 impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
