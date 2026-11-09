@@ -1782,7 +1782,7 @@ impl<'a> InodeStoreSnapshot<'a> {
             return Ok(None);
         };
         let Some(mut inode) = self.get_inode(id)? else {
-            return err_box!("directory edge references missing inode {}", id);
+            return err_box!("Failed to load inode {}: directory edge references missing inode", id);
         };
         inode.change_name(name.to_owned());
         Ok(Some(inode))
