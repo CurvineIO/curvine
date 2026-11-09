@@ -18,9 +18,9 @@ use crate::master::fs::full_block_report::{
 };
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
-use crate::master::meta::inode::{
-    InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
-};
+use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
+#[cfg(test)]
+use crate::master::meta::inode::ROOT_INODE_ID;
 use crate::master::meta::store::{InodeStoreSnapshot, StoreResolvedPath};
 use crate::master::meta::{
     trash, BlockLocationLockManager, CacheInvalidationResult, CommitGate, FsDir, InodeLockManager,
@@ -380,11 +380,8 @@ impl MasterFilesystem {
             .unwrap_or(0)
     }
 
-    // Plan from directory edges; load the target inode after acquiring its
-    // lock so its metadata cannot be stale when the mutation is applied.
-    // Each ID and child directory handle is read under the child-index lock.
-    // Handles keep subsequent lookups alive across concurrent deletions.
-    // The IDs are only a lock plan; callers must revalidate them after locking.
+    // Plan from a store snapshot rather than reading live inode fields before
+    // taking their locks. The IDs are only a plan and must be revalidated.
     fn resolve_edge_ids(&self, path: &str) -> FsResult<(Vec<i64>, usize, bool, u64)> {
         let fs_dir = self.fs_dir.read();
         let control = fs_dir.store.scan_control();
@@ -394,29 +391,11 @@ impl MasterFilesystem {
             );
         }
         let epoch = control.cancel_epoch();
-        fs_dir.store.ensure_available()?;
-        let components = InodeView::path_components(path)?;
-        let name = try_option!(components.last(), "Path {} has no components", path);
-        if name.is_empty() {
-            return err_box!("Path {} is invalid", path);
-        }
-        let mut ids = Vec::with_capacity(components.len());
-        let mut directory = match fs_dir.root_dir().children_handle() {
-            Some(handle) => handle,
-            None => return err_box!("root inode is not a directory"),
-        };
-        ids.push(ROOT_INODE_ID);
-        for name in components.iter().skip(1) {
-            let Some((id, next)) = directory.read_child_edge(name) else {
-                break;
-            };
-            ids.push(id);
-            let Some(next) = next else { break };
-            directory = next;
-        }
+        let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+        let resolved = snapshot.resolve_path(path)?;
         Self::check_not_pending_path(path)?;
-        let full = ids.len() == components.len();
-        Ok((ids, components.len(), full, epoch))
+        let ids = resolved.inodes().iter().map(InodeView::id).collect();
+        Ok((ids, resolved.components().len(), resolved.is_full(), epoch))
     }
 
     #[inline]

@@ -73,6 +73,24 @@ fn edge_plan_handles_survive_directory_replacement() {
 }
 
 #[test]
+fn edge_plan_uses_a_single_store_snapshot() {
+    let fs = test_fs("edge-plan-store-snapshot");
+    let id = fs.mkdir("/parent", false).unwrap().id;
+    {
+        // Deliberately diverge the live ID from the store to check the read
+        // source; this is not a valid namespace state or a race detector.
+        let guard = fs.fs_dir.write();
+        let path = MasterFilesystem::resolve_path(&guard, "/parent").unwrap();
+        let inode = path.get_last_inode().unwrap();
+        inode.as_mut().as_dir_mut().unwrap().id = id + 1;
+    }
+    let (ids, components, full, _) = fs.resolve_edge_ids("/parent").unwrap();
+    assert!(full);
+    assert_eq!(components, 2);
+    assert_eq!(ids, [ROOT_INODE_ID, id]);
+}
+
+#[test]
 fn edge_plan_stops_at_a_file_component() {
     let fs = test_fs("edge-plan-file-component");
     let file = fs.create("/file", true).unwrap();
