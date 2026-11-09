@@ -2649,21 +2649,17 @@ impl MasterFilesystem {
         }
 
         Self::check_not_pending_path(path)?;
-        // Owned views keep borrowed pointers out of the window where sharded
-        // writers may free removed inodes; versions reject torn walks.
-        for _ in 0..Self::LIVE_READ_RETRIES {
-            let fs_dir = self.fs_dir.read();
-            let inp = InodePath::resolve_shared(fs_dir.root_dir(), path, &fs_dir.store)?;
-            let statuses = fs_dir.file_status(&inp);
-            if inp.walk_is_current() {
-                return statuses;
-            }
-            drop(fs_dir);
-            std::thread::sleep(std::time::Duration::from_micros(50));
-        }
-        let fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-        fs_dir.file_status(&inp)
+        // Child-index versions protect topology, not mutable inode fields.
+        // Read both the path and its metadata from one store snapshot instead
+        // of cloning live inodes while sharded writers may replace them.
+        let fs_dir = self.fs_dir.read();
+        let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+        let resolved = snapshot.resolve_path(path)?;
+        let inode = resolved
+            .target()
+            .ok_or_else(|| FsError::file_not_found(path))?
+            .clone();
+        Self::file_status_from_snapshot(&snapshot, path, inode)
     }
 
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {

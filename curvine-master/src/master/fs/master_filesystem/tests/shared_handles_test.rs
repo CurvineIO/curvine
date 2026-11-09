@@ -182,6 +182,53 @@ fn path_status_uses_one_snapshot_without_exclusive_namespace_lock() {
 }
 
 #[test]
+fn path_status_reads_inode_from_store_snapshot() {
+    let fs = test_fs("status-store-snapshot");
+    fs.mkdir("/dir", false).unwrap();
+    fs.set_attr("/dir", SetAttrOptsBuilder::new().mode(0o700).build())
+        .unwrap();
+    {
+        // Simulate a live view from a different generation. Path status must
+        // not combine it with edges or directory attributes from the store.
+        let guard = fs.fs_dir.write();
+        let path = MasterFilesystem::resolve_path(&guard, "/dir").unwrap();
+        let inode = path.get_last_inode().unwrap();
+        inode
+            .as_mut()
+            .set_attr(SetAttrOptsBuilder::new().mode(0o755).build())
+            .unwrap();
+    }
+    assert_eq!(fs.file_status("/dir").unwrap().mode, 0o700);
+}
+
+#[test]
+fn path_status_remains_valid_during_metadata_replacement() {
+    let fs = test_fs("status-metadata-replacement");
+    fs.mkdir("/dir", false).unwrap();
+    fs.set_attr("/dir", SetAttrOptsBuilder::new().mode(0o700).build())
+        .unwrap();
+    let writer_fs = fs.clone();
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let writer_start = start.clone();
+    let writer = std::thread::spawn(move || {
+        writer_start.wait();
+        for i in 0..200 {
+            let mode = if i % 2 == 0 { 0o755 } else { 0o700 };
+            writer_fs
+                .set_attr("/dir", SetAttrOptsBuilder::new().mode(mode).build())
+                .unwrap();
+        }
+    });
+    start.wait();
+    for _ in 0..200 {
+        let status = fs.file_status("/dir").unwrap();
+        assert!(status.mode == 0o700 || status.mode == 0o755);
+        assert!(status.is_dir);
+    }
+    writer.join().unwrap();
+}
+
+#[test]
 fn path_status_uses_persisted_child_count_after_namespace_mutations() {
     let _guard = CHILDREN_COUNT_PERSISTENCE.lock().unwrap();
     let _reset = ResetChildrenCountPersistence;
