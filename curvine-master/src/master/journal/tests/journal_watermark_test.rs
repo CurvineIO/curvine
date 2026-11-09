@@ -523,7 +523,8 @@ fn record_format_negotiation_enables_on_leader_and_resets_on_step_down() {
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(loader.role_change(raft::StateRole::Leader)).unwrap();
+    rt.block_on(loader.role_change(raft::StateRole::Leader))
+        .unwrap();
     assert!(
         curvine_model::children_count_persisted(),
         "single-node leader must enable persisted child counts"

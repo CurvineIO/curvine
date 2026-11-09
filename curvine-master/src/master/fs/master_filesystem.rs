@@ -401,13 +401,8 @@ impl MasterFilesystem {
         ids: &[i64],
         components_len: usize,
     ) -> FsResult<Option<InodePath>> {
-        let result = InodePath::resolve_locked(
-            fs_dir.root_ptr(),
-            path,
-            &fs_dir.store,
-            ids,
-            components_len,
-        )?;
+        let result =
+            InodePath::resolve_locked(fs_dir.root_ptr(), path, &fs_dir.store, ids, components_len)?;
         Self::check_not_pending_path(path)?;
         Ok(result)
     }
@@ -971,10 +966,7 @@ impl MasterFilesystem {
 
         for _ in 0..MAX_RETRIES {
             let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
-            if !full
-                || ids.len() < 2
-                || inode_id.is_some_and(|id| ids.last() != Some(&id))
-            {
+            if !full || ids.len() < 2 || inode_id.is_some_and(|id| ids.last() != Some(&id)) {
                 return self.complete_file_with_global_lock(
                     path,
                     inode_id,
@@ -2632,7 +2624,9 @@ impl MasterFilesystem {
         let result = {
             let fs_dir = self.fs_dir.read();
             let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
-            snapshot.resolve_path(path).map(|resolved| resolved.is_full())
+            snapshot
+                .resolve_path(path)
+                .map(|resolved| resolved.is_full())
         };
         match result {
             Ok(exists) if self.journal_writer.ensure_metadata_current().is_ok() => Ok(exists),
@@ -2949,10 +2943,7 @@ impl MasterFilesystem {
                 Err(_) if expected_id.is_some() => return Ok(None),
                 Err(error) => return Err(error),
             };
-            if !full
-                || ids.len() < 2
-                || expected_id.is_some_and(|id| ids.last() != Some(&id))
-            {
+            if !full || ids.len() < 2 || expected_id.is_some_and(|id| ids.last() != Some(&id)) {
                 return Ok(None);
             }
             let target_depth = ids.len() - 1;

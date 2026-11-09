@@ -169,7 +169,10 @@ fn recursive_set_attr_waits_for_shared_namespace_readers() {
             task.join().unwrap();
             panic!("recursive set_attr bypassed the namespace writer: {result:?}");
         }
-        Err(_) => done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap(),
+        Err(_) => done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
     };
     assert_eq!(status.mode, 0o700);
     task.join().unwrap();

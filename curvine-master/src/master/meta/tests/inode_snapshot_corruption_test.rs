@@ -65,7 +65,10 @@ fn inode_snapshot_rejects_key_and_payload_id_mismatch() {
             Err(error) => error,
             Ok(_) => panic!("snapshot reader must detect the mismatch at /first"),
         };
-        assert!(error.to_string().contains("inode record id mismatch"), "{error}");
+        assert!(
+            error.to_string().contains("inode record id mismatch"),
+            "{error}"
+        );
         assert!(snapshot.resolve_path("/second").unwrap().is_full());
     }
     for error in [
@@ -78,8 +81,7 @@ fn inode_snapshot_rejects_key_and_payload_id_mismatch() {
     {
         let message = error.to_string();
         assert!(
-            message.contains("inode record id mismatch")
-                || message.contains("inode id mismatch"),
+            message.contains("inode record id mismatch") || message.contains("inode id mismatch"),
             "live read error: {message}"
         );
     }

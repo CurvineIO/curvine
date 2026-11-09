@@ -14,8 +14,8 @@
 
 use curvine_config::DBConf;
 use curvine_master::master::meta::store::RocksInodeStore;
+use curvine_model::{persist_children_count, DirectoryAttributes};
 use curvine_runtime::common::Utils;
-use curvine_model::{DirectoryAttributes, persist_children_count};
 use std::sync::Mutex;
 
 // `persist_children_count` is process-wide state shared by every test in
@@ -71,7 +71,8 @@ fn fresh_directory_attributes_match_merge_format() {
         .unwrap()
         .expect("fresh row must exist");
     assert_eq!(
-        attrs.children, Some(0),
+        attrs.children,
+        Some(0),
         "fresh row must carry a child count when counts persist"
     );
     drop(store);

@@ -131,9 +131,11 @@ fn edge_plan_stops_at_a_file_component() {
     assert_eq!(ids.len(), 2);
     assert_eq!(ids[1], file.id);
     let guard = fs.fs_dir.read();
-    assert!(MasterFilesystem::resolve_locked_path(&guard, "/file/child", &ids, components)
-        .unwrap()
-        .is_some());
+    assert!(
+        MasterFilesystem::resolve_locked_path(&guard, "/file/child", &ids, components)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -145,16 +147,20 @@ fn namespace_validation_checks_first_missing_component() {
     assert!(!full);
     {
         let guard = fs.fs_dir.read();
-        assert!(MasterFilesystem::resolve_locked_path(&guard, path, &ids, components)
-            .unwrap()
-            .is_some());
+        assert!(
+            MasterFilesystem::resolve_locked_path(&guard, path, &ids, components)
+                .unwrap()
+                .is_some()
+        );
     }
 
     fs.mkdir("/parent/missing", false).unwrap();
     let guard = fs.fs_dir.read();
-    assert!(MasterFilesystem::resolve_locked_path(&guard, path, &ids, components)
-        .unwrap()
-        .is_none());
+    assert!(
+        MasterFilesystem::resolve_locked_path(&guard, path, &ids, components)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

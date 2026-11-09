@@ -698,11 +698,7 @@ impl<'a> InodeWriteBatch<'a> {
         self.put_cf(
             RocksInodeStore::CF_DIR_ATTRS,
             RocksUtils::i64_to_bytes(id),
-            encode_matching(
-                None,
-                &attributes.encode(),
-                &attributes.encode_legacy(),
-            ),
+            encode_matching(None, &attributes.encode(), &attributes.encode_legacy()),
         )
     }
 

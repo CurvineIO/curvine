@@ -2752,7 +2752,10 @@ impl FsDir {
         let new_inode = InodeView::new_file(name, new_inode);
         // Replay may deliver the same inode twice; a distinct id means the old
         // link inode loses one hard link in the same store batch.
-        if old_inode.as_ref().is_some_and(|inode| inode.id() == new_inode.id()) {
+        if old_inode
+            .as_ref()
+            .is_some_and(|inode| inode.id() == new_inode.id())
+        {
             return Ok(link);
         }
         if let Some(inode) = old_inode.as_ref() {
@@ -2787,7 +2790,10 @@ impl FsDir {
             Some(v) => {
                 self.publish_metadata(parent.delete_child(v.id(), link.name()))?;
                 let added = self.publish_metadata(parent.add_child(new_inode))?;
-                *link.inodes.last_mut().expect("existing symlink has an inode") = added;
+                *link
+                    .inodes
+                    .last_mut()
+                    .expect("existing symlink has an inode") = added;
             }
             None => {
                 let added = self.publish_metadata(parent.add_child(new_inode))?;

@@ -115,8 +115,10 @@ impl InodePath {
         path: T,
         store: &InodeStore,
     ) -> CommonResult<Self> {
-        Ok(Self::resolve_inner::<T, false, false>(root, path, store, &[], 0)?
-            .expect("unconditional path resolution always returns a path"))
+        Ok(
+            Self::resolve_inner::<T, false, false>(root, path, store, &[], 0)?
+                .expect("unconditional path resolution always returns a path"),
+        )
     }
 
     /// Resolve while holding locks for every planned inode. Stop before
@@ -138,8 +140,10 @@ impl InodePath {
         path: T,
         store: &InodeStore,
     ) -> CommonResult<Self> {
-        Ok(Self::resolve_inner::<T, true, false>(root, path, store, &[], 0)?
-            .expect("unconditional path resolution always returns a path"))
+        Ok(
+            Self::resolve_inner::<T, true, false>(root, path, store, &[], 0)?
+                .expect("unconditional path resolution always returns a path"),
+        )
     }
 
     fn resolve_inner<T: AsRef<str>, const TRACK_VERSIONS: bool, const CHECK_IDS: bool>(

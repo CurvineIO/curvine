@@ -325,7 +325,10 @@ fn free_replans_after_parent_replacement() {
         .unwrap();
     fs.set_attr(
         "/a/file",
-        SetAttrOptsBuilder::new().ufs_mtime(1).ttl_action(TtlAction::Free).build(),
+        SetAttrOptsBuilder::new()
+            .ufs_mtime(1)
+            .ttl_action(TtlAction::Free)
+            .build(),
     )
     .unwrap();
     let runtime = FaultRuntime::process();
@@ -351,7 +354,10 @@ fn free_replans_after_parent_replacement() {
             .unwrap();
         fs.set_attr(
             "/a/file",
-            SetAttrOptsBuilder::new().ufs_mtime(1).ttl_action(TtlAction::Free).build(),
+            SetAttrOptsBuilder::new()
+                .ufs_mtime(1)
+                .ttl_action(TtlAction::Free)
+                .build(),
         )
         .unwrap();
         Some(replacement)
@@ -420,10 +426,18 @@ fn add_block_by_id_survives_parent_replacement() {
     let replacement = replacement.unwrap();
     assert_ne!(old.id, replacement.id);
     assert_eq!(result.unwrap().block.id, old_block);
-    assert!(fs.get_block_locations("/a/file").unwrap().block_locs.is_empty());
+    assert!(fs
+        .get_block_locations("/a/file")
+        .unwrap()
+        .block_locs
+        .is_empty());
     fs.restore_from_rocksdb().unwrap();
     assert_eq!(fs.file_status("/other/old").unwrap().id, old.id);
-    assert!(fs.get_block_locations("/a/file").unwrap().block_locs.is_empty());
+    assert!(fs
+        .get_block_locations("/a/file")
+        .unwrap()
+        .block_locs
+        .is_empty());
 }
 
 #[test]
@@ -2109,9 +2123,8 @@ fn resize_replans_after_parent_replacement() {
     runtime.configure(rule_id, rule).unwrap();
     let held = fs.inode_locks.write_inode(old.id);
     let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || {
-        worker_fs.resize("/a/file", FileAllocOpts::with_truncate(128))
-    });
+    let worker =
+        std::thread::spawn(move || worker_fs.resize("/a/file", FileAllocOpts::with_truncate(128)));
     let deadline = Instant::now() + Duration::from_secs(5);
     while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
         std::thread::yield_now();
@@ -2355,7 +2368,8 @@ fn atime_refresh_does_not_touch_replaced_inode() {
     runtime.configure(rule_id, rule).unwrap();
     let held = fs.inode_locks.write_inode(old.id);
     let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || worker_fs.touch_atime_sharded("/a/file", old.id, epoch));
+    let worker =
+        std::thread::spawn(move || worker_fs.touch_atime_sharded("/a/file", old.id, epoch));
     let deadline = Instant::now() + Duration::from_secs(5);
     while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
         std::thread::yield_now();
@@ -2376,10 +2390,16 @@ fn atime_refresh_does_not_touch_replaced_inode() {
     assert_ne!(old.id, replacement.id);
     result.unwrap();
     let status = fs.file_status("/a/file").unwrap();
-    assert_eq!((status.id, status.atime), (replacement.id, replacement.atime));
+    assert_eq!(
+        (status.id, status.atime),
+        (replacement.id, replacement.atime)
+    );
     fs.restore_from_rocksdb().unwrap();
     let status = fs.file_status("/a/file").unwrap();
-    assert_eq!((status.id, status.atime), (replacement.id, replacement.atime));
+    assert_eq!(
+        (status.id, status.atime),
+        (replacement.id, replacement.atime)
+    );
 }
 
 #[test]
@@ -2621,7 +2641,12 @@ fn status_probe_owned() {
         count += 1;
     }
     samples.sort_unstable();
-    println!("RESULT kind=status p50={} p99={} n={}", samples[samples.len()/2],samples[samples.len()*99/100],samples.len());
+    println!(
+        "RESULT kind=status p50={} p99={} n={}",
+        samples[samples.len() / 2],
+        samples[samples.len() * 99 / 100],
+        samples.len()
+    );
     let mut samples = Vec::new();
     let start = std::time::Instant::now();
     let mut count = 0;
@@ -2635,5 +2660,10 @@ fn status_probe_owned() {
         count += 1;
     }
     samples.sort_unstable();
-    println!("RESULT kind=list p50={} p99={} n={}", samples[samples.len()/2],samples[samples.len()*99/100],samples.len());
+    println!(
+        "RESULT kind=list p50={} p99={} n={}",
+        samples[samples.len() / 2],
+        samples[samples.len() * 99 / 100],
+        samples.len()
+    );
 }

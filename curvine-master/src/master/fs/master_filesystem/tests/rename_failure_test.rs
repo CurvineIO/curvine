@@ -81,9 +81,8 @@ fn rename_replans_after_source_parent_replacement() {
     runtime.configure(rule_id, rule).unwrap();
     let held = fs.inode_locks.write_inode(old_file.id);
     let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || {
-        worker_fs.rename("/a/file", "/d/moved", RenameFlags::empty())
-    });
+    let worker =
+        std::thread::spawn(move || worker_fs.rename("/a/file", "/d/moved", RenameFlags::empty()));
     let deadline = Instant::now() + Duration::from_secs(5);
     while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
         std::thread::yield_now();

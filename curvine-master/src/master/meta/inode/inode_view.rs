@@ -431,10 +431,7 @@ impl InodeView {
         }
     }
 
-    pub(crate) fn set_directory_attributes(
-        &self,
-        attributes: curvine_model::DirectoryAttributes,
-    ) {
+    pub(crate) fn set_directory_attributes(&self, attributes: curvine_model::DirectoryAttributes) {
         if let Dir(d) = self {
             d.dir.set_directory_attributes(attributes);
         }
