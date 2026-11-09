@@ -15,6 +15,9 @@ fn existing_mkdir_waits_for_target_inode_lock() {
     let fs = test_fs("mkdir-existing-inode-lock");
     let id = fs.mkdir("/dir", false).unwrap().id;
     let held = fs.inode_locks.write_inode(id);
+    // An idle namespace guard does not mean inode locks are idle. An
+    // exclusive fast path must not bypass an already admitted inode holder.
+    assert!(fs.fs_dir.try_write().is_ok());
     let worker_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
