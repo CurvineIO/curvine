@@ -130,6 +130,8 @@ pub struct InodeStore {
     /// journal applier can persist the cursor without taking the namespace
     /// guard and without blocking a restore.
     cursor_store: Arc<RwLock<Option<Arc<RocksInodeStore>>>>,
+    /// Availability published by restore; see `store_available`.
+    available: std::sync::atomic::AtomicBool,
 }
 
 const DIRECTORY_ATTRIBUTE_MIGRATION_BATCH_SIZE: usize = 4096;
@@ -159,6 +161,18 @@ impl JournalCursorStore {
 }
 
 impl InodeStore {
+    fn set_available(&self, available: bool) {
+        self.available
+            .store(available, std::sync::atomic::Ordering::Release);
+    }
+
+    /// One-load availability check. A stale `true` is impossible: restore
+    /// clears the flag before detaching the store and republishes only after
+    /// the cursor store is valid again.
+    fn store_available(&self) -> bool {
+        self.available.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn merge_directory_attributes(
         batch: &mut InodeWriteBatch<'_>,
         parent: &InodeView,
@@ -171,6 +185,7 @@ impl InodeStore {
         let store = Arc::new(store);
         Ok(InodeStore {
             cursor_store: Arc::new(RwLock::new(Some(store.clone()))),
+            available: std::sync::atomic::AtomicBool::new(true),
             store,
             fs_stats: Arc::new(FileSystemStats::new()?),
             ttl_bucket_list,
@@ -1612,6 +1627,7 @@ impl InodeStore {
         // failure here leaves both the old store and cursor usable.
         let tmp_conf = DBConf::new(Utils::temp_file());
         let tmp_store = Arc::new(RocksInodeStore::new(tmp_conf, false)?);
+        self.set_available(false);
         *cursor = None;
         self.store = tmp_store;
         drop(cursor);
@@ -1629,6 +1645,7 @@ impl InodeStore {
 
         self.store = Arc::new(RocksInodeStore::new(conf, false)?);
         *self.cursor_store.write() = Some(self.store.clone());
+        self.set_available(true);
         Ok(())
     }
 
@@ -1640,12 +1657,13 @@ impl InodeStore {
     }
 
     pub(crate) fn invalidate_cursor_store(&self) {
+        self.set_available(false);
         *self.cursor_store.write() = None;
     }
 
     /// Call with the namespace guard held while accessing metadata.
     pub(crate) fn ensure_available(&self) -> CommonResult<()> {
-        if !self.cursor_store_available() {
+        if !self.store_available() {
             return err_box!("metadata store is unavailable after failed restore");
         }
         Ok(())
