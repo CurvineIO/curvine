@@ -100,6 +100,37 @@ fn shared_walk_resolves_depth_two_and_reports_version() {
 }
 
 #[test]
+fn shared_walk_preserves_resolved_directory_views() {
+    let (root, root_children) = root_with_children();
+    let sub = root_children.read_child_view("sub").0.unwrap();
+    sub.children_handle()
+        .unwrap()
+        .add_child(InodeView::new_dir("nested".into(), InodeDir::new(1006, 1)))
+        .unwrap();
+    let store = test_store("shared-directory-views");
+
+    for (path, ids) in [
+        ("/", &[1000][..]),
+        ("/missing/leaf", &[1000][..]),
+        ("/sub/missing", &[1000, 1001][..]),
+        ("/sub/nested/missing", &[1000, 1001, 1006][..]),
+        ("/sub/nested", &[1000, 1001, 1006][..]),
+    ] {
+        let inp = InodePath::resolve_shared(&root, path, &store).unwrap();
+        assert!(inp.walk_is_current(), "{path}");
+        assert_eq!(inp.inodes.len(), ids.len(), "{path}");
+        for (inode, id) in inp.inodes.iter().zip(ids) {
+            assert_eq!(inode.id(), *id, "{path}");
+            assert!(
+                inode.as_ref().is_dir(),
+                "{path}: inode {id} is not a directory"
+            );
+            assert!(inode.as_ref().children_handle().is_some(), "{path}");
+        }
+    }
+}
+
+#[test]
 fn shared_walk_detects_concurrent_mutation() {
     Master::init_test_metrics();
     let (root, handle) = root_with_children();
