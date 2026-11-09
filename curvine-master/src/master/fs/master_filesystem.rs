@@ -476,14 +476,37 @@ impl MasterFilesystem {
                 return self.create_with_global_lock(path, opts, flags);
             }
             if full {
-                if flags.overwrite() && !flags.exclusive() {
-                    if let Some(result) = self.overwrite_file_sharded(
-                        path,
-                        opts.clone(),
-                        Some((ids, components_len, full, restore_epoch, None)),
-                    )? {
-                        return Ok((result.0, Some(result.1)));
+                {
+                    let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
+                        .iter()
+                        .enumerate()
+                        .map(|(depth, id)| InodeLockRequest::read(depth, *id))
+                        .collect();
+                    let _locks = self.inode_locks.lock_many(&requests);
+                    let fs_dir = self.fs_dir.read();
+                    if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
+                        continue;
                     }
+                    let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)?
+                    else {
+                        continue;
+                    };
+                    let Some(inode) = inp.get_last_inode() else {
+                        continue;
+                    };
+                    if inode.is_dir() {
+                        return err_box!("{}  already exists as a dir", inp.path());
+                    }
+                    if flags.exclusive() || !flags.overwrite() {
+                        return err_ext!(FsError::file_exists(inp.path()));
+                    }
+                }
+                if let Some(result) = self.overwrite_file_sharded(
+                    path,
+                    opts.clone(),
+                    Some((ids, components_len, full, restore_epoch, None)),
+                )? {
+                    return Ok((result.0, Some(result.1)));
                 }
                 return self.create_with_global_lock(path, opts, flags);
             }

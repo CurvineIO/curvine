@@ -828,6 +828,56 @@ fn create_and_open_preserve_path_and_flag_validation() {
 }
 
 #[test]
+fn existing_create_errors_match_global_path_without_namespace_write_lock() {
+    let fs = test_fs("create-existing-errors-shared-reader");
+    fs.create("/parent/file", true).unwrap();
+    let cases = [
+        ("/parent/file", OpenFlags::new_create().set_exclusive(true)),
+        ("/parent/file", OpenFlags::new_create().set_overwrite(false)),
+        ("/parent", OpenFlags::new_create().set_overwrite(true)),
+    ];
+    let held = fs.fs_dir.read();
+    let worker_fs = fs.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let errors: Vec<_> = cases
+            .iter()
+            .map(|(path, flags)| {
+                worker_fs
+                    .create_with_opts(path, CreateFileOpts::with_create(false), *flags)
+                    .unwrap_err()
+            })
+            .collect();
+        tx.send(errors).unwrap();
+    });
+    let early = rx.recv_timeout(std::time::Duration::from_secs(5));
+    drop(held);
+    worker.join().unwrap();
+    let errors = early.expect("existing creates must not require namespace write lock");
+    assert!(matches!(errors[0], FsError::FileAlreadyExists(_)));
+    assert!(matches!(errors[1], FsError::FileAlreadyExists(_)));
+    assert!(matches!(errors[2], FsError::Common(_)));
+    assert!(errors[0]
+        .to_string()
+        .contains("/parent/file  already exists"));
+    assert!(errors[1]
+        .to_string()
+        .contains("/parent/file  already exists"));
+    assert!(errors[2]
+        .to_string()
+        .contains("/parent  already exists as a dir"));
+    for ((path, flags), error) in cases.iter().zip(errors) {
+        let expected = fs
+            .create_with_global_lock(path, CreateFileOpts::with_create(false), *flags)
+            .unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&expected)
+        );
+    }
+}
+
+#[test]
 fn rename_does_not_wait_for_shared_namespace_readers() {
     let fs = test_fs("rename-shared-reader");
     fs.create("/source", true).unwrap();
