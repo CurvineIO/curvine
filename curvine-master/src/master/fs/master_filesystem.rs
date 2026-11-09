@@ -32,7 +32,7 @@ use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_config::{ClusterConf, MasterConf};
-use curvine_core_error::{err_box, err_ext, try_option, CommonError, CommonResult};
+use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
 use curvine_error::ErrorKind;
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -2551,16 +2551,8 @@ impl MasterFilesystem {
         let child_len = match attributes.and_then(|attributes| attributes.children()) {
             Some(children) if children >= 0 => children,
             Some(_) => return err_box!("directory {} has an invalid child count", inode.id()),
-            None => {
-                let mut children = 0_i32;
-                for entry in snapshot.scan_children(inode.id())? {
-                    entry.map_err(|error| FsError::from(Box::new(error) as CommonError))?;
-                    children = children
-                        .checked_add(1)
-                        .ok_or_else(|| FsError::common("directory has too many children"))?;
-                }
-                children
-            }
+            None => i32::try_from(snapshot.count_children(inode.id())?)
+                .map_err(|_| FsError::common("directory has too many children"))?,
         };
         let mut status = inode.to_file_status(path)?;
         if let Some(attributes) = attributes {

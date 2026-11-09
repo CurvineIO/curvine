@@ -253,6 +253,11 @@ fn test_rocksdb_snapshot_bulk_scan_consistent_across_cfs() -> CommonResult<()> {
         RocksUtils::i64_to_bytes(2),
     )?;
 
+    db.put_cf(
+        "edges",
+        RocksUtils::i64_str_to_bytes(2, "other"),
+        RocksUtils::i64_to_bytes(4),
+    )?;
     let snapshot = db.read_snapshot();
 
     // Write new records after the snapshot was created.
@@ -278,8 +283,10 @@ fn test_rocksdb_snapshot_bulk_scan_consistent_across_cfs() -> CommonResult<()> {
         let (parent, name) = RocksUtils::i64_str_from_bytes(&kv.0)?;
         edge_keys.push((parent, name));
     }
-    assert_eq!(edge_keys.len(), 1);
-    assert_eq!(edge_keys[0], (1, "child".to_string()));
+    assert_eq!(
+        edge_keys,
+        vec![(1, "child".to_string()), (2, "other".to_string())]
+    );
 
     // Point reads inside the snapshot also see the old generation.
     assert!(snapshot
@@ -297,10 +304,44 @@ fn test_rocksdb_snapshot_bulk_scan_consistent_across_cfs() -> CommonResult<()> {
         prefix_count += 1;
     }
     assert_eq!(prefix_count, 1);
+    assert_eq!(
+        snapshot.count_prefix("edges", RocksUtils::i64_to_bytes(1))?,
+        1
+    );
+    assert_eq!(
+        snapshot.count_prefix("edges", RocksUtils::i64_to_bytes(2))?,
+        1
+    );
+    assert_eq!(
+        snapshot.count_prefix("edges", RocksUtils::i64_to_bytes(3))?,
+        0
+    );
+    assert!(snapshot
+        .count_prefix("missing", RocksUtils::i64_to_bytes(1))
+        .is_err());
+    assert_eq!(
+        db.read_snapshot()
+            .count_prefix("edges", RocksUtils::i64_to_bytes(1))?,
+        2
+    );
 
     // Ordinary (non-snapshot) iterators see the new writes.
     let live_inode_count = db.scan("inodes")?.count();
     assert_eq!(live_inode_count, 2);
 
+    Ok(())
+}
+
+#[test]
+fn snapshot_count_prefix_handles_unbounded_end() -> CommonResult<()> {
+    let path = Utils::test_sub_dir(format!("snapshot-count-{}", Utils::rand_str(6)));
+    let db = DBEngine::new(DBConf::new(path).add_cf("keys"), true)?;
+    for key in [&b"a"[..], &b"\xff"[..], &b"\xff\x00"[..]] {
+        db.put_cf("keys", key, b"value")?;
+    }
+    let snapshot = db.read_snapshot();
+    assert_eq!(snapshot.count_prefix("keys", b"")?, 3);
+    assert_eq!(snapshot.count_prefix("keys", b"\xff")?, 2);
+    assert_eq!(snapshot.count_prefix("keys", b"\xff\xff")?, 0);
     Ok(())
 }

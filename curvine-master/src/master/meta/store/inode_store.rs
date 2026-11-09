@@ -1782,7 +1782,10 @@ impl<'a> InodeStoreSnapshot<'a> {
             return Ok(None);
         };
         let Some(mut inode) = self.get_inode(id)? else {
-            return err_box!("Failed to load inode {}: directory edge references missing inode", id);
+            return err_box!(
+                "Failed to load inode {}: directory edge references missing inode",
+                id
+            );
         };
         inode.change_name(name.to_owned());
         Ok(Some(inode))
@@ -1791,6 +1794,14 @@ impl<'a> InodeStoreSnapshot<'a> {
     /// Scan the child edges of one parent directory within the snapshot.
     pub fn scan_children(&self, parent_id: i64) -> CommonResult<RocksIterator<'_>> {
         self.snapshot.prefix_scan(
+            RocksInodeStore::CF_EDGES,
+            RocksUtils::i64_to_bytes(parent_id),
+        )
+    }
+
+    /// Count child edges in the same snapshot without materializing entries.
+    pub fn count_children(&self, parent_id: i64) -> CommonResult<usize> {
+        self.snapshot.count_prefix(
             RocksInodeStore::CF_EDGES,
             RocksUtils::i64_to_bytes(parent_id),
         )

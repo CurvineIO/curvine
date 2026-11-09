@@ -634,6 +634,28 @@ impl<'a> DbReadSnapshot<'a> {
         self.prefix_scan_from(cf, key.as_ref(), key.as_ref())
     }
 
+    /// Count keys under a prefix without allocating key/value buffers per entry.
+    pub fn count_prefix<K: AsRef<[u8]>>(&self, cf: &str, key: K) -> CommonResult<usize> {
+        let prefix = key.as_ref();
+        let mut opt = self.conf.create_read_opt();
+        opt.set_prefix_same_as_start(true);
+        opt.set_iterate_lower_bound(prefix);
+        let end = RocksUtils::calculate_end_bytes(prefix);
+        if !end.is_empty() {
+            opt.set_iterate_upper_bound(end);
+        }
+        opt.set_snapshot(&self.snapshot);
+        let mut iter = self.snapshot.raw_iterator_cf_opt(self.cf(cf)?, opt);
+        iter.seek(prefix);
+        let mut count = 0_usize;
+        while iter.valid() {
+            count += 1;
+            iter.next();
+        }
+        iter.status()?;
+        Ok(count)
+    }
+
     /// Prefix scan starting at a key within the prefix, using the same snapshot.
     pub fn prefix_scan_from(
         &self,
