@@ -23,3 +23,15 @@ fn keys_share_stripe_only_through_hash() {
     assert!(pool.index(1) < pool.stripe_count());
     assert!(pool.index(u64::MAX) < pool.stripe_count());
 }
+
+#[test]
+fn stripe_distribution_and_rounding() {
+    let single = ObjectLockPool::new(1);
+    assert!([0, 1, u64::MAX].iter().all(|&key| single.index(key) == 0));
+    assert_eq!(ObjectLockPool::new(6).stripe_count(), 8);
+    let pool = ObjectLockPool::new(4096);
+    let distinct = (0..4095)
+        .filter(|&key| pool.index(key) != pool.index(key + 1))
+        .count();
+    assert!(distinct * 100 >= 4095 * 99);
+}

@@ -26,19 +26,26 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 /// ascending order (see `InodeLockManager::lock_many`).
 pub(crate) struct ObjectLockPool {
     stripes: Box<[RwLock<()>]>,
+    shift: u32,
 }
 
 impl ObjectLockPool {
     pub(crate) fn new(shard_count: usize) -> Self {
+        let count = shard_count.max(1).next_power_of_two();
         Self {
-            stripes: (0..shard_count.max(1)).map(|_| RwLock::new(())).collect(),
+            stripes: (0..count).map(|_| RwLock::new(())).collect(),
+            shift: 64 - count.trailing_zeros(),
         }
     }
 
     /// Map a key to a fixed stripe.
     #[inline]
     pub(crate) fn index(&self, key: u64) -> usize {
-        (((key as u128 * 0x9E37_79B9_7F4A_7C15) >> 64) as usize) % self.stripes.len()
+        if self.shift == 64 {
+            0
+        } else {
+            (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
+        }
     }
 
     /// Acquire an already-computed stripe index. Callers that group keys by

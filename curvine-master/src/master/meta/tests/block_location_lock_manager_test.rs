@@ -17,16 +17,25 @@ use super::*;
 #[test]
 fn read_and_write_sets_acquire_one_guard_per_stripe() {
     let manager = BlockLocationLockManager::new(64, 8);
-    // ids 2 and 3 share stripe 1, 1 sits on stripe 0: four ids with one
-    // duplicate cover two stripes.
-    let set = manager.read_blocks(&[1, 2, 3, 1]);
-    assert_eq!(set.guards.len(), 2);
+    let ids = [1, 2, 3, 1];
+    let stripes = ids
+        .iter()
+        .map(|&id| manager.block_locks.index(id as u64))
+        .collect::<std::collections::HashSet<_>>();
+    let set = manager.read_blocks(&ids);
+    assert_eq!(set.guards.len(), stripes.len());
     drop(set);
 
     let set = manager.write_workers_blocks(&[7, 9], &[4, 4, 5]);
-    // workers 7,9 occupy distinct stripes of the 8-stripe pool; blocks
-    // 4 and 5 occupy distinct stripes: two + two guards.
-    assert_eq!(set.guards.len(), 4);
+    let workers = [7, 9]
+        .iter()
+        .map(|&id| manager.worker_locks.index(id))
+        .collect::<std::collections::HashSet<_>>();
+    let blocks = [4, 4, 5]
+        .iter()
+        .map(|&id| manager.block_locks.index(id))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(set.guards.len(), workers.len() + blocks.len());
 }
 
 #[test]

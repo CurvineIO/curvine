@@ -88,6 +88,24 @@ fn same_stripe_writers_serialise() {
 }
 
 #[test]
+fn different_stripes_do_not_block() {
+    let pool = super::super::object_lock_pool::ObjectLockPool::new(8);
+    let other_id = (1..64).find(|&id| pool.index(id) != pool.index(0)).unwrap() as i64;
+    let manager = Arc::new(InodeLockManager::new(8));
+    let held = manager.write_inode(0);
+    let other = manager.clone();
+    let (tx, rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let _guard = other.write_inode(other_id);
+        tx.send(()).unwrap();
+    });
+    let acquired = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    drop(held);
+    waiter.join().unwrap();
+    assert!(acquired, "different stripes must not block each other");
+}
+
+#[test]
 fn same_stripe_write_blocks_read() {
     let manager = Arc::new(InodeLockManager::new(1));
     let held = manager.write_inode(0);
@@ -130,6 +148,16 @@ fn same_stripe_lock_many_takes_one_guard_and_does_not_deadlock() {
 
 #[test]
 fn opposite_stripe_orders_do_not_deadlock() {
+    let pool = super::super::object_lock_pool::ObjectLockPool::new(8);
+    let (a, b) = (0..64)
+        .find_map(|a| {
+            (a + 1..64)
+                .find(|&b| pool.index(a) == pool.index(b))
+                .map(|b| (a, b))
+        })
+        .unwrap();
+    let c = (0..64).find(|&c| pool.index(c) != pool.index(a)).unwrap();
+    let (a, b, c) = (a as i64, b as i64, c as i64);
     let locks = Arc::new(InodeLockManager::new(8));
     let start = Arc::new(Barrier::new(3));
     let active = Arc::new(AtomicUsize::new(0));
@@ -143,18 +171,17 @@ fn opposite_stripe_orders_do_not_deadlock() {
         workers.push(thread::spawn(move || {
             start.wait();
             for _ in 0..1_000 {
-                // IDs 0 and 1 share a stripe; 2 uses a different stripe.
                 let requests = if reverse {
                     [
-                        InodeLockRequest::write(0, 2),
-                        InodeLockRequest::write(1, 0),
-                        InodeLockRequest::write(2, 1),
+                        InodeLockRequest::write(0, c),
+                        InodeLockRequest::write(1, a),
+                        InodeLockRequest::write(2, b),
                     ]
                 } else {
                     [
-                        InodeLockRequest::write(0, 1),
-                        InodeLockRequest::write(1, 0),
-                        InodeLockRequest::write(2, 2),
+                        InodeLockRequest::write(0, b),
+                        InodeLockRequest::write(1, a),
+                        InodeLockRequest::write(2, c),
                     ]
                 };
                 let _guard = locks.lock_many(&requests);
