@@ -458,6 +458,7 @@ fn directory_publication_failure_fences_subsequent_writes() {
         assert!(resolved.is_full(), "the store batch committed the child");
     }
     assert!(fs.journal_writer.ensure_metadata_current().is_err());
+    assert!(!fs.exists("/parent/child").unwrap());
     assert!(fs.mkdir("/another", false).is_err());
 }
 

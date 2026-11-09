@@ -2634,15 +2634,14 @@ impl MasterFilesystem {
             snapshot.resolve_path(path).map(|resolved| resolved.is_full())
         };
         match result {
-            Ok(true) => Ok(true),
-            Ok(false) if self.journal_writer.ensure_metadata_current().is_ok() => Ok(false),
-            Ok(false) | Err(_) => {
-                // Recheck after writers drain: a committed deletion can still
-                // have an unpublished live edge, including after a failure.
+            Ok(exists) if self.journal_writer.ensure_metadata_current().is_ok() => Ok(exists),
+            Ok(_) | Err(_) => {
+                // After publication failure, the committed store and live tree
+                // may disagree in either direction. Wait for writers to drain.
                 let fs_dir = self.fs_dir.write();
                 let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
                 if snapshot.resolve_path(path)?.is_full() {
-                    return Ok(true);
+                    return Ok(Self::resolve_path(&fs_dir, path)?.is_full());
                 }
                 match Self::resolve_path(&fs_dir, path) {
                     Ok(inp) if inp.is_full() => {
