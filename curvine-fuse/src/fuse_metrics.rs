@@ -1095,8 +1095,10 @@ impl Drop for ReadWaitTimer {
     }
 }
 
-/// Owned by a Read task, so abandoning a channel cannot leak its backlog gauge.
-/// Dropped/failed-to-publish tasks do not emit a successful queue latency sample.
+/// Owned by a Read task; its backlog gauge is released when dequeued or destroyed.
+/// A permit can publish after receiver destruction. With the pinned Tokio version,
+/// such a task can remain retained until the last sender drops, keeping depth > 0.
+/// Destroyed tasks do not emit a successful queue latency sample.
 pub(crate) struct ReadQueueGuard {
     timer: ReadWaitTimer,
     _depth: ActiveGuard,
@@ -1123,7 +1125,9 @@ impl ReadQueueGuard {
 #[cfg(test)]
 mod read_wait_tests {
     use super::*;
+    use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn timer(stage: &'static str) -> ReadWaitTimer {
@@ -1200,6 +1204,87 @@ mod read_wait_tests {
         drop(queue);
         assert_eq!(depth.get(), 0);
         assert_eq!(hist.get_sample_count(), 1);
+    }
+
+    fn isolated_queue_guard(name: &str) -> (ReadQueueGuard, Gauge, HistogramVec) {
+        let mut timer = timer(IO_WAIT_QUEUE);
+        timer.outcome = None;
+        let metric = timer.metric.clone();
+        let depth = m::new_gauge(name, "test").unwrap();
+        let queue = ReadQueueGuard {
+            timer,
+            _depth: ActiveGuard::new(depth.clone()),
+        };
+        (queue, depth, metric)
+    }
+
+    #[tokio::test]
+    async fn read_queue_reserved_send_after_receiver_close_can_be_drained() {
+        // Exercise the same channel/guard ownership as ReadTask, with a weak
+        // payload probe so task destruction is observable independently of depth.
+        let (tx, mut rx) = AsyncChannel::new(1).split();
+        let permit = tx.reserve().await.unwrap();
+        match &mut rx {
+            AsyncReceiver::Bounded(receiver) => receiver.close(),
+            AsyncReceiver::Unbounded(_) => unreachable!("bounded test channel"),
+        }
+        assert!(tx.reserve().await.is_err());
+
+        let (queue, depth, metric) = isolated_queue_guard("read_queue_after_close_test");
+        let payload = Arc::new(());
+        let lifetime = Arc::downgrade(&payload);
+        permit.send((payload, queue));
+        assert_eq!(depth.get(), 1);
+        assert!(lifetime.upgrade().is_some());
+
+        let (payload, queue) = rx.recv().await.expect("reserved task survives close");
+        queue.dequeued();
+        drop(payload);
+        assert_eq!(depth.get(), 0);
+        assert!(lifetime.upgrade().is_none());
+        assert_eq!(
+            metric
+                .with_label_values(&[IO_TYPE_READ, IO_WAIT_QUEUE, "success"])
+                .get_sample_count(),
+            1
+        );
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_queue_reserved_send_after_receiver_drop_retains_guard_until_last_sender() {
+        let (tx, rx) = AsyncChannel::new(1).split();
+        let last_sender = tx.clone();
+        let permit = tx.reserve().await.unwrap();
+        drop(rx);
+        assert!(tx.reserve().await.is_err());
+
+        let (queue, depth, metric) = isolated_queue_guard("read_queue_after_drop_test");
+        let payload = Arc::new(());
+        let lifetime = Arc::downgrade(&payload);
+        // Permit::send returns (), even though no receiver remains. In the
+        // pinned Tokio version this publication happens after receiver cleanup;
+        // the task and guard survive until channel destruction. This documents
+        // the lifecycle limitation; it does not provide worker-failure recovery.
+        permit.send((payload, queue));
+        assert_eq!(depth.get(), 1);
+        assert!(lifetime.upgrade().is_some());
+        drop(tx);
+        assert_eq!(depth.get(), 1);
+        assert!(lifetime.upgrade().is_some());
+
+        drop(last_sender);
+        assert_eq!(depth.get(), 0);
+        assert!(lifetime.upgrade().is_none());
+        for outcome in ["success", "error", "cancelled"] {
+            assert_eq!(
+                metric
+                    .with_label_values(&[IO_TYPE_READ, IO_WAIT_QUEUE, outcome])
+                    .get_sample_count(),
+                0,
+                "an abandoned task must not emit a queue duration sample"
+            );
+        }
     }
 
     #[test]
