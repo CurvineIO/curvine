@@ -177,6 +177,33 @@ async fn open_private_writer(path: &str, exclusive: bool) -> std::io::Result<tok
     Ok(file)
 }
 
+/// Removes a staging temporary file unless its upload published it.
+///
+/// A part is written to `.tmp-<uuid>` and published by one rename. Without this,
+/// every failed attempt would leave its own temporary file in the session
+/// directory until Complete or Abort, and forever once the client abandons the
+/// upload.
+struct TmpFile(Option<String>);
+
+impl TmpFile {
+    fn new(path: String) -> Self {
+        Self(Some(path))
+    }
+
+    /// The temporary path was published (or is otherwise gone): stop cleaning.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TmpFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Compare the MD5 recomputed while reading a part with the ETag the client
 /// listed in `CompleteMultipartUpload`.
 ///
@@ -297,6 +324,7 @@ impl LocalTempStorage {
         // final part file is always one coherent generation: bytes and record
         // can never come from different concurrent uploads of the same part.
         let tmp_path = format!("{}.tmp-{}", path, uuid::Uuid::new_v4());
+        let mut tmp = TmpFile::new(tmp_path.clone());
         let mut file = open_private_writer(&tmp_path, false)
             .await
             .map_err(|e| format!("Failed to create part file {}: {}", tmp_path, e))?;
@@ -317,8 +345,7 @@ impl LocalTempStorage {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(e) => {
-                    drop(file);
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    // `tmp` removes the partial part on the way out.
                     return Err(format!("Failed to read from body: {}", e));
                 }
             };
@@ -347,11 +374,7 @@ impl LocalTempStorage {
                 .map_err(|e| format!("Failed to write to part file: {}", e))?;
         }
 
-        if let Err(mismatch) = expect.check(staged, &hex::encode(sha256.finalize())) {
-            drop(file);
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(mismatch);
-        }
+        expect.check(staged, &hex::encode(sha256.finalize()))?;
 
         // The record rides in the part file itself: one rename publishes bytes
         // and record together, so `Complete` can never see a torn generation.
@@ -373,6 +396,7 @@ impl LocalTempStorage {
         tokio::fs::rename(&tmp_path, &path)
             .await
             .map_err(|e| format!("Failed to publish part {}: {}", path, e))?;
+        tmp.disarm();
 
         Ok(format!("\"{etag}\""))
     }
@@ -613,87 +637,90 @@ impl CurvineTempStorage {
             .await
             .map_err(|e| format!("Failed to create part file in Curvine: {}", e))?;
 
-        let mut hasher = md5::Context::new();
-        let mut sha256 = sha2::Sha256::new();
-        let buffer_size = self.config.buffer_size();
-        let threshold = self.config.memory_buffer_threshold;
-        let mut memory_buf = BytesMut::with_capacity(threshold.min(buffer_size));
-        let mut staged: usize = 0;
+        // One attempt up to the record: any failure drops the temporary part
+        // instead of leaving it in the session directory.
+        let staged = async {
+            let mut hasher = md5::Context::new();
+            let mut sha256 = sha2::Sha256::new();
+            let buffer_size = self.config.buffer_size();
+            let threshold = self.config.memory_buffer_threshold;
+            let mut memory_buf = BytesMut::with_capacity(threshold.min(buffer_size));
+            let mut staged: usize = 0;
 
-        loop {
-            // Same contract as the local backend: a read error removes the
-            // staged part, so `CompleteMultipartUpload` cannot assemble a
-            // truncated object from it.
-            let chunk = match body.poll_read().await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break,
-                Err(e) => {
-                    let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
-                    return Err(format!("Failed to read from body: {}", e));
-                }
-            };
-            staged += chunk.len();
-            sha256.update(&chunk);
-            hasher.consume(&chunk);
+            loop {
+                // Same contract as the local backend: a read error removes the
+                // staged part, so `CompleteMultipartUpload` cannot assemble a
+                // truncated object from it.
+                let chunk = match body.poll_read().await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(e) => return Err(format!("Failed to read from body: {}", e)),
+                };
+                staged += chunk.len();
+                sha256.update(&chunk);
+                hasher.consume(&chunk);
 
-            if memory_buf.len() + chunk.len() <= threshold {
-                memory_buf.extend_from_slice(&chunk);
-            } else {
-                if !memory_buf.is_empty() {
+                if memory_buf.len() + chunk.len() <= threshold {
+                    memory_buf.extend_from_slice(&chunk);
+                } else {
+                    if !memory_buf.is_empty() {
+                        writer
+                            .write(&memory_buf)
+                            .await
+                            .map_err(|e| format!("Failed to write part data to Curvine: {}", e))?;
+                        memory_buf.clear();
+                    }
                     writer
-                        .write(&memory_buf)
+                        .write(&chunk)
                         .await
                         .map_err(|e| format!("Failed to write part data to Curvine: {}", e))?;
-                    memory_buf.clear();
                 }
+            }
+
+            if !memory_buf.is_empty() {
                 writer
-                    .write(&chunk)
+                    .write(&memory_buf)
                     .await
                     .map_err(|e| format!("Failed to write part data to Curvine: {}", e))?;
             }
-        }
 
-        if !memory_buf.is_empty() {
+            expect.check(staged, &hex::encode(sha256.finalize()))?;
             writer
-                .write(&memory_buf)
+                .complete()
                 .await
-                .map_err(|e| format!("Failed to write part data to Curvine: {}", e))?;
-        }
+                .map_err(|e| format!("Failed to complete part write in Curvine: {}", e))?;
 
-        if let Err(mismatch) = expect.check(staged, &hex::encode(sha256.finalize())) {
-            let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
-            return Err(mismatch);
+            // The record rides on the part inode and the rename below is the
+            // only publish point, so bytes and record always come from the same
+            // upload generation. It is also what keeps preflight to one
+            // `get_status` per part instead of an extra open and read.
+            let digest = hasher.compute();
+            let etag = format!("{:x}", digest);
+            let record = PartMeta {
+                etag: etag.clone(),
+                size: staged,
+            }
+            .encode_xattr();
+            self.fs
+                .set_attr(
+                    &tmp_path,
+                    curvine_model::SetAttrOptsBuilder::new()
+                        .add_x_attr(XATTR_PART_META, record.into_bytes())
+                        .build(),
+                )
+                .await
+                .map_err(|e| format!("Failed to record part metadata in Curvine: {}", e))?;
+            Ok(etag)
         }
+        .await;
 
-        writer
-            .complete()
-            .await
-            .map_err(|e| format!("Failed to complete part write in Curvine: {}", e))?;
-
-        // The record rides on the part inode and the rename below is the only
-        // publish point, so bytes and record always come from the same upload
-        // generation. It is also what keeps preflight to one `get_status` per
-        // part instead of an extra open and read.
-        let digest = hasher.compute();
-        let etag = format!("{:x}", digest);
-        let record = PartMeta {
-            etag: etag.clone(),
-            size: staged,
-        }
-        .encode_xattr();
-        if let Err(e) = self
-            .fs
-            .set_attr(
-                &tmp_path,
-                curvine_model::SetAttrOptsBuilder::new()
-                    .add_x_attr(XATTR_PART_META, record.into_bytes())
-                    .build(),
-            )
-            .await
-        {
-            let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
-            return Err(format!("Failed to record part metadata in Curvine: {}", e));
-        }
+        let etag = match staged {
+            Ok(etag) => etag,
+            Err(e) => {
+                let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
+                return Err(e);
+            }
+        };
 
         if let Err(e) = self.fs.rename(&tmp_path, &path).await {
             let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
@@ -1381,6 +1408,75 @@ mod tests {
 
         storage.cleanup("upload-meta").await.unwrap();
         let _ = std::fs::remove_dir_all(&temp_path);
+    }
+
+    /// A part is staged under `.tmp-<uuid>` and published by one rename. A
+    /// failed attempt must take its temporary file with it: otherwise every
+    /// retry adds one more file to the session directory until Complete, and
+    /// they stay forever if the client abandons the upload.
+    #[tokio::test]
+    async fn a_failed_part_write_leaves_no_temporary_file() {
+        use std::env;
+        use std::io::Cursor;
+
+        let temp_path = env::temp_dir()
+            .join(format!("curvine-test-{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let storage = LocalTempStorage::new(TempStorageConfig::new(temp_path.clone(), 1024, 4096));
+        storage.create_dir("upload-tmp").await.unwrap();
+
+        // A length mismatch fails after the bytes were written to the temporary
+        // part, which is exactly the path that used to leak it.
+        let mut body = tokio::io::BufReader::new(Cursor::new(vec![4u8; 512]));
+        let err = storage
+            .write_part_stream(
+                "upload-tmp",
+                1,
+                &mut body,
+                StageExpect {
+                    sha256_hex: None,
+                    content_length: Some(4096),
+                },
+            )
+            .await
+            .expect_err("a short body must be rejected");
+        assert!(err.contains("length"), "{err}");
+
+        let mut entries = tokio::fs::read_dir(storage.dir_path("upload-tmp"))
+            .await
+            .unwrap();
+        let mut left = Vec::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            left.push(entry.file_name().to_string_lossy().to_string());
+        }
+        assert!(left.is_empty(), "a failed attempt left {left:?}");
+
+        storage.cleanup("upload-tmp").await.unwrap();
+        let _ = std::fs::remove_dir_all(&temp_path);
+    }
+
+    /// The Curvine backend stores its record in an inode xattr, not as a file
+    /// trailer, so this is the codec preflight depends on in the mode where
+    /// `enable_s3_gateway = true`. Only a well-formed record may decode: a
+    /// garbage value must mean "part not staged", never a bogus length.
+    #[test]
+    fn xattr_record_round_trips_and_rejects_garbage() {
+        let meta = PartMeta {
+            etag: "0123456789abcdef0123456789abcdef".to_string(),
+            size: 5 << 20,
+        };
+        assert_eq!(PartMeta::decode_xattr(&meta.encode_xattr()), Some(meta));
+
+        for garbage in [
+            "",
+            "no-separator",
+            "etag:not-a-number",
+            "etag:99999999999999999999999999",
+        ] {
+            assert_eq!(PartMeta::decode_xattr(garbage), None, "{garbage:?}");
+        }
     }
 
     /// A rejected Complete must not destroy staged parts: the client fixes the
