@@ -440,11 +440,11 @@ impl MasterFilesystem {
         result
     }
 
-    // Plan from store edges rather than reading live inode fields before
-    // taking their locks. The IDs are only a plan and are revalidated against
-    // the live tree under the locks, so no RocksDB snapshot (which takes the DB
-    // mutex) or inode decode is needed. Files have no edges, so the walk stops
-    // at a file component.
+    // Plan from live child edges rather than reading store rows before taking
+    // the inode locks. The IDs are only a plan and are revalidated against the
+    // live tree under the locks, so no RocksDB snapshot (which takes the DB
+    // mutex) or inode decode is needed here. Files have no edges, so the walk
+    // stops at a file component.
     fn resolve_edge_ids(&self, path: &str) -> FsResult<(Vec<i64>, usize, bool, u64)> {
         let components = InodeView::path_components(path)?;
         if components.last().is_none_or(String::is_empty) {
@@ -454,14 +454,26 @@ impl MasterFilesystem {
         let fs_dir = self.fs_dir.read();
         let epoch = Self::checked_live_epoch(&fs_dir)?;
         fs_dir.store.ensure_available()?;
-        let store = &fs_dir.store.store;
+        // Plan from live child edges only: the fs_dir guard excludes global
+        // restore windows (sharded writers still hold fs_dir.read and do not
+        // wait on this walk), each edge is read under DirectoryChildren's own
+        // shard lock and kept alive by its Arc, and the walk may straddle
+        // topology changes. Correctness comes from the single stripe-ordered
+        // lock acquisition afterwards plus the epoch, length and per-edge
+        // identity revalidation under those locks — not from this guard.
         let mut ids = Vec::with_capacity(components.len());
-        ids.push(ROOT_INODE_ID);
-        for name in &components[1..] {
-            match store.get_child_id(ids[ids.len() - 1], name)? {
-                Some(id) => ids.push(id),
-                None => break,
+        let mut next = Some(ChildEdge::Dir(fs_dir.root_node()));
+        for (index, _) in components.iter().enumerate() {
+            let Some(edge) = next else { break };
+            ids.push(edge.id());
+            if index + 1 == components.len() {
+                break;
             }
+            next = match edge {
+                ChildEdge::Dir(node) => node.children.get_child_edge(&components[index + 1]),
+                // Files have no edges: the walk stops at a file component.
+                ChildEdge::FileId(_) => None,
+            };
         }
         let full = ids.len() == components.len();
         Ok((ids, components.len(), full, epoch))
@@ -6415,6 +6427,8 @@ mod tests {
     mod shared_handles_test;
     #[path = "worker_recovery_test.rs"]
     mod worker_recovery_test;
+    #[path = "write_planning_test.rs"]
+    mod write_planning_test;
 
     #[test]
     fn soft_delete_moves_file_into_trash_with_origin_metadata() {
