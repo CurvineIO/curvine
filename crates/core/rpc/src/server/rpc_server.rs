@@ -192,9 +192,9 @@ where
                     }
                 });
             } else {
-                let mut handler =
-                    self.service
-                        .get_buffer_handler(self.rt.clone(), frame, &self.conf);
+                let handler = self
+                    .service
+                    .get_buffer_handler(self.rt.clone(), frame, &self.conf);
                 self.rt.spawn(async move {
                     if let Err(e) = handler.run().await {
                         error!("Connection[{} -> {}]: {}", bind_addr, client_addr, e);

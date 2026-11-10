@@ -398,7 +398,11 @@ mod tests {
         let runtime = Arc::new(AsyncRuntime::single());
         let make_reader = || {
             Arc::new(FuseReader::new(
-                &FuseConf::default(),
+                &FuseConf {
+                    // This fixture tests reader ownership, not IO or metrics.
+                    metrics_enabled: false,
+                    ..Default::default()
+                },
                 runtime.clone(),
                 UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap()),
             ))

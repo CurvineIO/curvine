@@ -282,11 +282,14 @@ pub struct FuseConf {
     #[client_cli]
     pub list_limit: usize,
 
-    /// Whether to use splice (zero-copy) for FUSE data transfer.
-    /// When enabled, the receiver uses splice(/dev/fuse → pipe → buf) and the
-    /// sender uses vmsplice + splice (pipe → /dev/fuse) for large responses.
-    /// When disabled, both use plain read/writev (extra memory copy but no
-    /// pipe management overhead). Default: true.
+    /// Use splice for FUSE request/reply transfer (opt-in, experimental).
+    /// When enabled, requests flow through a pipe (splice /dev/fuse → pipe → buf)
+    /// and replies of at least 8 KiB use vmsplice + splice (pipe → /dev/fuse).
+    /// Requires `fs.pipe-max-size` >= the FUSE buffer (~1 MiB + header) or
+    /// `CAP_SYS_RESOURCE`. Default: false. Curvine traffic is memory-backed, so
+    /// splice cannot steal pages: the receive side pays two copies and two
+    /// syscalls instead of one of each, and the send side still copies into the
+    /// pipe. Plain read/writev is cheaper for typical workloads.
     pub enable_splice: bool,
 
     pub path_lock_stripes: usize,
@@ -720,7 +723,7 @@ impl Default for FuseConf {
             meta_cache_ttl: Default::default(),
 
             list_limit: 1000,
-            enable_splice: true,
+            enable_splice: false,
 
             path_lock_stripes: 1024,
 
@@ -754,6 +757,13 @@ mod tests {
     #[test]
     fn async_delete_is_opt_in() {
         assert!(!FuseConf::default().async_delete);
+    }
+
+    #[test]
+    fn splice_is_opt_in() {
+        assert!(!FuseConf::default().enable_splice);
+        let conf: FuseConf = toml::from_str("io_threads = 16").expect("parse partial");
+        assert!(!conf.enable_splice);
     }
 
     #[test]

@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use crate::fuse_metrics::{
-    FuseMetrics, FuseReqCtx, FuseReqStatus, FuseRespMetrics, ENQUEUE_REASON_CHANNEL_CLOSED,
-    NOTIFY_ENQUEUE_FAILED, REPLY_TYPE_NO_REPLY,
+    FuseMetrics, FuseReqCtx, FuseReqStatus, FuseRespMetrics, ReadWaitStage, ReadWaitTimer,
+    ENQUEUE_REASON_CHANNEL_CLOSED, NOTIFY_ENQUEUE_FAILED, REPLY_TYPE_NO_REPLY,
 };
 use crate::raw::fuse_abi::{
     fuse_notify_inval_entry_out, fuse_notify_inval_inode_out, fuse_out_header,
 };
-use crate::session::{FuseNotifyCode, FuseTask};
+use crate::session::{FuseNotifyCode, FuseOpCode, FuseTask};
 use crate::{FuseError, FuseResult, FuseUtils};
 use crate::{FUSE_NOTIFY_UNIQUE, FUSE_OUT_HEADER_LEN, FUSE_SUCCESS};
 use bytes::BytesMut;
@@ -165,6 +165,44 @@ pub struct FuseResponse {
     pub(crate) sender: AsyncSender<FuseTask>,
     pub(crate) debug: bool,
     pub(crate) metrics: Option<Arc<Mutex<FuseRespMetrics>>>,
+    read_wait: bool,
+    wait_metrics: Option<ReadWaitStage>,
+    #[cfg(test)]
+    before_enqueue_failure: Option<Arc<dyn Fn(Option<f64>) + Send + Sync>>,
+}
+
+/// Normal replies need no extra state lock. Only an abandoned capacity wait
+/// checks the shared completion state, suppressing samples for finished replies.
+struct ReplyWait<'a> {
+    timer: Option<ReadWaitTimer>,
+    slot: &'a Mutex<FuseRespMetrics>,
+}
+
+impl ReplyWait<'_> {
+    fn finish(&mut self, success: bool) {
+        if let Some(timer) = self.timer.take() {
+            timer.finish(success);
+        }
+    }
+
+    fn discard(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            timer.discard();
+        }
+    }
+}
+
+impl Drop for ReplyWait<'_> {
+    fn drop(&mut self) {
+        if let Some(timer) = &mut self.timer {
+            // Exclude cancellation bookkeeping / lock contention from the wait.
+            // stop() preserves an already-frozen capacity acquisition boundary.
+            timer.stop();
+            if self.slot.lock().finished {
+                self.discard();
+            }
+        }
+    }
 }
 
 impl FuseResponse {
@@ -174,12 +212,23 @@ impl FuseResponse {
         debug: bool,
         ctx: Option<FuseReqCtx>,
     ) -> Self {
+        // Derive this once from the canonical opcode label, not a repeated
+        // string literal comparison under the per-response state mutex.
+        let read_wait = ctx
+            .as_ref()
+            .is_some_and(|c| c.labels.opcode == FuseOpCode::FUSE_READ.as_str());
+        let wait_metrics = (read_wait && sender.is_bounded())
+            .then(|| FuseMetrics::get().read_wait_metrics().reply_enqueue.clone());
         let metrics = ctx.map(|c| Arc::new(Mutex::new(FuseRespMetrics::new(c))));
         Self {
             unique,
             sender,
             debug,
             metrics,
+            read_wait,
+            wait_metrics,
+            #[cfg(test)]
+            before_enqueue_failure: None,
         }
     }
 
@@ -262,20 +311,53 @@ impl FuseResponse {
         // reserve is the only suspend point; if cancelled the slot stays unfinished
         // and the guard is dropped cleanly, no half-finished state.
         if self.sender.is_bounded() {
+            let mut wait = ReplyWait {
+                timer: self
+                    .wait_metrics
+                    .as_ref()
+                    .filter(|_| self.read_wait)
+                    .map(ReadWaitTimer::start),
+                slot,
+            };
             let permit = match self.sender.reserve().await {
-                Ok(p) => p,
+                Ok(p) => {
+                    if let Some(timer) = &mut wait.timer {
+                        timer.stop();
+                    }
+                    p
+                }
                 Err(e) => {
-                    // Channel closed before reserve: finish the pending slot now.
-                    self.finish_enqueue_failure(slot, status, errno, unsupported_reason);
+                    if let Some(timer) = &mut wait.timer {
+                        timer.stop();
+                    }
+                    #[cfg(test)]
+                    if let Some(observe) = &self.before_enqueue_failure {
+                        observe(
+                            wait.timer
+                                .as_ref()
+                                .and_then(ReadWaitTimer::frozen_elapsed_us),
+                        );
+                    }
+                    // Use the existing state transition to decide who records
+                    // failure; a second attempt on a finished reply emits nothing.
+                    if self.finish_enqueue_failure(slot, status, errno, unsupported_reason) {
+                        wait.finish(false);
+                    } else {
+                        wait.discard();
+                    }
                     return Err(e.into());
                 }
             };
             // Permit send is synchronous; commit and enqueue have no await gap.
             let task = match self.commit_reply_task(slot, data, status, errno, unsupported_reason) {
                 Some(task) => task,
-                None => return Ok(()), // double reply: warned/asserted in commit.
+                None => {
+                    wait.discard();
+                    return Ok(()); // double reply: warned/asserted in commit.
+                }
             };
             permit.send(task);
+            wait.finish(true);
             return Ok(());
         }
 
@@ -285,6 +367,7 @@ impl FuseResponse {
             Some(task) => task,
             None => return Ok(()),
         };
+        // Unbounded sends cannot wait for capacity; do not emit wait samples.
         let send_result = self.sender.send(task).await;
         if send_result.is_err() {
             self.record_enqueue_failure_metrics(slot, status, errno, unsupported_reason);
@@ -345,11 +428,11 @@ impl FuseResponse {
         status: FuseReqStatus,
         errno: i32,
         unsupported_reason: Option<&'static str>,
-    ) {
+    ) -> bool {
         {
             let mut m = slot.lock();
             if m.finished {
-                return;
+                return false;
             }
             m.op_status = Some(status);
             m.request_status = Some(FuseReqStatus::Error);
@@ -359,6 +442,7 @@ impl FuseResponse {
             let _ = m.active.take();
         }
         self.record_enqueue_failure_metrics(slot, status, errno, unsupported_reason);
+        true
     }
 
     fn record_enqueue_failure_metrics(
@@ -802,6 +886,165 @@ mod tests {
     fn disabled_reply(unique: u64) -> (FuseResponse, AsyncReceiver<FuseTask>) {
         let (tx, rx) = AsyncChannel::new(16).split();
         (FuseResponse::new_reply(unique, tx, false, None), rx)
+    }
+
+    fn isolated_wait_reply(
+        gauge: &Gauge,
+        opcode: &'static str,
+        capacity: usize,
+        enabled: bool,
+    ) -> (
+        FuseResponse,
+        AsyncReceiver<FuseTask>,
+        Arc<crate::fuse_metrics::ReadWaitMetrics>,
+    ) {
+        init_metrics();
+        let metrics = crate::fuse_metrics::ReadWaitMetrics::for_test();
+        let (tx, rx) = AsyncChannel::new(capacity).split();
+        let ctx = enabled.then(|| FuseReqCtx {
+            labels: FuseReqLabels::new(opcode, FuseReqKind::Stream, 64),
+            active: Some(ActiveGuard::new(gauge.clone())),
+        });
+        let mut reply = FuseResponse::new_reply(700, tx, false, ctx);
+        // Inject even for non-Read/unbounded/disabled cases: the production
+        // gating, not this fixture, must prevent observations.
+        reply.wait_metrics = Some(metrics.reply_enqueue.clone());
+        (reply, rx, metrics)
+    }
+
+    #[tokio::test]
+    async fn read_wait_reply_filters_non_read_and_tracks_error_replies() {
+        let gauge = m::new_gauge("read_wait_reply_filter_active", "test").unwrap();
+        for capacity in [0, 1] {
+            for opcode in ["Write", "Flush", "Release", "GetAttr", "Read"] {
+                for enabled in [false, true] {
+                    let (reply, mut rx, metrics) =
+                        isolated_wait_reply(&gauge, opcode, capacity, enabled);
+                    // A backend error can still have a successful capacity wait.
+                    reply
+                        .send_rep::<(), FuseError>(Err(FuseError::from("read failed")))
+                        .await
+                        .unwrap();
+                    let expected = u64::from(enabled && opcode == "Read" && capacity > 0);
+                    assert_eq!(metrics.reply_enqueue.success.get_sample_count(), expected);
+                    assert_eq!(metrics.reply_enqueue.error.get_sample_count(), 0);
+                    assert_eq!(metrics.reply_enqueue.cancelled.get_sample_count(), 0);
+                    if enabled {
+                        assert_eq!(reply.metrics_op_status(), Some(FuseReqStatus::Error));
+                    }
+                    drop(rx.recv().await.unwrap());
+                    assert_eq!(gauge.get(), 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_wait_reply_capacity_cancel_retry_and_closed_channel() {
+        let gauge = m::new_gauge("read_wait_reply_capacity_active", "test").unwrap();
+        let (reply, mut rx, metrics) = isolated_wait_reply(&gauge, "Read", 1, true);
+        reply
+            .sender
+            .send(FuseTask::Reply(ResponseData::create(0, 0, vec![]).unwrap()))
+            .await
+            .unwrap();
+        {
+            let pending = reply.send_rep::<(), FuseError>(Ok(()));
+            tokio::pin!(pending);
+            assert!(futures::poll!(&mut pending).is_pending());
+        }
+        assert_eq!(metrics.reply_enqueue.cancelled.get_sample_count(), 1);
+        assert_eq!(metrics.reply_enqueue.success.get_sample_count(), 0);
+        assert!(!reply.metrics.as_ref().unwrap().lock().finished);
+        assert_eq!(
+            gauge.get(),
+            1,
+            "cancelled reserve retains the unfinished context"
+        );
+        drop(rx.recv().await.unwrap());
+        reply.send_rep::<(), FuseError>(Ok(())).await.unwrap();
+        drop(rx.recv().await.unwrap());
+        assert_eq!(metrics.reply_enqueue.success.get_sample_count(), 1);
+        assert_eq!(metrics.reply_enqueue.error.get_sample_count(), 0);
+        assert_eq!(gauge.get(), 0);
+
+        for capacity in [0, 1] {
+            let (reply, rx, metrics) = isolated_wait_reply(&gauge, "Read", capacity, true);
+            drop(rx);
+            assert!(reply.send_rep::<(), FuseError>(Ok(())).await.is_err());
+            assert_eq!(
+                metrics.reply_enqueue.error.get_sample_count(),
+                capacity as u64
+            );
+            assert_eq!(metrics.reply_enqueue.success.get_sample_count(), 0);
+            assert_eq!(metrics.reply_enqueue.cancelled.get_sample_count(), 0);
+            assert_eq!(gauge.get(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_wait_closed_channel_freezes_before_error_bookkeeping() {
+        let gauge = m::new_gauge("read_wait_error_boundary_active", "test").unwrap();
+        let (mut reply, rx, metrics) = isolated_wait_reply(&gauge, "Read", 1, true);
+        let frozen = Arc::new(Mutex::new(None));
+        let observed = frozen.clone();
+        // Observe the real reserve-error path immediately before completion
+        // bookkeeping. No sleeps or wall-clock thresholds are needed.
+        reply.before_enqueue_failure = Some(Arc::new(move |elapsed| {
+            *observed.lock() = Some(elapsed.expect("reserve error must freeze the timer"));
+        }));
+        drop(rx);
+        assert!(reply.send_rep::<(), FuseError>(Ok(())).await.is_err());
+        let expected = frozen.lock().expect("error boundary was observed");
+        assert_eq!(metrics.reply_enqueue.error.get_sample_count(), 1);
+        assert_eq!(metrics.reply_enqueue.error.get_sample_sum(), expected);
+        assert_eq!(metrics.reply_enqueue.success.get_sample_count(), 0);
+        assert_eq!(metrics.reply_enqueue.cancelled.get_sample_count(), 0);
+        assert_eq!(gauge.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn read_wait_finished_reply_does_not_record_cancel_or_closed_channel_again() {
+        let gauge = m::new_gauge("read_wait_finished_reply_active", "test").unwrap();
+        let (reply, rx, metrics) = isolated_wait_reply(&gauge, "Read", 1, true);
+        reply.send_rep::<(), FuseError>(Ok(())).await.unwrap();
+        let duplicate = reply.clone();
+        {
+            // The previous reply fills the queue. Cancelling a duplicate must
+            // not count another wait for the already-finished request.
+            let pending = duplicate.send_rep::<(), FuseError>(Ok(()));
+            tokio::pin!(pending);
+            assert!(futures::poll!(&mut pending).is_pending());
+        }
+        assert_eq!(metrics.reply_enqueue.cancelled.get_sample_count(), 0);
+        drop(rx);
+        assert!(duplicate.send_rep::<(), FuseError>(Ok(())).await.is_err());
+        assert_eq!(metrics.reply_enqueue.error.get_sample_count(), 0);
+        assert_eq!(metrics.reply_enqueue.success.get_sample_count(), 1);
+        assert_eq!(gauge.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn read_wait_duplicate_commit_does_not_record_another_sample() {
+        use futures::FutureExt;
+        let gauge = m::new_gauge("read_wait_duplicate_commit_active", "test").unwrap();
+        let (reply, mut rx, metrics) = isolated_wait_reply(&gauge, "Read", 1, true);
+        reply.send_rep::<(), FuseError>(Ok(())).await.unwrap();
+        drop(rx.recv().await.unwrap());
+        let result = std::panic::AssertUnwindSafe(reply.send_rep::<(), FuseError>(Ok(())))
+            .catch_unwind()
+            .await;
+        // Preserve the existing debug assertion / release-mode discard behavior.
+        if cfg!(debug_assertions) {
+            assert!(result.is_err());
+        } else {
+            result.unwrap().unwrap();
+        }
+        assert!(rx.try_recv().unwrap().is_none());
+        assert_eq!(metrics.reply_enqueue.success.get_sample_count(), 1);
+        assert_eq!(metrics.reply_enqueue.error.get_sample_count(), 0);
+        assert_eq!(metrics.reply_enqueue.cancelled.get_sample_count(), 0);
+        assert_eq!(gauge.get(), 0);
     }
 
     #[tokio::test]

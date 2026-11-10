@@ -710,31 +710,16 @@ impl LoadJobRunner {
         Ok(PlannedLoadJob { tasks, total_size })
     }
 
+    /// Send cancel to every assigned worker. The caller has already marked the
+    /// job Canceled, and a repeated cancel is a no-op on a terminal job, so an
+    /// unreachable worker must not stop the remaining workers from being told.
     pub async fn cancel_job(
         &self,
         job_id: impl AsRef<str>,
         assigned_workers: FastHashSet<WorkerAddress>,
     ) -> FsResult<()> {
-        let job_id = job_id.as_ref();
-        for worker in assigned_workers.iter() {
-            let client = self.factory.get_worker_client(worker).await?;
-            let res = client.cancel_job(job_id).await;
-
-            if let Err(e) = res {
-                error!("failed to send cancel request to worker {}: {}", worker, e);
-                if let Err(update_err) = self.jobs.update_state(
-                    job_id,
-                    JobTaskState::Canceled,
-                    format!("failed to send cancel request to worker {}: {}", worker, e),
-                ) {
-                    error!(
-                        "failed to mark load job {} as canceled after worker cancel error: {}",
-                        job_id, update_err
-                    );
-                }
-            }
-        }
-
+        self.cancel_workers_best_effort(job_id.as_ref(), &assigned_workers)
+            .await;
         Ok(())
     }
 
@@ -743,7 +728,10 @@ impl LoadJobRunner {
         job_id: &str,
         assigned_workers: &FastHashSet<WorkerAddress>,
     ) {
-        for worker in assigned_workers.iter() {
+        // Dial workers concurrently: each unreachable worker can hold a full
+        // connect-retry window, and serial dialing would stack those windows
+        // past the caller's RPC timeout.
+        let cancels = assigned_workers.iter().map(|worker| async move {
             let client = match self.factory.get_worker_client(worker).await {
                 Ok(client) => client,
                 Err(err) => {
@@ -751,7 +739,7 @@ impl LoadJobRunner {
                         "failed to create cancel client for worker {}: {}",
                         worker, err
                     );
-                    continue;
+                    return;
                 }
             };
 
@@ -761,6 +749,172 @@ impl LoadJobRunner {
                     worker, err
                 );
             }
+        });
+        future::join_all(cancels).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::journal::JournalSystem;
+    use crate::Master;
+    use curvine_config::ClusterConf;
+    use curvine_core_error::{CommonErrorExt, CommonResultExt};
+    use curvine_fs_api::RpcCode;
+    use curvine_net::net::{ConnState, NetUtils};
+    use curvine_proto::{CancelJobRequest, CancelJobResponse};
+    use curvine_rpc::handler::{HandlerService, MessageHandler};
+    use curvine_rpc::message::{Builder, Message};
+    use curvine_rpc::server::{RpcServer, ServerConf};
+    use curvine_runtime::common::Utils;
+    use curvine_runtime::runtime::{RpcRuntime, Runtime};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    fn worker(id: u32, port: u16) -> WorkerAddress {
+        WorkerAddress {
+            worker_id: id,
+            hostname: "localhost".to_string(),
+            ip_addr: "127.0.0.1".to_string(),
+            rpc_port: port as u32,
+            web_port: 0,
         }
+    }
+
+    /// Worker stand-in that records the job id of every CancelJob it receives.
+    struct CancelProbe {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MessageHandler for CancelProbe {
+        type Error = CommonErrorExt;
+
+        fn handle(&self, msg: &Message) -> CommonResultExt<Message> {
+            if RpcCode::from(msg.code()) == RpcCode::CancelJob {
+                let req: CancelJobRequest = msg.parse_header()?;
+                self.seen.lock().unwrap().push(req.job_id);
+            }
+            Ok(Builder::success_with_header(msg, CancelJobResponse {}).build())
+        }
+    }
+
+    struct CancelProbeService {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl HandlerService for CancelProbeService {
+        type Item = CancelProbe;
+
+        fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
+            CancelProbe {
+                seen: self.seen.clone(),
+            }
+        }
+    }
+
+    /// Runner for cancel tests. `rpc_timeout_ms` bounds how long a worker that
+    /// accepts but never answers can hold a cancel.
+    fn test_runner(rpc_timeout_ms: u64) -> (LoadJobRunner, Arc<Runtime>) {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            ..Default::default()
+        };
+        conf.journal.enable = false;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("job-runner/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("job-runner/journal-{}", Utils::rand_str(6)));
+        // Generous connect budget: a refused port fails at once anyway, and a
+        // freshly started probe server can take well over 100ms to accept.
+        conf.client.conn_retry_max_duration_ms = 2000;
+        conf.client.conn_timeout_ms = 2000;
+        conf.client.rpc_retry_max_duration_ms = 100;
+        conf.client.rpc_timeout_ms = rpc_timeout_ms;
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+
+        let rt = conf.journal.create_runtime();
+        let runner = LoadJobRunner::new(
+            JobStore::new(),
+            fs,
+            Arc::new(UfsFactory::with_rt(&conf.client, rt.clone())),
+            1,
+            Arc::new(AtomicCounter::new(0)),
+        );
+        (runner, rt)
+    }
+
+    /// One unreachable worker must not stop cancel from reaching the others,
+    /// and must not fail a cancel the caller already recorded.
+    #[test]
+    fn cancel_job_reaches_live_workers_when_one_is_unreachable() {
+        // Bind then drop: nothing listens on `dead_port`, so connect is refused.
+        let dead_port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // Real RPC server that answers CancelJob and records the job id.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let live_port = NetUtils::hold_available_port();
+        let server = RpcServer::new(
+            ServerConf::with_hostname("127.0.0.1", live_port),
+            CancelProbeService { seen: seen.clone() },
+        );
+        let server_rt = server.clone_rt();
+        let mut listener = server.start();
+        server_rt
+            .block_on(listener.wait_startup())
+            .expect("cancel probe server must start");
+
+        let (runner, rt) = test_runner(1000);
+
+        let mut workers = FastHashSet::default();
+        workers.insert(worker(1, dead_port));
+        workers.insert(worker(2, live_port));
+
+        let res = rt.block_on(runner.cancel_job("job-1", workers));
+        assert!(res.is_ok(), "unreachable worker failed cancel: {:?}", res);
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["job-1".to_string()],
+            "live worker must receive exactly one CancelJob for job-1"
+        );
+    }
+
+    /// Stalled workers are waited on together, so cancel latency stays near
+    /// one RPC timeout instead of growing with the number of stalled workers.
+    #[test]
+    fn cancel_job_waits_on_stalled_workers_concurrently() {
+        const RPC_TIMEOUT_MS: u64 = 1000;
+        const STALLED: u32 = 4;
+        let (runner, rt) = test_runner(RPC_TIMEOUT_MS);
+
+        // Bound but never accepted: the kernel completes the handshake, the
+        // request is written, and no response ever comes back.
+        let stalled: Vec<TcpListener> = (0..STALLED)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let mut workers = FastHashSet::default();
+        for (i, l) in stalled.iter().enumerate() {
+            workers.insert(worker(i as u32 + 1, l.local_addr().unwrap().port()));
+        }
+
+        let start = Instant::now();
+        let res = rt.block_on(runner.cancel_job("job-1", workers));
+        let elapsed = start.elapsed();
+        assert!(res.is_ok(), "stalled workers failed cancel: {:?}", res);
+
+        // Serial dialing needs at least STALLED x RPC_TIMEOUT_MS.
+        let serial_floor = Duration::from_millis(RPC_TIMEOUT_MS * STALLED as u64);
+        assert!(
+            elapsed < serial_floor / 2,
+            "cancel took {:?}; stalled workers were waited on serially",
+            elapsed
+        );
     }
 }
