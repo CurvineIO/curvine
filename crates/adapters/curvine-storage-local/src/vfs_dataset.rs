@@ -235,6 +235,31 @@ impl VfsDataset {
         Ok(ds)
     }
 
+    /// Synthetic SPDK dataset (no real bdev) for cross-crate unit tests.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn new_spdk_test_dataset(dir_id: u32, capacity: i64) -> CommonResult<Self> {
+        let state = Arc::new(crate::DirState {
+            bdev_name: Some("test-nvme0".into()),
+            bdev_capacity: capacity,
+            offset_alloc: crate::DirState::new_offset_alloc(StorageType::SpdkDisk, capacity, 4096),
+        });
+        let mut version = StorageVersion::with_cluster("test");
+        version.dir_id = dir_id;
+        let dir = VfsDir {
+            version,
+            stats: curvine_sys::FsStats::new("/tmp"),
+            storage_type: StorageType::SpdkDisk,
+            conf_capacity: capacity,
+            reserved_bytes: 0,
+            free_ratio: 0.0,
+            final_bytes: curvine_runtime::sync::AtomicLong::new(0),
+            tmp_bytes: curvine_runtime::sync::AtomicLong::new(0),
+            state,
+            check_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        Self::new("test", DirList::new(vec![dir])?, None)
+    }
+
     // Initialize.
     // 1. Scan all blocks in the directory (filesystem or RocksDB for SPDK)
     // 2. Block is added to meta store.
@@ -305,7 +330,13 @@ impl VfsDataset {
             return Some(committed);
         }
         let meta = self.meta.get(id)?;
-        (meta.state() != &BlockState::Allocating).then_some(meta)
+        // Quarantined content is unknown (a timed-out write may still land):
+        // never serve it; readers fall back to another replica.
+        (!matches!(
+            meta.state(),
+            BlockState::Allocating | BlockState::Quarantined
+        ))
+        .then_some(meta)
     }
 
     pub fn reserve_file_open(
@@ -543,6 +574,10 @@ impl VfsDataset {
             None => return err_box!("Not found block {}", id),
             Some(meta) => meta,
         };
+        if meta.is_quarantined() {
+            // Write may still be in flight; keep the extent reserved.
+            return Err(Box::new(crate::QuarantinedBlockError(id)));
+        }
         let layout = self.layouts.get(meta.storage_type()).clone();
         let dir = match self.dir_list.get_dir(meta.dir_id()) {
             None => return err_box!("No storage directory found: {:?}", meta.dir_id()),
@@ -769,6 +804,11 @@ impl Dataset for VfsDataset {
             return Ok(());
         };
 
+        if meta.is_quarantined() {
+            // Already quarantined: no-op, extent stays reserved.
+            return Ok(());
+        }
+
         if let Some(committed) = self.committed_rewrites.get(&block.id).cloned() {
             let (layout, dir) = self.layout_for(&meta)?;
             layout.deallocate(&dir, &meta)?;
@@ -781,6 +821,27 @@ impl Dataset for VfsDataset {
         }
 
         self.remove_block_by_id(block.id)?;
+        Ok(())
+    }
+
+    /// Quarantine SPDK extents instead of releasing them; falls back to normal abort otherwise.
+    fn abort_block_uncertain(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
+        let Some(meta) = self.meta.get(block.id).cloned() else {
+            return Ok(());
+        };
+
+        if meta.is_quarantined() {
+            return Ok(());
+        }
+
+        if meta.storage_type() != StorageType::SpdkDisk {
+            return self.abort_block(block);
+        }
+
+        // Keep the extent reserved; only flip state, don't deallocate/release.
+        let mut quarantined = meta;
+        quarantined.state = BlockState::Quarantined;
+        self.meta.put_checked(quarantined)?;
         Ok(())
     }
 
@@ -882,8 +943,7 @@ mod test {
     }
 
     fn spdk_dataset() -> CommonResult<VfsDataset> {
-        let st = spdk_state();
-        VfsDataset::new("t", DirList::new(vec![spdk_dir(1, st)])?, None)
+        VfsDataset::new_spdk_test_dataset(1, 1 << 30)
     }
 
     /// SPDK dir with controllable capacity, used bytes, and free_ratio, so the
@@ -1949,7 +2009,7 @@ mod test {
         let path = "../testing/spdk_capacity_restore";
         let _ = std::fs::remove_dir_all(path);
         let store = Arc::new(SpdkMetaStore::open(path, true)?);
-        store.put(1, 1, 0, 4096, 1, true)?;
+        store.put(1, 1, 0, 4096, 1, true, false)?;
 
         let dir = spdk_dir(1, spdk_state());
         let available = dir.available();
@@ -2062,6 +2122,292 @@ mod test {
         assert_eq!(st2.offset_alloc.free_list_bytes(), 4096);
 
         assert_eq!(st2.offset_alloc.allocate(4, 4096).unwrap(), 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn abort_block_uncertain_quarantines_spdk_block() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let available = ds.available();
+        ds.open_block(&block)?;
+
+        ds.abort_block_uncertain(&block)?;
+
+        // Quarantined, not removed; capacity stays reserved.
+        let meta = ds.get_block(1).unwrap();
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        assert_eq!(ds.available(), available - 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn quarantined_extent_not_reused_by_allocator() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        ds.abort_block_uncertain(&b1)?;
+
+        // Quarantine must not free the offset (unlike normal abort).
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(alloc.free_list_size(), 0);
+        assert_eq!(alloc.free_list_bytes(), 0);
+
+        // New block must get a fresh offset, not the quarantined one.
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let m2 = ds.open_block(&b2)?;
+        assert_eq!(m2.bdev_offset, 4096, "must not reuse quarantined offset 0");
+        Ok(())
+    }
+
+    /// Ordinary abort (abort_replication_write's route) on a quarantined
+    /// block must be a no-op, not release the extent.
+    #[test]
+    fn abort_on_quarantined_block_keeps_extent_reserved() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        ds.abort_block_uncertain(&b1)?;
+
+        // Simulates abort_replication_write's revoke path.
+        ds.abort_block(&b1)?;
+
+        let meta = ds
+            .get_block(1)
+            .expect("quarantined block must survive abort");
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "ordinary abort must not free a quarantined extent"
+        );
+
+        // Must get a fresh offset, not the quarantined one.
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let m2 = ds.open_block(&b2)?;
+        assert_eq!(m2.bdev_offset, 4096, "must not reuse quarantined offset 0");
+        Ok(())
+    }
+
+    /// A quarantined block's content is unknown; it must not be readable.
+    /// The raw view still sees it, so it is not mistaken for a missing block.
+    #[test]
+    fn quarantined_block_is_not_readable() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        assert!(
+            ds.get_readable_block(1).is_some(),
+            "setup: Writing is readable"
+        );
+
+        ds.abort_block_uncertain(&b1)?;
+
+        assert!(
+            ds.get_readable_block(1).is_none(),
+            "quarantined block must not be served to readers"
+        );
+        assert_eq!(
+            ds.get_block(1).map(|m| *m.state()),
+            Some(BlockState::Quarantined),
+            "raw view must still see the quarantined block"
+        );
+        Ok(())
+    }
+
+    /// Async deletion (async_remove_block's route) on a quarantined block
+    /// must be rejected, not release the extent.
+    #[test]
+    fn remove_quarantined_block_is_rejected_and_extent_stays_reserved() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        ds.abort_block_uncertain(&b1)?;
+
+        // Simulates async_remove_block's route. The error must be the typed
+        // variant so the worker can park the block instead of retrying.
+        let err = match ds.remove_block_state_by_id(1) {
+            Err(e) => e,
+            Ok(_) => panic!("removal of a quarantined block must be rejected"),
+        };
+        assert!(
+            crate::is_quarantined_error(&err),
+            "must be QuarantinedBlockError, got: {err}"
+        );
+        assert!(err.to_string().contains("quarantined"), "{err}");
+
+        let meta = ds
+            .get_block(1)
+            .expect("quarantined block must survive removal attempt");
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "rejected removal must not free a quarantined extent"
+        );
+
+        // Must get a fresh offset, not the quarantined one.
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let m2 = ds.open_block(&b2)?;
+        assert_eq!(m2.bdev_offset, 4096, "must not reuse quarantined offset 0");
+        Ok(())
+    }
+
+    #[test]
+    fn quarantined_block_survives_metadata_reload() -> CommonResult<()> {
+        let path = "../testing/spdk_quarantine_reload";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let available = dir.available();
+        let mut ds = VfsDataset::new("t", DirList::new(vec![dir])?, Some(store.clone()))?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.abort_block_uncertain(&block)?;
+        drop(ds);
+
+        // Reopen: must restore as Quarantined, extent still occupied.
+        let dir2 = spdk_dir(1, spdk_state());
+        let ds2 = VfsDataset::new("t", DirList::new(vec![dir2])?, Some(store.clone()))?;
+        let meta = ds2.get_block(1).unwrap();
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        assert_eq!(ds2.available(), available - 4096);
+        let alloc = ds2.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "quarantined extent must stay occupied after reload"
+        );
+
+        drop(ds2);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// Repeated abort_block_uncertain() on a quarantined block must be a
+    /// no-op: no re-persist, no state/extent change.
+    #[test]
+    fn abort_block_uncertain_is_idempotent_for_already_quarantined_block() -> CommonResult<()> {
+        let path = "../testing/spdk_quarantine_idempotent_abort";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let mut ds = VfsDataset::new("t", DirList::new(vec![dir])?, Some(store.clone()))?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.abort_block_uncertain(&block)?;
+
+        // Force persistence to fail, so success only happens via a
+        // short-circuit before put_checked().
+        store.set_force_put_failure_for_test(true);
+        let result = ds.abort_block_uncertain(&block);
+        store.set_force_put_failure_for_test(false);
+
+        assert!(
+            result.is_ok(),
+            "repeated abort_block_uncertain on an already-quarantined block must be a no-op"
+        );
+        let meta = ds.get_block(1).expect("block must still exist");
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(alloc.free_list_size(), 0);
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// A failed persist of the quarantine transition must propagate, not
+    /// be swallowed; the in-memory quarantine must still hold.
+    #[test]
+    fn abort_block_uncertain_propagates_persist_failure_but_keeps_in_memory_quarantine(
+    ) -> CommonResult<()> {
+        let path = "../testing/spdk_quarantine_persist_failure";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let mut ds = VfsDataset::new("t", DirList::new(vec![dir])?, Some(store.clone()))?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+
+        store.set_force_put_failure_for_test(true);
+        let result = ds.abort_block_uncertain(&block);
+        store.set_force_put_failure_for_test(false);
+
+        assert!(result.is_err(), "persistence failure must propagate");
+
+        // Must still be Quarantined despite the persist failure.
+        let meta = ds.get_block(1).expect("block must still exist in memory");
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "extent must stay reserved even when persistence failed"
+        );
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// Regression: a legacy 29B record must restore its BlockMeta and keep
+    /// its extent occupied after an upgrade/reload (not free-listed).
+    #[test]
+    fn legacy_record_survives_upgrade_and_restart() -> CommonResult<()> {
+        let path = "../testing/spdk_legacy_upgrade_reload";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let available = dir.available();
+        // Pre-upgrade worker's on-disk record: no quarantined byte.
+        store.put_legacy_for_test(1, 1, 0, 4096, 4096, true)?;
+        drop(dir);
+
+        // Reopen as the upgraded binary.
+        let dir2 = spdk_dir(1, spdk_state());
+        let ds = VfsDataset::new("t", DirList::new(vec![dir2])?, Some(store.clone()))?;
+        let meta = ds.get_block(1).expect("legacy block must be restored");
+        assert_eq!(meta.state(), &BlockState::Finalized);
+        assert_eq!(
+            ds.available(),
+            available - 4096,
+            "legacy block's extent must be reserved, not free"
+        );
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "legacy block's extent must not be free-listed after upgrade"
+        );
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn abort_block_uncertain_falls_back_for_file_storage() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "abort-uncertain-file-fallback");
+        let block = ExtendedBlock::with_mem(1, "100B")?;
+        let available = ds.available();
+        ds.open_block(&block)?;
+        assert_eq!(ds.available(), available - 100);
+
+        // Non-SPDK: uncertain abort behaves like normal abort.
+        ds.abort_block_uncertain(&block)?;
+        assert!(ds.get_block(block.id).is_none());
+        assert_eq!(ds.available(), available);
         Ok(())
     }
 }

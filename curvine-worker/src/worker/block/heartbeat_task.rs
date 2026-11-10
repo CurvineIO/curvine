@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockStore, CorruptCheck, MasterClient};
-use crate::worker::storage::Dataset;
+use crate::worker::storage::{is_quarantined_error, Dataset};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::ProtoUtils;
@@ -35,6 +35,9 @@ pub struct HeartbeatTask {
     pub(crate) client: MasterClient,
     pub(crate) store: BlockStore,
     pub(crate) report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
+    /// Also parks quarantined ids (see `delete_block_task`). The release path
+    /// must remove the id, or report Deleted itself, so master's pending
+    /// delete can complete.
     pub(crate) pending_deletes: Arc<DashSet<i64>>,
 }
 
@@ -75,6 +78,11 @@ impl HeartbeatTask {
                             Ok(None) => {
                                 report_blocks1
                                     .insert(block, BlockReportInfo::with_deleted(block, 0));
+                            }
+                            // Permanent until released: keep the id so later
+                            // heartbeats skip it instead of rescheduling.
+                            Err(e) if is_quarantined_error(&e) => {
+                                info!("block {} is quarantined; delete deferred", block);
                             }
                             Err(e) => {
                                 warn!("async_remove_block {}: {}", block, e);

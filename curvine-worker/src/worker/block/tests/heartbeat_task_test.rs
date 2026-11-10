@@ -18,7 +18,9 @@ use bytes::BytesMut;
 use curvine_config::{ClusterConf, WorkerConf};
 use curvine_core_error::CommonResult;
 use curvine_io::DataSlice;
-use curvine_model::{BlockReportStatus, DeleteBlockCmd, ExtendedBlock, WorkerCommand};
+use curvine_model::{
+    BlockReportStatus, DeleteBlockCmd, ExtendedBlock, FileType, StorageType, WorkerCommand,
+};
 use curvine_runtime::runtime::GroupExecutor;
 use dashmap::{DashMap, DashSet};
 use std::sync::{mpsc, Arc};
@@ -227,6 +229,59 @@ fn corrupt_block_held_by_a_writer_is_cleaned_up_once_released() -> CommonResult<
     let report = reports.get(&8).expect("requeued block was not cleaned up");
     assert!(report.corrupted);
     assert!(store.get_block(8).is_err());
+    std::mem::forget(executor);
+    Ok(())
+}
+
+/// A quarantined block cannot be removed until released. Repeated
+/// DeleteBlock commands must not reschedule it on every heartbeat.
+#[test]
+fn quarantined_block_delete_is_parked_not_rescheduled() -> CommonResult<()> {
+    let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)?;
+    let store = BlockStore::from_dataset_for_test(dataset);
+    let block = ExtendedBlock::new(9, 4096, StorageType::SpdkDisk, FileType::File);
+    store.open_block(&block)?;
+    store.abort_block_uncertain(&block)?;
+    assert!(store.get_raw_block_opt(9)?.unwrap().is_quarantined());
+
+    let executor = Arc::new(GroupExecutor::new("heartbeat-task-quarantine", 1, 2));
+    let reports = Arc::new(DashMap::new());
+    let pending = Arc::new(DashSet::new());
+    let cmd = || {
+        vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
+            blocks: vec![9],
+        })]
+    };
+
+    // Heartbeat 1: the remove runs, is refused, and the id is parked.
+    HeartbeatTask::delete_block_task(
+        executor.clone(),
+        store.clone(),
+        cmd(),
+        reports.clone(),
+        pending.clone(),
+    );
+    drain(&executor);
+    assert!(pending.contains(&9), "quarantined id must stay pending");
+    assert!(reports.is_empty(), "must not report Deleted");
+    assert_eq!(store.read()?.num_blocks_to_delete(), 0);
+
+    // Heartbeat 2: same command; nothing must be scheduled again.
+    HeartbeatTask::delete_block_task(
+        executor.clone(),
+        store.clone(),
+        cmd(),
+        reports.clone(),
+        pending.clone(),
+    );
+    assert_eq!(
+        store.read()?.num_blocks_to_delete(),
+        0,
+        "a parked quarantined block must not be rescheduled"
+    );
+    drain(&executor);
+    assert!(reports.is_empty());
+    assert!(store.get_raw_block_opt(9)?.unwrap().is_quarantined());
     std::mem::forget(executor);
     Ok(())
 }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod block_meta;
-pub use self::block_meta::{BlockMeta, BlockState};
+pub use self::block_meta::{is_quarantined_error, BlockMeta, BlockState, QuarantinedBlockError};
 
 mod vfs_dir;
 pub use self::vfs_dir::*;
