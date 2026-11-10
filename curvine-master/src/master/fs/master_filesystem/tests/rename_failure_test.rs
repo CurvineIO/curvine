@@ -15,74 +15,148 @@
 use super::*;
 
 #[test]
-fn file_status_memory_rejects_metadata_built_after_a_move() {
+fn file_status_lock_window_excludes_rename_writers() {
     use curvine_fault::{FaultAction, FaultRuleBuilder, FaultRuntime};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
-    let fs = test_fs("file-status-move-window");
+    let fs = test_fs("file-status-lock-window");
     fs.mkdir("/p/a", true).unwrap();
     fs.mkdir("/q", true).unwrap();
+    let before = fs.file_status("/p/a").unwrap();
     let runtime = FaultRuntime::process();
-    let rule_id = "file-status-move-window";
-    // Pause the reader inside the window between the walk and the result
-    // construction so the mutation below deterministically lands there.
-    let rule = FaultRuleBuilder::named("master.metadata.file_status.after_walk")
-        .matches("path", "/p/a")
-        .unwrap()
-        .times(1)
-        .unwrap()
-        .action(FaultAction::Delay { duration_ms: 150 })
+    let entry_id = "file-status-lock-entry";
+    let park_id = "file-status-lock-park";
+    runtime
+        .configure(
+            entry_id,
+            FaultRuleBuilder::named("master.metadata.file_status.locked_build")
+                .matches("path", "/p/a")
+                .unwrap()
+                .record()
+                .unwrap(),
+        )
         .unwrap();
-    runtime.configure(rule_id, rule).unwrap();
+    runtime
+        .configure(
+            park_id,
+            FaultRuleBuilder::named("master.metadata.file_status.locked_build")
+                .matches("path", "/p/a")
+                .unwrap()
+                .times(1)
+                .unwrap()
+                .action(FaultAction::Delay { duration_ms: 300 })
+                .unwrap(),
+        )
+        .unwrap();
     let reader_fs = fs.clone();
     let reader = std::thread::spawn(move || reader_fs.file_status("/p/a"));
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    fs.rename("/p/a", "/q/a", RenameFlags::empty()).unwrap();
-    fs.set_attr(
-        "/q/a",
-        SetAttrOpts {
-            mode: Some(0o700),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let result = reader.join().unwrap();
-    runtime.remove(rule_id).unwrap();
-    // The moved attributes must never be reported under the vacant source
-    // path: the post-build validation detects the parent version change and
-    // the retry observes the move.
-    assert!(result.is_err());
-    assert_eq!(fs.file_status("/q/a").unwrap().mode, 0o700);
+    // Deterministic entry: the record rule only fires inside the locked
+    // window, after the read locks are held. The writer is released only
+    // once that entry is confirmed.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(entry_id).unwrap().unwrap().executions == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "reader never reached the locked build window"
+        );
+        std::thread::yield_now();
+    }
+    let (done, done_rx) = mpsc::channel::<()>();
+    let writer_fs = fs.clone();
+    let writer = std::thread::spawn(move || {
+        writer_fs
+            .rename("/p/a", "/q/a", RenameFlags::empty())
+            .unwrap();
+        done.send(()).unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        done_rx.try_recv().is_err(),
+        "rename must block while the locked read window holds inode locks"
+    );
+    let status = reader.join().unwrap().unwrap();
+    runtime.remove(entry_id).unwrap();
+    runtime.remove(park_id).unwrap();
+    // The status was built entirely inside the lock window from pre-move
+    // state; the parked writer could not interleave a rename or set_attr.
+    assert_eq!(status.id, before.id);
+    assert_eq!(status.mode, before.mode);
+    writer.join().unwrap();
+    drop(done_rx);
+    assert!(fs.file_status("/p/a").is_err());
+    assert_eq!(fs.file_status("/q/a").unwrap().id, before.id);
 }
 
 #[test]
-fn list_options_memory_rejects_pages_built_after_a_move() {
+fn list_options_lock_window_excludes_rename_writers() {
     use curvine_fault::{FaultAction, FaultRuleBuilder, FaultRuntime};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
-    let fs = test_fs("list-options-move-window");
+    let fs = test_fs("list-options-lock-window");
     fs.mkdir("/p", true).unwrap();
     fs.mkdir("/q", true).unwrap();
     fs.create("/p/f", false).unwrap();
+    let before = fs.file_status("/p/f").unwrap();
     let runtime = FaultRuntime::process();
-    let rule_id = "list-options-move-window";
-    let rule = FaultRuleBuilder::named("master.metadata.list_options.after_walk")
-        .matches("path", "/p/f")
-        .unwrap()
-        .times(1)
-        .unwrap()
-        .action(FaultAction::Delay { duration_ms: 150 })
+    let entry_id = "list-options-lock-entry";
+    let park_id = "list-options-lock-park";
+    runtime
+        .configure(
+            entry_id,
+            FaultRuleBuilder::named("master.metadata.list_options.locked_build")
+                .matches("path", "/p/f")
+                .unwrap()
+                .record()
+                .unwrap(),
+        )
         .unwrap();
-    runtime.configure(rule_id, rule).unwrap();
+    runtime
+        .configure(
+            park_id,
+            FaultRuleBuilder::named("master.metadata.list_options.locked_build")
+                .matches("path", "/p/f")
+                .unwrap()
+                .times(1)
+                .unwrap()
+                .action(FaultAction::Delay { duration_ms: 300 })
+                .unwrap(),
+        )
+        .unwrap();
     let reader_fs = fs.clone();
     let reader = std::thread::spawn(move || reader_fs.list_options("/p/f", ListOptions::default()));
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    fs.rename("/p/f", "/q/f", RenameFlags::empty()).unwrap();
-    let result = reader.join().unwrap();
-    runtime.remove(rule_id).unwrap();
-    assert!(result.is_err());
-    assert_eq!(
-        fs.list_options("/q/f", ListOptions::default()).unwrap()[0].name,
-        "f"
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.rule(entry_id).unwrap().unwrap().executions == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "reader never reached the locked build window"
+        );
+        std::thread::yield_now();
+    }
+    let (done, done_rx) = mpsc::channel::<()>();
+    let writer_fs = fs.clone();
+    let writer = std::thread::spawn(move || {
+        writer_fs
+            .rename("/p/f", "/q/f", RenameFlags::empty())
+            .unwrap();
+        done.send(()).unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        done_rx.try_recv().is_err(),
+        "rename must block while the locked read window holds inode locks"
     );
+    let page = reader.join().unwrap().unwrap();
+    runtime.remove(entry_id).unwrap();
+    runtime.remove(park_id).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].name, "f");
+    assert_eq!(page[0].id, before.id);
+    writer.join().unwrap();
+    drop(done_rx);
+    assert!(fs.list_options("/p/f", ListOptions::default()).is_err());
+    assert_eq!(fs.file_status("/q/f").unwrap().id, before.id);
 }
 
 #[test]

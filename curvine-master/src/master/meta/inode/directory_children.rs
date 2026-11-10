@@ -107,6 +107,11 @@ impl ChildEdge {
             Self::FileId(id) => *id,
         }
     }
+
+    /// Whether the edge resolves to a live directory node.
+    pub fn is_dir(&self) -> bool {
+        matches!(self, Self::Dir(_))
+    }
 }
 
 pub struct DirectoryChildren {
@@ -482,6 +487,54 @@ impl DirectoryChildren {
             }
         }
         out.sort_unstable_by(|left, right| left.name().cmp(right.name()));
+        out
+    }
+
+    /// Page membership as `(name, edge)` pairs without building inode
+    /// projections: memory-read planning captures identity only, and the
+    /// statuses are constructed after the inode read locks are held.
+    pub fn child_edges(&self, opts: &ListOptions) -> Vec<(String, ChildEdge)> {
+        let to_edge = |item: ChildItem<'_>| {
+            let edge = match &item {
+                ChildItem::DirNode { node, .. } => ChildEdge::Dir((*node).clone()),
+                ChildItem::FileEntry { id, .. } => ChildEdge::FileId(*id),
+                ChildItem::View(view) => ChildEdge::FileId(view.id()),
+            };
+            (item.name().to_owned(), edge)
+        };
+        if opts.limit == Some(0) {
+            return Vec::new();
+        }
+        if self.sharded().is_none() {
+            let children = self.children.read();
+            // Each container returns names in order; recheck promotion while
+            // holding its read lock before skipping the global shard sort.
+            if self.sharded().is_none() {
+                return children
+                    .list_options(opts)
+                    .into_iter()
+                    .map(to_edge)
+                    .collect();
+            }
+        }
+        let mut out: Vec<(String, ChildEdge)> = self
+            .read_all_guards(|children| {
+                children
+                    .list_options(opts)
+                    .into_iter()
+                    .map(to_edge)
+                    .collect::<Vec<_>>()
+            })
+            .into_iter()
+            .flatten()
+            .collect();
+        if let Some(limit) = opts.limit {
+            if limit < out.len() {
+                out.select_nth_unstable_by(limit, |left, right| left.0.cmp(&right.0));
+                out.truncate(limit);
+            }
+        }
+        out.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         out
     }
 

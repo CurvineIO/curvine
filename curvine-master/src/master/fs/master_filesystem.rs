@@ -19,8 +19,8 @@ use crate::master::fs::full_block_report::{
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
 use crate::master::meta::inode::{
-    ChildEdge, DirectoryChildrenSharedVersion, InodeDir, InodeEntry, InodeFile, InodePath,
-    InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
+    ChildEdge, InodeDir, InodeEntry, InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR,
+    ROOT_INODE_ID,
 };
 use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::meta::{
@@ -111,6 +111,57 @@ pub struct MasterFilesystem {
     /// keeps the direct release path, which is correct only while the replayer
     /// waits for each export. Shared by every clone so none bypasses the gate.
     fs_mode_releaser: Arc<OnceCell<Arc<dyn FsModeReleaser>>>,
+}
+
+/// Identity-only plan for a live-tree hot read: one inode id per path
+/// component, the target's kind, and — for a directory target — the page
+/// membership as edges. Planning copies no directory attributes and loads no
+/// file rows; statuses are built after the inode locks.
+struct MemoryReadPlan {
+    ids: Vec<i64>,
+    full: bool,
+    target_is_dir: bool,
+    root_target: bool,
+    target_name: String,
+    target_edge: Option<ChildEdge>,
+    children: Vec<(String, ChildEdge)>,
+}
+
+impl MemoryReadPlan {
+    /// Page inode read requests: path ancestors (root stays lock-free as a
+    /// pure ancestor) plus the target plus every page child. One
+    /// stripe-sorted acquisition covers the whole locked window; no locks
+    /// are taken incrementally while a batch is already held.
+    fn lock_requests(&self) -> SmallVec<[InodeLockRequest; 8]> {
+        let mut requests = SmallVec::new();
+        for (depth, id) in self.ids.iter().enumerate() {
+            let is_target = depth + 1 == self.ids.len();
+            if *id == ROOT_INODE_ID && !(is_target && self.root_target) {
+                continue;
+            }
+            requests.push(InodeLockRequest::read(depth, *id));
+        }
+        let child_depth = self.ids.len();
+        for (index, (_, edge)) in self.children.iter().enumerate() {
+            requests.push(InodeLockRequest::read(child_depth + index, edge.id()));
+        }
+        requests
+    }
+
+    /// Whether the planned identity still matches the live identity: path
+    /// edges and — for directory targets — page membership.
+    fn matches(&self, other: &MemoryReadPlan) -> bool {
+        self.ids == other.ids
+            && self.target_is_dir == other.target_is_dir
+            && (!self.target_is_dir || Self::membership_eq(&self.children, &other.children))
+    }
+
+    fn membership_eq(left: &[(String, ChildEdge)], right: &[(String, ChildEdge)]) -> bool {
+        left.len() == right.len()
+            && left.iter().zip(right.iter()).all(|((ln, le), (rn, re))| {
+                ln == rn && le.id() == re.id() && le.is_dir() == re.is_dir()
+            })
+    }
 }
 
 /// Result of [`MasterFilesystem::free_or_defer`].
@@ -2653,54 +2704,104 @@ impl MasterFilesystem {
         self.file_status_memory(path)
     }
 
-    /// Bounded attempts for a validated live-tree walk. Sustained write
-    /// storms on the walked directories keep failing version validation, so
-    /// exhausted attempts fall back to the snapshot read for progress.
-    const MEMORY_WALK_ATTEMPTS: usize = 4;
+    /// Bounded attempts for a locked live-tree read. Sustained membership
+    /// changes between planning and locking keep failing identity
+    /// verification, so exhausted attempts fall back to the snapshot read
+    /// for progress.
+    const MEMORY_READ_ATTEMPTS: usize = 4;
 
-    /// Hot-path `file_status` over the live tree. Directory targets are read
-    /// through their stable `DirNode` handles, never a projected pointer;
-    /// file targets reuse the walk's existing store hydration. Every attempt
-    /// validates the captured child-index versions so the reported metadata
-    /// equals one point-in-time namespace state.
+    /// Plans a hot read under the namespace read guard: an identity walk
+    /// plus page membership edges only. The caller releases the guard
+    /// before taking inode locks.
+    fn plan_memory_read(
+        fs_dir: &FsDir,
+        path: &str,
+        page: bool,
+        page_opts: &ListOptions,
+    ) -> FsResult<MemoryReadPlan> {
+        let components = InodeView::path_components(path)?;
+        if components.last().is_none_or(String::is_empty) {
+            return err_box!("Path {} is invalid", path);
+        }
+        let mut ids: Vec<i64> = Vec::with_capacity(components.len());
+        let mut children: Vec<(String, ChildEdge)> = Vec::new();
+        let mut target_is_dir = false;
+        let mut target_edge: Option<ChildEdge> = None;
+        let mut next: Option<ChildEdge> = Some(ChildEdge::Dir(fs_dir.root_node()));
+        for (index, _) in components.iter().enumerate() {
+            let Some(edge) = next.as_ref() else { break };
+            let node = match edge {
+                ChildEdge::Dir(node) => Some(node),
+                ChildEdge::FileId(_) => None,
+            };
+            ids.push(edge.id());
+            if index + 1 == components.len() {
+                target_is_dir = node.is_some();
+                target_edge = Some(edge.clone());
+                if let Some(node) = node.filter(|_| page) {
+                    children = node.children.child_edges(page_opts);
+                }
+            } else {
+                next = node.and_then(|node| node.children.get_child_edge(&components[index + 1]));
+            }
+        }
+        Ok(MemoryReadPlan {
+            root_target: ids.len() == 1 && ids.first() == Some(&ROOT_INODE_ID),
+            full: ids.len() == components.len(),
+            target_name: components.last().unwrap().clone(),
+            ids,
+            target_is_dir,
+            target_edge,
+            children,
+        })
+    }
+
+    /// Hot-path `file_status` over the live tree. Planning captures only
+    /// inode identity; the read locks (path ancestors, target) are taken in
+    /// one batch, identity is re-verified under them, and the status is
+    /// built inside the same locked window: a writer that mutates any read
+    /// inode holds its write lock first, so meta and attributes cannot tear.
     fn file_status_memory(&self, path: &str) -> FsResult<FileStatus> {
-        for _ in 0..Self::MEMORY_WALK_ATTEMPTS {
+        for _ in 0..Self::MEMORY_READ_ATTEMPTS {
             let fs_dir = self.fs_dir.read();
             Self::checked_live_epoch(&fs_dir)?;
-            let inp = InodePath::resolve_versioned(fs_dir.root_node(), path, fs_dir.store_ref())?;
+            let plan = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
+            drop(fs_dir);
+            let _locks = self.inode_locks.lock_many(&plan.lock_requests());
+            let fs_dir = self.fs_dir.read();
+            Self::checked_live_epoch(&fs_dir)?;
+            let verified = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
+            if !plan.matches(&verified) {
+                continue;
+            }
+            if !verified.full {
+                return err_ext!(FsError::file_not_found(path));
+            }
             #[cfg(test)]
             crate::fault_point! {
                 sync,
-                name: "master.metadata.file_status.after_walk",
-                description: "After the memory walk, before the status is built",
+                name: "master.metadata.file_status.locked_build",
+                description: "Inside the locked window before the status is built",
                 context: {"path" => path},
                 return_error: |fault| Err(fault.message.into()),
             }
-            if !inp.is_full() {
-                if inp.walk_is_current() {
-                    return err_ext!(FsError::file_not_found(path));
+            let status = match verified.target_edge {
+                // Directory DTO freshly built under the target's read lock:
+                // set_attr holds the write lock, so meta and attributes read
+                // one consistent generation.
+                Some(ChildEdge::Dir(node)) => {
+                    InodeDir::from_dir_node_live(verified.target_name.clone(), node)
+                        .to_file_status(path)?
                 }
-                continue;
-            }
-            // The result must be constructed before validation: a concurrent
-            // rename can move the target while this thread builds, and the
-            // parent's child-index version is the only signal that the
-            // returned (path, metadata) pair stopped coexisting mid-build.
-            if let Some(node) = inp.get_last_dir_node() {
-                let status = InodeDir::from_dir_node_live(inp.name().to_string(), node)
-                    .to_file_status(path)?;
-                if !inp.walk_is_current() {
-                    continue;
+                Some(ChildEdge::FileId(id)) => {
+                    let inode = fs_dir
+                        .store
+                        .get_inode(id, Some(&verified.target_name))?
+                        .ok_or_else(|| FsError::file_not_found(path))?;
+                    inode.to_file_status(path)?
                 }
-                return Ok(status);
-            }
-            let inode = inp
-                .get_last_inode()
-                .ok_or_else(|| FsError::file_not_found(path))?;
-            let status = inode.as_ref().to_file_status(path)?;
-            if !inp.walk_is_current() {
-                continue;
-            }
+                None => return err_ext!(FsError::file_not_found(path)),
+            };
             return Ok(status);
         }
         // Contention fallback: the pre-S4 snapshot read.
@@ -2714,19 +2815,24 @@ impl MasterFilesystem {
         Self::file_status_from_snapshot(&snapshot, path, inode)
     }
 
-    /// Hot-path existence check over the live tree with the same validation
-    /// protocol as [`Self::file_status_memory`]. Called with the namespace
-    /// read guard held.
-    fn exists_memory(&self, fs_dir: &FsDir, path: &str) -> FsResult<bool> {
-        for _ in 0..Self::MEMORY_WALK_ATTEMPTS {
-            Self::checked_live_epoch(fs_dir)?;
-            let inp = InodePath::resolve_versioned(fs_dir.root_node(), path, fs_dir.store_ref())?;
-            let full = inp.is_full();
-            if !inp.walk_is_current() {
+    /// Hot-path existence check over the live tree with the same locked
+    /// identity protocol as [`Self::file_status_memory`].
+    fn exists_memory(&self, path: &str) -> FsResult<bool> {
+        for _ in 0..Self::MEMORY_READ_ATTEMPTS {
+            let fs_dir = self.fs_dir.read();
+            Self::checked_live_epoch(&fs_dir)?;
+            let plan = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
+            drop(fs_dir);
+            let _locks = self.inode_locks.lock_many(&plan.lock_requests());
+            let fs_dir = self.fs_dir.read();
+            Self::checked_live_epoch(&fs_dir)?;
+            let verified = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
+            if !plan.matches(&verified) {
                 continue;
             }
-            return Ok(full);
+            return Ok(verified.full);
         }
+        let fs_dir = self.fs_dir.read();
         let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
         Ok(snapshot.resolve_path(path)?.is_full())
     }
@@ -2740,10 +2846,7 @@ impl MasterFilesystem {
         if components.last().is_none_or(String::is_empty) {
             return err_box!("Path {} is invalid", path);
         }
-        let result = {
-            let fs_dir = self.fs_dir.read();
-            self.exists_memory(&fs_dir, path)
-        };
+        let result = self.exists_memory(path);
         match result {
             Ok(exists) if self.journal_writer.ensure_metadata_current().is_ok() => Ok(exists),
             Ok(_) | Err(_) => {
@@ -2815,69 +2918,83 @@ impl MasterFilesystem {
         self.list_options_memory(path, page_opts)
     }
 
-    /// Hot-path listing over the live tree. Page membership comes from the
-    /// target directory's live child index; statuses come from the entries
-    /// themselves, and only packed file edges hydrate through the store
-    /// (the pre-existing file read). Target and listed-directory versions
-    /// are validated before returning so the page equals one point-in-time
-    /// namespace state: a grandchild moved between two listed directories
-    /// can never be counted in both.
+    /// Hot-path listing over the live tree. Planning captures the page
+    /// membership as identity edges only; the read locks (path ancestors,
+    /// target, every page child) are taken in one batch, identity and
+    /// membership are re-verified under them, and every status is built
+    /// inside the same locked window. Writers hold the matching write locks
+    /// first, so the page equals one point-in-time namespace state: a
+    /// grandchild moved between two listed directories can never be counted
+    /// in both, and a set_attr cannot tear meta against attributes.
     fn list_options_memory(
         &self,
         path: &str,
         page_opts: &ListOptions,
     ) -> FsResult<Vec<FileStatus>> {
-        for _ in 0..Self::MEMORY_WALK_ATTEMPTS {
+        for _ in 0..Self::MEMORY_READ_ATTEMPTS {
             let fs_dir = self.fs_dir.read();
             Self::checked_live_epoch(&fs_dir)?;
-            let inp = InodePath::resolve_versioned(fs_dir.root_node(), path, fs_dir.store_ref())?;
-            if !inp.is_full() {
-                if inp.walk_is_current() {
-                    return err_ext!(FsError::file_not_found(path));
-                }
+            let plan = Self::plan_memory_read(&fs_dir, path, true, page_opts)?;
+            drop(fs_dir);
+            let _locks = self.inode_locks.lock_many(&plan.lock_requests());
+            let fs_dir = self.fs_dir.read();
+            Self::checked_live_epoch(&fs_dir)?;
+            let verified = Self::plan_memory_read(&fs_dir, path, true, page_opts)?;
+            if !plan.matches(&verified) {
                 continue;
+            }
+            if !verified.full {
+                return err_ext!(FsError::file_not_found(path));
             }
             #[cfg(test)]
             crate::fault_point! {
                 sync,
-                name: "master.metadata.list_options.after_walk",
-                description: "After the memory walk, before the page is built",
+                name: "master.metadata.list_options.locked_build",
+                description: "Inside the locked window before the page is built",
                 context: {"path" => path},
                 return_error: |fault| Err(fault.message.into()),
             }
-            let Some(node) = inp.get_last_dir_node() else {
-                let inode = inp
-                    .get_last_inode()
+            let Some(ChildEdge::Dir(_)) = verified.target_edge else {
+                let ChildEdge::FileId(id) = verified
+                    .target_edge
+                    .expect("non-directory target carries a file edge")
+                else {
+                    unreachable!("non-directory target carries a file edge")
+                };
+                let inode = fs_dir
+                    .store
+                    .get_inode(id, Some(&verified.target_name))?
                     .ok_or_else(|| FsError::file_not_found(path))?;
                 let empty = page_opts.limit == Some(0)
                     || page_opts
                         .start_after
                         .as_ref()
                         .is_some_and(|cursor| inode.name() <= cursor.as_str());
-                let page = if empty {
-                    Vec::new()
-                } else {
-                    vec![inode.as_ref().to_file_status(path)?]
-                };
-                if !inp.walk_is_current() {
-                    continue;
+                if empty {
+                    return Ok(Vec::new());
                 }
-                return Ok(page);
+                return Ok(vec![inode.to_file_status(path)?]);
             };
-            let children = node.children.list_options(page_opts);
-            // Capture each listed directory's version before its status is
-            // built so a concurrent grandchild move between two of them is
-            // detected together with the target's own version below.
-            let child_versions: Vec<DirectoryChildrenSharedVersion> = children
-                .iter()
-                .filter_map(|view| view.children_handle())
-                .map(|children| children.shared_version())
-                .collect();
-            let statuses = fs_dir.store.batched_get_inodes(&inp, children)?;
-            if !inp.walk_is_current() || child_versions.iter().any(|version| !version.is_current())
-            {
-                continue;
+            let mut views = Vec::with_capacity(verified.children.len());
+            for (name, edge) in &verified.children {
+                match edge {
+                    ChildEdge::Dir(child) => {
+                        // Directory DTOs are built fresh under the page's
+                        // read locks, never copied during planning.
+                        views.push(InodeDir::from_dir_node_live(name.clone(), child.clone()))
+                    }
+                    ChildEdge::FileId(id) => views.push(InodeView::new_entry(name.clone(), *id)),
+                }
             }
+            let inp = InodePath::resolve_locked(
+                fs_dir.root_node(),
+                path,
+                fs_dir.store_ref(),
+                &verified.ids,
+                verified.ids.len(),
+            )?
+            .ok_or_else(|| FsError::file_not_found(path))?;
+            let statuses = fs_dir.store.batched_get_inodes(&inp, views)?;
             return Ok(Self::hide_pending(path, statuses));
         }
         // Contention fallback: the pre-S4 snapshot read.

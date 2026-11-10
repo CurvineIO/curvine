@@ -198,9 +198,13 @@ impl InodePath {
                 }
                 Some(ChildEdge::FileId(id)) => {
                     let full = store.get_inode(*id, None)?;
-                    let Some(full) = full else {
+                    let Some(mut full) = full else {
                         return err_box!("Failed to load inode {} from store", id);
                     };
+                    // The edge name is authoritative: hard-link aliases and
+                    // lagging row names must resolve under the requested
+                    // component, matching the snapshot reader's change_name.
+                    full.change_name(components.get(index).cloned().unwrap_or_default());
                     let id = full.id();
                     (id, InodeEntry::View(InodePtr::from_owned(full)))
                 }
