@@ -38,7 +38,9 @@ final class CurvineNativeLibraryResolver {
     }
 
     static String[] getLibraryNames(String sysOs, String osVersion, String arch) {
-        if (sysOs.contains("mac")) {
+        // JDKs report "Mac OS X"; also accept "darwin". Check macOS before Windows and match
+        // Windows by prefix, because "darwin" contains "win".
+        if (sysOs.contains("mac") || sysOs.contains("darwin")) {
             // macOS is for local development and testing. build.sh bundles the dylib under
             // the platform name; the cargo output name lets a plain `cargo build` be loaded
             // from java.library.path without repackaging the jar.
@@ -46,7 +48,7 @@ final class CurvineNativeLibraryResolver {
                 String.format("libcurvine_libsdk_mac_%s_64.dylib", arch),
                 "libcurvine_libsdk.dylib"
             };
-        } else if (sysOs.contains("win")) {
+        } else if (sysOs.startsWith("windows")) {
             return new String[] {"curvine_libsdk.dll"};
         } else if (sysOs.contains("linux")) {
             String archSuffix = arch + "_64";

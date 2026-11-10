@@ -107,6 +107,17 @@ public class LibFsTest {
                 CurvineNativeLibraryResolver.getLibraryNames("mac os x", null, "aarch"));
         Assert.assertArrayEquals(new String[] {"libcurvine_libsdk_mac_x86_64.dylib", "libcurvine_libsdk.dylib"},
                 CurvineNativeLibraryResolver.getLibraryNames("mac os x", null, "x86"));
+        // "darwin" contains "win" and must not be treated as Windows.
+        Assert.assertArrayEquals(new String[] {"libcurvine_libsdk_mac_aarch_64.dylib", "libcurvine_libsdk.dylib"},
+                CurvineNativeLibraryResolver.getLibraryNames("darwin", null, "aarch"));
+    }
+
+    @Test
+    public void windowsLibraryNames() {
+        Assert.assertArrayEquals(new String[] {"curvine_libsdk.dll"},
+                CurvineNativeLibraryResolver.getLibraryNames("windows 10", null, "x86"));
+        Assert.assertArrayEquals(new String[] {"curvine_libsdk.dll"},
+                CurvineNativeLibraryResolver.getLibraryNames("windows server 2019", null, "x86"));
     }
 
     @Test
