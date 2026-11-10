@@ -866,6 +866,14 @@ const MIN_PART_BYTES: usize = 5 << 20;
 /// carry the prefix, so hiding it can never hide user data.
 const STAGING_KEY_PREFIX: &str = ".curvine-s3-";
 
+/// Whether a listed entry is a gateway staging artefact rather than an object.
+///
+/// Sound because the namespace is reserved on every write path; ListObjects and
+/// ListObjectVersions share this predicate so neither can expose staging.
+fn is_staging_name(name: &str) -> bool {
+    name.starts_with(STAGING_KEY_PREFIX)
+}
+
 /// Reject keys whose last segment falls inside the reserved staging namespace.
 fn reject_reserved_key(key: &str) -> Result<(), String> {
     let last = key.rsplit('/').next().unwrap_or(key);
@@ -1254,7 +1262,7 @@ impl ListObjectHandler for S3Handlers {
             for st in list {
                 // Internal staging objects are build artefacts, not objects:
                 // a client listing the bucket must never see them.
-                if st.name.starts_with(".curvine-s3-") {
+                if is_staging_name(&st.name) {
                     continue;
                 }
 
@@ -1305,6 +1313,10 @@ impl ListObjectVersionsHandler for S3Handlers {
 
             for st in list {
                 if st.is_dir {
+                    continue;
+                }
+                // Same rule as ListObjects: staging objects are internal state.
+                if is_staging_name(&st.name) {
                     continue;
                 }
 

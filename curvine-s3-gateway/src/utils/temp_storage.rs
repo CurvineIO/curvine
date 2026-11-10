@@ -39,6 +39,11 @@ pub struct PartMeta {
     pub size: usize,
 }
 
+/// Curvine inode xattr holding a staged part's record. One `get_status` on the
+/// part then yields both the record and the length, so preflight costs one
+/// round trip per part instead of opening and reading a second file.
+const XATTR_PART_META: &str = "s3.part";
+
 /// Trailer layout: magic(8) + version(1) + etag ascii(32) + size u64 LE(8).
 const PART_TRAILER_MAGIC: &[u8; 8] = b"CVS3PART";
 const PART_TRAILER_VERSION: u8 = 1;
@@ -53,6 +58,20 @@ impl PartMeta {
         out[9..41].copy_from_slice(self.etag.as_bytes());
         out[41..49].copy_from_slice(&(self.size as u64).to_le_bytes());
         out
+    }
+
+    /// `"<etag>:<size>"`, the form stored in a Curvine inode xattr so one
+    /// `get_status` returns a part's whole record.
+    fn encode_xattr(&self) -> String {
+        format!("{}:{}", self.etag, self.size)
+    }
+
+    fn decode_xattr(text: &str) -> Option<Self> {
+        let (etag, size) = text.trim().split_once(':')?;
+        Some(Self {
+            etag: etag.to_string(),
+            size: size.parse().ok()?,
+        })
     }
 
     fn decode_trailer(bytes: &[u8]) -> Option<Self> {
@@ -641,23 +660,35 @@ impl CurvineTempStorage {
             return Err(mismatch);
         }
 
-        // The record rides in the part file itself: one rename publishes bytes
-        // and record together, so `Complete` can never see a torn generation.
-        let digest = hasher.compute();
-        let etag = format!("{:x}", digest);
-        let trailer = PartMeta {
-            etag: etag.clone(),
-            size: staged,
-        }
-        .encode_trailer();
-        writer
-            .write(&trailer)
-            .await
-            .map_err(|e| format!("Failed to append part record: {}", e))?;
         writer
             .complete()
             .await
             .map_err(|e| format!("Failed to complete part write in Curvine: {}", e))?;
+
+        // The record rides on the part inode and the rename below is the only
+        // publish point, so bytes and record always come from the same upload
+        // generation. It is also what keeps preflight to one `get_status` per
+        // part instead of an extra open and read.
+        let digest = hasher.compute();
+        let etag = format!("{:x}", digest);
+        let record = PartMeta {
+            etag: etag.clone(),
+            size: staged,
+        }
+        .encode_xattr();
+        if let Err(e) = self
+            .fs
+            .set_attr(
+                &tmp_path,
+                curvine_model::SetAttrOptsBuilder::new()
+                    .add_x_attr(XATTR_PART_META, record.into_bytes())
+                    .build(),
+            )
+            .await
+        {
+            let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
+            return Err(format!("Failed to record part metadata in Curvine: {}", e));
+        }
 
         if let Err(e) = self.fs.rename(&tmp_path, &path).await {
             let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
@@ -667,34 +698,16 @@ impl CurvineTempStorage {
         Ok(format!("\"{etag}\""))
     }
 
-    /// The record in this part file's trailer.
+    /// The record on this part's inode.
+    ///
+    /// One metadata call per part, which is why the record is an xattr here
+    /// rather than a trailer: preflight runs once per listed part, up to the S3
+    /// 10,000-part maximum, on the Complete critical path.
     pub async fn part_meta(&self, upload_id: &str, part_number: u32) -> Option<PartMeta> {
         let path = self.part_path(upload_id, part_number).ok()?;
-        let mut reader = self.fs.open(&path).await.ok()?;
-        let len = reader.len();
-        let meta = self.read_trailer(&mut reader, len).await;
-        // Complete on both the success and the error path: EOF does not send
-        // the completion RPC, so dropping the reader here would leave a
-        // worker-side read context open.
-        let _ = reader.complete().await;
-        meta
-    }
-
-    async fn read_trailer(&self, reader: &mut impl Reader, len: i64) -> Option<PartMeta> {
-        if len < PART_TRAILER_SIZE as i64 {
-            return None;
-        }
-        reader.seek(len - PART_TRAILER_SIZE as i64).await.ok()?;
-        let mut trailer = [0u8; PART_TRAILER_SIZE];
-        let mut filled = 0;
-        while filled < PART_TRAILER_SIZE {
-            let n = reader.read(&mut trailer[filled..]).await.ok()?;
-            if n == 0 {
-                return None;
-            }
-            filled += n;
-        }
-        PartMeta::decode_trailer(&trailer)
+        let status = self.fs.get_status(&path).await.ok()?;
+        let raw = status.x_attr.get(XATTR_PART_META)?;
+        PartMeta::decode_xattr(&String::from_utf8_lossy(raw))
     }
 
     /// Stages a single-object body in Curvine and returns a reader over it.
@@ -784,9 +797,8 @@ impl CurvineTempStorage {
             .await
             .map_err(|e| format!("Failed to open part file in Curvine: {}", e))?;
 
-        // The trailer is the part's own record, not payload: copy exactly the
-        // bytes that were staged.
-        let mut remaining = (reader.len() as u64).saturating_sub(PART_TRAILER_SIZE as u64);
+        // The record lives in an xattr here, so the whole file is payload.
+        let mut remaining = reader.len() as u64;
         let buffer_size = self.config.buffer_size();
         let mut buf = BytesMut::with_capacity(buffer_size);
         buf.resize(buffer_size, 0);
@@ -1357,6 +1369,42 @@ mod tests {
         assert!(storage.part_meta("upload-meta", 1).await.is_none());
 
         storage.cleanup("upload-meta").await.unwrap();
+        let _ = std::fs::remove_dir_all(&temp_path);
+    }
+
+    /// A rejected Complete must not destroy staged parts: the client fixes the
+    /// list and retries. Validation only reads, so the parts and their records
+    /// must still be there afterwards.
+    #[tokio::test]
+    async fn a_rejected_part_list_leaves_the_staged_parts_in_place() {
+        use std::env;
+        use std::io::Cursor;
+
+        let temp_path = env::temp_dir()
+            .join(format!("curvine-test-{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let storage = LocalTempStorage::new(TempStorageConfig::new(temp_path.clone(), 1024, 4096));
+        storage.create_dir("upload-retry").await.unwrap();
+
+        let mut body = tokio::io::BufReader::new(Cursor::new(vec![3u8; 2048]));
+        let etag = storage
+            .write_part_stream("upload-retry", 1, &mut body, StageExpect::default())
+            .await
+            .unwrap();
+
+        // A Complete naming a part that was never uploaded is rejected...
+        assert!(storage.part_meta("upload-retry", 2).await.is_none());
+        // ...and the staged part with its record survives for the retry.
+        assert!(storage.upload_exists("upload-retry").await);
+        assert!(tokio::fs::try_exists(storage.part_path("upload-retry", 1))
+            .await
+            .unwrap());
+        let meta = storage.part_meta("upload-retry", 1).await.unwrap();
+        assert_eq!(meta.etag, etag.trim_matches('"'));
+
+        storage.cleanup("upload-retry").await.unwrap();
         let _ = std::fs::remove_dir_all(&temp_path);
     }
 

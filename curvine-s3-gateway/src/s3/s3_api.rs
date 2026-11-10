@@ -2409,6 +2409,26 @@ mod tests {
         assert_eq!(reject_streaming_part(&part_header("64", None)), Ok(()));
     }
 
+    /// Complete reports protocol conditions as text; without these mappings an
+    /// invalid part list answered 500 and SDKs retried it forever.
+    #[test]
+    fn multipart_validation_errors_map_to_client_errors() {
+        for err in [
+            "InvalidPart: part 2 of upload u is not staged",
+            "InvalidPartOrder: part numbers must be strictly ascending (got 2 then 1)",
+            "EntityTooSmall: part 1 is 10 bytes, below the 5 MiB minimum for a non-final part",
+            "InvalidArgument: object keys may not start a segment with .curvine-s3-",
+        ] {
+            assert_eq!(status_for_error(err), 400, "{err}");
+        }
+        assert_eq!(
+            status_for_error("NoSuchUpload: upload u does not exist"),
+            404
+        );
+        assert_eq!(status_for_error("PreconditionFailed: nope"), 412);
+        assert_eq!(status_for_error("Failed to write to destination: io"), 500);
+    }
+
     #[test]
     fn unsigned_parts_carry_no_digest() {
         assert_eq!(part_sha256(Some("UNSIGNED-PAYLOAD")), None);
