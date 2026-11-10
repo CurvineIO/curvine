@@ -19,7 +19,8 @@ use crate::master::fs::full_block_report::{
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
 use crate::master::meta::inode::{
-    ChildEdge, InodeEntry, InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
+    ChildEdge, DirectoryChildrenSharedVersion, InodeDir, InodeEntry, InodeFile, InodePath,
+    InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
 };
 use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::meta::{
@@ -2649,9 +2650,40 @@ impl MasterFilesystem {
         }
 
         Self::check_not_pending_path(path)?;
-        // Child-index versions protect topology, not mutable inode fields.
-        // Read both the path and its metadata from one store snapshot instead
-        // of cloning live inodes while sharded writers may replace them.
+        self.file_status_memory(path)
+    }
+
+    /// Bounded attempts for a validated live-tree walk. Sustained write
+    /// storms on the walked directories keep failing version validation, so
+    /// exhausted attempts fall back to the snapshot read for progress.
+    const MEMORY_WALK_ATTEMPTS: usize = 4;
+
+    /// Hot-path `file_status` over the live tree. Directory targets are read
+    /// through their stable `DirNode` handles, never a projected pointer;
+    /// file targets reuse the walk's existing store hydration. Every attempt
+    /// validates the captured child-index versions so the reported metadata
+    /// equals one point-in-time namespace state.
+    fn file_status_memory(&self, path: &str) -> FsResult<FileStatus> {
+        for _ in 0..Self::MEMORY_WALK_ATTEMPTS {
+            let fs_dir = self.fs_dir.read();
+            Self::checked_live_epoch(&fs_dir)?;
+            let inp = InodePath::resolve_versioned(fs_dir.root_node(), path, fs_dir.store_ref())?;
+            if !inp.walk_is_current() {
+                continue;
+            }
+            if !inp.is_full() {
+                return err_ext!(FsError::file_not_found(path));
+            }
+            if let Some(node) = inp.get_last_dir_node() {
+                return Ok(InodeDir::from_dir_node_live(inp.name().to_string(), node)
+                    .to_file_status(path)?);
+            }
+            let inode = inp
+                .get_last_inode()
+                .ok_or_else(|| FsError::file_not_found(path))?;
+            return Ok(inode.as_ref().to_file_status(path)?);
+        }
+        // Contention fallback: the pre-S4 snapshot read.
         let fs_dir = self.fs_dir.read();
         let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
         let resolved = snapshot.resolve_path(path)?;
@@ -2660,6 +2692,22 @@ impl MasterFilesystem {
             .ok_or_else(|| FsError::file_not_found(path))?
             .clone();
         Self::file_status_from_snapshot(&snapshot, path, inode)
+    }
+
+    /// Hot-path existence check over the live tree with the same validation
+    /// protocol as [`Self::file_status_memory`]. Called with the namespace
+    /// read guard held.
+    fn exists_memory(&self, fs_dir: &FsDir, path: &str) -> FsResult<bool> {
+        for _ in 0..Self::MEMORY_WALK_ATTEMPTS {
+            Self::checked_live_epoch(fs_dir)?;
+            let inp = InodePath::resolve_versioned(fs_dir.root_node(), path, fs_dir.store_ref())?;
+            if !inp.walk_is_current() {
+                continue;
+            }
+            return Ok(inp.is_full());
+        }
+        let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+        Ok(snapshot.resolve_path(path)?.is_full())
     }
 
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
@@ -2673,10 +2721,7 @@ impl MasterFilesystem {
         }
         let result = {
             let fs_dir = self.fs_dir.read();
-            let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
-            snapshot
-                .resolve_path(path)
-                .map(|resolved| resolved.is_full())
+            self.exists_memory(&fs_dir, path)
         };
         match result {
             Ok(exists) if self.journal_writer.ensure_metadata_current().is_ok() => Ok(exists),
@@ -2746,6 +2791,70 @@ impl MasterFilesystem {
         } else {
             &opts
         };
+        self.list_options_memory(path, page_opts)
+    }
+
+    /// Hot-path listing over the live tree. Page membership comes from the
+    /// target directory's live child index; statuses come from the entries
+    /// themselves, and only packed file edges hydrate through the store
+    /// (the pre-existing file read). Target and listed-directory versions
+    /// are validated before returning so the page equals one point-in-time
+    /// namespace state: a grandchild moved between two listed directories
+    /// can never be counted in both.
+    fn list_options_memory(
+        &self,
+        path: &str,
+        page_opts: &ListOptions,
+    ) -> FsResult<Vec<FileStatus>> {
+        for _ in 0..Self::MEMORY_WALK_ATTEMPTS {
+            let fs_dir = self.fs_dir.read();
+            Self::checked_live_epoch(&fs_dir)?;
+            let inp = InodePath::resolve_versioned(fs_dir.root_node(), path, fs_dir.store_ref())?;
+            if !inp.walk_is_current() {
+                continue;
+            }
+            if !inp.is_full() {
+                return err_ext!(FsError::file_not_found(path));
+            }
+            let Some(node) = inp.get_last_dir_node() else {
+                let inode = inp
+                    .get_last_inode()
+                    .ok_or_else(|| FsError::file_not_found(path))?;
+                if page_opts.limit == Some(0)
+                    || page_opts
+                        .start_after
+                        .as_ref()
+                        .is_some_and(|cursor| inode.name() <= cursor.as_str())
+                {
+                    return Ok(Vec::new());
+                }
+                return Ok(vec![inode.as_ref().to_file_status(path)?]);
+            };
+            let children = node.children.list_options(page_opts);
+            // Capture each listed directory's version before its status is
+            // built so a concurrent grandchild move between two of them is
+            // detected together with the target's own version below.
+            let child_versions: Vec<DirectoryChildrenSharedVersion> = children
+                .iter()
+                .filter_map(|view| view.children_handle())
+                .map(|children| children.shared_version())
+                .collect();
+            let statuses = fs_dir.store.batched_get_inodes(&inp, children)?;
+            if !inp.walk_is_current() || child_versions.iter().any(|version| !version.is_current())
+            {
+                continue;
+            }
+            return Ok(Self::hide_pending(path, statuses));
+        }
+        // Contention fallback: the pre-S4 snapshot read.
+        self.list_options_snapshot(path, page_opts)
+    }
+
+    fn list_options_snapshot(
+        &self,
+        path: &str,
+        page_opts: &ListOptions,
+    ) -> FsResult<Vec<FileStatus>> {
         let fs_dir = self.fs_dir.read();
         let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
         let resolved = snapshot.resolve_path(path)?;

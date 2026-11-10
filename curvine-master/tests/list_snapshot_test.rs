@@ -22,6 +22,102 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 #[test]
+fn memory_reads_match_snapshot_semantics() {
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("memory-reads-{}", Utils::rand_str(8)));
+    let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+    fs.mkdir("/dir", true).unwrap();
+    fs.create("/dir/file", false).unwrap();
+    fs.mkdir("/dir/child", true).unwrap();
+
+    let dir_status = fs.file_status("/dir").unwrap();
+    assert!(dir_status.is_dir);
+    assert_eq!(dir_status.children_num, 2);
+
+    let listing = fs.list_status("/dir").unwrap();
+    let names: Vec<&str> = listing.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names, vec!["child", "file"]);
+
+    let page = fs
+        .list_options(
+            "/dir",
+            ListOptions {
+                start_after: Some("child".to_string()),
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].name, "file");
+
+    let file_status = fs.file_status("/dir/file").unwrap();
+    assert!(!file_status.is_dir);
+    assert!(fs.exists("/dir/child").unwrap());
+    assert!(!fs.exists("/dir/missing").unwrap());
+
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/dir").unwrap().children_num, 2);
+    assert_eq!(fs.list_status("/dir").unwrap().len(), 2);
+    assert!(fs.exists("/dir/file").unwrap());
+}
+
+#[test]
+fn memory_listing_stays_point_in_time_under_grandchild_moves() {
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("memory-list-race-{}", Utils::rand_str(8)));
+    let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+    fs.mkdir("/left", true).unwrap();
+    fs.mkdir("/left/a", true).unwrap();
+    fs.mkdir("/left/b", true).unwrap();
+    fs.create("/left/a/x", false).unwrap();
+    let (done, done_rx) = mpsc::channel::<()>();
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        for _ in 0..200 {
+            worker_fs
+                .rename("/left/a/x", "/left/b/x", RenameFlags::empty())
+                .unwrap();
+            worker_fs
+                .rename("/left/b/x", "/left/a/x", RenameFlags::empty())
+                .unwrap();
+        }
+        done.send(()).unwrap();
+    });
+    for _ in 0..200 {
+        let statuses = fs.list_status("/left").unwrap();
+        let mut names: Vec<&str> = statuses.iter().map(|entry| entry.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), statuses.len(), "duplicate page entry");
+        let a_num = statuses
+            .iter()
+            .find(|entry| entry.name == "a")
+            .map(|entry| entry.children_num)
+            .unwrap();
+        let b_num = statuses
+            .iter()
+            .find(|entry| entry.name == "b")
+            .map(|entry| entry.children_num)
+            .unwrap();
+        assert!(
+            (a_num, b_num) == (1, 0) || (a_num, b_num) == (0, 1),
+            "torn grandchild counts: a={a_num} b={b_num}"
+        );
+    }
+    worker.join().unwrap();
+    drop(done_rx);
+}
+
+#[test]
 fn listing_matches_live_status_fields() {
     Master::init_test_metrics();
     let mut conf = ClusterConf {
