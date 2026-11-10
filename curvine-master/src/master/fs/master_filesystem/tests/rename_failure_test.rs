@@ -14,6 +14,40 @@
 
 use super::*;
 
+#[test]
+fn moved_directory_ctime_matches_live_attributes() {
+    let fs = test_fs("moved-directory-ctime");
+    fs.mkdir("/left/a", true).unwrap();
+    fs.mkdir("/right/b", true).unwrap();
+    let (a, b) = {
+        let dir = fs.fs_dir.read();
+        let a = InodePath::resolve(dir.root_node(), "/left/a", dir.store_ref()).unwrap();
+        let b = InodePath::resolve(dir.root_node(), "/right/b", dir.store_ref()).unwrap();
+        (
+            a.get_last_dir_node().unwrap(),
+            b.get_last_dir_node().unwrap(),
+        )
+    };
+    let a_before = a.directory_attributes().ctime;
+    let b_before = b.directory_attributes().ctime;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    fs.rename("/left/a", "/right/b", RenameFlags::EXCHANGE)
+        .unwrap();
+    let a_after = a.directory_attributes().ctime;
+    let b_after = b.directory_attributes().ctime;
+    assert!(a_after > a_before && b_after > b_before);
+    assert_eq!(a_after, fs.file_status("/right/b").unwrap().ctime());
+    assert_eq!(b_after, fs.file_status("/left/a").unwrap().ctime());
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    fs.rename("/right/b", "/left/c", RenameFlags::empty())
+        .unwrap();
+    assert!(a.directory_attributes().ctime > a_after);
+    assert_eq!(
+        a.directory_attributes().ctime,
+        fs.file_status("/left/c").unwrap().ctime()
+    );
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn rename_reloads_inode_after_a_hard_link_is_added() {
@@ -129,6 +163,14 @@ fn rename_commit_failure_keeps_parent_metadata_and_tree() {
     let before_left = fs.file_status("/left").unwrap();
     let before_right = fs.file_status("/right").unwrap();
     let before_source = fs.file_status(&source_path).unwrap();
+    let source_node = {
+        let dir = fs.fs_dir.read();
+        InodePath::resolve(dir.root_node(), &source_path, dir.store_ref())
+            .unwrap()
+            .get_last_dir_node()
+            .unwrap()
+    };
+    let before_attrs = source_node.directory_attributes();
     let runtime = FaultRuntime::process();
     let rule_id = format!("rename-failure-{name}");
     let rule = FaultRuleBuilder::named("master.metadata.rename.before_commit")
@@ -145,6 +187,7 @@ fn rename_commit_failure_keeps_parent_metadata_and_tree() {
         .unwrap_err()
         .to_string()
         .contains("injected rename commit failure"));
+    assert_eq!(source_node.directory_attributes(), before_attrs);
     for restored in [false, true] {
         if restored {
             fs.restore_from_rocksdb().unwrap();
@@ -160,6 +203,10 @@ fn rename_commit_failure_keeps_parent_metadata_and_tree() {
             (before_right.mtime, before_right.nlink)
         );
         assert_eq!(fs.file_status(&source_path).unwrap().id, before_source.id);
+        assert_eq!(
+            fs.file_status(&source_path).unwrap().ctime(),
+            before_source.ctime()
+        );
         assert!(fs.exists(&format!("{source_path}/child")).unwrap());
         assert!(!fs.exists("/right/target").unwrap());
     }

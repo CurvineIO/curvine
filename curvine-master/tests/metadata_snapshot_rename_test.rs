@@ -47,6 +47,61 @@ fn live_dir_parent_id(fs: &MasterFilesystem, path: &str) -> i64 {
         .parent_id()
 }
 
+#[test]
+fn directory_rename_ctime_survives_restore() {
+    Master::init_test_metrics();
+    for (src, dst) in [("/p/a", "/p/c"), ("/p/a", "/q/c")] {
+        let mut conf = ClusterConf {
+            testing: true,
+            ..Default::default()
+        };
+        conf.change_test_meta_dir(format!("rename-ctime-{}", Utils::rand_str(8)));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.mkdir(src, true).unwrap();
+        fs.mkdir("/q", true).unwrap();
+        fs.set_attr(
+            src,
+            SetAttrOpts {
+                mtime: Some(-10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let before = fs.file_status(src).unwrap().ctime();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs.rename(src, dst, RenameFlags::empty()).unwrap();
+        let after = fs.file_status(dst).unwrap().ctime();
+        assert!(after > before, "directory rename must update ctime");
+        assert_eq!(fs.file_status(dst).unwrap().mtime, -10);
+        fs.restore_from_rocksdb().unwrap();
+        assert_eq!(fs.file_status(dst).unwrap().ctime(), after);
+        assert_eq!(fs.file_status(dst).unwrap().mtime, -10);
+    }
+}
+
+#[test]
+fn directory_exchange_ctime_survives_restore() {
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("exchange-ctime-{}", Utils::rand_str(8)));
+    let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+    fs.mkdir("/p/a", true).unwrap();
+    fs.mkdir("/q/b", true).unwrap();
+    let a_before = fs.file_status("/p/a").unwrap().ctime();
+    let b_before = fs.file_status("/q/b").unwrap().ctime();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    fs.rename("/p/a", "/q/b", RenameFlags::EXCHANGE).unwrap();
+    let a_after = fs.file_status("/q/b").unwrap().ctime();
+    let b_after = fs.file_status("/p/a").unwrap().ctime();
+    assert!(a_after > a_before && b_after > b_before);
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/q/b").unwrap().ctime(), a_after);
+    assert_eq!(fs.file_status("/p/a").unwrap().ctime(), b_after);
+}
+
 /// A same-directory directory rename must move the live node, not rebuild it:
 /// the subtree behind the edge has to survive `/a` -> `/c` unchanged.
 #[test]
