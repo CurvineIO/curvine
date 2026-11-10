@@ -1833,7 +1833,7 @@ impl JournalLoader {
     }
 
     pub fn free(&self, entry: FreeEntry) -> CommonResult<()> {
-        let mut fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
         let Some(inode) = inp.get_last_inode() else {
             warn!("Free: path not found: {:?}", entry);

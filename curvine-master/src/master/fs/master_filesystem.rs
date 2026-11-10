@@ -6425,6 +6425,8 @@ mod tests {
         );
     }
 
+    #[path = "cache_invalidation_lock_test.rs"]
+    mod cache_invalidation_lock_test;
     #[path = "complete_file_sharding_test.rs"]
     mod complete_file_sharding_test;
     #[path = "create_failure_test.rs"]

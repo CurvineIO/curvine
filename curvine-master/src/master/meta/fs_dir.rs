@@ -1504,7 +1504,7 @@ impl FsDir {
     }
 
     pub(crate) fn unprotected_free(
-        &mut self,
+        &self,
         inode: InodePtr,
         mtime: i64,
         recursive: bool,
