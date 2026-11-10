@@ -22,6 +22,9 @@ pub enum ApplyMsg {
     Entry(Entry),
     EntryWithAck((Entry, CallSender<RaftResult<()>>)),
     Scan(AppliedIndex),
+    /// Synchronous scan completion for JournalLoader's online apply worker.
+    /// Process-local control message, not a journal record.
+    ScanWithAck((AppliedIndex, CallSender<RaftResult<()>>)),
     CreateSnapshot(CallSender<RaftResult<SnapshotData>>),
     ApplySnapshot((CallSender<RaftResult<()>>, SnapshotData)),
     RoleChange((StateRole, u64, CallSender<RaftResult<()>>)),

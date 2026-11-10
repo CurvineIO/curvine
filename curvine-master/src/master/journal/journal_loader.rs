@@ -57,6 +57,10 @@ use tokio::sync::Notify;
 #[path = "tests/role_queue_fence_test.rs"]
 mod role_queue_fence_test;
 
+#[cfg(test)]
+#[path = "tests/scan_worker_test.rs"]
+mod scan_worker_test;
+
 enum UfsDrive {
     CaughtUp,
     Advanced,
@@ -921,6 +925,7 @@ impl JournalLoader {
                                 Some(ApplyMsg::RoleChange(change)) => ApplyMsg::RoleChange(change),
                                 Some(ApplyMsg::Shutdown(tx)) => ApplyMsg::Shutdown(tx),
                                 Some(ApplyMsg::CreateSnapshot(tx)) => ApplyMsg::CreateSnapshot(tx),
+                                Some(msg @ ApplyMsg::ScanWithAck(_)) => msg,
                                 Some(other) => {
                                     buffered.push_back(other);
                                     continue;
@@ -952,6 +957,17 @@ impl JournalLoader {
                     };
                     if let Err(e) = tx.send(result) {
                         warn!("send create snapshot result failed: {}", e);
+                    }
+                }
+
+                ApplyMsg::ScanWithAck((applied, tx)) => {
+                    // Preserve the direct recovery scan's non-leader semantics.
+                    let result = self
+                        .apply_msg(false, &ApplyMsg::new_scan(applied), false)
+                        .await
+                        .map_err(Into::into);
+                    if let Err(e) = tx.send(result) {
+                        warn!("send scan result failed: {}", e);
                     }
                 }
 
@@ -2035,13 +2051,22 @@ impl AppStorage for JournalLoader {
             return self.apply_direct(msg).await;
         }
 
-        if matches!(&msg, ApplyMsg::EntryWithAck(_)) {
+        if matches!(&msg, ApplyMsg::EntryWithAck(_) | ApplyMsg::ScanWithAck(_)) {
             self.sender.send(msg).await?;
             return Ok(());
         }
 
         if wait {
-            return self.apply_direct(msg).await;
+            return match msg {
+                ApplyMsg::Scan(applied) => {
+                    let (tx, rx) = CallChannel::channel();
+                    self.sender
+                        .send(ApplyMsg::ScanWithAck((applied, tx)))
+                        .await?;
+                    rx.receive().await?
+                }
+                other => self.apply_direct(other).await,
+            };
         }
 
         self.sender.send(msg).await?;
