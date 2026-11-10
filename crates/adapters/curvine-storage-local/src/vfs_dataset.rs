@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::layout::{FileFinalizePlan, SidecarSync};
+use crate::{BlockChecksum, BlockMeta, BlockState, ChecksumVerify};
 use crate::{
     BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirFreeRatio, DirList, FileLayout,
     SpdkMetaStore, StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
 };
-use crate::{BlockMeta, BlockState, ChecksumVerify};
 use curvine_config::{ClusterConf, WorkerDataDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
@@ -96,6 +96,9 @@ pub struct FileFinalizeReservation {
     pending: BlockMeta,
     dir: Arc<VfsDir>,
     checksum: bool,
+    /// Checksum accumulated by the write session that produced the staging
+    /// bytes, if it covered them sequentially from offset 0.
+    checksum_hint: Option<BlockChecksum>,
 }
 
 impl FileFinalizeReservation {
@@ -103,10 +106,15 @@ impl FileFinalizeReservation {
     /// writer may still change the bytes after the checksum pass.
     pub fn skip_checksum(&mut self) {
         self.checksum = false;
+        self.checksum_hint = None;
     }
 
-    pub fn prepare(&self, committed_len: i64) -> CommonResult<FileFinalizePlan> {
-        FileLayout::prepare_finalize(&self.dir, &self.pending, committed_len, self.checksum)
+    pub fn prepare(&mut self, committed_len: i64) -> CommonResult<FileFinalizePlan> {
+        let hint = self
+            .checksum_hint
+            .take()
+            .filter(|hint| committed_len >= 0 && hint.data_len() == committed_len as u64);
+        FileLayout::prepare_finalize(&self.dir, &self.pending, committed_len, self.checksum, hint)
     }
 }
 
@@ -428,9 +436,24 @@ impl VfsDataset {
         Ok(())
     }
 
+    /// Whether finalized file blocks get a checksum sidecar.
+    pub fn block_checksum(&self) -> bool {
+        self.block_checksum
+    }
+
     pub fn reserve_file_finalize(
         &mut self,
         block: &ExtendedBlock,
+    ) -> CommonResult<Option<FileFinalizeReservation>> {
+        self.reserve_file_finalize_with_checksum(block, None)
+    }
+
+    /// Reserve a finalize and carry the checksum of the bytes the write session
+    /// wrote, so the sidecar does not have to re-read the staging file.
+    pub fn reserve_file_finalize_with_checksum(
+        &mut self,
+        block: &ExtendedBlock,
+        checksum_hint: Option<BlockChecksum>,
     ) -> CommonResult<Option<FileFinalizeReservation>> {
         let writing = self.get_block_check(block.id)?.clone();
         if writing.storage_type() == StorageType::SpdkDisk
@@ -457,6 +480,7 @@ impl VfsDataset {
             pending,
             dir,
             checksum: self.block_checksum,
+            checksum_hint,
         }))
     }
 
@@ -1569,7 +1593,7 @@ mod test {
     }
 
     fn finalize_reserved(ds: &mut VfsDataset, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        let reservation = ds
+        let mut reservation = ds
             .reserve_file_finalize(block)?
             .expect("file block must use reservation");
         match reservation.prepare(block.len) {
@@ -1610,6 +1634,54 @@ mod test {
         assert_eq!(read_checksum(&active_path)?.data_len(), 60);
         let staging_dir = ds.find_dir(finalized.dir_id())?.base_path().join("staging");
         assert_eq!(std::fs::read_dir(staging_dir)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_uses_matching_checksum_hint() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-hint");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let writing = ds.open_block(&block)?;
+        let bytes = vec![3u8; 60];
+        std::fs::write(block_file(&ds, &writing)?, &bytes)?;
+        block.len = bytes.len() as i64;
+
+        // Same length, different bytes: the sidecar must be the hint, which
+        // proves finalize did not re-read the staging file.
+        let hint = BlockChecksum::compute(DEFAULT_CHECKSUM_CHUNK_SIZE, &[9u8; 60])?;
+        let mut reservation = ds
+            .reserve_file_finalize_with_checksum(&block, Some(hint.clone()))?
+            .expect("file block must use reservation");
+        let plan = reservation.prepare(block.len)?;
+        let (finalized, sync) = ds.publish_file_finalize(&reservation, plan)?;
+        if let Some(sync) = sync {
+            sync.finish();
+        }
+        assert_eq!(read_checksum(&block_file(&ds, &finalized)?)?, hint);
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_ignores_checksum_hint_with_wrong_length() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-hint-mismatch");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let writing = ds.open_block(&block)?;
+        let bytes = vec![5u8; 60];
+        std::fs::write(block_file(&ds, &writing)?, &bytes)?;
+        block.len = bytes.len() as i64;
+
+        // A hint that does not cover `block.len` must be dropped in favour of
+        // the streaming read of the published bytes.
+        let stale = BlockChecksum::compute(DEFAULT_CHECKSUM_CHUNK_SIZE, &[9u8; 10])?;
+        let mut reservation = ds
+            .reserve_file_finalize_with_checksum(&block, Some(stale))?
+            .expect("file block must use reservation");
+        let plan = reservation.prepare(block.len)?;
+        let (finalized, sync) = ds.publish_file_finalize(&reservation, plan)?;
+        if let Some(sync) = sync {
+            sync.finish();
+        }
+        assert_checksum_matches(&block_file(&ds, &finalized)?)?;
         Ok(())
     }
 
@@ -1701,7 +1773,7 @@ mod test {
 
         // A lost reservation fails in publish after the sidecar was written.
         block.len = 40;
-        let reservation = ds.reserve_file_finalize(&block)?.unwrap();
+        let mut reservation = ds.reserve_file_finalize(&block)?.unwrap();
         let plan = reservation.prepare(block.len)?;
         assert!(FileLayout::checksum_path_of(&staging_path).exists());
         ds.rollback_file_finalize(&reservation)?;

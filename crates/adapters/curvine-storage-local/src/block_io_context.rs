@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::BlockChecksum;
+use crate::{BlockChecksum, ChecksumBuilder};
 use bytes::BytesMut;
 use curvine_core_error::{err_box, try_err};
 use curvine_io::DataSlice;
@@ -24,6 +24,17 @@ fn absolute_offset(device_base: i64, block_off: i64) -> IOResult<i64> {
         .ok_or_else(|| IOError::from("absolute block offset overflow"))
 }
 
+/// Incremental checksum of the bytes written by one write session.
+///
+/// `valid` is cleared as soon as the session stops being a plain sequential
+/// append from block offset 0 (seek, rewrite, resize). Finalize then falls back
+/// to re-reading the published file, so a sidecar is never built from a partial
+/// view of the block.
+struct IncrementalChecksum {
+    builder: ChecksumBuilder,
+    valid: bool,
+}
+
 /// Block-relative write session produced by layout.
 pub struct BlockWriteContext {
     device: Box<dyn BlockIO>,
@@ -31,6 +42,7 @@ pub struct BlockWriteContext {
     device_base: i64,
     block_size: i64,
     block_pos: i64,
+    checksum: Option<IncrementalChecksum>,
 }
 
 impl BlockWriteContext {
@@ -60,7 +72,41 @@ impl BlockWriteContext {
             device_base,
             block_size,
             block_pos: initial_off,
+            checksum: None,
         })
+    }
+
+    /// Start tracking a per-chunk checksum of the written bytes.
+    ///
+    /// Only a session that starts at offset 0 can ever cover the whole block,
+    /// so a later offset leaves the context without a checksum and finalize
+    /// keeps re-reading the file.
+    pub fn enable_checksum(&mut self, chunk_size: u32) {
+        if self.block_pos != 0 || self.checksum.is_some() {
+            return;
+        }
+        match ChecksumBuilder::new(chunk_size) {
+            Ok(builder) => {
+                self.checksum = Some(IncrementalChecksum {
+                    builder,
+                    valid: true,
+                })
+            }
+            Err(e) => log::warn!("disable incremental block checksum: {}", e),
+        }
+    }
+
+    /// Hand over the checksum of the written bytes, or `None` when the session
+    /// was not a sequential append from offset 0.
+    pub fn take_checksum(&mut self) -> Option<BlockChecksum> {
+        let state = self.checksum.take()?;
+        state.valid.then(|| state.builder.finish())
+    }
+
+    fn invalidate_checksum(&mut self) {
+        if let Some(state) = self.checksum.as_mut() {
+            state.valid = false;
+        }
     }
 
     pub fn path(&self) -> &str {
@@ -87,12 +133,15 @@ impl BlockWriteContext {
             let absolute = absolute_offset(self.device_base, block_off)?;
             try_err!(self.device.seek(absolute));
             self.block_pos = block_off;
+            // The session no longer describes the bytes before `block_off`.
+            self.invalidate_checksum();
         }
         Ok(())
     }
 
     pub fn write_region(&mut self, region: &DataSlice) -> IOResult<()> {
         let data_len = region.len() as i64;
+        let start = self.block_pos;
         let Some(write_end) = self.block_pos.checked_add(data_len) else {
             return err_box!(
                 "Write range overflow: offset={}, length={}",
@@ -110,6 +159,13 @@ impl BlockWriteContext {
         }
         try_err!(self.device.write_region(region));
         self.block_pos = write_end;
+        if let Some(state) = self.checksum.as_mut() {
+            if state.valid && start == state.builder.data_len() as i64 {
+                state.builder.update(region.as_slice());
+            } else {
+                state.valid = false;
+            }
+        }
         Ok(())
     }
 
@@ -143,6 +199,9 @@ impl BlockWriteContext {
         }
         let absolute = absolute_offset(self.device_base, block_off)?;
         try_err!(self.device.resize(truncate, absolute, len, mode));
+        // Resize changes the published bytes (truncation, preallocation or a
+        // rewritten tail), so the written range is no longer authoritative.
+        self.invalidate_checksum();
         Ok(())
     }
 
@@ -458,6 +517,58 @@ mod tests {
         if let Some(parent) = std::path::Path::new(path).parent() {
             std::fs::create_dir_all(parent)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_checksum_covers_sequential_writes() -> Result<(), Box<dyn std::error::Error>> {
+        let path = Utils::test_file();
+        ensure_parent(&path)?;
+        let device = shared_write_device(&path)?;
+        let mut ctx = BlockWriteContext::new(device, 0, 1024, 0)?;
+        ctx.enable_checksum(64);
+        ctx.write_region(&DataSlice::from_str("ABCD"))?;
+        ctx.write_region(&DataSlice::from_str("E".repeat(100)))?;
+
+        let sum = ctx
+            .take_checksum()
+            .expect("a sequential session has a checksum");
+        let written = std::fs::read(&path)?;
+        assert_eq!(sum, BlockChecksum::compute(64, &written)?);
+        // The session hands its checksum over once; a second take is empty.
+        assert!(ctx.take_checksum().is_none());
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn mid_block_session_never_tracks_a_checksum() -> Result<(), Box<dyn std::error::Error>> {
+        let path = Utils::test_file();
+        ensure_parent(&path)?;
+        let device = shared_write_device(&path)?;
+        let mut ctx = BlockWriteContext::new(device, 0, 1024, 8)?;
+        ctx.enable_checksum(64);
+        ctx.write_region(&DataSlice::from_str("ABCD"))?;
+        assert!(ctx.take_checksum().is_none());
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn seek_backwards_invalidates_checksum() -> Result<(), Box<dyn std::error::Error>> {
+        let path = Utils::test_file();
+        ensure_parent(&path)?;
+        let device = shared_write_device(&path)?;
+        let mut ctx = BlockWriteContext::new(device, 0, 1024, 0)?;
+        ctx.enable_checksum(64);
+        ctx.write_region(&DataSlice::from_str("ABCDEFGH"))?;
+        ctx.seek_to(0)?;
+        ctx.write_region(&DataSlice::from_str("XY"))?;
+        assert!(ctx.take_checksum().is_none());
+
+        let _ = remove_file(&path);
         Ok(())
     }
 
