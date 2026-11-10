@@ -164,6 +164,37 @@ impl MemoryReadPlan {
     }
 }
 
+/// Test-only gate that parks a memory-read thread inside its locked window
+/// until the driving test releases it, so lock-window tests confirm entry
+/// and writer arrival instead of racing a fixed sleep.
+#[cfg(test)]
+pub(crate) mod memory_read_gates {
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::LazyLock;
+    use std::time::Duration;
+
+    static GATES: LazyLock<Mutex<HashMap<String, Receiver<()>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Registers a release channel for `point`; returns the release handle.
+    pub fn install(point: &str) -> Sender<()> {
+        let (sender, receiver) = channel();
+        GATES.lock().insert(point.to_string(), receiver);
+        sender
+    }
+
+    /// Blocks the caller until the gate is released or the safety timeout
+    /// expires, so a failing test can never hang the suite.
+    pub fn park(point: &str, timeout: Duration) {
+        let receiver: Option<Receiver<()>> = GATES.lock().remove(point);
+        if let Some(receiver) = receiver {
+            let _ = receiver.recv_timeout(timeout);
+        }
+    }
+}
+
 /// Result of [`MasterFilesystem::free_or_defer`].
 pub enum FreeOutcome {
     Freed(FreeResult),
@@ -2764,12 +2795,30 @@ impl MasterFilesystem {
     fn file_status_memory(&self, path: &str) -> FsResult<FileStatus> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
             let fs_dir = self.fs_dir.read();
-            Self::checked_live_epoch(&fs_dir)?;
+            // Reads stay available while the restore flag is set: the
+            // snapshot protocol is the pre-S4 safe reader in that window.
+            let plan_epoch = match Self::checked_live_epoch(&fs_dir) {
+                Ok(epoch) => epoch,
+                Err(_) => {
+                    drop(fs_dir);
+                    return self.file_status_snapshot(path);
+                }
+            };
             let plan = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
             drop(fs_dir);
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
             let fs_dir = self.fs_dir.read();
-            Self::checked_live_epoch(&fs_dir)?;
+            let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
+                Ok(epoch) => epoch,
+                Err(_) => {
+                    drop(_locks);
+                    drop(fs_dir);
+                    return self.file_status_snapshot(path);
+                }
+            };
+            if locked_epoch != plan_epoch {
+                continue;
+            }
             let verified = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
             if !plan.matches(&verified) {
                 continue;
@@ -2785,6 +2834,11 @@ impl MasterFilesystem {
                 context: {"path" => path},
                 return_error: |fault| Err(fault.message.into()),
             }
+            #[cfg(test)]
+            memory_read_gates::park(
+                "master.metadata.file_status.locked_build",
+                std::time::Duration::from_secs(5),
+            );
             let status = match verified.target_edge {
                 // Directory DTO freshly built under the target's read lock:
                 // set_attr holds the write lock, so meta and attributes read
@@ -2805,6 +2859,13 @@ impl MasterFilesystem {
             return Ok(status);
         }
         // Contention fallback: the pre-S4 snapshot read.
+        self.file_status_snapshot(path)
+    }
+
+    /// Pre-S4 status read: one store snapshot decides edges, inode rows and
+    /// directory attributes together. Also the safe reader while the restore
+    /// flag is set, mirroring the old hot-path semantics.
+    fn file_status_snapshot(&self, path: &str) -> FsResult<FileStatus> {
         let fs_dir = self.fs_dir.read();
         let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
         let resolved = snapshot.resolve_path(path)?;
@@ -2820,18 +2881,49 @@ impl MasterFilesystem {
     fn exists_memory(&self, path: &str) -> FsResult<bool> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
             let fs_dir = self.fs_dir.read();
-            Self::checked_live_epoch(&fs_dir)?;
+            let plan_epoch = match Self::checked_live_epoch(&fs_dir) {
+                Ok(epoch) => epoch,
+                Err(_) => {
+                    drop(fs_dir);
+                    return self.exists_snapshot(path);
+                }
+            };
             let plan = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
             drop(fs_dir);
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
             let fs_dir = self.fs_dir.read();
-            Self::checked_live_epoch(&fs_dir)?;
+            let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
+                Ok(epoch) => epoch,
+                Err(_) => {
+                    drop(_locks);
+                    drop(fs_dir);
+                    return self.exists_snapshot(path);
+                }
+            };
+            if locked_epoch != plan_epoch {
+                continue;
+            }
             let verified = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
             if !plan.matches(&verified) {
                 continue;
             }
+            // File targets keep the pre-S4 inode-row existence check: a
+            // missing row behind a live edge is the deletion-publication
+            // window owned by the caller's drain fallback.
+            if let Some(ChildEdge::FileId(id)) = verified.target_edge {
+                if fs_dir.store.get_inode(id, None)?.is_none() {
+                    return err_box!("Failed to load inode {} from store", id);
+                }
+            }
             return Ok(verified.full);
         }
+        self.exists_snapshot(path)
+    }
+
+    /// Pre-S4 existence read: one store snapshot decides both edges and
+    /// inode rows, so a row deleted ahead of its journal publication never
+    /// reports the live edge alone.
+    fn exists_snapshot(&self, path: &str) -> FsResult<bool> {
         let fs_dir = self.fs_dir.read();
         let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
         Ok(snapshot.resolve_path(path)?.is_full())
@@ -2933,12 +3025,28 @@ impl MasterFilesystem {
     ) -> FsResult<Vec<FileStatus>> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
             let fs_dir = self.fs_dir.read();
-            Self::checked_live_epoch(&fs_dir)?;
+            let plan_epoch = match Self::checked_live_epoch(&fs_dir) {
+                Ok(epoch) => epoch,
+                Err(_) => {
+                    drop(fs_dir);
+                    return self.list_options_snapshot(path, page_opts);
+                }
+            };
             let plan = Self::plan_memory_read(&fs_dir, path, true, page_opts)?;
             drop(fs_dir);
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
             let fs_dir = self.fs_dir.read();
-            Self::checked_live_epoch(&fs_dir)?;
+            let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
+                Ok(epoch) => epoch,
+                Err(_) => {
+                    drop(_locks);
+                    drop(fs_dir);
+                    return self.list_options_snapshot(path, page_opts);
+                }
+            };
+            if locked_epoch != plan_epoch {
+                continue;
+            }
             let verified = Self::plan_memory_read(&fs_dir, path, true, page_opts)?;
             if !plan.matches(&verified) {
                 continue;
@@ -2954,6 +3062,11 @@ impl MasterFilesystem {
                 context: {"path" => path},
                 return_error: |fault| Err(fault.message.into()),
             }
+            #[cfg(test)]
+            memory_read_gates::park(
+                "master.metadata.list_options.locked_build",
+                std::time::Duration::from_secs(5),
+            );
             let Some(ChildEdge::Dir(_)) = verified.target_edge else {
                 let ChildEdge::FileId(id) = verified
                     .target_edge

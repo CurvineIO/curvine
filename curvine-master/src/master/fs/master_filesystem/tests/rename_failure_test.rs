@@ -14,9 +14,10 @@
 
 use super::*;
 
+#[cfg(feature = "fault-injection")]
 #[test]
 fn file_status_lock_window_excludes_rename_writers() {
-    use curvine_fault::{FaultAction, FaultRuleBuilder, FaultRuntime};
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -26,7 +27,7 @@ fn file_status_lock_window_excludes_rename_writers() {
     let before = fs.file_status("/p/a").unwrap();
     let runtime = FaultRuntime::process();
     let entry_id = "file-status-lock-entry";
-    let park_id = "file-status-lock-park";
+    let arrival_id = "file-status-lock-arrival";
     runtime
         .configure(
             entry_id,
@@ -39,58 +40,87 @@ fn file_status_lock_window_excludes_rename_writers() {
         .unwrap();
     runtime
         .configure(
-            park_id,
-            FaultRuleBuilder::named("master.metadata.file_status.locked_build")
+            arrival_id,
+            FaultRuleBuilder::named("master.metadata.rename_planned")
                 .matches("path", "/p/a")
                 .unwrap()
-                .times(1)
-                .unwrap()
-                .action(FaultAction::Delay { duration_ms: 300 })
+                .record()
                 .unwrap(),
         )
         .unwrap();
+    let release = crate::master::fs::master_filesystem::memory_read_gates::install(
+        "master.metadata.file_status.locked_build",
+    );
     let reader_fs = fs.clone();
     let reader = std::thread::spawn(move || reader_fs.file_status("/p/a"));
-    // Deterministic entry: the record rule only fires inside the locked
-    // window, after the read locks are held. The writer is released only
-    // once that entry is confirmed.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while runtime.rule(entry_id).unwrap().unwrap().executions == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "reader never reached the locked build window"
-        );
-        std::thread::yield_now();
+
+    fn confirm(runtime: &FaultRuntime, id: &str, deadline: Instant) -> bool {
+        while Instant::now() < deadline {
+            if runtime
+                .rule(id)
+                .ok()
+                .and_then(|rule| rule)
+                .is_some_and(|rule| rule.executions > 0)
+            {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        false
     }
-    let (done, done_rx) = mpsc::channel::<()>();
-    let writer_fs = fs.clone();
-    let writer = std::thread::spawn(move || {
-        writer_fs
-            .rename("/p/a", "/q/a", RenameFlags::empty())
-            .unwrap();
-        done.send(()).unwrap();
-    });
-    std::thread::sleep(Duration::from_millis(50));
-    assert!(
-        done_rx.try_recv().is_err(),
-        "rename must block while the locked read window holds inode locks"
-    );
+
+    let mut failures = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    if !confirm(&runtime, entry_id, deadline) {
+        failures.push("reader never reached the locked build window".to_string());
+    }
+    let writer = if failures.is_empty() {
+        let (done, done_rx) = mpsc::channel::<()>();
+        let writer_fs = fs.clone();
+        let handle = std::thread::spawn(move || {
+            writer_fs
+                .rename("/p/a", "/q/a", RenameFlags::empty())
+                .unwrap();
+            done.send(()).unwrap();
+        });
+        if !confirm(&runtime, arrival_id, deadline) {
+            failures.push("rename writer never reached its lock plan".to_string());
+        }
+        let blocked = {
+            std::thread::sleep(Duration::from_millis(50));
+            done_rx.try_recv().is_err()
+        };
+        if !blocked {
+            failures
+                .push("rename completed while the locked read window held inode locks".to_string());
+        }
+        Some((handle, done_rx))
+    } else {
+        None
+    };
+
+    // Release, join and clean up before asserting so failures never leak
+    // parked readers or fault rules.
+    drop(release);
     let status = reader.join().unwrap().unwrap();
+    if let Some((handle, done_rx)) = writer {
+        handle.join().unwrap();
+        drop(done_rx);
+    }
     runtime.remove(entry_id).unwrap();
-    runtime.remove(park_id).unwrap();
-    // The status was built entirely inside the lock window from pre-move
-    // state; the parked writer could not interleave a rename or set_attr.
+    runtime.remove(arrival_id).unwrap();
+
+    assert!(failures.is_empty(), "{:?}", failures);
     assert_eq!(status.id, before.id);
     assert_eq!(status.mode, before.mode);
-    writer.join().unwrap();
-    drop(done_rx);
     assert!(fs.file_status("/p/a").is_err());
     assert_eq!(fs.file_status("/q/a").unwrap().id, before.id);
 }
 
+#[cfg(feature = "fault-injection")]
 #[test]
 fn list_options_lock_window_excludes_rename_writers() {
-    use curvine_fault::{FaultAction, FaultRuleBuilder, FaultRuntime};
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -101,7 +131,7 @@ fn list_options_lock_window_excludes_rename_writers() {
     let before = fs.file_status("/p/f").unwrap();
     let runtime = FaultRuntime::process();
     let entry_id = "list-options-lock-entry";
-    let park_id = "list-options-lock-park";
+    let arrival_id = "list-options-lock-arrival";
     runtime
         .configure(
             entry_id,
@@ -114,47 +144,78 @@ fn list_options_lock_window_excludes_rename_writers() {
         .unwrap();
     runtime
         .configure(
-            park_id,
-            FaultRuleBuilder::named("master.metadata.list_options.locked_build")
+            arrival_id,
+            FaultRuleBuilder::named("master.metadata.rename_planned")
                 .matches("path", "/p/f")
                 .unwrap()
-                .times(1)
-                .unwrap()
-                .action(FaultAction::Delay { duration_ms: 300 })
+                .record()
                 .unwrap(),
         )
         .unwrap();
+    let release = crate::master::fs::master_filesystem::memory_read_gates::install(
+        "master.metadata.list_options.locked_build",
+    );
     let reader_fs = fs.clone();
     let reader = std::thread::spawn(move || reader_fs.list_options("/p/f", ListOptions::default()));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while runtime.rule(entry_id).unwrap().unwrap().executions == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "reader never reached the locked build window"
-        );
-        std::thread::yield_now();
+
+    fn confirm(runtime: &FaultRuntime, id: &str, deadline: Instant) -> bool {
+        while Instant::now() < deadline {
+            if runtime
+                .rule(id)
+                .ok()
+                .and_then(|rule| rule)
+                .is_some_and(|rule| rule.executions > 0)
+            {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        false
     }
-    let (done, done_rx) = mpsc::channel::<()>();
-    let writer_fs = fs.clone();
-    let writer = std::thread::spawn(move || {
-        writer_fs
-            .rename("/p/f", "/q/f", RenameFlags::empty())
-            .unwrap();
-        done.send(()).unwrap();
-    });
-    std::thread::sleep(Duration::from_millis(50));
-    assert!(
-        done_rx.try_recv().is_err(),
-        "rename must block while the locked read window holds inode locks"
-    );
+
+    let mut failures = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    if !confirm(&runtime, entry_id, deadline) {
+        failures.push("reader never reached the locked build window".to_string());
+    }
+    let writer = if failures.is_empty() {
+        let (done, done_rx) = mpsc::channel::<()>();
+        let writer_fs = fs.clone();
+        let handle = std::thread::spawn(move || {
+            writer_fs
+                .rename("/p/f", "/q/f", RenameFlags::empty())
+                .unwrap();
+            done.send(()).unwrap();
+        });
+        if !confirm(&runtime, arrival_id, deadline) {
+            failures.push("rename writer never reached its lock plan".to_string());
+        }
+        let blocked = {
+            std::thread::sleep(Duration::from_millis(50));
+            done_rx.try_recv().is_err()
+        };
+        if !blocked {
+            failures
+                .push("rename completed while the locked read window held inode locks".to_string());
+        }
+        Some((handle, done_rx))
+    } else {
+        None
+    };
+
+    drop(release);
     let page = reader.join().unwrap().unwrap();
+    if let Some((handle, done_rx)) = writer {
+        handle.join().unwrap();
+        drop(done_rx);
+    }
     runtime.remove(entry_id).unwrap();
-    runtime.remove(park_id).unwrap();
+    runtime.remove(arrival_id).unwrap();
+
+    assert!(failures.is_empty(), "{:?}", failures);
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].name, "f");
     assert_eq!(page[0].id, before.id);
-    writer.join().unwrap();
-    drop(done_rx);
     assert!(fs.list_options("/p/f", ListOptions::default()).is_err());
     assert_eq!(fs.file_status("/q/f").unwrap().id, before.id);
 }
