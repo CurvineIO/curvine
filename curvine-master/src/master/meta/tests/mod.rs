@@ -1,5 +1,6 @@
 mod block_lock_metrics_test;
 mod directory_attribute_corruption_test;
 mod directory_attribute_state_test;
+mod fs_dir_handle_test;
 mod inode_lock_pool_test;
 mod inode_snapshot_corruption_test;

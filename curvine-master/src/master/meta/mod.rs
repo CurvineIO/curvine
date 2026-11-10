@@ -34,6 +34,8 @@ pub(crate) use self::fs_dir::{
     CacheInvalidationResult, RestoredTrashEntry, TrashListing, TrashScanPage,
 };
 
+mod fs_dir_handle;
+
 mod fs_stats;
 pub use self::fs_stats::FileSystemStats;
 
