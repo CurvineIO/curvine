@@ -716,6 +716,11 @@ impl MasterFilesystem {
                     description: "Overwrite path resolved before inode locks",
                 context: {"path" => path},
             }
+            #[cfg(test)]
+            memory_read_gates::park(
+                "master.metadata.overwrite_planned",
+                std::time::Duration::from_secs(5),
+            );
             let _locks = self.lock_sharded_requests(requests, false);
             let _location_locks = self
                 .block_location_locks

@@ -74,27 +74,42 @@ fn overwrite_replans_after_parent_replacement() {
         .record()
         .unwrap();
     runtime.configure(rule_id, rule).unwrap();
-    let held = fs.inode_locks.write_inode(old.id);
+    let release = crate::master::fs::master_filesystem::memory_read_gates::install(
+        "master.metadata.overwrite_planned",
+    );
     let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || worker_fs.create("/a/file", true));
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = worker_fs.create("/a/file", true);
+        let _ = result_tx.send(result);
+    });
     let deadline = Instant::now() + Duration::from_secs(5);
-    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+    let mut planned = false;
+    while Instant::now() < deadline {
+        if runtime.rule(rule_id).unwrap().unwrap().executions > 0 {
+            planned = true;
+            break;
+        }
         std::thread::yield_now();
     }
-    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    // The overwrite worker is parked before acquiring any inode lock, so the
+    // parent replacement below cannot deadlock with its lock ordering.
     let replacement = if planned {
         fs.delete("/a", true).unwrap();
         Some(fs.create("/a/file", true).unwrap())
     } else {
         None
     };
-    drop(held);
-    let result = worker.join().unwrap();
+    release.send(()).ok();
+    let result = result_rx.recv_timeout(Duration::from_secs(60));
     runtime.remove(rule_id).unwrap();
     assert!(planned, "overwrite did not reach lock planning");
     let replacement = replacement.unwrap();
     assert_ne!(old.id, replacement.id);
-    assert_eq!(result.unwrap().id, replacement.id);
+    assert_eq!(
+        result.expect("overwrite worker did not finish").unwrap().id,
+        replacement.id
+    );
     fs.restore_from_rocksdb().unwrap();
     assert_eq!(fs.file_status("/a/file").unwrap().id, replacement.id);
 }
