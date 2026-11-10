@@ -254,7 +254,7 @@ mod tests {
         let conf = get_conf("[fuse]\n", &["--meta-cache-ttl", "90s"]);
         assert_eq!(
             conf.fuse.meta_cache_timeout,
-            DurationUnit::new(90 * DurationUnit::SECONDS)
+            Some(DurationUnit::new(90 * DurationUnit::SECONDS))
         );
     }
 
