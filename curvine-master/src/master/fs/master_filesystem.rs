@@ -839,6 +839,11 @@ impl MasterFilesystem {
                     description: "Delete path resolved before inode locks",
                 context: {"path" => path},
             }
+            #[cfg(test)]
+            memory_read_gates::park(
+                "master.metadata.delete_planned",
+                std::time::Duration::from_secs(5),
+            );
             let _locks = self.lock_sharded_requests(requests, parent_index == 0);
             let fs_dir = self.fs_dir.read();
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {

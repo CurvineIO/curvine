@@ -11,7 +11,6 @@ fn delete_reloads_inode_after_a_hard_link_is_added() {
     fs.mkdir("/b", false).unwrap();
     fs.mkdir("/c", false).unwrap();
     fs.link("/a/file", "/b/alias").unwrap();
-    let parent = fs.file_status("/a").unwrap().id;
     let runtime = FaultRuntime::process();
     let rule_id = "delete-reload-hardlink";
     let rule = FaultRuleBuilder::named("master.metadata.delete_planned")
@@ -20,25 +19,39 @@ fn delete_reloads_inode_after_a_hard_link_is_added() {
         .record()
         .unwrap();
     runtime.configure(rule_id, rule).unwrap();
-    let held = fs.inode_locks.write_inode(parent);
+    let release = crate::master::fs::master_filesystem::memory_read_gates::install(
+        "master.metadata.delete_planned",
+    );
     let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || worker_fs.delete("/a/file", false));
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = worker_fs.delete("/a/file", false);
+        let _ = result_tx.send(result);
+    });
     let deadline = Instant::now() + Duration::from_secs(5);
-    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
+    let mut planned = false;
+    while Instant::now() < deadline {
+        if runtime.rule(rule_id).unwrap().unwrap().executions > 0 {
+            planned = true;
+            break;
+        }
         std::thread::yield_now();
     }
-    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    // The delete worker is parked before acquiring any inode lock, so the
+    // link below cannot invert the delete's lock_many ordering.
     let link_result = if planned {
         Some(fs.link("/b/alias", "/c/alias"))
     } else {
         None
     };
-    drop(held);
-    let delete_result = worker.join().unwrap();
+    release.send(()).ok();
+    let delete_result = result_rx.recv_timeout(Duration::from_secs(60));
     runtime.remove(rule_id).unwrap();
     assert!(planned, "delete did not reach lock planning");
     link_result.unwrap().unwrap();
-    delete_result.unwrap();
+    delete_result
+        .expect("delete worker did not finish")
+        .unwrap();
     fs.delete("/b/alias", false).unwrap();
     assert_eq!(fs.file_status("/c/alias").unwrap().id, original.id);
     fs.restore_from_rocksdb().unwrap();
