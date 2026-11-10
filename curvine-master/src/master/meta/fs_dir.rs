@@ -2578,7 +2578,7 @@ impl FsDir {
         self.journal_writer.take_entries()
     }
 
-    pub fn store_mount(&mut self, info: MountInfo, send_log: bool) -> FsResult<()> {
+    pub fn store_mount(&self, info: MountInfo, send_log: bool) -> FsResult<()> {
         self.store.store.add_mountpoint(info.mount_id, &info)?;
 
         if send_log {
@@ -2588,19 +2588,13 @@ impl FsDir {
         Ok(())
     }
 
-    pub fn unprotected_store_mount(&mut self, info: MountInfo) -> FsResult<()> {
-        self.store.store.add_mountpoint(info.mount_id, &info)?;
-        Ok(())
-    }
-
-    pub fn unmount(&mut self, id: u32) -> FsResult<()> {
+    /// Persists the row deletion; `send_log` selects the journal echo exactly
+    /// like [`FsDir::store_mount`].
+    pub fn unmount_with_log(&self, id: u32, send_log: bool) -> FsResult<()> {
         self.store.store.remove_mountpoint(id)?;
-        self.journal_writer.log_unmount(self, id)?;
-        Ok(())
-    }
-
-    pub fn unprotected_unmount(&mut self, id: u32) -> FsResult<()> {
-        self.store.store.remove_mountpoint(id)?;
+        if send_log {
+            self.journal_writer.log_unmount(self, id)?;
+        }
         Ok(())
     }
 
@@ -2608,7 +2602,7 @@ impl FsDir {
         self.store.get_mount_table()
     }
 
-    pub fn save_mount_table_version(&mut self, version: u64) -> FsResult<()> {
+    pub fn save_mount_table_version(&self, version: u64) -> FsResult<()> {
         self.store.save_mount_table_version(version)?;
         Ok(())
     }

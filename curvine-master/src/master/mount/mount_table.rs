@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::SyncFsDir;
+use crate::master::meta::FsDir;
 use curvine_config::{UfsConf, UfsConfBuilder};
-use curvine_core_error::err_box;
+use curvine_core_error::{err_box, err_msg};
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::{MountInfo, MountOptions};
-use log::{info, warn};
+use log::warn;
 use rand::Rng;
 use std::collections::HashMap;
 use std::convert::Into;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 pub struct MountTableInner {
     ufs2mountid: HashMap<String, u32>,
@@ -44,11 +44,15 @@ pub struct TableSnapshot {
 pub struct MountTable {
     inner: RwLock<MountTableInner>,
     snapshot: RwLock<Arc<TableSnapshot>>,
-    fs_dir: SyncFsDir,
 }
 
+/// Online RPC mutation: emits a journal entry through `FsDir`.
+const ONLINE: bool = true;
+/// Journal replay mutation: persists the row without echoing a journal entry.
+const REPLAY: bool = false;
+
 impl MountTable {
-    pub fn new(fs_dir: SyncFsDir) -> Self {
+    pub fn new() -> Self {
         MountTable {
             inner: RwLock::new(MountTableInner {
                 ufs2mountid: HashMap::new(),
@@ -59,7 +63,6 @@ impl MountTable {
                 version: 0,
                 entries: Vec::new(),
             })),
-            fs_dir,
         }
     }
 
@@ -94,8 +97,7 @@ impl MountTable {
     /// Publishes a fresh snapshot of `inner` with version bumped by one.
     ///
     /// Caller must hold `write_inner()` on the same `inner`; the snapshot lock
-    /// is a different lock so no re-entrancy occurs. Persisting the new version
-    /// to the store is left to the caller (after the inner lock is released).
+    /// is a different lock so no re-entrancy occurs.
     fn publish_snapshot(&self, inner: &MountTableInner) -> FsResult<u64> {
         let mut snap = self.write_snapshot()?;
         let version = snap.version + 1;
@@ -109,22 +111,26 @@ impl MountTable {
     }
 
     //for new master node
-    pub fn restore(&self) -> FsResult<()> {
-        let fs_dir = self.fs_dir.read();
+    pub fn restore(&self, fs_dir: &FsDir) -> FsResult<()> {
         let mounts = fs_dir.get_mount_table()?;
         let version = fs_dir.get_mount_table_version()?;
         self.replace_with_mounts(mounts, version)
     }
 
-    pub fn restore_best_effort(&self) {
-        if let Err(e) = self.restore() {
+    pub fn restore_best_effort(&self, fs_dir: &FsDir) {
+        if let Err(e) = self.restore(fs_dir) {
             warn!("failed to restore mount table: {}", e);
         }
     }
 
-    /// Replaces the in-memory table and snapshot with `mounts`. Pure
-    /// in-memory: the caller holds the `fs_dir` read guard and `SyncFsDir`
-    /// forbids re-entrancy.
+    /// Replaces the in-memory table and snapshot with `mounts`.
+    ///
+    /// Release points are separate from the online mutate path: this runs
+    /// under the namespace read guard (the caller's), reads rows and the
+    /// persisted version from the store, then swaps the live table and the
+    /// snapshot in one write-locked window. It is NOT the mount business
+    /// write guard of `put_mount`/`remove_mount` — restore has no row or
+    /// version writes of its own.
     fn replace_with_mounts(&self, mounts: Vec<MountInfo>, version: u64) -> FsResult<()> {
         let mut restored = MountTableInner {
             ufs2mountid: HashMap::new(),
@@ -176,8 +182,13 @@ impl MountTable {
         Ok(false)
     }
 
-    pub fn check_conflict(&self, cv_path: &str, ufs_path: &str) -> FsResult<()> {
-        let inner = self.read_inner()?;
+    /// Prefix-overlap check against every live entry. The caller holds the
+    /// write guard, so this runs on `&mut Inner`.
+    fn check_conflict_locked(
+        inner: &MountTableInner,
+        cv_path: &str,
+        ufs_path: &str,
+    ) -> FsResult<()> {
         for info in inner.mountid2entry.values() {
             if Path::has_prefix(cv_path, &info.cv_path) {
                 return err_box!("mount point {} is a prefix of {}", info.cv_path, cv_path);
@@ -204,69 +215,125 @@ impl MountTable {
         Ok(inner.mountid2entry.contains_key(&mount_id))
     }
 
-    // mount_path maybe mounted by other ufs
-    fn mount_point_inuse(&self, cv_path: &str) -> FsResult<bool> {
-        let inner = self.read_inner()?;
-        Ok(inner.mountpath2id.contains_key(cv_path))
-    }
-
-    /// In-memory add + snapshot publish. Returns the new version; persisting
-    /// it is the caller's job — this method must not touch `fs_dir`, since
-    /// every caller (journal replay, add/update) already holds or immediately
-    /// takes the `fs_dir` write lock and `SyncFsDir` forbids re-entrancy.
-    pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<u64> {
-        info!("add mount: {:?}", info);
-
+    /// Insert-or-replace one entry and persist the row + the same version
+    /// while the business write guard is held.
+    ///
+    /// `online` distinguishes the RPC path (journal echo, full duplicate and
+    /// prefix-conflict checks) from journal replay (record application with
+    /// no conflict re-check and no journal echo), matching the pre-existing
+    /// semantics of the old unprotected helper.
+    fn put_mount(&self, fs_dir: &FsDir, info: MountInfo, online: bool) -> FsResult<()> {
         let mut inner = self.write_inner()?;
+        if online {
+            if inner.ufs2mountid.contains_key(&info.ufs_path) {
+                return err_box!("{} already exists in mount table", info.ufs_path);
+            }
+            if inner.mountpath2id.contains_key(&info.cv_path) {
+                return err_box!("{} already exists in mount table", info.cv_path);
+            }
+            if inner.mountid2entry.contains_key(&info.mount_id) {
+                return err_box!("mount id {} already exists in mount table", info.mount_id);
+            }
+            Self::check_conflict_locked(&inner, &info.cv_path, &info.ufs_path)?;
+        } else {
+            // Replay applies a recorded row exactly like the old
+            // unprotected helper: an unconditional overwrite of the id's
+            // entry. If a mixed-version journal reuses an id with different
+            // paths, stale ufs2mountid/mountpath2id keys can linger; this is
+            // the pre-existing replay contract and is intentionally kept
+            // (a rebuild via restore() clears it).
+        }
+
         inner
             .ufs2mountid
             .insert(info.ufs_path.to_string(), info.mount_id);
         inner
             .mountpath2id
             .insert(info.cv_path.to_string(), info.mount_id);
-        inner.mountid2entry.insert(info.mount_id, info);
-        self.publish_snapshot(&inner)
+        inner.mountid2entry.insert(info.mount_id, info.clone());
+        let version = self.publish_snapshot(&inner)?;
+
+        fs_dir.store_mount(info, online)?;
+        fs_dir.save_mount_table_version(version)
+    }
+
+    /// Removes by mount path (online RPC): path lookup, table removal and
+    /// persistence all run under the single write guard, so no concurrent
+    /// mount mutation can slip between the check and the delete.
+    fn remove_mount_by_path(&self, fs_dir: &FsDir, mount_path: &str) -> FsResult<()> {
+        let mut inner = self.write_inner()?;
+        let mount_id = match inner.mountpath2id.get(mount_path) {
+            Some(&id) => id,
+            None => return err_box!("failed found {} to umount", mount_path),
+        };
+        let info = match inner.mountid2entry.remove(&mount_id) {
+            Some(entry) => entry,
+            None => return err_box!("failed found {} entry", mount_id),
+        };
+
+        inner.ufs2mountid.remove(&info.ufs_path);
+        inner.mountpath2id.remove(&info.cv_path);
+        let version = self.publish_snapshot(&inner)?;
+
+        fs_dir.unmount_with_log(info.mount_id, ONLINE)?;
+        fs_dir.save_mount_table_version(version)
+    }
+
+    /// Removes by mount id (journal replay): the same single write guard;
+    /// an unknown id is an idempotent no-op that still acks.
+    fn remove_mount_by_id(&self, fs_dir: &FsDir, mount_id: u32) -> FsResult<()> {
+        let mut inner = self.write_inner()?;
+        let info = match inner.mountid2entry.remove(&mount_id) {
+            Some(entry) => entry,
+            None => return Ok(()),
+        };
+
+        inner.ufs2mountid.remove(&info.ufs_path);
+        inner.mountpath2id.remove(&info.cv_path);
+        let version = self.publish_snapshot(&inner)?;
+
+        fs_dir.unmount_with_log(info.mount_id, REPLAY)?;
+        fs_dir.save_mount_table_version(version)
     }
 
     pub fn add_mount(
         &self,
+        fs_dir: &FsDir,
         mount_id: u32,
         cv_path: &str,
         ufs_path: &str,
         mnt_opt: &MountOptions,
     ) -> FsResult<()> {
-        let mut fs_dir = self.fs_dir.write();
-        if self.exists(ufs_path)? {
-            return err_box!("{} already exists in mount table", ufs_path);
-        }
-
-        if self.mount_point_inuse(cv_path)? {
-            return err_box!("{} already exists in mount table", cv_path);
-        }
-
-        if self.has_mounted(mount_id)? {
-            return err_box!("mount id {} already exists in mount table", mount_id);
-        }
-
-        self.check_conflict(cv_path, ufs_path)?;
-
         let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
-        let version = self.unprotected_add_mount(info.clone())?;
-
-        fs_dir.store_mount(info, true)?;
-        fs_dir.save_mount_table_version(version)
+        self.put_mount(fs_dir, info, ONLINE)
     }
 
-    pub fn update_mount(&self, info: MountInfo) -> FsResult<()> {
-        let mut fs_dir = self.fs_dir.write();
-        let old = self.get_mount_info_by_id(info.mount_id)?;
+    pub fn update_mount(&self, fs_dir: &FsDir, info: MountInfo) -> FsResult<()> {
+        self.put_mount_replace(fs_dir, info)
+    }
+
+    /// Update variant: the entry must exist, paths stay unchanged, and the
+    /// row is persisted with the online journal echo.
+    fn put_mount_replace(&self, fs_dir: &FsDir, info: MountInfo) -> FsResult<()> {
+        let mut inner = self.write_inner()?;
+        let old = inner
+            .mountid2entry
+            .get(&info.mount_id)
+            .ok_or_else(|| err_msg!("failed found {} entry", info.mount_id))?;
         if old.cv_path != info.cv_path || old.ufs_path != info.ufs_path {
             return err_box!("cannot change mount path");
         }
 
-        let version = self.unprotected_add_mount(info.clone())?;
+        inner
+            .ufs2mountid
+            .insert(info.ufs_path.to_string(), info.mount_id);
+        inner
+            .mountpath2id
+            .insert(info.cv_path.to_string(), info.mount_id);
+        inner.mountid2entry.insert(info.mount_id, info.clone());
+        let version = self.publish_snapshot(&inner)?;
 
-        fs_dir.store_mount(info, true)?;
+        fs_dir.store_mount(info, ONLINE)?;
         fs_dir.save_mount_table_version(version)
     }
 
@@ -282,20 +349,20 @@ impl MountTable {
         err_box!("failed assign mount id")
     }
 
-    pub fn umount(&self, mount_path: &str) -> FsResult<()> {
-        let mut fs_dir = self.fs_dir.write();
-        let mount_id = {
-            let inner = self.read_inner()?;
-            match inner.mountpath2id.get(mount_path) {
-                Some(&id) => id,
-                None => return err_box!("failed found {} to umount", mount_path),
-            }
-        };
+    pub fn umount(&self, fs_dir: &FsDir, mount_path: &str) -> FsResult<()> {
+        self.remove_mount_by_path(fs_dir, mount_path)
+    }
 
-        let version = self.unprotected_umount_by_id(mount_id)?;
+    /// Replay entry point for a Mount journal entry: applies the recorded row
+    /// through the same business guard without echoing a journal entry.
+    pub fn replay_mount(&self, fs_dir: &FsDir, info: MountInfo) -> FsResult<()> {
+        self.put_mount(fs_dir, info, REPLAY)
+    }
 
-        fs_dir.unmount(mount_id)?;
-        fs_dir.save_mount_table_version(version)
+    /// Replay entry point for an UnMount journal entry: idempotent when the
+    /// table no longer knows the id.
+    pub fn replay_unmount(&self, fs_dir: &FsDir, mount_id: u32) -> FsResult<()> {
+        self.remove_mount_by_id(fs_dir, mount_id)
     }
 
     /// use ufs_uri to find ufs config
@@ -365,19 +432,18 @@ impl MountTable {
         self.read_snapshot()
     }
 
-    /// In-memory remove + snapshot publish. Returns the new version; the
-    /// caller persists it under its own `fs_dir` write lock (see the
-    /// re-entrancy note on [`MountTable::unprotected_add_mount`]).
-    pub fn unprotected_umount_by_id(&self, mount_id: u32) -> FsResult<u64> {
-        let mut inner = self.write_inner()?;
-
-        let info = match inner.mountid2entry.remove(&mount_id) {
-            Some(entry) => entry,
-            None => return err_box!("failed found {} entry", mount_id),
-        };
-
-        inner.ufs2mountid.remove(&info.ufs_path);
-        inner.mountpath2id.remove(&info.cv_path);
-        self.publish_snapshot(&inner)
+    /// Test-only probe distinguishing a free lock (`Ok`) from contention
+    /// (`Err(TryLockError::WouldBlock)`) or poisoning
+    /// (`Err(TryLockError::Poisoned)`). Lives on this type so the test child
+    /// module can reach the private `inner` without a production accessor.
+    #[cfg(test)]
+    pub(crate) fn try_write_inner(
+        &self,
+    ) -> Result<(), TryLockError<RwLockWriteGuard<'_, MountTableInner>>> {
+        self.inner.try_write().map(|_| ())
     }
 }
+
+#[cfg(test)]
+#[path = "tests/mount_txn_test.rs"]
+mod mount_txn_test;

@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused)]
 use crate::master::fs::MasterFilesystem;
+use crate::master::meta::FsDir;
 use crate::master::mount::MountTable;
-use crate::master::{self, SyncFsDir};
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_fs_api::{self, CurvineURI, Path};
+use curvine_fs_api::{self, Path};
 use curvine_model::{MkdirOpts, MountInfo, MountOptions};
 use curvine_ufs_api::S3Conf;
 use log::info;
@@ -32,20 +31,21 @@ pub struct MountManager {
 
 impl MountManager {
     pub fn new(master_fs: MasterFilesystem) -> Self {
-        let fs_dir = master_fs.fs_dir.clone();
         MountManager {
             master_fs,
-            mount_table: MountTable::new(fs_dir),
+            mount_table: MountTable::new(),
         }
     }
 
     /// recovery mount points from store
     pub fn restore(&self) -> FsResult<()> {
-        self.mount_table.restore()
+        let fs_dir = self.master_fs.fs_dir.read();
+        self.mount_table.restore(&fs_dir)
     }
 
     pub fn restore_best_effort(&self) {
-        self.mount_table.restore_best_effort()
+        let fs_dir = self.master_fs.fs_dir.read();
+        self.mount_table.restore_best_effort(&fs_dir)
     }
 
     fn create_mount_point(&self, mount_path: &str) -> FsResult<bool> {
@@ -109,8 +109,14 @@ impl MountManager {
         let mut normalized_options = mnt_opt.clone();
         normalized_options.add_properties = mount.properties;
         self.master_fs.run_metadata_write(|| {
-            self.mount_table
-                .add_mount(assign_id, mount_path, ufs_path, &normalized_options)
+            let fs_dir = self.master_fs.fs_dir.write();
+            self.mount_table.add_mount(
+                &fs_dir,
+                assign_id,
+                mount_path,
+                ufs_path,
+                &normalized_options,
+            )
         })
     }
 
@@ -122,7 +128,8 @@ impl MountManager {
             };
             let mut merged = existing.merge_with(mnt_opt.clone());
             Self::normalize_mount_config(&mut merged)?;
-            self.mount_table.update_mount(merged)
+            let fs_dir = self.master_fs.fs_dir.write();
+            self.mount_table.update_mount(&fs_dir, merged)
         })
     }
 
@@ -144,15 +151,11 @@ impl MountManager {
         self.add_mount(mnt_id, cv_path, ufs_path, mnt_opt)
     }
 
-    /// Returns the new mount table version; the caller persists it under its
-    /// own `fs_dir` write lock (journal replay holds one).
-    pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<u64> {
-        self.mount_table.unprotected_add_mount(info)
-    }
-
     pub fn umount(&self, cv_path: &str) -> FsResult<()> {
-        self.master_fs
-            .run_metadata_write(|| self.mount_table.umount(cv_path))
+        self.master_fs.run_metadata_write(|| {
+            let fs_dir = self.master_fs.fs_dir.write();
+            self.mount_table.umount(&fs_dir, cv_path)
+        })
     }
 
     pub fn unmount_by_id(&self, id: u32) -> FsResult<()> {
@@ -160,8 +163,14 @@ impl MountManager {
         self.umount(&info.cv_path)
     }
 
-    pub fn unprotected_umount_by_id(&self, id: u32) -> FsResult<u64> {
-        self.mount_table.unprotected_umount_by_id(id)
+    /// Replay entry point for Mount journal entries: namespace guard held by
+    /// the caller (journal loader), row persisted without a new journal.
+    pub fn replay_mount(&self, fs_dir: &FsDir, info: MountInfo) -> FsResult<()> {
+        self.mount_table.replay_mount(fs_dir, info)
+    }
+
+    pub fn replay_unmount(&self, fs_dir: &FsDir, mount_id: u32) -> FsResult<()> {
+        self.mount_table.replay_unmount(fs_dir, mount_id)
     }
 
     pub fn has_mounted(&self, id: u32) -> FsResult<bool> {

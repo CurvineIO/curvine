@@ -1858,24 +1858,15 @@ impl JournalLoader {
     }
 
     pub fn mount(&self, entry: MountEntry) -> CommonResult<()> {
-        let version = self.mnt_mgr.unprotected_add_mount(entry.info.clone())?;
-
-        let mut fs_dir = self.fs_dir.write();
-        fs_dir.unprotected_store_mount(entry.info)?;
-        fs_dir.save_mount_table_version(version)?;
-        Ok(())
+        // Namespace first, then the mount table transaction: the same order
+        // as the online RPC path.
+        let fs_dir = self.fs_dir.write();
+        Ok(self.mnt_mgr.replay_mount(&fs_dir, entry.info)?)
     }
 
     pub fn unmount(&self, entry: UnMountEntry) -> CommonResult<()> {
-        if !self.mnt_mgr.has_mounted(entry.id)? {
-            warn!("Unmount: id already unmounted: {:?}", entry);
-            return Ok(());
-        }
-        let version = self.mnt_mgr.unprotected_umount_by_id(entry.id)?;
-        let mut fs_dir = self.fs_dir.write();
-        fs_dir.unprotected_unmount(entry.id)?;
-        fs_dir.save_mount_table_version(version)?;
-        Ok(())
+        let fs_dir = self.fs_dir.write();
+        Ok(self.mnt_mgr.replay_unmount(&fs_dir, entry.id)?)
     }
 
     pub fn set_attr(&self, entry: SetAttrEntry) -> CommonResult<()> {

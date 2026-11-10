@@ -143,21 +143,26 @@ fn mount_publication_waits_for_namespace_lock() {
     ));
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
-    let table = Arc::new(MountTable::new(fs.fs_dir.clone()));
+    let table = Arc::new(MountTable::new());
     let guard = fs.fs_dir.write();
     let worker_table = table.clone();
+    let worker_fs = fs.clone();
     let (started_tx, started_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
         started_tx.send(()).unwrap();
-        done_tx
-            .send(worker_table.add_mount(
-                42,
-                "/mount",
-                "file:///tmp/mount-publication",
-                &MountOptions::builder().build(),
-            ))
-            .unwrap();
+        // The caller acquires the namespace guard before the table
+        // transaction, matching the production ordering.
+        let guard_dir = worker_fs.fs_dir.write();
+        let result = worker_table.add_mount(
+            &guard_dir,
+            42,
+            "/mount",
+            "file:///tmp/mount-publication",
+            &MountOptions::builder().build(),
+        );
+        drop(guard_dir);
+        done_tx.send(result).unwrap();
     });
     started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let blocked = done_rx.recv_timeout(Duration::from_millis(100));
@@ -168,17 +173,24 @@ fn mount_publication_waits_for_namespace_lock() {
     assert!(snapshot.entries.is_empty());
     done_rx.recv().unwrap().unwrap();
     let version = table.snapshot().unwrap().version;
-    assert!(table
-        .add_mount(
-            42,
-            "/other",
-            "file:///tmp/mount-publication-other",
-            &MountOptions::builder().build(),
-        )
-        .is_err());
+    {
+        let fs_dir = fs.fs_dir.read();
+        assert!(table
+            .add_mount(
+                &fs_dir,
+                42,
+                "/other",
+                "file:///tmp/mount-publication-other",
+                &MountOptions::builder().build(),
+            )
+            .is_err());
+    }
     assert_eq!(table.snapshot().unwrap().version, version);
-    let restored = MountTable::new(fs.fs_dir.clone());
-    restored.restore().unwrap();
+    let restored = MountTable::new();
+    {
+        let fs_dir = fs.fs_dir.read();
+        restored.restore(&fs_dir).unwrap();
+    }
     let current = table.snapshot().unwrap();
     let recovered = restored.snapshot().unwrap();
     assert_eq!(current.version, recovered.version);
