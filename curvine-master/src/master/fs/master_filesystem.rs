@@ -24,7 +24,7 @@ use crate::master::meta::inode::{
 use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::meta::{
     trash, BlockLocationLockManager, CacheInvalidationResult, CommitGate, FsDir, InodeLockManager,
-    InodeLockRequest, RestoredTrashEntry, TrashListing, TrashScanPage,
+    InodeLockMode, InodeLockRequest, InodeLockSet, RestoredTrashEntry, TrashListing, TrashScanPage,
 };
 
 use crate::master::fs::DeleteResult;
@@ -394,6 +394,27 @@ impl MasterFilesystem {
         Ok(control.cancel_epoch())
     }
 
+    /// Root directory state is internally synchronized, so sharded paths only
+    /// retain an explicit root-parent or root-attribute write request.
+    fn filter_root_requests(
+        requests: &mut SmallVec<[InodeLockRequest; 8]>,
+        retain_root_write: bool,
+    ) {
+        requests.retain(|request| {
+            request.inode_id != ROOT_INODE_ID
+                || (retain_root_write && matches!(request.mode, InodeLockMode::Write))
+        });
+    }
+
+    fn lock_sharded_requests(
+        &self,
+        mut requests: SmallVec<[InodeLockRequest; 8]>,
+        retain_root_write: bool,
+    ) -> InodeLockSet<'_> {
+        Self::filter_root_requests(&mut requests, retain_root_write);
+        self.inode_locks.lock_many(&requests)
+    }
+
     // The caller holds every planned inode lock throughout this traversal.
     fn resolve_locked_path(
         fs_dir: &FsDir,
@@ -434,7 +455,7 @@ impl MasterFilesystem {
                     }
                 })
                 .collect();
-            let _locks = self.inode_locks.lock_many(&requests);
+            let _locks = self.lock_sharded_requests(requests, !full && parent_index == 0);
             let fs_dir = self.fs_dir.read();
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -487,7 +508,7 @@ impl MasterFilesystem {
                         .enumerate()
                         .map(|(depth, id)| InodeLockRequest::read(depth, *id))
                         .collect();
-                    let _locks = self.inode_locks.lock_many(&requests);
+                    let _locks = self.lock_sharded_requests(requests, false);
                     let fs_dir = self.fs_dir.read();
                     if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                         continue;
@@ -528,7 +549,7 @@ impl MasterFilesystem {
                     }
                 })
                 .collect();
-            let _locks = self.inode_locks.lock_many(&requests);
+            let _locks = self.lock_sharded_requests(requests, !full && parent_index == 0);
             let fs_dir = self.fs_dir.read();
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -608,10 +629,10 @@ impl MasterFilesystem {
             crate::fault_point! {
                 sync,
                 name: "master.metadata.overwrite_planned",
-                description: "Overwrite path resolved before inode locks",
+                    description: "Overwrite path resolved before inode locks",
                 context: {"path" => path},
             }
-            let _locks = self.inode_locks.lock_many(&requests);
+            let _locks = self.lock_sharded_requests(requests, false);
             let _location_locks = self
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
@@ -731,10 +752,10 @@ impl MasterFilesystem {
             crate::fault_point! {
                 sync,
                 name: "master.metadata.delete_planned",
-                description: "Delete path resolved before inode locks",
+                    description: "Delete path resolved before inode locks",
                 context: {"path" => path},
             }
-            let _locks = self.inode_locks.lock_many(&requests);
+            let _locks = self.lock_sharded_requests(requests, parent_index == 0);
             let fs_dir = self.fs_dir.read();
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -889,10 +910,11 @@ impl MasterFilesystem {
             crate::fault_point! {
                 sync,
                 name: "master.metadata.rename_planned",
-                description: "Rename paths resolved before inode locks",
+                    description: "Rename paths resolved before inode locks",
                 context: {"path" => src},
             }
-            let _locks = self.inode_locks.lock_many(&requests);
+            let _locks =
+                self.lock_sharded_requests(requests, source_parent == 0 || destination_parent == 0);
 
             let fs_dir = self.fs_dir.read();
             let epoch = Self::checked_live_epoch(&fs_dir)?;
@@ -959,7 +981,7 @@ impl MasterFilesystem {
                     }
                 })
                 .collect();
-            let _locks = self.inode_locks.lock_many(&requests);
+            let _locks = self.lock_sharded_requests(requests, target_depth == 0);
             let fs_dir = self.fs_dir.read();
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -1021,10 +1043,10 @@ impl MasterFilesystem {
             crate::fault_point! {
                 sync,
                 name: "master.metadata.complete_planned",
-                description: "Complete path resolved before inode locks",
+                    description: "Complete path resolved before inode locks",
                 context: {"path" => path},
             }
-            let _inode_locks = self.inode_locks.lock_many(&requests);
+            let _inode_locks = self.lock_sharded_requests(requests, false);
             let _location_locks = self
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
@@ -1137,10 +1159,10 @@ impl MasterFilesystem {
             crate::fault_point! {
                 sync,
                 name: "master.metadata.close_planned",
-                description: "Close path resolved before inode locks",
+                    description: "Close path resolved before inode locks",
                 context: {"path" => path},
             }
-            let _locks = self.inode_locks.lock_many(&requests);
+            let _locks = self.lock_sharded_requests(requests, false);
             let fs_dir = self.fs_dir.read();
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -1199,7 +1221,7 @@ impl MasterFilesystem {
                     }
                 })
                 .collect();
-            let _locks = self.inode_locks.lock_many(&requests);
+            let _locks = self.lock_sharded_requests(requests, parent_index == 0);
             let fs_dir = self.fs_dir.read();
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -1290,10 +1312,10 @@ impl MasterFilesystem {
             crate::fault_point! {
                 sync,
                 name: "master.metadata.link_planned",
-                description: "Link paths resolved before inode locks",
+                    description: "Link paths resolved before inode locks",
                 context: {"path" => src},
             }
-            let _locks = self.inode_locks.lock_many(&requests);
+            let _locks = self.lock_sharded_requests(requests, destination_parent == 0);
             let fs_dir = self.fs_dir.read();
             let epoch = Self::checked_live_epoch(&fs_dir)?;
             if source_epoch != epoch || destination_epoch != epoch {
@@ -1477,7 +1499,7 @@ impl MasterFilesystem {
                     }
                 })
                 .collect();
-            let _locks = self.inode_locks.lock_many(&requests);
+            let _locks = self.lock_sharded_requests(requests, parent_index == 0);
             let _location_locks = self
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
@@ -1981,7 +2003,7 @@ impl MasterFilesystem {
                     }
                 })
                 .collect();
-            let _inode_locks = self.inode_locks.lock_many(&requests);
+            let _inode_locks = self.lock_sharded_requests(requests, false);
             let _location_locks = self
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
@@ -2174,7 +2196,7 @@ impl MasterFilesystem {
                     }
                 })
                 .collect();
-            let _inode_locks = self.inode_locks.lock_many(&requests);
+            let _inode_locks = self.lock_sharded_requests(requests, false);
             let _location_locks = self
                 .block_location_locks
                 .write_workers_blocks(&worker_ids.iter().copied().collect::<Vec<_>>(), &block_ids);
@@ -2525,10 +2547,10 @@ impl MasterFilesystem {
             crate::fault_point! {
                 sync,
                 name: "master.metadata.reopen_planned",
-                description: "Reopen path resolved before inode locks",
+                    description: "Reopen path resolved before inode locks",
                 context: {"path" => path},
             }
-            let _locks = self.inode_locks.lock_many(&requests);
+            let _locks = self.lock_sharded_requests(requests, false);
 
             let fs_dir = self.fs_dir.read();
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
@@ -2993,10 +3015,10 @@ impl MasterFilesystem {
             crate::fault_point! {
                 sync,
                 name: "master.metadata.add_block_planned",
-                description: "Block allocation path resolved before inode locks",
+                    description: "Block allocation path resolved before inode locks",
                 context: {"path" => path},
             }
-            let _inode_locks = self.inode_locks.lock_many(&requests);
+            let _inode_locks = self.lock_sharded_requests(requests, false);
 
             let next_id = {
                 let fs_dir = self.fs_dir.read();
@@ -3308,10 +3330,10 @@ impl MasterFilesystem {
             crate::fault_point! {
                 sync,
                 name: "master.metadata.locations_read_planned",
-                description: "Block location read path resolved before inode locks",
+                    description: "Block location read path resolved before inode locks",
                 context: {"path" => path},
             }
-            let _locks = self.inode_locks.lock_many(&requests);
+            let _locks = self.lock_sharded_requests(requests, false);
             let fs_dir = self.fs_dir.read();
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -3389,10 +3411,10 @@ impl MasterFilesystem {
             crate::fault_point! {
                 sync,
                 name: "master.metadata.atime_planned",
-                description: "Atime path resolved before inode locks",
+                    description: "Atime path resolved before inode locks",
                 context: {"path" => path},
             }
-            let _locks = self.inode_locks.lock_many(&requests);
+            let _locks = self.lock_sharded_requests(requests, false);
 
             let fs_dir = self.fs_dir.read();
             let Ok(locked_epoch) = Self::checked_live_epoch(&fs_dir) else {
@@ -4609,10 +4631,10 @@ impl MasterFilesystem {
             crate::fault_point! {
                 sync,
                 name: "master.metadata.resize_planned",
-                description: "Resize path resolved before inode locks",
+                    description: "Resize path resolved before inode locks",
                 context: {"path" => path},
             }
-            let _inode_locks = self.inode_locks.lock_many(&requests);
+            let _inode_locks = self.lock_sharded_requests(requests, false);
             let _location_locks = self.block_location_locks.write_blocks(&block_ids);
             let fs_dir = self.fs_dir.read();
             let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
@@ -4758,10 +4780,10 @@ impl MasterFilesystem {
             crate::fault_point! {
                 sync,
                 name: "master.metadata.assign_worker_planned",
-                description: "Worker assignment path resolved before inode locks",
+                    description: "Worker assignment path resolved before inode locks",
                 context: {"path" => path},
             }
-            let _inode_locks = self.inode_locks.lock_many(&requests);
+            let _inode_locks = self.lock_sharded_requests(requests, false);
             let _location_lock = self.block_location_locks.write_blocks(&[block.id]);
             let fs_dir = self.fs_dir.read();
             let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
@@ -4897,10 +4919,10 @@ impl MasterFilesystem {
                 crate::fault_point! {
                     sync,
                     name: "master.metadata.set_lock_planned",
-                    description: "Lock path resolved before inode locks",
+                            description: "Lock path resolved before inode locks",
                     context: {"path" => path},
                 }
-                let _locks = self.inode_locks.lock_many(&requests);
+                let _locks = self.lock_sharded_requests(requests, false);
                 let fs_dir = self.fs_dir.read();
                 if epoch != Self::checked_live_epoch(&fs_dir)? {
                     continue;

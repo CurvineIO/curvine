@@ -2,6 +2,27 @@ use super::*;
 
 static CHILDREN_COUNT_PERSISTENCE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[test]
+fn root_lock_filter_keeps_only_explicit_root_writes() {
+    let mut requests = SmallVec::<[InodeLockRequest; 8]>::from_vec(vec![
+        InodeLockRequest::read(0, ROOT_INODE_ID),
+        InodeLockRequest::write(0, ROOT_INODE_ID),
+        InodeLockRequest::read(1, 42),
+    ]);
+
+    MasterFilesystem::filter_root_requests(&mut requests, false);
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0], InodeLockRequest::read(1, 42));
+
+    requests.insert(0, InodeLockRequest::write(0, ROOT_INODE_ID));
+    MasterFilesystem::filter_root_requests(&mut requests, true);
+
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], InodeLockRequest::write(0, ROOT_INODE_ID));
+    assert_eq!(requests[1], InodeLockRequest::read(1, 42));
+}
+
 struct ResetChildrenCountPersistence;
 
 impl Drop for ResetChildrenCountPersistence {
