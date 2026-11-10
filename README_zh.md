@@ -17,6 +17,8 @@
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=ru">Русский</a>
 </p>
 
+[![CNCF Sandbox](https://img.shields.io/badge/CNCF-Sandbox-0086FF?logo=cncf&logoColor=white)](https://www.cncf.io/projects/curvine/)
+[![CNCF Landscape](https://img.shields.io/badge/CNCF%20Landscape-5699C6)](https://landscape.cncf.io/?item=runtime--cloud-native-storage--curvine)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange)](https://www.rust-lang.org)
 
@@ -258,6 +260,14 @@ Curvine 在高并发场景下表现优异，支持：
 - 高吞吐量数据读写
 - 低延迟操作
 - 大规模并发连接
+
+## ☁️ CNCF
+
+Curvine 是 [云原生计算基金会（CNCF）](https://www.cncf.io/) 的 Sandbox 项目。
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/cncf/artwork/main/other/cncf/horizontal/color/cncf-color.svg" width="300" alt="CNCF logo">
+</p>
 
 ## 📜 许可证
 

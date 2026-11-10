@@ -17,6 +17,7 @@
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=ru">Русский</a>
 </p>
 
+[![CNCF Sandbox](https://img.shields.io/badge/CNCF-Sandbox-0086FF?logo=cncf&logoColor=white)](https://www.cncf.io/projects/curvine/)
 [![CNCF Landscape](https://img.shields.io/badge/CNCF%20Landscape-5699C6)](https://landscape.cncf.io/?item=runtime--cloud-native-storage--curvine)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Rust](https://img.shields.io/badge/Rust-1.86%2B-orange)](https://www.rust-lang.org)
@@ -163,6 +164,14 @@ Benchmarking against Alluxio under identical hardware conditions.
 ### 3. Resource Consumption
 
 Benefiting from Rust language features, in big data shuffle acceleration scenarios, comparing resource consumption between Curvine and Alluxio in production environments shows that memory usage is reduced by over 90%, and CPU usage is reduced by over 50%.
+
+## ☁️ CNCF
+
+Curvine is a [Cloud Native Computing Foundation](https://www.cncf.io/) sandbox project.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/cncf/artwork/main/other/cncf/horizontal/color/cncf-color.svg" width="300" alt="CNCF logo">
+</p>
 
 ## Contributing
 Please read Curvine [Contribute guidelines](CONTRIBUTING.md)
