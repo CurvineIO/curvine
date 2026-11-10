@@ -4823,8 +4823,28 @@ impl MasterFilesystem {
 
         for chunk in removed_block_ids.chunks(Self::LOST_WORKER_INVALIDATION_CHUNK) {
             let result = self.run_metadata_write(|| {
+                // Inode-stripes write lock before location locks keeps the
+                // inode→location→namespace order; lock_many sorts stripes and
+                // dedupes repeated inode ids.
+                let inode_requests: smallvec::SmallVec<[InodeLockRequest; 8]> = chunk
+                    .iter()
+                    .map(|block_id| {
+                        InodeLockRequest::write(0, crate::master::meta::InodeId::get_id(*block_id))
+                    })
+                    .collect();
+                #[cfg(test)]
+                crate::fault_point! {
+                    sync,
+                    name: "master.metadata.cache_invalidation_inode_lock_planned",
+                    description: "Before requesting cache invalidation inode write locks",
+                    context: {
+                        "worker_id" => worker_id,
+                        "data_dir" => self.fs_dir.read().get_rocks_store().db.conf().data_dir.clone(),
+                    },
+                }
+                let _inode_guard = self.inode_locks.lock_many(&inode_requests);
                 let _location_locks = self.block_location_locks.write_blocks(chunk);
-                let mut fs_dir = self.fs_dir.write();
+                let fs_dir = self.fs_dir.write();
                 fs_dir.invalidate_lost_cache_files(chunk)
             });
             match result {
