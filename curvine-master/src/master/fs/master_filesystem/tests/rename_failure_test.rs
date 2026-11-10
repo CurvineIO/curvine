@@ -18,26 +18,19 @@ use super::*;
 fn moved_directory_ctime_matches_live_attributes() {
     let fs = test_fs("moved-directory-ctime");
     fs.mkdir("/left/a", true).unwrap();
-    fs.mkdir("/right/b", true).unwrap();
-    let (a, b) = {
+    fs.mkdir("/right", true).unwrap();
+    let a = {
         let dir = fs.fs_dir.read();
         let a = InodePath::resolve(dir.root_node(), "/left/a", dir.store_ref()).unwrap();
-        let b = InodePath::resolve(dir.root_node(), "/right/b", dir.store_ref()).unwrap();
-        (
-            a.get_last_dir_node().unwrap(),
-            b.get_last_dir_node().unwrap(),
-        )
+        a.get_last_dir_node().unwrap()
     };
     let a_before = a.directory_attributes().ctime;
-    let b_before = b.directory_attributes().ctime;
     std::thread::sleep(std::time::Duration::from_millis(5));
-    fs.rename("/left/a", "/right/b", RenameFlags::EXCHANGE)
+    fs.rename("/left/a", "/right/b", RenameFlags::empty())
         .unwrap();
     let a_after = a.directory_attributes().ctime;
-    let b_after = b.directory_attributes().ctime;
-    assert!(a_after > a_before && b_after > b_before);
+    assert!(a_after > a_before);
     assert_eq!(a_after, fs.file_status("/right/b").unwrap().ctime());
-    assert_eq!(b_after, fs.file_status("/left/a").unwrap().ctime());
     std::thread::sleep(std::time::Duration::from_millis(5));
     fs.rename("/right/b", "/left/c", RenameFlags::empty())
         .unwrap();

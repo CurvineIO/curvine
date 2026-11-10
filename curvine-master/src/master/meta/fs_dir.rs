@@ -1885,34 +1885,6 @@ impl FsDir {
         at_dst.change_name(dst_name.clone());
         at_dst.set_parent_id(dst_parent.id());
 
-        let at_src_node = if at_src.is_dir() {
-            let node = dst_inp.get_dir_node(-1).ok_or_else(|| {
-                FsError::common("exchange destination directory lost its live node")
-            })?;
-            at_src.update_ctime(mtime);
-            at_src.as_dir_mut()?.node = Some(node.clone());
-            Some(node)
-        } else {
-            None
-        };
-        let at_dst_node = if at_dst.is_dir() {
-            let node = src_inp
-                .get_dir_node(-1)
-                .ok_or_else(|| FsError::common("exchange source directory lost its live node"))?;
-            at_dst.update_ctime(mtime);
-            at_dst.as_dir_mut()?.node = Some(node.clone());
-            Some(node)
-        } else {
-            None
-        };
-        let moved_raw = DirectoryAttributeDelta::new(i64::MIN, mtime, 0);
-        let at_src_delta = at_src_node
-            .as_ref()
-            .map(|node| node.directory_attribute_delta(moved_raw));
-        let at_dst_delta = at_dst_node
-            .as_ref()
-            .map(|node| node.directory_attribute_delta(moved_raw));
-
         // Exchange keeps child counts unchanged on both sides; only nlink
         // moves when a directory swaps with a file across parents. One raw
         // delta per parent feeds both the store batch and the live state.
@@ -1942,8 +1914,6 @@ impl FsDir {
             &at_dst,
             src_delta,
             dst_delta,
-            at_src_delta,
-            at_dst_delta,
         )?;
         self.publish_metadata(src_parent.publish_directory_delta(src_raw))?;
         self.publish_metadata(src_parent.mark_persisted())?;
@@ -1951,29 +1921,14 @@ impl FsDir {
             self.publish_metadata(dst_parent.publish_directory_delta(dst_raw))?;
             self.publish_metadata(dst_parent.mark_persisted())?;
         }
-        for node in [at_src_node.as_ref(), at_dst_node.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            self.publish_metadata(node.apply_attribute_delta(moved_raw))?;
-            node.mark_attributes_persisted();
-        }
 
         let detached_src = self.publish_metadata(src_parent.delete_child(src_id, &src_name))?;
         let detached_dst = self.publish_metadata(dst_parent.delete_child(dst_id, &dst_name))?;
         // Move the live node handles: the detached views carry the original
         // Arc<DirNode> backlink, so each parent slot stores the identical
         // handle and both subtrees keep their shared children index.
-        let mut moved_src = if at_src_node.is_some() {
-            at_src
-        } else {
-            detached_dst
-        };
-        let mut moved_dst = if at_dst_node.is_some() {
-            at_dst
-        } else {
-            detached_src
-        };
+        let mut moved_src = detached_dst;
+        let mut moved_dst = detached_src;
         moved_src.change_name(src_name.clone());
         moved_dst.change_name(dst_name.clone());
         self.publish_metadata(src_parent.add_child(moved_src))?;

@@ -80,7 +80,7 @@ fn directory_rename_ctime_survives_restore() {
 }
 
 #[test]
-fn directory_exchange_ctime_survives_restore() {
+fn directory_exchange_keeps_existing_ctime() {
     Master::init_test_metrics();
     let mut conf = ClusterConf {
         testing: true,
@@ -90,16 +90,17 @@ fn directory_exchange_ctime_survives_restore() {
     let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
     fs.mkdir("/p/a", true).unwrap();
     fs.mkdir("/q/b", true).unwrap();
-    let a_before = fs.file_status("/p/a").unwrap().ctime();
-    let b_before = fs.file_status("/q/b").unwrap().ctime();
+    let a_ctime = fs.file_status("/p/a").unwrap().ctime();
+    let b_ctime = fs.file_status("/q/b").unwrap().ctime();
     std::thread::sleep(std::time::Duration::from_millis(5));
     fs.rename("/p/a", "/q/b", RenameFlags::EXCHANGE).unwrap();
-    let a_after = fs.file_status("/q/b").unwrap().ctime();
-    let b_after = fs.file_status("/p/a").unwrap().ctime();
-    assert!(a_after > a_before && b_after > b_before);
-    fs.restore_from_rocksdb().unwrap();
-    assert_eq!(fs.file_status("/q/b").unwrap().ctime(), a_after);
-    assert_eq!(fs.file_status("/p/a").unwrap().ctime(), b_after);
+    for restored in [false, true] {
+        if restored {
+            fs.restore_from_rocksdb().unwrap();
+        }
+        assert_eq!(fs.file_status("/q/b").unwrap().ctime(), a_ctime);
+        assert_eq!(fs.file_status("/p/a").unwrap().ctime(), b_ctime);
+    }
 }
 
 /// A same-directory directory rename must move the live node, not rebuild it:

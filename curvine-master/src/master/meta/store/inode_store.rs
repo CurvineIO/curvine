@@ -694,8 +694,6 @@ impl InodeStore {
         at_dst: &InodeView,
         src_delta: DirectoryAttributeDelta,
         dst_delta: DirectoryAttributeDelta,
-        at_src_delta: Option<DirectoryAttributeDelta>,
-        at_dst_delta: Option<DirectoryAttributeDelta>,
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
@@ -710,12 +708,6 @@ impl InodeStore {
         } else {
             Self::merge_directory_attributes(&mut batch, src_parent.id(), src_delta)?;
             Self::merge_directory_attributes(&mut batch, dst_parent.id(), dst_delta)?;
-        }
-        if let Some(delta) = at_src_delta {
-            Self::merge_directory_attributes(&mut batch, at_src.id(), delta)?;
-        }
-        if let Some(delta) = at_dst_delta {
-            Self::merge_directory_attributes(&mut batch, at_dst.id(), delta)?;
         }
         batch.write_inode(src_parent)?;
         batch.write_inode(dst_parent)?;
