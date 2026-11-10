@@ -206,6 +206,27 @@ fn set_lock_waits_for_target_inode_lock() {
 }
 
 #[test]
+fn set_lock_root_waits_for_target_inode_lock() {
+    let fs = test_fs("set-lock-root-inode-order");
+    let inode_guard = fs.inode_locks.write_inode(ROOT_INODE_ID);
+    let worker = fs.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let task = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        done_tx
+            .send(worker.set_lock("/", FileLock::default()))
+            .unwrap();
+    });
+    started_rx.recv().unwrap();
+    let early = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+    drop(inode_guard);
+    task.join().unwrap();
+    assert!(early.is_err(), "set_lock('/') bypassed the root inode lock");
+    done_rx.recv().unwrap().unwrap();
+}
+
+#[test]
 fn set_lock_does_not_wait_for_fs_dir_readers() {
     let fs = test_fs("set-lock-shared-fs-dir");
     fs.create("/file", true).unwrap();

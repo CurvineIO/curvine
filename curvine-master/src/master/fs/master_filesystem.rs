@@ -395,7 +395,7 @@ impl MasterFilesystem {
     }
 
     /// Root directory state is internally synchronized, so sharded paths only
-    /// retain an explicit root-parent or root-attribute write request.
+    /// retain an explicit root mutation write request.
     fn filter_root_requests(
         requests: &mut SmallVec<[InodeLockRequest; 8]>,
         retain_root_write: bool,
@@ -4919,10 +4919,10 @@ impl MasterFilesystem {
                 crate::fault_point! {
                     sync,
                     name: "master.metadata.set_lock_planned",
-                            description: "Lock path resolved before inode locks",
+                    description: "Lock path resolved before inode locks",
                     context: {"path" => path},
                 }
-                let _locks = self.lock_sharded_requests(requests, false);
+                let _locks = self.lock_sharded_requests(requests, target_depth == 0);
                 let fs_dir = self.fs_dir.read();
                 if epoch != Self::checked_live_epoch(&fs_dir)? {
                     continue;
