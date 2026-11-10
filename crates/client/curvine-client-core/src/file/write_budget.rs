@@ -24,8 +24,21 @@
 use curvine_core_error::CommonResult;
 use curvine_metrics::{Counter, Metrics as m};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::Notify;
+
+const WAITS_METRIC: &str = "client_write_budget_waits_total";
+const WAITS_HELP: &str = "writes that had to wait for the queued-byte budget";
+
+// One counter for the whole process: `Metrics::register` ignores a second
+// metric with the same name, so a per-budget counter would stop being exported
+// as soon as the first client (the registered one) is dropped.
+static WAITS: LazyLock<Result<Counter, String>> =
+    LazyLock::new(|| m::new_counter(WAITS_METRIC, WAITS_HELP).map_err(|e| e.to_string()));
+
+fn shared_waits_counter() -> CommonResult<Counter> {
+    WAITS.clone().map_err(Into::into)
+}
 
 struct BudgetState {
     used: i64,
@@ -60,10 +73,7 @@ impl WriteBudget {
             capacity: AtomicI64::new(capacity as i64),
             state: Mutex::new(BudgetState { used: 0 }),
             notify: Notify::new(),
-            waits: m::new_counter(
-                "client_write_budget_waits_total",
-                "writes that had to wait for the queued-byte budget",
-            )?,
+            waits: shared_waits_counter()?,
         }))
     }
 
@@ -95,9 +105,12 @@ impl WriteBudget {
         let want = (bytes as i64).min(capacity);
         let mut waited = false;
         loop {
-            // Register before checking so a release between the check and the
-            // await is not lost (`notify_one` stores a permit).
+            // Register before checking the state: `notify_waiters` wakes only
+            // already-registered waiters and stores no permit, so a release
+            // between the check and the await would otherwise be lost.
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let mut state = self.lock();
                 if state.used + want <= capacity {
@@ -124,7 +137,10 @@ impl WriteBudget {
             let mut state = self.lock();
             state.used = (state.used - bytes).max(0);
         }
-        self.notify.notify_one();
+        // One release can make room for several small requests, so notify every
+        // waiter; waking only one would leave fitting writers asleep with free
+        // capacity.
+        self.notify.notify_waiters();
     }
 }
 
@@ -198,5 +214,71 @@ mod tests {
         assert_eq!(budget.used(), 100);
         drop(permit);
         assert_eq!(budget.used(), 0);
+    }
+
+    // One release can free room for several requests: every waiter that fits
+    // must wake, otherwise the remaining writers sleep with free capacity.
+    #[tokio::test]
+    async fn one_release_wakes_every_fitting_waiter() {
+        let budget = WriteBudget::new(1024).unwrap();
+        let held = budget.acquire(1024).await.expect("the whole budget");
+
+        let mut waiters = Vec::new();
+        for _ in 0..3 {
+            let budget = budget.clone();
+            waiters.push(tokio::spawn(async move { budget.acquire(128).await }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(held);
+
+        let mut permits = Vec::new();
+        for waiter in waiters {
+            let permit = tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("one release must wake every fitting waiter")
+                .expect("waiter task panicked")
+                .expect("room is available after release");
+            permits.push(permit);
+        }
+        assert_eq!(budget.used(), 3 * 128);
+        drop(permits);
+        assert_eq!(budget.used(), 0);
+    }
+
+    // The metric must survive the client that registered it: a later budget has
+    // to reuse the exported counter instead of registering a new one that the
+    // registry ignores.
+    #[tokio::test]
+    async fn later_budgets_export_the_shared_wait_metric() {
+        drop(WriteBudget::new(64).unwrap());
+
+        let registered = match m::get(WAITS_METRIC) {
+            Some(m::Counter(counter)) => counter,
+            other => panic!(
+                "wait counter must be registered, got: {:?}",
+                other.is_some()
+            ),
+        };
+        let before = registered.get();
+
+        let budget = WriteBudget::new(64).unwrap();
+        let held = budget.acquire(64).await.expect("room is available");
+        let waiting = {
+            let budget = budget.clone();
+            tokio::spawn(async move { budget.acquire(64).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(held);
+        let permit = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("release must wake the waiter")
+            .expect("waiter task panicked")
+            .expect("room is available after release");
+
+        assert!(
+            registered.get() > before,
+            "waits from a later budget must be exported"
+        );
+        drop(permit);
     }
 }

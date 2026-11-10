@@ -85,7 +85,9 @@ pub struct ClientConf {
 
     // Total bytes the buffered writers of this client may queue before new
     // writes wait. Bounds queued write memory across files; "0" disables the
-    // budget, which leaves only the per-file chunk count as a bound.
+    // budget, which leaves only the per-file chunk count as a bound. FUSE
+    // request queues are not charged here: the kernel's max_background window
+    // already bounds them.
     #[serde(skip)]
     pub write_buffer_size: usize,
     #[serde(alias = "write_buffer_size")]
@@ -355,11 +357,6 @@ impl ClientConf {
     /// Falls back to the built-in default when the field is 0, so an
     /// uninitialised conf never yields `Duration::ZERO` and makes every
     /// `timeout(..)` fire immediately.
-    /// Configured queued-write budget in bytes, `0` when disabled.
-    pub fn write_buffer_bytes(&self) -> usize {
-        self.write_buffer_size
-    }
-
     pub fn data_timeout(&self) -> Duration {
         let millis = if self.data_timeout_ms > 0 {
             self.data_timeout_ms
@@ -367,6 +364,11 @@ impl ClientConf {
             Self::DEFAULT_DATA_TIMEOUT_MS
         };
         Duration::from_millis(millis)
+    }
+
+    /// Configured queued-write budget in bytes, `0` when disabled.
+    pub fn write_buffer_bytes(&self) -> usize {
+        self.write_buffer_size
     }
 
     pub fn init(&mut self) -> CommonResult<()> {
