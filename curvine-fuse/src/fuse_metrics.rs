@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use log::warn;
@@ -205,7 +206,8 @@ pub struct FuseMetrics {
     pub(crate) io_size_bytes: HistogramVec,
     pub(crate) io_dispatch_duration_us: HistogramVec,
     pub(crate) io_wait_duration_us: HistogramVec,
-    pub(crate) stream_read_queue_depth: Gauge,
+    pub(crate) stream_queue_depth: GaugeVec,
+    read_wait_metrics: OnceCell<Arc<ReadWaitMetrics>>,
     pub(crate) stream_io_inflight: GaugeVec,
     pub(crate) stream_lifecycle_duration_us: HistogramVec,
     pub(crate) stream_lifecycle_requests_total: CounterVec,
@@ -261,6 +263,17 @@ impl FuseMetrics {
         if let Some(m) = FUSE_METRICS.get() {
             f(m);
         }
+    }
+
+    pub(crate) fn read_wait_metrics(&self) -> Arc<ReadWaitMetrics> {
+        self.read_wait_metrics
+            .get_or_init(|| {
+                Arc::new(ReadWaitMetrics::new(
+                    &self.io_wait_duration_us,
+                    self.stream_queue_depth.with_label_values(&[IO_TYPE_READ]),
+                ))
+            })
+            .clone()
     }
 
     fn new() -> CommonResult<Self> {
@@ -484,7 +497,7 @@ impl FuseMetrics {
             io_wait_duration_us: m::new_histogram_vec_with_buckets(
                 "curvine_fuse_io_wait_duration_us",
                 "Read-path waits in microseconds. enqueue/reply_enqueue measure bounded channel \
-                 capacity waits or unbounded synchronous send overhead; exclude pre-send locks, \
+                 capacity waits only (no samples for unbounded sends); exclude pre-send locks, \
                  backend IO and reply queue residence. queue measures publication-to-dequeue \
                  latency, including publication overhead; only dequeued tasks emit queue samples. \
                  outcome is the wait outcome (success/error/cancelled), NOT the backend result. \
@@ -492,11 +505,13 @@ impl FuseMetrics {
                 &["io_type", "stage", "outcome"],
                 REQUEST_DURATION_BUCKETS_US,
             )?,
-            stream_read_queue_depth: m::new_gauge(
-                "curvine_fuse_stream_read_queue_depth",
+            read_wait_metrics: OnceCell::new(),
+            stream_queue_depth: m::new_gauge_vec(
+                "curvine_fuse_stream_queue_depth",
                 "Read tasks awaiting dequeue across reader channels, excluding Complete, \
                  capacity waiters and backend IO. Incremented just before publication; \
-                 decremented on dequeue, failed send or task drop",
+                 decremented on dequeue, failed send or task drop. Currently io_type=read only",
+                &["io_type"],
             )?,
             stream_io_inflight: m::new_gauge_vec(
                 "curvine_fuse_stream_io_inflight",
@@ -1047,30 +1062,93 @@ pub(crate) struct StreamLifecycleScope {
     _inflight: ActiveGuard,
 }
 
+/// Resolve the fixed label children once, outside the per-request timing path.
+#[derive(Clone)]
+pub(crate) struct ReadWaitStage {
+    pub(crate) success: Histogram,
+    pub(crate) error: Histogram,
+    pub(crate) cancelled: Histogram,
+}
+
+impl ReadWaitStage {
+    fn new(metric: &HistogramVec, stage: &'static str) -> Self {
+        Self {
+            success: metric.with_label_values(&[IO_TYPE_READ, stage, "success"]),
+            error: metric.with_label_values(&[IO_TYPE_READ, stage, "error"]),
+            cancelled: metric.with_label_values(&[IO_TYPE_READ, stage, "cancelled"]),
+        }
+    }
+
+    fn outcome(&self, outcome: &str) -> &Histogram {
+        match outcome {
+            "success" => &self.success,
+            "error" => &self.error,
+            "cancelled" => &self.cancelled,
+            _ => unreachable!("invalid read wait outcome"),
+        }
+    }
+}
+
+pub(crate) struct ReadWaitMetrics {
+    pub(crate) enqueue: ReadWaitStage,
+    pub(crate) queue: ReadWaitStage,
+    pub(crate) reply_enqueue: ReadWaitStage,
+    pub(crate) depth: Gauge,
+}
+
+impl ReadWaitMetrics {
+    fn new(metric: &HistogramVec, depth: Gauge) -> Self {
+        Self {
+            enqueue: ReadWaitStage::new(metric, IO_WAIT_ENQUEUE),
+            queue: ReadWaitStage::new(metric, IO_WAIT_QUEUE),
+            reply_enqueue: ReadWaitStage::new(metric, IO_WAIT_REPLY),
+            depth,
+        }
+    }
+
+    /// Instance-scoped injection also works when the reader runs on another runtime.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Arc<Self> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ID: AtomicUsize = AtomicUsize::new(0);
+        let id = ID.fetch_add(1, Ordering::Relaxed);
+        let metric = m::new_histogram_vec_with_buckets(
+            format!("isolated_read_wait_{id}"),
+            "test".to_string(),
+            &["io_type", "stage", "outcome"],
+            REQUEST_DURATION_BUCKETS_US,
+        )
+        .unwrap();
+        let depth = m::new_gauge(format!("isolated_read_depth_{id}"), "test".to_string()).unwrap();
+        Arc::new(Self::new(&metric, depth))
+    }
+}
+
 /// One read wait attempt. Cancellation records time spent waiting, not a completed IO.
 /// Disabled instrumentation creates neither a timestamp nor a metric handle.
 pub(crate) struct ReadWaitTimer {
     start: Instant,
     elapsed_us: Option<f64>,
-    stage: &'static str,
     outcome: Option<&'static str>,
-    metric: HistogramVec,
+    metric: ReadWaitStage,
 }
 
 impl ReadWaitTimer {
-    pub(crate) fn start(enabled: bool, stage: &'static str) -> Option<Self> {
-        enabled.then(|| Self {
+    pub(crate) fn start(metric: &ReadWaitStage) -> Self {
+        let metric = metric.clone();
+        Self {
             start: mono_now(),
             elapsed_us: None,
-            stage,
             outcome: Some("cancelled"),
-            metric: FuseMetrics::get().io_wait_duration_us.clone(),
-        })
+            metric,
+        }
     }
 
     /// Freeze at capacity acquisition; later reply bookkeeping is outside this wait.
     pub(crate) fn stop(&mut self) {
-        self.elapsed_us = Some(self.start.elapsed().as_secs_f64() * 1_000_000.0);
+        if self.elapsed_us.is_none() {
+            self.elapsed_us = Some(self.start.elapsed().as_secs_f64() * 1_000_000.0);
+        }
     }
 
     pub(crate) fn finish(mut self, success: bool) {
@@ -1088,9 +1166,7 @@ impl Drop for ReadWaitTimer {
             let elapsed = self
                 .elapsed_us
                 .unwrap_or_else(|| self.start.elapsed().as_secs_f64() * 1_000_000.0);
-            self.metric
-                .with_label_values(&[IO_TYPE_READ, self.stage, outcome])
-                .observe(elapsed);
+            self.metric.outcome(outcome).observe(elapsed);
         }
     }
 }
@@ -1105,16 +1181,14 @@ pub(crate) struct ReadQueueGuard {
 }
 
 impl ReadQueueGuard {
-    pub(crate) fn new(enabled: bool) -> Option<Self> {
-        let mut timer = ReadWaitTimer::start(enabled, IO_WAIT_QUEUE)?;
+    pub(crate) fn new(metrics: &ReadWaitMetrics) -> Self {
+        let depth = ActiveGuard::new(metrics.depth.clone());
+        let mut timer = ReadWaitTimer::start(&metrics.queue);
         timer.outcome = None;
-        let depth = ActiveGuard::new(FuseMetrics::get().stream_read_queue_depth.clone());
-        // Start immediately before publication, after instrumentation setup.
-        timer.start = mono_now();
-        Some(Self {
+        Self {
             timer,
             _depth: depth,
-        })
+        }
     }
 
     pub(crate) fn dequeued(self) {
@@ -1136,15 +1210,17 @@ mod read_wait_tests {
         ReadWaitTimer {
             start: mono_now() - Duration::from_millis(1),
             elapsed_us: None,
-            stage,
             outcome: Some("cancelled"),
-            metric: m::new_histogram_vec_with_buckets(
-                format!("read_wait_test_{id}"),
-                "test".to_string(),
-                &["io_type", "stage", "outcome"],
-                REQUEST_DURATION_BUCKETS_US,
-            )
-            .unwrap(),
+            metric: ReadWaitStage::new(
+                &m::new_histogram_vec_with_buckets(
+                    format!("read_wait_test_{id}"),
+                    "test".to_string(),
+                    &["io_type", "stage", "outcome"],
+                    REQUEST_DURATION_BUCKETS_US,
+                )
+                .unwrap(),
+                stage,
+            ),
         }
     }
 
@@ -1156,13 +1232,12 @@ mod read_wait_tests {
             ("cancelled", None),
         ] {
             let mut timer = timer(IO_WAIT_ENQUEUE);
-            let hist = timer
-                .metric
-                .with_label_values(&[IO_TYPE_READ, IO_WAIT_ENQUEUE, outcome]);
+            let hist = timer.metric.outcome(outcome).clone();
             timer.stop();
             let elapsed = timer.elapsed_us.unwrap();
             // Subsequent bookkeeping must not inflate the recorded capacity wait.
             timer.start -= Duration::from_secs(10);
+            timer.stop(); // Cancellation cleanup must preserve the first boundary.
             match result {
                 Some(ok) => timer.finish(ok),
                 None => drop(timer),
@@ -1178,7 +1253,7 @@ mod read_wait_tests {
         let mut timer = timer(IO_WAIT_QUEUE);
         timer.outcome = None;
         let metric = timer.metric.clone();
-        let hist = metric.with_label_values(&[IO_TYPE_READ, IO_WAIT_QUEUE, "success"]);
+        let hist = metric.success.clone();
         let depth = m::new_gauge("read_queue_depth_test", "test").unwrap();
         let queue = ReadQueueGuard {
             timer,
@@ -1194,7 +1269,6 @@ mod read_wait_tests {
             timer: ReadWaitTimer {
                 start: mono_now(),
                 elapsed_us: None,
-                stage: IO_WAIT_QUEUE,
                 outcome: None,
                 metric,
             },
@@ -1206,7 +1280,7 @@ mod read_wait_tests {
         assert_eq!(hist.get_sample_count(), 1);
     }
 
-    fn isolated_queue_guard(name: &str) -> (ReadQueueGuard, Gauge, HistogramVec) {
+    fn isolated_queue_guard(name: &str) -> (ReadQueueGuard, Gauge, ReadWaitStage) {
         let mut timer = timer(IO_WAIT_QUEUE);
         timer.outcome = None;
         let metric = timer.metric.clone();
@@ -1242,12 +1316,7 @@ mod read_wait_tests {
         drop(payload);
         assert_eq!(depth.get(), 0);
         assert!(lifetime.upgrade().is_none());
-        assert_eq!(
-            metric
-                .with_label_values(&[IO_TYPE_READ, IO_WAIT_QUEUE, "success"])
-                .get_sample_count(),
-            1
-        );
+        assert_eq!(metric.success.clone().get_sample_count(), 1);
         assert!(rx.recv().await.is_none());
     }
 
@@ -1278,9 +1347,7 @@ mod read_wait_tests {
         assert!(lifetime.upgrade().is_none());
         for outcome in ["success", "error", "cancelled"] {
             assert_eq!(
-                metric
-                    .with_label_values(&[IO_TYPE_READ, IO_WAIT_QUEUE, outcome])
-                    .get_sample_count(),
+                metric.outcome(outcome).get_sample_count(),
                 0,
                 "an abandoned task must not emit a queue duration sample"
             );
@@ -1288,13 +1355,9 @@ mod read_wait_tests {
     }
 
     #[test]
-    fn read_wait_disabled_and_discarded_attempts_emit_nothing() {
-        assert!(ReadWaitTimer::start(false, IO_WAIT_ENQUEUE).is_none());
-        assert!(ReadQueueGuard::new(false).is_none());
+    fn read_wait_discarded_attempts_emit_nothing() {
         let timer = timer(IO_WAIT_REPLY);
-        let hist = timer
-            .metric
-            .with_label_values(&[IO_TYPE_READ, IO_WAIT_REPLY, "cancelled"]);
+        let hist = timer.metric.cancelled.clone();
         timer.discard();
         assert_eq!(hist.get_sample_count(), 0);
     }
