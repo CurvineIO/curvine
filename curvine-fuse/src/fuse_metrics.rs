@@ -1151,6 +1151,11 @@ impl ReadWaitTimer {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn frozen_elapsed_us(&self) -> Option<f64> {
+        self.elapsed_us
+    }
+
     pub(crate) fn finish(mut self, success: bool) {
         self.outcome = Some(if success { "success" } else { "error" });
     }

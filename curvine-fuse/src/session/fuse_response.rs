@@ -167,6 +167,8 @@ pub struct FuseResponse {
     pub(crate) metrics: Option<Arc<Mutex<FuseRespMetrics>>>,
     read_wait: bool,
     wait_metrics: Option<ReadWaitStage>,
+    #[cfg(test)]
+    before_enqueue_failure: Option<Arc<dyn Fn(Option<f64>) + Send + Sync>>,
 }
 
 /// Normal replies need no extra state lock. Only an abandoned capacity wait
@@ -225,6 +227,8 @@ impl FuseResponse {
             metrics,
             read_wait,
             wait_metrics,
+            #[cfg(test)]
+            before_enqueue_failure: None,
         }
     }
 
@@ -323,6 +327,17 @@ impl FuseResponse {
                     p
                 }
                 Err(e) => {
+                    if let Some(timer) = &mut wait.timer {
+                        timer.stop();
+                    }
+                    #[cfg(test)]
+                    if let Some(observe) = &self.before_enqueue_failure {
+                        observe(
+                            wait.timer
+                                .as_ref()
+                                .and_then(ReadWaitTimer::frozen_elapsed_us),
+                        );
+                    }
                     // Use the existing state transition to decide who records
                     // failure; a second attempt on a finished reply emits nothing.
                     if self.finish_enqueue_failure(slot, status, errno, unsupported_reason) {
@@ -965,6 +980,27 @@ mod tests {
             assert_eq!(metrics.reply_enqueue.cancelled.get_sample_count(), 0);
             assert_eq!(gauge.get(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn read_wait_closed_channel_freezes_before_error_bookkeeping() {
+        let gauge = m::new_gauge("read_wait_error_boundary_active", "test").unwrap();
+        let (mut reply, rx, metrics) = isolated_wait_reply(&gauge, "Read", 1, true);
+        let frozen = Arc::new(Mutex::new(None));
+        let observed = frozen.clone();
+        // Observe the real reserve-error path immediately before completion
+        // bookkeeping. No sleeps or wall-clock thresholds are needed.
+        reply.before_enqueue_failure = Some(Arc::new(move |elapsed| {
+            *observed.lock() = Some(elapsed.expect("reserve error must freeze the timer"));
+        }));
+        drop(rx);
+        assert!(reply.send_rep::<(), FuseError>(Ok(())).await.is_err());
+        let expected = frozen.lock().expect("error boundary was observed");
+        assert_eq!(metrics.reply_enqueue.error.get_sample_count(), 1);
+        assert_eq!(metrics.reply_enqueue.error.get_sample_sum(), expected);
+        assert_eq!(metrics.reply_enqueue.success.get_sample_count(), 0);
+        assert_eq!(metrics.reply_enqueue.cancelled.get_sample_count(), 0);
+        assert_eq!(gauge.get(), 0);
     }
 
     #[tokio::test]
