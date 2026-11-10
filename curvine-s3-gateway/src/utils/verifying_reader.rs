@@ -63,7 +63,22 @@ where
         }
 
         match self.inner.poll_read().await {
-            Err(error) => Err(error),
+            // A truncated HTTP body does not end in a clean EOF: hyper's length
+            // decoder reports the premature end as a transport error. When the
+            // declared length was not reached, that is a client-side short body
+            // and must be answered 400, not become an opaque 500. A transport
+            // error after the full length arrived is unrelated and passes
+            // through unchanged.
+            Err(error) => {
+                self.finished = true;
+                match self.expected_length {
+                    Some(expected_length) if self.bytes_seen < expected_length => Err(format!(
+                        "ContentLengthMismatch: received {} of {} bytes (transport: {error})",
+                        self.bytes_seen, expected_length
+                    )),
+                    _ => Err(error),
+                }
+            }
             Ok(None) => {
                 if let Some(expected_length) = self.expected_length {
                     if self.bytes_seen != expected_length {
@@ -94,6 +109,7 @@ where
             }
             Ok(Some(chunk)) => {
                 let Some(new_bytes_seen) = self.bytes_seen.checked_add(chunk.len() as u64) else {
+                    self.finished = true;
                     return Err(format!(
                         "ContentLengthMismatch: body exceeded the declared length {}",
                         self.expected_length
@@ -104,6 +120,10 @@ where
 
                 if let Some(expected_length) = self.expected_length {
                     if new_bytes_seen > expected_length {
+                        // Terminal: without this a retried read could reach a
+                        // no-longer-exceeding EOF and report success for a body
+                        // already rejected as too long.
+                        self.finished = true;
                         return Err(format!(
                             "ContentLengthMismatch: received more than declared length {}",
                             expected_length

@@ -89,3 +89,66 @@ async fn empty_body_with_empty_hash_succeeds() {
 
     assert_eq!(reader.poll_read().await.unwrap(), None);
 }
+
+/// A reader that fails the way hyper's length decoder does on a truncated
+/// request: the stream ends in a transport error, not a clean EOF.
+struct TruncatedAfterOneChunk {
+    chunk: Option<Vec<u8>>,
+}
+
+#[async_trait::async_trait]
+impl PollRead for TruncatedAfterOneChunk {
+    async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        match self.chunk.take() {
+            Some(chunk) => Ok(Some(chunk)),
+            None => Err("end of file before message length reached".to_string()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn transport_error_before_the_declared_length_is_a_length_mismatch() {
+    let mut reader = VerifyingReader::new(
+        TruncatedAfterOneChunk {
+            chunk: Some(b"hello".to_vec()),
+        },
+        None,
+        Some(10),
+    );
+
+    assert_eq!(reader.poll_read().await.unwrap(), Some(b"hello".to_vec()));
+    let error = reader.poll_read().await.unwrap_err();
+    assert!(error.starts_with("ContentLengthMismatch:"), "{error}");
+    assert!(error.contains("received 5 of 10 bytes"), "{error}");
+}
+
+#[tokio::test]
+async fn transport_error_after_the_declared_length_passes_through() {
+    let mut reader = VerifyingReader::new(
+        TruncatedAfterOneChunk {
+            chunk: Some(b"hello".to_vec()),
+        },
+        None,
+        Some(5),
+    );
+
+    assert_eq!(reader.poll_read().await.unwrap(), Some(b"hello".to_vec()));
+    let error = reader.poll_read().await.unwrap_err();
+    assert!(!error.starts_with("ContentLengthMismatch:"), "{error}");
+    assert!(error.contains("end of file"), "{error}");
+}
+
+#[tokio::test]
+async fn an_over_long_body_stays_failed_after_a_retried_read() {
+    let reader = Chunks::new([b"hello".to_vec(), b"!".to_vec()]);
+    let mut reader = VerifyingReader::new(reader, Some(sha256_hex(b"hello")), Some(5));
+
+    assert_eq!(reader.poll_read().await.unwrap(), Some(b"hello".to_vec()));
+    assert!(reader
+        .poll_read()
+        .await
+        .unwrap_err()
+        .starts_with("ContentLengthMismatch:"));
+    // The rejection is terminal: a retried read must not turn into success.
+    assert_eq!(reader.poll_read().await, Ok(None));
+}
