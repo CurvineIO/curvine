@@ -28,6 +28,7 @@ use curvine_model::{
     BlockLocation, CommitBlock, DirectoryAttributeDelta, DirectoryAttributes, FileLock, FileStatus,
     ListOptions, MountInfo,
 };
+use curvine_raft::proto::raft::AppliedIndex;
 use curvine_rocksdb::{DBConf, DbReadSnapshot as DBReadSnapshot, RocksIterator, RocksUtils};
 use curvine_runtime::common::{FileUtils, Utils};
 use log::info;
@@ -154,11 +155,32 @@ impl JournalCursorStore {
             context: { "key" => key },
             return_error: |fault| Err(fault.message.into()),
         }
+        self.with_store(|store| store.put_common_kv(key, value))
+    }
+
+    /// Borrows the current store for the whole synchronous operation, so
+    /// restore must wait before detaching or replacing it.
+    fn with_store<T>(
+        &self,
+        op: impl FnOnce(&RocksInodeStore) -> CommonResult<T>,
+    ) -> CommonResult<T> {
         let store = self.inner.read();
         match store.as_ref() {
-            Some(store) => store.put_common_kv(key, value),
+            Some(store) => op(store),
             None => err_box!("cursor store unavailable during metadata restore"),
         }
+    }
+
+    pub(crate) fn get_applied_req(&self, req_id: i64) -> CommonResult<Option<AppliedIndex>> {
+        self.with_store(|store| store.get_applied_req(req_id))
+    }
+
+    pub(crate) fn put_applied_req(&self, req_id: i64, index: u64, term: u64) -> CommonResult<()> {
+        self.with_store(|store| store.put_applied_req(req_id, index, term))
+    }
+
+    pub(crate) fn prune_applied_req_below(&self, floor: u64) -> CommonResult<()> {
+        self.with_store(|store| store.prune_applied_req_below(floor))
     }
 }
 
@@ -1825,6 +1847,10 @@ impl<'a> InodeStoreSnapshot<'a> {
 }
 
 #[cfg(test)]
+#[path = "tests/journal_cursor_test.rs"]
+mod journal_cursor_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::master::meta::inode::ttl::TtlBucketList;
@@ -1833,7 +1859,7 @@ mod tests {
     };
     use crate::master::Master;
 
-    fn new_store(name: &str) -> CommonResult<InodeStore> {
+    pub(super) fn new_store(name: &str) -> CommonResult<InodeStore> {
         Master::init_test_metrics();
         let conf = DBConf::new(Utils::test_sub_dir(format!(
             "inode-store-test/{}-{}",

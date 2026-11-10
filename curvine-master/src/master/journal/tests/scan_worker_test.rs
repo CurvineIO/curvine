@@ -93,18 +93,38 @@ fn scan_error_propagates_to_the_caller() {
     });
 }
 
+#[cfg(feature = "fault-injection")]
 #[test]
 fn scan_with_ack_survives_a_retrying_entry() {
-    with_scan_loader("retry-window", |loader, receiver| async move {
-        let mut batch = JournalBatch::new(1);
-        for (path, id, parent) in [("/applied", 5001, 0), ("/missing/child", 5002, 9999)] {
-            batch.push(JournalEntry::Mkdir(MkdirEntry {
-                op_id: id as u64,
-                rpc_id: 0,
-                path: path.to_string(),
-                dir: crate::master::meta::inode::InodeDir::new(id, parent),
-            }));
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+
+    struct RuleCleanup(&'static FaultRuntime, &'static str);
+    impl Drop for RuleCleanup {
+        fn drop(&mut self) {
+            let _ = self.0.remove(self.1);
         }
+    }
+
+    with_scan_loader("retry-window", |loader, receiver| async move {
+        let child_name = format!("scan-retry-{}", Utils::rand_str(8));
+        let faults = FaultRuntime::process();
+        let rule_id = "scan-worker-transient-add";
+        let rule = FaultRuleBuilder::named("master.metadata.add.before_commit")
+            .matches("child_name", child_name.as_str())
+            .unwrap()
+            .times(1)
+            .unwrap()
+            .return_error("transient add failure")
+            .unwrap();
+        faults.configure(rule_id, rule).unwrap();
+        let rule_guard = RuleCleanup(faults, rule_id);
+        let mut batch = JournalBatch::new(1);
+        batch.push(JournalEntry::Mkdir(MkdirEntry {
+            op_id: 5001,
+            rpc_id: 0,
+            path: format!("/{child_name}"),
+            dir: crate::master::meta::inode::InodeDir::new(5001, 0),
+        }));
         loader
             .sender
             .send(ApplyMsg::new_entry(Entry {
@@ -119,6 +139,7 @@ fn scan_with_ack_survives_a_retrying_entry() {
         // Exclude safe mode, which also rejects snapshots: the remaining
         // cause is a pending retry whose 60s delay exceeds the test timeout.
         let snapshot = loader.create_snapshot().await;
+        assert_eq!(rule_guard.0.rule(rule_id).unwrap().unwrap().executions, 1);
         assert!(!loader.recovery.is_safe_mode());
         assert!(matches!(
             snapshot,
@@ -136,6 +157,54 @@ fn scan_with_ack_survives_a_retrying_entry() {
         loader.sender.send(ApplyMsg::Shutdown(tx)).await.unwrap();
         rx.receive().await.unwrap();
         worker.await.unwrap();
+    });
+}
+
+#[test]
+fn leader_bookkeeping_does_not_wait_for_namespace_writer() {
+    with_scan_loader("bookkeeping", |loader, _receiver| async move {
+        let mut batch = JournalBatch::new(1);
+        let entry = Entry {
+            index: 8192,
+            term: 1,
+            data: batch.encode().unwrap(),
+            context: SerdeUtils::serialize(&7_i64).unwrap().into(),
+            ..Default::default()
+        };
+        let namespace = loader.fs_dir.clone();
+        let held = namespace.write();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(loader.apply0(true, &entry, false));
+            drop(runtime);
+            let _ = done_tx.send(result);
+        });
+        let early = done_rx.recv_timeout(Duration::from_secs(2));
+        let progressed = matches!(&early, Ok(Ok(())));
+        drop(held);
+        let result = match early {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                done_rx.recv_timeout(Duration::from_secs(2))
+            }
+            completed => completed,
+        };
+        if result.is_ok() {
+            worker.join().unwrap();
+        }
+        assert!(
+            progressed,
+            "leader bookkeeping waited for the namespace lock"
+        );
+        result
+            .expect("bookkeeping did not finish after release")
+            .unwrap();
+        let dir = namespace.read();
+        let record = dir.store.store.get_applied_req(7).unwrap().unwrap();
+        assert_eq!((record.index, record.term), (8192, 1));
     });
 }
 

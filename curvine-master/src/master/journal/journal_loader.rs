@@ -562,8 +562,9 @@ impl JournalLoader {
         // cannot see across either boundary. The persisted applied-request
         // record is the durable dedup boundary: the same proposing request
         // must never replay its metadata a second time.
-        if let Some(req_id) = Self::entry_req_id(entry) {
-            match self.fs_dir.read().store.store.get_applied_req(req_id) {
+        let request_id = Self::entry_req_id(entry);
+        if let Some(req_id) = request_id {
+            match self.cursor_store.get_applied_req(req_id) {
                 Ok(Some(applied_req)) => {
                     warn!(
                         "skip duplicate journal batch: request {} already applied at index {}, duplicate entry index {}, term {}",
@@ -641,19 +642,16 @@ impl JournalLoader {
         // applied: with a snapshot the duplicate is skipped and the cursor
         // catches up; without one the rebuild wipes rows and records together
         // and replays everything from scratch.
-        if let Some(req_id) = Self::entry_req_id(entry) {
-            let store = &self.fs_dir.read().store.store;
-            store.put_applied_req(req_id, entry.index, entry.term)?;
+        if let Some(req_id) = request_id {
+            self.cursor_store
+                .put_applied_req(req_id, entry.index, entry.term)?;
         }
         self.set_applied(is_leader, applied, has_ufs_affecting)?;
-        if Self::entry_req_id(entry).is_some() {
+        if request_id.is_some() {
             let entry_index = entry.index;
             let window = self.applied_req_window;
             if entry_index % 8192 == 0 {
-                self.fs_dir
-                    .read()
-                    .store
-                    .store
+                self.cursor_store
                     .prune_applied_req_below(entry_index.saturating_sub(window))?;
             }
         }
