@@ -220,6 +220,7 @@ fn list_options_lock_window_excludes_rename_writers() {
     assert_eq!(fs.file_status("/q/f").unwrap().id, before.id);
 }
 
+#[cfg(feature = "fault-injection")]
 #[test]
 fn rename_reloads_inode_after_a_hard_link_is_added() {
     use curvine_fault::{FaultRuleBuilder, FaultRuntime};
