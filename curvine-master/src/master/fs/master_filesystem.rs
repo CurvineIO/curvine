@@ -2793,7 +2793,11 @@ impl MasterFilesystem {
             }
         }
         Ok(MemoryReadPlan {
-            root_target: ids.len() == 1 && ids.first() == Some(&ROOT_INODE_ID),
+            // Root is the read target only when the requested path itself is
+            // "/". A failed walk of a deeper request also yields just the
+            // root id, and that negative lookup must not re-claim the root
+            // read lock.
+            root_target: components.len() == 1 && components[0] == PATH_SEPARATOR,
             full: ids.len() == components.len(),
             target_name: components.last().unwrap().clone(),
             ids,

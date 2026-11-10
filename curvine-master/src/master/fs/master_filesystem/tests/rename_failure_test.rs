@@ -15,6 +15,28 @@
 use super::*;
 
 #[cfg(feature = "fault-injection")]
+use curvine_fault::FaultRuntime;
+#[cfg(feature = "fault-injection")]
+use std::time::Instant;
+
+/// Confirms a fault point executed before `deadline` without busy sleeping.
+#[cfg(feature = "fault-injection")]
+fn confirm(runtime: &FaultRuntime, id: &str, deadline: Instant) -> bool {
+    while Instant::now() < deadline {
+        if runtime
+            .rule(id)
+            .ok()
+            .and_then(|rule| rule)
+            .is_some_and(|rule| rule.executions > 0)
+        {
+            return true;
+        }
+        std::thread::yield_now();
+    }
+    false
+}
+
+#[cfg(feature = "fault-injection")]
 #[test]
 fn file_status_lock_window_excludes_rename_writers() {
     use curvine_fault::{FaultRuleBuilder, FaultRuntime};
@@ -53,21 +75,6 @@ fn file_status_lock_window_excludes_rename_writers() {
     );
     let reader_fs = fs.clone();
     let reader = std::thread::spawn(move || reader_fs.file_status("/p/a"));
-
-    fn confirm(runtime: &FaultRuntime, id: &str, deadline: Instant) -> bool {
-        while Instant::now() < deadline {
-            if runtime
-                .rule(id)
-                .ok()
-                .and_then(|rule| rule)
-                .is_some_and(|rule| rule.executions > 0)
-            {
-                return true;
-            }
-            std::thread::yield_now();
-        }
-        false
-    }
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -158,21 +165,6 @@ fn list_options_lock_window_excludes_rename_writers() {
     let reader_fs = fs.clone();
     let reader = std::thread::spawn(move || reader_fs.list_options("/p/f", ListOptions::default()));
 
-    fn confirm(runtime: &FaultRuntime, id: &str, deadline: Instant) -> bool {
-        while Instant::now() < deadline {
-            if runtime
-                .rule(id)
-                .ok()
-                .and_then(|rule| rule)
-                .is_some_and(|rule| rule.executions > 0)
-            {
-                return true;
-            }
-            std::thread::yield_now();
-        }
-        false
-    }
-
     let mut failures = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     if !confirm(&runtime, entry_id, deadline) {
@@ -218,6 +210,128 @@ fn list_options_lock_window_excludes_rename_writers() {
     assert_eq!(page[0].id, before.id);
     assert!(fs.list_options("/p/f", ListOptions::default()).is_err());
     assert_eq!(fs.file_status("/q/f").unwrap().id, before.id);
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn directory_page_lock_window_excludes_rename_writers() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let fs = test_fs("directory-page-lock-window");
+    fs.mkdir("/p", true).unwrap();
+    fs.mkdir("/q", true).unwrap();
+    fs.create("/p/f", false).unwrap();
+    fs.create("/p/g", false).unwrap();
+    let before_f = fs.file_status("/p/f").unwrap();
+    let before_g = fs.file_status("/p/g").unwrap();
+    let runtime = FaultRuntime::process();
+    let entry_id = "directory-page-lock-entry";
+    let arrival_id = "directory-page-lock-arrival";
+    runtime
+        .configure(
+            entry_id,
+            FaultRuleBuilder::named("master.metadata.list_options.locked_build")
+                .matches("path", "/p")
+                .unwrap()
+                .record()
+                .unwrap(),
+        )
+        .unwrap();
+    runtime
+        .configure(
+            arrival_id,
+            FaultRuleBuilder::named("master.metadata.rename_planned")
+                .matches("path", "/p/f")
+                .unwrap()
+                .record()
+                .unwrap(),
+        )
+        .unwrap();
+    let release = crate::master::fs::master_filesystem::memory_read_gates::install(
+        "master.metadata.list_options.locked_build",
+    );
+    let reader_fs = fs.clone();
+    let reader = std::thread::spawn(move || reader_fs.list_options("/p", ListOptions::default()));
+
+    let mut failures = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    if !confirm(&runtime, entry_id, deadline) {
+        failures.push("reader never reached the directory page locked build window".to_string());
+    }
+    let writer = if failures.is_empty() {
+        let (done, done_rx) = mpsc::channel::<()>();
+        let writer_fs = fs.clone();
+        let handle = std::thread::spawn(move || {
+            writer_fs
+                .rename("/p/f", "/q/f", RenameFlags::empty())
+                .unwrap();
+            done.send(()).unwrap();
+        });
+        if !confirm(&runtime, arrival_id, deadline) {
+            failures.push("rename writer never reached its lock plan".to_string());
+        }
+        let blocked = {
+            std::thread::sleep(Duration::from_millis(50));
+            done_rx.try_recv().is_err()
+        };
+        if !blocked {
+            failures.push(
+                "rename completed while the directory page window held inode locks".to_string(),
+            );
+        }
+        Some((handle, done_rx))
+    } else {
+        None
+    };
+
+    drop(release);
+    let page = reader.join().unwrap().unwrap();
+    if let Some((handle, done_rx)) = writer {
+        handle.join().unwrap();
+        drop(done_rx);
+    }
+    runtime.remove(entry_id).unwrap();
+    runtime.remove(arrival_id).unwrap();
+
+    assert!(failures.is_empty(), "{:?}", failures);
+    assert_eq!(page.len(), 2);
+    assert!(page
+        .iter()
+        .any(|status| status.name == "f" && status.id == before_f.id));
+    assert!(page
+        .iter()
+        .any(|status| status.name == "g" && status.id == before_g.id));
+    assert!(fs.file_status("/p/f").is_err());
+    assert_eq!(fs.file_status("/q/f").unwrap().id, before_f.id);
+}
+
+#[test]
+fn negative_lookups_do_not_claim_the_root_read_lock() {
+    let fs = test_fs("memory-read-plan-root");
+    fs.mkdir("/d", false).unwrap();
+    let fs_dir = fs.fs_dir.read();
+    for path in ["/missing", "/missing/child"] {
+        let plan =
+            MasterFilesystem::plan_memory_read(&fs_dir, path, false, &ListOptions::default())
+                .unwrap();
+        assert!(!plan.root_target, "{} misclassified as a root target", path);
+        assert!(
+            plan.lock_requests()
+                .iter()
+                .all(|request| request.inode_id != ROOT_INODE_ID),
+            "{} still requests the root read lock",
+            path
+        );
+    }
+    let plan =
+        MasterFilesystem::plan_memory_read(&fs_dir, "/", false, &ListOptions::default()).unwrap();
+    assert!(plan.root_target);
+    assert!(plan
+        .lock_requests()
+        .iter()
+        .any(|request| request.inode_id == ROOT_INODE_ID));
 }
 
 #[cfg(feature = "fault-injection")]
