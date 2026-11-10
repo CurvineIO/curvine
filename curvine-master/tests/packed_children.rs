@@ -70,7 +70,7 @@ fn assert_matches_oracle(children: &PackedChildren, oracle: &Oracle) {
 
     for (name, (id, is_dir)) in oracle {
         let child = children
-            .get_child(name)
+            .get_child_item(name)
             .unwrap_or_else(|| panic!("child {} is missing", name));
         assert_eq!(child.id(), *id, "wrong id for {}", name);
         assert_eq!(child.is_dir(), *is_dir, "wrong kind for {}", name);
@@ -89,22 +89,26 @@ fn add_get_delete_round_trip_for_both_kinds() {
     assert_eq!(children.len(), 2);
     assert!(!children.is_empty());
 
-    let file = children.get_child("a.txt").expect("file edge must resolve");
+    let file = children
+        .get_child_item("a.txt")
+        .expect("file edge must resolve");
     assert_eq!(file.id(), 11);
     assert_eq!(file.name(), "a.txt");
     assert!(!file.is_dir());
     assert!(file.is_file_entry());
 
-    let dir = children.get_child("sub").expect("dir edge must resolve");
+    let dir = children
+        .get_child_item("sub")
+        .expect("dir edge must resolve");
     assert_eq!(dir.id(), 22);
     assert!(dir.is_dir());
 
-    assert!(children.get_child("missing").is_none());
+    assert!(children.get_child_item("missing").is_none());
 
     let removed_file = children.delete_child(11, "a.txt").unwrap();
     assert_eq!(removed_file.id(), 11);
     assert!(removed_file.is_file_entry());
-    assert!(children.get_child("a.txt").is_none());
+    assert!(children.get_child_item("a.txt").is_none());
 
     let removed_dir = children.delete_child(22, "sub").unwrap();
     assert_eq!(removed_dir.id(), 22);
@@ -125,7 +129,7 @@ fn multibyte_names_round_trip() {
     let name = "目录-数据.txt";
     children.add_child(file_edge(name, 5)).unwrap();
 
-    assert_eq!(children.get_child(name).unwrap().id(), 5);
+    assert_eq!(children.get_child_item(name).unwrap().id(), 5);
     let items: Vec<ChildItem<'_>> = children.iter().collect();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].name(), name);
@@ -153,17 +157,17 @@ fn duplicate_add_keeps_the_existing_child_and_its_slot() {
     let mut children = PackedChildren::new();
     children.add_child(file_edge("dup", 1)).unwrap();
     assert!(children.add_child(file_edge("dup", 2)).is_err());
-    assert_eq!(children.get_child("dup").unwrap().id(), 1);
+    assert_eq!(children.get_child_item("dup").unwrap().id(), 1);
     assert_eq!(children.len(), 1);
 
     children.add_child(dir_edge("d", 10)).unwrap();
     assert!(children.add_child(dir_edge("d", 20)).is_err());
-    let kept = children.get_child("d").unwrap();
+    let kept = children.get_child_item("d").unwrap();
     assert_eq!(kept.id(), 10);
     assert!(kept.is_dir());
 
     children.add_child(dir_edge("d2", 30)).unwrap();
-    let d2 = children.get_child("d2").unwrap();
+    let d2 = children.get_child_item("d2").unwrap();
     assert_eq!(d2.id(), 30);
     assert!(d2.is_dir());
     assert_eq!(children.len(), 3);
@@ -175,7 +179,7 @@ fn name_length_is_bounded_by_the_record_layout() {
 
     let longest = "n".repeat(255);
     children.add_child(file_edge(&longest, 1)).unwrap();
-    assert_eq!(children.get_child(&longest).unwrap().id(), 1);
+    assert_eq!(children.get_child_item(&longest).unwrap().id(), 1);
     children
         .add_child(dir_edge(&format!("{}d", "n".repeat(254)), 2))
         .unwrap();
@@ -183,7 +187,7 @@ fn name_length_is_bounded_by_the_record_layout() {
     let too_long = "n".repeat(256);
     assert!(children.add_child(file_edge(&too_long, 3)).is_err());
     assert!(children.add_child(dir_edge(&too_long, 4)).is_err());
-    assert!(children.get_child(&too_long).is_none());
+    assert!(children.get_child_item(&too_long).is_none());
     assert_eq!(children.len(), 2);
 }
 
@@ -223,7 +227,10 @@ fn item_name_matches_the_directory_object() {
     assert_eq!(listed[0].name(), "renamed");
     assert_eq!(listed[0].id(), 7);
 
-    assert_eq!(children.get_child("renamed").unwrap().name(), "renamed");
+    assert_eq!(
+        children.get_child_item("renamed").unwrap().name(),
+        "renamed"
+    );
 }
 
 #[test]
@@ -232,7 +239,7 @@ fn pointer_ownership_matches_the_contract() {
     children.add_child(file_edge("solo", 42)).unwrap();
     children.add_child(dir_edge("dir", 43)).unwrap();
 
-    let owned = children.get_child("solo").unwrap();
+    let owned = children.get_child_item("solo").unwrap();
     assert_eq!(owned.id(), 42);
     assert!(owned.is_file_entry());
 
@@ -259,7 +266,7 @@ fn random_add_and_delete_track_the_oracle_across_chunks() {
         if let Some((old_id, _)) = oracle.get(&name) {
             let old_id = *old_id;
             assert!(children.add_child(make_edge(&name, id, is_dir)).is_err());
-            assert_eq!(children.get_child(&name).unwrap().id(), old_id);
+            assert_eq!(children.get_child_item(&name).unwrap().id(), old_id);
         } else if !oracle.is_empty() && rng.below(10) < 3 {
             let victim = oracle.keys().nth(rng.below(oracle.len())).unwrap().clone();
             let victim_id = oracle[&victim].0;
@@ -401,8 +408,13 @@ fn dir_pointer_survives_growth_and_slot_reuse() {
     let mut children = PackedChildren::new();
     children.add_child(dir_edge("keep", 1)).unwrap();
 
-    let kept = children.get_child("keep").expect("keep must resolve");
-    assert!(kept.is_dir());
+    // Hold the shared Arc<DirNode> handle: it must survive growth and slot reuse.
+    let _kept = children
+        .get_child_item("keep")
+        .expect("keep must resolve")
+        .dir_node()
+        .cloned()
+        .expect("keep must be a directory edge");
 
     for i in 0..3000 {
         children
@@ -416,10 +428,7 @@ fn dir_pointer_survives_growth_and_slot_reuse() {
         children.delete_child(id, &name).unwrap();
     }
 
-    assert_eq!(kept.id(), 1);
-    assert_eq!(kept.name(), "keep");
-    assert!(kept.is_dir());
-    assert_eq!(children.get_child("keep").unwrap().id(), 1);
+    assert_eq!(children.get_child_item("keep").unwrap().id(), 1);
     assert_eq!(children.len(), 3001);
 }
 
@@ -448,7 +457,7 @@ fn compaction_remaps_directory_slots_without_losing_children() {
 
     for i in 1500..2000 {
         let dir = children
-            .get_child(&format!("d-{i:05}"))
+            .get_child_item(&format!("d-{i:05}"))
             .unwrap_or_else(|| panic!("d-{i:05} was lost by compaction"));
         assert!(dir.is_dir(), "d-{i:05} came back as a file edge");
         assert_eq!(
@@ -458,16 +467,16 @@ fn compaction_remaps_directory_slots_without_losing_children() {
         );
     }
     for i in 0..500 {
-        let file = children.get_child(&format!("f-{i:05}")).unwrap();
+        let file = children.get_child_item(&format!("f-{i:05}")).unwrap();
         assert!(!file.is_dir());
         assert_eq!(file.id(), i as i64 + 100000);
     }
     for i in 0..1500 {
-        assert!(children.get_child(&format!("d-{i:05}")).is_none());
+        assert!(children.get_child_item(&format!("d-{i:05}")).is_none());
     }
 
     children.add_child(dir_edge("d-new", 777)).unwrap();
-    let new_dir = children.get_child("d-new").unwrap();
+    let new_dir = children.get_child_item("d-new").unwrap();
     assert!(new_dir.is_dir());
     assert_eq!(new_dir.id(), 777);
     assert_eq!(children.len(), 1001);

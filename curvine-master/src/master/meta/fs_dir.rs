@@ -46,7 +46,10 @@ const MODE_SETGID: u32 = 0o2000;
 /// In-memory inode and namespace mutations require either the exclusive
 /// filesystem guard or the inode locks owned by the sharded write path.
 pub struct FsDir {
-    pub(crate) root_dir: InodeView,
+    /// Live root directory. Held as `Arc<DirNode>` for the same reason every
+    /// other directory edge is: the node owns its children index and
+    /// attribute state, so readers and writers never need a projected view.
+    pub(crate) root: Arc<DirNode>,
     pub(crate) inode_id: Arc<InodeId>,
     pub(crate) store: InodeStore,
     pub(crate) journal_writer: Arc<JournalWriter>,
@@ -224,20 +227,6 @@ impl ParentMut {
         }
     }
 
-    fn dec_nlink(&mut self, mtime: i64) -> FsResult<()> {
-        match self {
-            Self::Live(node) => {
-                let delta = DirectoryAttributeDelta::new(mtime, mtime, -1);
-                node.apply_attribute_delta(delta)
-                    .map_err(|e| FsError::common(e.to_string()))
-            }
-            Self::View(ptr) => {
-                ptr.dec_nlink(mtime);
-                Ok(())
-            }
-        }
-    }
-
     fn add_child(&self, inode: InodeView) -> CommonResult<ChildAddResult> {
         match self {
             Self::Live(node) => node.add_child_edge(inode),
@@ -310,11 +299,11 @@ impl FsDir {
         // Rebuild the live tree from the local store; create_tree supplies a
         // blank root for a fresh format. Store rows and the journal cursor are
         // persisted independently, so this is not a proof of crash consistency.
-        let (last_inode_id, root_dir) = state.create_tree()?;
-        root_dir.as_dir_ref()?;
+        let (last_inode_id, root_view) = state.create_tree()?;
+        root_view.as_dir_ref()?;
 
         let fs_dir = Self {
-            root_dir,
+            root: DirNode::from_view(&root_view),
             inode_id: Arc::new(InodeId::new()),
             store: state,
             journal_writer,
@@ -334,12 +323,18 @@ impl FsDir {
         InodeView::new_dir(ROOT_INODE_NAME.to_string(), InodeDir::new(ROOT_INODE_ID, 0))
     }
 
-    pub fn root_ptr(&self) -> InodePtr {
-        InodePtr::from_ref(&self.root_dir)
+    /// Live root handle. Every root write goes through this node, so the
+    /// namespace never hands out a projected root pointer.
+    pub fn root_node(&self) -> Arc<DirNode> {
+        self.root.clone()
     }
 
-    pub fn root_dir(&self) -> &InodeView {
-        &self.root_dir
+    /// Detached attribute projection of the root for DTO-shaped callers
+    /// (metadata snapshot, tree dump). Attribute writes stay local to the
+    /// projection; child mutations still reach the shared live container, so
+    /// this is read-only by contract.
+    pub fn root_view(&self) -> InodeView {
+        InodeDir::from_dir_node_live(ROOT_INODE_NAME.to_string(), self.root.clone())
     }
 
     fn next_inode_id(&self) -> FsResult<i64> {
@@ -662,9 +657,6 @@ impl FsDir {
         if update_parent_mtime {
             self.publish_metadata(parent.update_mtime(mtime).map_err(CommonError::from))?;
         }
-        if child.is_dir() {
-            self.publish_metadata(parent.dec_nlink(mtime).map_err(CommonError::from))?;
-        }
         if matches!(child, File(f) if f.nlink() > 1) {
             if let File(file) = target.as_mut() {
                 file.decrement_nlink(mtime);
@@ -678,7 +670,7 @@ impl FsDir {
         )
         .for_child_removal();
         self.publish_metadata(parent.publish_directory_delta(delta))?;
-        parent.mark_persisted()?;
+        self.publish_metadata(parent.mark_persisted())?;
 
         // After deletion occurs, the target address cannot be used.
         let _ = self.publish_metadata(parent.delete_child(child.id(), child_name))?;
@@ -713,7 +705,7 @@ impl FsDir {
             // A missing path resolves to a truncated InodePath and is skipped
             // below; an error here is a store failure, not a missing path, and
             // must fail replay instead of advancing past an undeleted inode.
-            let inp = InodePath::resolve(self.root_ptr(), path, &self.store)?;
+            let inp = InodePath::resolve(self.root_node(), path, &self.store)?;
 
             let Some(child) = inp.get_last_inode() else {
                 debug!("purge: skip vanished path {}", path);
@@ -811,7 +803,7 @@ impl FsDir {
             )
             .for_child_removal();
             self.publish_metadata(parent.publish_directory_delta(delta))?;
-            parent.mark_persisted()?;
+            self.publish_metadata(parent.mark_persisted())?;
             // Do not journal or release blocks when live publication fails:
             // recovery may restore the still-uncommitted journal operation.
             // This can leave orphaned blocks that require recovery cleanup.
@@ -864,7 +856,7 @@ impl FsDir {
 
         let entry_name = self.unique_trash_entry_name(op_ms, inode.id())?;
         let dst_path = trash::trash_entry_path(&entry_name);
-        let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+        let dst_inp = InodePath::resolve(self.root_node(), &dst_path, &self.store)?;
 
         // The TRASH rename records the origin and the deletion time on the
         // moved inode as part of the same persisted mutation, so a hard delete
@@ -922,7 +914,7 @@ impl FsDir {
 
         let entry_name = self.unique_trash_entry_name(op_ms, inode.id())?;
         let dst_path = trash::pending_entry_path(&entry_name);
-        let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+        let dst_inp = InodePath::resolve(self.root_node(), &dst_path, &self.store)?;
 
         self.rename_with_mtime(
             inp,
@@ -955,14 +947,14 @@ impl FsDir {
             )));
         }
 
-        let src_inp = InodePath::resolve(self.root_ptr(), trash_path, &self.store)?;
+        let src_inp = InodePath::resolve(self.root_node(), trash_path, &self.store)?;
         if src_inp.get_last_inode().is_none() {
             return Ok(None);
         }
 
         self.ensure_pending_root()?;
         let dst_path = trash::pending_entry_path(src_inp.name());
-        let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+        let dst_inp = InodePath::resolve(self.root_node(), &dst_path, &self.store)?;
 
         // Trash markers are kept: the entry stays a trash entry, only no longer
         // a restorable one.
@@ -985,7 +977,7 @@ impl FsDir {
     }
 
     fn ensure_trash_dir(&mut self, path: &str) -> FsResult<()> {
-        let inp = InodePath::resolve(self.root_ptr(), path, &self.store)?;
+        let inp = InodePath::resolve(self.root_node(), path, &self.store)?;
         match inp.get_last_inode() {
             Some(inode) if inode.is_dir() => Ok(()),
             Some(_) => err_ext!(FsError::invalid_argument(format!(
@@ -1012,7 +1004,7 @@ impl FsDir {
             // by directory, so both locations must be free to reuse a name.
             candidates.push(trash::pending_entry_path(&name));
             if candidates.iter().all(|path| {
-                InodePath::resolve(self.root_ptr(), path, &self.store)
+                InodePath::resolve(self.root_node(), path, &self.store)
                     .map(|inp| inp.get_last_inode().is_none())
                     .unwrap_or(false)
             }) {
@@ -1031,7 +1023,7 @@ impl FsDir {
         after: Option<&trash::TrashCursor>,
         limit: usize,
     ) -> FsResult<TrashListing> {
-        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store)?;
+        let inp = InodePath::resolve(self.root_node(), trash::TRASH_ROOT, &self.store)?;
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => {
@@ -1094,7 +1086,7 @@ impl FsDir {
             let path = trash::trash_entry_path(name);
             // Directory children can be unresolved FileEntry pointers; resolve
             // each entry so the full inode (and its trash xattrs) is loaded.
-            let child_inp = InodePath::resolve(self.root_ptr(), &path, &self.store)?;
+            let child_inp = InodePath::resolve(self.root_node(), &path, &self.store)?;
             let Some(child) = child_inp.get_last_inode() else {
                 continue;
             };
@@ -1172,7 +1164,7 @@ impl FsDir {
                 trash_path
             )));
         }
-        let src_inp = InodePath::resolve(self.root_ptr(), trash_path, &self.store)?;
+        let src_inp = InodePath::resolve(self.root_node(), trash_path, &self.store)?;
         self.resolve_restore_dst(&src_inp, dst)
     }
 
@@ -1187,7 +1179,7 @@ impl FsDir {
         start_after: Option<&str>,
     ) -> FsResult<TrashScanPage> {
         let limit = limit.max(1);
-        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store)?;
+        let inp = InodePath::resolve(self.root_node(), trash::TRASH_ROOT, &self.store)?;
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return Ok(TrashScanPage::default()),
@@ -1243,7 +1235,7 @@ impl FsDir {
         start_after: Option<&str>,
     ) -> FsResult<TrashScanPage> {
         let limit = limit.max(1);
-        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_PENDING_ROOT, &self.store)?;
+        let inp = InodePath::resolve(self.root_node(), trash::TRASH_PENDING_ROOT, &self.store)?;
         let Some(inode) = inp.get_last_inode() else {
             return Ok(TrashScanPage::default());
         };
@@ -1287,11 +1279,11 @@ impl FsDir {
             )));
         }
 
-        let src_inp = InodePath::resolve(self.root_ptr(), trash_path, &self.store)?;
+        let src_inp = InodePath::resolve(self.root_node(), trash_path, &self.store)?;
         let default_dst = dst.is_none() || dst.is_some_and(|value| value.is_empty());
         let dst = self.resolve_restore_dst(&src_inp, dst)?;
 
-        let dst_inp = InodePath::resolve(self.root_ptr(), &dst, &self.store)?;
+        let dst_inp = InodePath::resolve(self.root_node(), &dst, &self.store)?;
         if dst_inp.get_last_inode().is_some() && !overwrite {
             return err_ext!(FsError::file_exists(&dst));
         }
@@ -1324,7 +1316,7 @@ impl FsDir {
 
         let replaced = self.rename(&src_inp, &dst_inp, flags)?;
 
-        let restored_inp = InodePath::resolve(self.root_ptr(), &dst, &self.store)?;
+        let restored_inp = InodePath::resolve(self.root_node(), &dst, &self.store)?;
         let status = match restored_inp.get_last_inode() {
             Some(inode) => inode.to_file_status(&dst)?,
             None => return err_ext!(FsError::file_not_found(&dst)),
@@ -1339,7 +1331,7 @@ impl FsDir {
     }
 
     pub fn trash_entry_names(&self) -> FsResult<Vec<String>> {
-        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_ROOT, &self.store)?;
+        let inp = InodePath::resolve(self.root_node(), trash::TRASH_ROOT, &self.store)?;
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return Ok(vec![]),
@@ -1395,7 +1387,7 @@ impl FsDir {
             let src_path = trash::trash_entry_path(name);
             let dst_path = trash::pending_entry_path(name);
 
-            let src = match InodePath::resolve(self.root_ptr(), &src_path, &self.store) {
+            let src = match InodePath::resolve(self.root_node(), &src_path, &self.store) {
                 Ok(inp) => inp,
                 Err(e) => {
                     debug!("stage: skip unresolvable trash entry {}: {}", src_path, e);
@@ -1406,7 +1398,7 @@ impl FsDir {
                 continue;
             }
 
-            let dst = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+            let dst = InodePath::resolve(self.root_node(), &dst_path, &self.store)?;
             if dst.get_last_inode().is_some() {
                 debug!("stage: {} is already staged", dst_path);
                 continue;
@@ -1487,7 +1479,7 @@ impl FsDir {
         if path != expected_path {
             return Ok(None);
         }
-        let inp = InodePath::resolve(self.root_ptr(), &path, &self.store)?;
+        let inp = InodePath::resolve(self.root_node(), &path, &self.store)?;
         let Some(inode) = inp.get_last_inode() else {
             return Ok(None);
         };
@@ -1683,16 +1675,15 @@ impl FsDir {
                 x_attr.remove(trash::TRASH_XATTR_ORIGIN);
                 x_attr.remove(trash::TRASH_XATTR_DELETE_MS);
             }
-            // The slot stores the shared Arc<DirNode>: a moved directory must
-            // carry the trash markers in its node meta, or live projections
-            // lose them the moment the DTO copy is dropped.
-            if let Ok(dir) = new_inode.as_dir_ref() {
-                if let Some(node) = dir.node.as_ref() {
-                    let mut meta = DirMeta::clone(&node.meta());
-                    meta.features = dir.features.clone();
-                    node.store_meta(meta);
-                }
-            }
+        }
+        // A directory edge stores its stable live node. Attach it before the
+        // store batch commits so the only post-commit publication is the
+        // staged DTO whose metadata matches the persisted inode record.
+        if new_inode.is_dir() {
+            let node = src_inp
+                .get_dir_node(-1)
+                .ok_or_else(|| FsError::common("source directory lost its live node"))?;
+            new_inode.as_dir_mut()?.node = Some(node);
         }
 
         // Stage parent metadata separately: a failed store write must not
@@ -1785,24 +1776,27 @@ impl FsDir {
         }
 
         self.publish_metadata(src_parent.publish_directory_delta(src_raw))?;
-        src_parent.mark_persisted()?;
+        self.publish_metadata(src_parent.mark_persisted())?;
         if let Some(raw) = dst_raw {
             self.publish_metadata(dst_parent.publish_directory_delta(raw))?;
-            dst_parent.mark_persisted()?;
+            self.publish_metadata(dst_parent.mark_persisted())?;
         }
         // Update memory status. Same-directory renames mutate the child index
         // inside a single rename-mutation window so a concurrent listing never
         // observes the deleted-but-not-yet-added middle state.
         if src_parent.id() == dst_parent.id() {
-            let children = src_parent.children_handle()?;
+            let children =
+                self.publish_metadata(src_parent.children_handle().map_err(CommonError::from))?;
             let mut mutation = children.begin_rename_mutation(src_inp.name(), dst_inp.name());
-            mutation.rename_to(
-                src_inode.id(),
-                src_inp.name(),
-                replaced
-                    .as_ref()
-                    .map(|target| (target.id(), dst_inp.name())),
-                new_inode,
+            self.publish_metadata(
+                mutation.rename_to(
+                    src_inode.id(),
+                    src_inp.name(),
+                    replaced
+                        .as_ref()
+                        .map(|target| (target.id(), dst_inp.name())),
+                    new_inode,
+                ),
             )?;
             return Ok(del_res);
         }
@@ -1811,45 +1805,11 @@ impl FsDir {
             let _ = self.publish_metadata(dst_parent.delete_child(target.id(), dst_inp.name()))?;
         }
 
-        // Cross-directory renames touch two independent directories; each
-        // side's child mutation is individually atomic, and the store batch
-        // committed before them is already atomic for the parent chain.
-        let detached =
-            self.publish_metadata(src_parent.delete_child(src_inode.id(), src_inp.name()))?;
-        // Persist first, then move the same Arc<DirNode> under the new edge:
-        // the detached view carries the live node backlink, so the slot stores
-        // the identical handle and the subtree stays shared.
-        let mut moved_inode = detached;
-        moved_inode.change_name(dst_inp.name().to_string());
-        if moved_inode.is_dir() {
-            if flags.trash() {
-                let x_attr = moved_inode.x_attr_mut()?;
-                x_attr.insert(
-                    trash::TRASH_XATTR_ORIGIN.to_string(),
-                    src_inp.path().as_bytes().to_vec(),
-                );
-                x_attr.insert(
-                    trash::TRASH_XATTR_DELETE_MS.to_string(),
-                    mtime.to_le_bytes().to_vec(),
-                );
-            } else if flags.restore() {
-                let x_attr = moved_inode.x_attr_mut()?;
-                x_attr.remove(trash::TRASH_XATTR_ORIGIN);
-                x_attr.remove(trash::TRASH_XATTR_DELETE_MS);
-            }
-            // The slot stores the shared Arc<DirNode>: a moved directory must
-            // carry the trash markers in its node meta, or live projections
-            // lose them the moment the detached DTO copy is dropped.
-            if let Ok(dir) = moved_inode.as_dir_ref() {
-                if let Some(node) = dir.node.as_ref() {
-                    let mut meta = DirMeta::clone(&node.meta());
-                    meta.features = dir.features.clone();
-                    node.store_meta(meta);
-                }
-            }
-        }
-
-        self.publish_metadata(dst_parent.add_child(moved_inode))?;
+        // Cross-directory renames publish the same staged DTO that was
+        // committed above. Its live-node backlink preserves the subtree and
+        // `DirNode::for_edge` installs its parent and feature metadata.
+        let _ = self.publish_metadata(src_parent.delete_child(src_inode.id(), src_inp.name()))?;
+        self.publish_metadata(dst_parent.add_child(new_inode))?;
 
         Ok(del_res)
     }
@@ -1942,10 +1902,10 @@ impl FsDir {
             dst_delta,
         )?;
         self.publish_metadata(src_parent.publish_directory_delta(src_raw))?;
-        src_parent.mark_persisted()?;
+        self.publish_metadata(src_parent.mark_persisted())?;
         if src_parent.id() != dst_parent.id() {
             self.publish_metadata(dst_parent.publish_directory_delta(dst_raw))?;
-            dst_parent.mark_persisted()?;
+            self.publish_metadata(dst_parent.mark_persisted())?;
         }
 
         let detached_src = self.publish_metadata(src_parent.delete_child(src_id, &src_name))?;
@@ -2042,7 +2002,7 @@ impl FsDir {
             DirectoryAttributeDelta::new(child.mtime(), child.mtime(), i32::from(child.is_dir()))
                 .for_child_entry();
         self.publish_metadata(parent.publish_directory_delta(delta))?;
-        parent.mark_persisted()?;
+        self.publish_metadata(parent.mark_persisted())?;
         let added = self.publish_metadata(parent.add_child(child))?;
         self.publish_metadata(inp.append(added.into_entry()))?;
 
@@ -2382,12 +2342,12 @@ impl FsDir {
     }
 
     pub fn print_tree(&self) {
-        self.root_dir.print_tree()
+        self.root_view().print_tree()
     }
 
     pub fn sum_hash(&self) -> CommonResult<u128> {
         self.store.ensure_available()?;
-        let mut tree_hash = self.root_dir.sum_hash()?;
+        let mut tree_hash = self.root_view().sum_hash()?;
         tree_hash += self.store.cf_hash(RocksInodeStore::CF_INODES)?;
         tree_hash += self.store.cf_hash(RocksInodeStore::CF_EDGES)?;
         tree_hash += self.store.cf_hash(RocksInodeStore::CF_LOCATION)?;
@@ -2419,7 +2379,7 @@ impl FsDir {
         self.store.initialize_root_directory_attributes()?;
         let (last_inode_id, root_dir) = self.store.create_tree()?;
         root_dir.as_dir_ref()?;
-        self.root_dir = root_dir;
+        self.root = DirNode::from_view(&root_dir);
         self.update_last_inode_id(last_inode_id)?;
         Ok(())
     }
@@ -2471,7 +2431,7 @@ impl FsDir {
             self.journal_writer.fail_metadata_restore();
             error
         })?;
-        self.root_dir = root_dir;
+        self.root = DirNode::from_view(&root_dir);
         self.update_last_inode_id(last_inode_id).map_err(|error| {
             self.store.invalidate_cursor_store();
             self.journal_writer.fail_metadata_restore();
@@ -2828,9 +2788,8 @@ impl FsDir {
             return err_box!("set_attr is not supported on unresolved FileEntry inodes; resolve/load the full inode before calling set_attr");
         }
 
-        // Root element: the caller's pointer may be a live-node projection
-        // (node backlink set) or a plain DTO (root dir). Directories without
-        // a node handle cannot be published, so they are rejected.
+        // Every directory write publishes through its live node. The root has
+        // no parent edge, so its handle comes from `FsDir` itself.
         enum Element {
             Dir {
                 name: String,
@@ -2839,7 +2798,7 @@ impl FsDir {
             File {
                 view: InodeView,
             },
-            /// Borrowed live view (root until S6): publication writes it.
+            /// Borrowed live view (files): publication writes it.
             Borrowed(InodePtr),
         }
 
@@ -2847,11 +2806,8 @@ impl FsDir {
             .as_ref()
             .as_dir_ref()
             .ok()
-            .and_then(|dir| dir.node.clone());
-        // The filesystem root lives as a plain `InodeView` on `FsDir` (no slot,
-        // no node backlink) until S6; publishing through the borrowed view is
-        // safe and matches the pre-S3 behaviour.
-        let is_root_view = inode.id() == ROOT_INODE_ID && root_node.is_none();
+            .and_then(|dir| dir.node.clone())
+            .or_else(|| (inode.id() == ROOT_INODE_ID).then(|| self.root.clone()));
         let root_name = inode.name().to_string();
         let mut stack = LinkedList::new();
         if inode.is_dir() {
@@ -2860,18 +2816,11 @@ impl FsDir {
                     name: root_name,
                     node,
                 }),
-                None if is_root_view => {
-                    // The root lives as a plain `InodeView` on `FsDir`; keep
-                    // the caller's borrowed pointer so publication writes the
-                    // live root, not a detached clone.
-                    stack.push_back(Element::Borrowed(inode.clone()));
-                }
                 None => {
                     return err_box!(
-                        "set_attr: directory {} has no live node handle; cannot publish (id={}, is_root_view={})",
+                        "set_attr: directory {} has no live node handle; cannot publish (id={})",
                         inode.name(),
-                        inode.id(),
-                        is_root_view
+                        inode.id()
                     );
                 }
             }
@@ -2936,12 +2885,14 @@ impl FsDir {
             let mut updated = cur_view.clone_metadata();
             updated.set_attr(set_opts)?;
             if updated.is_dir() {
-                let mut attributes = match &cur_node {
-                    Some(node) => node.directory_attributes(),
-                    // Root-view publish: read the current values from the
-                    // borrowed DTO (the node backlink is absent until S6).
-                    None => cur_view.as_dir_ref()?.directory_attributes(),
+                let Some(node) = &cur_node else {
+                    return err_box!(
+                        "set_attr: directory {} is missing its live node handle (id={})",
+                        cur_view.name(),
+                        cur_id
+                    );
                 };
+                let mut attributes = node.directory_attributes();
                 if let Some(mtime) = assigned_mtime {
                     attributes.mtime = mtime;
                 }
@@ -2975,7 +2926,9 @@ impl FsDir {
                     node.store_meta(updated_dir.to_dir_meta());
                 }
                 Some(SetAttrTarget::View(ptr)) => {
-                    ptr.as_mut().replace_metadata(updated);
+                    // Files are owned views backed by the caller's pointer:
+                    // publishing is a plain in-place overwrite.
+                    *ptr.as_mut() = updated;
                 }
                 None => {}
             }
@@ -3067,7 +3020,7 @@ impl FsDir {
         } else {
             self.publish_metadata(parent.publish_directory_delta(delta))?;
         }
-        parent.mark_persisted()?;
+        self.publish_metadata(parent.mark_persisted())?;
         match old_inode {
             Some(v) => {
                 self.publish_metadata(parent.delete_child(v.id(), link.name()))?;
@@ -3166,7 +3119,7 @@ impl FsDir {
         )?;
         let delta = DirectoryAttributeDelta::for_child(op_ms as i64).for_child_entry();
         self.publish_metadata(parent.publish_directory_delta(delta))?;
-        parent.mark_persisted()?;
+        self.publish_metadata(parent.mark_persisted())?;
         let added = self.publish_metadata(parent.add_child(file_entry))?;
         self.publish_metadata(new_path.append(added.into_entry()))?;
 

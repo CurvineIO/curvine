@@ -26,8 +26,8 @@
 
 use curvine_config::ChildrenContainer;
 use curvine_master::master::meta::inode::{
-    DirectoryChildren, InodeChildren, InodeDir, InodeFile, InodePtr, InodeView, NamedDir,
-    NamedEntry, ROOT_INODE_ID, ROOT_INODE_NAME,
+    ChildEdge, DirectoryChildren, InodeChildren, InodeDir, InodeFile, InodePtr, InodeView,
+    NamedDir, NamedEntry, ROOT_INODE_ID, ROOT_INODE_NAME,
 };
 use curvine_sys::SysUtils;
 use std::mem::size_of;
@@ -181,13 +181,19 @@ fn measure(container: ChildrenContainer, dir_count: usize) {
     // master drops it after persisting to RocksDB.
     let t = Instant::now();
     for i in 0..dir_count {
-        let dir = root
-            .get_child(&dir_name(i))
-            .expect("directory should exist");
+        let dir = match root
+            .children_handle()
+            .expect("root must be a directory")
+            .get_child_edge(&dir_name(i))
+            .expect("directory should exist")
+        {
+            ChildEdge::Dir(node) => node,
+            ChildEdge::FileId(id) => panic!("{} resolved as a file: {id}", dir_name(i)),
+        };
         for j in 0..FILES_PER_DIR {
             let file = InodeView::new_file(file_name(j), InodeFile::new(next_id, 0));
             next_id += 1;
-            dir.as_mut().add_child(file).unwrap();
+            dir.add_child_edge(file).unwrap();
         }
     }
     let file_time = t.elapsed();

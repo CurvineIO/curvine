@@ -1257,7 +1257,7 @@ impl InodeStore {
 
         // BFS stack: (parent_ptr, parent_id)
         let mut stack: VecDeque<(InodePtr, i64)> = VecDeque::new();
-        stack.push_back((root.as_ptr(), ROOT_INODE_ID));
+        stack.push_back((InodePtr::from_ref(&mut root), ROOT_INODE_ID));
 
         let mut last_inode_id = ROOT_INODE_ID;
         let mut dir_edges: HashMap<i64, (i64, String)> = HashMap::new();
@@ -1830,7 +1830,7 @@ mod tests {
     use super::*;
     use crate::master::meta::inode::ttl::TtlBucketList;
     use crate::master::meta::inode::{
-        Inode, InodeDir, InodeFile, InodePath, InodePtr, ROOT_INODE_ID,
+        ChildEdge, DirNode, Inode, InodeDir, InodeFile, InodePath, ROOT_INODE_ID,
     };
     use crate::master::Master;
 
@@ -1933,7 +1933,10 @@ mod tests {
 
         let (_, restored) = store.create_tree()?;
         let child = restored
-            .get_child("edge-name")
+            .children_handle()
+            .expect("restored tree root must be a directory")
+            .read_child_view("edge-name")
+            .0
             .expect("edge name should be hydrated into restored tree");
         assert_eq!(child.name(), "edge-name");
 
@@ -1998,14 +2001,13 @@ mod tests {
             batch.commit()?;
         }
 
-        let (_, mut root) = store.create_tree()?;
-        root.add_child(InodeView::new_entry("missing.txt".to_string(), missing_id))?;
+        let (_, mut root_view) = store.create_tree()?;
+        root_view.add_child(InodeView::new_entry("missing.txt".to_string(), missing_id))?;
 
-        // Keep `root` alive and resolve through a borrowed pointer: `resolve`
-        // clones the root InodePtr and RawPtr::clone clears the owned flag, so
-        // handing it an owned root would free the tree once `resolve` returns.
-        let children = root.children();
-        let inp = InodePath::resolve(InodePtr::from_ref(&root), "/", &store)?;
+        // The live root is a shared node, so the resolved path keeps it alive.
+        let root = DirNode::from_view(&root_view);
+        let children = root.children.list_options(&Default::default());
+        let inp = InodePath::resolve(root, "/", &store)?;
         let result = store.batched_get_inodes(&inp, children)?;
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "good.txt");
@@ -2065,15 +2067,22 @@ mod tests {
         }
 
         let (_, restored) = store.create_tree()?;
-        let dir = restored
-            .get_child("dir")
-            .expect("restored directory should exist");
-        dir.as_mut()
-            .add_child(InodeView::new_entry("stale.txt".to_string(), missing_id))?;
+        let root_children = restored
+            .children_handle()
+            .expect("restored tree root must be a directory");
+        let dir_node = match root_children
+            .get_child_edge("dir")
+            .expect("restored directory should exist")
+        {
+            ChildEdge::Dir(node) => node,
+            ChildEdge::FileId(id) => panic!("dir edge resolved as a file: {id}"),
+        };
+        dir_node.add_child_edge(InodeView::new_entry("stale.txt".to_string(), missing_id))?;
+        let dir = root_children.read_child_view("dir").0.unwrap();
 
         let result = store.apply_delete(
             &restored,
-            dir.as_ref(),
+            &dir,
             "dir",
             100,
             true,
@@ -2111,10 +2120,11 @@ mod tests {
 
         let (_, restored) = store.create_tree()?;
         let dir = restored
-            .get_child("dir")
-            .expect("restored directory should exist")
-            .as_ref()
-            .clone();
+            .children_handle()
+            .expect("restored tree root must be a directory")
+            .read_child_view("dir")
+            .0
+            .expect("restored directory should exist");
 
         let result = store.apply_delete(
             &restored,

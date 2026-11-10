@@ -22,7 +22,7 @@
 //! Astra promotion protocol.
 
 use super::sharded_children::{min_sharded_children, ShardedChildren};
-use super::{ChildAddResult, ChildItem, DirNode, InodeChildren, InodePtr, InodeView};
+use super::{ChildAddResult, ChildItem, DirNode, InodeChildren, InodeView};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::ListOptions;
 use glob::Pattern;
@@ -426,10 +426,6 @@ impl DirectoryChildren {
         mutation.delete_child(child_id, child_name)
     }
 
-    pub fn get_child_ptr(&self, name: &str) -> Option<InodePtr> {
-        self.with_children_for_name(name, |children, name| children.get_child(name))
-    }
-
     /// One child edge with its stable identity, captured as owned data:
     /// directory edges carry the `Arc<DirNode>` handle, file edges the
     /// inline name+id record. The guard is released before returning.
@@ -698,11 +694,11 @@ impl DirectoryRenameMutation<'_> {
                         .as_mut()
                         .expect("cross-shard rename must own both shard guards")
                 };
-                // The detached source carries the live child index; a
-                // directory must keep it under its new name.
-                let detached = source_shard.delete_child(source_id, source_name)?;
-                let mut new_view = new_view;
-                new_view.adopt_directory_children(detached);
+                // The slot already owns the live `Arc<DirNode>`; deleting the
+                // source detaches a projection carrying the same node, and
+                // `add_child` reuses that backlink, so the directory keeps its
+                // identity without re-attaching children.
+                let _ = source_shard.delete_child(source_id, source_name)?;
                 let destination_shard: &mut InodeChildren = if destination_index == *first_index {
                     first
                 } else {
@@ -726,9 +722,9 @@ impl DirectoryRenameMutation<'_> {
         if let Some((replaced_id, replaced_name)) = replaced {
             let _ = children.delete_child(replaced_id, replaced_name)?;
         }
-        let detached = children.delete_child(source_id, source_name)?;
-        let mut new_view = new_view;
-        new_view.adopt_directory_children(detached);
+        // Same identity rule as `rename_to`: the detached projection already
+        // carries the slot's `Arc<DirNode>`, so no children re-attachment.
+        let _ = children.delete_child(source_id, source_name)?;
         let _ = children.add_child(new_view)?;
         Ok(())
     }

@@ -87,7 +87,7 @@ fn bounded_send_while_holding_namespace_write_blocks_namespace_read() -> FsResul
     let worker = std::thread::spawn(move || {
         let guard = worker_dir.write();
         holding_tx.send(()).unwrap();
-        let result = InodePath::resolve(guard.root_ptr(), "/queued", guard.store_ref())
+        let result = InodePath::resolve(guard.root_node(), "/queued", guard.store_ref())
             .map_err(curvine_error::FsError::from)
             .and_then(|path| guard.mkdir(path, curvine_model::MkdirOpts::with_create(true)))
             .map(|_| ());
@@ -268,7 +268,7 @@ fn fsdir_write_only_marks_periodic_snapshot_due() -> FsResult<()> {
     conf.journal.leader_create_snapshot = Some(true);
     let writer = Arc::new(build_writer(&conf)?);
     let dir = build_fs_dir(&conf, writer.clone())?;
-    let path = InodePath::resolve(dir.root_ptr(), "/snapshot-slot", dir.store_ref())?;
+    let path = InodePath::resolve(dir.root_node(), "/snapshot-slot", dir.store_ref())?;
     dir.mkdir(path, curvine_model::MkdirOpts::with_create(true))?;
     assert!(writer.periodic_snapshot_due());
     assert!(checkpoint_dirs(&conf).is_empty());
@@ -293,7 +293,7 @@ fn unscoped_mkdir_commit_failure_fences_after_store_write() -> FsResult<()> {
     let writer = Arc::new(writer);
     let dir = build_fs_dir(&conf, writer.clone())?;
     let worker = std::thread::spawn(move || {
-        let path = InodePath::resolve(dir.root_ptr(), "/created", dir.store_ref()).unwrap();
+        let path = InodePath::resolve(dir.root_node(), "/created", dir.store_ref()).unwrap();
         let result = dir.mkdir(path, curvine_model::MkdirOpts::with_create(true));
         (dir, result)
     });
@@ -322,7 +322,7 @@ fn unscoped_set_attr_enqueue_failure_fences_after_store_write() -> FsResult<()> 
     drop(writer.receiver.take());
     let writer = Arc::new(writer);
     let dir = build_fs_dir(&conf, writer.clone())?;
-    let path = InodePath::resolve(dir.root_ptr(), "/", dir.store_ref())?;
+    let path = InodePath::resolve(dir.root_node(), "/", dir.store_ref())?;
     let root_id = path.get_last_inode().unwrap().id();
     let result = dir.set_attr(
         path,
@@ -506,7 +506,7 @@ fn overwrite_and_ttl_delete_entries_replay_idempotently() -> FsResult<()> {
     let overwrite_file = {
         let fs_dir_handle = fs.fs_dir();
         let fs_dir = fs_dir_handle.read();
-        InodePath::resolve(fs_dir.root_ptr(), "/file", &fs_dir.store)?.clone_last_file()?
+        InodePath::resolve(fs_dir.root_node(), "/file", &fs_dir.store)?.clone_last_file()?
     };
 
     fs.create_with_opts(
@@ -540,7 +540,7 @@ fn overwrite_and_ttl_delete_entries_replay_idempotently() -> FsResult<()> {
         file: {
             let fs_dir_handle = fs.fs_dir();
             let fs_dir = fs_dir_handle.read();
-            InodePath::resolve(fs_dir.root_ptr(), "/file", &fs_dir.store)?.clone_last_file()?
+            InodePath::resolve(fs_dir.root_node(), "/file", &fs_dir.store)?.clone_last_file()?
         },
     }))?;
     assert_eq!(fs.file_status("/file")?.len, 0);

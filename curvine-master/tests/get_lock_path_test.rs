@@ -101,6 +101,7 @@ fn get_lock_matches_full_path_resolution() {
     let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
     fs.create("/dir/file", true).unwrap();
     fs.mkdir("/dir/sub", false).unwrap();
+    fs.create("/dir/sub/deep/file", true).unwrap();
 
     let held = FileLock {
         client_id: "owner".into(),
@@ -123,6 +124,9 @@ fn get_lock_matches_full_path_resolution() {
         "/dir",
         "/dir/file",
         "/dir/sub",
+        "/dir/sub/deep",
+        "/dir/sub/deep/file",
+        "/dir/sub/deep/file/child",
         "/missing",
         "/dir/missing",
         "/dir/file/child",
@@ -135,7 +139,7 @@ fn get_lock_matches_full_path_resolution() {
         let actual = fs.get_lock(path, query.clone()).map_err(|e| e.to_string());
         let expected = {
             let guard = fs.fs_dir.read();
-            InodePath::resolve(guard.root_ptr(), path, guard.store_ref())
+            InodePath::resolve(guard.root_node(), path, guard.store_ref())
                 .map_err(|e| e.to_string())
                 .and_then(|inp| {
                     guard

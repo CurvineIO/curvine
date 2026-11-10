@@ -191,7 +191,7 @@ fn recursive_setattr_rejects_missing_child_inode_without_partial_updates() {
     let file_before = fs.file_status("/tree/a/file").unwrap();
     {
         let dir = fs.fs_dir.write();
-        let path = InodePath::resolve(dir.root_ptr(), "/tree/a", dir.store_ref()).unwrap();
+        let path = InodePath::resolve(dir.root_node(), "/tree/a", dir.store_ref()).unwrap();
         let mut parent = path.get_last_inode().unwrap();
         parent
             .add_child(InodeView::new_entry("dangling".into(), i64::MAX))
@@ -232,7 +232,7 @@ fn directory_setattr_keeps_tree_and_persists_recursive_attributes() {
     {
         let dir = fs.fs_dir.read();
         for path in ["/tree", "/tree/a", "/tree/b"] {
-            let resolved = InodePath::resolve(dir.root_ptr(), path, dir.store_ref()).unwrap();
+            let resolved = InodePath::resolve(dir.root_node(), path, dir.store_ref()).unwrap();
             let children = resolved
                 .get_last_inode()
                 .unwrap()

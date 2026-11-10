@@ -370,7 +370,7 @@ fn restore_failure_after_detach_rejects_direct_reads() {
         assert!(dir.block_ids_for_worker(100).is_err());
         assert!(dir.delete_locations(100).is_err());
         assert!(curvine_master::master::meta::inode::InodePath::resolve(
-            dir.root_ptr(),
+            dir.root_node(),
             "/existing",
             dir.store_ref()
         )

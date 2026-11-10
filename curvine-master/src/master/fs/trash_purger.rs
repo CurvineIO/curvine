@@ -278,7 +278,7 @@ impl TrashPurger {
         after: Option<&str>,
         limit: usize,
     ) -> FsResult<ChildPage> {
-        let inp = match InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store) {
+        let inp = match InodePath::resolve(fs_dir.root_node(), path, &fs_dir.store) {
             Ok(inp) => inp,
             Err(_) => return Ok(ChildPage::Missing),
         };

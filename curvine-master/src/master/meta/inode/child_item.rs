@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::{DirNode, InodePtr, InodeView};
+use crate::master::meta::inode::{DirNode, InodeView};
 use std::sync::Arc;
 
 /// One resolved child edge. Directory children carry their stable
@@ -71,6 +71,13 @@ impl<'a> ChildItem<'a> {
         }
     }
 
+    /// Whether the edge resolves to a file (inline id or a borrowed file
+    /// view). Directory edges always carry a live node handle.
+    #[inline]
+    pub fn is_file_entry(&self) -> bool {
+        !self.is_dir()
+    }
+
     #[inline]
     pub(crate) fn into_view(self) -> InodeView {
         match self {
@@ -79,19 +86,6 @@ impl<'a> ChildItem<'a> {
                 InodeView::from_dir_node_live(name.to_owned(), (*node).clone())
             }
             ChildItem::FileEntry { name, id } => InodeView::new_entry(name.to_owned(), id),
-        }
-    }
-
-    #[inline]
-    pub fn as_ptr(self) -> InodePtr {
-        match self {
-            ChildItem::View(view) => InodePtr::from_ref(view),
-            ChildItem::DirNode { name, node } => InodePtr::from_owned(
-                InodeView::from_dir_node_live(name.to_string(), (*node).clone()),
-            ),
-            ChildItem::FileEntry { name, id } => {
-                InodePtr::from_owned(InodeView::new_entry(name.to_string(), id))
-            }
         }
     }
 }

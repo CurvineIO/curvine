@@ -15,7 +15,7 @@
 use crate::master::meta::feature::{AclFeature, DirFeature};
 use crate::master::meta::inode::ChildAddResult;
 use crate::master::meta::inode::DirectoryChildren;
-use crate::master::meta::inode::{Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID};
+use crate::master::meta::inode::{Inode, InodeFile, InodeView, EMPTY_PARENT_ID};
 use arc_swap::ArcSwap;
 use curvine_codec::{CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{CommonError, CommonResult};
@@ -289,7 +289,7 @@ impl DirNode {
 
     /// Adds a child edge after the store batch committed. Must be called
     /// under the directory inode write lock.
-    pub(crate) fn add_child_edge(&self, mut inode: InodeView) -> CommonResult<ChildAddResult> {
+    pub fn add_child_edge(&self, mut inode: InodeView) -> CommonResult<ChildAddResult> {
         inode.set_parent_id(self.id);
         self.children.add_child(inode)
     }
@@ -308,6 +308,20 @@ impl DirNode {
         self.meta.store(Arc::new(meta));
     }
 
+    /// Returns the live node to retain in a directory edge. A moved directory
+    /// already carries its node; publish the staged metadata before reusing it.
+    pub(crate) fn for_edge(inode: &InodeView) -> Arc<Self> {
+        let dir = inode
+            .as_dir_ref()
+            .expect("DirNode::for_edge requires a directory");
+        if let Some(node) = &dir.node {
+            node.store_meta(dir.to_dir_meta());
+            node.clone()
+        } else {
+            Self::from_view(inode)
+        }
+    }
+
     /// Builds the live node for a fresh directory (mkdir / root).
     ///
     /// Invariant: `attributes` must already be initialized (mtime/ctime/
@@ -318,7 +332,7 @@ impl DirNode {
     /// boundary (mkdir / restore / replay). Attributes are initialized from
     /// the record's persisted values (or its plain fields when no dir-attr
     /// state exists), so the constructor invariant holds.
-    pub(crate) fn from_view(view: &InodeView) -> Arc<Self> {
+    pub fn from_view(view: &InodeView) -> Arc<Self> {
         let dir = match view {
             InodeView::Dir(named) => &named.dir,
             other => panic!("from_view requires a directory, got {:?}", other.is_dir()),
@@ -477,13 +491,6 @@ impl InodeDir {
         }
     }
 
-    /// Attach the original subtree after its updated metadata has been persisted.
-    /// The caller owns the detached directory and still holds the namespace lock.
-    pub(crate) fn adopt_children(&mut self, detached: Self) {
-        debug_assert_eq!(self.id, detached.id);
-        self.children = detached.children;
-    }
-
     pub fn new(id: i64, time: i64) -> Self {
         Self::with_children(id, time, Arc::new(DirectoryChildren::new()))
     }
@@ -565,10 +572,6 @@ impl InodeDir {
     pub fn add_child(&mut self, mut inode: InodeView) -> CommonResult<ChildAddResult> {
         inode.set_parent_id(self.id);
         self.children.add_child(inode)
-    }
-
-    pub fn get_child(&self, name: &str) -> Option<InodePtr> {
-        self.children.get_child_ptr(name)
     }
 
     pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodeView> {

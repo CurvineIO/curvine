@@ -350,7 +350,11 @@ fn production_store_migrates_legacy_directories_once() {
     );
 
     let (_, root) = store.create_tree().unwrap();
-    assert!(root.get_child("child").is_some());
+    assert!(root
+        .children_handle()
+        .unwrap()
+        .get_child_edge("child")
+        .is_some());
     assert_eq!(
         store.store().get_directory_attributes(2_001).unwrap(),
         Some(expected)

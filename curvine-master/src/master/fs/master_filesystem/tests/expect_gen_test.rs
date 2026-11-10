@@ -71,7 +71,7 @@ fn completed_file(fs: &MasterFilesystem, path: &str, len: i64) -> FileGen {
 
 fn gen_of(fs: &MasterFilesystem, path: &str) -> FileGen {
     let fs_dir = fs.fs_dir.read();
-    let inp = InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store).unwrap();
+    let inp = InodePath::resolve(fs_dir.root_node(), path, &fs_dir.store).unwrap();
     inp.get_last_inode()
         .expect("inode exists")
         .as_ref()

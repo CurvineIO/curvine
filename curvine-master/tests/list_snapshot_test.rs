@@ -48,7 +48,7 @@ fn listing_matches_live_status_fields() {
         let expected_status = {
             let dir = fs.fs_dir.write();
             let inp = curvine_master::master::meta::inode::InodePath::resolve(
-                dir.root_ptr(),
+                dir.root_node(),
                 path,
                 dir.store_ref(),
             )
@@ -64,7 +64,7 @@ fn listing_matches_live_status_fields() {
             let expected = {
                 let dir = fs.fs_dir.write();
                 let inp = curvine_master::master::meta::inode::InodePath::resolve(
-                    dir.root_ptr(),
+                    dir.root_node(),
                     path,
                     dir.store_ref(),
                 )
@@ -154,7 +154,7 @@ fn paginated_listing_uses_shared_lock_and_preserves_cursors() {
             let expected = {
                 let dir = fs.fs_dir.write();
                 let inp = curvine_master::master::meta::inode::InodePath::resolve(
-                    dir.root_ptr(),
+                    dir.root_node(),
                     "/dir",
                     dir.store_ref(),
                 )

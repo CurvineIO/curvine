@@ -59,9 +59,9 @@ fn restored_large_directory_preserves_nested_tree_and_metadata() {
     let nested_status = nested.to_file_status("/large/nested").unwrap();
     assert_eq!(nested_status.id, nested_before.id);
     assert_eq!(nested_status.mtime, nested_before.mtime);
-    // A projected pointer must NOT mutate the live node (S3-B invariant).
-    let mut nested_ptr = large_children.get_child_ptr("nested").unwrap();
-    nested_ptr.update_mtime(23456);
+    // A projected view must NOT mutate the live node (S3-B invariant).
+    let mut nested_view = large_children.read_child_view("nested").0.unwrap();
+    nested_view.update_mtime(23456);
     let updated = large_children.read_child_view("nested").0.unwrap();
     assert_eq!(
         updated.to_file_status("/large/nested").unwrap().mtime,

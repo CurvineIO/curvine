@@ -13,11 +13,121 @@
 // limitations under the License.
 
 use curvine_config::ClusterConf;
+use curvine_master::master::fs::MasterFilesystem;
 use curvine_master::master::journal::JournalSystem;
-use curvine_master::master::meta::inode::{InodePath, ROOT_INODE_ID};
+use curvine_master::master::meta::inode::{ChildEdge, Inode, InodePath, ROOT_INODE_ID};
 use curvine_master::master::Master;
-use curvine_model::RenameFlags;
+use curvine_model::{RenameFlags, SetAttrOpts};
 use curvine_runtime::common::Utils;
+use std::sync::Arc;
+
+fn root_dir_node(
+    fs: &MasterFilesystem,
+    name: &str,
+) -> Arc<curvine_master::master::meta::inode::DirNode> {
+    let dir = fs.fs_dir.read();
+    match dir
+        .root_view()
+        .children_handle()
+        .unwrap()
+        .get_child_edge(name)
+    {
+        Some(ChildEdge::Dir(node)) => node,
+        _ => panic!("/{name} must be a live directory edge"),
+    }
+}
+
+fn live_dir_parent_id(fs: &MasterFilesystem, path: &str) -> i64 {
+    let dir = fs.fs_dir.read();
+    let path = InodePath::resolve(dir.root_node(), path, dir.store_ref()).unwrap();
+    path.get_last_inode()
+        .unwrap()
+        .as_dir_ref()
+        .unwrap()
+        .parent_id()
+}
+
+/// A same-directory directory rename must move the live node, not rebuild it:
+/// the subtree behind the edge has to survive `/a` -> `/c` unchanged.
+#[test]
+fn same_parent_directory_rename_moves_the_live_node() {
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("same-parent-rename-{}", Utils::rand_str(8)));
+    let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+    fs.create("/a/x/f", true).unwrap();
+
+    let before = root_dir_node(&fs, "a");
+    fs.rename("/a", "/c", RenameFlags::empty()).unwrap();
+    let after = root_dir_node(&fs, "c");
+
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "same-parent rename must reuse the live DirNode"
+    );
+    assert!(fs.file_status("/c/x/f").is_ok(), "subtree must survive");
+    assert!(fs.file_status("/a/x/f").is_err(), "old name must be gone");
+}
+
+#[test]
+fn cross_parent_directory_rename_publishes_live_parent() {
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("cross-parent-rename-{}", Utils::rand_str(8)));
+    let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+    fs.mkdir("/p/a", true).unwrap();
+    fs.mkdir("/q", true).unwrap();
+    let moved_id = fs.file_status("/p/a").unwrap().id;
+    let q_id = fs.file_status("/q").unwrap().id;
+
+    fs.rename("/p/a", "/q/a", RenameFlags::empty()).unwrap();
+    fs.set_attr(
+        "/q/a",
+        SetAttrOpts {
+            mode: Some(0o700),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let child = fs.create("/q/a/file", false).unwrap();
+
+    assert_eq!(fs.fs_dir.read().get_inode_path(moved_id).unwrap(), "/q/a");
+    assert_eq!(live_dir_parent_id(&fs, "/q/a"), q_id);
+    assert_eq!(
+        fs.fs_dir.read().get_inode_path(child.id).unwrap(),
+        "/q/a/file"
+    );
+}
+
+#[test]
+fn cross_parent_directory_exchange_publishes_live_parents() {
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("cross-parent-exchange-{}", Utils::rand_str(8)));
+    let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+    fs.mkdir("/p/a", true).unwrap();
+    fs.mkdir("/q/b", true).unwrap();
+    let a_id = fs.file_status("/p/a").unwrap().id;
+    let b_id = fs.file_status("/q/b").unwrap().id;
+    let p_id = fs.file_status("/p").unwrap().id;
+    let q_id = fs.file_status("/q").unwrap().id;
+
+    fs.rename("/p/a", "/q/b", RenameFlags::EXCHANGE).unwrap();
+
+    assert_eq!(fs.fs_dir.read().get_inode_path(a_id).unwrap(), "/q/b");
+    assert_eq!(fs.fs_dir.read().get_inode_path(b_id).unwrap(), "/p/a");
+    assert_eq!(live_dir_parent_id(&fs, "/q/b"), q_id);
+    assert_eq!(live_dir_parent_id(&fs, "/p/a"), p_id);
+}
 
 #[test]
 fn opposite_cross_directory_renames_complete_and_restore() {
@@ -204,7 +314,7 @@ fn snapshot_sees_consistent_edges_and_inodes_across_replace_rename() {
             "/left/missing/child",
             "/right/alias/child",
         ] {
-            let memory = InodePath::resolve(dir.root_ptr(), path, dir.store_ref()).unwrap();
+            let memory = InodePath::resolve(dir.root_node(), path, dir.store_ref()).unwrap();
             let snapshot = before.resolve_path(path).unwrap();
             assert_eq!(snapshot.is_full(), memory.is_full(), "{path}");
             assert_eq!(

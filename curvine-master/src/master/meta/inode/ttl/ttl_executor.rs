@@ -74,7 +74,7 @@ impl InodeTtlExecutor {
     fn is_empty_dir(&self, path: &str) -> FsResult<bool> {
         let fs_dir = self.filesystem.fs_dir();
         let fs_dir_guard = fs_dir.write();
-        let inp = InodePath::resolve(fs_dir_guard.root_ptr(), path, &fs_dir_guard.store)?;
+        let inp = InodePath::resolve(fs_dir_guard.root_node(), path, &fs_dir_guard.store)?;
         Ok(inp.is_empty_dir())
     }
 

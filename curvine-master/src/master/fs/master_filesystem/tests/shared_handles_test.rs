@@ -44,7 +44,7 @@ fn edge_plan_handles_survive_directory_replacement() {
     let fs = test_fs("edge-plan-directory-replacement");
     let old_id = fs.mkdir("/parent", false).unwrap().id;
     let old_child_id = fs.mkdir("/parent/child", false).unwrap().id;
-    let root = fs.fs_dir.read().root_dir().children_handle().unwrap();
+    let root = fs.fs_dir.read().root_node().children.clone();
     let (old_parent, _) = root.read_child_shared("parent");
     let old_children = old_parent.unwrap().children_handle().unwrap();
 
@@ -430,7 +430,6 @@ fn same_parent_directory_replacement_persists_link_count() {
         fs.mkdir("/p/a", true).unwrap();
         fs.mkdir("/p/b", false).unwrap();
         assert_eq!(fs.file_status("/p").unwrap().nlink, 4);
-        let pre = fs.file_status("/p").unwrap();
         fs.rename("/p/a", "/p/b", RenameFlags::empty()).unwrap();
         let status = fs.file_status("/p").unwrap();
         assert_eq!((status.nlink, status.children_num), (3, 1));

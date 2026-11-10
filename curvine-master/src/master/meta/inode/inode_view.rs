@@ -17,7 +17,7 @@
 use crate::master::meta::feature::AclFeature;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{
-    ChildAddResult, DirNode, Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
+    ChildAddResult, DirNode, Inode, InodeDir, InodeFile, PATH_SEPARATOR, ROOT_INODE_ID,
 };
 use crate::master::MetadataCodec;
 use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
@@ -177,20 +177,6 @@ impl InodeView {
         }
     }
 
-    pub(crate) fn replace_metadata(&mut self, updated: Self) {
-        let old = std::mem::replace(self, updated);
-        self.adopt_directory_children(old);
-    }
-
-    pub(crate) fn adopt_directory_children(&mut self, detached: Self) {
-        debug_assert_eq!(self.is_dir(), detached.is_dir());
-        if let (Dir(updated), Dir(original)) = (self, detached) {
-            let node = original.dir.node.clone();
-            updated.dir.adopt_children(original.dir);
-            updated.dir.node = node;
-        }
-    }
-
     pub fn new_dir(name: String, dir: InodeDir) -> Self {
         Dir(Box::new(NamedDir::new(name, dir)))
     }
@@ -274,14 +260,6 @@ impl InodeView {
 
     pub fn is_full_path(path: &str) -> bool {
         path.starts_with(PATH_SEPARATOR)
-    }
-
-    pub fn get_child(&self, name: &str) -> Option<InodePtr> {
-        match self {
-            File(_) => None,
-            Dir(d) => d.get_child(name),
-            FileEntry(_) => None,
-        }
     }
 
     // Test and print for use.
@@ -585,10 +563,6 @@ impl InodeView {
         }
     }
 
-    pub fn as_ptr(&mut self) -> InodePtr {
-        InodePtr::from_ref(self)
-    }
-
     pub fn set_attr(&mut self, opts: SetAttrOpts) -> CommonResult<()> {
         if let Some(owner) = opts.owner {
             self.acl_mut()?.owner = owner;
@@ -685,6 +659,23 @@ impl InodeView {
             Dir(d) => {
                 let acl = &d.features.acl;
                 let child_count = d.children_len();
+                // Directory ctime is owned by the attribute state; carry it
+                // through the internal xattr so proto conversion reports the
+                // same value the store path derives from the dir-attrs record.
+                // Only a ctime that differs from mtime needs the marker: proto
+                // conversion falls back to mtime otherwise, so the common case
+                // allocates nothing extra. A stale marker in the persisted
+                // xattrs must not leak through.
+                let mut x_attr = d.features.x_attr.clone();
+                let ctime = self.ctime();
+                if ctime != d.mtime() {
+                    x_attr.insert(
+                        INTERNAL_CTIME_XATTR.to_string(),
+                        ctime.to_le_bytes().to_vec(),
+                    );
+                } else {
+                    x_attr.remove(INTERNAL_CTIME_XATTR);
+                }
                 Ok(FileStatus {
                     id: self.id(),
                     path: path.to_owned(),
@@ -698,7 +689,7 @@ impl InodeView {
                     replicas: 0,
                     block_size: 0,
                     file_type: FileType::Dir,
-                    x_attr: d.features.x_attr.clone(),
+                    x_attr,
                     storage_policy: d.storage_policy.clone(),
                     owner: acl.owner.to_owned(),
                     group: acl.group.to_owned(),

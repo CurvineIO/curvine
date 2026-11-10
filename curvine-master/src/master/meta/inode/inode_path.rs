@@ -16,7 +16,7 @@ use crate::master::meta::glob_utils::parse_glob_pattern;
 use crate::master::meta::inode::InodeView::{self, Dir, File, FileEntry};
 use crate::master::meta::inode::{
     ChildEdge, DirNode, DirectoryChildren, DirectoryChildrenSharedVersion, InodeDir, InodeFile,
-    InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR,
+    InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR, ROOT_INODE_NAME,
 };
 use crate::master::meta::store::InodeStore;
 use curvine_core_error::{err_box, try_option, CommonResult};
@@ -99,76 +99,6 @@ pub struct InodePath {
 }
 
 impl InodePath {
-    /// Versioned walk over shared directory handles. Returns the path plus
-    /// the per-level version tokens; the caller re-checks them with
-    /// [`Self::walk_is_current`] and retries on invalidation instead of
-    /// taking a global lock.
-    pub fn resolve_shared<T: AsRef<str>>(
-        root_view: &InodeView,
-        path: T,
-        store: &InodeStore,
-    ) -> CommonResult<Self> {
-        store.ensure_available()?;
-        let components = InodeView::path_components(path.as_ref())?;
-        let name = try_option!(
-            components.last(),
-            "Path {} has no components",
-            path.as_ref()
-        );
-        if name.is_empty() {
-            return err_box!("Path {} is invalid", path.as_ref());
-        }
-
-        let mut inodes: Vec<InodeEntry> = Vec::with_capacity(components.len());
-        let mut versions = SmallVec::new();
-        let mut directory = match root_view.children_handle() {
-            Some(handle) => handle,
-            None => return err_box!("root inode is not a directory"),
-        };
-
-        // Preserve the complete directory view at every resolved level.
-        versions.push(directory.shared_version());
-        let mut root_view = root_view.clone();
-        root_view.change_name(components[0].clone());
-        inodes.push(InodeEntry::View(InodePtr::from_owned(root_view)));
-
-        for component in components.iter().skip(1) {
-            let (child, _child_version) = directory.read_child_view(component);
-            let child = match child {
-                None => break,
-                Some(child) => child,
-            };
-            let resolved = match child {
-                InodeView::FileEntry(entry) => {
-                    let full = store.get_inode(entry.id(), Some(entry.name()))?;
-                    InodePtr::from_owned(try_option!(
-                        full,
-                        "Failed to load inode {} from store",
-                        entry.id()
-                    ))
-                }
-                other => InodePtr::from_owned(other),
-            };
-            let next_directory = resolved.as_ref().children_handle();
-            inodes.push(InodeEntry::View(resolved));
-            match next_directory {
-                Some(next) => {
-                    versions.push(next.shared_version());
-                    directory = next;
-                }
-                None => break,
-            }
-        }
-
-        Ok(Self {
-            path: path.as_ref().to_string(),
-            name: name.to_string(),
-            components,
-            inodes,
-            versions,
-        })
-    }
-
     /// Whether every directory level captured by a shared walk is still
     /// quiescent at its recorded version. Cheap atomic re-reads only.
     pub fn walk_is_current(&self) -> bool {
@@ -176,7 +106,7 @@ impl InodePath {
     }
 
     pub fn resolve<T: AsRef<str>>(
-        root: InodePtr,
+        root: Arc<DirNode>,
         path: T,
         store: &InodeStore,
     ) -> CommonResult<Self> {
@@ -189,7 +119,7 @@ impl InodePath {
     /// Resolve while holding locks for every planned inode. Stop before
     /// traversing an inode whose identity differs from the lock plan.
     pub(crate) fn resolve_locked<T: AsRef<str>>(
-        root: InodePtr,
+        root: Arc<DirNode>,
         path: T,
         store: &InodeStore,
         ids: &[i64],
@@ -201,7 +131,7 @@ impl InodePath {
     /// Capture directory versions before each traversal step and before the
     /// caller reads the final directory's children.
     pub fn resolve_versioned<T: AsRef<str>>(
-        root: InodePtr,
+        root: Arc<DirNode>,
         path: T,
         store: &InodeStore,
     ) -> CommonResult<Self> {
@@ -212,7 +142,7 @@ impl InodePath {
     }
 
     fn resolve_inner<T: AsRef<str>, const TRACK_VERSIONS: bool, const CHECK_IDS: bool>(
-        root: InodePtr,
+        root: Arc<DirNode>,
         path: T,
         store: &InodeStore,
         ids: &[i64],
@@ -239,10 +169,7 @@ impl InodePath {
         // means the current element is the root, `Dir` a stable directory
         // handle, `FileId` a file edge to hydrate through the store.
         let mut pending: Option<ChildEdge> = None;
-        let mut cur_children: Option<Arc<DirectoryChildren>> = root.as_ref().children_handle();
-        // Holds the caller's root pointer until the first push moves it into
-        // the entry, so an owned root lives as long as the resolved path.
-        let mut owned_root = Some(root);
+        let mut cur_children: Option<Arc<DirectoryChildren>> = Some(root.children.clone());
         let mut index = 0;
 
         while index < components.len() {
@@ -250,9 +177,14 @@ impl InodePath {
             // child access; the edge id is the plan-identity source.
             let (cur_id, resolved_entry) = match &pending {
                 None => {
-                    let id = owned_root.as_ref().expect("root kept for first round").id();
-                    let entry = InodeEntry::View(owned_root.take().expect("root moved once"));
-                    (id, entry)
+                    // The root is a live node like any other directory edge.
+                    (
+                        root.id,
+                        InodeEntry::Dir {
+                            name: ROOT_INODE_NAME.to_string(),
+                            node: root.clone(),
+                        },
+                    )
                 }
                 Some(ChildEdge::Dir(node)) => {
                     let name = components.get(index).cloned().unwrap_or_default();
@@ -406,7 +338,7 @@ impl InodePath {
     }
 
     pub fn resolve_for_glob_pattern(
-        root: InodePtr,
+        root: Arc<DirNode>,
         pattern: &str,
         store: &InodeStore,
     ) -> CommonResult<Vec<Self>> {
@@ -418,7 +350,16 @@ impl InodePath {
 
         // Directories cannot be hard-linked, so their IDs uniquely identify parents.
         let mut parent_map: HashMap<i64, i64> = HashMap::new();
-        queue.push_back((0, root, EMPTY_PARENT_ID)); // Start BFS
+        // Read-only BFS starts from a detached root projection: the walk only
+        // reads ids/names and expands children through the shared index.
+        queue.push_back((
+            0,
+            InodePtr::from_owned(InodeDir::from_dir_node_live(
+                ROOT_INODE_NAME.to_string(),
+                root,
+            )),
+            EMPTY_PARENT_ID,
+        ));
 
         while let Some((curr_index, curr_node, parent_id)) = queue.pop_front() {
             if curr_index == components_length - 1 {

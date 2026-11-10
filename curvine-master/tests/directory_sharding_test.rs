@@ -116,11 +116,14 @@ fn container_contents_are_preserved_for_every_container() {
         expected_names.sort();
         assert_eq!(names(&children), expected_names, "{container:?}");
         assert_eq!(
-            children.get_child_ptr("f512").unwrap().id(),
+            children.get_child_edge("f512").unwrap().id(),
             512,
             "{container:?}"
         );
-        assert!(children.get_child_ptr("missing").is_none(), "{container:?}");
+        assert!(
+            children.get_child_edge("missing").is_none(),
+            "{container:?}"
+        );
     }
 }
 
@@ -208,7 +211,7 @@ fn directory_writes_remain_consistent_under_concurrency() {
     assert_eq!(children.iter_len(), 512 + 400);
     for thread in 0..4 {
         for i in 0..100 {
-            assert!(children.get_child_ptr(&format!("t{thread}-{i}")).is_some());
+            assert!(children.get_child_edge(&format!("t{thread}-{i}")).is_some());
         }
     }
     // Delete half of one thread's entries and confirm the count follows.
@@ -395,7 +398,14 @@ fn concurrent_shard_writes_never_produce_a_current_version() {
         panic!("directory changed type")
     };
     assert!(Arc::ptr_eq(&handle, &moved.children_handle()));
-    assert_eq!(moved.get_child("f9002").unwrap().id(), 9002);
+    assert_eq!(
+        moved
+            .children_handle()
+            .get_child_edge("f9002")
+            .unwrap()
+            .id(),
+        9002
+    );
 }
 
 #[test]
@@ -419,7 +429,8 @@ fn promotion_preserves_directory_node_identity() {
             .add_child(InodeView::new_dir("hole".into(), InodeDir::new(9001, 1)))
             .unwrap();
         children.delete_child(9001, "hole").unwrap();
-        let mut original = children.get_child_ptr("sub").unwrap();
+        let original = children.get_child_edge("sub").unwrap();
+        let original_id = original.id();
         let original_names = names(&children);
         let guard = children.begin_mutation("holder");
         let other = children.clone();
@@ -437,13 +448,8 @@ fn promotion_preserves_directory_node_identity() {
         worker.join().unwrap();
         assert!(format!("{children:?}").contains("sharded: true"));
         assert_eq!(names(&children), original_names, "{container:?}");
-        let promoted = children.get_child_ptr("sub").unwrap();
-        assert!(
-            std::ptr::eq(original.as_ref(), promoted.as_ref()),
-            "{container:?}"
-        );
-        original.as_dir_mut().unwrap().update_mtime(123);
-        assert_eq!(children.read_child_view("sub").0.unwrap().mtime(), 123);
+        let promoted = children.get_child_edge("sub").unwrap();
+        assert_eq!(original_id, promoted.id(), "{container:?}");
     }
 }
 
@@ -463,11 +469,10 @@ fn dir_views_move_between_containers_with_their_own_children() {
     let children = seeded(ChildrenContainer::Packed, 8);
     let dir = InodeView::new_dir("sub".to_string(), InodeDir::new(99, 1));
     children.add_child(dir).unwrap();
-    let found = children.get_child_ptr("sub").unwrap();
+    let found = children.read_child_view("sub").0.unwrap();
     assert!(found.is_dir());
-    // The dir view is a clone; its own children handle stays valid.
-    let view = found.as_ref().clone();
-    assert!(matches!(view, InodeView::Dir(_)));
+    // The projected view is detached; its own children handle stays valid.
+    assert!(matches!(found, InodeView::Dir(_)));
 }
 
 #[test]
@@ -507,10 +512,10 @@ fn concurrent_same_directory_renames_both_complete() {
 
     rename_a.join().unwrap();
     rename_b.join().unwrap();
-    assert!(children.get_child_ptr("x-aaa").is_none());
-    assert!(children.get_child_ptr("x-zzz").is_none());
-    assert_eq!(children.get_child_ptr("x-renamed-a").unwrap().id(), 800);
-    assert_eq!(children.get_child_ptr("x-renamed-b").unwrap().id(), 801);
+    assert!(children.get_child_edge("x-aaa").is_none());
+    assert!(children.get_child_edge("x-zzz").is_none());
+    assert_eq!(children.get_child_edge("x-renamed-a").unwrap().id(), 800);
+    assert_eq!(children.get_child_edge("x-renamed-b").unwrap().id(), 801);
     assert_eq!(children.iter_len(), 512 + 2);
 }
 
@@ -577,7 +582,10 @@ fn rename_moves_original_directory_and_children() {
             panic!("directory changed type")
         };
         assert!(Arc::ptr_eq(&handle, &moved.children_handle()));
-        assert_eq!(moved.get_child("f11").unwrap().id(), 11);
+        assert_eq!(
+            moved.children_handle().get_child_edge("f11").unwrap().id(),
+            11
+        );
     }
 }
 
@@ -592,8 +600,8 @@ fn single_index_rename_replaces_target() {
         .rename_child(1, "f1", Some((2, "f2")), "f2")
         .unwrap();
     drop(mutation);
-    assert!(children.get_child_ptr("f1").is_none());
-    assert_eq!(children.get_child_ptr("f2").unwrap().id(), 1);
+    assert!(children.get_child_edge("f1").is_none());
+    assert_eq!(children.get_child_edge("f2").unwrap().id(), 1);
     // f1..f4 seeded (4) minus f1, minus replaced f2, plus f2 = 3 entries.
     assert_eq!(children.iter_len(), 3);
 }

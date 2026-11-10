@@ -14,7 +14,7 @@
 
 use curvine_config::ClusterConf;
 use curvine_master::master::journal::JournalSystem;
-use curvine_master::master::meta::inode::{DirNode, InodePath};
+use curvine_master::master::meta::inode::InodePath;
 use curvine_master::Master;
 use curvine_model::SetAttrOpts;
 use curvine_runtime::common::Utils;
@@ -100,7 +100,7 @@ fn unchanged_legacy_parent_initializes_attributes_from_inode() {
         // Simulate a legacy directory: the dir-attrs row is gone, and the
         // live node's persisted flag must be invalidated so the next delta
         // re-carries its base and rebuilds the record.
-        let path = InodePath::resolve(guard.root_ptr(), "/parent", guard.store_ref()).unwrap();
+        let path = InodePath::resolve(guard.root_node(), "/parent", guard.store_ref()).unwrap();
         let node = path.get_last_dir_node().expect("live /parent node");
         node.invalidate_persisted();
         let mut batch = guard.store_ref().new_batch();

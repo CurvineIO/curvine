@@ -59,8 +59,8 @@ fn atime_refresh_does_not_touch_a_replacement_inode() {
     )
     .unwrap();
     {
-        let mut dir = fs.fs_dir.write();
-        let path = InodePath::resolve(dir.root_ptr(), "/file", dir.store_ref()).unwrap();
+        let dir = fs.fs_dir.write();
+        let path = InodePath::resolve(dir.root_node(), "/file", dir.store_ref()).unwrap();
         let epoch = dir.store_ref().scan_control().cancel_epoch();
         assert!(!dir.touch_atime_for_ttl(&path, original.id, epoch).unwrap());
         let restore = dir

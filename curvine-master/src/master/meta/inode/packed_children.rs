@@ -37,9 +37,7 @@
 
 use crate::master::meta::inode::ChildItem;
 use crate::master::meta::inode::PackedIter;
-use crate::master::meta::inode::{
-    ChildAddResult, ChildSlot, DirNode, InodeDir, InodePtr, InodeView,
-};
+use crate::master::meta::inode::{ChildAddResult, ChildSlot, DirNode, InodeDir, InodeView};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::ListOptions;
 use curvine_record::{Chunk, InsertOutcome, Layout, Record};
@@ -179,13 +177,9 @@ impl PackedChildren {
         }
     }
 
-    pub(crate) fn get_child_item(&self, name: &str) -> Option<ChildItem<'_>> {
+    pub fn get_child_item(&self, name: &str) -> Option<ChildItem<'_>> {
         let (ci, off) = self.area.find(name.as_bytes()).ok()?;
         Some(Self::packed_item(&self.dirs, &self.area.chunks()[ci], off))
-    }
-
-    pub fn get_child(&self, name: &str) -> Option<InodePtr> {
-        self.get_child_item(name).map(|item| item.as_ptr())
     }
 
     pub fn add_child(&mut self, inode: InodeView) -> CommonResult<ChildAddResult> {
@@ -200,7 +194,7 @@ impl PackedChildren {
         let id = inode.id();
 
         if inode.is_dir() {
-            let node = DirNode::from_view(&inode);
+            let node = DirNode::for_edge(&inode);
             let slot = self.alloc_slot();
             self.dirs[slot as usize] = Some(node);
             let inserted = matches!(

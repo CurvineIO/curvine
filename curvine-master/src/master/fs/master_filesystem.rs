@@ -19,7 +19,7 @@ use crate::master::fs::full_block_report::{
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
 use crate::master::meta::inode::{
-    InodeEntry, InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
+    ChildEdge, InodeEntry, InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
 };
 use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::meta::{
@@ -401,8 +401,13 @@ impl MasterFilesystem {
         ids: &[i64],
         components_len: usize,
     ) -> FsResult<Option<InodePath>> {
-        let result =
-            InodePath::resolve_locked(fs_dir.root_ptr(), path, &fs_dir.store, ids, components_len)?;
+        let result = InodePath::resolve_locked(
+            fs_dir.root_node(),
+            path,
+            &fs_dir.store,
+            ids,
+            components_len,
+        )?;
         Self::check_not_pending_path(path)?;
         Ok(result)
     }
@@ -2768,7 +2773,7 @@ impl MasterFilesystem {
     }
 
     fn resolve_path_raw(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
-        InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
+        InodePath::resolve(fs_dir.root_node(), path, &fs_dir.store)
     }
 
     fn check_not_pending_path(path: &str) -> FsResult<()> {
@@ -2797,7 +2802,7 @@ impl MasterFilesystem {
     }
 
     fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {
-        InodePath::resolve_for_glob_pattern(fs_dir.root_ptr(), path, &fs_dir.store)
+        InodePath::resolve_for_glob_pattern(fs_dir.root_node(), path, &fs_dir.store)
     }
 
     pub fn check_path_length(&self, path: &str) -> CommonResult<()> {
@@ -3551,7 +3556,7 @@ impl MasterFilesystem {
         let mut entries = Vec::with_capacity(page_size.saturating_add(1));
         self.collect_cv_metadata_snapshot_page(
             &fs_dir,
-            fs_dir.root_dir(),
+            &fs_dir.root_view(),
             "/",
             start_after.as_deref(),
             page_size.saturating_add(1),
@@ -4817,8 +4822,7 @@ impl MasterFilesystem {
     pub fn get_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
-        // Retain the original exclusive namespace guard while walking borrowed
-        // child pointers; the lock query only needs the target inode id.
+        // Retain the namespace guard while resolving the lock target.
         let fs_dir = self.fs_dir.write();
         if !InodeView::is_full_path(path)
             || (path != PATH_SEPARATOR && path.ends_with(PATH_SEPARATOR))
@@ -4828,22 +4832,34 @@ impl MasterFilesystem {
         }
         fs_dir.store.ensure_available()?;
 
-        let mut inode = fs_dir.root_ptr();
+        let root = fs_dir.root_node();
+        let mut inode_id = root.id;
+        let mut children = Some(root.children.clone());
         let mut full = true;
         if path != PATH_SEPARATOR {
             for component in path.split(PATH_SEPARATOR).skip(1) {
-                let Some(child) = inode.as_ref().get_child(component) else {
+                let Some(child) = children
+                    .as_ref()
+                    .and_then(|children| children.get_child_edge(component))
+                else {
                     full = false;
                     break;
                 };
-                inode = match child.as_ref() {
-                    InodeView::FileEntry(entry) => InodePtr::from_owned(try_option!(
-                        fs_dir.store.get_inode(entry.id(), Some(entry.name()))?,
-                        "Failed to load inode {} from store",
-                        entry.id()
-                    )),
-                    _ => child,
-                };
+                match child {
+                    ChildEdge::Dir(node) => {
+                        inode_id = node.id;
+                        children = Some(node.children.clone());
+                    }
+                    ChildEdge::FileId(id) => {
+                        let inode = try_option!(
+                            fs_dir.store.get_inode(id, Some(component))?,
+                            "Failed to load inode {} from store",
+                            id
+                        );
+                        inode_id = inode.id();
+                        children = None;
+                    }
+                }
             }
         }
         Self::check_not_pending_path(path)?;
@@ -4851,7 +4867,7 @@ impl MasterFilesystem {
             return err_ext!(FsError::file_not_found(path));
         }
 
-        let mut meta = fs_dir.store.get_locks(inode.id())?;
+        let mut meta = fs_dir.store.get_locks(inode_id)?;
         Ok(meta.check_conflict(&lock, self.conf.lock_expire_time_ms()))
     }
 
@@ -4930,14 +4946,15 @@ mod tests {
     // Seeds an entry under the reserved root through FsDir, since the public
     // API refuses to create anything inside /.Trash.
     fn seed_trash_entry(fs: &MasterFilesystem, name: &str) -> (String, i64) {
-        let mut fs_dir = fs.fs_dir.write();
-        let root = InodePath::resolve(fs_dir.root_ptr(), trash::TRASH_ROOT, &fs_dir.store).unwrap();
+        let fs_dir = fs.fs_dir.write();
+        let root =
+            InodePath::resolve(fs_dir.root_node(), trash::TRASH_ROOT, &fs_dir.store).unwrap();
         if !root.is_full() {
             fs_dir.mkdir(root, MkdirOpts::with_create(true)).unwrap();
         }
 
         let path = format!("{}/{}", trash::TRASH_ROOT, name);
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &path, &fs_dir.store).unwrap();
+        let inp = InodePath::resolve(fs_dir.root_node(), &path, &fs_dir.store).unwrap();
         let inp = fs_dir
             .create_file(inp, CreateFileOpts::with_create(false))
             .unwrap();

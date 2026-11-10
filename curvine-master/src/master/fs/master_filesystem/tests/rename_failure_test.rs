@@ -427,7 +427,7 @@ fn rename_uses_source_edge_when_directory_metadata_name_is_stale() {
     let source = fs.file_status("/source").unwrap();
     {
         let dir = fs.fs_dir.write();
-        let path = InodePath::resolve(dir.root_ptr(), "/source", &dir.store).unwrap();
+        let path = InodePath::resolve(dir.root_node(), "/source", &dir.store).unwrap();
         let mut inode = path.get_last_inode().unwrap();
         inode.change_name("stale-name".to_string());
     }
@@ -457,10 +457,10 @@ fn rename_rejects_long_packed_name_before_mutation() {
     }
     let dir = fs.fs_dir.read();
     let (_, restored) = dir.store.create_tree().unwrap();
-    let root = restored.as_dir_ref().unwrap();
-    assert_eq!(root.get_child("source").unwrap().id(), original.id);
-    assert!(root.get_child(&"x".repeat(256)).is_none());
-    assert!(root.get_child(&"界".repeat(86)).is_none());
+    let root = restored.children_handle().unwrap();
+    assert_eq!(root.get_child_edge("source").unwrap().id(), original.id);
+    assert!(root.get_child_edge(&"x".repeat(256)).is_none());
+    assert!(root.get_child_edge(&"界".repeat(86)).is_none());
 }
 
 #[test]
@@ -506,9 +506,9 @@ fn rename_between_hard_links_is_a_noop() {
     assert_eq!((target.id, target.nlink), (before.id, 2));
     let dir = fs.fs_dir.read();
     let (_, root) = dir.store.create_tree().unwrap();
-    let root = root.as_dir_ref().unwrap();
-    assert_eq!(root.get_child("source").unwrap().id(), before.id);
-    assert_eq!(root.get_child("target").unwrap().id(), before.id);
+    let root = root.children_handle().unwrap();
+    assert_eq!(root.get_child_edge("source").unwrap().id(), before.id);
+    assert_eq!(root.get_child_edge("target").unwrap().id(), before.id);
     assert_eq!(
         dir.store
             .get_inode(before.id, None)
@@ -567,9 +567,9 @@ fn replace_rename_returns_replaced_file_blocks() {
         None,
     )
     .unwrap();
-    let mut dir = fs.fs_dir.write();
-    let source = InodePath::resolve(dir.root_ptr(), "/source", &dir.store).unwrap();
-    let target = InodePath::resolve(dir.root_ptr(), "/target", &dir.store).unwrap();
+    let dir = fs.fs_dir.write();
+    let source = InodePath::resolve(dir.root_node(), "/source", &dir.store).unwrap();
+    let target = InodePath::resolve(dir.root_node(), "/target", &dir.store).unwrap();
     let deleted = dir
         .rename(&source, &target, RenameFlags::empty())
         .unwrap()
