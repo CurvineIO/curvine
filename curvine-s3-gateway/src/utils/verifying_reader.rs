@@ -23,6 +23,10 @@ use crate::utils::io::PollRead;
 /// copy. When the underlying stream reaches its end, the wrapper checks the
 /// declared length and accumulated hash before reporting completion; a mismatch
 /// turns the end of the stream into an error instead of a successful read.
+///
+/// Once a read fails, the failure is sticky: every later read returns the same
+/// error. A verifier rejection must never be observable as a clean end of body,
+/// because that is exactly what publishing a rejected object looks like.
 pub struct VerifyingReader<R> {
     inner: R,
     expected_sha256: Option<String>,
@@ -30,6 +34,8 @@ pub struct VerifyingReader<R> {
     bytes_seen: u64,
     hasher: Option<Sha256>,
     finished: bool,
+    /// First error returned to the consumer, re-surfaced by every later read.
+    failure: Option<String>,
 }
 
 impl<R> VerifyingReader<R> {
@@ -43,12 +49,20 @@ impl<R> VerifyingReader<R> {
             bytes_seen: 0,
             hasher,
             finished: false,
+            failure: None,
         }
     }
 
     /// Number of bytes released to the consumer so far.
     pub fn bytes_seen(&self) -> u64 {
         self.bytes_seen
+    }
+
+    /// Make `message` the terminal result of this reader and return it.
+    fn fail(&mut self, message: String) -> String {
+        self.finished = true;
+        self.failure = Some(message.clone());
+        message
     }
 }
 
@@ -58,6 +72,9 @@ where
     R: PollRead + Send,
 {
     async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if let Some(failure) = self.failure.clone() {
+            return Err(failure);
+        }
         if self.finished {
             return Ok(None);
         }
@@ -70,23 +87,22 @@ where
             // error after the full length arrived is unrelated and passes
             // through unchanged.
             Err(error) => {
-                self.finished = true;
-                match self.expected_length {
-                    Some(expected_length) if self.bytes_seen < expected_length => Err(format!(
+                let message = match self.expected_length {
+                    Some(expected_length) if self.bytes_seen < expected_length => format!(
                         "ContentLengthMismatch: received {} of {} bytes (transport: {error})",
                         self.bytes_seen, expected_length
-                    )),
-                    _ => Err(error),
-                }
+                    ),
+                    _ => error,
+                };
+                Err(self.fail(message))
             }
             Ok(None) => {
                 if let Some(expected_length) = self.expected_length {
                     if self.bytes_seen != expected_length {
-                        self.finished = true;
-                        return Err(format!(
+                        return Err(self.fail(format!(
                             "ContentLengthMismatch: received {} of {} bytes",
                             self.bytes_seen, expected_length
-                        ));
+                        )));
                     }
                 }
 
@@ -97,10 +113,9 @@ where
                         .map(|hasher| hex::encode(hasher.finalize()))
                         .unwrap_or_default();
                     if actual_hash != expected_hash {
-                        self.finished = true;
-                        return Err(format!(
+                        return Err(self.fail(format!(
                             "HashMismatch: received {actual_hash}, expected {expected_hash}"
-                        ));
+                        )));
                     }
                 }
 
@@ -109,25 +124,22 @@ where
             }
             Ok(Some(chunk)) => {
                 let Some(new_bytes_seen) = self.bytes_seen.checked_add(chunk.len() as u64) else {
-                    self.finished = true;
-                    return Err(format!(
+                    return Err(self.fail(format!(
                         "ContentLengthMismatch: body exceeded the declared length {}",
                         self.expected_length
                             .map(|length| length.to_string())
                             .unwrap_or_else(|| "<unbounded>".to_string())
-                    ));
+                    )));
                 };
 
                 if let Some(expected_length) = self.expected_length {
                     if new_bytes_seen > expected_length {
-                        // Terminal: without this a retried read could reach a
-                        // no-longer-exceeding EOF and report success for a body
-                        // already rejected as too long.
-                        self.finished = true;
-                        return Err(format!(
+                        // Sticky through `fail`: a rejected body must never later
+                        // read as a clean end of stream.
+                        return Err(self.fail(format!(
                             "ContentLengthMismatch: received more than declared length {}",
                             expected_length
-                        ));
+                        )));
                     }
                 }
 

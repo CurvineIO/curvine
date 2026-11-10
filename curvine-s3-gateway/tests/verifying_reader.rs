@@ -67,6 +67,10 @@ async fn unsigned_body_rejects_a_short_body() {
         reader.poll_read().await.unwrap_err(),
         "ContentLengthMismatch: received 5 of 10 bytes"
     );
+    assert!(
+        reader.poll_read().await.is_err(),
+        "a short body must not later read as EOF"
+    );
 }
 
 #[tokio::test]
@@ -138,17 +142,33 @@ async fn transport_error_after_the_declared_length_passes_through() {
     assert!(error.contains("end of file"), "{error}");
 }
 
+/// A rejection must be sticky: a consumer that retries after an error must not
+/// observe a successful end of body, which is what a rejected object being
+/// published would look like.
 #[tokio::test]
-async fn an_over_long_body_stays_failed_after_a_retried_read() {
+async fn a_verification_failure_is_returned_by_every_later_read() {
     let reader = Chunks::new([b"hello".to_vec(), b"!".to_vec()]);
     let mut reader = VerifyingReader::new(reader, Some(sha256_hex(b"hello")), Some(5));
 
     assert_eq!(reader.poll_read().await.unwrap(), Some(b"hello".to_vec()));
-    assert!(reader
-        .poll_read()
-        .await
-        .unwrap_err()
-        .starts_with("ContentLengthMismatch:"));
-    // The rejection is terminal: a retried read must not turn into success.
-    assert_eq!(reader.poll_read().await, Ok(None));
+    let first = reader.poll_read().await.unwrap_err();
+    assert!(first.starts_with("ContentLengthMismatch:"), "{first}");
+
+    let second = reader.poll_read().await.unwrap_err();
+    assert_eq!(second, first, "the first failure must repeat exactly");
+    assert!(reader.poll_read().await.is_err(), "still failing");
+}
+
+/// The hash check runs at EOF, so its rejection must be sticky for the same
+/// reason.
+#[tokio::test]
+async fn a_hash_mismatch_is_returned_by_every_later_read() {
+    let reader = Chunks::new([b"hello".to_vec()]);
+    let mut reader = VerifyingReader::new(reader, Some("0".repeat(64)), Some(5));
+
+    // The digest is only decidable at EOF, so the chunk is released first.
+    assert_eq!(reader.poll_read().await.unwrap(), Some(b"hello".to_vec()));
+    let first = reader.poll_read().await.unwrap_err();
+    assert!(first.starts_with("HashMismatch:"), "{first}");
+    assert_eq!(reader.poll_read().await.unwrap_err(), first);
 }

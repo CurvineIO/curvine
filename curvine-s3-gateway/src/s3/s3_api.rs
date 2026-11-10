@@ -2253,6 +2253,22 @@ mod tests {
         assert_eq!(status_for_error("Failed to write to destination: io"), 500);
     }
 
+    /// This arm is the only place a verification failure becomes the 400 that
+    /// #1990 requires; without it a rejected body is reported as 500.
+    #[test]
+    fn verification_failures_map_to_client_errors() {
+        assert_eq!(
+            status_for_error("HashMismatch: received aa, expected bb"),
+            400
+        );
+        assert_eq!(
+            status_for_error("ContentLengthMismatch: received 5 of 10 bytes (transport: eof)"),
+            400
+        );
+        // A genuine backend failure stays a server error.
+        assert_eq!(status_for_error("Failed to write to destination: io"), 500);
+    }
+
     #[test]
     fn unsigned_parts_carry_no_digest() {
         assert_eq!(part_sha256(Some("UNSIGNED-PAYLOAD")), None);
