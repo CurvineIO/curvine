@@ -36,15 +36,20 @@
 //! | crc      | 4    | CRC32C of the 16 bytes above |
 //!
 //! The trailing CRC makes a torn or partial write fail to decode instead of
-//! truncating a healthy block to a garbage length.
+//! truncating a healthy block to a garbage length, and new records are
+//! published with an atomic rename so that an interrupted update keeps the
+//! previous watermark.
 
 use curvine_io::IOResult;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Suffix appended to the staging block path for its watermark sidecar.
 pub const WATERMARK_FILE_SUFFIX: &str = ".wmk";
+
+/// Suffix of a sidecar that is still being published.
+const TEMP_FILE_SUFFIX: &str = ".wmk.tmp";
 
 const WATERMARK_MAGIC: [u8; 4] = *b"CVWM";
 const WATERMARK_VERSION: u16 = 1;
@@ -62,6 +67,27 @@ pub fn path_of(block_path: &Path) -> PathBuf {
     let mut name = block_path.as_os_str().to_os_string();
     name.push(WATERMARK_FILE_SUFFIX);
     PathBuf::from(name)
+}
+
+fn temp_path_of(sidecar_path: &Path) -> PathBuf {
+    let mut name = sidecar_path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+/// Whether `path` is a temporary sidecar left behind by an interrupted
+/// publish. It is never a live watermark.
+pub fn is_temp_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(TEMP_FILE_SUFFIX))
+}
+
+fn sync_parent_dir(path: &Path) -> IOResult<()> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Path of the block a sidecar belongs to, `None` when `path` is not one.
@@ -102,18 +128,28 @@ pub fn decode(buf: &[u8]) -> Option<u64> {
 
 /// Record `len` as the durable length of `block_path`.
 ///
-/// The sidecar is synced before returning, so a crash after this call cannot
-/// resurrect a shorter watermark.
+/// The new record is synced under a temporary name, renamed over the live
+/// sidecar and the parent directory is synced, so an interrupted update
+/// leaves either the previous watermark or the new one, never a torn record.
 pub fn write(block_path: &Path, len: u64) -> IOResult<()> {
     let path = path_of(block_path);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&path)?;
-    file.write_all(&encode(len))?;
-    file.sync_all()?;
-    Ok(())
+    let temp = temp_path_of(&path);
+    let published = (|| -> IOResult<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)?;
+        file.write_all(&encode(len))?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, &path)?;
+        sync_parent_dir(&path)
+    })();
+    if published.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    published
 }
 
 /// Durable length recorded for `block_path`, `None` when there is no usable
@@ -163,6 +199,7 @@ mod tests {
         let path = dir.join(name);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path_of(&path));
+        let _ = fs::remove_file(temp_path_of(&path_of(&path)));
         path
     }
 
@@ -191,9 +228,14 @@ mod tests {
     fn sidecar_naming_round_trips() {
         let block = Path::new("/data/staging/blk_42");
         let sidecar = path_of(block);
+        let temp = temp_path_of(&sidecar);
         assert_eq!(sidecar, PathBuf::from("/data/staging/blk_42.wmk"));
+        assert_eq!(temp, PathBuf::from("/data/staging/blk_42.wmk.tmp"));
         assert!(is_sidecar(&sidecar));
         assert!(!is_sidecar(block));
+        assert!(!is_sidecar(&temp));
+        assert!(is_temp_sidecar(&temp));
+        assert!(!is_temp_sidecar(&sidecar));
         assert_eq!(block_path_of(&sidecar), Some(block.to_path_buf()));
         assert_eq!(block_path_of(block), None);
         assert_eq!(block_path_of(Path::new("/data/staging/.wmk")), None);
@@ -207,6 +249,10 @@ mod tests {
 
         write(&block, 4)?;
         assert_eq!(read(&block), Some(4));
+        assert!(
+            !temp_path_of(&path_of(&block)).exists(),
+            "a published watermark must not leave its temporary file behind"
+        );
 
         remove(&block)?;
         assert_eq!(read(&block), None);
@@ -214,6 +260,25 @@ mod tests {
         remove(&block)?;
 
         let _ = fs::remove_file(&block);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_update_keeps_the_previous_watermark() -> IOResult<()> {
+        let block = temp_block("blk_3");
+        fs::write(&block, [3u8; 8])?;
+        write(&block, 5)?;
+
+        // A directory at the temporary path makes the publish fail before the
+        // rename, like a crash or write error in the middle of an update.
+        let temp = temp_path_of(&path_of(&block));
+        fs::create_dir(&temp)?;
+        assert!(write(&block, 8).is_err());
+        assert_eq!(read(&block), Some(5));
+        fs::remove_dir(&temp)?;
+
+        let _ = fs::remove_file(&block);
+        remove(&block)?;
         Ok(())
     }
 

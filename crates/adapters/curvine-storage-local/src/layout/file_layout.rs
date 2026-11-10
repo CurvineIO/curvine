@@ -24,7 +24,7 @@ use curvine_model::ExtendedBlock;
 #[cfg(test)]
 use curvine_runtime::common::ByteUnit;
 use curvine_runtime::common::FileUtils;
-use log::{info, warn};
+use log::info;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -497,6 +497,12 @@ impl BlockLayout for FileLayout {
                 Self::remove_if_exists(Path::new(&file))?;
                 continue;
             }
+            // A temporary watermark is only valid while its writer is alive, so
+            // a leftover one is always from a crash during publish.
+            if write_watermark::is_temp_sidecar(Path::new(&file)) {
+                Self::remove_if_exists(Path::new(&file))?;
+                continue;
+            }
             if write_watermark::is_sidecar(Path::new(&file)) {
                 staging_watermarks.push(file);
                 continue;
@@ -505,27 +511,26 @@ impl BlockLayout for FileLayout {
         }
         // Drop watermarks whose staging block is gone (crash during finalize or
         // abort).
+        let staging_paths: HashSet<PathBuf> = staging_files.iter().map(PathBuf::from).collect();
         for watermark in staging_watermarks {
             let Some(block) = write_watermark::block_path_of(Path::new(&watermark)) else {
                 Self::remove_if_exists(Path::new(&watermark))?;
                 continue;
             };
-            if !staging_files.iter().any(|file| Path::new(file) == block) {
+            if !staging_paths.contains(&block) {
                 Self::remove_if_exists(Path::new(&watermark))?;
             }
         }
 
         for file in staging_files {
-            // Only bytes that were flushed before the crash may survive. Without
-            // this, the recovered block length includes an unsynced tail whose
-            // content is undefined.
-            match write_watermark::apply(Path::new(&file)) {
-                Ok(Some(watermark)) => info!(
+            // Only bytes that were flushed before the crash may survive. If the
+            // truncation fails the durable length is unknown, so the block must
+            // not be registered with its unchecked file size.
+            if let Some(watermark) = write_watermark::apply(Path::new(&file))? {
+                info!(
                     "Truncated staging block {} to its durable write watermark {}",
                     file, watermark
-                ),
-                Ok(None) => {}
-                Err(e) => warn!("Failed to apply write watermark of {}: {}", file, e),
+                );
             }
             if let Ok(meta) = BlockMeta::from_file(&file, BlockState::Recovering, dir) {
                 // A crash during a rewrite can leave the committed active file

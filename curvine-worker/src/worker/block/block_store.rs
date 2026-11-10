@@ -1243,7 +1243,17 @@ mod tests {
         let mut writer = store.open_writer(&meta, 0)?;
         writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&b"durable"[..])))?;
         writer.flush()?;
-        let flushed = writer.block_pos();
+
+        // A backward seek moves the cursor behind bytes that were already
+        // flushed. The recorded extent must stay at the file length, otherwise
+        // recovery would truncate acknowledged data.
+        writer.seek_to(0)?;
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&b"XY"[..])))?;
+        writer.flush()?;
+        assert_eq!(writer.block_pos(), 2);
+        let flushed = writer.durable_len()?;
+        assert_eq!(flushed, 7);
+
         let (_, path, _) = store
             .short_circuit_by_id(block.id)?
             .expect("file layout must expose a local path");
@@ -1266,6 +1276,7 @@ mod tests {
         let recovered = restarted.get_block(block.id)?;
         assert_eq!(recovered.len(), flushed);
         assert_eq!(std::fs::metadata(&path)?.len(), flushed as u64);
+        assert_eq!(std::fs::read(&path)?, b"XYrable");
         Ok(())
     }
 

@@ -319,19 +319,32 @@ impl WriteHandler {
                 Self::record_write_error(self.metrics, context.dir_id, &e);
                 return Err(e.into());
             }
-            // Record the durable prefix so recovery cannot advertise bytes that
-            // were never fsynced. Losing the watermark only costs the safety
-            // net, so a failure here must not fail an otherwise good flush.
+            // The watermark is only meaningful once the bytes it covers reached
+            // stable storage, so sync the block before recording its length.
+            if let Err(e) = file.sync_data() {
+                Self::record_write_error(self.metrics, context.dir_id, &e);
+                return Err(e.into());
+            }
+            // Record the durable extent so recovery cannot advertise bytes that
+            // were never fsynced. The cursor is not a safe record: a client can
+            // seek backwards, which would move the watermark behind bytes that
+            // were already flushed. A stale watermark must not survive either,
+            // because recovery would truncate acknowledged bytes, so a failed
+            // persist fails the flush.
             // Layout block paths are absolute; a relative one means a test
             // device, which has no staging file to protect.
             let path = std::path::Path::new(file.path());
             if path.is_absolute() {
-                if let Err(e) = write_watermark::write(path, file.block_pos() as u64) {
-                    warn!(
-                        "failed to persist write watermark for {}: {}",
-                        file.path(),
-                        e
-                    );
+                let durable_len = match file.durable_len() {
+                    Ok(len) => len,
+                    Err(e) => {
+                        Self::record_write_error(self.metrics, context.dir_id, &e);
+                        return Err(e.into());
+                    }
+                };
+                if let Err(e) = write_watermark::write(path, durable_len as u64) {
+                    Self::record_write_error(self.metrics, context.dir_id, &e);
+                    return Err(e.into());
                 }
             }
         }
@@ -817,6 +830,58 @@ mod tests {
             .to_string();
         let path = std::path::Path::new(&path);
         assert_eq!(crate::worker::storage::write_watermark::read(path), Some(5));
+
+        // A backward seek moves the cursor behind bytes that were already
+        // flushed; the watermark must stay at the durable extent.
+        let seek = DataHeaderProto {
+            offset: 0,
+            flush: false,
+            is_last: false,
+        };
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .seq_id(3)
+            .proto_header(seek)
+            .build();
+        handler.write(&msg)?;
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .seq_id(4)
+            .data(DataSlice::from_str("xy"))
+            .build();
+        handler.write(&msg)?;
+
+        let header = DataHeaderProto {
+            offset: 0,
+            flush: true,
+            is_last: false,
+        };
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .seq_id(5)
+            .proto_header(header)
+            .build();
+        handler.write(&msg)?;
+
+        assert_eq!(crate::worker::storage::write_watermark::read(path), Some(5));
+
+        // Simulated crash: recovery drops only the unsynced tail and keeps the
+        // five flushed bytes instead of truncating to the seek cursor.
+        let mut tail = std::fs::OpenOptions::new().append(true).open(path)?;
+        std::io::Write::write_all(&mut tail, &[0xAB; 8])?;
+        drop(tail);
+        assert_eq!(
+            crate::worker::storage::write_watermark::apply(path)?,
+            Some(5)
+        );
+        assert_eq!(std::fs::metadata(path)?.len(), 5);
 
         let _ = crate::worker::storage::write_watermark::remove(path);
         Ok(())
