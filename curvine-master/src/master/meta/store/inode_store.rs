@@ -572,7 +572,6 @@ impl InodeStore {
         parents_equal: bool,
         src_delta: DirectoryAttributeDelta,
         dst_delta: DirectoryAttributeDelta,
-        moved_delta: Option<DirectoryAttributeDelta>,
     ) -> CommonResult<()> {
         if src_inode.id() != dst_inode.id() {
             return err_box!(
@@ -595,10 +594,6 @@ impl InodeStore {
         if src_parent.id() != dst_parent.id() {
             Self::merge_directory_attributes(&mut batch, dst_parent.id(), dst_delta)?;
         }
-        if let Some(delta) = moved_delta {
-            Self::merge_directory_attributes(&mut batch, dst_inode.id(), delta)?;
-        }
-
         // Update the modification time of the previous node. A plain
         // same-directory rename stages two equal parent views; one row write
         // carries their shared value.
@@ -634,7 +629,6 @@ impl InodeStore {
         ctime: i64,
         src_delta: DirectoryAttributeDelta,
         dst_delta: DirectoryAttributeDelta,
-        moved_delta: Option<DirectoryAttributeDelta>,
     ) -> CommonResult<DeleteResult> {
         if src_inode.id() != dst_inode.id() || src_inode.id() == replaced.id() {
             return err_box!("invalid inode identities for replacement rename");
@@ -656,9 +650,6 @@ impl InodeStore {
         Self::merge_directory_attributes(&mut batch, src_parent.id(), src_delta)?;
         if src_parent.id() != dst_parent.id() {
             Self::merge_directory_attributes(&mut batch, dst_parent.id(), dst_delta)?;
-        }
-        if let Some(delta) = moved_delta {
-            Self::merge_directory_attributes(&mut batch, dst_inode.id(), delta)?;
         }
         batch.write_inode(src_parent)?;
         batch.write_inode(dst_parent)?;
@@ -1883,7 +1874,6 @@ mod tests {
             false,
             delta,
             delta,
-            None,
         )?;
 
         let (_, restored) = store.create_tree()?;

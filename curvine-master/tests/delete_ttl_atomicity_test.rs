@@ -71,19 +71,9 @@ fn replace_rename_updates_ttl_only_after_commit() {
         .return_error("injected replace ttl failure")
         .unwrap();
     runtime.configure(&rule_id, rule).unwrap();
-    let parent_delta = DirectoryAttributeDelta::new(10, 10, -1).for_child_removal();
-    let moved_delta = Some(DirectoryAttributeDelta::new(i64::MIN, 10, 0));
+    let delta = DirectoryAttributeDelta::new(10, 10, -1).for_child_removal();
     let result = store.apply_replace_rename(
-        &root,
-        &source,
-        &name,
-        &root,
-        &renamed,
-        &target,
-        10,
-        parent_delta,
-        parent_delta,
-        moved_delta,
+        &root, &source, &name, &root, &renamed, &target, 10, delta, delta,
     );
     runtime.remove(&rule_id).unwrap();
     assert!(result
@@ -96,16 +86,7 @@ fn replace_rename_updates_ttl_only_after_commit() {
 
     store
         .apply_replace_rename(
-            &root,
-            &source,
-            &name,
-            &root,
-            &renamed,
-            &target,
-            10,
-            parent_delta,
-            parent_delta,
-            moved_delta,
+            &root, &source, &name, &root, &renamed, &target, 10, delta, delta,
         )
         .unwrap();
     assert_eq!(buckets.total_inodes(), 0);
@@ -169,7 +150,6 @@ fn replace_hard_link_keeps_surviving_inode_in_ttl_index() {
             2,
             DirectoryAttributeDelta::new(0, 0, -1).for_child_removal(),
             DirectoryAttributeDelta::new(0, 0, 0),
-            None,
         )
         .unwrap();
     assert_eq!(buckets.total_inodes(), 1);

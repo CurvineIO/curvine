@@ -1679,20 +1679,12 @@ impl FsDir {
         // A directory edge stores its stable live node. Attach it before the
         // store batch commits so the only post-commit publication is the
         // staged DTO whose metadata matches the persisted inode record.
-        let moved_node = if new_inode.is_dir() {
+        if new_inode.is_dir() {
             let node = src_inp
                 .get_dir_node(-1)
                 .ok_or_else(|| FsError::common("source directory lost its live node"))?;
-            new_inode.as_dir_mut()?.node = Some(node.clone());
-            Some(node)
-        } else {
-            None
-        };
-        // A rename changes ctime, not the directory's mtime (which may be negative).
-        let moved_raw = DirectoryAttributeDelta::new(i64::MIN, mtime, 0);
-        let moved_delta = moved_node
-            .as_ref()
-            .map(|node| node.directory_attribute_delta(moved_raw));
+            new_inode.as_dir_mut()?.node = Some(node);
+        }
 
         // Stage parent metadata separately: a failed store write must not
         // publish a new mtime or link count into the live namespace.
@@ -1769,7 +1761,6 @@ impl FsDir {
                 mtime,
                 src_delta,
                 dst_delta,
-                moved_delta,
             )?);
         } else {
             self.store.apply_rename(
@@ -1781,7 +1772,6 @@ impl FsDir {
                 same_parent_plain,
                 src_delta,
                 dst_delta,
-                moved_delta,
             )?;
         }
 
@@ -1790,10 +1780,6 @@ impl FsDir {
         if let Some(raw) = dst_raw {
             self.publish_metadata(dst_parent.publish_directory_delta(raw))?;
             self.publish_metadata(dst_parent.mark_persisted())?;
-        }
-        if let Some(node) = &moved_node {
-            self.publish_metadata(node.apply_attribute_delta(moved_raw))?;
-            node.mark_attributes_persisted();
         }
         // Update memory status. Same-directory renames mutate the child index
         // inside a single rename-mutation window so a concurrent listing never
