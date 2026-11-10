@@ -15,6 +15,77 @@
 use super::*;
 
 #[test]
+fn file_status_memory_rejects_metadata_built_after_a_move() {
+    use curvine_fault::{FaultAction, FaultRuleBuilder, FaultRuntime};
+
+    let fs = test_fs("file-status-move-window");
+    fs.mkdir("/p/a", true).unwrap();
+    fs.mkdir("/q", true).unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "file-status-move-window";
+    // Pause the reader inside the window between the walk and the result
+    // construction so the mutation below deterministically lands there.
+    let rule = FaultRuleBuilder::named("master.metadata.file_status.after_walk")
+        .matches("path", "/p/a")
+        .unwrap()
+        .times(1)
+        .unwrap()
+        .action(FaultAction::Delay { duration_ms: 150 })
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let reader_fs = fs.clone();
+    let reader = std::thread::spawn(move || reader_fs.file_status("/p/a"));
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    fs.rename("/p/a", "/q/a", RenameFlags::empty()).unwrap();
+    fs.set_attr(
+        "/q/a",
+        SetAttrOpts {
+            mode: Some(0o700),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let result = reader.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    // The moved attributes must never be reported under the vacant source
+    // path: the post-build validation detects the parent version change and
+    // the retry observes the move.
+    assert!(result.is_err());
+    assert_eq!(fs.file_status("/q/a").unwrap().mode, 0o700);
+}
+
+#[test]
+fn list_options_memory_rejects_pages_built_after_a_move() {
+    use curvine_fault::{FaultAction, FaultRuleBuilder, FaultRuntime};
+
+    let fs = test_fs("list-options-move-window");
+    fs.mkdir("/p", true).unwrap();
+    fs.mkdir("/q", true).unwrap();
+    fs.create("/p/f", false).unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = "list-options-move-window";
+    let rule = FaultRuleBuilder::named("master.metadata.list_options.after_walk")
+        .matches("path", "/p/f")
+        .unwrap()
+        .times(1)
+        .unwrap()
+        .action(FaultAction::Delay { duration_ms: 150 })
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    let reader_fs = fs.clone();
+    let reader = std::thread::spawn(move || reader_fs.list_options("/p/f", ListOptions::default()));
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    fs.rename("/p/f", "/q/f", RenameFlags::empty()).unwrap();
+    let result = reader.join().unwrap();
+    runtime.remove(rule_id).unwrap();
+    assert!(result.is_err());
+    assert_eq!(
+        fs.list_options("/q/f", ListOptions::default()).unwrap()[0].name,
+        "f"
+    );
+}
+
+#[test]
 fn moved_directory_ctime_matches_live_attributes() {
     let fs = test_fs("moved-directory-ctime");
     fs.mkdir("/left/a", true).unwrap();

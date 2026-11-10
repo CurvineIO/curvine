@@ -2668,20 +2668,40 @@ impl MasterFilesystem {
             let fs_dir = self.fs_dir.read();
             Self::checked_live_epoch(&fs_dir)?;
             let inp = InodePath::resolve_versioned(fs_dir.root_node(), path, fs_dir.store_ref())?;
-            if !inp.walk_is_current() {
-                continue;
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.file_status.after_walk",
+                description: "After the memory walk, before the status is built",
+                context: {"path" => path},
+                return_error: |fault| Err(fault.message.into()),
             }
             if !inp.is_full() {
-                return err_ext!(FsError::file_not_found(path));
+                if inp.walk_is_current() {
+                    return err_ext!(FsError::file_not_found(path));
+                }
+                continue;
             }
+            // The result must be constructed before validation: a concurrent
+            // rename can move the target while this thread builds, and the
+            // parent's child-index version is the only signal that the
+            // returned (path, metadata) pair stopped coexisting mid-build.
             if let Some(node) = inp.get_last_dir_node() {
-                return Ok(InodeDir::from_dir_node_live(inp.name().to_string(), node)
-                    .to_file_status(path)?);
+                let status = InodeDir::from_dir_node_live(inp.name().to_string(), node)
+                    .to_file_status(path)?;
+                if !inp.walk_is_current() {
+                    continue;
+                }
+                return Ok(status);
             }
             let inode = inp
                 .get_last_inode()
                 .ok_or_else(|| FsError::file_not_found(path))?;
-            return Ok(inode.as_ref().to_file_status(path)?);
+            let status = inode.as_ref().to_file_status(path)?;
+            if !inp.walk_is_current() {
+                continue;
+            }
+            return Ok(status);
         }
         // Contention fallback: the pre-S4 snapshot read.
         let fs_dir = self.fs_dir.read();
@@ -2701,10 +2721,11 @@ impl MasterFilesystem {
         for _ in 0..Self::MEMORY_WALK_ATTEMPTS {
             Self::checked_live_epoch(fs_dir)?;
             let inp = InodePath::resolve_versioned(fs_dir.root_node(), path, fs_dir.store_ref())?;
+            let full = inp.is_full();
             if !inp.walk_is_current() {
                 continue;
             }
-            return Ok(inp.is_full());
+            return Ok(full);
         }
         let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
         Ok(snapshot.resolve_path(path)?.is_full())
@@ -2810,25 +2831,38 @@ impl MasterFilesystem {
             let fs_dir = self.fs_dir.read();
             Self::checked_live_epoch(&fs_dir)?;
             let inp = InodePath::resolve_versioned(fs_dir.root_node(), path, fs_dir.store_ref())?;
-            if !inp.walk_is_current() {
+            if !inp.is_full() {
+                if inp.walk_is_current() {
+                    return err_ext!(FsError::file_not_found(path));
+                }
                 continue;
             }
-            if !inp.is_full() {
-                return err_ext!(FsError::file_not_found(path));
+            #[cfg(test)]
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.list_options.after_walk",
+                description: "After the memory walk, before the page is built",
+                context: {"path" => path},
+                return_error: |fault| Err(fault.message.into()),
             }
             let Some(node) = inp.get_last_dir_node() else {
                 let inode = inp
                     .get_last_inode()
                     .ok_or_else(|| FsError::file_not_found(path))?;
-                if page_opts.limit == Some(0)
+                let empty = page_opts.limit == Some(0)
                     || page_opts
                         .start_after
                         .as_ref()
-                        .is_some_and(|cursor| inode.name() <= cursor.as_str())
-                {
-                    return Ok(Vec::new());
+                        .is_some_and(|cursor| inode.name() <= cursor.as_str());
+                let page = if empty {
+                    Vec::new()
+                } else {
+                    vec![inode.as_ref().to_file_status(path)?]
+                };
+                if !inp.walk_is_current() {
+                    continue;
                 }
-                return Ok(vec![inode.as_ref().to_file_status(path)?]);
+                return Ok(page);
             };
             let children = node.children.list_options(page_opts);
             // Capture each listed directory's version before its status is
