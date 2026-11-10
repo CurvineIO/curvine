@@ -2128,6 +2128,14 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         404
     } else if err.starts_with("PreconditionFailed") {
         412
+    } else if err.starts_with("InvalidPart")
+        || err.starts_with("EntityTooSmall")
+        || err.starts_with("InvalidArgument")
+    {
+        // `InvalidPartOrder` shares the `InvalidPart` prefix. All of these are
+        // request errors; answering 500 would make clients retry a request that
+        // can never succeed.
+        400
     } else {
         500
     }

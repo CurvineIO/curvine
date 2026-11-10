@@ -20,8 +20,13 @@ use std::future::Future;
 const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 const MIN_BUFFER_SIZE: usize = 64 * 1024;
 
-/// What an uploaded part recorded about itself, written next to the part
-/// when it is staged.
+/// What an uploaded part recorded about itself, stored in a trailer at the end
+/// of the part file.
+///
+/// Bytes and record are one file published by a single atomic rename, so a
+/// concurrent re-upload of the same part can never publish one generation's
+/// bytes with another generation's record (a separate sidecar could, across
+/// gateway instances sharing the staging area).
 ///
 /// `size` is taken from the staged bytes themselves rather than remembered from
 /// the request, so the value cannot drift from what is on disk; `etag` is the
@@ -34,17 +39,34 @@ pub struct PartMeta {
     pub size: usize,
 }
 
+/// Trailer layout: magic(8) + version(1) + etag ascii(32) + size u64 LE(8).
+const PART_TRAILER_MAGIC: &[u8; 8] = b"CVS3PART";
+const PART_TRAILER_VERSION: u8 = 1;
+pub const PART_TRAILER_SIZE: usize = 8 + 1 + 32 + 8;
+
 impl PartMeta {
-    /// Encode as `"<etag>:<size>"` for the sidecar file.
-    fn encode(&self) -> String {
-        format!("{}:{}", self.etag.trim_matches('"'), self.size)
+    /// Serialise into the fixed-width trailer appended to a part file.
+    fn encode_trailer(&self) -> [u8; PART_TRAILER_SIZE] {
+        let mut out = [0u8; PART_TRAILER_SIZE];
+        out[..8].copy_from_slice(PART_TRAILER_MAGIC);
+        out[8] = PART_TRAILER_VERSION;
+        out[9..41].copy_from_slice(self.etag.as_bytes());
+        out[41..49].copy_from_slice(&(self.size as u64).to_le_bytes());
+        out
     }
 
-    fn decode(text: &str) -> Option<Self> {
-        let (etag, size) = text.trim().split_once(':')?;
+    fn decode_trailer(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != PART_TRAILER_SIZE
+            || &bytes[..8] != PART_TRAILER_MAGIC
+            || bytes[8] != PART_TRAILER_VERSION
+        {
+            return None;
+        }
+        let etag = std::str::from_utf8(&bytes[9..41]).ok()?;
+        let size = u64::from_le_bytes(bytes[41..49].try_into().ok()?);
         Some(Self {
             etag: etag.to_string(),
-            size: size.parse().ok()?,
+            size: usize::try_from(size).ok()?,
         })
     }
 }
@@ -154,7 +176,7 @@ fn verify_part_etag(
         .to_ascii_lowercase();
     if expected != actual {
         return Err(format!(
-            "part {} etag {} does not match the staged part ({})",
+            "InvalidPart: part {} etag {} does not match the staged part ({})",
             part_number, expected_etag, actual
         ));
     }
@@ -202,13 +224,6 @@ impl LocalTempStorage {
         format!("{}/{}/{}", self.config.temp_dir, upload_id, part_number)
     }
 
-    fn part_meta_path(&self, upload_id: &str, part_number: u32) -> String {
-        format!(
-            "{}/{}/{}.meta",
-            self.config.temp_dir, upload_id, part_number
-        )
-    }
-
     #[inline]
     fn dir_path(&self, upload_id: &str) -> String {
         format!("{}/{}", self.config.temp_dir, upload_id)
@@ -254,9 +269,13 @@ impl LocalTempStorage {
         let dir = self.dir_path(upload_id);
         create_private_dir(&dir).await?;
 
-        let mut file = open_private_writer(&path, false)
+        // Stage to a unique temporary name and publish with one rename, so the
+        // final part file is always one coherent generation: bytes and record
+        // can never come from different concurrent uploads of the same part.
+        let tmp_path = format!("{}.tmp-{}", path, uuid::Uuid::new_v4());
+        let mut file = open_private_writer(&tmp_path, false)
             .await
-            .map_err(|e| format!("Failed to create part file {}: {}", path, e))?;
+            .map_err(|e| format!("Failed to create part file {}: {}", tmp_path, e))?;
 
         let mut hasher = md5::Context::new();
         let mut sha256 = sha2::Sha256::new();
@@ -275,7 +294,7 @@ impl LocalTempStorage {
                 Ok(None) => break,
                 Err(e) => {
                     drop(file);
-                    let _ = tokio::fs::remove_file(&path).await;
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
                     return Err(format!("Failed to read from body: {}", e));
                 }
             };
@@ -304,49 +323,52 @@ impl LocalTempStorage {
                 .map_err(|e| format!("Failed to write to part file: {}", e))?;
         }
 
+        if let Err(mismatch) = expect.check(staged, &hex::encode(sha256.finalize())) {
+            drop(file);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(mismatch);
+        }
+
+        // The record rides in the part file itself: one rename publishes bytes
+        // and record together, so `Complete` can never see a torn generation.
+        let digest = hasher.compute();
+        let etag = format!("{:x}", digest);
+        let trailer = PartMeta {
+            etag: etag.clone(),
+            size: staged,
+        }
+        .encode_trailer();
+        file.write_all(&trailer)
+            .await
+            .map_err(|e| format!("Failed to append part record: {}", e))?;
         file.flush()
             .await
             .map_err(|e| format!("Failed to flush part file: {}", e))?;
         drop(file);
 
-        if let Err(mismatch) = expect.check(staged, &hex::encode(sha256.finalize())) {
-            let _ = tokio::fs::remove_file(&path).await;
-            return Err(mismatch);
-        }
-
-        let digest = hasher.compute();
-        let etag = format!("{:x}", digest);
-        // Sidecar next to the part: Complete validates the request against this
-        // record, and a part with no record is treated as never uploaded.
-        let meta_path = self.part_meta_path(upload_id, part_number);
-        tokio::fs::write(
-            &meta_path,
-            PartMeta {
-                etag: etag.clone(),
-                size: staged,
-            }
-            .encode(),
-        )
-        .await
-        .map_err(|e| format!("Failed to record part metadata {}: {}", meta_path, e))?;
+        tokio::fs::rename(&tmp_path, &path)
+            .await
+            .map_err(|e| format!("Failed to publish part {}: {}", path, e))?;
 
         Ok(format!("\"{etag}\""))
     }
 
-    /// The record `write_part_stream` left next to this part.
+    /// The record in this part file's trailer.
     pub async fn part_meta(&self, upload_id: &str, part_number: u32) -> Option<PartMeta> {
-        let text = tokio::fs::read_to_string(self.part_meta_path(upload_id, part_number))
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        let path = self.part_path(upload_id, part_number);
+        let mut file = tokio::fs::File::open(&path).await.ok()?;
+        let len = file.metadata().await.ok()?.len();
+        if len < PART_TRAILER_SIZE as u64 {
+            return None;
+        }
+        file.seek(std::io::SeekFrom::Start(len - PART_TRAILER_SIZE as u64))
             .await
             .ok()?;
-        PartMeta::decode(&text)
-    }
-
-    /// Recorded size of a staged part, read from the file itself.
-    pub async fn part_size(&self, upload_id: &str, part_number: u32) -> Option<usize> {
-        tokio::fs::metadata(self.part_path(upload_id, part_number))
-            .await
-            .ok()
-            .map(|metadata| metadata.len() as usize)
+        let mut trailer = [0u8; PART_TRAILER_SIZE];
+        file.read_exact(&mut trailer).await.ok()?;
+        PartMeta::decode_trailer(&trailer)
     }
 
     /// Stages a single-object body on local disk and returns the reader plus
@@ -402,12 +424,9 @@ impl LocalTempStorage {
         }
     }
 
-    /// Whether a part of this upload is staged.
-    ///
-    /// `CompleteMultipartUpload` checks this before touching the destination, so
-    /// a stale upload id cannot destroy an existing object.
-    pub async fn part_exists(&self, upload_id: &str, part_number: u32) -> bool {
-        tokio::fs::try_exists(self.part_path(upload_id, part_number))
+    /// Whether an upload session exists.
+    pub async fn upload_exists(&self, upload_id: &str) -> bool {
+        tokio::fs::try_exists(self.dir_path(upload_id))
             .await
             .unwrap_or(false)
     }
@@ -433,19 +452,33 @@ impl LocalTempStorage {
             .await
             .map_err(|e| format!("Failed to open part file {}: {}", path, e))?;
 
+        // The trailer is the part's own record, not payload: copy exactly the
+        // bytes that were staged.
+        let payload_len = file
+            .metadata()
+            .await
+            .map_err(|e| e.to_string())?
+            .len()
+            .saturating_sub(PART_TRAILER_SIZE as u64);
         let buffer_size = self.config.buffer_size();
         let mut buf = BytesMut::with_capacity(buffer_size);
         buf.resize(buffer_size, 0);
         let mut hasher = md5::Context::new();
+        let mut remaining = payload_len;
 
-        loop {
+        while remaining > 0 {
+            let want = std::cmp::min(buf.len() as u64, remaining) as usize;
             let n = file
-                .read(&mut buf)
+                .read(&mut buf[..want])
                 .await
                 .map_err(|e| format!("Failed to read from part file: {}", e))?;
             if n == 0 {
-                break;
+                return Err(format!(
+                    "InvalidPart: part {} of upload {} was truncated after staging",
+                    part_number, upload_id
+                ));
             }
+            remaining -= n as u64;
 
             hasher.consume(&buf[..n]);
             writer
@@ -482,14 +515,6 @@ impl CurvineTempStorage {
             self.config.temp_dir, upload_id, part_number
         ))
         .map_err(|e| format!("Invalid part path: {}", e))
-    }
-
-    fn part_meta_path(&self, upload_id: &str, part_number: u32) -> Result<Path, String> {
-        Path::from_str(format!(
-            "{}/{}/{}.meta",
-            self.config.temp_dir, upload_id, part_number
-        ))
-        .map_err(|e| format!("Invalid part metadata path: {}", e))
     }
 
     #[inline]
@@ -552,9 +577,15 @@ impl CurvineTempStorage {
         let _ = self.fs.mkdir(&dir_path, true).await;
 
         let path = self.part_path(upload_id, part_number)?;
+        // Stage to a unique temporary name and publish with one rename, so the
+        // final part file is always one coherent generation: bytes and record
+        // can never come from different concurrent uploads of the same part,
+        // even across gateway instances sharing this staging area.
+        let tmp_path = Path::from_str(format!("{}.tmp-{}", path, uuid::Uuid::new_v4()))
+            .map_err(|e| format!("Invalid part path: {}", e))?;
         let mut writer = self
             .fs
-            .create(&path, true)
+            .create(&tmp_path, true)
             .await
             .map_err(|e| format!("Failed to create part file in Curvine: {}", e))?;
 
@@ -573,7 +604,7 @@ impl CurvineTempStorage {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(e) => {
-                    let _ = self.fs.delete_with_opts(&path, true, true).await;
+                    let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
                     return Err(format!("Failed to read from body: {}", e));
                 }
             };
@@ -605,70 +636,65 @@ impl CurvineTempStorage {
                 .map_err(|e| format!("Failed to write part data to Curvine: {}", e))?;
         }
 
+        if let Err(mismatch) = expect.check(staged, &hex::encode(sha256.finalize())) {
+            let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
+            return Err(mismatch);
+        }
+
+        // The record rides in the part file itself: one rename publishes bytes
+        // and record together, so `Complete` can never see a torn generation.
+        let digest = hasher.compute();
+        let etag = format!("{:x}", digest);
+        let trailer = PartMeta {
+            etag: etag.clone(),
+            size: staged,
+        }
+        .encode_trailer();
+        writer
+            .write(&trailer)
+            .await
+            .map_err(|e| format!("Failed to append part record: {}", e))?;
         writer
             .complete()
             .await
             .map_err(|e| format!("Failed to complete part write in Curvine: {}", e))?;
 
-        if let Err(mismatch) = expect.check(staged, &hex::encode(sha256.finalize())) {
-            let _ = self.fs.delete_with_opts(&path, true, true).await;
-            return Err(mismatch);
+        if let Err(e) = self.fs.rename(&tmp_path, &path).await {
+            let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
+            return Err(format!("Failed to publish part in Curvine: {}", e));
         }
-
-        let digest = hasher.compute();
-        let etag = format!("{:x}", digest);
-        // Sidecar next to the part, in the same staging area.
-        let meta_path = self.part_meta_path(upload_id, part_number)?;
-        let mut meta_writer = self
-            .fs
-            .create(&meta_path, true)
-            .await
-            .map_err(|e| format!("Failed to create part metadata {}: {}", meta_path, e))?;
-        meta_writer
-            .write(
-                PartMeta {
-                    etag: etag.clone(),
-                    size: staged,
-                }
-                .encode()
-                .as_bytes(),
-            )
-            .await
-            .map_err(|e| format!("Failed to write part metadata {}: {}", meta_path, e))?;
-        meta_writer
-            .complete()
-            .await
-            .map_err(|e| format!("Failed to complete part metadata {}: {}", meta_path, e))?;
 
         Ok(format!("\"{etag}\""))
     }
 
-    /// The record `write_part_stream` left next to this part.
-    /// Recorded size of a staged part.
-    pub async fn part_size(&self, upload_id: &str, part_number: u32) -> Option<usize> {
+    /// The record in this part file's trailer.
+    pub async fn part_meta(&self, upload_id: &str, part_number: u32) -> Option<PartMeta> {
         let path = self.part_path(upload_id, part_number).ok()?;
-        self.fs
-            .get_status(&path)
-            .await
-            .ok()
-            .and_then(|status| usize::try_from(status.len).ok())
+        let mut reader = self.fs.open(&path).await.ok()?;
+        let len = reader.len();
+        let meta = self.read_trailer(&mut reader, len).await;
+        // Complete on both the success and the error path: EOF does not send
+        // the completion RPC, so dropping the reader here would leave a
+        // worker-side read context open.
+        let _ = reader.complete().await;
+        meta
     }
 
-    pub async fn part_meta(&self, upload_id: &str, part_number: u32) -> Option<PartMeta> {
-        use curvine_fs_api::Reader;
-
-        let path = self.part_meta_path(upload_id, part_number).ok()?;
-        let mut reader = self.fs.open(&path).await.ok()?;
-        let mut text = String::new();
-        let mut buf = vec![0u8; 256];
-        loop {
-            let n = reader.read(&mut buf).await.ok()?;
-            if n == 0 {
-                break;
-            }
-            text.push_str(&String::from_utf8_lossy(&buf[..n]));
+    async fn read_trailer(&self, reader: &mut impl Reader, len: i64) -> Option<PartMeta> {
+        if len < PART_TRAILER_SIZE as i64 {
+            return None;
         }
-        PartMeta::decode(&text)
+        reader.seek(len - PART_TRAILER_SIZE as i64).await.ok()?;
+        let mut trailer = [0u8; PART_TRAILER_SIZE];
+        let mut filled = 0;
+        while filled < PART_TRAILER_SIZE {
+            let n = reader.read(&mut trailer[filled..]).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            filled += n;
+        }
+        PartMeta::decode_trailer(&trailer)
     }
 
     /// Stages a single-object body in Curvine and returns a reader over it.
@@ -732,9 +758,9 @@ impl CurvineTempStorage {
         }
     }
 
-    /// Whether a part of this upload is staged.
-    pub async fn part_exists(&self, upload_id: &str, part_number: u32) -> bool {
-        match self.part_path(upload_id, part_number) {
+    /// Whether an upload session exists.
+    pub async fn upload_exists(&self, upload_id: &str) -> bool {
+        match self.dir_path(upload_id) {
             Ok(path) => self.fs.get_status(&path).await.is_ok(),
             Err(_) => false,
         }
@@ -758,19 +784,28 @@ impl CurvineTempStorage {
             .await
             .map_err(|e| format!("Failed to open part file in Curvine: {}", e))?;
 
+        // The trailer is the part's own record, not payload: copy exactly the
+        // bytes that were staged.
+        let mut remaining = (reader.len() as u64).saturating_sub(PART_TRAILER_SIZE as u64);
         let buffer_size = self.config.buffer_size();
         let mut buf = BytesMut::with_capacity(buffer_size);
         buf.resize(buffer_size, 0);
         let mut hasher = md5::Context::new();
 
-        loop {
+        while remaining > 0 {
+            let want = std::cmp::min(buf.len() as u64, remaining) as usize;
             let n = reader
-                .read(&mut buf)
+                .read(&mut buf[..want])
                 .await
                 .map_err(|e| format!("Failed to read from part file: {}", e))?;
             if n == 0 {
-                break;
+                let _ = reader.complete().await;
+                return Err(format!(
+                    "InvalidPart: part {} of upload {} was truncated after staging",
+                    part_number, upload_id
+                ));
             }
+            remaining -= n as u64;
 
             hasher.consume(&buf[..n]);
             writer
@@ -779,13 +814,13 @@ impl CurvineTempStorage {
                 .map_err(|e| format!("Failed to write to destination: {}", e))?;
         }
 
-        verify_part_etag(part_number, expected_etag, &hasher.compute())?;
-
-        reader
-            .complete()
-            .await
-            .map_err(|e| format!("Failed to complete reader in Curvine: {}", e))?;
-
+        let verified = verify_part_etag(part_number, expected_etag, &hasher.compute());
+        // Complete on both paths: EOF does not send the completion RPC, so
+        // dropping the reader on the verify-error path would leak a read
+        // context.
+        let completed = reader.complete().await;
+        verified?;
+        completed.map_err(|e| format!("Failed to complete reader in Curvine: {}", e))?;
         Ok(())
     }
 }
@@ -942,11 +977,11 @@ impl TempStorageEnum {
         }
     }
 
-    /// Whether a part of this upload is staged, in either backend.
-    pub async fn part_exists(&self, upload_id: &str, part_number: u32) -> bool {
+    /// Whether an upload session exists, in either backend.
+    pub async fn upload_exists(&self, upload_id: &str) -> bool {
         match self {
-            TempStorageEnum::Local(s) => s.part_exists(upload_id, part_number).await,
-            TempStorageEnum::Curvine(s) => s.part_exists(upload_id, part_number).await,
+            TempStorageEnum::Local(s) => s.upload_exists(upload_id).await,
+            TempStorageEnum::Curvine(s) => s.upload_exists(upload_id).await,
         }
     }
 
@@ -955,14 +990,6 @@ impl TempStorageEnum {
         match self {
             TempStorageEnum::Local(s) => s.part_meta(upload_id, part_number).await,
             TempStorageEnum::Curvine(s) => s.part_meta(upload_id, part_number).await,
-        }
-    }
-
-    /// Recorded size of a staged part, in either backend.
-    pub async fn part_size(&self, upload_id: &str, part_number: u32) -> Option<usize> {
-        match self {
-            TempStorageEnum::Local(s) => s.part_size(upload_id, part_number).await,
-            TempStorageEnum::Curvine(s) => s.part_size(upload_id, part_number).await,
         }
     }
 
@@ -1216,6 +1243,123 @@ mod tests {
         assert!(err.contains("etag"), "{err}");
     }
 
+    /// The record is published with the bytes by one rename, so a part that is
+    /// rewritten leaves exactly one coherent generation behind: the record must
+    /// always describe the bytes on disk, never an earlier attempt's.
+    #[tokio::test]
+    async fn a_part_record_always_describes_its_own_bytes() {
+        use std::env;
+        use std::io::Cursor;
+
+        let temp_path = env::temp_dir()
+            .join(format!("curvine-test-{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let storage = LocalTempStorage::new(TempStorageConfig::new(temp_path.clone(), 1024, 4096));
+        storage.create_dir("upload-atomic").await.unwrap();
+
+        let first = vec![7u8; 4096];
+        let mut body = tokio::io::BufReader::new(Cursor::new(first.clone()));
+        let etag = storage
+            .write_part_stream("upload-atomic", 1, &mut body, StageExpect::default())
+            .await
+            .unwrap();
+
+        let second = vec![9u8; 2048];
+        let mut body = tokio::io::BufReader::new(Cursor::new(second.clone()));
+        let second_etag = storage
+            .write_part_stream("upload-atomic", 1, &mut body, StageExpect::default())
+            .await
+            .unwrap();
+
+        let meta = storage.part_meta("upload-atomic", 1).await.unwrap();
+        assert_eq!(meta.size, second.len(), "the record must track the rewrite");
+        assert_eq!(meta.etag, second_etag.trim_matches('"'));
+        assert_ne!(meta.etag, etag.trim_matches('"'));
+
+        storage.cleanup("upload-atomic").await.unwrap();
+        let _ = std::fs::remove_dir_all(&temp_path);
+    }
+
+    /// Complete must assemble the staged payload only. The trailer is internal
+    /// bookkeeping; the file must therefore be the payload followed by exactly
+    /// one fixed-width record, so `read_part_stream` can stop at the boundary.
+    #[tokio::test]
+    async fn a_part_file_is_its_payload_followed_by_one_record() {
+        use std::env;
+        use std::io::Cursor;
+
+        let temp_path = env::temp_dir()
+            .join(format!("curvine-test-{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let storage = LocalTempStorage::new(TempStorageConfig::new(temp_path.clone(), 1024, 4096));
+        storage.create_dir("upload-layout").await.unwrap();
+
+        let payload = b"payload-bytes".to_vec();
+        let mut body = tokio::io::BufReader::new(Cursor::new(payload.clone()));
+        let etag = storage
+            .write_part_stream("upload-layout", 1, &mut body, StageExpect::default())
+            .await
+            .unwrap();
+
+        let bytes = tokio::fs::read(storage.part_path("upload-layout", 1))
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), payload.len() + PART_TRAILER_SIZE);
+        assert_eq!(&bytes[..payload.len()], &payload[..]);
+
+        let meta = PartMeta::decode_trailer(&bytes[payload.len()..]).expect("trailer must decode");
+        assert_eq!(meta.size, payload.len());
+        assert_eq!(meta.etag, etag.trim_matches('"'));
+
+        // A record that does not describe its own payload length is not usable
+        // as a preflight source of truth.
+        assert!(PartMeta::decode_trailer(&bytes[..PART_TRAILER_SIZE]).is_none());
+
+        storage.cleanup("upload-layout").await.unwrap();
+        let _ = std::fs::remove_dir_all(&temp_path);
+    }
+
+    /// A part with no record was never staged (or lost its bytes): preflight
+    /// must see that, so Complete rejects before creating the assembly object.
+    #[tokio::test]
+    async fn a_missing_or_unrecorded_part_has_no_metadata() {
+        use std::env;
+        use std::io::Cursor;
+
+        let temp_path = env::temp_dir()
+            .join(format!("curvine-test-{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let storage = LocalTempStorage::new(TempStorageConfig::new(temp_path.clone(), 1024, 4096));
+        storage.create_dir("upload-meta").await.unwrap();
+
+        assert!(!storage.upload_exists("upload-absent").await);
+        assert!(storage.upload_exists("upload-meta").await);
+
+        // Never uploaded.
+        assert!(storage.part_meta("upload-meta", 5).await.is_none());
+
+        // Uploaded, then the body disappeared: the record went with it.
+        let mut body = tokio::io::BufReader::new(Cursor::new(vec![1u8; 1024]));
+        storage
+            .write_part_stream("upload-meta", 1, &mut body, StageExpect::default())
+            .await
+            .unwrap();
+        assert!(storage.part_meta("upload-meta", 1).await.is_some());
+        tokio::fs::remove_file(storage.part_path("upload-meta", 1))
+            .await
+            .unwrap();
+        assert!(storage.part_meta("upload-meta", 1).await.is_none());
+
+        storage.cleanup("upload-meta").await.unwrap();
+        let _ = std::fs::remove_dir_all(&temp_path);
+    }
+
     /// With the default `/tmp/curvine-temp` staging dir, default modes let any
     /// local user read in-flight object bodies.
     #[tokio::test]
@@ -1298,7 +1442,12 @@ mod tests {
 
         let part_path = storage.part_path(upload_id, 1);
         let file_data = tokio::fs::read(&part_path).await.unwrap();
-        assert_eq!(file_data, small_data);
+        // Bytes and record are one file: payload followed by the trailer.
+        assert_eq!(file_data.len(), small_data.len() + PART_TRAILER_SIZE);
+        assert_eq!(&file_data[..small_data.len()], small_data);
+        let meta = storage.part_meta(upload_id, 1).await.unwrap();
+        assert_eq!(meta.size, small_data.len());
+        assert_eq!(meta.etag, etag_value.trim_matches('"'));
 
         let large_data: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
         let mut body2 = tokio::io::BufReader::new(Cursor::new(large_data.clone()));
@@ -1310,7 +1459,8 @@ mod tests {
 
         let part_path2 = storage.part_path(upload_id, 2);
         let file_data2 = tokio::fs::read(&part_path2).await.unwrap();
-        assert_eq!(file_data2, large_data);
+        assert_eq!(file_data2.len(), large_data.len() + PART_TRAILER_SIZE);
+        assert_eq!(&file_data2[..large_data.len()], &large_data[..]);
 
         storage.cleanup(upload_id).await.unwrap();
         let _ = std::fs::remove_dir_all(&temp_path);

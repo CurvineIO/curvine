@@ -28,7 +28,7 @@ use crate::s3::s3_api::HeadObjectResult;
 use crate::utils::s3_utils::{
     file_status_to_head_object_result, file_status_to_list_object_content,
 };
-use crate::utils::temp_storage::TempStorageEnum;
+use crate::utils::temp_storage::{PartMeta, TempStorageEnum};
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_error::FsResult;
@@ -591,6 +591,10 @@ impl PutObjectHandler for S3Handlers {
         );
 
         async move {
+            // The staging prefix is reserved; a PUT cannot create an object
+            // that listings would have to hide.
+            reject_reserved_key(&object)?;
+
             // S3 applies `If-Match` / `If-None-Match` to the DESTINATION on
             // PutObject. Without this an `If-Match: <old>` overwrite silently
             // clobbered a concurrently-replaced object, which is the lost
@@ -745,6 +749,9 @@ impl S3Handlers {
         let dst = self
             .cv_object_path(dest_bucket, dest_key)
             .map_err(|e| format!("Invalid copy destination: {e}"))?;
+        // The staging prefix is reserved; a copy cannot create an object that
+        // listings would have to hide.
+        reject_reserved_key(dest_key)?;
 
         let status = self.fs.get_status(&src).await.map_err(|_| {
             format!("NoSuchKey: copy source {source_bucket}/{source_key} does not exist")
@@ -851,6 +858,74 @@ fn same_etag(left: &str, right: &str) -> bool {
 /// S3 minimum size for a part other than the last one.
 const MIN_PART_BYTES: usize = 5 << 20;
 
+/// Key segment reserved for gateway staging artefacts.
+///
+/// Every staging object (`PutOperation`, CopyObject, multipart assembly) is a
+/// sibling named `.curvine-s3-*`, and listings filter that prefix out. Reserving
+/// it on the write paths is what makes the filter sound: no user object can
+/// carry the prefix, so hiding it can never hide user data.
+const STAGING_KEY_PREFIX: &str = ".curvine-s3-";
+
+/// Reject keys whose last segment falls inside the reserved staging namespace.
+fn reject_reserved_key(key: &str) -> Result<(), String> {
+    let last = key.rsplit('/').next().unwrap_or(key);
+    if last.starts_with(STAGING_KEY_PREFIX) {
+        return Err(format!(
+            "InvalidArgument: object keys may not start a segment with {STAGING_KEY_PREFIX}, which is reserved for gateway staging"
+        ));
+    }
+    Ok(())
+}
+
+/// S3 requires a Complete request to list parts in strictly ascending
+/// part-number order, without duplicates.
+///
+/// Sorting the list first used to silently accept both, so the request is
+/// validated in the order it arrived.
+fn validate_part_order(parts: &[(String, u32)]) -> Result<(), String> {
+    for window in parts.windows(2) {
+        if window[1].1 <= window[0].1 {
+            return Err(format!(
+                "InvalidPartOrder: part numbers must be strictly ascending (got {} then {})",
+                window[0].1, window[1].1
+            ));
+        }
+    }
+    if parts.is_empty() {
+        return Err("InvalidPart: no parts listed".to_string());
+    }
+    Ok(())
+}
+
+/// Check every listed part against the record staged with its bytes.
+///
+/// One record per part decides existence, ETag match and the non-final
+/// minimum size, so all three read from the same source of truth: the trailer
+/// published atomically with the part. Returns the staged sizes in request
+/// order.
+fn validate_staged_parts(
+    parts: &[(String, u32)],
+    staged: &[(u32, PartMeta)],
+) -> Result<(), String> {
+    let count = staged.len();
+    for (index, ((etag, part_num), (_, recorded))) in parts.iter().zip(staged).enumerate() {
+        if !same_etag(&recorded.etag, etag) {
+            return Err(format!(
+                "InvalidPart: part {part_num} etag does not match the staged part"
+            ));
+        }
+        // S3 requires every part except the last to be at least 5 MiB; a
+        // single-part upload is the last part and is exempt.
+        if index + 1 < count && recorded.size < MIN_PART_BYTES {
+            return Err(format!(
+                "EntityTooSmall: part {part_num} is {} bytes, below the 5 MiB minimum for a non-final part",
+                recorded.size
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl crate::s3::s3_api::ListBucketHandler for S3Handlers {
     fn handle(
         &self,
@@ -942,21 +1017,18 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             }
         };
 
-        // S3 requires a complete request to list parts in strictly ascending
-        // part-number order, without duplicates. Sorting first would silently
-        // accept both, so the request is validated in the order it arrived.
-        for window in data.windows(2) {
-            if window[1].1 <= window[0].1 {
-                return Err(format!(
-                    "InvalidPartOrder: part numbers must be strictly ascending (got {} then {})",
-                    window[0].1, window[1].1
-                ));
-            }
-        }
-        if data.is_empty() {
-            return Err("InvalidPart: no parts listed".to_string());
-        }
+        validate_part_order(&data)?;
         let part_list = data;
+
+        // The staging prefix is reserved, so Complete cannot publish there.
+        reject_reserved_key(&key)?;
+
+        // An unknown, aborted or already-completed upload id is a 404, not a
+        // part error: without this check a missing part record inside a dead
+        // session would be misreported as InvalidPart (400).
+        if !self.temp_storage.upload_exists(&upload_id).await {
+            return Err(format!("NoSuchUpload: upload {upload_id} does not exist"));
+        }
 
         // Validate the upload before touching the destination. Creating the
         // final object first meant a bad upload id, or a part that is not
@@ -966,46 +1038,22 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         // The part ETAG is compared with the record the upload left next to the
         // part, so a request naming a different digest than the one staged is
         // rejected here, not discovered while streaming.
-        for (etag, part_num) in part_list.iter() {
+        let mut staged_parts = Vec::with_capacity(part_list.len());
+        for (_, part_num) in part_list.iter() {
             let recorded = self
                 .temp_storage
                 .part_meta(&upload_id, *part_num)
                 .await
                 .ok_or_else(|| {
                     // No record means the part was never uploaded under this
-                    // upload id, or was uploaded by an older build.
+                    // upload id, or was uploaded by an older build. This also
+                    // covers a part whose bytes were lost: the record is
+                    // published with them.
                     format!("InvalidPart: part {part_num} of upload {upload_id} is not staged")
                 })?;
-            if !same_etag(&recorded.etag, etag) {
-                return Err(format!(
-                    "InvalidPart: part {part_num} etag does not match the staged part"
-                ));
-            }
+            staged_parts.push((*part_num, recorded));
         }
-
-        // S3 requires every part except the last to be at least 5 MiB. Enforcing
-        // it here turns a length violation into a 400 instead of publishing an
-        // object with an undersized non-final part. A single-part upload is the
-        // last part, so it is exempt.
-        let part_count = part_list.len();
-        for (index, (_, part_num)) in part_list.iter().enumerate() {
-            if index + 1 == part_count {
-                continue;
-            }
-            match self.temp_storage.part_size(&upload_id, *part_num).await {
-                Some(size) if size >= MIN_PART_BYTES => {}
-                Some(size) => {
-                    return Err(format!(
-                        "EntityTooSmall: part {part_num} is {size} bytes, below the 5 MiB minimum for a non-final part"
-                    ));
-                }
-                None => {
-                    return Err(format!(
-                        "NoSuchUpload: part {part_num} of upload {upload_id} is not staged"
-                    ));
-                }
-            }
-        }
+        validate_staged_parts(&part_list, &staged_parts)?;
 
         // Stage the assembled object beside the destination and publish it with
         // a rename, so the destination is only ever the previous object or the
@@ -1045,9 +1093,11 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                 // and deleting them would force the client to re-upload.
                 let _ = writer.cancel().await;
                 let _ = self.fs.delete(&staging, false).await;
-                // A missing part means the upload id or the part list does not
-                // match what was staged; S3 answers 404 NoSuchUpload.
-                return Err(format!("NoSuchUpload: {e}"));
+                // Pass the staging error through unchanged: an ETag mismatch
+                // surfaces here when a part changed between preflight and
+                // assembly and its `InvalidPart:` prefix must reach the mapping
+                // as a 400, while a genuine I/O failure stays a 500.
+                return Err(e);
             }
             part_etags.push(etag.trim_matches('"').to_ascii_lowercase());
         }
@@ -1567,26 +1617,74 @@ mod put_destination_condition_tests {
 
 #[cfg(test)]
 mod part_validation_tests {
-    use super::{same_etag, MIN_PART_BYTES};
+    use super::{
+        reject_reserved_key, same_etag, validate_part_order, validate_staged_parts, PartMeta,
+        MIN_PART_BYTES, STAGING_KEY_PREFIX,
+    };
 
-    /// S3 requires strictly ascending, deduplicated part numbers. Duplicate or
-    /// descending numbers used to be silently accepted because the list was
-    /// sorted before use.
+    fn parts(numbers: &[u32]) -> Vec<(String, u32)> {
+        numbers
+            .iter()
+            .map(|n| (format!("\"etag{n}\""), *n))
+            .collect()
+    }
+
+    fn staged(numbers_and_sizes: &[(u32, usize)]) -> Vec<(u32, PartMeta)> {
+        numbers_and_sizes
+            .iter()
+            .map(|(n, size)| {
+                (
+                    *n,
+                    PartMeta {
+                        etag: format!("etag{n}"),
+                        size: *size,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The production order check, not a test-local copy of it.
     #[test]
     fn part_order_requires_strictly_ascending_numbers() {
-        let ascending = [(0, 1u32), (0, 2), (0, 3)];
-        for window in ascending.windows(2) {
-            assert!(window[1].1 > window[0].1);
-        }
-        let duplicated = [(0, 1u32), (0, 1)];
-        assert!(duplicated.windows(2).any(|w| w[1].1 <= w[0].1));
-        let descending = [(0, 2u32), (0, 1)];
-        assert!(descending.windows(2).any(|w| w[1].1 <= w[0].1));
+        assert!(validate_part_order(&parts(&[1, 2, 3])).is_ok());
+        assert!(validate_part_order(&parts(&[3])).is_ok());
+
+        let duplicate = validate_part_order(&parts(&[1, 1])).unwrap_err();
+        assert!(duplicate.starts_with("InvalidPartOrder:"), "{duplicate}");
+
+        let descending = validate_part_order(&parts(&[2, 1])).unwrap_err();
+        assert!(descending.starts_with("InvalidPartOrder:"), "{descending}");
+
+        let empty = validate_part_order(&parts(&[])).unwrap_err();
+        assert!(empty.starts_with("InvalidPart:"), "{empty}");
+    }
+
+    /// The production size check: an undersized non-final part is refused, the
+    /// final part is exempt, and a missing part is caught here rather than
+    /// during assembly.
+    #[test]
+    fn non_final_parts_must_reach_the_minimum() {
+        let big = MIN_PART_BYTES;
+        let ok = validate_staged_parts(&parts(&[1, 2]), &staged(&[(1, big), (2, 1)]));
+        assert!(ok.is_ok(), "a small final part is allowed: {ok:?}");
+
+        let small_non_final =
+            validate_staged_parts(&parts(&[1, 2]), &staged(&[(1, big - 1), (2, 1)])).unwrap_err();
+        assert!(
+            small_non_final.starts_with("EntityTooSmall:"),
+            "{small_non_final}"
+        );
+
+        // A single part is also the final part, so it is exempt.
+        assert!(validate_staged_parts(&parts(&[1]), &staged(&[(1, 1)])).is_ok());
     }
 
     #[test]
-    fn non_final_parts_must_reach_the_minimum() {
-        assert_eq!(MIN_PART_BYTES, 5 * 1024 * 1024);
+    fn staged_part_etags_must_match_the_request() {
+        let mismatch =
+            validate_staged_parts(&parts(&[1]), &staged(&[(2, MIN_PART_BYTES)])).unwrap_err();
+        assert!(mismatch.starts_with("InvalidPart:"), "{mismatch}");
     }
 
     #[test]
@@ -1594,5 +1692,22 @@ mod part_validation_tests {
         assert!(same_etag("abc123", "\"abc123\""));
         assert!(same_etag("W/\"ABC123\"", "abc123"));
         assert!(!same_etag("abc123", "other"));
+    }
+
+    /// Reserving the prefix is what makes hiding staging objects from listings
+    /// sound: no accepted key can collide with it.
+    #[test]
+    fn the_staging_prefix_is_reserved_on_write_paths() {
+        for key in [
+            ".curvine-s3-report",
+            "folder/.curvine-s3-mp-abc",
+            format!("{STAGING_KEY_PREFIX}staging-1").as_str(),
+        ] {
+            let err = reject_reserved_key(key).unwrap_err();
+            assert!(err.starts_with("InvalidArgument:"), "{key}: {err}");
+        }
+        for key in ["report", "folder/file", "folder/.hidden", ".curvine-s3"] {
+            assert!(reject_reserved_key(key).is_ok(), "{key} must be accepted");
+        }
     }
 }
