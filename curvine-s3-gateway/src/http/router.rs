@@ -368,12 +368,7 @@ impl S3Router {
             Err(e) => {
                 // Map every protocol status the handler may report; a missing
                 // arm silently degraded 412 to 500.
-                let status = match crate::s3::s3_api::status_for_error(&e) {
-                    404 => StatusCode::NOT_FOUND,
-                    409 => StatusCode::CONFLICT,
-                    412 => StatusCode::PRECONDITION_FAILED,
-                    _ => StatusCode::INTERNAL_SERVER_ERROR,
-                };
+                let status = copy_error_status(&e);
                 log::warn!("copy object failed ({status}): {e}");
                 (status, b"".to_vec()).into_response()
             }
@@ -577,5 +572,42 @@ impl S3Router {
         let mut resp = Response::default();
         crate::s3::s3_api::handle_abort_multipart_upload(req, &mut resp, handlers.as_ref()).await;
         resp.into()
+    }
+}
+
+/// HTTP status for a `copy_object` failure.
+///
+/// Delegates to the protocol mapping instead of re-deriving a subset: a local
+/// match answered 500 for every code it did not list, which turned a 400 (a
+/// reserved staging key, for example) into a retryable server error.
+fn copy_error_status(err: &str) -> StatusCode {
+    StatusCode::from_u16(crate::s3::s3_api::status_for_error(err))
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[cfg(test)]
+mod copy_status_tests {
+    use super::copy_error_status;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn copy_errors_use_the_protocol_mapping() {
+        assert_eq!(
+            copy_error_status("NoSuchKey: copy source b/k does not exist"),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            copy_error_status("PreconditionFailed: copy source condition returned 412"),
+            StatusCode::PRECONDITION_FAILED
+        );
+        // A reserved staging destination must reach the client as a 400.
+        assert_eq!(
+            copy_error_status("InvalidArgument: object keys may not contain a segment"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            copy_error_status("Failed to write copy destination: io"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

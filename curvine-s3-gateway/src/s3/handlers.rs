@@ -874,12 +874,18 @@ fn is_staging_name(name: &str) -> bool {
     name.starts_with(STAGING_KEY_PREFIX)
 }
 
-/// Reject keys whose last segment falls inside the reserved staging namespace.
+/// Reject any key with a segment inside the reserved staging namespace.
+///
+/// Every segment is checked, not just the last: creating `a/.curvine-s3-x/b`
+/// also creates the `.curvine-s3-x` directory, and listings of `a` would then
+/// hide that entry. Rejecting it is what keeps the listing filter sound.
 fn reject_reserved_key(key: &str) -> Result<(), String> {
-    let last = key.rsplit('/').next().unwrap_or(key);
-    if last.starts_with(STAGING_KEY_PREFIX) {
+    if key
+        .split('/')
+        .any(|segment| segment.starts_with(STAGING_KEY_PREFIX))
+    {
         return Err(format!(
-            "InvalidArgument: object keys may not start a segment with {STAGING_KEY_PREFIX}, which is reserved for gateway staging"
+            "InvalidArgument: object keys may not contain a segment starting with {STAGING_KEY_PREFIX}, which is reserved for gateway staging"
         ));
     }
     Ok(())
@@ -908,9 +914,8 @@ fn validate_part_order(parts: &[(String, u32)]) -> Result<(), String> {
 /// Check every listed part against the record staged with its bytes.
 ///
 /// One record per part decides existence, ETag match and the non-final
-/// minimum size, so all three read from the same source of truth: the trailer
-/// published atomically with the part. Returns the staged sizes in request
-/// order.
+/// minimum size, so all three read from the same source of truth: the record
+/// published atomically with the part (`PartMeta`).
 fn validate_staged_parts(
     parts: &[(String, u32)],
     staged: &[(u32, PartMeta)],
@@ -1714,11 +1719,22 @@ mod part_validation_tests {
             ".curvine-s3-report",
             "folder/.curvine-s3-mp-abc",
             format!("{STAGING_KEY_PREFIX}staging-1").as_str(),
+            // Only checking the last segment used to accept these, and the
+            // parent directory then vanished from listings.
+            ".curvine-s3-x/file",
+            "folder/.curvine-s3-x/file",
+            "a/.curvine-s3-staging-1/b/c",
         ] {
             let err = reject_reserved_key(key).unwrap_err();
             assert!(err.starts_with("InvalidArgument:"), "{key}: {err}");
         }
-        for key in ["report", "folder/file", "folder/.hidden", ".curvine-s3"] {
+        for key in [
+            "report",
+            "folder/file",
+            "folder/.hidden",
+            ".curvine-s3",
+            "folder/.curvine-s3",
+        ] {
             assert!(reject_reserved_key(key).is_ok(), "{key} must be accepted");
         }
     }

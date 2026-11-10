@@ -20,8 +20,13 @@ use std::future::Future;
 const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 const MIN_BUFFER_SIZE: usize = 64 * 1024;
 
-/// What an uploaded part recorded about itself, stored in a trailer at the end
-/// of the part file.
+/// What an uploaded part recorded about itself, published together with its
+/// bytes.
+///
+/// The local backend stores it as a trailer at the end of the part file; the
+/// Curvine backend stores it in an inode xattr so preflight needs one metadata
+/// call per part. Both are written before the publishing rename, so bytes and
+/// record always come from the same upload generation.
 ///
 /// Bytes and record are one file published by a single atomic rename, so a
 /// concurrent re-upload of the same part can never publish one generation's
@@ -806,24 +811,30 @@ impl CurvineTempStorage {
 
         while remaining > 0 {
             let want = std::cmp::min(buf.len() as u64, remaining) as usize;
-            let n = reader
-                .read(&mut buf[..want])
-                .await
-                .map_err(|e| format!("Failed to read from part file: {}", e))?;
-            if n == 0 {
+            let read = match reader.read(&mut buf[..want]).await {
+                Ok(n) => n,
+                Err(e) => {
+                    // Complete on this path too: EOF alone never sends the
+                    // completion RPC, so dropping the reader would leave a
+                    // worker-side read context open.
+                    let _ = reader.complete().await;
+                    return Err(format!("Failed to read from part file: {}", e));
+                }
+            };
+            if read == 0 {
                 let _ = reader.complete().await;
                 return Err(format!(
                     "InvalidPart: part {} of upload {} was truncated after staging",
                     part_number, upload_id
                 ));
             }
-            remaining -= n as u64;
+            remaining -= read as u64;
 
-            hasher.consume(&buf[..n]);
-            writer
-                .write(&buf[..n])
-                .await
-                .map_err(|e| format!("Failed to write to destination: {}", e))?;
+            hasher.consume(&buf[..read]);
+            if let Err(e) = writer.write(&buf[..read]).await {
+                let _ = reader.complete().await;
+                return Err(format!("Failed to write to destination: {}", e));
+            }
         }
 
         let verified = verify_part_etag(part_number, expected_etag, &hasher.compute());
@@ -997,7 +1008,7 @@ impl TempStorageEnum {
         }
     }
 
-    /// The record an uploaded part left next to itself, in either backend.
+    /// The record published with an uploaded part, in either backend.
     pub async fn part_meta(&self, upload_id: &str, part_number: u32) -> Option<PartMeta> {
         match self {
             TempStorageEnum::Local(s) => s.part_meta(upload_id, part_number).await,
