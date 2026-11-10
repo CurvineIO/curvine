@@ -70,7 +70,11 @@ static INIT_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "jni")]
 const MAX_INIT_ATTEMPTS: u32 = 3;
 
-static JVM_BUILDER: OnceLock<Box<dyn Fn() -> JavaVM + Send + Sync>> = OnceLock::new();
+/// Builds the JVM. Returns an error instead of panicking: release builds use
+/// `panic = "abort"`, where a panic would kill the host process (e.g. a Spark executor).
+type JvmBuilder = Box<dyn Fn() -> Result<JavaVM> + Send + Sync>;
+
+static JVM_BUILDER: OnceLock<JvmBuilder> = OnceLock::new();
 
 pub struct JavaVmWrapper;
 
@@ -82,7 +86,7 @@ impl JavaVmWrapper {
     ///
     /// # Note
     /// If called multiple times, subsequent calls are ignored with a warning
-    pub fn register_jvm(&self, builder: Box<dyn Fn() -> JavaVM + Send + Sync>) {
+    pub fn register_jvm(&self, builder: JvmBuilder) {
         if JVM_BUILDER.set(builder).is_err() {
             warn!("JVM builder already registered, ignoring subsequent registration");
         }
@@ -137,6 +141,17 @@ impl JavaVmWrapper {
             return Ok(jvm);
         }
 
+        // A process can host only one JVM. Inside a JVM process (e.g. the Java SDK loaded
+        // by Spark), JNI_CreateJavaVM fails with "VM already created", so attach to the
+        // running JVM instead of building a new one.
+        if let Some(jvm) = find_created_jvm() {
+            info!("Reusing the JVM already running in this process for HDFS operations");
+            INSTANCE.set(jvm).map_err(|_| {
+                anyhow::anyhow!("Failed to store JVM instance (concurrent initialization conflict)")
+            })?;
+            return Ok(INSTANCE.get().expect("JVM was just initialized"));
+        }
+
         // Increment attempt counter
         let attempt = INIT_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
         info!(
@@ -151,10 +166,16 @@ impl JavaVmWrapper {
 
         // Try to initialize JVM
         info!("Initializing JVM for HDFS operations (thread-safe initialization)");
-        let jvm = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| builder())) {
-            Ok(jvm) => {
+        // catch_unwind only helps in unwind builds; with `panic = "abort"` the builder must
+        // report failures through its Result.
+        let jvm = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(builder)) {
+            Ok(Ok(jvm)) => {
                 info!("JVM initialized successfully on attempt {}", attempt);
                 jvm
+            }
+            Ok(Err(e)) => {
+                error!("JVM initialization failed on attempt {}: {:#}", attempt, e);
+                return Err(e.context(format!("JVM initialization failed on attempt {attempt}")));
             }
             Err(panic_err) => {
                 error!(
@@ -199,6 +220,37 @@ impl JavaVmWrapper {
     pub fn get(&self) -> Option<()> {
         None
     }
+}
+
+/// Returns the JVM already running in this process, if any.
+///
+/// Looks up `JNI_GetCreatedJavaVMs` among the process's global symbols: the `java` launcher
+/// loads libjvm with `RTLD_GLOBAL`, so the symbol is visible in any JVM process, while a
+/// process without a JVM (e.g. a Curvine worker) does not export it. A reused JVM keeps
+/// its own classpath and Hadoop configuration; the builder's settings are not applied.
+#[cfg(all(feature = "jni", unix))]
+fn find_created_jvm() -> Option<JavaVM> {
+    use jni::sys::{jint, jsize, JNI_OK};
+
+    type GetCreatedJavaVms =
+        unsafe extern "system" fn(*mut *mut jni::sys::JavaVM, jsize, *mut jsize) -> jint;
+
+    let this = libloading::os::unix::Library::this();
+    let get_created_vms =
+        unsafe { this.get::<GetCreatedJavaVms>(b"JNI_GetCreatedJavaVMs\0") }.ok()?;
+
+    let mut vm: *mut jni::sys::JavaVM = std::ptr::null_mut();
+    let mut count: jsize = 0;
+    let rc = unsafe { get_created_vms(&mut vm, 1, &mut count) };
+    if rc != JNI_OK || count < 1 || vm.is_null() {
+        return None;
+    }
+    unsafe { JavaVM::from_raw(vm) }.ok()
+}
+
+#[cfg(all(feature = "jni", not(unix)))]
+fn find_created_jvm() -> Option<JavaVM> {
+    None
 }
 
 const DEFAULT_MEMORY_PROPORTION: f64 = 0.1;
@@ -397,7 +449,7 @@ pub fn register_jvm() {
     #[cfg(feature = "jni")]
     {
         JVM.register_jvm(Box::new(|| {
-            build_jvm_for_hdfs().expect("Failed to build JVM for HDFS")
+            build_jvm_for_hdfs().context("Failed to build JVM for HDFS")
         }));
         info!("JVM builder registered for HDFS operations");
     }
