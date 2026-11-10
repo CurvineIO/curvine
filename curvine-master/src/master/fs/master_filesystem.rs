@@ -179,6 +179,7 @@ pub(crate) mod memory_read_gates {
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
     /// Registers a release channel for `point`; returns the release handle.
+    #[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
     pub fn install(point: &str) -> Sender<()> {
         let (sender, receiver) = channel();
         GATES.lock().insert(point.to_string(), receiver);
@@ -996,6 +997,11 @@ impl MasterFilesystem {
                     description: "Rename paths resolved before inode locks",
                 context: {"path" => src},
             }
+            #[cfg(test)]
+            memory_read_gates::park(
+                "master.metadata.rename_planned",
+                std::time::Duration::from_secs(5),
+            );
             let _locks =
                 self.lock_sharded_requests(requests, source_parent == 0 || destination_parent == 0);
 
