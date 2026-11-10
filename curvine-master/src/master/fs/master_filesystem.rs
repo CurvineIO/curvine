@@ -20,7 +20,7 @@ use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
 use crate::master::meta::inode::{
     ChildEdge, InodeDir, InodeEntry, InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR,
-    ROOT_INODE_ID,
+    ROOT_INODE_ID, ROOT_INODE_NAME,
 };
 use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::meta::{
@@ -2770,6 +2770,9 @@ impl MasterFilesystem {
         if components.last().is_none_or(String::is_empty) {
             return err_box!("Path {} is invalid", path);
         }
+        // A failed restore detaches the store; directory targets never touch
+        // file rows, so every memory read re-checks availability up front.
+        fs_dir.store.ensure_available()?;
         let mut ids: Vec<i64> = Vec::with_capacity(components.len());
         let mut children: Vec<(String, ChildEdge)> = Vec::new();
         let mut target_is_dir = false;
@@ -2792,14 +2795,21 @@ impl MasterFilesystem {
                 next = node.and_then(|node| node.children.get_child_edge(&components[index + 1]));
             }
         }
+        let root_target = components.len() == 1 && components[0] == PATH_SEPARATOR;
         Ok(MemoryReadPlan {
             // Root is the read target only when the requested path itself is
             // "/". A failed walk of a deeper request also yields just the
             // root id, and that negative lookup must not re-claim the root
             // read lock.
-            root_target: components.len() == 1 && components[0] == PATH_SEPARATOR,
+            root_target,
             full: ids.len() == components.len(),
-            target_name: components.last().unwrap().clone(),
+            // The root stat keeps the shared ROOT_INODE_NAME: the component
+            // walk spells it "/" but the live tree and store rows do not.
+            target_name: if root_target {
+                ROOT_INODE_NAME.to_string()
+            } else {
+                components.last().unwrap().clone()
+            },
             ids,
             target_is_dir,
             target_edge,
