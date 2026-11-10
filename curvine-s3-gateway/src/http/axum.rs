@@ -31,6 +31,12 @@ impl Request {
     pub fn extensions(&self) -> &axum::http::Extensions {
         self.request.extensions()
     }
+
+    /// Raw, still percent-encoded request path, exactly as sent by the client.
+    /// SigV4/V2 canonical requests must sign this value, not the decoded one.
+    fn encoded_path(&self) -> &str {
+        self.request.uri().path()
+    }
 }
 
 impl From<Request> for axum::extract::Request {
@@ -565,7 +571,7 @@ pub async fn handle_authorization_middleware(
                     &v2_args,
                     &secretkey,
                     req.method().as_str(),
-                    req.request.uri().path(),
+                    req.encoded_path(),
                     &query_params,
                     &req,
                 ) {
@@ -644,7 +650,7 @@ pub async fn handle_authorization_middleware(
         &base_arg.region,
         &base_arg.service,
         // SigV4 canonical URI must use the encoded path as sent by the client
-        req.request.uri().path(),
+        req.encoded_path(),
         &secretkey,
         &base_arg.content_hash,
         &base_arg.signed_headers,
@@ -810,12 +816,10 @@ mod tests {
     }
 
     #[test]
-    fn raw_uri_path_stays_encoded_for_signing() {
-        // SigV4/V2 canonical URI must use the path exactly as the client sent it
+    fn encoded_path_stays_encoded_for_signing() {
+        // `encoded_path()` is what both SigV4 and V2 signing call sites use;
+        // it must return the path exactly as the client sent it, unlike `url_path()`.
         let req = build("/warehouse/dt%3D2026-11-01/f.parquet");
-        assert_eq!(
-            req.request.uri().path(),
-            "/warehouse/dt%3D2026-11-01/f.parquet"
-        );
+        assert_eq!(req.encoded_path(), "/warehouse/dt%3D2026-11-01/f.parquet");
     }
 }
