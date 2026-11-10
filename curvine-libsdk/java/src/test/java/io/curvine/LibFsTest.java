@@ -102,6 +102,22 @@ public class LibFsTest {
     }
 
     @Test
+    public void macLibraryNamesPreferBundledDylib() {
+        Assert.assertArrayEquals(new String[] {"libcurvine_libsdk_mac_aarch_64.dylib", "libcurvine_libsdk.dylib"},
+                CurvineNativeLibraryResolver.getLibraryNames("mac os x", null, "aarch"));
+        Assert.assertArrayEquals(new String[] {"libcurvine_libsdk_mac_x86_64.dylib", "libcurvine_libsdk.dylib"},
+                CurvineNativeLibraryResolver.getLibraryNames("mac os x", null, "x86"));
+    }
+
+    @Test
+    public void loadLibraryLookupNameStripsLibPrefix() {
+        Assert.assertEquals("curvine_libsdk", CurvineNativeLibraryResolver.loadLibraryLookupName("libcurvine_libsdk.dylib"));
+        Assert.assertEquals("curvine_libsdk_linux_x86_64",
+                CurvineNativeLibraryResolver.loadLibraryLookupName("libcurvine_libsdk_linux_x86_64.so"));
+        Assert.assertEquals("curvine_libsdk", CurvineNativeLibraryResolver.loadLibraryLookupName("curvine_libsdk.dll"));
+    }
+
+    @Test
     public void linuxLibraryNamesFallBackToGenericLinux() {
         List<String> x86 = Arrays.asList(CurvineNativeLibraryResolver.getLibraryNames("linux", "ubuntu20", "x86"));
         Assert.assertEquals("libcurvine_libsdk_ubuntu20_x86_64.so", x86.get(0));
