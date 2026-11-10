@@ -2516,7 +2516,7 @@ impl FsDir {
     /// The returned locations belong to the discarded cache copies and should
     /// be scheduled for deletion from any surviving workers.
     pub(crate) fn invalidate_lost_cache_files(
-        &mut self,
+        &self,
         block_ids: &[i64],
     ) -> FsResult<CacheInvalidationResult> {
         let inode_ids: HashSet<_> = block_ids.iter().map(|id| InodeId::get_id(*id)).collect();
