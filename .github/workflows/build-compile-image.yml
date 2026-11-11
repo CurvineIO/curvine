@@ -21,7 +21,7 @@ on:
 
 permissions:
   contents: read
-  packages: write
+  packages: read
 
 jobs:
   prepare:
@@ -122,6 +122,9 @@ jobs:
   # Build for each selected build type and architecture on native runners
   build-image:
     needs: prepare
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -170,6 +173,9 @@ jobs:
     needs: [prepare, build-image]
     runs-on: ubuntu-latest
     if: inputs.push_image == true
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include: ${{ fromJSON(needs.prepare.outputs.manifest_matrix) }}

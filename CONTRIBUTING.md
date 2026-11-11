@@ -97,6 +97,16 @@ cargo bench
 - Update documentation as needed
 - Ensure all CI checks pass
 
+### Dependency Policy
+
+Curvine is a Cargo workspace with smaller Go (`curvine-csi`), Java (`curvine-libsdk/java`), npm (`curvine-web/webui`), and Python components. Dependencies follow these rules:
+
+- **Adding a dependency:** prefer the standard library or a crate already in the workspace. A new dependency must be actively maintained, use a license compatible with Apache-2.0, and be explained in the PR description. Declare shared Rust crates once under `[workspace.dependencies]` in the root `Cargo.toml`.
+- **Lockfiles:** `Cargo.lock`, `go.sum`, and `package-lock.json` are committed. Changes to them are reviewed like code.
+- **Updates:** [Dependabot](.github/dependabot.yml) opens weekly, grouped update PRs for Cargo, Go modules, Maven, npm, and GitHub Actions. Maintainers review and merge them after CI passes. Major version bumps are reviewed individually.
+- **Security fixes:** dependencies with known vulnerabilities are updated as soon as a fixed version is available. Report vulnerabilities in Curvine itself as described in [SECURITY.md](SECURITY.md).
+- **GitHub Actions:** workflows request the minimum token permissions they need, and write permissions are granted per job.
+
 ## AI-Assisted Contribution Workflow
 
 Curvine keeps a set of versioned AI agent skills under [`.agents/skills/`](.agents/skills/), all prefixed with `cv-`. They encode the project's issue, implementation, pull request, and review conventions so an AI coding agent can perform the routine steps consistently. Using them is optional, but they are the canonical checklists for the workflows described above, even if you contribute manually.

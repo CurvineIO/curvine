@@ -30,7 +30,7 @@ on:
 
 permissions:
   contents: read
-  packages: write
+  packages: read
 
 jobs:
   # Prepare metadata shared across all jobs
@@ -90,6 +90,9 @@ jobs:
   # Build for each architecture on native runners
   build-arch:
     needs: prepare
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include:
@@ -149,6 +152,9 @@ jobs:
     needs: [prepare, build-arch]
     runs-on: ubuntu-latest
     if: needs.prepare.outputs.push_image == 'true'
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
