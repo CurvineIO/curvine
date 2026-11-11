@@ -19,8 +19,8 @@ use crate::fs::state::{DirTreeLock, DirTreeReadGuard, DirTreeWriteGuard};
 use crate::fs::{FuseReader, FuseWriter};
 use crate::fuse_metrics::{
     StateStageTimer, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT, CACHE_STATUS,
-    STATE_KIND_DIR_HANDLES, STATE_KIND_FILE_HANDLES, STATE_KIND_NODE_MAP, STATE_STAGE_DIR_HANDLES,
-    STATE_STAGE_FILE_HANDLES, STATE_STAGE_NODE_MAP,
+    INVAL_REASON_RMDIR, STATE_KIND_DIR_HANDLES, STATE_KIND_FILE_HANDLES, STATE_KIND_NODE_MAP,
+    STATE_STAGE_DIR_HANDLES, STATE_STAGE_FILE_HANDLES, STATE_STAGE_NODE_MAP,
 };
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
@@ -45,9 +45,15 @@ use log::{debug, error, info, warn};
 use std::borrow::Cow;
 use std::sync::Arc;
 
+#[derive(Clone, Copy)]
+struct ProbeSnapshot {
+    child: Option<u64>,
+    nlink: Option<u32>,
+}
+
 enum StatProbe {
     Hit(FileStatus),
-    Miss(Path),
+    Miss { path: Path, snapshot: ProbeSnapshot },
 }
 
 /// Outcome of one `NodeState::clear` sweep over the dcache.
@@ -886,6 +892,57 @@ impl NodeState {
         Ok(())
     }
 
+    pub async fn fs_rmdir(&self, parent: u64, name: &str) -> FuseResult<()> {
+        let path = {
+            let dir = self.dir_read();
+            dir.get_path_name(parent, name)?
+        };
+        let _guard = self.lock_path(&path).await;
+
+        let ino = {
+            let dir = self.dir_read();
+            dir.get_inode(parent, Some(name)).map(|inode| inode.ino)
+        };
+
+        let Some(ino) = ino else {
+            return match self.delete_path(&path, false).await {
+                Ok(_) | Err(FsError::FileNotFound(_)) => {
+                    self.invalid_cache(parent, None, INVAL_REASON_RMDIR);
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
+            };
+        };
+
+        let rollback = {
+            let mut dir = self.dir_write();
+            let (_last_link, rollback) = dir.unlink(parent, name, true)?;
+            rollback
+        };
+
+        match self.delete_path(&path, false).await {
+            Ok(_) | Err(FsError::FileNotFound(_)) => (),
+            Err(e) => {
+                if let Err(err) = self.restore_unlink_state(rollback) {
+                    warn!("fs_rmdir ino={} rollback failed: {}", ino, err);
+                }
+                return Err(e.into());
+            }
+        }
+
+        self.clear_unlink_state(ino, parent, name)?;
+        let removed = {
+            let mut dir = self.dir_write();
+            !self.has_open_handles(ino) && dir.reclaim_unreferenced(ino, parent, name)
+        };
+        if removed {
+            FuseMetrics::with(|m| Self::dec_gauges_lockstep(&m.inode_num, &m.inode_count));
+        }
+        self.invalid_cache(parent, None, INVAL_REASON_RMDIR);
+
+        Ok(())
+    }
+
     pub async fn deferred_delete_ready(&self, ino: u64) -> FuseResult<bool> {
         // Early exit if there are open handles or no pending delete.
         if self.has_open_handles(ino) || !self.dir_read().pending_delete(ino) {
@@ -1150,7 +1207,7 @@ impl NodeState {
 
     /// Resolve unlinked status, cached status, or the backend path under one read guard.
     fn probe_status(&self, ino: u64, name: Option<&str>) -> FuseResult<StatProbe> {
-        let cached = {
+        let (cached, snapshot) = {
             let dir = self.dir_read();
             // An unlinked inode can remain addressable by nodeid until the kernel
             // releases its lookup/open references. Its former path no longer exists.
@@ -1167,7 +1224,12 @@ impl NodeState {
             } else {
                 None
             };
-            cached.ok_or_else(|| dir.get_path_common(ino, name))
+            let child = dir.get_ino(ino, name);
+            let nlink = dir.get_inode(ino, name).map(|inode| inode.nlink);
+            (
+                cached.ok_or_else(|| dir.get_path_common(ino, name)),
+                ProbeSnapshot { child, nlink },
+            )
         };
 
         if self.enable_meta_cache {
@@ -1179,18 +1241,21 @@ impl NodeState {
         }
         match cached {
             Ok(status) => Ok(StatProbe::Hit(status)),
-            Err(path) => Ok(StatProbe::Miss(path?)),
+            Err(path) => Ok(StatProbe::Miss {
+                path: path?,
+                snapshot,
+            }),
         }
     }
 
     pub async fn fs_stat(&self, ino: u64, name: Option<&str>) -> FuseResult<FileStatus> {
-        let path = match self.probe_status(ino, name)? {
+        let (path, snapshot) = match self.probe_status(ino, name)? {
             StatProbe::Hit(status) => return Ok(status),
-            StatProbe::Miss(path) => path,
+            StatProbe::Miss { path, snapshot } => (path, snapshot),
         };
         let status = self.fs.get_status(&path).await?;
 
-        self.cache_resolved_status(ino, name, &status);
+        self.cache_resolved_status(ino, name, &status, snapshot);
 
         Ok(status)
     }
@@ -1203,61 +1268,65 @@ impl NodeState {
     }
 
     pub async fn fs_stat_guarded(&self, ino: u64) -> FuseResult<FileStatus> {
-        let path = match self.probe_status(ino, None)? {
+        let (path, snapshot) = match self.probe_status(ino, None)? {
             StatProbe::Hit(status) => return Ok(status),
-            StatProbe::Miss(path) => path,
+            StatProbe::Miss { path, snapshot } => (path, snapshot),
         };
-        // The path lock keeps the daemon-side metadata cache coherent across
-        // concurrent resolutions of the same path. With the cache disabled
-        // only the root inode's status is refreshed (see
-        // cache_resolved_status), which does not take this lock; holding the
-        // lock across the RPC only serializes this backend RPC behind other
-        // stats of the same path - notably the mount root, which the kernel
-        // revalidates on every traversal when attr_timeout is 0. Skip it in
-        // that mode instead of capping every stat behind one ~RTT-long
-        // critical section.
-        if self.enable_meta_cache {
-            let _guard = self.lock_path(&path).await;
-            if let Some(status) = self.unlinked_status(ino) {
-                return Ok(status);
-            }
-            let status = self.fs.get_status(&path).await?;
-            self.cache_resolved_status(ino, None, &status);
-            return Ok(status);
-        }
-
         if let Some(status) = self.unlinked_status(ino) {
             return Ok(status);
         }
         let status = match self.fs.get_status(&path).await {
             Ok(status) => status,
             Err(e) => {
-                // An unlink may commit while this RPC is in flight (no lock
-                // serializes it in this mode). The tombstone resolver answers
-                // that case without taking the path lock; the success path
-                // pays nothing.
                 if let Some(status) = self.unlinked_status(ino) {
                     return Ok(status);
                 }
                 return Err(e.into());
             }
         };
+        if let Some(status) = self.unlinked_status(ino) {
+            return Ok(status);
+        }
         // No-op for non-root inodes; the root refresh is required because
         // fs_lookup serves `.`/`..` to the root inode without a cache gate.
-        self.cache_resolved_status(ino, None, &status);
+        self.cache_resolved_status(ino, None, &status, snapshot);
         Ok(status)
     }
 
-    fn cache_resolved_status(&self, ino: u64, name: Option<&str>, status: &FileStatus) {
+    fn cache_resolved_status(
+        &self,
+        ino: u64,
+        name: Option<&str>,
+        status: &FileStatus,
+        snapshot: ProbeSnapshot,
+    ) {
         // The root inode starts as synthetic metadata with mode 0. Cache its first
         // real backend status even when the general metadata cache is disabled so
         // every path traversal does not issue another root get_status RPC.
         let cache_root = ino == FUSE_ROOT_ID && name.is_none();
-        if self.enable_meta_cache || cache_root {
-            let _ = self.update_status(ino, name, status);
-            if self.enable_meta_cache {
-                self.record_status_cache(CACHE_RESULT_PUT);
+        if !(self.enable_meta_cache || cache_root) {
+            return;
+        }
+
+        {
+            let mut dir = self.dir_write();
+            if dir.get_ino(ino, name) != snapshot.child {
+                return;
             }
+            let Some(inode) = dir.get_inode_mut(ino, name) else {
+                return;
+            };
+            if inode.mark_delete
+                || inode.is_unlinked()
+                || snapshot.nlink.is_some_and(|nlink| nlink != inode.nlink)
+            {
+                return;
+            }
+            inode.update_status(status.clone());
+        }
+
+        if self.enable_meta_cache {
+            self.record_status_cache(CACHE_RESULT_PUT);
         }
     }
 
@@ -1628,6 +1697,7 @@ impl NodeState {
 #[cfg(test)]
 mod test {
     use crate::fs::state::file_handle::FileHandle;
+    use crate::fs::state::node_state::ProbeSnapshot;
     use crate::fs::state::{DirHandle, NodeState};
     #[cfg(target_os = "linux")]
     use crate::fs::FuseWriter;
@@ -1850,6 +1920,10 @@ mod test {
                 mode: 0o755,
                 ..Default::default()
             },
+            ProbeSnapshot {
+                child: Some(FUSE_ROOT_ID),
+                nlink: None,
+            },
         );
 
         let dir = state.dir_read();
@@ -1948,6 +2022,10 @@ mod test {
                 mode: 0o755,
                 ..Default::default()
             },
+            ProbeSnapshot {
+                child: Some(FUSE_ROOT_ID),
+                nlink: None,
+            },
         );
         assert_eq!(
             state
@@ -1965,6 +2043,9 @@ mod test {
             .is_none());
     }
 
+    /// An unlink that commits while the backend read is in flight must resolve
+    /// to the dcache tombstone, never to a backend error: the unlinked inode is
+    /// answered from the dcache alone.
     #[test]
     fn guarded_fs_stat_observes_concurrent_directory_unlink() {
         let rt = Arc::new(AsyncRuntime::single());
@@ -1972,6 +2053,13 @@ mod test {
             let mut conf = ClusterConf::default();
             conf.fuse.enable_meta_cache = Some(true);
             conf.fuse.metrics_enabled = false;
+            // Hermetic backend: an unlinked inode must never need it, so any
+            // get_status here fails fast against a closed port.
+            conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 1)];
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
             let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
             let state = Arc::new(NodeState::new(fs).unwrap());
 
@@ -1985,8 +2073,6 @@ mod test {
                 ino
             };
 
-            let path = state.get_path(ino).unwrap();
-            let guard = state.lock_path(&path).await;
             let task_state = state.clone();
             let stat_task = tokio::spawn(async move { task_state.fs_stat_guarded(ino).await });
             tokio::task::yield_now().await;
@@ -1995,9 +2081,12 @@ mod test {
                 .dir_write()
                 .unlink(FUSE_ROOT_ID, "gone", false)
                 .unwrap();
-            drop(guard);
 
-            let status = stat_task.await.unwrap().unwrap();
+            let status = tokio::time::timeout(std::time::Duration::from_secs(2), stat_task)
+                .await
+                .expect("an unlinked inode must be answered without waiting on the backend")
+                .expect("fs_stat_guarded panicked")
+                .expect("an unlinked inode must fall back to the dcache status");
             assert!(status.is_dir);
             assert_eq!(status.mode, 0o755);
             assert_eq!(status.nlink, 1);
@@ -2008,6 +2097,228 @@ mod test {
                     .unwrap()
                     .n_lookup(),
                 1
+            );
+        });
+    }
+
+    /// A backend status read before an unlink committed must not overwrite the
+    /// dcache's deletion bookkeeping when the resolution is cached afterwards.
+    #[test]
+    fn resolved_status_is_not_cached_for_unlinked_inode() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(true);
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let ino = {
+            let mut dir = state.dir_write();
+            let mut status = FileStatus::with_name(44, "gone".to_string(), true);
+            status.mode = 0o755;
+            status.nlink = 2;
+            dir.lookup(FUSE_ROOT_ID, "gone", status, true).unwrap().ino
+        };
+        state
+            .dir_write()
+            .unlink(FUSE_ROOT_ID, "gone", false)
+            .unwrap();
+        state.invalid_cache(ino, None, crate::fuse_metrics::INVAL_REASON_RMDIR);
+
+        state.cache_resolved_status(
+            ino,
+            None,
+            &FileStatus {
+                is_dir: true,
+                nlink: 2,
+                mode: 0o755,
+                ..Default::default()
+            },
+            ProbeSnapshot {
+                child: Some(ino),
+                nlink: Some(2),
+            },
+        );
+
+        let dir = state.dir_read();
+        let inode = dir.get_inode_check(ino, None).unwrap();
+        assert_eq!(inode.nlink, 1, "pre-unlink nlink must not be restored");
+        assert_eq!(
+            inode.lifecycle,
+            crate::fs::dcache::Lifecycle::Invalid,
+            "a backend write-back must not revert the invalidation"
+        );
+    }
+
+    /// A link count that moved while the backend read was in flight is the same
+    /// deletion bookkeeping as an unlink, even when the dcache entry is still
+    /// referenced and therefore not flagged as unlinked yet.
+    #[test]
+    fn changed_nlink_rejects_stale_write_back() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(true);
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let ino = {
+            let mut dir = state.dir_write();
+            let mut status = FileStatus::with_name(46, "shared".to_string(), false);
+            status.mode = 0o644;
+            status.nlink = 2;
+            let ino = dir
+                .lookup(FUSE_ROOT_ID, "shared", status, true)
+                .unwrap()
+                .ino;
+            // One link was dropped while the kernel still holds a reference, so
+            // neither `mark_delete` nor `is_unlinked` is set.
+            dir.get_inode_mut_check(ino, None).unwrap().sub_link(1);
+            ino
+        };
+
+        // A status that agrees with the current bookkeeping but was read before
+        // an unlink still loses to the probe snapshot.
+        state.cache_resolved_status(
+            ino,
+            None,
+            &FileStatus {
+                nlink: 1,
+                mode: 0o600,
+                ..Default::default()
+            },
+            ProbeSnapshot {
+                child: Some(ino),
+                nlink: Some(2),
+            },
+        );
+        let dir = state.dir_read();
+        let inode = dir.get_inode_check(ino, None).unwrap();
+        assert_eq!(
+            inode.nlink, 1,
+            "a link count that moved after the probe is stale"
+        );
+        assert_eq!(inode.mode, 0o644, "the whole status must be rejected");
+        drop(dir);
+
+        state.cache_resolved_status(
+            ino,
+            None,
+            &FileStatus {
+                nlink: 2,
+                mode: 0o600,
+                ..Default::default()
+            },
+            ProbeSnapshot {
+                child: Some(ino),
+                nlink: Some(1),
+            },
+        );
+        let dir = state.dir_read();
+        let inode = dir.get_inode_check(ino, None).unwrap();
+        assert_eq!(inode.nlink, 2, "the backend count is authoritative");
+        assert_eq!(inode.mode, 0o600, "the refreshed status must be cached");
+    }
+
+    #[test]
+    fn stale_write_back_skips_recreated_name() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(true);
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let probed = {
+            let mut dir = state.dir_write();
+            let mut status = FileStatus::with_name(52, "swap".to_string(), false);
+            status.mode = 0o644;
+            status.nlink = 1;
+            dir.lookup(FUSE_ROOT_ID, "swap", status, true).unwrap().ino
+        };
+        let snapshot = ProbeSnapshot {
+            child: Some(probed),
+            nlink: Some(1),
+        };
+
+        let replacement = {
+            let mut dir = state.dir_write();
+            dir.unlink(FUSE_ROOT_ID, "swap", true).unwrap();
+            let mut status = FileStatus::with_name(53, "swap".to_string(), true);
+            status.mode = 0o755;
+            status.nlink = 1;
+            dir.lookup(FUSE_ROOT_ID, "swap", status, true).unwrap().ino
+        };
+        assert_ne!(probed, replacement);
+
+        state.cache_resolved_status(
+            FUSE_ROOT_ID,
+            Some("swap"),
+            &FileStatus {
+                nlink: 1,
+                mode: 0o600,
+                ..Default::default()
+            },
+            snapshot,
+        );
+
+        let dir = state.dir_read();
+        let inode = dir.get_inode_check(replacement, None).unwrap();
+        assert_eq!(inode.mode, 0o755, "the replacement keeps its own mode");
+        assert!(
+            inode.is_dir,
+            "a file status must not convert the replacement"
+        );
+        assert!(
+            inode.dir.is_some(),
+            "the replacement directory must keep its children map"
+        );
+    }
+
+    /// `rm_dir` drops the dcache entry before the master delete, so a failed
+    /// delete must put the dentry back instead of leaving a phantom removal.
+    #[test]
+    fn failed_rmdir_restores_dcache_entry() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.metrics_enabled = false;
+            conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 1)];
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let ino = {
+                let mut dir = state.dir_write();
+                let mut status = FileStatus::with_name(48, "victim".to_string(), true);
+                status.mode = 0o755;
+                status.nlink = 1;
+                dir.lookup(FUSE_ROOT_ID, "victim", status, true)
+                    .unwrap()
+                    .ino
+            };
+
+            assert!(
+                state.fs_rmdir(FUSE_ROOT_ID, "victim").await.is_err(),
+                "a dead backend must fail the rmdir"
+            );
+
+            let dir = state.dir_read();
+            let inode = dir.get_inode_check(ino, None).unwrap();
+            assert!(!inode.mark_delete, "the delete mark must be rolled back");
+            assert_eq!(inode.nlink, 1, "the link count must be rolled back");
+            assert_eq!(
+                dir.get_inode(FUSE_ROOT_ID, Some("victim")).map(|i| i.ino),
+                Some(ino),
+                "the dentry must be restored"
+            );
+            assert!(
+                dir.check_deleted_child(FUSE_ROOT_ID, Some("victim"))
+                    .is_ok(),
+                "the deleted-child marker must be cleared"
             );
         });
     }
