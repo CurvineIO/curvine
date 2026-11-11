@@ -10,7 +10,7 @@
   "dependencies": {
     "axios": "^1.21.0",
     "bootstrap": "^4.3.1",
-    "bootswatch": "^4.3.1",
+    "bootswatch": "^5.3.8",
     "core-js": "^3.51.0",
     "mitt": "^3.0.1",
     "vue": "^3.5.45",
