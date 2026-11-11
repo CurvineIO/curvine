@@ -20,6 +20,10 @@ We maintain a list of good first issues in GitHub here. Look for issues labeled 
 - `bug` - Bug reports that need fixing
 - `enhancement` - Feature requests and improvements
 
+### Claiming an issue
+
+To work on an issue, comment `/assign` on it. A bot assigns the issue to you if it is open and nobody else is assigned. If you can no longer work on it, comment `/unassign` so others can pick it up. The comment must contain only the command.
+
 ## Reporting issues
 
 We use GitHub issues for bug reports and feature requests. When reporting an issue, please include:
@@ -89,6 +93,23 @@ cargo bench
 - Provide clear, descriptive commit messages
 - Reference issue numbers when applicable
 - [Commit convention](https://github.com/CurvineIO/curvine/blob/main/COMMIT_CONVENTION.md)
+
+### Sign Your Commits
+
+Curvine uses the [Developer Certificate of Origin](DCO) (DCO). Every commit must carry a `Signed-off-by:` line whose email matches the commit author, which certifies that you wrote the change or have the right to submit it under the project license.
+
+Add the line with `git commit -s`:
+
+```bash
+git commit -s -m "fix(client): handle empty paths (#123)"
+```
+
+The `DCO` check on each pull request fails if a commit is not signed off. To sign off commits already on your branch:
+
+```bash
+git rebase --signoff origin/main
+git push --force-with-lease
+```
 
 ### Pull Request Guidelines
 - Create feature branches from `main`
