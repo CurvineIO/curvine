@@ -52,7 +52,9 @@ pub(crate) struct PendingAbort {
     pub(crate) block: ExtendedBlock,
     /// Retry with abort_block_uncertain() instead of abort_block().
     pub(crate) uncertain: bool,
-    /// The original failure, re-returned with the same kind and message on every retry.
+    /// The original failure, re-returned on every retry. Only `IO` keeps its kind;
+    /// every other kind is answered as `Common` with the same message.
+    /// TODO: store the error wire-encoded (`ErrorExt::encode`/`decode`) to preserve every kind.
     pub(crate) kind: ErrorKind,
     pub(crate) error: String,
 }
