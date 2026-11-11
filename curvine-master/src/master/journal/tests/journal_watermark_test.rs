@@ -2,15 +2,16 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+
+use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT; // You may obtain a copy of the License at
+                                                              //
+                                                              //     http://www.apache.org/licenses/LICENSE-2.0
+                                                              //
+                                                              // Unless required by applicable law or agreed to in writing, software
+                                                              // distributed under the License is distributed on an "AS IS" BASIS,
+                                                              // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+                                                              // See the License for the specific language governing permissions and
+                                                              // limitations under the License.
 
 use crate::master::journal::{
     CacheInvalidationEntry, JournalBatch, JournalEntry, JournalSystem, UfsAppliedEntry,
@@ -79,7 +80,7 @@ fn deferred_ufs_operations_reject_failed_restore() {
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
     let loader = journal.journal_loader();
-    let checkpoint = fs.fs_dir.read().create_checkpoint(1).unwrap();
+    let checkpoint = fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
     let faults = FaultRuntime::process();
     let rule = FaultRuleBuilder::named("master.metadata.restore.after_store_detach")
         .matches("data_dir", conf.db_conf().data_dir.as_str())
@@ -89,7 +90,11 @@ fn deferred_ufs_operations_reject_failed_restore() {
         .return_error("injected restore failure")
         .unwrap();
     faults.configure("deferred-restore-failure", rule).unwrap();
-    let result = fs.fs_dir.write().restore(&checkpoint, 0);
+    let result = fs
+        .fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .restore(&checkpoint, 0);
     faults.remove("deferred-restore-failure").unwrap();
     assert!(result.is_err());
     assert!(loader.deferred_ufs_records().is_err());
@@ -128,7 +133,7 @@ fn cursor_flush_cannot_hide_a_committed_inode_after_restart() {
         let fs = journal.fs();
         fs.mkdir("/committed", false).unwrap();
         let mut batch = JournalBatch::new(1);
-        for item in fs.fs_dir.read().take_entries() {
+        for item in fs.fs_dir.view().unwrap().take_entries() {
             batch.push(item);
         }
         assert!(batch.len() > 0);
@@ -155,7 +160,7 @@ fn cursor_flush_cannot_hide_a_committed_inode_after_restart() {
                 }),
             ))
             .unwrap();
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         let db = dir.store_ref().store().db.db();
         let cf = db
             .cf_handle(crate::master::meta::store::RocksInodeStore::CF_COMMON)
@@ -276,7 +281,8 @@ fn leader_duplicate_entry_does_not_rewind_metadata_cursor_when_ufs_lags() {
     let bytes = journal
         .fs()
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .load_journal_applied()
         .unwrap()
         .unwrap();
@@ -328,7 +334,8 @@ fn stale_concurrent_cursor_commit_fences_without_rewinding() {
     let bytes = journal
         .fs()
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .load_journal_applied()
         .unwrap()
         .unwrap();
@@ -490,7 +497,8 @@ fn duplicate_proposal_req_id_skips_metadata_replay() {
     let applied_req = journal
         .fs()
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store
         .store
         .get_applied_req(7777)

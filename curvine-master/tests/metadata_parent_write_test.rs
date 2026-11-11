@@ -14,6 +14,7 @@
 
 use curvine_config::ClusterConf;
 use curvine_master::master::journal::JournalSystem;
+use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use curvine_master::master::meta::inode::InodePath;
 use curvine_master::Master;
 use curvine_model::SetAttrOpts;
@@ -61,8 +62,9 @@ fn unchanged_parent_preserves_persisted_child_count() {
     fs.create("/parent/b", false).unwrap();
     fs.delete("/parent/a", false).unwrap();
     let attributes = fs
-        .fs_dir()
-        .read()
+        .fs_dir
+        .view()
+        .unwrap()
         .store_ref()
         .store()
         .get_directory_attributes(parent.id)
@@ -95,8 +97,8 @@ fn unchanged_legacy_parent_initializes_attributes_from_inode() {
     )
     .unwrap();
     {
-        let shared = fs.fs_dir();
-        let guard = shared.write();
+        let shared = fs.fs_dir.clone();
+        let guard = shared.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         // Simulate a legacy directory: the dir-attrs row is gone, and the
         // live node's persisted flag must be invalidated so the next delta
         // re-carries its base and rebuilds the record.
@@ -179,8 +181,9 @@ fn unchanged_parent_metadata_survives_tree_restore() {
     assert_eq!(by_id.mtime, mtime);
     assert_eq!(by_id.children_num, 1);
     let inode = fs
-        .fs_dir()
-        .read()
+        .fs_dir
+        .view()
+        .unwrap()
         .store_ref()
         .store()
         .get_inode(parent.id)
@@ -223,8 +226,9 @@ fn unchanged_parent_metadata_survives_tree_restore() {
 
     fs.mkdir("/parent/dir", false).unwrap();
     let nlink_with_dir = fs
-        .fs_dir()
-        .read()
+        .fs_dir
+        .view()
+        .unwrap()
         .store_ref()
         .store()
         .get_inode(parent.id)
@@ -234,8 +238,9 @@ fn unchanged_parent_metadata_survives_tree_restore() {
         .unwrap();
     fs.delete("/parent/dir", false).unwrap();
     let nlink_after = fs
-        .fs_dir()
-        .read()
+        .fs_dir
+        .view()
+        .unwrap()
         .store_ref()
         .store()
         .get_inode(parent.id)

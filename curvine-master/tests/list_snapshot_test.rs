@@ -15,6 +15,7 @@
 use curvine_config::ClusterConf;
 use curvine_master::master::fs::DeleteMode;
 use curvine_master::master::journal::JournalSystem;
+use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use curvine_master::Master;
 use curvine_model::{ListOptions, RenameFlags};
 use curvine_runtime::common::Utils;
@@ -142,7 +143,7 @@ fn listing_matches_live_status_fields() {
 
     for path in ["/", "/parent", "/parent/dir", "/parent/file"] {
         let expected_status = {
-            let dir = fs.fs_dir.write();
+            let dir = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
             let inp = curvine_master::master::meta::inode::InodePath::resolve(
                 dir.root_node(),
                 path,
@@ -158,7 +159,7 @@ fn listing_matches_live_status_fields() {
         );
         for opts in [ListOptions::default(), ListOptions::with_limit(1)] {
             let expected = {
-                let dir = fs.fs_dir.write();
+                let dir = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
                 let inp = curvine_master::master::meta::inode::InodePath::resolve(
                     dir.root_node(),
                     path,
@@ -193,7 +194,7 @@ fn paginated_listing_uses_shared_lock_and_preserves_cursors() {
         limit: Some(2),
         start_after: Some("a".into()),
     };
-    let guard = fs.fs_dir.read();
+    let guard = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (tx, rx) = mpsc::channel();
     let worker =
@@ -248,7 +249,7 @@ fn paginated_listing_uses_shared_lock_and_preserves_cursors() {
                 start_after: cursor.map(str::to_owned),
             };
             let expected = {
-                let dir = fs.fs_dir.write();
+                let dir = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
                 let inp = curvine_master::master::meta::inode::InodePath::resolve(
                     dir.root_node(),
                     "/dir",
@@ -342,7 +343,7 @@ fn listing_uses_owned_snapshot_with_shared_namespace_guard() {
     fs.mkdir("/dir/sub", false).unwrap();
     fs.create("/dir/sub/child", false).unwrap();
     let dir_id = fs.file_status("/dir").unwrap().id;
-    let lease = fs.fs_dir.read().begin_snapshot_scan().unwrap();
+    let lease = fs.fs_dir.view().unwrap().begin_snapshot_scan().unwrap();
     let snapshot = lease.snapshot_reader().unwrap();
     fs.rename("/dir/file", "/dir/moved", RenameFlags::empty())
         .unwrap();
@@ -358,7 +359,7 @@ fn listing_uses_owned_snapshot_with_shared_namespace_guard() {
         .map(|child| child.name().to_string())
         .collect();
     assert_eq!(old, ["alias", "file", "sub"]);
-    let guard = fs.fs_dir.read();
+    let guard = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (tx, rx) = mpsc::channel();
     let worker = std::thread::spawn(move || tx.send(worker_fs.list_status("/dir")).unwrap());
@@ -378,7 +379,7 @@ fn listing_uses_owned_snapshot_with_shared_namespace_guard() {
     assert!(fs.list_status("/dir/missing").is_err());
     assert_eq!(fs.list_status("/dir/moved").unwrap()[0].name, "moved");
     {
-        let dir = fs.fs_dir.write();
+        let dir = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let mut batch = dir.store_ref().new_batch();
         batch.add_child(dir_id, "00-dangling", i64::MAX).unwrap();
         batch.commit().unwrap();

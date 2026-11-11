@@ -37,11 +37,11 @@ fn delayed_duplicate_delete_does_not_remove_recreated_path() {
     let target = JournalSystem::from_conf(&target_conf).unwrap();
     let fs = source.fs();
     fs.mkdir("/duplicate", false).unwrap();
-    let mkdir = fs.fs_dir.read().take_entries();
+    let mkdir = fs.fs_dir.view().unwrap().take_entries();
     fs.delete("/duplicate", false).unwrap();
-    let delete = fs.fs_dir.read().take_entries();
+    let delete = fs.fs_dir.view().unwrap().take_entries();
     fs.mkdir("/duplicate", false).unwrap();
-    let recreate = fs.fs_dir.read().take_entries();
+    let recreate = fs.fs_dir.view().unwrap().take_entries();
     assert_eq!((mkdir.len(), delete.len(), recreate.len()), (1, 1, 1));
     let loader = target.journal_loader();
     loader.apply_entry(mkdir[0].clone()).unwrap();

@@ -82,8 +82,8 @@ fn directory_merge_preserves_selected_record_format() {
             .merge_directory_attributes(id, DirectoryAttributeDelta::for_child(2).for_child_entry())
             .unwrap();
         batch.commit().unwrap();
-        let attributes = store.get_directory_attributes(id).unwrap().unwrap();
-        assert_eq!(attributes.children(), enabled.then_some(1));
+        let attributes = store.get_directory_attributes(id).unwrap();
+        assert_eq!(attributes.unwrap().children(), enabled.then_some(1));
     }
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
@@ -132,7 +132,7 @@ fn directory_attributes_and_edges_share_one_batch() {
     batch
         .merge_directory_attributes(1, DirectoryAttributeDelta::new(3, 4, 1))
         .unwrap();
-    assert_eq!(store.get_directory_attributes(1).unwrap(), None);
+    assert!(store.get_directory_attributes(1).unwrap().is_none());
     assert_eq!(store.get_child_ids(1, None).unwrap().count(), 0);
     let snapshot = store.read_snapshot();
     batch.commit().unwrap();
@@ -156,7 +156,10 @@ fn directory_attributes_and_edges_share_one_batch() {
     expected
         .apply(DirectoryAttributeDelta::new(3, 4, 1))
         .unwrap();
-    assert_eq!(store.get_directory_attributes(1).unwrap(), Some(expected));
+    assert_eq!(
+        store.get_directory_attributes(1).unwrap().unwrap(),
+        expected
+    );
     assert_eq!(
         store
             .get_child_ids(1, None)
@@ -169,7 +172,7 @@ fn directory_attributes_and_edges_share_one_batch() {
     batch.delete_directory_attributes(1).unwrap();
     batch.delete_child(1, "child").unwrap();
     batch.commit().unwrap();
-    assert_eq!(store.get_directory_attributes(1).unwrap(), None);
+    assert!(store.get_directory_attributes(1).unwrap().is_none());
     assert_eq!(store.get_child_ids(1, None).unwrap().count(), 0);
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
@@ -212,8 +215,8 @@ fn unlink_uses_staged_parent_attributes() {
         .apply(DirectoryAttributeDelta::new(1, 1, 0))
         .unwrap();
     assert_eq!(
-        store.store().get_directory_attributes(1).unwrap(),
-        Some(expected)
+        store.store().get_directory_attributes(1).unwrap().unwrap(),
+        expected
     );
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
@@ -240,9 +243,10 @@ fn explicit_attribute_write_keeps_an_existing_legacy_record() {
         .unwrap();
     batch.commit().unwrap();
 
-    let attributes = store.get_directory_attributes(1).unwrap().unwrap();
-    assert_eq!((attributes.mtime, attributes.ctime), (2, 3));
-    assert_eq!(attributes.children(), None);
+    let attributes = store.get_directory_attributes(1).unwrap();
+    let attrs = store.get_directory_attributes(1).unwrap();
+    assert_eq!((attrs.unwrap().mtime, attrs.unwrap().ctime), (2, 3));
+    assert_eq!(attributes.unwrap().children(), None);
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
 }
@@ -330,8 +334,12 @@ fn production_store_migrates_legacy_directories_once() {
         Some(legacy_attributes(10, 10, 2))
     );
     assert_eq!(
-        store.store().get_directory_attributes(2_001).unwrap(),
-        Some(legacy_attributes(20, 20, 2))
+        store
+            .store()
+            .get_directory_attributes(2_001)
+            .unwrap()
+            .unwrap(),
+        legacy_attributes(20, 20, 2)
     );
 
     let mut expected = legacy_attributes(20, 20, 2);
@@ -345,8 +353,12 @@ fn production_store_migrates_legacy_directories_once() {
     batch.commit().unwrap();
     store.migrate_directory_attributes().unwrap();
     assert_eq!(
-        store.store().get_directory_attributes(2_001).unwrap(),
-        Some(expected)
+        store
+            .store()
+            .get_directory_attributes(2_001)
+            .unwrap()
+            .unwrap(),
+        expected
     );
 
     let (_, root) = store.create_tree().unwrap();
@@ -356,8 +368,12 @@ fn production_store_migrates_legacy_directories_once() {
         .get_child_edge("child")
         .is_some());
     assert_eq!(
-        store.store().get_directory_attributes(2_001).unwrap(),
-        Some(expected)
+        store
+            .store()
+            .get_directory_attributes(2_001)
+            .unwrap()
+            .unwrap(),
+        expected
     );
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
@@ -417,8 +433,8 @@ fn snapshot_directory_child_is_independent_from_in_memory_tree() {
 
     let lease = store.begin_snapshot_scan().unwrap();
     let snapshot = lease.snapshot_reader().unwrap();
-    let child = snapshot.get_child(1, "child").unwrap().unwrap();
-    assert!(child.is_file());
+    let child = snapshot.get_child(1, "child").unwrap();
+    assert!(child.unwrap().is_file());
     assert!(snapshot.get_directory_attributes(1).unwrap().is_none());
     drop(snapshot);
     drop(lease);
@@ -464,8 +480,8 @@ fn typed_snapshot_keeps_directory_attributes_at_its_read_version() {
     batch.add_child(1, "dangling", 99).unwrap();
     batch.commit().unwrap();
     assert_eq!(
-        snapshot.get_directory_attributes(1).unwrap(),
-        Some(legacy_attributes(1, 2, 2))
+        snapshot.get_directory_attributes(1).unwrap().unwrap(),
+        legacy_attributes(1, 2, 2)
     );
     assert_eq!(snapshot.get_child_id(1, "old").unwrap(), Some(42));
     let old = snapshot.get_child(1, "old").unwrap().unwrap();
@@ -483,8 +499,8 @@ fn typed_snapshot_keeps_directory_attributes_at_its_read_version() {
         .apply(DirectoryAttributeDelta::new(3, 4, 1))
         .unwrap();
     assert_eq!(
-        store.store().get_directory_attributes(1).unwrap(),
-        Some(updated)
+        store.store().get_directory_attributes(1).unwrap().unwrap(),
+        updated
     );
     drop(snapshot);
     drop(lease);
@@ -512,8 +528,8 @@ fn production_configuration_reopens_attribute_database() {
     drop(store);
     let reopened = RocksInodeStore::new(base, false).unwrap();
     assert_eq!(
-        reopened.get_directory_attributes(1).unwrap(),
-        Some(legacy_attributes(1, 2, 2))
+        reopened.get_directory_attributes(1).unwrap().unwrap(),
+        legacy_attributes(1, 2, 2)
     );
     drop(reopened);
     std::fs::remove_dir_all(path).unwrap();
@@ -523,15 +539,15 @@ fn production_configuration_reopens_attribute_database() {
 fn production_store_enables_attribute_column_family() {
     let path = Utils::test_sub_dir(format!("dir_attrs_missing_{}", Utils::rand_str(12)));
     let store = RocksInodeStore::new(DBConf::new(&path), true).unwrap();
-    assert_eq!(store.get_directory_attributes(1).unwrap(), None);
+    assert!(store.get_directory_attributes(1).unwrap().is_none());
     let mut batch = store.new_batch();
     batch
         .write_directory_attributes(1, DirectoryAttributes::new(1, 2, 2))
         .unwrap();
     batch.commit().unwrap();
     assert_eq!(
-        store.get_directory_attributes(1).unwrap(),
-        Some(legacy_attributes(1, 2, 2))
+        store.get_directory_attributes(1).unwrap().unwrap(),
+        legacy_attributes(1, 2, 2)
     );
     drop(store);
     std::fs::remove_dir_all(path).unwrap();

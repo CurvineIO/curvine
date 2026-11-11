@@ -14,6 +14,7 @@
 
 use curvine_config::ClusterConf;
 use curvine_master::master::journal::JournalSystem;
+use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use curvine_master::master::meta::inode::InodePath;
 use curvine_master::Master;
 use curvine_model::{
@@ -59,7 +60,7 @@ fn atime_refresh_does_not_touch_a_replacement_inode() {
     )
     .unwrap();
     {
-        let dir = fs.fs_dir.write();
+        let dir = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let path = InodePath::resolve(dir.root_node(), "/file", dir.store_ref()).unwrap();
         let epoch = dir.store_ref().scan_control().cancel_epoch();
         assert!(!dir.touch_atime_for_ttl(&path, original.id, epoch).unwrap());

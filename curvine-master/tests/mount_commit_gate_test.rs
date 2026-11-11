@@ -14,6 +14,7 @@
 
 use curvine_config::ClusterConf;
 use curvine_master::master::journal::JournalSystem;
+use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use curvine_master::master::mount::MountTable;
 use curvine_master::Master;
 use curvine_model::MountOptions;
@@ -60,7 +61,7 @@ fn mount_mutations_wait_for_commit_gate() {
     worker.join().unwrap();
     assert!(matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)));
     assert!(!before.iter().any(|mount| mount.cv_path == "/mnt"));
-    done_rx.recv().unwrap().unwrap();
+    done_rx.recv().unwrap();
     assert!(manager
         .get_mount_table()
         .unwrap()
@@ -94,7 +95,7 @@ fn mount_mutations_wait_for_commit_gate() {
     worker.join().unwrap();
     assert!(matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)));
     assert_ne!(before.ttl_ms, 1234);
-    done_rx.recv().unwrap().unwrap();
+    done_rx.recv().unwrap();
     assert_eq!(
         manager
             .get_mount_table()
@@ -121,7 +122,7 @@ fn mount_mutations_wait_for_commit_gate() {
     worker.join().unwrap();
     assert!(matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)));
     assert!(before.iter().any(|mount| mount.cv_path == "/mnt"));
-    done_rx.recv().unwrap().unwrap();
+    done_rx.recv().unwrap();
     assert!(!manager
         .get_mount_table()
         .unwrap()
@@ -144,7 +145,7 @@ fn mount_publication_waits_for_namespace_lock() {
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
     let table = Arc::new(MountTable::new());
-    let guard = fs.fs_dir.write();
+    let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
     let worker_table = table.clone();
     let worker_fs = fs.clone();
     let (started_tx, started_rx) = mpsc::channel();
@@ -153,7 +154,7 @@ fn mount_publication_waits_for_namespace_lock() {
         started_tx.send(()).unwrap();
         // The caller acquires the namespace guard before the table
         // transaction, matching the production ordering.
-        let guard_dir = worker_fs.fs_dir.write();
+        let guard_dir = worker_fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let result = worker_table.add_mount(
             &guard_dir,
             42,
@@ -171,10 +172,10 @@ fn mount_publication_waits_for_namespace_lock() {
     worker.join().unwrap();
     assert!(matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)));
     assert!(snapshot.entries.is_empty());
-    done_rx.recv().unwrap().unwrap();
+    done_rx.recv().unwrap();
     let version = table.snapshot().unwrap().version;
     {
-        let fs_dir = fs.fs_dir.read();
+        let fs_dir = fs.fs_dir.view().unwrap();
         assert!(table
             .add_mount(
                 &fs_dir,
@@ -188,7 +189,7 @@ fn mount_publication_waits_for_namespace_lock() {
     assert_eq!(table.snapshot().unwrap().version, version);
     let restored = MountTable::new();
     {
-        let fs_dir = fs.fs_dir.read();
+        let fs_dir = fs.fs_dir.view().unwrap();
         restored.restore(&fs_dir).unwrap();
     }
     let current = table.snapshot().unwrap();

@@ -1,6 +1,7 @@
 use curvine_config::ClusterConf;
 use curvine_master::master::fs::MasterFilesystem;
 use curvine_master::master::journal::JournalSystem;
+use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use curvine_master::master::meta::inode::{InodePath, InodeView};
 use curvine_master::Master;
 use curvine_model::SetAttrOpts;
@@ -26,7 +27,8 @@ fn setattr_rejects_restore_admission_without_changing_metadata() {
     let before = fs.file_status("/dir").unwrap();
     let restore = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store_ref()
         .begin_restore(std::time::Duration::from_secs(1))
         .unwrap();
@@ -190,7 +192,7 @@ fn recursive_setattr_rejects_missing_child_inode_without_partial_updates() {
     let dir_before = fs.file_status("/tree/a").unwrap();
     let file_before = fs.file_status("/tree/a/file").unwrap();
     {
-        let dir = fs.fs_dir.write();
+        let dir = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let path = InodePath::resolve(dir.root_node(), "/tree/a", dir.store_ref()).unwrap();
         let mut parent = path.get_last_inode().unwrap();
         parent
@@ -230,7 +232,7 @@ fn directory_setattr_keeps_tree_and_persists_recursive_attributes() {
     }
     let before = fs.file_status("/tree/a/file").unwrap();
     {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         for path in ["/tree", "/tree/a", "/tree/b"] {
             let resolved = InodePath::resolve(dir.root_node(), path, dir.store_ref()).unwrap();
             let children = resolved

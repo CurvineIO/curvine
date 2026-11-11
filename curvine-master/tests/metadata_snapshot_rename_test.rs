@@ -15,6 +15,7 @@
 use curvine_config::ClusterConf;
 use curvine_master::master::fs::MasterFilesystem;
 use curvine_master::master::journal::JournalSystem;
+use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use curvine_master::master::meta::inode::{ChildEdge, Inode, InodePath, ROOT_INODE_ID};
 use curvine_master::master::Master;
 use curvine_model::{RenameFlags, SetAttrOpts};
@@ -25,7 +26,7 @@ fn root_dir_node(
     fs: &MasterFilesystem,
     name: &str,
 ) -> Arc<curvine_master::master::meta::inode::DirNode> {
-    let dir = fs.fs_dir.read();
+    let dir = fs.fs_dir.view().unwrap();
     match dir
         .root_view()
         .children_handle()
@@ -38,7 +39,7 @@ fn root_dir_node(
 }
 
 fn live_dir_parent_id(fs: &MasterFilesystem, path: &str) -> i64 {
-    let dir = fs.fs_dir.read();
+    let dir = fs.fs_dir.view().unwrap();
     let path = InodePath::resolve(dir.root_node(), path, dir.store_ref()).unwrap();
     path.get_last_inode()
         .unwrap()
@@ -121,10 +122,13 @@ fn cross_parent_directory_rename_publishes_live_parent() {
     .unwrap();
     let child = fs.create("/q/a/file", false).unwrap();
 
-    assert_eq!(fs.fs_dir.read().get_inode_path(moved_id).unwrap(), "/q/a");
+    assert_eq!(
+        fs.fs_dir.view().unwrap().get_inode_path(moved_id).unwrap(),
+        "/q/a"
+    );
     assert_eq!(live_dir_parent_id(&fs, "/q/a"), q_id);
     assert_eq!(
-        fs.fs_dir.read().get_inode_path(child.id).unwrap(),
+        fs.fs_dir.view().unwrap().get_inode_path(child.id).unwrap(),
         "/q/a/file"
     );
 }
@@ -147,8 +151,14 @@ fn cross_parent_directory_exchange_publishes_live_parents() {
 
     fs.rename("/p/a", "/q/b", RenameFlags::EXCHANGE).unwrap();
 
-    assert_eq!(fs.fs_dir.read().get_inode_path(a_id).unwrap(), "/q/b");
-    assert_eq!(fs.fs_dir.read().get_inode_path(b_id).unwrap(), "/p/a");
+    assert_eq!(
+        fs.fs_dir.view().unwrap().get_inode_path(a_id).unwrap(),
+        "/q/b"
+    );
+    assert_eq!(
+        fs.fs_dir.view().unwrap().get_inode_path(b_id).unwrap(),
+        "/p/a"
+    );
     assert_eq!(live_dir_parent_id(&fs, "/q/b"), q_id);
     assert_eq!(live_dir_parent_id(&fs, "/p/a"), p_id);
 }
@@ -229,7 +239,7 @@ fn inode_path_rejects_cycles_and_missing_ancestors() {
     conf.change_test_meta_dir(format!("inode-parent-corrupt-{}", Utils::rand_str(8)));
     let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
     let file = fs.create("/dir/file", true).unwrap();
-    let dir = fs.fs_dir.write();
+    let dir = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
     let mut inode = dir.store_ref().get_inode(file.id, None).unwrap().unwrap();
     inode.set_parent_id(file.id);
     let mut batch = dir.store_ref().new_batch();
@@ -275,7 +285,7 @@ fn inode_path_does_not_mix_parent_generations_during_rename() {
     });
     start.wait();
     for _ in 0..400 {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         let path = dir.get_inode_path(file.id).unwrap();
         assert!(
             path == "/a/x/file" || path == "/b/y/file",
@@ -295,14 +305,14 @@ fn snapshot_path_rejects_dangling_edge() {
     conf.change_test_meta_dir(format!("snapshot-dangling-{}", Utils::rand_str(8)));
     let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
     {
-        let dir = fs.fs_dir.write();
+        let dir = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let mut batch = dir.store_ref().new_batch();
         batch
             .add_child(ROOT_INODE_ID, "dangling", ROOT_INODE_ID + 999)
             .unwrap();
         batch.commit().unwrap();
     }
-    let lease = fs.fs_dir.read().begin_snapshot_scan().unwrap();
+    let lease = fs.fs_dir.view().unwrap().begin_snapshot_scan().unwrap();
     let snapshot = lease.snapshot_reader().unwrap();
     let error = match snapshot.resolve_path("/dangling") {
         Ok(_) => panic!("dangling edge must fail closed"),
@@ -326,10 +336,10 @@ fn snapshot_sees_consistent_edges_and_inodes_across_replace_rename() {
     let left = fs.file_status("/left").unwrap().id;
     let right = fs.file_status("/right").unwrap().id;
 
-    let lease = fs.fs_dir.read().begin_snapshot_scan().unwrap();
+    let lease = fs.fs_dir.view().unwrap().begin_snapshot_scan().unwrap();
     let before = lease.snapshot_reader().unwrap();
     {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         for path in [
             "/",
             "/left/source",

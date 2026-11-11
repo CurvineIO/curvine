@@ -2,15 +2,16 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+
+use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT; // You may obtain a copy of the License at
+                                                              //
+                                                              //     http://www.apache.org/licenses/LICENSE-2.0
+                                                              //
+                                                              // Unless required by applicable law or agreed to in writing, software
+                                                              // distributed under the License is distributed on an "AS IS" BASIS,
+                                                              // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+                                                              // See the License for the specific language governing permissions and
+                                                              // limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::{Master, MasterMetrics};
@@ -124,11 +125,14 @@ impl LoopTask for FsDirWatchdog {
         }
 
         let spent = TimeSpent::new();
-        // Non-blocking shared probe. It never blocks the watchdog thread.
-        match self.fs.fs_dir().try_read() {
-            Ok(_guard) => self.on_available(spent.used_us() as i64),
-            Err(TryLockError::WouldBlock) => self.on_unavailable(spent.used_us() as i64, false),
-            Err(TryLockError::Poisoned(_)) => self.on_unavailable(spent.used_us() as i64, true),
+        // Non-blocking probe: handle.is_cold()/is_failed() maps directly to
+        // the previous RwLock would-block/poisoned states.
+        if self.fs.fs_dir.is_cold() {
+            self.on_unavailable(spent.used_us() as i64, false);
+        } else if self.fs.fs_dir.is_failed() {
+            self.on_unavailable(spent.used_us() as i64, true);
+        } else {
+            self.on_available(spent.used_us() as i64);
         }
         Ok(())
     }
@@ -142,6 +146,7 @@ impl LoopTask for FsDirWatchdog {
 mod tests {
     use super::*;
     use crate::master::journal::JournalSystem;
+    use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
     use crate::master::Master;
     use curvine_config::{ClusterConf, JournalConf, MasterConf};
     use curvine_raft::raft::RoleState;
@@ -170,7 +175,7 @@ mod tests {
     fn inactive_master_resets_without_probing_lock() {
         let fs = test_fs("inactive");
         let fs_dir = fs.fs_dir();
-        let _write_guard = fs_dir.write();
+        let _write_guard = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let watchdog = FsDirWatchdog::new(fs, 0);
 
         watchdog.first_unavailable_ms.store(123, Ordering::SeqCst);
@@ -200,7 +205,7 @@ mod tests {
         let fs_dir = fs.fs_dir();
         let watchdog = FsDirWatchdog::new(fs, 0);
 
-        let write_guard = fs_dir.write();
+        let write_guard = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         watchdog.run().unwrap();
 
         assert!(watchdog.first_unavailable_ms.load(Ordering::SeqCst) > 0);

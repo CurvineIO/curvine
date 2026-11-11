@@ -48,7 +48,7 @@ fn delete_reloads_inode_after_a_hard_link_is_added() {
     let delete_result = result_rx.recv_timeout(Duration::from_secs(60));
     runtime.remove(rule_id).unwrap();
     assert!(planned, "delete did not reach lock planning");
-    link_result.unwrap().unwrap();
+    link_result.unwrap();
     delete_result
         .expect("delete worker did not finish")
         .unwrap();
@@ -501,7 +501,7 @@ fn concurrent_overwrites_of_the_same_target_keep_one_consistent_file_version() {
     start.wait();
 
     for worker in workers {
-        worker.join().unwrap().unwrap();
+        worker.join().unwrap();
     }
 
     assert_eq!(fs.file_status("/file").unwrap().len, 0);
@@ -537,7 +537,8 @@ fn overwrite_is_rejected_during_metadata_restore_generation() {
     let before = fs.file_status("/file").unwrap();
     let restore_guard = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store
         .begin_restore(std::time::Duration::from_secs(1))
         .unwrap();
@@ -548,7 +549,8 @@ fn overwrite_is_rejected_during_metadata_restore_generation() {
     assert_eq!(fs.file_status("/file").unwrap().len, before.len);
     assert_eq!(
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .store
             .get_locations(block_id)
             .unwrap()
@@ -564,7 +566,7 @@ fn complete_file_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("complete-file-shared-reader");
     fs.create("/file", true).unwrap();
 
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -576,7 +578,7 @@ fn complete_file_does_not_wait_for_a_shared_namespace_reader() {
         .expect("sharded complete_file was blocked by a shared namespace reader")
         .unwrap();
     drop(reader);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
     assert!(result.is_none());
     assert!(fs.file_status("/file").unwrap().is_complete);
 }
@@ -608,7 +610,7 @@ fn complete_file_waits_for_conflicting_block_location_lock() {
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
     drop(held);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
     assert!(done_rx.recv().unwrap().unwrap().is_none());
     assert!(fs.file_status("/file").unwrap().is_complete);
 }
@@ -618,7 +620,7 @@ fn close_file_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("close-file-shared-reader");
     fs.create("/file", true).unwrap();
     let client = {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         MasterFilesystem::resolve_path(&dir, "/file")
             .unwrap()
             .get_last_inode()
@@ -636,7 +638,7 @@ fn close_file_does_not_wait_for_a_shared_namespace_reader() {
             .clone()
     };
 
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || done_tx.send(worker_fs.close_file("/file", &client)));
@@ -645,14 +647,14 @@ fn close_file_does_not_wait_for_a_shared_namespace_reader() {
         .expect("sharded close_file was blocked by a shared namespace reader")
         .unwrap();
     drop(reader);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
 }
 
 #[test]
 fn reopen_file_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("reopen-file-shared-reader");
     fs.create("/file", true).unwrap();
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -668,14 +670,14 @@ fn reopen_file_does_not_wait_for_a_shared_namespace_reader() {
         .expect("reopen was blocked by a shared namespace reader")
         .unwrap();
     drop(reader);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
 }
 
 #[test]
 fn overwrite_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("overwrite-shared-reader");
     fs.create("/file", true).unwrap();
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || done_tx.send(worker_fs.create("/file", true)));
@@ -685,7 +687,7 @@ fn overwrite_does_not_wait_for_a_shared_namespace_reader() {
         .expect("sharded overwrite was blocked by a shared namespace reader")
         .unwrap();
     drop(reader);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
 }
 
 #[test]
@@ -701,8 +703,8 @@ fn overwrite_waits_for_conflicting_block_location_lock() {
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
     drop(held);
-    worker.join().unwrap().unwrap();
-    done_rx.recv().unwrap().unwrap();
+    worker.join().unwrap();
+    done_rx.recv().unwrap();
 }
 
 #[test]
@@ -818,7 +820,8 @@ fn overwrite_commit_failure_keeps_file_state_unchanged() {
     assert_eq!(fs.file_status("/file").unwrap().len, before.len);
     assert_eq!(
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .store
             .get_locations(old_block_id)
             .unwrap()
@@ -878,7 +881,8 @@ fn truncate_open_commit_failure_keeps_file_state_unchanged() {
     assert_eq!(fs.file_status("/file").unwrap().len, before.len);
     assert_eq!(
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .store
             .get_locations(old_block_id)
             .unwrap()
@@ -950,7 +954,8 @@ fn expired_delete_is_rejected_during_metadata_restore_generation() {
     let inode_id = expired_delete_file(&fs, "/ttl/file");
     let restore_guard = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store
         .begin_restore(std::time::Duration::from_secs(1))
         .unwrap();
@@ -971,7 +976,7 @@ fn expired_delete_is_rejected_during_metadata_restore_generation() {
 fn free_file_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("free-file-shared-reader");
     let block_id = freeable_replication_file(&fs, "/file");
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || done_tx.send(worker_fs.free("/file", false)));
@@ -981,11 +986,12 @@ fn free_file_does_not_wait_for_a_shared_namespace_reader() {
         .expect("sharded free was blocked by a shared namespace reader")
         .unwrap();
     drop(reader);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
     assert_eq!(result.inodes, 1);
     assert!(
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .store
             .get_locations(block_id)
             .unwrap()
@@ -1007,7 +1013,7 @@ fn free_file_waits_for_conflicting_block_location_lock() {
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
     drop(held);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
     assert_eq!(done_rx.recv().unwrap().unwrap().inodes, 1);
 }
 
@@ -1026,7 +1032,7 @@ fn free_file_waits_for_conflicting_worker_location_lock() {
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
     drop(held);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
     assert_eq!(done_rx.recv().unwrap().unwrap().inodes, 1);
 }
 
@@ -1043,7 +1049,7 @@ fn delete_file_waits_for_conflicting_block_location_lock() {
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
     drop(held);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
     assert_eq!(done_rx.recv().unwrap().unwrap().inodes, 1);
 }
 
@@ -1062,7 +1068,7 @@ fn delete_file_waits_for_conflicting_worker_location_lock() {
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
     drop(held);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
     assert_eq!(done_rx.recv().unwrap().unwrap().inodes, 1);
 }
 
@@ -1336,11 +1342,11 @@ fn delete_serializes_with_a_concurrent_block_report() {
         .is_err());
 
     drop(held);
-    report.join().unwrap().unwrap();
-    report_rx.recv().unwrap().unwrap();
-    delete.join().unwrap().unwrap();
-    let result = delete_rx.recv().unwrap().unwrap();
-    assert_eq!(result.inodes, 1);
+    report.join().unwrap();
+    report_rx.recv().unwrap();
+    delete.join().unwrap();
+    let result = delete_rx.recv().unwrap();
+    assert_eq!(result.unwrap().inodes, 1);
     assert!(fs.file_status("/file").is_err());
     let commands = fs.worker_manager.write().block_map.handle_heartbeat(100);
     let deleted = commands
@@ -1384,7 +1390,7 @@ fn delete_does_not_hold_namespace_read_while_waiting_for_block_lock() {
     let writer_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
-        let _guard = writer_fs.fs_dir.write();
+        let _guard = writer_fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         tx.send(()).unwrap();
     });
     let writer_entered = rx.recv_timeout(Duration::from_millis(500)).is_ok();
@@ -1405,7 +1411,7 @@ fn delete_does_not_hold_namespace_read_while_waiting_for_block_lock() {
 fn delete_serializes_with_worker_location_cleanup() {
     let fs = test_fs("delete-worker-cleanup-race");
     let block_id = replication_file(&fs, "/file");
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
 
     let cleanup_fs = fs.clone();
     let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
@@ -1429,16 +1435,17 @@ fn delete_serializes_with_worker_location_cleanup() {
         .is_err());
 
     drop(reader);
-    cleanup.join().unwrap().unwrap();
-    let cleanup_result = cleanup_rx.recv().unwrap().unwrap();
-    assert_eq!(cleanup_result.removed_block_ids, vec![block_id]);
-    delete.join().unwrap().unwrap();
-    let result = delete_rx.recv().unwrap().unwrap();
-    assert_eq!(result.inodes, 1);
+    cleanup.join().unwrap();
+    let cleanup_result = cleanup_rx.recv().unwrap();
+    assert_eq!(cleanup_result.unwrap().removed_block_ids, vec![block_id]);
+    delete.join().unwrap();
+    let result = delete_rx.recv().unwrap();
+    assert_eq!(result.unwrap().inodes, 1);
     assert!(fs.file_status("/file").is_err());
     assert!(fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .get_block_locations(block_id)
         .unwrap()
         .is_empty());
@@ -1448,7 +1455,7 @@ fn delete_serializes_with_worker_location_cleanup() {
 fn delete_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("delete-shared-reader");
     fs.create("/file", true).unwrap();
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -1468,7 +1475,8 @@ fn delete_is_rejected_during_metadata_restore_generation() {
     let before = fs.create("/file", true).unwrap();
     let restore_guard = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store
         .begin_restore(std::time::Duration::from_secs(1))
         .unwrap();
@@ -1489,7 +1497,8 @@ fn free_is_rejected_during_metadata_restore_generation() {
     let before = fs.file_status("/file").unwrap();
     let restore_guard = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store
         .begin_restore(std::time::Duration::from_secs(1))
         .unwrap();
@@ -1500,7 +1509,8 @@ fn free_is_rejected_during_metadata_restore_generation() {
     assert_eq!(fs.file_status("/file").unwrap().id, before.id);
     assert!(!fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store
         .get_locations(block_id)
         .unwrap()
@@ -1536,7 +1546,8 @@ fn delete_commit_failure_keeps_file_state_unchanged() {
     assert_eq!(fs.file_status("/file").unwrap().id, before.id);
     assert!(!fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store
         .get_locations(block_id)
         .unwrap()
@@ -1612,7 +1623,7 @@ fn expired_root_is_not_deleted_by_sharded_ttl_path() {
 fn expired_trash_root_keeps_reserved_delete_protection() {
     let fs = test_fs("expired-trash-root");
     let id = {
-        let fs_dir = fs.fs_dir.write();
+        let fs_dir = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let path = MasterFilesystem::resolve_path(&fs_dir, trash::TRASH_ROOT).unwrap();
         let mut opts = MkdirOpts::with_create(false);
         opts.storage_policy.ttl_ms = 1;
@@ -1684,7 +1695,7 @@ fn expired_delete_does_not_delete_replaced_inode() {
 fn expired_delete_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("expired-delete-shared-reader");
     let inode_id = expired_delete_file(&fs, "/ttl/file");
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -1697,7 +1708,7 @@ fn expired_delete_does_not_wait_for_a_shared_namespace_reader() {
         .unwrap()
         .expect("expired file should be deleted");
     drop(reader);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
     assert_eq!(result.0.inodes, 1);
     assert_eq!(result.1.id(), inode_id);
     assert!(fs.file_status("/ttl/file").is_err());
@@ -1744,7 +1755,7 @@ fn expired_delete_waits_for_conflicting_worker_location_lock() {
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
     drop(held);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
     assert_eq!(done_rx.recv().unwrap().unwrap().unwrap().0.inodes, 1);
 }
 
@@ -1939,7 +1950,8 @@ fn expired_delete_commit_failure_keeps_memory_and_store_unchanged() {
     assert_eq!(fs.file_status("/ttl").unwrap().mtime, before_parent.mtime);
     assert!(!fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store
         .get_locations(block_id)
         .unwrap()
@@ -1950,7 +1962,8 @@ fn expired_delete_commit_failure_keeps_memory_and_store_unchanged() {
     assert_eq!(fs.file_status(path).unwrap().len, 1);
     assert!(!fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store
         .get_locations(block_id)
         .unwrap()
@@ -2019,7 +2032,7 @@ fn assign_worker_by_id_survives_parent_replacement() {
 fn assign_worker_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("assign-worker-shared-reader");
     let block = replication_file(&fs, "/file");
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -2039,7 +2052,7 @@ fn assign_worker_does_not_wait_for_a_shared_namespace_reader() {
         .expect("assign worker was blocked by a shared namespace reader")
         .unwrap();
     drop(reader);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
 }
 
 #[test]
@@ -2065,7 +2078,7 @@ fn assign_worker_waits_for_conflicting_block_location_lock() {
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
     drop(held);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
 }
 
 #[test]
@@ -2086,7 +2099,7 @@ fn resize_does_not_wait_for_a_shared_namespace_reader() {
         None,
     )
     .unwrap();
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -2098,7 +2111,7 @@ fn resize_does_not_wait_for_a_shared_namespace_reader() {
         .expect("resize was blocked by a shared namespace reader")
         .unwrap();
     drop(reader);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
 }
 
 #[test]
@@ -2130,7 +2143,7 @@ fn resize_waits_for_conflicting_block_location_lock() {
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
     drop(held);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
 }
 
 #[cfg(feature = "fault-injection")]
@@ -2211,7 +2224,7 @@ fn add_block_test_file(fs: &MasterFilesystem, path: &str) {
 fn add_block_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("add-block-shared-reader");
     add_block_test_file(&fs, "/file");
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -2231,7 +2244,7 @@ fn add_block_does_not_wait_for_a_shared_namespace_reader() {
         .expect("add block was blocked by a shared namespace reader")
         .unwrap();
     drop(reader);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
 }
 
 #[test]
@@ -2272,7 +2285,7 @@ fn add_block_waits_for_conflicting_block_location_lock() {
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
     drop(held);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
 }
 
 #[cfg(feature = "fault-injection")]
@@ -2338,7 +2351,8 @@ fn free_file_commit_failure_keeps_memory_and_store_unchanged() {
     assert_eq!(fs.file_status("/file").unwrap().len, before.len);
     assert!(!fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store
         .get_locations(block_id)
         .unwrap()
@@ -2348,7 +2362,8 @@ fn free_file_commit_failure_keeps_memory_and_store_unchanged() {
     assert_eq!(fs.file_status("/file").unwrap().len, before.len);
     assert!(!fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store
         .get_locations(block_id)
         .unwrap()
@@ -2385,7 +2400,13 @@ fn atime_refresh_does_not_touch_replaced_inode() {
     let fs = test_fs("atime-replaced-parent");
     atime_ttl_file_due(&fs, "a/file");
     let old = fs.file_status("/a/file").unwrap();
-    let epoch = fs.fs_dir.read().store.scan_control().cancel_epoch();
+    let epoch = fs
+        .fs_dir
+        .view()
+        .unwrap()
+        .store
+        .scan_control()
+        .cancel_epoch();
     let runtime = FaultRuntime::process();
     let rule_id = "atime-replaced-parent";
     let rule = FaultRuleBuilder::named("master.metadata.atime_planned")
@@ -2435,15 +2456,30 @@ fn atime_refresh_ignores_previous_restore_epoch() {
     let fs = test_fs("atime-restore-epoch");
     atime_ttl_file_due(&fs, "file");
     let original = fs.file_status("/file").unwrap();
-    let epoch = fs.fs_dir.read().store.scan_control().cancel_epoch();
+    let epoch = fs
+        .fs_dir
+        .view()
+        .unwrap()
+        .store
+        .scan_control()
+        .cancel_epoch();
     let guard = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store
         .begin_restore(std::time::Duration::from_secs(1))
         .unwrap();
     drop(guard);
-    assert_ne!(fs.fs_dir.read().store.scan_control().cancel_epoch(), epoch);
+    assert_ne!(
+        fs.fs_dir
+            .view()
+            .unwrap()
+            .store
+            .scan_control()
+            .cancel_epoch(),
+        epoch
+    );
     fs.touch_atime_sharded("/file", original.id, epoch).unwrap();
     let status = fs.file_status("/file").unwrap();
     assert_eq!((status.id, status.atime), (original.id, original.atime));
@@ -2453,7 +2489,7 @@ fn atime_refresh_ignores_previous_restore_epoch() {
 fn atime_refresh_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("atime-refresh-shared-reader");
     atime_ttl_file_due(&fs, "file");
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || done_tx.send(worker_fs.get_block_locations("/file")));
@@ -2463,7 +2499,7 @@ fn atime_refresh_does_not_wait_for_a_shared_namespace_reader() {
         .expect("atime refresh was blocked by a shared namespace reader")
         .unwrap();
     drop(reader);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
 }
 
 #[cfg(feature = "fault-injection")]
@@ -2475,7 +2511,7 @@ fn verified_release_does_not_touch_replaced_inode() {
     let fs = test_fs("verified-release-replaced-parent");
     freeable_replication_file(&fs, "/a/file");
     let id = fs.file_status("/a/file").unwrap().id;
-    let snapshot = fs.fs_mode_snapshot(id).unwrap().unwrap();
+    let snapshot = fs.fs_mode_snapshot(id).unwrap();
     let runtime = FaultRuntime::process();
     let rule_id = "verified-release-replaced-parent";
     let rule = FaultRuleBuilder::named("master.metadata.locations_sampled")
@@ -2487,7 +2523,12 @@ fn verified_release_does_not_touch_replaced_inode() {
     let held = fs.inode_locks.write_inode(id);
     let worker_fs = fs.clone();
     let worker = std::thread::spawn(move || {
-        worker_fs.release_verified(id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime)
+        worker_fs.release_verified(
+            id,
+            &snapshot.as_ref().unwrap().path,
+            snapshot.as_ref().unwrap().gen,
+            snapshot.as_ref().unwrap().ufs_mtime,
+        )
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
@@ -2551,7 +2592,7 @@ fn verified_release_does_not_wait_for_a_shared_namespace_reader() {
         .fs_mode_snapshot(fs.file_status("/file").unwrap().id)
         .unwrap()
         .unwrap();
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -2568,7 +2609,7 @@ fn verified_release_does_not_wait_for_a_shared_namespace_reader() {
         .expect("verified release was blocked by a shared namespace reader")
         .unwrap();
     drop(reader);
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
     assert_eq!(
         fs.file_status("/file").unwrap().storage_policy.state,
         StorageState::Ufs
@@ -2583,7 +2624,7 @@ fn verified_release_commit_failure_keeps_memory_and_store_unchanged() {
     let fs = test_fs("verified-release-commit-failure");
     let _block_id = freeable_replication_file(&fs, "/file");
     let status = fs.file_status("/file").unwrap();
-    let snapshot = fs.fs_mode_snapshot(status.id).unwrap().unwrap();
+    let snapshot = fs.fs_mode_snapshot(status.id).unwrap();
 
     let runtime = FaultRuntime::process();
     let rule_id = "verified-release-commit-failure";
@@ -2593,6 +2634,7 @@ fn verified_release_commit_failure_keeps_memory_and_store_unchanged() {
         .return_error("injected verified release failure")
         .unwrap();
     runtime.configure(rule_id, rule).unwrap();
+    let snapshot = snapshot.unwrap();
     let result = fs.release_verified(status.id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime);
     runtime.remove(rule_id).unwrap();
 

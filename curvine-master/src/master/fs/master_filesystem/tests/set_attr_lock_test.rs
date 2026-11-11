@@ -109,7 +109,7 @@ fn recursive_set_attr_preserves_concurrent_hardlink_update() {
     let result = worker.join().unwrap();
     runtime.remove(rule_id).unwrap();
     assert!(delayed, "recursive set_attr did not reach the commit point");
-    update.unwrap().unwrap();
+    update.unwrap();
     result.unwrap();
     let status = fs.file_status("/alias").unwrap();
     assert_eq!(status.mtime, 1_234_567);
@@ -124,7 +124,7 @@ fn recursive_set_attr_preserves_concurrent_hardlink_update() {
 fn single_inode_set_attr_does_not_wait_for_fs_dir_readers() {
     let fs = test_fs("set-attr-shared-fs-dir");
     fs.create("/file", true).unwrap();
-    let read_guard = fs.fs_dir.read();
+    let read_guard = fs.fs_dir.view().unwrap();
     let worker = fs.clone();
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
     let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
@@ -137,7 +137,7 @@ fn single_inode_set_attr_does_not_wait_for_fs_dir_readers() {
     let result = done_rx.recv_timeout(std::time::Duration::from_secs(5));
     drop(read_guard);
     task.join().unwrap();
-    result.unwrap().unwrap();
+    result.unwrap();
     assert_eq!(fs.file_status("/file").unwrap().mode, 0o600);
 }
 
@@ -145,7 +145,7 @@ fn single_inode_set_attr_does_not_wait_for_fs_dir_readers() {
 fn recursive_set_attr_waits_for_shared_namespace_readers() {
     let fs = test_fs("recursive-set-attr-shared-reader");
     fs.create("/tree/dir/file", true).unwrap();
-    let read_guard = fs.fs_dir.read();
+    let read_guard = fs.fs_dir.view().unwrap();
     let worker = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
     let task = std::thread::spawn(move || {
@@ -202,7 +202,7 @@ fn set_lock_waits_for_target_inode_lock() {
     drop(inode_guard);
     task.join().unwrap();
     assert!(early.is_err(), "set_lock bypassed the target inode lock");
-    done_rx.recv().unwrap().unwrap();
+    done_rx.recv().unwrap();
 }
 
 #[test]
@@ -223,14 +223,14 @@ fn set_lock_root_waits_for_target_inode_lock() {
     drop(inode_guard);
     task.join().unwrap();
     assert!(early.is_err(), "set_lock('/') bypassed the root inode lock");
-    done_rx.recv().unwrap().unwrap();
+    done_rx.recv().unwrap();
 }
 
 #[test]
 fn set_lock_does_not_wait_for_fs_dir_readers() {
     let fs = test_fs("set-lock-shared-fs-dir");
     fs.create("/file", true).unwrap();
-    let read_guard = fs.fs_dir.read();
+    let read_guard = fs.fs_dir.view().unwrap();
     let worker = fs.clone();
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
     let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
@@ -252,5 +252,5 @@ fn set_lock_does_not_wait_for_fs_dir_readers() {
     let result = done_rx.recv_timeout(std::time::Duration::from_secs(5));
     drop(read_guard);
     task.join().unwrap();
-    result.unwrap().unwrap();
+    result.unwrap();
 }

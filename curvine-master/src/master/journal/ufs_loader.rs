@@ -18,7 +18,8 @@ use crate::master::journal::{
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::meta::FsDir;
-use crate::master::{FsModeExport, JobManager, SyncFsDir};
+use crate::master::meta::FsDirHandle;
+use crate::master::{FsModeExport, JobManager};
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsError;
@@ -34,12 +35,12 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct UfsLoader {
     job_manager: Arc<JobManager>,
-    fs_dir: SyncFsDir,
+    fs_dir: Arc<FsDirHandle>,
     copy_timeout: Duration,
 }
 
 impl UfsLoader {
-    pub fn new(job_manager: Arc<JobManager>, fs_dir: SyncFsDir, conf: &JournalConf) -> Self {
+    pub fn new(job_manager: Arc<JobManager>, fs_dir: Arc<FsDirHandle>, conf: &JournalConf) -> Self {
         let copy_timeout = match DurationUnit::from_str(&conf.ufs_copy_timeout) {
             Ok(unit) => unit.as_duration(),
             Err(e) => {
@@ -59,7 +60,7 @@ impl UfsLoader {
     }
 
     pub fn get_real_path(&self, inode_id: i64) -> FsResult<Path> {
-        let path = self.fs_dir.read().get_inode_path(inode_id)?;
+        let path = self.fs_dir.view().unwrap().get_inode_path(inode_id)?;
         Ok(Path::from_str(path)?)
     }
 
@@ -206,7 +207,7 @@ impl UfsLoader {
         }
         let gen = e.file.gen();
         let path = {
-            let fs_dir = self.fs_dir.read();
+            let fs_dir = self.fs_dir.view().unwrap();
             let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
             let Some(InodeView::File(file)) = snapshot.get_inode(e.file.id)? else {
                 return Ok(None);

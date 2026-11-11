@@ -14,6 +14,7 @@
 
 use curvine_config::ClusterConf;
 use curvine_master::master::journal::JournalSystem;
+use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use curvine_master::master::meta::inode::ttl::TtlBucketList;
 use curvine_master::master::meta::store::{InodeStore, RocksInodeStore};
 use curvine_master::Master;
@@ -44,14 +45,18 @@ fn restore_rebuilds_ttl_index_from_checkpoint() {
     let kept = fs
         .create_with_opts("/kept", opts.clone(), OpenFlags::new_create())
         .unwrap();
-    let checkpoint = fs.fs_dir.read().create_checkpoint(1).unwrap();
+    let checkpoint = fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
     let removed = fs
         .create_with_opts("/removed", opts, OpenFlags::new_create())
         .unwrap();
-    let buckets = fs.fs_dir.read().store_ref().get_ttl_bucket_list();
+    let buckets = fs.fs_dir.view().unwrap().store_ref().get_ttl_bucket_list();
     assert_eq!(buckets.total_inodes(), 2);
 
-    fs.fs_dir.write().restore(&checkpoint, 0).unwrap();
+    fs.fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .restore(&checkpoint, 0)
+        .unwrap();
     assert!(fs.exists("/kept").unwrap());
     assert!(!fs.exists("/removed").unwrap());
     let ids: Vec<_> = buckets
@@ -78,18 +83,39 @@ fn checkpoint_is_unchanged_after_restore_and_new_wal_writes() {
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
     fs.mkdir("/baseline", false).unwrap();
-    fs.fs_dir.read().store_journal_applied(b"baseline").unwrap();
-    let checkpoint = fs.fs_dir.read().create_checkpoint(1).unwrap();
+    fs.fs_dir
+        .view()
+        .unwrap()
+        .store_journal_applied(b"baseline")
+        .unwrap();
+    let checkpoint = fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
 
-    fs.fs_dir.write().restore(&checkpoint, 0).unwrap();
+    fs.fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .restore(&checkpoint, 0)
+        .unwrap();
     fs.mkdir("/later", false).unwrap();
-    fs.fs_dir.read().store_journal_applied(b"later").unwrap();
-    fs.fs_dir.write().restore(&checkpoint, 0).unwrap();
+    fs.fs_dir
+        .view()
+        .unwrap()
+        .store_journal_applied(b"later")
+        .unwrap();
+    fs.fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .restore(&checkpoint, 0)
+        .unwrap();
 
     assert!(fs.exists("/baseline").unwrap());
     assert!(!fs.exists("/later").unwrap());
     assert_eq!(
-        fs.fs_dir.read().load_journal_applied().unwrap().unwrap(),
+        fs.fs_dir
+            .view()
+            .unwrap()
+            .load_journal_applied()
+            .unwrap()
+            .unwrap(),
         b"baseline"
     );
     journal.shutdown();
@@ -242,7 +268,7 @@ fn filesystem_restore_failure_before_replacement_preserves_live_tree() {
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
     fs.mkdir("/parent/child", true).unwrap();
-    let checkpoint = fs.fs_dir.read().create_checkpoint(1).unwrap();
+    let checkpoint = fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
     let rule = FaultRuleBuilder::named("master.metadata.restore.before_temp_store")
         .matches("data_dir", conf.db_conf().data_dir.as_str())
         .unwrap()
@@ -252,7 +278,11 @@ fn filesystem_restore_failure_before_replacement_preserves_live_tree() {
         .unwrap();
     let faults = FaultRuntime::process();
     faults.configure("restore-live-tree-failure", rule).unwrap();
-    let result = fs.fs_dir.write().restore(&checkpoint, 0);
+    let result = fs
+        .fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .restore(&checkpoint, 0);
     faults.remove("restore-live-tree-failure").unwrap();
     assert!(result
         .unwrap_err()
@@ -288,7 +318,7 @@ fn restore_failure_after_detach_fences_new_writes() {
         Arc::new(curvine_master::master::mount::MountManager::new(fs.clone())),
         Arc::new(space_conf),
     );
-    let checkpoint = fs.fs_dir.read().create_checkpoint(1).unwrap();
+    let checkpoint = fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
     let faults = FaultRuntime::process();
     let rule = FaultRuleBuilder::named("master.metadata.restore.after_store_detach")
         .matches("data_dir", conf.db_conf().data_dir.as_str())
@@ -298,7 +328,11 @@ fn restore_failure_after_detach_fences_new_writes() {
         .return_error("injected post-detach failure")
         .unwrap();
     faults.configure("restore-detach-failure", rule).unwrap();
-    let result = fs.fs_dir.write().restore(&checkpoint, 0);
+    let result = fs
+        .fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .restore(&checkpoint, 0);
     faults.remove("restore-detach-failure").unwrap();
     assert!(result
         .unwrap_err()
@@ -334,7 +368,7 @@ fn restore_failure_after_detach_rejects_direct_reads() {
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
     fs.mkdir("/existing", false).unwrap();
-    let checkpoint = fs.fs_dir.read().create_checkpoint(1).unwrap();
+    let checkpoint = fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
     let faults = FaultRuntime::process();
     let rule = FaultRuleBuilder::named("master.metadata.restore.after_store_detach")
         .matches("data_dir", conf.db_conf().data_dir.as_str())
@@ -344,7 +378,11 @@ fn restore_failure_after_detach_rejects_direct_reads() {
         .return_error("injected post-detach failure")
         .unwrap();
     faults.configure("restore-detach-read", rule).unwrap();
-    let result = fs.fs_dir.write().restore(&checkpoint, 0);
+    let result = fs
+        .fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .restore(&checkpoint, 0);
     faults.remove("restore-detach-read").unwrap();
     assert!(result.is_err());
     let read = fs.exists("/existing");
@@ -357,7 +395,7 @@ fn restore_failure_after_detach_rejects_direct_reads() {
     assert!(fs.list_status("/*").is_err());
     assert!(fs.list_options("/", Default::default()).is_err());
     {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         assert!(dir.begin_snapshot_scan().is_err());
         assert!(dir.create_checkpoint(2).is_err());
         assert!(dir.sum_hash().is_err());
@@ -379,7 +417,8 @@ fn restore_failure_after_detach_rejects_direct_reads() {
     assert!(fs.restore_from_rocksdb().is_err());
     assert!(fs
         .fs_dir
-        .write()
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
         .block_report(vec![
             (false, 1, curvine_model::BlockLocation::with_id(100),)
         ])
@@ -411,7 +450,7 @@ fn drained_lease_releases_store_before_restore_proceeds() {
             }
             assert!(control.is_restoring());
             drop(lease);
-            worker.join().unwrap().unwrap();
+            worker.join().unwrap();
         });
     }
 }
@@ -430,7 +469,7 @@ fn overlapping_restores_cannot_reopen_scan_admission() {
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
     {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         let store = dir.store_ref();
         let first = store.begin_restore(Duration::from_secs(1)).unwrap();
         let epoch = store.scan_control().cancel_epoch();
@@ -449,7 +488,7 @@ fn overlapping_restores_cannot_reopen_scan_admission() {
             assert!(store.begin_restore(Duration::from_secs(1)).is_err());
             assert!(store.begin_snapshot_scan().is_err());
             drop(lease);
-            let pending = worker.join().unwrap().unwrap();
+            let pending = worker.join().unwrap();
             assert!(store.begin_snapshot_scan().is_err());
             drop(pending);
         });
@@ -479,7 +518,7 @@ fn restore_scan_timeout_returns_error_without_reentering_fs_lock() {
         .unwrap();
     let loader = journal.journal_loader();
     let snapshot = runtime.block_on(loader.create_snapshot()).unwrap();
-    let lease = fs.fs_dir.read().begin_snapshot_scan().unwrap();
+    let lease = fs.fs_dir.view().unwrap().begin_snapshot_scan().unwrap();
     let result = runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(5), loader.apply_snapshot(snapshot)).await
     });
@@ -637,14 +676,14 @@ fn restore_from_rocksdb_repair_failure_keeps_old_tree_and_ttl_rebuilt() {
     let kept = fs
         .create_with_opts("/kept", opts, OpenFlags::new_create())
         .unwrap();
-    let buckets = fs.fs_dir.read().store_ref().get_ttl_bucket_list();
+    let buckets = fs.fs_dir.view().unwrap().store_ref().get_ttl_bucket_list();
     assert_eq!(buckets.total_inodes(), 1);
 
     // Plant an orphan edge under the root (no inode row for 999_999): the
     // rebuild must repair it via delete_child, guaranteeing
     // `has_repairs == true` so the repair-batch commit fault point fires.
     {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         let mut batch = dir.store_ref().new_batch();
         batch.add_child(ROOT_INODE_ID, "orphan", 999_999).unwrap();
         batch.commit().unwrap();
@@ -662,7 +701,11 @@ fn restore_from_rocksdb_repair_failure_keeps_old_tree_and_ttl_rebuilt() {
         .unwrap();
     runtime.configure(rule_id, rule).unwrap();
 
-    let rebuild = fs.fs_dir.write().restore_from_rocksdb();
+    let rebuild = fs
+        .fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .restore_from_rocksdb();
     let executions = runtime
         .rule(rule_id)
         .unwrap()
@@ -711,11 +754,16 @@ fn restore_from_rocksdb_rebuilds_ttl_from_current_db() {
 
     // Successful rebuild: the TTL list is cleared and repopulated from the
     // current database (only /kept remains).
-    fs.fs_dir.write().restore_from_rocksdb().unwrap();
+    fs.fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .restore_from_rocksdb()
+        .unwrap();
     assert!(fs.exists("/kept").unwrap());
     let ids: Vec<_> = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store_ref()
         .get_ttl_bucket_list()
         .get_expired_buckets_at(i64::MAX)

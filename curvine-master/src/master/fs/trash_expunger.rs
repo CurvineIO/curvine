@@ -2,15 +2,16 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+
+use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT; // You may obtain a copy of the License at
+                                                              //
+                                                              //     http://www.apache.org/licenses/LICENSE-2.0
+                                                              //
+                                                              // Unless required by applicable law or agreed to in writing, software
+                                                              // distributed under the License is distributed on an "AS IS" BASIS,
+                                                              // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+                                                              // See the License for the specific language governing permissions and
+                                                              // limitations under the License.
 
 use crate::master::fs::{MasterFilesystem, TrashPurger};
 use crate::master::MasterMonitor;
@@ -151,6 +152,7 @@ mod tests {
     use super::*;
     use crate::master::fs::DeleteMode;
     use crate::master::journal::JournalSystem;
+    use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
     use crate::master::meta::trash;
     use crate::master::Master;
     use curvine_config::ClusterConf;
@@ -261,7 +263,7 @@ mod tests {
         // role changes; the delete must observe the demotion at the mutation
         // boundary instead of purging the listing snapshot.
         let fs_dir = fs.fs_dir();
-        let lock = fs_dir.write();
+        let lock = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let sweep_fs = fs.clone();
         let handle = std::thread::spawn(move || {
             let expunger = TrashExpunger::new(sweep_fs.clone(), sweep_fs.master_monitor.clone());
@@ -272,8 +274,8 @@ mod tests {
         fs.master_monitor.journal_ctl.set_state(RoleState::Follower);
         drop(lock);
 
-        let result = handle.join().unwrap().unwrap();
-        assert_eq!(result, TrashExpungeResult::default());
+        let result = handle.join().unwrap();
+        assert_eq!(result.unwrap(), TrashExpungeResult::default());
         assert_eq!(fs.list_trash().unwrap().len(), 2);
     }
 

@@ -2,15 +2,16 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+
+use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT; // You may obtain a copy of the License at
+                                                              //
+                                                              //     http://www.apache.org/licenses/LICENSE-2.0
+                                                              //
+                                                              // Unless required by applicable law or agreed to in writing, software
+                                                              // distributed under the License is distributed on an "AS IS" BASIS,
+                                                              // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+                                                              // See the License for the specific language governing permissions and
+                                                              // limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::quota::QuotaManager;
@@ -210,6 +211,7 @@ impl LoopTask for HeartbeatChecker {
 mod tests {
     use super::*;
     use crate::master::journal::JournalSystem;
+    use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
     use crate::master::quota::eviction::evictor::{Evictor, LRUEvictor};
     use crate::master::quota::eviction::EvictionConf;
     use crate::master::Master;
@@ -251,8 +253,9 @@ mod tests {
             },
             1,
         ));
-        fs.fs_dir()
-            .write()
+        fs.fs_dir
+            .begin_cold(DEFAULT_COLD_TIMEOUT)
+            .unwrap()
             .store
             .add_block_location(BLOCK_ID, BlockLocation::new(WORKER_ID, StorageType::Disk))
             .unwrap();
@@ -293,8 +296,9 @@ mod tests {
     }
 
     fn location_count(fs: &MasterFilesystem) -> usize {
-        fs.fs_dir()
-            .read()
+        fs.fs_dir
+            .view()
+            .unwrap()
             .store
             .get_locations(BLOCK_ID)
             .unwrap()

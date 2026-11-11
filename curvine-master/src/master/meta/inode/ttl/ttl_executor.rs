@@ -45,14 +45,12 @@ impl InodeTtlExecutor {
     }
 
     fn get_inode_path(&self, inode_id: i64) -> FsResult<String> {
-        let fs_dir = self.filesystem.fs_dir();
-        let fs_dir_guard = fs_dir.read();
+        let fs_dir_guard = self.filesystem.fs_dir.view().unwrap();
         fs_dir_guard.get_inode_path(inode_id)
     }
 
     pub fn get_inode_from_store(&self, inode_id: i64) -> FsResult<Option<InodeView>> {
-        let fs_dir = self.filesystem.fs_dir();
-        let fs_dir_guard = fs_dir.read();
+        let fs_dir_guard = self.filesystem.fs_dir.view().unwrap();
         let inode = fs_dir_guard.store.get_inode(inode_id, None)?;
         Ok(inode)
     }
@@ -72,8 +70,7 @@ impl InodeTtlExecutor {
     }
 
     fn is_empty_dir(&self, path: &str) -> FsResult<bool> {
-        let fs_dir = self.filesystem.fs_dir();
-        let fs_dir_guard = fs_dir.write();
+        let fs_dir_guard = self.filesystem.fs_dir.view().unwrap();
         let inp = InodePath::resolve(fs_dir_guard.root_node(), path, &fs_dir_guard.store)?;
         Ok(inp.is_empty_dir())
     }

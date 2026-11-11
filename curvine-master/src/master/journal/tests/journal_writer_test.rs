@@ -1,4 +1,5 @@
 use super::*;
+use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::quota::eviction::evictor::{Evictor, LRUEvictor};
 use crate::master::quota::eviction::EvictionConf;
@@ -146,7 +147,7 @@ fn periodic_snapshot_waits_for_other_admitted_writers() -> FsResult<()> {
     conf.journal.writer_channel_size = 16;
     let journal = JournalSystem::from_conf(&conf)?;
     let fs = journal.fs();
-    let writer = fs.fs_dir.read().journal_writer.clone();
+    let writer = fs.fs_dir.view().unwrap().journal_writer.clone();
     let gate = fs.metadata_commit_gate();
     let guard = gate.enter();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -210,7 +211,12 @@ fn periodic_snapshot_failure_keeps_committed_write_and_retries() -> FsResult<()>
     fs::remove_file(&checkpoint_dir)?;
     first?;
     assert!(fs.exists("/first")?);
-    assert!(fs.fs_dir.read().journal_writer.periodic_snapshot_due());
+    assert!(fs
+        .fs_dir
+        .view()
+        .unwrap()
+        .journal_writer
+        .periodic_snapshot_due());
 
     fs.mkdir("/second", false)?;
     assert!(fs.exists("/second")?);
@@ -505,7 +511,7 @@ fn overwrite_and_ttl_delete_entries_replay_idempotently() -> FsResult<()> {
     fs.create("/file", true)?;
     let overwrite_file = {
         let fs_dir_handle = fs.fs_dir();
-        let fs_dir = fs_dir_handle.read();
+        let fs_dir = fs_dir_handle.view().unwrap();
         InodePath::resolve(fs_dir.root_node(), "/file", &fs_dir.store)?.clone_last_file()?
     };
 
@@ -539,7 +545,7 @@ fn overwrite_and_ttl_delete_entries_replay_idempotently() -> FsResult<()> {
         path: "/file".to_string(),
         file: {
             let fs_dir_handle = fs.fs_dir();
-            let fs_dir = fs_dir_handle.read();
+            let fs_dir = fs_dir_handle.view().unwrap();
             InodePath::resolve(fs_dir.root_node(), "/file", &fs_dir.store)?.clone_last_file()?
         },
     }))?;
@@ -620,14 +626,18 @@ fn verify_overwrite_confirmation(committed: bool) -> FsResult<()> {
         None,
     )?;
     let block_id = block.block.id;
-    fs.fs_dir()
-        .write()
+    fs.fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
         .add_block_location(block_id, BlockLocation::with_id(100))?;
     let mut writer = build_writer(&conf)?;
     writer.require_raft_commit = true;
     writer.recovery = journal.master_monitor().recovery();
     let writer = Arc::new(writer);
-    fs.fs_dir().write().journal_writer = writer.clone();
+    fs.fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .journal_writer = writer.clone();
     let mut fs = fs;
     fs.journal_writer = writer.clone();
     let worker_fs = fs.clone();
@@ -709,7 +719,10 @@ fn ttl_refresh_holds_commit_gate_until_confirmation() -> FsResult<()> {
     writer.require_raft_commit = true;
     writer.recovery = journal.master_monitor().recovery();
     let writer = Arc::new(writer);
-    fs.fs_dir().write().journal_writer = writer.clone();
+    fs.fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .journal_writer = writer.clone();
 
     let mut fs = fs;
     fs.journal_writer = writer.clone();
@@ -763,7 +776,10 @@ fn lost_commit_confirmation_fences_filesystem() -> FsResult<()> {
     writer.require_raft_commit = true;
     writer.recovery = journal.master_monitor().recovery();
     let writer = Arc::new(writer);
-    fs.fs_dir().write().journal_writer = writer.clone();
+    fs.fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .journal_writer = writer.clone();
 
     let mut fs = fs;
     fs.journal_writer = writer.clone();
@@ -801,7 +817,10 @@ fn failed_scoped_enqueue_fences_filesystem() -> FsResult<()> {
     writer.recovery = journal.master_monitor().recovery();
     drop(writer.receiver.take());
     let writer = Arc::new(writer);
-    fs.fs_dir().write().journal_writer = writer.clone();
+    fs.fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .journal_writer = writer.clone();
     let mut fs = fs;
     fs.journal_writer = writer.clone();
     assert!(fs.mkdir("/unlogged", false).is_err());

@@ -2,15 +2,16 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+
+use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT; // You may obtain a copy of the License at
+                                                                       //
+                                                                       //     http://www.apache.org/licenses/LICENSE-2.0
+                                                                       //
+                                                                       // Unless required by applicable law or agreed to in writing, software
+                                                                       // distributed under the License is distributed on an "AS IS" BASIS,
+                                                                       // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+                                                                       // See the License for the specific language governing permissions and
+                                                                       // limitations under the License.
 
 use curvine_config::ClusterConf;
 use curvine_master::master::fs::{DeleteMode, MasterFilesystem, TrashPurger};
@@ -76,7 +77,7 @@ fn purge_batch_preserves_external_hard_link() {
     fs.delete_with_mode("/victim", true, DeleteMode::Default)
         .unwrap();
     let entry = fs.list_trash().unwrap().remove(0).path;
-    purger(&fs).purge_entry(&entry).unwrap().unwrap();
+    purger(&fs).purge_entry(&entry).unwrap();
     let survivor = fs.file_status("/survivor").unwrap();
     assert_eq!(survivor.id, original.id);
     assert_eq!(survivor.nlink, 1);
@@ -89,8 +90,8 @@ fn purge_batch_preserves_external_hard_link() {
 fn missing_entry_walk_waits_for_namespace_readers() {
     let _serial = TEST_LOCK.lock().unwrap();
     let fs = trash_fs("walk-lock", 8, 0);
-    let fs_dir = fs.fs_dir();
-    let held = fs_dir.read();
+    let fs_dir = fs.fs_dir.clone();
+    let held = fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (tx, rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -101,7 +102,7 @@ fn missing_entry_walk_waits_for_namespace_readers() {
     drop(held);
     worker.join().unwrap();
     assert!(early.is_err(), "trash walk bypassed the namespace lock");
-    assert!(rx.recv().unwrap().unwrap().is_some());
+    assert!(rx.recv().unwrap().is_ok());
 }
 
 #[test]
@@ -141,7 +142,10 @@ fn releases_the_namespace_lock_between_batches() {
     let purge_entry = entry.clone();
     let handle = std::thread::spawn(move || {
         let started = Instant::now();
-        let outcome = purger(&purge_fs).purge_entry(&purge_entry);
+        let outcome = purger(&purge_fs)
+            .purge_entry(&purge_entry)
+            .unwrap()
+            .unwrap();
         tx.send(outcome).unwrap();
         started.elapsed()
     });
@@ -152,16 +156,12 @@ fn releases_the_namespace_lock_between_batches() {
     std::thread::sleep(Duration::from_millis(20));
     let started = Instant::now();
     {
-        let fs_dir = fs.fs_dir();
-        let _guard = fs_dir.write();
+        let fs_dir = fs.fs_dir.clone();
+        let _guard = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
     }
     let waited = started.elapsed();
 
-    let outcome = rx
-        .recv_timeout(Duration::from_secs(60))
-        .unwrap()
-        .expect("the purger must finish")
-        .expect("the purger must stay active");
+    let outcome = rx.recv_timeout(Duration::from_secs(60)).unwrap();
     let purged_for = handle.join().unwrap();
 
     assert!(outcome.batches > 1, "purge must span several batches");
@@ -212,9 +212,9 @@ fn purge_survives_a_restart_and_replaying_a_finished_entry_is_a_no_op() {
     assert!(fs.list_trash().unwrap().is_empty());
 
     // A second cycle for the same (now missing) entry must not fail.
-    let replay = purger(&fs).purge_entry(&entry).unwrap().unwrap();
-    assert_eq!(replay.batches, 0);
-    assert_eq!(replay.inodes, 0);
+    let replay = purger(&fs).purge_entry(&entry).unwrap();
+    assert_eq!(replay.unwrap().batches, 0);
+    assert_eq!(replay.unwrap().inodes, 0);
 }
 
 #[test]
@@ -228,9 +228,9 @@ fn purges_a_trashed_single_file_entry() {
 
     // A trashed entry can be a plain file: the walk must emit the root itself
     // instead of descending into it.
-    let outcome = purger(&fs).purge_entry(&entry).unwrap().unwrap();
-    assert_eq!(outcome.batches, 1);
-    assert_eq!(outcome.inodes, 1);
+    let outcome = purger(&fs).purge_entry(&entry).unwrap();
+    assert_eq!(outcome.unwrap().batches, 1);
+    assert_eq!(outcome.unwrap().inodes, 1);
     assert!(!fs.exists(&entry).unwrap());
     assert!(fs.list_trash().unwrap().is_empty());
     // (dirs, files): the surviving /data parent and the trash root, no files.
@@ -277,6 +277,6 @@ fn bounds_batches_by_path_bytes_as_well_as_inodes() {
     fs.delete_with_mode("/victim", true, DeleteMode::Default)
         .unwrap();
     let entry = fs.list_trash().unwrap().remove(0).path;
-    let outcome = purger(&fs).purge_entry(&entry).unwrap().unwrap();
-    assert_eq!(outcome.batches, 1);
+    let outcome = purger(&fs).purge_entry(&entry).unwrap();
+    assert_eq!(outcome.unwrap().batches, 1);
 }

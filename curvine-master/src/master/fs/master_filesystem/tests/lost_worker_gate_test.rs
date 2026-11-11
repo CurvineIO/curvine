@@ -31,7 +31,8 @@ fn lost_worker_cleanup_does_not_cross_a_closed_commit_gate() {
         .is_err());
     assert_eq!(
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .get_block_locations(block_id)
             .unwrap()
             .len(),
@@ -47,7 +48,8 @@ fn lost_worker_cleanup_does_not_cross_a_closed_commit_gate() {
     assert_eq!(cleanup.removed_block_ids, vec![block_id]);
     assert!(fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .get_block_locations(block_id)
         .unwrap()
         .is_empty());
@@ -58,7 +60,7 @@ fn close_file_waits_for_commit_gate() {
     let fs = test_fs("close-file-commit-gate");
     fs.create("/file", true).unwrap();
     let client = {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         let path = MasterFilesystem::resolve_path(&dir, "/file").unwrap();
         let inode = path.get_last_inode().unwrap();
         inode
@@ -90,7 +92,7 @@ fn close_file_waits_for_commit_gate() {
         .unwrap();
     let blocked = done_rx.recv_timeout(std::time::Duration::from_millis(100));
     let writing = {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         let path = MasterFilesystem::resolve_path(&dir, "/file").unwrap();
         path.get_last_inode()
             .unwrap()
@@ -105,8 +107,8 @@ fn close_file_waits_for_commit_gate() {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout)
     ));
     assert!(writing);
-    done_rx.recv().unwrap().unwrap();
-    let dir = fs.fs_dir.read();
+    done_rx.recv().unwrap();
+    let dir = fs.fs_dir.view().unwrap();
     let path = MasterFilesystem::resolve_path(&dir, "/file").unwrap();
     assert!(!path
         .get_last_inode()
@@ -123,7 +125,7 @@ fn independent_block_reports_progress_with_namespace_reader() {
         replication_file(&fs, "/report-a"),
         replication_file(&fs, "/report-b"),
     ];
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let mut workers = Vec::new();
     for (index, block_id) in blocks.into_iter().enumerate() {
@@ -161,7 +163,8 @@ fn independent_block_reports_progress_with_namespace_reader() {
     for (index, block_id) in blocks.into_iter().enumerate() {
         assert!(fs
             .fs_dir
-            .read()
+            .view()
+            .unwrap()
             .get_block_locations(block_id)
             .unwrap()
             .iter()
@@ -256,7 +259,12 @@ fn block_report_waits_for_commit_gate() {
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
     let blocked = done_rx.recv_timeout(std::time::Duration::from_millis(100));
-    let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+    let locations = fs
+        .fs_dir
+        .view()
+        .unwrap()
+        .get_block_locations(block_id)
+        .unwrap();
     drop(barrier);
     worker.join().unwrap();
     assert!(matches!(
@@ -264,10 +272,11 @@ fn block_report_waits_for_commit_gate() {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout)
     ));
     assert!(locations.iter().all(|location| location.worker_id != 300));
-    done_rx.recv().unwrap().unwrap();
+    done_rx.recv().unwrap();
     assert!(fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .get_block_locations(block_id)
         .unwrap()
         .iter()
@@ -315,7 +324,8 @@ fn reconcile_rechecks_generation_after_gate_wait() {
     );
     assert!(fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .get_block_locations(block_id)
         .unwrap()
         .iter()
@@ -326,7 +336,7 @@ fn reconcile_rechecks_generation_after_gate_wait() {
 fn replication_location_progresses_with_namespace_reader() {
     let fs = test_fs("replication-location-shared-namespace");
     let block_id = replication_file(&fs, "/replication-shared.log");
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -342,7 +352,8 @@ fn replication_location_progresses_with_namespace_reader() {
         .unwrap());
     assert!(fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .get_block_locations(block_id)
         .unwrap()
         .iter()
@@ -368,7 +379,12 @@ fn replication_location_waits_for_commit_gate_and_checks_session() {
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
     let blocked = done_rx.recv_timeout(std::time::Duration::from_millis(100));
-    let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+    let locations = fs
+        .fs_dir
+        .view()
+        .unwrap()
+        .get_block_locations(block_id)
+        .unwrap();
     drop(barrier);
     worker.join().unwrap();
     assert!(matches!(
@@ -382,7 +398,8 @@ fn replication_location_waits_for_commit_gate_and_checks_session() {
         .is_err());
     assert!(fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .get_block_locations(block_id)
         .unwrap()
         .iter()
@@ -411,7 +428,8 @@ fn replication_location_waits_for_block_location_lock() {
         .is_err());
     assert!(fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .get_block_locations(block_id)
         .unwrap()
         .iter()
@@ -422,5 +440,5 @@ fn replication_location_waits_for_block_location_lock() {
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap()
         .unwrap());
-    worker.join().unwrap().unwrap();
+    worker.join().unwrap();
 }

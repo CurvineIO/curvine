@@ -290,8 +290,9 @@ fn metadata_edge_bench() {
     assert_eq!(
         persisted
             .fs
-            .fs_dir()
-            .read()
+            .fs_dir
+            .view()
+            .unwrap()
             .store_ref()
             .store()
             .get_directory_attributes(id)

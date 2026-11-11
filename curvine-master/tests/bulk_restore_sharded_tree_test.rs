@@ -44,7 +44,7 @@ fn restored_large_directory_preserves_nested_tree_and_metadata() {
     let nested_before = fs.file_status("/large/nested").unwrap();
     let last_before = fs.file_status("/large/file-2047").unwrap();
 
-    let dir = fs.fs_dir.read();
+    let dir = fs.fs_dir.view().unwrap();
     let (_, root) = dir.store_ref().create_tree().unwrap();
     let large = root
         .children_handle()

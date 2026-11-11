@@ -15,13 +15,12 @@
 use crate::master::fs::{MasterFilesystem, WorkerManager};
 use crate::master::journal::{JournalLoader, JournalWriter};
 use crate::master::meta::inode::ttl::TtlBucketList;
-use crate::master::meta::FsDir;
+use crate::master::meta::{FsDir, FsDirHandle};
 use crate::master::quota::eviction::evictor::{Evictor, LFUEvictor, LRUEvictor};
 use crate::master::quota::eviction::types::EvictionPolicy;
 use crate::master::quota::eviction::EvictionConf;
 use crate::master::{
-    JobManager, MasterMonitor, MetaRaftJournal, MountManager, QuotaManager, SyncFsDir,
-    SyncWorkerManager,
+    JobManager, MasterMonitor, MetaRaftJournal, MountManager, QuotaManager, SyncWorkerManager,
 };
 use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
@@ -55,7 +54,7 @@ pub struct JournalSystem {
 struct FsInitParts {
     worker_manager: SyncWorkerManager,
     journal_writer: Arc<JournalWriter>,
-    fs_dir: SyncFsDir,
+    fs_dir: Arc<FsDirHandle>,
     fs: MasterFilesystem,
     mount_manager: Arc<MountManager>,
     quota_manager: Arc<QuotaManager>,
@@ -117,12 +116,12 @@ impl JournalSystem {
             //to-do: EvictionPolicy::Arc
         };
 
-        let fs_dir = SyncFsDir::new(FsDir::new(
+        let fs_dir = Arc::new(FsDirHandle::new(FsDir::new(
             conf,
             journal_writer.clone(),
             ttl_bucket_list,
             evictor.clone(),
-        )?);
+        )?));
 
         let fs = MasterFilesystem::new(
             conf,

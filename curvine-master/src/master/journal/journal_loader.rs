@@ -19,14 +19,14 @@ use crate::master::journal::recovery::{
     classify_apply_error, should_defer_ufs, ApplyDisposition, RecoveryGate,
 };
 use crate::master::journal::*;
+use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::store::{JournalCursorStore, RocksInodeStore};
+use crate::master::meta::FsDirHandle;
 use crate::master::meta::{CommitGate, FsDir, InodeId};
 use crate::master::space::MetadataScanControl;
-use crate::master::{
-    JobManager, Master, MasterMetrics, MountManager, SyncFsDir, SyncWorkerManager,
-};
+use crate::master::{JobManager, Master, MasterMetrics, MountManager, SyncWorkerManager};
 use curvine_config::DBConf;
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, ternary, CommonResult, ErrorExt};
@@ -75,7 +75,7 @@ pub struct JournalLoader {
     node_id: u64,
     client: RaftClient,
     group_size: usize,
-    fs_dir: SyncFsDir,
+    fs_dir: Arc<FsDirHandle>,
     meta_data_dir: String,
     scan_control: Arc<MetadataScanControl>,
     inode_id: Arc<InodeId>,
@@ -161,7 +161,7 @@ impl JournalLoader {
     }
 
     pub fn new_replay_loader(
-        fs_dir: SyncFsDir,
+        fs_dir: Arc<FsDirHandle>,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
         job_manager: Arc<JobManager>,
@@ -191,7 +191,7 @@ impl JournalLoader {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         rt: Arc<Runtime>,
-        fs_dir: SyncFsDir,
+        fs_dir: Arc<FsDirHandle>,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
         job_manager: Arc<JobManager>,
@@ -224,7 +224,7 @@ impl JournalLoader {
     #[allow(clippy::too_many_arguments)]
     fn build(
         rt: Arc<Runtime>,
-        fs_dir: SyncFsDir,
+        fs_dir: Arc<FsDirHandle>,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
         job_manager: Arc<JobManager>,
@@ -251,7 +251,7 @@ impl JournalLoader {
         // The cursor and metadata rows are persisted independently. An invalid
         // cursor cannot safely be replaced by zero: replay may mutate already
         // materialized metadata a second time.
-        let persisted_applied = fs_dir.read().load_journal_applied()?;
+        let persisted_applied = fs_dir.view().unwrap().load_journal_applied()?;
         let mut initial_state = FsmState::default();
         if let Some(ref bytes) = persisted_applied {
             let applied = match AppliedIndex::decode(bytes.as_slice()) {
@@ -302,7 +302,7 @@ impl JournalLoader {
             );
         }
         let (meta_data_dir, scan_control, inode_id, op_id, cursor_store) = {
-            let dir = fs_dir.read();
+            let dir = fs_dir.view().unwrap();
             (
                 dir.store.store().db.conf().data_dir.clone(),
                 dir.store.scan_control().clone(),
@@ -1341,19 +1341,19 @@ impl JournalLoader {
     }
 
     fn deferred_ufs_records(&self) -> CommonResult<Vec<(u64, Vec<u8>)>> {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.view().unwrap();
         fs_dir.store.ensure_available()?;
         fs_dir.store.store().ufs_deferred_records()
     }
 
     fn put_deferred_ufs(&self, index: u64, payload: &[u8]) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.view().unwrap();
         fs_dir.store.ensure_available()?;
         fs_dir.store.store().put_ufs_deferred(index, payload)
     }
 
     fn delete_deferred_ufs(&self, index: u64) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.view().unwrap();
         fs_dir.store.ensure_available()?;
         fs_dir.store.store().delete_ufs_deferred(index)
     }
@@ -1470,7 +1470,7 @@ impl JournalLoader {
         let dir = match dir_option {
             Some(dir) => dir,
             None => {
-                let fs_dir = self.fs_dir.read();
+                let fs_dir = self.fs_dir.view().unwrap();
                 fs_dir
                     .create_checkpoint(fsm_state.applied.index)
                     .map_err(|e| {
@@ -1587,7 +1587,7 @@ impl JournalLoader {
             0
         };
 
-        let mut fs_dir = self.fs_dir.write();
+        let mut fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .restore(&restore_path, checkpoint_size)
             .map_err(|e| {
@@ -1692,7 +1692,7 @@ impl JournalLoader {
             entry.paths.len()
         );
 
-        let mut fs_dir = self.fs_dir.write();
+        let mut fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let res = fs_dir.purge_paths(&entry.paths, entry.mtime)?;
         debug!(
             "TrashPurge: entry={} removed inodes={} bytes={}",
@@ -1702,12 +1702,12 @@ impl JournalLoader {
     }
 
     fn cache_invalidation(&self, entry: CacheInvalidationEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir.store.apply_cache_invalidations(entry.inodes)
     }
 
     fn mkdir(&self, entry: MkdirEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let inp = InodePath::resolve(fs_dir.root_node(), entry.path, &fs_dir.store)?;
         let name = inp.name().to_string();
         let _ = fs_dir.add_last_inode(inp, InodeView::new_dir(name, entry.dir))?;
@@ -1715,7 +1715,7 @@ impl JournalLoader {
     }
 
     fn create_file(&self, entry: CreateFileEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
 
         if inp.is_full() {
@@ -1728,7 +1728,7 @@ impl JournalLoader {
     }
 
     fn reopen_file(&self, entry: ReopenFileEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
 
         let mut inode = match inp.get_last_inode() {
@@ -1747,7 +1747,7 @@ impl JournalLoader {
     }
 
     fn overwrite_file(&self, entry: OverWriteFileEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
 
         let mut inode = match inp.get_last_inode() {
@@ -1766,7 +1766,7 @@ impl JournalLoader {
     }
 
     fn add_block(&self, entry: AddBlockEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
 
         let inode_id = entry.blocks.first().map(|v| InodeId::get_id(v.id));
 
@@ -1787,7 +1787,7 @@ impl JournalLoader {
     }
 
     fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
 
         let mut inode =
             match MasterFilesystem::resolve_file_inode(&fs_dir, &entry.path, Some(entry.file.id)) {
@@ -1808,7 +1808,7 @@ impl JournalLoader {
         Ok(())
     }
     pub fn rename(&self, entry: RenameEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let entry_src = entry.src;
         let src_inp = InodePath::resolve(fs_dir.root_node(), &entry_src, &fs_dir.store)?;
         let dst_inp = InodePath::resolve(fs_dir.root_node(), entry.dst, &fs_dir.store)?;
@@ -1835,7 +1835,7 @@ impl JournalLoader {
     }
 
     pub fn delete(&self, entry: DeleteEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let entry_path = entry.path;
         let inp = InodePath::resolve(fs_dir.root_node(), &entry_path, &fs_dir.store)?;
         if inp.get_last_inode().is_none() {
@@ -1847,7 +1847,7 @@ impl JournalLoader {
     }
 
     pub fn free(&self, entry: FreeEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
         let Some(inode) = inp.get_last_inode() else {
             warn!("Free: path not found: {:?}", entry);
@@ -1860,17 +1860,17 @@ impl JournalLoader {
     pub fn mount(&self, entry: MountEntry) -> CommonResult<()> {
         // Namespace first, then the mount table transaction: the same order
         // as the online RPC path.
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         Ok(self.mnt_mgr.replay_mount(&fs_dir, entry.info)?)
     }
 
     pub fn unmount(&self, entry: UnMountEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         Ok(self.mnt_mgr.replay_unmount(&fs_dir, entry.id)?)
     }
 
     pub fn set_attr(&self, entry: SetAttrEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
         let last_inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -1886,7 +1886,7 @@ impl JournalLoader {
 
     pub fn symlink(&self, entry: SymlinkEntry) -> CommonResult<()> {
         let link_path = entry.link;
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let inp = InodePath::resolve(fs_dir.root_node(), &link_path, &fs_dir.store)?;
         match fs_dir.unprotected_symlink(inp, entry.new_inode, entry.force) {
             Ok(_) => Ok(()),
@@ -1899,7 +1899,7 @@ impl JournalLoader {
     }
 
     pub fn link(&self, entry: LinkEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let old_path = InodePath::resolve(fs_dir.root_node(), &entry.src_path, &fs_dir.store)?;
         let new_path = InodePath::resolve(fs_dir.root_node(), &entry.dst_path, &fs_dir.store)?;
 
@@ -1929,7 +1929,7 @@ impl JournalLoader {
     }
 
     pub fn set_locks(&self, entry: SetLocksEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir.store.apply_set_locks(entry.ino, &entry.locks)
     }
 
@@ -2156,7 +2156,7 @@ impl AppStorage for JournalLoader {
     }
 
     fn snapshot_dir(&self, snapshot_id: u64) -> RaftResult<String> {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.view().unwrap();
         Ok(fs_dir.get_checkpoint_path(snapshot_id))
     }
 }

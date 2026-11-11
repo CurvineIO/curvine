@@ -462,7 +462,7 @@ impl DirSpaceManager {
         let Ok(normalized) = normalize_tracked_path(path) else {
             return Ok(None);
         };
-        let fs_dir = self.fs.fs_dir.read();
+        let fs_dir = self.fs.fs_dir.view().unwrap();
         let snapshot = InodeStoreSnapshot::new(fs_dir.store_ref().checked_read_snapshot()?);
         resolve_dir_id(&snapshot, &normalized)
     }
@@ -612,7 +612,7 @@ impl DirSpaceManager {
         context: &ScanContext,
     ) -> CommonResult<DirSpaceSnapshot> {
         let lease = {
-            let fs_dir = self.fs.fs_dir.read();
+            let fs_dir = self.fs.fs_dir.view().unwrap();
             fs_dir.begin_snapshot_scan()?
         };
         let unpublished = PointScanner::scan(&lease, root_id, context)?;
@@ -743,7 +743,7 @@ impl DirSpaceManager {
         // One short store clone; the lease (and its store Arc) is dropped
         // before returning so a pending restore can proceed.
         let lease = {
-            let fs_dir = self.fs.fs_dir.read();
+            let fs_dir = self.fs.fs_dir.view().unwrap();
             fs_dir.begin_snapshot_scan()?
         };
         let unpublished = GlobalScanner::scan(&lease, context)?;
@@ -874,7 +874,7 @@ impl DirSpaceManager {
             return Ok(None);
         }
 
-        let fs_dir = self.fs.fs_dir.read();
+        let fs_dir = self.fs.fs_dir.view().unwrap();
         let namespace =
             InodeStoreSnapshot::new(fs_dir.store_ref().checked_read_snapshot().map_err(|_| {
                 DirSpaceQueryError::SnapshotMiss(
@@ -916,7 +916,7 @@ impl DirSpaceManager {
         let normalized = normalize_dir_path(path)?;
 
         // Resolve the requested path and all point roots from one store view.
-        let fs_dir = self.fs.fs_dir.read();
+        let fs_dir = self.fs.fs_dir.view().unwrap();
         let namespace =
             InodeStoreSnapshot::new(fs_dir.store_ref().checked_read_snapshot().map_err(|_| {
                 DirSpaceQueryError::SnapshotMiss(
@@ -1249,7 +1249,7 @@ mod tests {
         // Make the scan impossible: a pending restore rejects new leases, so
         // the round fails and the old generation stays.
         let guard = {
-            let fs_dir = fs.fs_dir.read();
+            let fs_dir = fs.fs_dir.view().unwrap();
             fs_dir
                 .store_ref()
                 .begin_restore(std::time::Duration::from_secs(60))
@@ -1275,14 +1275,14 @@ mod tests {
         let manager = manager_for(&fs, &conf);
 
         let id_a = {
-            let fs_dir = fs.fs_dir.read();
+            let fs_dir = fs.fs_dir.view().unwrap();
             let snapshot = InodeStoreSnapshot::new(fs_dir.store_ref().store().read_snapshot());
-            super::resolve_dir_id(&snapshot, "/a").unwrap().unwrap()
+            super::resolve_dir_id(&snapshot, "/a").unwrap()
         };
         let id_ab = {
-            let fs_dir = fs.fs_dir.read();
+            let fs_dir = fs.fs_dir.view().unwrap();
             let snapshot = InodeStoreSnapshot::new(fs_dir.store_ref().store().read_snapshot());
-            super::resolve_dir_id(&snapshot, "/ab").unwrap().unwrap()
+            super::resolve_dir_id(&snapshot, "/ab").unwrap()
         };
         assert_ne!(id_a, id_ab);
 
@@ -1302,7 +1302,7 @@ mod tests {
         };
 
         let mut points = HashMap::new();
-        points.insert("/a".to_string(), Arc::new(mk_point(id_a)));
+        points.insert("/a".to_string(), Arc::new(mk_point(id_a.unwrap())));
         // Component-level matching: "/a" is a prefix of "/a/sub", never "/ab".
         assert!(Path::has_prefix("/a/sub", "/a"));
         assert!(!Path::has_prefix("/ab", "/a"));
@@ -1313,7 +1313,7 @@ mod tests {
 
         // Stale point (root id changed): skipped.
         let mut stale = HashMap::new();
-        stale.insert("/a".to_string(), Arc::new(mk_point(id_ab)));
+        stale.insert("/a".to_string(), Arc::new(mk_point(id_ab.unwrap())));
         assert!(manager.select_point("/a/sub", &stale).unwrap().is_none());
 
         // Removed root: skipped.
@@ -1323,12 +1323,12 @@ mod tests {
 
         // Longest prefix wins when nested points exist.
         let id_sub = {
-            let fs_dir = fs.fs_dir.read();
+            let fs_dir = fs.fs_dir.view().unwrap();
             let snapshot = InodeStoreSnapshot::new(fs_dir.store_ref().store().read_snapshot());
-            super::resolve_dir_id(&snapshot, "/a/sub").unwrap().unwrap()
+            super::resolve_dir_id(&snapshot, "/a/sub").unwrap()
         };
         let mut nested = points.clone();
-        nested.insert("/a/sub".to_string(), Arc::new(mk_point(id_sub)));
+        nested.insert("/a/sub".to_string(), Arc::new(mk_point(id_sub.unwrap())));
         let selected = manager.select_point("/a/sub/x", &nested).unwrap();
         assert_eq!(selected.as_ref().map(|(p, _)| p.as_str()), Some("/a/sub"));
     }

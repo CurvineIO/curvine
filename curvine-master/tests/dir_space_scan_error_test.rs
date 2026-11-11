@@ -45,7 +45,7 @@ fn dangling_tracked_directory_is_a_failed_scan() {
     );
     assert_eq!(manager.try_scan_tracked_points(0).0, ScanOutcome::Success);
     {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         let mut batch = dir.store_ref().store().new_batch();
         batch.delete_inode(id).unwrap();
         batch.commit().unwrap();

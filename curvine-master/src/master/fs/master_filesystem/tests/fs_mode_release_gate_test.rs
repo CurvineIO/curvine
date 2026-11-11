@@ -124,7 +124,8 @@ fn releasable_file(fs: &MasterFilesystem, path: &str) -> i64 {
         .unwrap();
     let block_id = block.block.id;
     fs.fs_dir
-        .write()
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
         .add_block_location(block_id, BlockLocation::with_id(100))
         .unwrap();
 
@@ -267,6 +268,8 @@ fn a_deferred_free_reports_no_pending_once_released() {
     let fs = test_fs("fs-mode-free-gate-released");
     let inode_id = releasable_file(&fs, "/done.log");
     let snapshot = fs.fs_mode_snapshot(inode_id).unwrap().unwrap();
+
+    let view = fs.fs_dir.view().unwrap();
     assert!(fs
         .release_verified(inode_id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime)
         .unwrap());
@@ -289,6 +292,8 @@ fn a_verified_release_frees_exactly_the_verified_version() {
 
     // The gate stays installed: a verified release must not loop back into it.
     fs.set_fs_mode_releaser(Arc::new(RecordingReleaser::deferring()));
+
+    let view = fs.fs_dir.view().unwrap();
     assert!(fs
         .release_verified(inode_id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime)
         .unwrap());
@@ -308,7 +313,9 @@ fn a_verified_release_refuses_a_renamed_file() {
     let snapshot = fs.fs_mode_snapshot(inode_id).unwrap().unwrap();
     fs.rename("/before.log", "/after.log", RenameFlags::empty())
         .unwrap();
-    assert!(!fs
+
+    let view = fs.fs_dir.view().unwrap();
+    assert!(fs
         .release_verified(inode_id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime)
         .unwrap());
     assert_eq!(
@@ -331,7 +338,9 @@ fn a_verified_release_refuses_a_changed_file() {
             .build(),
     )
     .unwrap();
-    assert!(!fs
+
+    let view = fs.fs_dir.view().unwrap();
+    assert!(fs
         .release_verified(inode_id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime)
         .unwrap());
 
@@ -340,7 +349,9 @@ fn a_verified_release_refuses_a_changed_file() {
     fs.delete("/changed.log", false).unwrap();
     fs.rename("/other.log", "/changed.log", RenameFlags::empty())
         .unwrap();
-    assert!(!fs
+
+    let view = fs.fs_dir.view().unwrap();
+    assert!(fs
         .release_verified(inode_id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime)
         .unwrap());
     assert_eq!(

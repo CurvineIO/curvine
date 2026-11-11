@@ -45,7 +45,13 @@ fn write_planning_walks_live_edges_and_keeps_partial_ids() {
     assert!(fs.resolve_edge_ids("relative/path").is_err());
 
     // The planned epoch matches the live scan control.
-    let epoch = fs.fs_dir.read().store.scan_control().cancel_epoch();
+    let epoch = fs
+        .fs_dir
+        .view()
+        .unwrap()
+        .store
+        .scan_control()
+        .cancel_epoch();
     let (_, _, _, planned) = fs.resolve_edge_ids("/a").unwrap();
     assert_eq!(planned, epoch);
 }

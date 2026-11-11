@@ -38,7 +38,7 @@ fn existing_mkdir_waits_for_target_inode_lock() {
     let held = fs.inode_locks.write_inode(id);
     // An idle namespace guard does not mean inode locks are idle. An
     // exclusive fast path must not bypass an already admitted inode holder.
-    assert!(fs.fs_dir.try_write().is_ok());
+    assert!(!fs.fs_dir.is_cold());
     let worker_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -65,7 +65,7 @@ fn edge_plan_handles_survive_directory_replacement() {
     let fs = test_fs("edge-plan-directory-replacement");
     let old_id = fs.mkdir("/parent", false).unwrap().id;
     let old_child_id = fs.mkdir("/parent/child", false).unwrap().id;
-    let root = fs.fs_dir.read().root_node().children.clone();
+    let root = fs.fs_dir.view().unwrap().root_node().children.clone();
     let (old_parent, _) = root.read_child_shared("parent");
     let old_children = old_parent.unwrap().children_handle().unwrap();
 
@@ -75,7 +75,7 @@ fn edge_plan_handles_survive_directory_replacement() {
     assert_ne!(old_id, new_id);
     assert_ne!(old_child_id, new_child_id);
     {
-        let guard = fs.fs_dir.read();
+        let guard = fs.fs_dir.view().unwrap();
         assert!(MasterFilesystem::resolve_locked_path(
             &guard,
             "/parent/child",
@@ -100,7 +100,7 @@ fn edge_plan_reads_store_edges() {
     {
         // Deliberately diverge the live ID from the store to check the read
         // source; this is not a valid namespace state or a race detector.
-        let guard = fs.fs_dir.write();
+        let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let path = MasterFilesystem::resolve_path(&guard, "/parent").unwrap();
         let inode = path.get_last_inode().unwrap();
         inode.as_mut().as_dir_mut().unwrap().id = id + 1;
@@ -133,7 +133,7 @@ fn exists_reads_topology_from_store_snapshot() {
     {
         // Deliberately detach the live subtree to check the read source; this
         // is not a valid namespace state or a concurrency test.
-        let guard = fs.fs_dir.write();
+        let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let path = MasterFilesystem::resolve_path(&guard, "/parent").unwrap();
         let inode = path.get_last_inode().unwrap();
         let detached = inode.as_ref().clone_metadata();
@@ -151,7 +151,7 @@ fn edge_plan_stops_at_a_file_component() {
     assert_eq!(components, 3);
     assert_eq!(ids.len(), 2);
     assert_eq!(ids[1], file.id);
-    let guard = fs.fs_dir.read();
+    let guard = fs.fs_dir.view().unwrap();
     assert!(
         MasterFilesystem::resolve_locked_path(&guard, "/file/child", &ids, components)
             .unwrap()
@@ -167,7 +167,7 @@ fn namespace_validation_checks_first_missing_component() {
     let (ids, components, full, _) = fs.resolve_edge_ids(path).unwrap();
     assert!(!full);
     {
-        let guard = fs.fs_dir.read();
+        let guard = fs.fs_dir.view().unwrap();
         assert!(
             MasterFilesystem::resolve_locked_path(&guard, path, &ids, components)
                 .unwrap()
@@ -176,7 +176,7 @@ fn namespace_validation_checks_first_missing_component() {
     }
 
     fs.mkdir("/parent/missing", false).unwrap();
-    let guard = fs.fs_dir.read();
+    let guard = fs.fs_dir.view().unwrap();
     assert!(
         MasterFilesystem::resolve_locked_path(&guard, path, &ids, components)
             .unwrap()
@@ -188,7 +188,7 @@ fn namespace_validation_checks_first_missing_component() {
 fn topology_reads_wait_for_shared_namespace_writers() {
     let fs = test_fs("status-list-exclusive");
     fs.create("/dir/file", true).unwrap();
-    let held = fs.fs_dir.read();
+    let held = fs.fs_dir.view().unwrap();
     let start = Arc::new(std::sync::Barrier::new(9));
     let (tx, rx) = std::sync::mpsc::channel();
     let mut threads = Vec::new();
@@ -242,15 +242,15 @@ fn path_status_uses_one_snapshot_without_exclusive_namespace_lock() {
     fs.set_attr("/dir", SetAttrOptsBuilder::new().mode(0o700).build())
         .unwrap();
 
-    let held = fs.fs_dir.read();
+    let held = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || tx.send(worker_fs.file_status("/dir")).unwrap());
-    let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+    let result = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
     drop(held);
     worker.join().unwrap();
 
-    let status = result.unwrap().unwrap();
+    let status = result.unwrap();
     assert!(status.is_dir);
     assert_eq!(status.mode, 0o700);
     assert_eq!(status.children_num, 2);
@@ -266,7 +266,7 @@ fn path_status_reads_inode_from_store_snapshot() {
     {
         // Simulate a live view from a different generation. Path status must
         // not combine it with edges or directory attributes from the store.
-        let guard = fs.fs_dir.write();
+        let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let path = MasterFilesystem::resolve_path(&guard, "/dir").unwrap();
         let inode = path.get_last_inode().unwrap();
         inode
@@ -323,7 +323,8 @@ fn path_status_uses_persisted_child_count_after_namespace_mutations() {
 
     let attributes = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store
         .store
         .get_directory_attributes(dir.id)
@@ -344,7 +345,8 @@ fn path_status_uses_persisted_child_count_after_namespace_mutations() {
     assert_eq!((dir.children_num, dir.len), (0, 0));
     assert_eq!(
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .store
             .store
             .get_directory_attributes(dir.id)
@@ -359,7 +361,11 @@ fn path_status_uses_persisted_child_count_after_namespace_mutations() {
         "cross-directory rename must add one destination child"
     );
 
-    fs.fs_dir.write().restore_from_rocksdb().unwrap();
+    fs.fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .restore_from_rocksdb()
+        .unwrap();
     assert_eq!(fs.file_status("/dir").unwrap().children_num, 0);
     assert_eq!(fs.file_status("/outside").unwrap().children_num, 1);
 
@@ -371,7 +377,8 @@ fn path_status_uses_persisted_child_count_after_namespace_mutations() {
     assert_eq!(outside.children_num, 2);
     assert_eq!(
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .store
             .store
             .get_directory_attributes(outside.id)
@@ -380,7 +387,11 @@ fn path_status_uses_persisted_child_count_after_namespace_mutations() {
             .children(),
         None
     );
-    fs.fs_dir.write().restore_from_rocksdb().unwrap();
+    fs.fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .restore_from_rocksdb()
+        .unwrap();
     fs.set_attr("/outside", SetAttrOptsBuilder::new().mode(0o700).build())
         .unwrap();
     assert_eq!(fs.file_status("/outside").unwrap().children_num, 2);
@@ -406,7 +417,7 @@ fn cross_parent_rename_tracks_live_and_stored_child_counts() {
                 fs.rename(src, dst, RenameFlags::empty()).unwrap();
                 for (path, expected) in [("/a", expected_a), ("/b", expected_b)] {
                     assert_eq!(fs.file_status(path).unwrap().children_num, expected);
-                    let guard = fs.fs_dir.read();
+                    let guard = fs.fs_dir.view().unwrap();
                     let inode_path = MasterFilesystem::resolve_path(&guard, path).unwrap();
                     let parent = inode_path.get_last_inode().unwrap();
                     assert_eq!(
@@ -421,7 +432,7 @@ fn cross_parent_rename_tracks_live_and_stored_child_counts() {
             .unwrap();
         for (path, expected) in [("/a", 0), ("/b", 1)] {
             assert_eq!(fs.file_status(path).unwrap().children_num, expected);
-            let guard = fs.fs_dir.read();
+            let guard = fs.fs_dir.view().unwrap();
             let inode_path = MasterFilesystem::resolve_path(&guard, path).unwrap();
             let parent = inode_path.get_last_inode().unwrap();
             assert_eq!(
@@ -431,7 +442,11 @@ fn cross_parent_rename_tracks_live_and_stored_child_counts() {
         }
         fs.rename("/b/target", "/a/file", RenameFlags::empty())
             .unwrap();
-        fs.fs_dir.write().restore_from_rocksdb().unwrap();
+        fs.fs_dir
+            .begin_cold(DEFAULT_COLD_TIMEOUT)
+            .unwrap()
+            .restore_from_rocksdb()
+            .unwrap();
         assert_eq!(fs.file_status("/a").unwrap().children_num, 1);
         assert_eq!(fs.file_status("/b").unwrap().children_num, 0);
     }
@@ -455,13 +470,17 @@ fn same_parent_directory_replacement_persists_link_count() {
         let status = fs.file_status("/p").unwrap();
         assert_eq!((status.nlink, status.children_num), (3, 1));
         {
-            let guard = fs.fs_dir.read();
+            let guard = fs.fs_dir.view().unwrap();
             let path = MasterFilesystem::resolve_path(&guard, "/p").unwrap();
             let parent = path.get_last_inode().unwrap();
             let attributes = parent.as_dir_ref().unwrap().directory_attributes();
             assert_eq!((attributes.nlink, attributes.children), (3, Some(1)));
         }
-        fs.fs_dir.write().restore_from_rocksdb().unwrap();
+        fs.fs_dir
+            .begin_cold(DEFAULT_COLD_TIMEOUT)
+            .unwrap()
+            .restore_from_rocksdb()
+            .unwrap();
         let status = fs.file_status("/p").unwrap();
         assert_eq!((status.nlink, status.children_num), (3, 1));
         fs.delete("/p/b", false).unwrap();
@@ -475,7 +494,7 @@ fn directory_publication_failure_fences_subsequent_writes() {
     let fs = test_fs("directory-publication-fence");
     fs.mkdir("/parent", false).unwrap();
     {
-        let guard = fs.fs_dir.write();
+        let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let path = MasterFilesystem::resolve_path(&guard, "/parent").unwrap();
         let node = path.get_last_dir_node().expect("live dir node");
         let mut attributes = node.directory_attributes();
@@ -489,7 +508,7 @@ fn directory_publication_failure_fences_subsequent_writes() {
     // the live tree did not publish the child, the writer is fenced, and the
     // no-snapshot rebuild reconciles the store on restart.
     {
-        let guard = fs.fs_dir.read();
+        let guard = fs.fs_dir.view().unwrap();
         let lease = guard.begin_snapshot_scan().unwrap();
         let resolved = lease
             .snapshot_reader()
@@ -508,7 +527,7 @@ fn child_publication_failure_after_delete_fences_writes() {
     let fs = test_fs("child-publication-fence");
     fs.create("/parent/child", true).unwrap();
     {
-        let guard = fs.fs_dir.write();
+        let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let path = MasterFilesystem::resolve_path(&guard, "/parent/child").unwrap();
         let id = path.get_last_inode().unwrap().id();
         let mut parent = path.get_inode(-2).unwrap();
@@ -558,7 +577,8 @@ fn purge_child_publication_failure_fences_writes() {
         .id;
     let location = BlockLocation::with_id(100);
     fs.fs_dir
-        .write()
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
         .add_block_location(block_id, location.clone())
         .unwrap();
     fs.complete_file(
@@ -577,9 +597,14 @@ fn purge_child_publication_failure_fences_writes() {
     .unwrap();
     {
         let inode_id = fs.file_status(&path).unwrap().id;
-        let guard = fs.fs_dir.read();
-        let inode = guard.store.get_inode(inode_id, None).unwrap().unwrap();
-        let locs = inode.as_file_ref().unwrap().get_locs(&guard.store).unwrap();
+        let guard = fs.fs_dir.view().unwrap();
+        let inode = guard.store.get_inode(inode_id, None).unwrap();
+        let locs = inode
+            .unwrap()
+            .as_file_ref()
+            .unwrap()
+            .get_locs(&guard.store)
+            .unwrap();
         assert_eq!(locs.get(&block_id).unwrap().len(), 1);
     }
     fs.master_monitor
@@ -623,7 +648,7 @@ fn delete_and_rename_publication_failures_fence_writes() {
         let fs = test_fs(&format!("directory-publication-{operation}"));
         fs.create("/parent/child", true).unwrap();
         {
-            let guard = fs.fs_dir.write();
+            let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
             let path = MasterFilesystem::resolve_path(&guard, "/parent").unwrap();
             let node = path.get_last_dir_node().expect("live dir node");
             let mut attributes = node.directory_attributes();
@@ -665,7 +690,7 @@ fn directory_space_query_resolves_with_a_shared_namespace_guard() {
         Arc::new(MountManager::new(fs.clone())),
         Arc::new(conf),
     );
-    let guard = fs.fs_dir.read();
+    let guard = fs.fs_dir.view().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || tx.send(manager.query("/dir")).unwrap());
     let result = rx.recv_timeout(std::time::Duration::from_secs(5));
@@ -684,7 +709,7 @@ fn status_by_id_reads_owned_file_and_directory_without_exclusive_namespace_lock(
     let directory = fs
         .set_attr("/dir", SetAttrOptsBuilder::new().mode(0o700).build())
         .unwrap();
-    let guard = fs.fs_dir.read();
+    let guard = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -709,18 +734,18 @@ fn inode_path_uses_the_same_snapshot_as_file_metadata() {
     let fs = test_fs("inode-path-snapshot");
     let file = fs.create("/old/file", true).unwrap();
     fs.mkdir("/new", true).unwrap();
-    let lease = fs.fs_dir.read().begin_snapshot_scan().unwrap();
+    let lease = fs.fs_dir.view().unwrap().begin_snapshot_scan().unwrap();
     let snapshot = lease.snapshot_reader().unwrap();
     fs.rename("/old/file", "/new/file", RenameFlags::empty())
         .unwrap();
-    let old_inode = snapshot.get_inode(file.id).unwrap().unwrap();
-    assert_eq!(old_inode.name(), "file");
+    let old_inode = snapshot.get_inode(file.id).unwrap();
+    assert_eq!(old_inode.unwrap().name(), "file");
     assert_eq!(
         FsDir::inode_path_in_snapshot(&snapshot, file.id).unwrap(),
         "/old/file"
     );
     assert_eq!(
-        fs.fs_dir.read().get_inode_path(file.id).unwrap(),
+        fs.fs_dir.view().unwrap().get_inode_path(file.id).unwrap(),
         "/new/file"
     );
 }
@@ -729,7 +754,7 @@ fn inode_path_uses_the_same_snapshot_as_file_metadata() {
 fn link_and_symlink_do_not_wait_for_shared_namespace_readers() {
     let fs = test_fs("link-shared-reader");
     fs.create("/source", true).unwrap();
-    let held = fs.fs_dir.read();
+    let held = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -741,7 +766,7 @@ fn link_and_symlink_do_not_wait_for_shared_namespace_readers() {
     let result = rx.recv_timeout(std::time::Duration::from_secs(5));
     drop(held);
     worker.join().unwrap();
-    result.unwrap().unwrap();
+    result.unwrap();
     assert_eq!(
         fs.file_status("/hard").unwrap().id,
         fs.file_status("/source").unwrap().id
@@ -786,7 +811,7 @@ fn open_missing_path_fallback_excludes_namespace_readers() {
         .record()
         .unwrap();
     runtime.configure(rule_id, rule).unwrap();
-    let held = fs.fs_dir.read();
+    let held = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -855,7 +880,7 @@ fn existing_create_errors_match_global_path_without_namespace_write_lock() {
         ("/parent/file", OpenFlags::new_create().set_overwrite(false)),
         ("/parent", OpenFlags::new_create().set_overwrite(true)),
     ];
-    let held = fs.fs_dir.read();
+    let held = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -900,7 +925,7 @@ fn existing_create_errors_match_global_path_without_namespace_write_lock() {
 fn rename_does_not_wait_for_shared_namespace_readers() {
     let fs = test_fs("rename-shared-reader");
     fs.create("/source", true).unwrap();
-    let held = fs.fs_dir.read();
+    let held = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {

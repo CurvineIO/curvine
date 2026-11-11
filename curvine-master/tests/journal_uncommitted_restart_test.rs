@@ -36,7 +36,7 @@ fn restart_does_not_expose_uncommitted_metadata() {
         fs.mkdir("/uncommitted", false).unwrap();
         // Checkpoint creation flushes the live RocksDB but does not register a
         // Raft snapshot, forcing the no-snapshot restart path under test.
-        fs.fs_dir.read().create_checkpoint(1).unwrap();
+        fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
         // Exit without Rust destructors, after ensuring RocksDB data reached
         // disk.
         std::process::exit(0);
@@ -92,7 +92,7 @@ fn restart_does_not_expose_uncommitted_rename_after_committed_cursor() {
         // The rebuild reconstructs the namespace from the committed log, so
         // the baseline mkdir must be part of the committed entry.
         let mut batch = JournalBatch::new(1);
-        for entry in fs.fs_dir.read().take_entries() {
+        for entry in fs.fs_dir.view().unwrap().take_entries() {
             batch.push(entry);
         }
         journal
@@ -104,7 +104,8 @@ fn restart_does_not_expose_uncommitted_rename_after_committed_cursor() {
             })
             .unwrap();
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .store_journal_applied(
                 &AppliedIndex {
                     term: 1,
@@ -116,7 +117,7 @@ fn restart_does_not_expose_uncommitted_rename_after_committed_cursor() {
             .unwrap();
         fs.rename("/committed", "/uncommitted", RenameFlags::empty())
             .unwrap();
-        fs.fs_dir.read().create_checkpoint(1).unwrap();
+        fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
         std::process::exit(0);
     }
 
@@ -176,7 +177,7 @@ fn raft_start_does_not_expose_uncommitted_rename() {
         let fs = journal.fs();
         fs.mkdir("/committed", false).unwrap();
         let mut batch = JournalBatch::new(1);
-        for entry in fs.fs_dir.read().take_entries() {
+        for entry in fs.fs_dir.view().unwrap().take_entries() {
             batch.push(entry);
         }
         assert!(batch.len() > 0, "the committed fixture must contain mkdir");
@@ -189,7 +190,8 @@ fn raft_start_does_not_expose_uncommitted_rename() {
             })
             .unwrap();
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .store_journal_applied(
                 &AppliedIndex {
                     term: 1,
@@ -201,7 +203,7 @@ fn raft_start_does_not_expose_uncommitted_rename() {
             .unwrap();
         fs.rename("/committed", "/uncommitted", RenameFlags::empty())
             .unwrap();
-        fs.fs_dir.read().create_checkpoint(1).unwrap();
+        fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
         std::process::exit(0);
     }
     let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -265,7 +267,7 @@ fn raft_start_restores_registered_snapshot_before_replay() {
         }
         fs.mkdir("/committed", false).unwrap();
         let mut batch = JournalBatch::new(1);
-        for entry in fs.fs_dir.read().take_entries() {
+        for entry in fs.fs_dir.view().unwrap().take_entries() {
             batch.push(entry);
         }
         assert!(batch.len() > 0);
@@ -301,7 +303,7 @@ fn raft_start_restores_registered_snapshot_before_replay() {
         let fs = journal.fs();
         fs.mkdir("/suffix", false).unwrap();
         let mut suffix = JournalBatch::new(2);
-        for entry in fs.fs_dir.read().take_entries() {
+        for entry in fs.fs_dir.view().unwrap().take_entries() {
             suffix.push(entry);
         }
         assert!(suffix.len() > 0);
@@ -315,7 +317,7 @@ fn raft_start_restores_registered_snapshot_before_replay() {
             .unwrap();
         fs.rename("/committed", "/uncommitted", RenameFlags::empty())
             .unwrap();
-        fs.fs_dir.read().create_checkpoint(2).unwrap();
+        fs.fs_dir.view().unwrap().create_checkpoint(2).unwrap();
         std::process::exit(0);
     }
     let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -360,8 +362,12 @@ fn restart_rejects_corrupt_applied_cursor() {
         let conf = probe_conf(&base, None);
         let journal = JournalSystem::from_conf(&conf).unwrap();
         let fs = journal.fs();
-        fs.fs_dir.read().store_journal_applied(&[0xff]).unwrap();
-        fs.fs_dir.read().create_checkpoint(1).unwrap();
+        fs.fs_dir
+            .view()
+            .unwrap()
+            .store_journal_applied(&[0xff])
+            .unwrap();
+        fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
         std::process::exit(0);
     }
     let base = std::env::temp_dir().join(format!(
@@ -410,10 +416,11 @@ fn restart_rejects_cursor_ahead_of_raft_commit() {
             ..Default::default()
         };
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .store_journal_applied(&applied.encode_to_vec())
             .unwrap();
-        fs.fs_dir.read().create_checkpoint(1).unwrap();
+        fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
         std::process::exit(0);
     }
     let base = std::env::temp_dir().join(format!(
@@ -450,7 +457,8 @@ fn restart_rejects_cursor_with_wrong_term() {
             .unwrap();
         let fs = journal.fs();
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .store_journal_applied(
                 &AppliedIndex {
                     term: 2,
@@ -460,7 +468,7 @@ fn restart_rejects_cursor_with_wrong_term() {
                 .encode_to_vec(),
             )
             .unwrap();
-        fs.fs_dir.read().create_checkpoint(1).unwrap();
+        fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
         std::process::exit(0);
     }
     let base = std::env::temp_dir()
@@ -505,10 +513,11 @@ fn restart_loads_cursor_at_raft_commit() {
             ..Default::default()
         };
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .store_journal_applied(&applied.encode_to_vec())
             .unwrap();
-        fs.fs_dir.read().create_checkpoint(1).unwrap();
+        fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
         std::process::exit(0);
     }
     let base = std::env::temp_dir().join(format!(
@@ -566,10 +575,11 @@ fn restored_snapshot_cursor_survives_restart() {
             ..Default::default()
         };
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .store_journal_applied(&applied.encode_to_vec())
             .unwrap();
-        let checkpoint = fs.fs_dir.read().create_checkpoint(1).unwrap();
+        let checkpoint = fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
         let state = FsmState {
             applied: AppliedIndex {
                 term: 1,
@@ -632,7 +642,7 @@ fn direct_scan_replays_committed_entry_onto_materialized_rows() {
         let fs = journal.fs();
         fs.mkdir("/committed", false).unwrap();
         let mut batch = JournalBatch::new(1);
-        for entry in fs.fs_dir.read().take_entries() {
+        for entry in fs.fs_dir.view().unwrap().take_entries() {
             batch.push(entry);
         }
         journal
@@ -644,7 +654,7 @@ fn direct_scan_replays_committed_entry_onto_materialized_rows() {
             })
             .unwrap();
         fs.mkdir("/uncommitted", false).unwrap();
-        fs.fs_dir.read().create_checkpoint(1).unwrap();
+        fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
         std::fs::write(format!("{base}/raft-port"), port.to_string()).unwrap();
         std::process::exit(0);
     }

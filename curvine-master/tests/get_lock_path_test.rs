@@ -14,6 +14,7 @@
 
 use curvine_config::ChildrenContainer;
 use curvine_master::master::journal::JournalSystem;
+use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use curvine_master::master::meta::inode::InodePath;
 use curvine_master::Master;
 use curvine_model::{FileLock, LockType};
@@ -138,7 +139,7 @@ fn get_lock_matches_full_path_resolution() {
     ] {
         let actual = fs.get_lock(path, query.clone()).map_err(|e| e.to_string());
         let expected = {
-            let guard = fs.fs_dir.read();
+            let guard = fs.fs_dir.view().unwrap();
             InodePath::resolve(guard.root_node(), path, guard.store_ref())
                 .map_err(|e| e.to_string())
                 .and_then(|inp| {
@@ -167,7 +168,7 @@ fn get_lock_matches_full_path_resolution() {
     }
     let file_id = fs.file_status("/dir/file").unwrap().id;
     {
-        let guard = fs.fs_dir.write();
+        let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let mut batch = guard.store_ref().new_batch();
         batch.delete_inode(file_id).unwrap();
         batch.commit().unwrap();

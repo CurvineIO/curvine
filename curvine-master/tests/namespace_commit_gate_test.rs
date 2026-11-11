@@ -2,6 +2,7 @@ use curvine_master::master::meta::CommitGate;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 #[test]
 fn filesystem_handles_for_same_journal_share_commit_gate() {
     use curvine_master::master::fs::MasterFilesystem;
@@ -124,8 +125,8 @@ fn cancelling_snapshot_request_keeps_gate_closed_until_apply_finishes() {
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
     let gate = fs.metadata_commit_gate();
-    let fs_dir = fs.fs_dir();
-    let fs_lock = fs_dir.write();
+    let fs_dir = fs.fs_dir.clone();
+    let fs_lock = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
     let loader = journal.journal_loader();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -163,7 +164,7 @@ fn cancelling_snapshot_request_keeps_gate_closed_until_apply_finishes() {
     let _ = runtime.block_on(snapshot);
     let closed_after_cancel = gate.try_enter().is_none();
     drop(fs_lock);
-    runtime.block_on(marker).unwrap().unwrap().unwrap();
+    runtime.block_on(marker).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while gate.try_enter().is_none() && Instant::now() < deadline {
         std::thread::yield_now();

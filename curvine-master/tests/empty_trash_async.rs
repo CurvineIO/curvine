@@ -85,8 +85,8 @@ fn async_empty_acknowledges_then_the_purger_reclaims() {
 
     // The background purger (or an explicit drain) reclaims them in bounded
     // batches through the same engine as a retention sweep.
-    let drained = fs.drain_pending_trash().unwrap().unwrap();
-    assert_eq!(drained.inodes, expected);
+    let drained = fs.drain_pending_trash().unwrap();
+    assert_eq!(drained.unwrap().inodes, expected);
     assert_eq!(pending_children(&fs), 0);
     assert_eq!(fs.get_file_counts().1, 0, "every file inode is reclaimed");
 }
@@ -121,8 +121,8 @@ fn staged_empty_survives_a_restart() {
     fs.restore_from_rocksdb().unwrap();
     assert_eq!(pending_children(&fs), 3);
 
-    let drained = fs.drain_pending_trash().unwrap().unwrap();
-    assert_eq!(drained.inodes, expected);
+    let drained = fs.drain_pending_trash().unwrap();
+    assert_eq!(drained.unwrap().inodes, expected);
     assert_eq!(pending_children(&fs), 0);
 }
 

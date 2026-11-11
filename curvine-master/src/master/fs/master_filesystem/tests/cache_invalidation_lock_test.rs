@@ -40,14 +40,15 @@ fn cache_invalidation_waits_for_the_file_inode_read_lock() {
     let inode_id = fs.file_status(path).unwrap().id;
     let data_dir = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .get_rocks_store()
         .db
         .conf()
         .data_dir
         .clone();
     let file_state = || {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         let inode = dir.store.get_inode(inode_id, None).unwrap().unwrap();
         let file = inode.as_file_ref().unwrap();
         (

@@ -2,7 +2,7 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 //
@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use curvine_config::ClusterConf;
 use curvine_runtime::common::Utils;
 
@@ -27,7 +28,7 @@ fn leader_replay_advances_ids_without_namespace_lock() {
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
     let loader = journal.journal_loader();
-    let guard = fs.fs_dir.write();
+    let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -63,7 +64,7 @@ fn leader_replay_advances_ids_without_namespace_lock() {
     };
     worker.join().unwrap();
     result.unwrap();
-    let dir = fs.fs_dir.read();
+    let dir = fs.fs_dir.view().unwrap();
     assert!(dir.op_id.get() >= 1234);
     assert!(dir.last_inode_id() >= 4321);
     drop(dir);
@@ -81,8 +82,8 @@ fn leader_snapshot_packaging_does_not_wait_for_namespace_lock() {
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
     let loader = journal.journal_loader();
-    let checkpoint = fs.fs_dir.read().create_checkpoint(123).unwrap();
-    let guard = fs.fs_dir.write();
+    let checkpoint = fs.fs_dir.view().unwrap().create_checkpoint(123).unwrap();
+    let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         tx.send(loader.create_snapshot0(Some(checkpoint))).unwrap();
@@ -205,7 +206,8 @@ fn snapshot_directory_check_waits_for_active_restore() {
     let loader = journal.journal_loader();
     let restore = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store_ref()
         .begin_restore(std::time::Duration::from_secs(5))
         .unwrap();
@@ -242,7 +244,7 @@ fn snapshot_only_entry_publishes_when_ufs_was_caught_up() {
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
     let loader = journal.journal_loader();
-    let checkpoint = fs.fs_dir.read().create_checkpoint(123).unwrap();
+    let checkpoint = fs.fs_dir.view().unwrap().create_checkpoint(123).unwrap();
     let mut batch = JournalBatch::new(1);
     batch.push(JournalEntry::Snapshot(SnapshotEntry {
         op_id: 1,
@@ -286,7 +288,7 @@ fn snapshot_with_ufs_operation_does_not_advance_ufs_cursor() {
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
     let loader = journal.journal_loader();
-    let checkpoint = fs.fs_dir.read().create_checkpoint(123).unwrap();
+    let checkpoint = fs.fs_dir.view().unwrap().create_checkpoint(123).unwrap();
     let mut batch = JournalBatch::new(1);
     batch.push(JournalEntry::Mkdir(MkdirEntry {
         op_id: 1,
@@ -336,7 +338,7 @@ fn snapshot_only_entry_does_not_skip_earlier_ufs_backlog() {
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
     let loader = journal.journal_loader();
-    let checkpoint = fs.fs_dir.read().create_checkpoint(123).unwrap();
+    let checkpoint = fs.fs_dir.view().unwrap().create_checkpoint(123).unwrap();
     let mut pending = JournalBatch::new(1);
     pending.push(JournalEntry::Mkdir(MkdirEntry {
         op_id: 1,
@@ -399,8 +401,12 @@ fn leader_replay_updates_ids_after_snapshot_restore() {
     let journal = JournalSystem::from_conf(&conf).unwrap();
     let fs = journal.fs();
     let loader = journal.journal_loader();
-    let checkpoint = fs.fs_dir.read().create_checkpoint(123).unwrap();
-    fs.fs_dir.write().restore(&checkpoint, 0).unwrap();
+    let checkpoint = fs.fs_dir.view().unwrap().create_checkpoint(123).unwrap();
+    fs.fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .restore(&checkpoint, 0)
+        .unwrap();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -420,7 +426,7 @@ fn leader_replay_updates_ids_after_snapshot_restore() {
         dir: crate::master::meta::inode::InodeDir::new(20, 0),
     });
     runtime.block_on(loader.replay_entry(true, &older)).unwrap();
-    let dir = fs.fs_dir.read();
+    let dir = fs.fs_dir.view().unwrap();
     assert!(dir.op_id.get() >= 2000);
     assert!(dir.last_inode_id() >= 5000);
     drop(dir);
@@ -591,7 +597,7 @@ fn role_change_fences_before_apply_worker_acknowledges() {
             ApplyMsg::RoleChange((StateRole::Follower, _, tx)) => tx.send(Ok(())).unwrap(),
             _ => panic!("unexpected apply message"),
         }
-        task.await.unwrap().unwrap();
+        task.await.unwrap();
     });
     journal.shutdown();
 }

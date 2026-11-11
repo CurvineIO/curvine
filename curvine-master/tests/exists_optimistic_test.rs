@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use curvine_master::master::fs::MasterFilesystem;
+use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use curvine_master::Master;
 use curvine_model::RenameFlags;
 use curvine_runtime::common::Utils;
@@ -41,8 +42,8 @@ fn exists_waits_for_file_deletion_publication() {
 
     let fs = test_fs("exists-delete-publication");
     let id = fs.create("/dir/file", true).unwrap().id;
-    let guard = fs.fs_dir.read();
-    let inode = guard.store_ref().get_inode(id, None).unwrap().unwrap();
+    let guard = fs.fs_dir.view().unwrap();
+    let inode = guard.store_ref().get_inode(id, None).unwrap();
     let mut batch = guard.store_ref().new_batch();
     batch.delete_inode(id).unwrap();
     batch.commit().unwrap();
@@ -57,7 +58,7 @@ fn exists_waits_for_file_deletion_publication() {
     started_rx.recv().unwrap();
     let early = result_rx.recv_timeout(Duration::from_millis(100));
     let mut batch = guard.store_ref().new_batch();
-    batch.write_inode(&inode).unwrap();
+    batch.write_inode(&inode.unwrap()).unwrap();
     batch.commit().unwrap();
     drop(guard);
     let result = match early {
@@ -75,8 +76,8 @@ fn exists_waits_for_file_deletion_publication() {
 fn exists_reads_a_store_snapshot_with_a_shared_namespace_guard() {
     let fs = test_fs("shared-snapshot");
     fs.create("/dir/file", true).unwrap();
-    let dir = fs.fs_dir();
-    let guard = dir.read();
+    let dir = fs.fs_dir.clone();
+    let guard = dir.view().unwrap();
     let worker_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -114,14 +115,14 @@ fn exists_reports_a_dangling_edge_instead_of_treating_it_as_present() {
     let file_id = fs.file_status("/dir/file").unwrap().id;
     let parent_id = fs.file_status("/other/sub").unwrap().id;
     {
-        let guard = fs.fs_dir.write();
+        let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let mut batch = guard.store_ref().new_batch();
         batch.delete_inode(file_id).unwrap();
         batch.delete_inode(parent_id).unwrap();
         batch.commit().unwrap();
     }
 
-    let guard = fs.fs_dir.read();
+    let guard = fs.fs_dir.view().unwrap();
     let lease = guard.begin_snapshot_scan().unwrap();
     let snapshot = lease.snapshot_reader().unwrap();
     for path in ["/dir/file", "/other/sub/file"] {
@@ -183,7 +184,7 @@ fn exists_tracks_own_create_and_delete_under_concurrent_writes() {
 fn recursive_mkdir_does_not_wait_for_a_shared_namespace_reader() {
     let fs = test_fs("recursive-mkdir-shared-reader");
     fs.mkdir("/root", false).unwrap();
-    let reader = fs.fs_dir.read();
+    let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || tx.send(worker_fs.mkdir("/root/a/b/c", true)).unwrap());
@@ -333,7 +334,7 @@ fn rename_noop_rejects_dangling_file_inode() {
     let file_id = fs.create("/dir/file", true).unwrap().id;
     fs.link("/dir/file", "/dir/alias").unwrap();
     {
-        let guard = fs.fs_dir.write();
+        let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let mut batch = guard.store_ref().new_batch();
         batch.delete_inode(file_id).unwrap();
         batch.commit().unwrap();
@@ -351,7 +352,7 @@ fn delete_rejects_dangling_file_inode_after_lock_planning() {
     let fs = test_fs("delete-dangling-inode");
     let file_id = fs.create("/dir/file", true).unwrap().id;
     {
-        let guard = fs.fs_dir.write();
+        let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let mut batch = guard.store_ref().new_batch();
         batch.delete_inode(file_id).unwrap();
         batch.commit().unwrap();
@@ -473,7 +474,8 @@ fn reopen_rejects_restore_admission_without_changing_writer_state() {
     assert!(fs.file_status("/file").unwrap().is_complete);
     let restore = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store_ref()
         .begin_restore(std::time::Duration::from_secs(1))
         .unwrap();
@@ -634,7 +636,8 @@ fn symlink_rejects_restore_admission_without_publishing_entry() {
     fs.mkdir("/dir", false).unwrap();
     let restore = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .store_ref()
         .begin_restore(std::time::Duration::from_secs(1))
         .unwrap();

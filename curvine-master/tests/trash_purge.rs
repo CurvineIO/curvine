@@ -2,15 +2,16 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+
+use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT; // You may obtain a copy of the License at
+                                                                       //
+                                                                       //     http://www.apache.org/licenses/LICENSE-2.0
+                                                                       //
+                                                                       // Unless required by applicable law or agreed to in writing, software
+                                                                       // distributed under the License is distributed on an "AS IS" BASIS,
+                                                                       // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+                                                                       // See the License for the specific language governing permissions and
+                                                                       // limitations under the License.
 
 use curvine_config::ClusterConf;
 use curvine_master::master::fs::{DeleteMode, MasterFilesystem};
@@ -59,8 +60,8 @@ fn purge_paths_removes_only_the_listed_batch() {
     // First batch: the two leaves of /a only.
     let first = vec![format!("{entry}/a/file-a"), format!("{entry}/a/file-b")];
     let res = {
-        let fs_dir = fs.fs_dir();
-        let mut fs_dir = fs_dir.write();
+        let fs_dir = fs.fs_dir.clone();
+        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&first, LocalTime::mills() as i64)
             .unwrap()
@@ -72,8 +73,8 @@ fn purge_paths_removes_only_the_listed_batch() {
     // Second batch: the now-empty directory and its sibling leaf.
     let second = vec![format!("{entry}/a"), format!("{entry}/b/file-c")];
     let res = {
-        let fs_dir = fs.fs_dir();
-        let mut fs_dir = fs_dir.write();
+        let fs_dir = fs.fs_dir.clone();
+        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&second, LocalTime::mills() as i64)
             .unwrap()
@@ -85,8 +86,8 @@ fn purge_paths_removes_only_the_listed_batch() {
     // precedes the entry itself.
     let last = vec![format!("{entry}/b"), entry.clone()];
     let res = {
-        let fs_dir = fs.fs_dir();
-        let mut fs_dir = fs_dir.write();
+        let fs_dir = fs.fs_dir.clone();
+        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&last, LocalTime::mills() as i64)
             .unwrap()
@@ -108,8 +109,8 @@ fn purge_paths_never_removes_unlisted_descendants() {
 
     // Listing a directory that still holds children must not delete them.
     let res = {
-        let fs_dir = fs.fs_dir();
-        let mut fs_dir = fs_dir.write();
+        let fs_dir = fs.fs_dir.clone();
+        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(std::slice::from_ref(&entry), LocalTime::mills() as i64)
             .unwrap()
@@ -130,8 +131,8 @@ fn purge_paths_never_removes_unlisted_descendants() {
         entry.clone(),
     ];
     let res = {
-        let fs_dir = fs.fs_dir();
-        let mut fs_dir = fs_dir.write();
+        let fs_dir = fs.fs_dir.clone();
+        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&batch, LocalTime::mills() as i64)
             .unwrap()
@@ -158,8 +159,8 @@ fn purge_paths_releases_a_hard_linked_inode_once() {
         entry.clone(),
     ];
     let res = {
-        let fs_dir = fs.fs_dir();
-        let mut fs_dir = fs_dir.write();
+        let fs_dir = fs.fs_dir.clone();
+        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&batch, LocalTime::mills() as i64)
             .unwrap()
@@ -188,8 +189,8 @@ fn purge_paths_is_idempotent_across_retries() {
         format!("{entry}/missing"),
     ];
     let first = {
-        let fs_dir = fs.fs_dir();
-        let mut fs_dir = fs_dir.write();
+        let fs_dir = fs.fs_dir.clone();
+        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&batch, LocalTime::mills() as i64)
             .unwrap()
@@ -199,8 +200,8 @@ fn purge_paths_is_idempotent_across_retries() {
     // A replayed or retried batch must be a no-op instead of failing on the
     // paths it already removed.
     let second = {
-        let fs_dir = fs.fs_dir();
-        let mut fs_dir = fs_dir.write();
+        let fs_dir = fs.fs_dir.clone();
+        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&batch, LocalTime::mills() as i64)
             .unwrap()

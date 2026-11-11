@@ -64,6 +64,5 @@ pub use self::quota::*;
 pub mod space;
 
 pub type MetaRaftJournal = RaftJournal<RocksLogStorage, JournalLoader>;
-pub type SyncFsDir = ArcRwLock<FsDir>;
 pub type SyncWorkerManager = ArcRwLock<WorkerManager>;
 pub use mount::MountManager;

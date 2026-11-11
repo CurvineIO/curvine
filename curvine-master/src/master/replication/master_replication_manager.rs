@@ -326,7 +326,12 @@ impl MasterReplicationManager {
             };
             let generation = self.repairs.lock().blocks.get(&block_id).copied();
             // Never hold the demand mutex across filesystem reads or tracker operations.
-            let state = self.fs.fs_dir.read().replication_block_state(block_id);
+            let state = self
+                .fs
+                .fs_dir
+                .view()
+                .unwrap()
+                .replication_block_state(block_id);
             if matches!(state, Ok(None))
                 || matches!(&state, Ok(Some(s)) if s.locations.len() >= s.replicas as usize)
             {
@@ -393,7 +398,8 @@ impl MasterReplicationManager {
         let state = self
             .fs
             .fs_dir
-            .read()
+            .view()
+            .unwrap()
             .replication_block_state(item.block_id)?;
         if state.is_none() || state.is_some_and(|s| s.locations.len() >= s.replicas as usize) {
             if self.remove_attempt(item.block_id, &item.attempt_id) {
@@ -456,7 +462,7 @@ impl MasterReplicationManager {
         permit: OwnedSemaphorePermit,
     ) -> CommonResult<()> {
         let block_state = {
-            let fs_dir = self.fs.fs_dir.read();
+            let fs_dir = self.fs.fs_dir.view().unwrap();
             fs_dir.replication_block_state(block_id)?
         };
         let Some(block_state) = block_state else {

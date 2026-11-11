@@ -35,9 +35,9 @@ fn inode_snapshot_rejects_key_and_payload_id_mismatch() {
     let second = fs.create("/second", false).unwrap().id;
     assert_ne!(first, second);
     {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         let store = dir.store_ref();
-        let inode = store.get_inode(second, None).unwrap().unwrap();
+        let inode = store.get_inode(second, None).unwrap();
         let mut batch = store.new_batch();
         batch
             .put_cf_raw(
@@ -49,7 +49,7 @@ fn inode_snapshot_rejects_key_and_payload_id_mismatch() {
         batch.commit().unwrap();
     }
     {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         let error = dir.store_ref().store().get_inode(first).err().unwrap();
         assert!(error.to_string().contains("inode record id mismatch"));
     }
@@ -58,7 +58,7 @@ fn inode_snapshot_rejects_key_and_payload_id_mismatch() {
     // reads surface it whenever the touched child hydrates; children stored
     // as full views answer from memory without touching the store.
     {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         let lease = dir.begin_snapshot_scan().unwrap();
         let snapshot = lease.snapshot_reader().unwrap();
         let error = match snapshot.resolve_path("/first") {

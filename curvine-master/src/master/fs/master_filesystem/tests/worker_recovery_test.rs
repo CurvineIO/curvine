@@ -8,7 +8,7 @@ fn replication_rejects_detached_metadata_store() {
     let fs = test_fs("replication-detached-store");
     let block_id = replication_file(&fs, "/replication-detached.log");
     let (checkpoint, data_dir) = {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         (
             dir.create_checkpoint(1).unwrap(),
             dir.store_ref().store().db.conf().data_dir.clone(),
@@ -25,10 +25,14 @@ fn replication_rejects_detached_metadata_store() {
     faults
         .configure("replication-detached-store", rule)
         .unwrap();
-    let result = fs.fs_dir.write().restore(&checkpoint, 0);
+    let result = fs
+        .fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
+        .restore(&checkpoint, 0);
     faults.remove("replication-detached-store").unwrap();
     assert!(result.is_err());
-    let dir = fs.fs_dir.read();
+    let dir = fs.fs_dir.view().unwrap();
     assert!(dir.replication_block_state(block_id).is_err());
     assert!(dir
         .add_replication_location_if_needed(block_id, BlockLocation::with_id(200))
@@ -76,7 +80,8 @@ fn replica_completion_invalidates_older_full_report_reconcile() {
         .is_empty());
     assert!(fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .get_block_locations(block_id)
         .unwrap()
         .iter()
@@ -162,7 +167,8 @@ fn replica_completion_restarts_begun_full_report() {
     assert!(stale.delete_blocks.is_empty());
     assert!(fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .get_block_locations(block_id)
         .unwrap()
         .iter()
@@ -217,7 +223,8 @@ fn replica_completion_and_full_report_share_block_lock() {
     let report = report.join().unwrap();
     let state = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .replication_block_state(block_id)
         .unwrap()
         .unwrap();
@@ -280,7 +287,8 @@ fn concurrent_full_reports_do_not_overfill_a_block() {
     );
     let state = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .replication_block_state(block_id)
         .unwrap()
         .unwrap();
@@ -300,7 +308,8 @@ fn full_block_report_reclaims_excess_replica() {
     let fs = test_fs("full-block-report-excess-replica");
     let block_id = replication_file(&fs, "/full-block-report-excess-replica.log");
     fs.fs_dir
-        .write()
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
         .add_block_location(block_id, BlockLocation::with_id(200))
         .unwrap();
 
@@ -326,7 +335,8 @@ fn full_block_report_reclaims_excess_replica() {
     assert_eq!(result.delete_blocks, vec![block_id]);
     let state = fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .replication_block_state(block_id)
         .unwrap()
         .unwrap();
@@ -372,7 +382,8 @@ fn stale_block_report_does_not_register_location() {
     assert!(result.is_none());
     assert!(fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .get_block_locations(block_id)
         .unwrap()
         .iter()
@@ -427,7 +438,8 @@ fn lost_cleanup_only_removes_matching_session_locations() {
     assert_eq!(cleanup.replication_block_ids, vec![block_id]);
     assert!(fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .get_block_locations(block_id)
         .unwrap()
         .is_empty());
@@ -489,7 +501,8 @@ fn old_lost_cleanup_skips_recovered_worker_session() {
         .is_none());
     assert_eq!(
         fs.fs_dir
-            .read()
+            .view()
+            .unwrap()
             .get_block_locations(block_id)
             .unwrap()
             .len(),

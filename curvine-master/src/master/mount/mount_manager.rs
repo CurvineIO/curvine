@@ -2,15 +2,16 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+
+use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT; // You may obtain a copy of the License at
+                                                              //
+                                                              //     http://www.apache.org/licenses/LICENSE-2.0
+                                                              //
+                                                              // Unless required by applicable law or agreed to in writing, software
+                                                              // distributed under the License is distributed on an "AS IS" BASIS,
+                                                              // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+                                                              // See the License for the specific language governing permissions and
+                                                              // limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::meta::FsDir;
@@ -39,12 +40,12 @@ impl MountManager {
 
     /// recovery mount points from store
     pub fn restore(&self) -> FsResult<()> {
-        let fs_dir = self.master_fs.fs_dir.read();
+        let fs_dir = self.master_fs.fs_dir.view().unwrap();
         self.mount_table.restore(&fs_dir)
     }
 
     pub fn restore_best_effort(&self) {
-        let fs_dir = self.master_fs.fs_dir.read();
+        let fs_dir = self.master_fs.fs_dir.view().unwrap();
         self.mount_table.restore_best_effort(&fs_dir)
     }
 
@@ -109,7 +110,11 @@ impl MountManager {
         let mut normalized_options = mnt_opt.clone();
         normalized_options.add_properties = mount.properties;
         self.master_fs.run_metadata_write(|| {
-            let fs_dir = self.master_fs.fs_dir.write();
+            let fs_dir = self
+                .master_fs
+                .fs_dir
+                .begin_cold(DEFAULT_COLD_TIMEOUT)
+                .unwrap();
             self.mount_table.add_mount(
                 &fs_dir,
                 assign_id,
@@ -128,7 +133,11 @@ impl MountManager {
             };
             let mut merged = existing.merge_with(mnt_opt.clone());
             Self::normalize_mount_config(&mut merged)?;
-            let fs_dir = self.master_fs.fs_dir.write();
+            let fs_dir = self
+                .master_fs
+                .fs_dir
+                .begin_cold(DEFAULT_COLD_TIMEOUT)
+                .unwrap();
             self.mount_table.update_mount(&fs_dir, merged)
         })
     }
@@ -153,7 +162,11 @@ impl MountManager {
 
     pub fn umount(&self, cv_path: &str) -> FsResult<()> {
         self.master_fs.run_metadata_write(|| {
-            let fs_dir = self.master_fs.fs_dir.write();
+            let fs_dir = self
+                .master_fs
+                .fs_dir
+                .begin_cold(DEFAULT_COLD_TIMEOUT)
+                .unwrap();
             self.mount_table.umount(&fs_dir, cv_path)
         })
     }

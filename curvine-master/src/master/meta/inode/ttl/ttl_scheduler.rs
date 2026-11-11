@@ -160,8 +160,7 @@ mod tests {
 
     fn build_ttl_manager(fs: &MasterFilesystem) -> (Arc<InodeTtlManager>, Arc<TtlBucketList>) {
         let bucket_list = {
-            let fs_dir_lock = fs.fs_dir();
-            let fs_dir = fs_dir_lock.read();
+            let fs_dir = fs.fs_dir.view().unwrap();
             fs_dir.get_ttl_bucket_list()
         };
         let manager = InodeTtlManager::new(fs.clone(), bucket_list.clone()).unwrap();

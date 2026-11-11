@@ -19,6 +19,7 @@
 use super::*;
 use crate::master::fs::MasterFilesystem;
 use crate::master::journal::JournalSystem;
+use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use crate::master::Master;
 use curvine_config::ClusterConf;
 use curvine_runtime::common::Utils;
@@ -44,7 +45,7 @@ fn txn_journal(name: &str) -> (JournalSystem, MasterFilesystem, Arc<MountTable>)
 /// observed, releasing the backpressure that paused the writer.
 fn drain(journal: &JournalSystem, count: usize, deadline: Instant) {
     loop {
-        let drained = journal.fs().fs_dir.read().take_entries().len() >= count;
+        let drained = journal.fs().fs_dir.view().unwrap().take_entries().len() >= count;
         if drained || Instant::now() >= deadline {
             return;
         }
@@ -64,7 +65,7 @@ fn online_add_persists_row_and_version_under_one_lock() {
         // The business critical section only needs &FsDir: hold a read guard
         // so the main thread can still observe the row while this worker is
         // paused on journal backpressure.
-        let guard_dir = worker_fs.fs_dir.read();
+        let guard_dir = worker_fs.fs_dir.view().unwrap();
         done_tx
             .send(worker_table.add_mount(
                 &guard_dir,
@@ -84,7 +85,7 @@ fn online_add_persists_row_and_version_under_one_lock() {
             break false;
         }
         let visible = {
-            let dir = fs.fs_dir.read();
+            let dir = fs.fs_dir.view().unwrap();
             dir.get_mount_point(1).unwrap().is_some()
         };
         if visible {
@@ -116,7 +117,7 @@ fn online_add_persists_row_and_version_under_one_lock() {
     // Snapshot version and persisted version agree after completion.
     let snapshot_version = table.snapshot().unwrap().version;
     let persisted_version = {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         dir.get_mount_table_version().unwrap()
     };
     assert_eq!(snapshot_version, persisted_version);
@@ -130,9 +131,9 @@ fn replay_mount_does_not_echo_journal() {
 
     // Drain any pre-existing entries, then the replay itself must leave the
     // queue empty (no journal echo).
-    let _ = fs.fs_dir.read().take_entries();
+    let _ = fs.fs_dir.view().unwrap().take_entries();
     {
-        let fs_dir = fs.fs_dir.write();
+        let fs_dir = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let info = curvine_model::MountOptions::builder().build().to_info(
             7,
             "/mnt",
@@ -140,18 +141,18 @@ fn replay_mount_does_not_echo_journal() {
         );
         table.replay_mount(&fs_dir, info).unwrap();
     }
-    let echoed = fs.fs_dir.read().take_entries().len();
+    let echoed = fs.fs_dir.view().unwrap().take_entries().len();
 
     // Row and version persisted; the queue gained no journal echo.
     assert_eq!(echoed, 0, "replay echoed a journal entry");
     let snapshot_version = table.snapshot().unwrap().version;
     let persisted_version = {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         dir.get_mount_table_version().unwrap()
     };
     assert_eq!(snapshot_version, persisted_version);
     let row = {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         dir.get_mount_point(7)
             .unwrap()
             .expect("replay row persisted")
@@ -167,9 +168,9 @@ fn replay_unmount_idempotent_without_echo() {
 
     // Drain history first: a replay add and a replay unmount pair must
     // leave the queue empty (neither echoes a journal entry).
-    let _ = fs.fs_dir.read().take_entries();
+    let _ = fs.fs_dir.view().unwrap().take_entries();
     {
-        let fs_dir = fs.fs_dir.write();
+        let fs_dir = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let info = curvine_model::MountOptions::builder().build().to_info(
             9,
             "/mnt",
@@ -177,12 +178,16 @@ fn replay_unmount_idempotent_without_echo() {
         );
         table.replay_mount(&fs_dir, info).unwrap();
     }
-    table.replay_unmount(&fs.fs_dir.write(), 9).unwrap();
-    let echoed = fs.fs_dir.read().take_entries().len();
+    table
+        .replay_unmount(&fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap(), 9)
+        .unwrap();
+    let echoed = fs.fs_dir.view().unwrap().take_entries().len();
 
     assert_eq!(echoed, 0, "replay add/unmount echoed a journal entry");
     assert!(table.snapshot().unwrap().entries.is_empty());
     // Replaying the same unmount again is an idempotent no-op.
-    table.replay_unmount(&fs.fs_dir.write(), 9).unwrap();
+    table
+        .replay_unmount(&fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap(), 9)
+        .unwrap();
     journal.shutdown();
 }

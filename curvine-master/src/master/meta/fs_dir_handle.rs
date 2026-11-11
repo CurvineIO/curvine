@@ -45,6 +45,9 @@ const STATE_OPEN: u8 = 0;
 const STATE_COLD: u8 = 1;
 const STATE_FAILED: u8 = 2;
 
+/// Default timeout for cold exclusivity used by regular consumers.
+pub const DEFAULT_COLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamespaceError {
     Busy,
@@ -94,6 +97,16 @@ impl FsDirHandle {
             inner: guard,
             _handle: PhantomData,
         })
+    }
+
+    /// 永久失效判定：True 时视图不可达。
+    pub fn is_failed(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Acquire) == STATE_FAILED
+    }
+
+    /// 冷窗中判定。
+    pub fn is_cold(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Acquire) == STATE_COLD
     }
 
     /// Takes exclusive mutable access to the current view.
@@ -196,6 +209,20 @@ impl ColdFsDirGuard<'_> {
             fs_dir.journal_writer.fail_metadata_restore();
         }
         self.handle.state.store(STATE_FAILED, Ordering::Release);
+    }
+}
+
+impl std::ops::Deref for ColdFsDirGuard<'_> {
+    type Target = FsDir;
+    fn deref(&self) -> &FsDir {
+        self.taken.as_ref().expect("cold guard owns the view")
+    }
+}
+
+impl std::ops::DerefMut for ColdFsDirGuard<'_> {
+    fn deref_mut(&mut self) -> &mut FsDir {
+        Arc::get_mut(self.taken.as_mut().expect("cold guard owns the view"))
+            .expect("cold exclusivity guarantees a single strong reference")
     }
 }
 

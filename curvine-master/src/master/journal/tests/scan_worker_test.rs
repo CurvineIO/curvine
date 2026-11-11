@@ -172,7 +172,7 @@ fn leader_bookkeeping_does_not_wait_for_namespace_writer() {
             ..Default::default()
         };
         let namespace = loader.fs_dir.clone();
-        let held = namespace.write();
+        let held = namespace.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -202,7 +202,7 @@ fn leader_bookkeeping_does_not_wait_for_namespace_writer() {
         result
             .expect("bookkeeping did not finish after release")
             .unwrap();
-        let dir = namespace.read();
+        let dir = namespace.view().unwrap();
         let record = dir.store.store.get_applied_req(7).unwrap().unwrap();
         assert_eq!((record.index, record.term), (8192, 1));
     });

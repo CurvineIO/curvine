@@ -37,7 +37,7 @@ fn concurrent_watermark_advances_do_not_reuse_ids() {
     ids.advance_to(1);
     assert_eq!(ids.current(), 2000);
     {
-        let dir = fs.fs_dir.read();
+        let dir = fs.fs_dir.view().unwrap();
         dir.update_op_id(25);
         dir.update_op_id(1);
         assert_eq!(dir.next_op_id(), 26);
@@ -59,9 +59,9 @@ fn concurrent_watermark_advances_do_not_reuse_ids() {
                     let value = (worker * 1000 + i + 10_000) as u64;
                     ids.advance_to(value as i64);
                     inode_ids.push(ids.next().unwrap());
-                    let guard = dir.read();
-                    guard.update_op_id(value);
-                    guard.update_last_inode_id(value as i64).unwrap();
+                    let guard = dir.view().unwrap();
+                    let _ = guard.update_op_id(value);
+                    guard.update_last_inode_id(value as i64);
                     op_ids.push(guard.next_op_id());
                 }
                 (op_ids, inode_ids)
@@ -79,7 +79,7 @@ fn concurrent_watermark_advances_do_not_reuse_ids() {
             assert!(inodes.insert(id), "duplicate inode id {id}");
         }
     }
-    let dir = fs.fs_dir.read();
+    let dir = fs.fs_dir.view().unwrap();
     assert!(dir.next_op_id() > 17_999);
     assert!(dir.last_inode_id() >= 17_999);
     drop(dir);

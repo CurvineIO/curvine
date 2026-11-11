@@ -147,9 +147,14 @@ fn cleanup_removes_only_files_without_cv_metadata() {
     )
     .unwrap();
     let status = fs.file_status("/mnt/cv-file").unwrap();
-    let snapshot = fs.fs_mode_snapshot(status.id).unwrap().unwrap();
+    let snapshot = fs.fs_mode_snapshot(status.id).unwrap();
     assert!(fs
-        .release_verified(status.id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime)
+        .release_verified(
+            status.id,
+            &snapshot.as_ref().unwrap().path,
+            snapshot.as_ref().unwrap().gen,
+            snapshot.as_ref().unwrap().ufs_mtime
+        )
         .unwrap());
     assert_eq!(
         fs.file_status("/mnt/cv-file").unwrap().storage_policy.state,

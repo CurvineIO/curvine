@@ -109,7 +109,7 @@ fn file_status_lock_window_excludes_rename_writers() {
     // Release, join and clean up before asserting so failures never leak
     // parked readers or fault rules.
     drop(release);
-    let status = reader.join().unwrap().unwrap();
+    let status = reader.join().unwrap();
     if let Some((handle, done_rx)) = writer {
         handle.join().unwrap();
         drop(done_rx);
@@ -118,6 +118,7 @@ fn file_status_lock_window_excludes_rename_writers() {
     runtime.remove(arrival_id).unwrap();
 
     assert!(failures.is_empty(), "{:?}", failures);
+    let status = status.unwrap();
     assert_eq!(status.id, before.id);
     assert_eq!(status.mode, before.mode);
     assert!(fs.file_status("/p/a").is_err());
@@ -196,7 +197,7 @@ fn list_options_lock_window_excludes_rename_writers() {
     };
 
     drop(release);
-    let page = reader.join().unwrap().unwrap();
+    let page = reader.join().unwrap();
     if let Some((handle, done_rx)) = writer {
         handle.join().unwrap();
         drop(done_rx);
@@ -205,6 +206,7 @@ fn list_options_lock_window_excludes_rename_writers() {
     runtime.remove(arrival_id).unwrap();
 
     assert!(failures.is_empty(), "{:?}", failures);
+    let page = page.unwrap();
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].name, "f");
     assert_eq!(page[0].id, before.id);
@@ -287,7 +289,7 @@ fn directory_page_lock_window_excludes_rename_writers() {
     };
 
     drop(release);
-    let page = reader.join().unwrap().unwrap();
+    let page = reader.join().unwrap();
     if let Some((handle, done_rx)) = writer {
         handle.join().unwrap();
         drop(done_rx);
@@ -296,6 +298,7 @@ fn directory_page_lock_window_excludes_rename_writers() {
     runtime.remove(arrival_id).unwrap();
 
     assert!(failures.is_empty(), "{:?}", failures);
+    let page = page.unwrap();
     assert_eq!(page.len(), 2);
     assert!(page
         .iter()
@@ -311,7 +314,7 @@ fn directory_page_lock_window_excludes_rename_writers() {
 fn negative_lookups_do_not_claim_the_root_read_lock() {
     let fs = test_fs("memory-read-plan-root");
     fs.mkdir("/d", false).unwrap();
-    let fs_dir = fs.fs_dir.read();
+    let fs_dir = fs.fs_dir.view().unwrap();
     for path in ["/missing", "/missing/child"] {
         let plan =
             MasterFilesystem::plan_memory_read(&fs_dir, path, false, &ListOptions::default())
@@ -383,7 +386,7 @@ fn rename_reloads_inode_after_a_hard_link_is_added() {
     let rename_result = result_rx.recv_timeout(Duration::from_secs(60));
     runtime.remove(rule_id).unwrap();
     assert!(planned, "rename did not reach lock planning");
-    link_result.unwrap().unwrap();
+    link_result.unwrap();
     rename_result
         .expect("rename worker did not finish")
         .unwrap();
@@ -758,7 +761,7 @@ fn rename_uses_source_edge_when_directory_metadata_name_is_stale() {
     fs.mkdir("/source/child", true).unwrap();
     let source = fs.file_status("/source").unwrap();
     {
-        let dir = fs.fs_dir.write();
+        let dir = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let path = InodePath::resolve(dir.root_node(), "/source", &dir.store).unwrap();
         let mut inode = path.get_last_inode().unwrap();
         inode.change_name("stale-name".to_string());
@@ -787,7 +790,7 @@ fn rename_rejects_long_packed_name_before_mutation() {
         assert_eq!(fs.file_status("/source").unwrap().id, original.id);
         assert!(!fs.exists(&destination).unwrap());
     }
-    let dir = fs.fs_dir.read();
+    let dir = fs.fs_dir.view().unwrap();
     let (_, restored) = dir.store.create_tree().unwrap();
     let root = restored.children_handle().unwrap();
     assert_eq!(root.get_child_edge("source").unwrap().id(), original.id);
@@ -836,7 +839,7 @@ fn rename_between_hard_links_is_a_noop() {
     let target = fs.file_status("/target").unwrap();
     assert_eq!((source.id, source.nlink), (before.id, 2));
     assert_eq!((target.id, target.nlink), (before.id, 2));
-    let dir = fs.fs_dir.read();
+    let dir = fs.fs_dir.view().unwrap();
     let (_, root) = dir.store.create_tree().unwrap();
     let root = root.children_handle().unwrap();
     assert_eq!(root.get_child_edge("source").unwrap().id(), before.id);
@@ -882,7 +885,8 @@ fn replace_rename_returns_replaced_file_blocks() {
     let block_id = block.block.id;
     let location = BlockLocation::with_id(100);
     fs.fs_dir
-        .write()
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
         .add_block_location(block_id, location.clone())
         .unwrap();
     fs.complete_file(
@@ -899,7 +903,7 @@ fn replace_rename_returns_replaced_file_blocks() {
         None,
     )
     .unwrap();
-    let dir = fs.fs_dir.write();
+    let dir = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
     let source = InodePath::resolve(dir.root_node(), "/source", &dir.store).unwrap();
     let target = InodePath::resolve(dir.root_node(), "/target", &dir.store).unwrap();
     let deleted = dir

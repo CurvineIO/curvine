@@ -54,7 +54,8 @@ fn completed_file(fs: &MasterFilesystem, path: &str, len: i64) -> FileGen {
         .unwrap();
     let block_id = block.block.id;
     fs.fs_dir
-        .write()
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap()
         .add_block_location(block_id, BlockLocation::with_id(100))
         .unwrap();
 
@@ -70,7 +71,7 @@ fn completed_file(fs: &MasterFilesystem, path: &str, len: i64) -> FileGen {
 }
 
 fn gen_of(fs: &MasterFilesystem, path: &str) -> FileGen {
-    let fs_dir = fs.fs_dir.read();
+    let fs_dir = fs.fs_dir.view().unwrap();
     let inp = InodePath::resolve(fs_dir.root_node(), path, &fs_dir.store).unwrap();
     inp.get_last_inode()
         .expect("inode exists")

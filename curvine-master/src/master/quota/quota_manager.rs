@@ -272,7 +272,7 @@ fn execute_eviction_step(
     // blocks after removal, so it contributes nothing to the byte target.
     let mut file_inode_ids: Vec<(i64, i64)> = Vec::with_capacity(inode_ids.len());
     {
-        let fs_guard = fs.fs_dir.read();
+        let fs_guard = fs.fs_dir.view().unwrap();
         for &inode_id in inode_ids {
             match fs_guard.store.get_inode(inode_id, None) {
                 Ok(Some(InodeView::File(f))) => {
@@ -577,7 +577,7 @@ mod tests {
         );
 
         // One purger cycle reclaims it, so the space comes back within a tick.
-        fs.drain_pending_trash().unwrap().unwrap();
+        fs.drain_pending_trash().unwrap();
         assert!(pending_entries(&fs).is_empty());
     }
 
