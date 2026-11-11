@@ -567,7 +567,7 @@ impl MasterMetrics {
             self.blocks_size_avg.set(avg_size);
         }
 
-        let fs_dir = fs.fs_dir.view().unwrap();
+        let fs_dir = fs.fs_dir.view()?;
         let rocksdb_metrics = fs_dir.get_rocks_store().get_rocksdb_metrics()?;
         for (key, value) in rocksdb_metrics {
             self.rocksdb_metrics

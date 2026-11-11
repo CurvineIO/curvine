@@ -388,8 +388,14 @@ impl MasterFilesystem {
     }
 
     pub fn print_tree(&self) {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        fs_dir.print_tree();
+        let mut cold = match self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("print_tree: namespace unavailable: {e}");
+                return;
+            }
+        };
+        cold.view().print_tree();
     }
 
     /// Holds the commit gate through mutation and journal confirmation so a
@@ -421,9 +427,15 @@ impl MasterFilesystem {
         if self.journal_writer.periodic_snapshot_due() {
             if let Some(_snapshot_guard) = self.metadata_commit_gate.close_and_enter_if_open() {
                 if self.journal_writer.ensure_metadata_epoch(epoch).is_ok() {
-                    let fs_dir = self.fs_dir.view().unwrap();
-                    if let Err(error) = self.journal_writer.maybe_emit_snapshot(&fs_dir) {
-                        warn!("periodic metadata snapshot failed: {}", error);
+                    match self.fs_dir.view() {
+                        Ok(fs_dir) => {
+                            if let Err(error) = self.journal_writer.maybe_emit_snapshot(&fs_dir) {
+                                warn!("periodic metadata snapshot failed: {}", error);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("periodic metadata snapshot: namespace unavailable: {e}");
+                        }
                     }
                 }
             }
@@ -2291,7 +2303,7 @@ impl MasterFilesystem {
                 }
                 Ok(workers)
             };
-            let Ok(worker_ids) = read_workers(&self.fs_dir.view().unwrap()) else {
+            let Ok(worker_ids) = read_workers(&*self.fs_dir.view().unwrap()) else {
                 break;
             };
             #[cfg(test)]

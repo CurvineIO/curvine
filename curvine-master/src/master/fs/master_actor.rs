@@ -126,7 +126,7 @@ impl MasterActor {
         info!("Starting inode ttl scheduler.");
 
         let ttl_bucket_list = {
-            let fs_dir = self.fs.fs_dir.view().unwrap();
+            let fs_dir = self.fs.fs_dir.view()?;
             fs_dir.get_ttl_bucket_list()
         };
 

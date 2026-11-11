@@ -60,7 +60,7 @@ impl UfsLoader {
     }
 
     pub fn get_real_path(&self, inode_id: i64) -> FsResult<Path> {
-        let path = self.fs_dir.view().unwrap().get_inode_path(inode_id)?;
+        let path = self.fs_dir.view()?.get_inode_path(inode_id)?;
         Ok(Path::from_str(path)?)
     }
 
@@ -207,7 +207,7 @@ impl UfsLoader {
         }
         let gen = e.file.gen();
         let path = {
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
             let Some(InodeView::File(file)) = snapshot.get_inode(e.file.id)? else {
                 return Ok(None);

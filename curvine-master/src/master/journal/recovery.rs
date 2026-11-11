@@ -126,8 +126,11 @@ impl RecoveryGate {
         self.note_error(reason);
         self.inner.safe_mode.store(true, Ordering::Release);
         self.inner.ufs_caught_up.store(false, Ordering::Release);
-        self.inner.failure_seq.fetch_add(1, Ordering::Release);
         log::error!("master entered safe mode: {reason}");
+    }
+
+    pub(crate) fn record_failure(&self) {
+        self.inner.failure_seq.fetch_add(1, Ordering::Release);
     }
 
     pub(crate) fn mark_writer_failed(&self) {

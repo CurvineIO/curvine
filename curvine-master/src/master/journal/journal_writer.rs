@@ -339,6 +339,7 @@ impl JournalWriter {
         self.fence_metadata();
         self.recovery.enter_safe_mode(reason);
         self.recovery.mark_writer_failed();
+        self.recovery.record_failure();
     }
 
     pub fn ensure_metadata_current(&self) -> FsResult<()> {

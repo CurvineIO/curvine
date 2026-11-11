@@ -462,7 +462,7 @@ impl MasterReplicationManager {
         permit: OwnedSemaphorePermit,
     ) -> CommonResult<()> {
         let block_state = {
-            let fs_dir = self.fs.fs_dir.view().unwrap();
+            let fs_dir = self.fs.fs_dir.view()?;
             fs_dir.replication_block_state(block_id)?
         };
         let Some(block_state) = block_state else {

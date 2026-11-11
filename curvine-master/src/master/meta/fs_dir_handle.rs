@@ -36,6 +36,7 @@
 
 use crate::master::meta::FsDir;
 use arc_swap::{ArcSwapOption, Guard};
+use curvine_error::FsError;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -44,6 +45,38 @@ use std::time::{Duration, Instant};
 const STATE_OPEN: u8 = 0;
 const STATE_COLD: u8 = 1;
 const STATE_FAILED: u8 = 2;
+
+impl From<NamespaceError> for FsError {
+    fn from(e: NamespaceError) -> Self {
+        match e {
+            NamespaceError::Busy => {
+                FsError::in_progress_msg("namespace is temporarily unavailable (cold window)")
+            }
+            NamespaceError::Unavailable => {
+                FsError::journal_unavailable("namespace permanently unavailable after failure")
+            }
+        }
+    }
+}
+
+impl From<ColdError> for FsError {
+    fn from(e: ColdError) -> Self {
+        match e {
+            ColdError::Busy => {
+                FsError::in_progress_msg("another cold exclusivity window is active")
+            }
+            ColdError::DrainTimeout => {
+                FsError::in_progress_msg("cold window drain timed out waiting for view guards")
+            }
+            ColdError::Unavailable => {
+                FsError::journal_unavailable("namespace permanently unavailable after failure")
+            }
+            ColdError::InvalidTimeout => {
+                FsError::invalid_argument("cold window timeout overflows the deadline")
+            }
+        }
+    }
+}
 
 /// Default timeout for cold exclusivity used by regular consumers.
 pub const DEFAULT_COLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -54,18 +87,37 @@ pub enum NamespaceError {
     Unavailable,
 }
 
+impl std::fmt::Display for NamespaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => write!(f, "namespace view temporarily unavailable (cold window)"),
+            Self::Unavailable => write!(f, "namespace permanently unavailable after failure"),
+        }
+    }
+}
+
+impl std::error::Error for NamespaceError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColdError {
-    /// Another cold owner is already running.
     Busy,
-    /// A previous cold window failed closed; this handle cannot recover it.
     Unavailable,
-    /// Existing view guards did not drain in time; access was restored and
-    /// the view was left untouched.
     DrainTimeout,
-    /// The timeout value overflows the deadline clock; nothing was touched.
     InvalidTimeout,
 }
+
+impl std::fmt::Display for ColdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => write!(f, "another cold exclusivity window is active"),
+            Self::Unavailable => write!(f, "namespace permanently unavailable after failure"),
+            Self::DrainTimeout => write!(f, "cold window drain timed out waiting for view guards"),
+            Self::InvalidTimeout => write!(f, "cold window timeout overflows the deadline"),
+        }
+    }
+}
+
+impl std::error::Error for ColdError {}
 
 pub struct FsDirHandle {
     current: ArcSwapOption<FsDir>,

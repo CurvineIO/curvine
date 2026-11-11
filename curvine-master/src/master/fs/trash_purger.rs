@@ -131,7 +131,7 @@ impl TrashPurger {
             // The bounded walk dereferences live inodes, so exclude sharded
             // writers for one page at a time.
             let batch = {
-                let fs_dir = self.fs.fs_dir.view().unwrap();
+                let fs_dir = self.fs.fs_dir.view()?;
                 Self::next_batch(&fs_dir, &mut frames, self.batch_inodes, self.batch_bytes)?
             };
             if batch.is_empty() {
