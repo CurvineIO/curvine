@@ -62,3 +62,17 @@
 ### 手动重试
 
 Actions -> `Trigger Helm Release` -> Run workflow，填写 tag（如 `v0.3.0`）。
+
+## 4. Issue 自助认领 (issue-self-assign.yml)
+
+参与者在 Issue 下评论即可认领或放弃认领，无需维护者手动操作：
+
+| 评论内容 | 效果 |
+| --- | --- |
+| `/assign` | Issue 处于打开状态且无人认领时，assign 给评论者 |
+| `/unassign` | 将评论者从 assignees 中移除 |
+
+- 评论必须只包含命令本身（不区分大小写），句子中提到 `/assign` 不会触发
+- Issue 已被他人认领或已关闭时，机器人会回复说明，不会改动 assignees
+- PR 下的评论不会触发
+- 使用默认 `GITHUB_TOKEN`，只申请 `issues: write` 权限，无需额外配置 Secret
