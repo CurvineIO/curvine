@@ -3511,7 +3511,7 @@ version = "53.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d72a11ca44a95e1081870d3abb80c717496e8a7acb467a1d3e932bb636af5cc2"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrow 58.4.1",
  "arrow-ipc 58.4.1",
  "chrono",
@@ -6145,7 +6145,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
- "twox-hash",
+ "twox-hash 2.1.2",
  "url",
 ]
 
@@ -7250,7 +7250,7 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef0d4ed8669f8f8826eb00dc878084aa8f253506c4fd5e8f58f5bce72ddb97e"
 dependencies = [
- "twox-hash",
+ "twox-hash 2.1.2",
 ]
 
 [[package]]
