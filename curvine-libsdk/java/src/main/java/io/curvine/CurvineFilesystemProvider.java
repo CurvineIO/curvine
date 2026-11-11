@@ -149,7 +149,10 @@ public class CurvineFilesystemProvider implements Closeable {
         CompletableFuture<CurvineFileSystem> future = CompletableFuture.supplyAsync(() -> {
             try {
                 URI uri = new URI(CurvineFileSystem.SCHEME + "://" + clusterName);
-                FileSystem fileSystem = FileSystem.get(uri, conf);
+                // newInstance, not get: close() releases this instance, and closing the
+                // FileSystem cache's shared instance would break every other holder of it.
+                // Instances with the same master share one native mount (refcounted).
+                FileSystem fileSystem = FileSystem.newInstance(uri, conf);
 
                 if (!(fileSystem instanceof CurvineFileSystem)) {
                     throw new RuntimeException("Failed to create CurvineFileSystem instance");
