@@ -16,7 +16,7 @@
 #
 
 # Get the absolute path to the directory where the script is located
-BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd)"
 
 # Close all services and restart.
 
@@ -97,6 +97,36 @@ transfer_enabled() {
     [ "$(read_bool "transfer" "enabled" "false")" = "true" ]
 }
 
+# Stop one service, if there is one to stop.
+#
+# Each service's own stop signals only the PID recorded in that service's
+# pid file, so a process that merely mentions curvine in its command line is
+# left alone: another Curvine deployment on the same host, an editor with a
+# Curvine file open, a shell in a curvine/ directory, even a `tail -f
+# curvine.log`. `pkill -9 -f curvine` killed those too.
+stop_service() {
+    local script=$1
+    if [ ! -f "${BIN_DIR}/${script}" ]; then
+        echo "no ${script} to stop"
+        return 0
+    fi
+    "${BIN_DIR}/${script}" stop || true
+}
+
+# Stop the services this script manages, in the reverse order they were
+# started.
+stop_services() {
+    stop_service curvine-fuse.sh
+    # A fuse daemon that was killed leaves its mount behind; the lazy
+    # unmount clears it, and it names the mount point this script manages.
+    umount -l /curvine-fuse 2>/dev/null || true
+    if transfer_enabled; then
+        stop_service curvine-transfer.sh
+    fi
+    stop_service curvine-worker.sh
+    stop_service curvine-master.sh
+}
+
 # Function to wait for a process to start
 wait_for_process() {
     local service_name=$1
@@ -155,32 +185,34 @@ wait_for_port() {
     return 1
 }
 
-umount -l /curvine-fuse
-pkill -9 -f "curvine"
+main() {
+    stop_services
 
-# Wait a moment for processes to be killed
-sleep 3
+    MASTER_PORT=$(read_rpc_port "master" 8995)
+    WORKER_PORT=$(read_rpc_port "worker" 8997)
+    TRANSFER_PORT=$(read_rpc_port "transfer" 9010)
 
-MASTER_PORT=$(read_rpc_port "master" 8995)
-WORKER_PORT=$(read_rpc_port "worker" 8997)
-TRANSFER_PORT=$(read_rpc_port "transfer" 9010)
+    # Start master and worker services
+    ${BIN_DIR}/curvine-master.sh start
+    wait_for_process "master" || exit 1
+    wait_for_port "master" "$MASTER_PORT" 180 || exit 1
 
-# Start master and worker services
-${BIN_DIR}/curvine-master.sh start
-wait_for_process "master" || exit 1
-wait_for_port "master" "$MASTER_PORT" 180 || exit 1
+    ${BIN_DIR}/curvine-worker.sh start
 
-${BIN_DIR}/curvine-worker.sh start
+    # Wait for master and worker to start
+    wait_for_process "worker" || exit 1
+    wait_for_port "worker" "$WORKER_PORT" 60 || exit 1
 
-# Wait for master and worker to start
-wait_for_process "worker" || exit 1
-wait_for_port "worker" "$WORKER_PORT" 60 || exit 1
+    if transfer_enabled; then
+        ${BIN_DIR}/curvine-transfer.sh start
+        wait_for_process "transfer" || exit 1
+        wait_for_port "transfer" "$TRANSFER_PORT" 60 || exit 1
+    fi
 
-if transfer_enabled; then
-    ${BIN_DIR}/curvine-transfer.sh start
-    wait_for_process "transfer" || exit 1
-    wait_for_port "transfer" "$TRANSFER_PORT" 60 || exit 1
+    # Start fuse service
+    ${BIN_DIR}/curvine-fuse.sh start
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-
-# Start fuse service
-${BIN_DIR}/curvine-fuse.sh start

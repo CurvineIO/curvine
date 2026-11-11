@@ -37,6 +37,22 @@ jobs:
           echo "Disk usage after cleanup:"
           df -h
 
+  script-tests:
+    name: script tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # The script tests that need no cluster: the version checks, and the
+      # stop phase of restart-all.sh.
+      - name: Run the script tests
+        run: |
+          set -euo pipefail
+          bash build/tests/test_package_version.sh
+          bash build/tests/test_release_version.sh
+          bash build/tests/test_workspace_version.sh
+          bash build/tests/test_restart_all.sh
+
   build:
     runs-on: ubuntu-latest
     needs: cleanup
