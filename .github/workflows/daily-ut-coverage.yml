@@ -21,7 +21,7 @@ jobs:
     container:
       image: ghcr.io/curvineio/curvine-tests:rocky9
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Rust toolchain
         run: |
@@ -72,7 +72,7 @@ jobs:
           echo "Full artifacts: \`daily-ut-coverage-artifacts\`." >> $GITHUB_STEP_SUMMARY
 
       - name: Upload daily UT + coverage artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: daily-ut-coverage-artifacts
           path: curvine-tests/regression_result
