@@ -14,11 +14,11 @@ If you prefer not to open a PR, you can also [open an issue](https://github.com/
 
 ## Companies/Projects using Curvine in production
 
-These companies and projects are using Curvine in production. If your company is using Curvine, open a PR to add your company or project name, a logo, and a description of how you are using Curvine.
+These companies and projects are using Curvine in production. If your company is using Curvine, open a PR to add your company or project name, a 1–3 sentence description of how you are using Curvine, and optionally a logo (entries without a logo are fine; the Logo cell is left empty).
 
 | Company / Project | Logo | Use Case |
 | --- | --- | --- |
-| OPPO | <img src="docs/adopters/oppo.svg" alt="OPPO" height="40"> | OPPO uses Curvine as a multi-cloud big-data cache acceleration layer. Curvine's FUSE interface hosts big-data compute intermediate data, accelerates multimodal data lake access via LanceDB caching, and speeds up StarRocks hot-data queries in compute-storage separated architectures. |
+| OPPO |  | OPPO uses Curvine as a multi-cloud big-data cache acceleration layer. Curvine's FUSE interface hosts big-data compute intermediate data, accelerates multimodal data lake access via LanceDB caching, and speeds up StarRocks hot-data queries in compute-storage separated architectures. |
 
 ## Companies/Projects evaluating or using Curvine
 

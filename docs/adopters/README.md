@@ -1,6 +1,6 @@
 # Adopter Logo Assets
 
-Logos of organizations listed in [ADOPTERS.md](../ADOPTERS.md) are stored in this directory.
+Logos of organizations listed in [ADOPTERS.md](../../ADOPTERS.md) are stored in this directory.
 
 ## Conventions
 

@@ -71,12 +71,9 @@ Follow [cv-create-pr](../cv-create-pr/SKILL.md):
 
 ## Review Checklist (for maintainers handling the PR)
 
-- [ ] Logo path exists and file is SVG/transparent PNG, < 100 KB
-- [ ] Logo rendered with `height="40"` so the table stays consistent
-- [ ] Entry added to the correct table (production vs evaluation)
 - [ ] Use-case description is factual, English, 1–3 sentences
-- [ ] If only a logo with no use case: acceptable, use case may be omitted
-- [ ] Logo file name is kebab-case and placed under `docs/adopters/`
+- [ ] Logo optional: if none provided, leave the Logo cell empty (docs site renders a text placeholder)
+- [ ] If a logo is included: file is SVG/transparent PNG, < 100 KB, kebab-case name under `docs/adopters/`, rendered with `height="40"`
 
 ## Related
 
