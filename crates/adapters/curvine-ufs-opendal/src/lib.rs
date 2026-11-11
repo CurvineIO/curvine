@@ -541,9 +541,35 @@ pub struct OpendalWriter {
     writer: Option<opendal::Writer>,
     /// Hard upper bound for one write/close, including opendal's own retries.
     operation_timeout: Duration,
+    /// Cause of the first failed upload step. A failed or timed-out chunk upload
+    /// has already drained its bytes from `chunk`, and a failed close has already
+    /// dropped `writer`, so the object can no longer be committed correctly.
+    /// Once set, every later write, flush, and complete fails instead of
+    /// reporting a partial or missing upload as committed.
+    failed: Option<String>,
 }
 
 impl OpendalWriter {
+    fn check_not_failed(&self) -> FsResult<()> {
+        match &self.failed {
+            Some(cause) => err_box!(format!(
+                "UFS writer for {} already failed and cannot be completed: {}",
+                self.object_path, cause
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Make the first upload failure sticky; see [`Self::failed`].
+    fn record_failure<T>(&mut self, res: FsResult<T>) -> FsResult<T> {
+        if let Err(e) = &res {
+            if self.failed.is_none() {
+                self.failed = Some(e.to_string());
+            }
+        }
+        res
+    }
+
     /// Upload one chunk without the outer deadline; see [`Writer::write_chunk`].
     async fn write_chunk_inner(&mut self, chunk: DataSlice) -> FsResult<i64> {
         if self.writer.is_none() {
@@ -594,18 +620,21 @@ impl Writer for OpendalWriter {
     }
 
     async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
+        self.check_not_failed()?;
         let timeout = self.operation_timeout;
         let object_path = self.object_path.clone();
-        with_deadline(
+        let res = with_deadline(
             timeout,
             "write",
             &object_path,
             self.write_chunk_inner(chunk),
         )
-        .await
+        .await;
+        self.record_failure(res)
     }
 
     async fn flush(&mut self) -> FsResult<()> {
+        self.check_not_failed()?;
         self.flush_chunk().await?;
         Ok(())
     }
@@ -617,13 +646,15 @@ impl Writer for OpendalWriter {
             let timeout = self.operation_timeout;
             let object_path = self.object_path.clone();
             let close_path = object_path.clone();
-            with_deadline(timeout, "complete", &object_path, async move {
+            let res = with_deadline(timeout, "complete", &object_path, async move {
                 writer
                     .close()
                     .await
+                    .map(|_| ())
                     .map_err(|e| opendal_error("Failed to close writer", &close_path, e))
             })
-            .await?;
+            .await;
+            self.record_failure(res)?;
         }
 
         Ok(())
@@ -1213,6 +1244,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             chunk_size: 8 * 1024 * 1024,
             writer: None,
             operation_timeout: self.operation_timeout,
+            failed: None,
         })
     }
 
@@ -1248,6 +1280,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                         chunk_size: 8 * 1024 * 1024,
                         writer: None,
                         operation_timeout: self.operation_timeout,
+                        failed: None,
                     });
                 }
                 err_ext!(FsError::unsupported(format!(
