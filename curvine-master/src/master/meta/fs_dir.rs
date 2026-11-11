@@ -2374,9 +2374,18 @@ impl FsDir {
     // Restore in-memory tree from RocksDB without checkpoint (for testing only).
     // In production, use restore() with checkpoint path via Raft snapshot.
     pub fn restore_from_rocksdb(&mut self) -> CommonResult<()> {
+        // Same restore boundary as `restore()`: the restore guard drains and
+        // cancels scans across the rebuild. Clear-before-build; on failure the
+        // old tree is never replaced and the TTL list may be empty, partially
+        // rebuilt, or fully rebuilt. DB migration and repair writes are not
+        // rolled back. Executors read current inodes, so the entries present
+        // never cause wrong deletions; the only cost is TTL-deletion timing.
+        // This matches the pre-existing `restore()` semantics.
+        let _restore_guard = self.store.begin_restore(self.restore_wait_timeout)?;
         self.store.ensure_available()?;
         self.store.migrate_directory_attributes()?;
         self.store.initialize_root_directory_attributes()?;
+        self.store.get_ttl_bucket_list().clear();
         let (last_inode_id, root_dir) = self.store.create_tree()?;
         root_dir.as_dir_ref()?;
         self.root = DirNode::from_view(&root_dir);

@@ -1405,6 +1405,13 @@ impl InodeStore {
 
         // Commit repairs atomically
         if has_repairs {
+            crate::fault_point! {
+                sync,
+                name: "master.metadata.restore.repair_commit",
+                description: "Before committing the tree repair batch",
+                context: { "phase" => "restore_from_rocksdb" },
+                return_error: |fault| Err(fault.message.into()),
+            }
             repair_batch.commit()?;
         }
         timer.mark("build_tree");

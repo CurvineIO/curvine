@@ -612,3 +612,116 @@ fn checkpoint_failure_returns_error_without_reentering_fs_lock() {
     assert!(fs.exists("/existing").unwrap());
     journal.shutdown();
 }
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn restore_from_rocksdb_repair_failure_keeps_old_tree_and_ttl_rebuilt() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use curvine_master::master::meta::inode::ROOT_INODE_ID;
+    use curvine_model::{CreateFileOpts, OpenFlags, TtlAction};
+
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!(
+        "restore-rebuild-repair-{}",
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    let journal = JournalSystem::from_conf(&conf).unwrap();
+    let fs = journal.fs();
+    let mut opts = CreateFileOpts::with_create(true);
+    opts.storage_policy.ttl_ms = 1_000;
+    opts.storage_policy.ttl_action = TtlAction::Delete;
+    let kept = fs
+        .create_with_opts("/kept", opts, OpenFlags::new_create())
+        .unwrap();
+    let buckets = fs.fs_dir.read().store_ref().get_ttl_bucket_list();
+    assert_eq!(buckets.total_inodes(), 1);
+
+    // Plant an orphan edge under the root (no inode row for 999_999): the
+    // rebuild must repair it via delete_child, guaranteeing
+    // `has_repairs == true` so the repair-batch commit fault point fires.
+    {
+        let dir = fs.fs_dir.read();
+        let mut batch = dir.store_ref().new_batch();
+        batch.add_child(ROOT_INODE_ID, "orphan", 999_999).unwrap();
+        batch.commit().unwrap();
+    }
+
+    // Inject a repair-batch commit failure: the rebuild fails, the old tree
+    // stays visible, and the TTL list has already been repopulated from the
+    // current database (the walk runs before the repair commit).
+    let runtime = FaultRuntime::process();
+    let rule_id = "restore-rebuild-repair-failure";
+    let rule = FaultRuleBuilder::named("master.metadata.restore.repair_commit")
+        .matches("phase", "restore_from_rocksdb")
+        .unwrap()
+        .return_error("injected repair batch commit failure")
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+
+    let rebuild = fs.fs_dir.write().restore_from_rocksdb();
+    let executions = runtime
+        .rule(rule_id)
+        .unwrap()
+        .map(|rule| rule.executions)
+        .unwrap_or(0);
+    runtime.remove(rule_id).unwrap();
+    assert!(rebuild.is_err(), "injected repair failure must propagate");
+    assert_eq!(
+        executions, 1,
+        "repair commit fault point must fire exactly once"
+    );
+
+    // Old tree still readable. The repair commit failed after the TTL walk
+    // had repopulated the list from the current database: /kept is present.
+    assert!(fs.exists("/kept").unwrap());
+    let ttl_ids: Vec<_> = buckets
+        .get_expired_buckets_at(i64::MAX)
+        .iter()
+        .flat_map(|bucket| bucket.inodes.lock().iter().collect::<Vec<_>>())
+        .collect();
+    assert_eq!(ttl_ids, vec![kept.id as u64]);
+    journal.shutdown();
+}
+
+#[test]
+fn restore_from_rocksdb_rebuilds_ttl_from_current_db() {
+    use curvine_model::{CreateFileOpts, OpenFlags, TtlAction};
+
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!(
+        "restore-rebuild-ttl-{}",
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    let journal = JournalSystem::from_conf(&conf).unwrap();
+    let fs = journal.fs();
+    let mut opts = CreateFileOpts::with_create(true);
+    opts.storage_policy.ttl_ms = 1_000;
+    opts.storage_policy.ttl_action = TtlAction::Delete;
+    let kept = fs
+        .create_with_opts("/kept", opts, OpenFlags::new_create())
+        .unwrap();
+
+    // Successful rebuild: the TTL list is cleared and repopulated from the
+    // current database (only /kept remains).
+    fs.fs_dir.write().restore_from_rocksdb().unwrap();
+    assert!(fs.exists("/kept").unwrap());
+    let ids: Vec<_> = fs
+        .fs_dir
+        .read()
+        .store_ref()
+        .get_ttl_bucket_list()
+        .get_expired_buckets_at(i64::MAX)
+        .iter()
+        .flat_map(|bucket| bucket.inodes.lock().iter().collect::<Vec<_>>())
+        .collect();
+    assert_eq!(ids, vec![kept.id as u64]);
+    journal.shutdown();
+}
