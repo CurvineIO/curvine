@@ -10,6 +10,9 @@ on:
       - '**'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Tune build parallelism: 4 uses more CPU on standard 4-vCPU runner; set to 2 if OOM

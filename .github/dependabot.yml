@@ -1,0 +1,60 @@
+# Dependabot configuration.
+# Version updates run weekly and are grouped per ecosystem to keep PR volume low.
+# Security updates are not limited by these groups.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "build"
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "gomod"
+    directory: "/curvine-csi"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "build"
+    groups:
+      gomod-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "maven"
+    directory: "/curvine-libsdk/java"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "build"
+    groups:
+      maven-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/curvine-web/webui"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "build"
+    groups:
+      npm-minor-patch:
+        update-types: ["minor", "patch"]

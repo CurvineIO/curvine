@@ -23,6 +23,7 @@
   <a href="https://github.com/CurvineIO/curvine/releases"><img src="https://img.shields.io/github/v/release/CurvineIO/curvine?include_prereleases" alt="Release"></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.86%2B-orange" alt="Rust"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/CurvineIO/curvine"><img src="https://api.scorecard.dev/projects/github.com/CurvineIO/curvine/badge" alt="OpenSSF Scorecard"></a>
 </p>
 
 <p align="center">
@@ -221,6 +222,7 @@ Curvine 分为四层，在上图中以不同颜色区分：
 - **问题与想法：** [GitHub Discussions](https://github.com/CurvineIO/curvine/discussions)
 - **Bug 与功能需求：** [GitHub Issues](https://github.com/CurvineIO/curvine/issues)
 - **正在使用 Curvine？** 欢迎把你的公司加入 [ADOPTERS.md](ADOPTERS.md)。
+- **项目方向：** 见 [路线图](ROADMAP.md) 和 [治理规则](GOVERNANCE.md)。
 
 ## 🤝 参与贡献
 
