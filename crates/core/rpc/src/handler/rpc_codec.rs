@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::message::RefMessage;
-use crate::message::{Message, MAX_DATE_SIZE};
+use crate::message::{Message, MAX_FRAME_SIZE};
 use bytes::BytesMut;
 use curvine_io::{IOError, IOResult};
 use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
@@ -28,7 +28,7 @@ pub struct RpcCodec {
 impl RpcCodec {
     pub fn new() -> RpcCodec {
         let inner = LengthDelimitedCodec::builder()
-            .max_frame_length(MAX_DATE_SIZE as usize)
+            .max_frame_length(MAX_FRAME_SIZE as usize)
             .length_field_length(4)
             .new_codec();
 
@@ -64,5 +64,26 @@ impl Decoder for RpcCodec {
 impl Default for RpcCodec {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::HEAD_SIZE;
+    use bytes::BufMut;
+
+    #[test]
+    fn decode_rejects_frame_shorter_than_head() {
+        let mut buf = BytesMut::from(&[0u8; 10][..]);
+        assert!(Message::decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_header_beyond_frame_body() {
+        let mut buf = BytesMut::new();
+        buf.put_u32(64);
+        buf.put_bytes(0, (HEAD_SIZE - 4) as usize);
+        assert!(Message::decode(&mut buf).is_err());
     }
 }

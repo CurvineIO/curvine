@@ -13,130 +13,31 @@
 // limitations under the License.
 
 use std::io;
-use std::ops::DerefMut;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, ReadHalf};
+use tokio::io::ReadHalf;
 use tokio::net::TcpStream;
 
 use crate::handler::FrameBuf;
-use crate::message;
-use crate::message::{Message, Protocol};
+use crate::message::Message;
 use crate::IOUtils;
-use curvine_io::{DataSlice, IOResult};
+use curvine_io::IOResult;
 
 pub struct ReadFrame {
     io: ReadHalf<TcpStream>,
     buf: FrameBuf,
-    /// Protocol head decoded but still waiting for its header/data sections;
-    /// lets a frame span multiple socket reads without losing buffered bytes.
-    pending: Option<(Protocol, i32, i32)>,
 }
 
 impl ReadFrame {
     pub(crate) fn new(io: ReadHalf<TcpStream>, buf: FrameBuf) -> Self {
-        Self {
-            io,
-            buf,
-            pending: None,
-        }
+        Self { io, buf }
     }
 
     /// Receives the next complete message. Bytes read from the socket are
     /// buffered, so one syscall can satisfy several back-to-back messages
     /// instead of the per-frame `read_exact` calls of the exact-read path.
     pub async fn receive(&mut self) -> IOResult<Message> {
-        loop {
-            match self.pending.take() {
-                Some((protocol, header_size, data_size)) => {
-                    // Both are validated non-negative i32; summing in usize
-                    // cannot wrap, unlike the i32 add.
-                    let need = header_size as usize + data_size as usize;
-                    if self.buf.len() < need {
-                        self.pending = Some((protocol, header_size, data_size));
-                    } else {
-                        let header = if header_size > 0 {
-                            Some(self.buf.split_to(header_size as usize))
-                        } else {
-                            None
-                        };
-
-                        let data = if data_size > 0 {
-                            DataSlice::Buffer(self.buf.split_to(data_size as usize))
-                        } else {
-                            DataSlice::Empty
-                        };
-                        let mut msg = Message::new(protocol, header, data);
-                        self.buf.maybe_shrink();
-
-                        // Heartbeat message.
-                        if msg.is_heartbeat() {
-                            continue;
-                        } else {
-                            msg.set_time();
-                            return Ok(msg);
-                        }
-                    }
-                }
-
-                None => {
-                    if self.buf.len() >= message::PROTOCOL_SIZE as usize {
-                        let (protocol, header_size, data_size) =
-                            Message::decode_protocol(self.buf.deref_mut())?;
-                        // decode_protocol only bounds data_size; header_size is
-                        // unbounded (large header-only responses such as
-                        // ListStatus are legitimate). A negative header_size
-                        // would wrap the usize fill target computed below into
-                        // something the buffer can never reach, stalling the
-                        // connection while it grows without bound, so reject it
-                        // here. With header_size >= 0 the usize sum cannot wrap.
-                        if header_size < 0 {
-                            return err_box!(
-                                "invalid frame head: negative header_size={}",
-                                header_size
-                            );
-                        }
-                        self.pending = Some((protocol, header_size, data_size));
-                        continue;
-                    }
-                }
-            }
-
-            // Need more bytes from the socket. Reserve the exact shortfall so
-            // read_buf never reports a zero-byte read (mistaken for EOF) and
-            // does not grow the buffer one read at a time.
-            let want = match self.pending {
-                Some((_, header_size, data_size)) => {
-                    header_size as usize + data_size as usize - self.buf.len()
-                }
-                None => message::PROTOCOL_SIZE as usize - self.buf.len(),
-            };
-            self.buf.reserve(want.max(1));
-            let n = self.io.read_buf(self.buf.deref_mut()).await?;
-            if n == 0 {
-                // A clean close (no buffered bytes) keeps the empty-message
-                // contract; any buffered partial frame is a truncation and
-                // must surface as UnexpectedEof so callers drop the
-                // connection instead of treating it as a clean EOF.
-                if self.pending.is_none() && self.buf.is_empty() {
-                    return Ok(Message::empty());
-                }
-                let what = if self.pending.is_none() {
-                    "frame head"
-                } else {
-                    "frame body"
-                };
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "connection closed mid-{} with {} buffered bytes",
-                        what,
-                        self.buf.len()
-                    ),
-                )
-                .into());
-            }
-        }
+        IOUtils::receive_buffered(&mut self.io, &mut self.buf).await
     }
 
     pub async fn receive_timeout(&mut self, dur: Duration) -> IOResult<Message> {
@@ -145,18 +46,14 @@ impl ReadFrame {
             // Any buffered but unconsumed bytes mean a frame is in progress,
             // so a timeout leaves the stream desynced and the connection must
             // be dropped instead of resuming it.
-            Err(e)
-                if IOUtils::is_timeout(&e) && (self.pending.is_some() || !self.buf.is_empty()) =>
-            {
-                Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    format!(
-                        "frame receive timed out after {dur:?} in the middle of a frame, \
+            Err(e) if IOUtils::is_timeout(&e) && !self.buf.is_empty() => Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!(
+                    "frame receive timed out after {dur:?} in the middle of a frame, \
                      the stream is desynced and the connection must be dropped"
-                    ),
-                )
-                .into())
-            }
+                ),
+            )
+            .into()),
 
             other => other,
         }
@@ -271,6 +168,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receive_timeout_aborts_a_head_without_its_body() {
+        let (mut read_frame, mut client_write) = setup_pair().await;
+
+        // Send only the 22-byte head of a frame declaring a 1024-byte body. The
+        // head must stay unconsumed, otherwise the stream looks idle and the
+        // next receive would parse the body bytes as a frame head.
+        let mut frame = BytesMut::new();
+        Builder::new_rpc(1i8)
+            .data(DataSlice::Buffer(BytesMut::zeroed(1024)))
+            .build()
+            .encode(&mut frame)
+            .unwrap();
+        client_write
+            .write_all(&frame[..crate::message::PROTOCOL_USIZE])
+            .await
+            .unwrap();
+
+        let err = match read_frame
+            .receive_timeout(std::time::Duration::from_millis(50))
+            .await
+        {
+            Ok(_) => panic!("a head without its body must not yield a message"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionAborted,
+            "a mid-frame timeout must abort the stream, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn receive_rejects_invalid_header_size() {
         let (mut read_frame, mut client_write) = setup_pair().await;
 
@@ -299,7 +228,7 @@ mod tests {
 
         let mut msg = Builder::new_rpc(1i8).build();
         msg.header = Some(BytesMut::zeroed(
-            message::MAX_DATE_SIZE as usize + 1024 * 1024,
+            crate::message::MAX_DATE_SIZE as usize + 1024 * 1024,
         ));
         let mut frame = BytesMut::new();
         msg.encode(&mut frame).unwrap();
@@ -313,7 +242,10 @@ mod tests {
         let got = read_frame.receive().await.unwrap();
         writer.await.unwrap();
         let header = got.header.expect("header must round-trip");
-        assert_eq!(header.len(), message::MAX_DATE_SIZE as usize + 1024 * 1024);
+        assert_eq!(
+            header.len(),
+            crate::message::MAX_DATE_SIZE as usize + 1024 * 1024
+        );
     }
 
     #[tokio::test]
@@ -350,5 +282,115 @@ mod tests {
             err.to_string().contains("frame head"),
             "expected a frame-head truncation error, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn receive_errors_on_truncated_frame_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+
+        let mut frame = BytesMut::new();
+        Builder::new_rpc(1i8)
+            .data(DataSlice::Buffer(BytesMut::zeroed(1024)))
+            .build()
+            .encode(&mut frame)
+            .unwrap();
+        let truncated = frame.len() - 512;
+
+        let (_, mut client_write) = tokio::io::split(client);
+        client_write.write_all(&frame[..truncated]).await.unwrap();
+        client_write.shutdown().await.unwrap();
+
+        let (read_half, _) = tokio::io::split(server_stream);
+        let mut read_frame = ReadFrame::new(read_half, FrameBuf::new(0));
+
+        let err = match read_frame.receive().await {
+            Ok(_) => panic!("truncated frame body must be an error"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "truncated frame body must surface as UnexpectedEof, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("frame body"),
+            "expected a frame-body truncation error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_rejects_frame_above_max_frame_size() {
+        let (mut read_frame, mut client_write) = setup_pair().await;
+
+        // Only the head is sent: a declaration beyond the frame budget must be
+        // rejected before any body is buffered, so the receiver never reserves
+        // the declared amount.
+        let declared = crate::message::MAX_FRAME_SIZE;
+        let mut head = BytesMut::new();
+        head.put_i32(declared + 18);
+        head.put_i32(declared);
+        head.put_i8(0);
+        head.put_i8(0);
+        head.put_i64(0);
+        head.put_i32(0);
+        client_write.write_all(&head).await.unwrap();
+
+        let err = match read_frame.receive().await {
+            Ok(_) => panic!("a frame above the budget must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("Frame exceeds maximum size"),
+            "expected an oversized-frame rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_rejects_extreme_sizes_without_overflow() {
+        let (mut read_frame, mut client_write) = setup_pair().await;
+
+        // total_size - header_size underflows i32 here; the head must be
+        // rejected instead of panicking in a debug build or wrapping in a
+        // release build.
+        let mut head = BytesMut::new();
+        head.put_i32(i32::MIN);
+        head.put_i32(i32::MAX);
+        head.put_i8(0);
+        head.put_i8(0);
+        head.put_i64(0);
+        head.put_i32(0);
+        client_write.write_all(&head).await.unwrap();
+
+        let err = match read_frame.receive().await {
+            Ok(_) => panic!("an underflowing head must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("data length is negative"),
+            "expected a negative-data rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_skips_heartbeat_and_returns_next_frame() {
+        let (mut read_frame, mut client_write) = setup_pair().await;
+
+        let mut frames = BytesMut::new();
+        Message::heartbeat().encode(&mut frames).unwrap();
+        Builder::new_rpc(7i8)
+            .data(DataSlice::Buffer(BytesMut::zeroed(32)))
+            .build()
+            .encode(&mut frames)
+            .unwrap();
+        client_write.write_all(&frames).await.unwrap();
+
+        let msg = read_frame.receive().await.unwrap();
+        assert_eq!(msg.protocol.code, 7);
+        assert_eq!(msg.data.len(), 32);
+        assert!(msg.time.is_some(), "the surfaced frame must be stamped");
     }
 }
