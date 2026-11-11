@@ -370,10 +370,14 @@ mod tests {
             write_completion(*shell, &mut out);
             let script = String::from_utf8(out).expect("completion script is UTF-8");
             assert!(!script.is_empty(), "{shell} script is empty");
-            assert!(script.contains("cv"), "{shell} script does not mention cv");
+            // Match whole words so sibling names such as `fsck` and `umount`
+            // cannot satisfy the checks for `fs` and `mount`.
+            let words: std::collections::HashSet<&str> =
+                script.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+            assert!(words.contains("cv"), "{shell} script does not mention cv");
             for sub in ["fs", "report", "mount", "completion"] {
                 assert!(
-                    script.contains(sub),
+                    words.contains(sub),
                     "{shell} script misses subcommand {sub}"
                 );
             }
