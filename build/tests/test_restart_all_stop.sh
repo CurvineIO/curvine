@@ -115,7 +115,11 @@ PYEOF
 assert_stop_sequence() {
   local expected=("$@")
   local actual=()
-  mapfile -t actual < <(grep -F ' stop' "$CALLS_LOG" || true)
+  # while-read instead of mapfile: mapfile needs bash 4+, macOS still ships 3.2
+  local line
+  while IFS= read -r line; do
+    actual+=("$line")
+  done < <(grep -F ' stop' "$CALLS_LOG" || true)
   [ "${#actual[@]}" = "${#expected[@]}" ] ||
     fail "expected ${#expected[@]} stop calls, got ${#actual[@]}: ${actual[*]:-none}"
   local i
@@ -153,16 +157,19 @@ grep -qF 'curvine-master.sh start' "$CALLS_LOG" || fail "master was not restarte
 grep -qF 'curvine-fuse.sh start' "$CALLS_LOG" || fail "fuse was not restarted"
 
 # --- scenario 2: transfer enabled -> fuse, transfer, worker, master ---------
+# Distinct ports from scenario 1: scenario 1's listener is left running and
+# SO_REUSEADDR cannot take a port away from an active listener, so reusing
+# 18995/18997 would kill the scenario 2 listener on bind (18999 never opens).
 
 setup_sandbox
 write_conf '[master]
-rpc_port = 18995
+rpc_port = 18985
 [worker]
-rpc_port = 18997
+rpc_port = 18987
 [transfer]
 enabled = true
-rpc_port = 18999'
-spawn_listeners 18995 18997 18999
+rpc_port = 18989'
+spawn_listeners 18985 18987 18989
 spawn_service_probes master worker transfer
 
 CURVINE_CONF_FILE="$SANDBOX/conf/curvine-cluster.toml" bash "$SANDBOX/bin/restart-all.sh" \
