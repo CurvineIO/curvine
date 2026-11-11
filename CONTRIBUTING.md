@@ -20,10 +20,6 @@ We maintain a list of good first issues in GitHub here. Look for issues labeled 
 - `bug` - Bug reports that need fixing
 - `enhancement` - Feature requests and improvements
 
-### Claiming an issue
-
-To work on an issue, comment `/assign` on it. A bot assigns the issue to you if it is open and nobody else is assigned. If you can no longer work on it, comment `/unassign` so others can pick it up. The comment must contain only the command.
-
 ## Reporting issues
 
 We use GitHub issues for bug reports and feature requests. When reporting an issue, please include:
