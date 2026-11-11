@@ -96,6 +96,7 @@ struct RecoveryInner {
     generation: AtomicU64,
     pending: AtomicU64,
     last_error: Mutex<String>,
+    failure_seq: AtomicU64,
 }
 
 impl RecoveryGate {
@@ -108,6 +109,7 @@ impl RecoveryGate {
                 generation: AtomicU64::new(1),
                 pending: AtomicU64::new(0),
                 last_error: Mutex::new(String::new()),
+                failure_seq: AtomicU64::new(0),
             }),
         }
     }
@@ -116,10 +118,15 @@ impl RecoveryGate {
         self.inner.safe_mode.load(Ordering::Acquire)
     }
 
+    pub(crate) fn failure_seq(&self) -> u64 {
+        self.inner.failure_seq.load(Ordering::Acquire)
+    }
+
     pub(crate) fn enter_safe_mode(&self, reason: &str) {
         self.note_error(reason);
         self.inner.safe_mode.store(true, Ordering::Release);
         self.inner.ufs_caught_up.store(false, Ordering::Release);
+        self.inner.failure_seq.fetch_add(1, Ordering::Release);
         log::error!("master entered safe mode: {reason}");
     }
 

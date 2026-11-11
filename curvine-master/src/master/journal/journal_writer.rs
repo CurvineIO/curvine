@@ -323,6 +323,10 @@ impl JournalWriter {
         self.fail_metadata("metadata journal commit failed after mutation");
     }
 
+    pub(crate) fn failure_seq(&self) -> u64 {
+        self.recovery.failure_seq()
+    }
+
     pub(crate) fn fail_metadata_publication(&self) {
         self.fail_metadata("metadata publication failed after durable commit");
     }
