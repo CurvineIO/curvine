@@ -33,7 +33,7 @@ use curvine_config::{ClusterConf, FuseConf};
 use curvine_core_error::try_option;
 use curvine_error::FsError;
 use curvine_error::MAX_FILE_SIZE;
-use curvine_fs_api::Path;
+use curvine_fs_api::{Path, RpcCode};
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{
     is_special_file_type, FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags,
@@ -2046,6 +2046,10 @@ impl fs::FileSystem for CurvineFileSystem {
             .await?;
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         self.ensure_writable_path(&path)?;
+        // Unlink can be served from the dcache: the last link of a file that still has
+        // open handles is deferred to RELEASE, so the unified layer never sees the
+        // delete rpc and would not reject a read_only cache_mode mount.
+        let _ = self.fs.get_mount(&path, RpcCode::Delete).await?;
         self.state.fs_unlink(op.header.nodeid, name).await?;
         Ok(())
     }
