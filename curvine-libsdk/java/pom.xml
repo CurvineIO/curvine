@@ -36,7 +36,7 @@
         <scala.compat.version>2.12</scala.compat.version>
         <dependency.scope>compile</dependency.scope>
         <protobuf.version>4.36.2</protobuf.version>
-        <hadoop.version>3.5.0</hadoop.version>
+        <hadoop.version>3.3.4</hadoop.version>
         <shade.prefix>curvine_shaded</shade.prefix>
     </properties>
 
