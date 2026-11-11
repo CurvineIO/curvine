@@ -40,9 +40,23 @@ jobs:
               return;
             }
 
+            const body = "If you like this project, please give it a star so it\u2019s easier for you to get involved later. Thank you.";
+
+            // A re-run of this workflow must not post the invitation twice.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: pr.number,
+              per_page: 100,
+            });
+            if (comments.some((c) => c.user?.login === "github-actions[bot]" && c.body === body)) {
+              core.info(`Invitation already posted on #${pr.number}; skipping.`);
+              return;
+            }
+
             await github.rest.issues.createComment({
               owner,
               repo,
               issue_number: pr.number,
-              body: "If you like this project, please give it a star so it\u2019s easier for you to get involved later. Thank you.",
+              body,
             });
