@@ -334,17 +334,19 @@ impl FsWriterBase {
             self.cache_writers.insert(writer.block_id(), writer);
         };
 
-        let mut writer_commits = Vec::with_capacity(self.cache_writers.len());
-        for (_, writer) in self.cache_writers.iter_mut() {
+        let block_ids: Vec<i64> = self.cache_writers.keys().copied().collect();
+        for block_id in block_ids {
+            let Some(writer) = self.cache_writers.get_mut(&block_id) else {
+                continue;
+            };
             let commit_block = writer.complete().await?;
-            writer_commits.push(commit_block);
+            // The worker has finalized this block: mark it durable before any
+            // later writer can fail, so cleanup never aborts finalized data.
+            self.durable_blocks.insert(block_id);
+            self.add_durable_commit(commit_block)?;
         }
 
         self.cache_writers.clear();
-
-        for commit in writer_commits {
-            self.add_durable_commit(commit)?;
-        }
 
         Ok(())
     }
@@ -642,3 +644,7 @@ mod tests {
         assert!(!needs_append_block(&blocks, block_size - 1, block_size - 1));
     }
 }
+
+#[cfg(test)]
+#[path = "fs_writer_base_tests.rs"]
+mod commit_gate_tests;
