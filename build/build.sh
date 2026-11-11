@@ -409,6 +409,7 @@ mkdir -p "$DIST_DIR"/conf
 mkdir -p "$DIST_DIR"/bin
 mkdir -p "$DIST_DIR"/lib
 mkdir -p "$DIST_DIR"/tests
+mkdir -p "$DIST_DIR"/systemd
 
 
 # Copy configuration files and directories.
@@ -416,6 +417,9 @@ cp -R "$FS_HOME"/etc/. "$DIST_DIR"/conf/
 
 cp "$FS_HOME"/build/bin/* "$DIST_DIR"/bin
 chmod +x "$DIST_DIR"/bin/*
+
+# Copy systemd unit templates (rendered by bin/curvine-systemd.sh)
+cp -R "$FS_HOME"/build/systemd/. "$DIST_DIR"/systemd/
 
 # Copy tests (including scripts directory)
 cp -R "$FS_HOME"/build/tests/. "$DIST_DIR"/tests/

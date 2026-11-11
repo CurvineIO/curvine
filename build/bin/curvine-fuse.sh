@@ -95,11 +95,16 @@ main() {
             echo "Starting curvine-fuse with arguments: ${PARAMS[*]}"
             exec "${BIN_DIR}/launch-process.sh" fuse start "${PARAMS[@]}"
             ;;
+        run)
+            # Foreground mode used by the systemd units (systemd/README.md).
+            prepare_mount_path || exit 1
+            exec "${BIN_DIR}/launch-process.sh" fuse run "${PARAMS[@]}"
+            ;;
         stop|reload)
             exec "${BIN_DIR}/launch-process.sh" fuse "$ACTION" "${PARAMS[@]}"
             ;;
         *)
-            echo "Usage: $0 [start|stop|restart|reload] [FUSE options]" >&2
+            echo "Usage: $0 [start|stop|restart|reload|run] [FUSE options]" >&2
             exit 1
             ;;
     esac

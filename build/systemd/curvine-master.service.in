@@ -1,0 +1,44 @@
+#
+# Copyright 2025 OPPO.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Template rendered by bin/curvine-systemd.sh install; @...@ placeholders are
+# replaced with the installation paths and the service account.
+
+[Unit]
+Description=Curvine master
+Documentation=https://github.com/CurvineIO/curvine/tree/main/build/systemd
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@CURVINE_USER@
+Group=@CURVINE_GROUP@
+WorkingDirectory=@CURVINE_HOME@
+ExecStart=@CURVINE_HOME@/bin/curvine-master.sh run
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+LimitNOFILE=1048576
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=curvine-master
+
+[Install]
+WantedBy=multi-user.target
