@@ -47,13 +47,10 @@ jobs:
       - name: Extract metadata for Docker
         id: meta
         run: |
-          # Called via workflow_call: tag comes from the orchestrator and the
-          # image is always pushed. Dispatch: use the tag input or current ref.
-          if [ "${{ github.event_name }}" == "workflow_call" ]; then
-            TAG="${{ inputs.tag }}"
-            PUSH_IMAGE="true"
-            echo "Called by release workflow for tag: ${TAG}"
-          elif [ -n "${{ inputs.tag }}" ]; then
+          # Tag input from the orchestrator or dispatch; fall back to the
+          # current ref tag, else 'latest'. push_image always comes from inputs
+          # (release.yml passes true for orchestrated runs).
+          if [ -n "${{ inputs.tag }}" ]; then
             TAG="${{ inputs.tag }}"
             PUSH_IMAGE="${{ inputs.push_image }}"
             echo "Using manual tag: ${TAG}"
@@ -108,7 +105,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      
+        # Release tags must build the tagged sources even when dispatched from
+        # main; non-tag labels (e.g. latest) keep the caller's ref.
+        with:
+          ref: ${{ startsWith(inputs.tag, 'v') && inputs.tag || github.ref }}
+        
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       
