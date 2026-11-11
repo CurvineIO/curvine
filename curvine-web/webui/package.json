@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "axios": "^1.21.0",
-    "bootstrap": "^4.3.1",
+    "bootstrap": "^5.3.8",
     "bootswatch": "^5.3.8",
     "core-js": "^3.51.0",
     "mitt": "^3.0.1",
@@ -18,14 +18,14 @@
     "vuex": "^4.0.0"
   },
   "devDependencies": {
-    "@babel/core": "^8.1.0",
-    "@babel/eslint-parser": "^8.0.7",
+    "@babel/core": "^7.12.16",
+    "@babel/eslint-parser": "^7.12.16",
     "@vue/cli-plugin-babel": "~5.0.9",
     "@vue/cli-plugin-eslint": "~5.0.9",
     "@vue/cli-plugin-router": "~5.0.9",
     "@vue/cli-plugin-vuex": "~5.0.9",
     "@vue/cli-service": "~5.0.9",
-    "eslint": "^10.14.0",
+    "eslint": "^7.32.0",
     "eslint-plugin-vue": "^8.0.3",
     "sass": "^1.108.1",
     "sass-loader": "^17.1.0"
