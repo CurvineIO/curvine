@@ -95,20 +95,37 @@ pub(crate) async fn dispatch<M: MessageHandler>(
     handler: &Arc<M>,
     request: Message,
 ) -> IOResult<Message> {
+    dispatch_with_guard(rt, handler, request, ()).await
+}
+
+/// [`dispatch`] that keeps `guard` alive until the request has really finished.
+///
+/// The guard is moved into the blocking closure, so cancelling the caller's
+/// future cannot release it while the handler is still running.
+pub(crate) async fn dispatch_with_guard<M: MessageHandler, G: Send + 'static>(
+    rt: &Arc<Runtime>,
+    handler: &Arc<M>,
+    request: Message,
+    guard: G,
+) -> IOResult<Message> {
     let response = if handler.is_sync(&request) {
         let rt = handler.get_rt(&request).unwrap_or(rt);
 
         let handler = handler.clone();
-        rt.spawn_blocking(move || match handler.handle(&request) {
-            Err(e) => {
-                debug!("handler request {} error: {}", request.req_id(), e);
-                request.error_ext(&e)
-            }
+        rt.spawn_blocking(move || {
+            let _guard = guard;
+            match handler.handle(&request) {
+                Err(e) => {
+                    debug!("handler request {} error: {}", request.req_id(), e);
+                    request.error_ext(&e)
+                }
 
-            Ok(v) => v,
+                Ok(v) => v,
+            }
         })
         .await?
     } else {
+        let _guard = guard;
         let protocol = request.protocol;
         match handler.async_handle(request).await {
             Ok(v) => v,

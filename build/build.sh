@@ -944,6 +944,9 @@ if [ $BUILD_JAVA_SDK -eq 1 ]; then
     cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" "$FS_HOME/curvine-libsdk/java/native/curvine_libsdk.dll"
   elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" ]; then
     cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.so"
+  elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.dylib" ]; then
+    # macOS local builds: OS_VERSION is "mac", matching CurvineNativeLibraryResolver.
+    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.dylib" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.dylib"
   fi
 fi
 

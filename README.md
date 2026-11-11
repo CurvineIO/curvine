@@ -6,7 +6,7 @@
 ![curvine-font-light](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/static/img/curvine_font_white.svg#gh-dark-mode-only)
 
 <p align="center">
-  English | 
+  English |
   <a href="https://github.com/CurvineIO/curvine/blob/main/README_zh.md">简体中文</a> |
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=de">Deutsch</a> |
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=es">Español</a> |
@@ -17,161 +17,235 @@
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=ru">Русский</a>
 </p>
 
-[![CNCF Landscape](https://img.shields.io/badge/CNCF%20Landscape-5699C6)](https://landscape.cncf.io/?item=runtime--cloud-native-storage--curvine)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Rust](https://img.shields.io/badge/Rust-1.86%2B-orange)](https://www.rust-lang.org)
+<p align="center">
+  <a href="https://www.cncf.io/projects/curvine/"><img src="https://img.shields.io/badge/CNCF-Sandbox-0086FF?logo=cncf&logoColor=white" alt="CNCF Sandbox"></a>
+  <a href="https://landscape.cncf.io/?item=runtime--cloud-native-storage--curvine"><img src="https://img.shields.io/badge/CNCF%20Landscape-5699C6" alt="CNCF Landscape"></a>
+  <a href="https://github.com/CurvineIO/curvine/releases"><img src="https://img.shields.io/github/v/release/CurvineIO/curvine?include_prereleases" alt="Release"></a>
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.86%2B-orange" alt="Rust"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/CurvineIO/curvine"><img src="https://api.scorecard.dev/projects/github.com/CurvineIO/curvine/badge" alt="OpenSSF Scorecard"></a>
+</p>
 
-[![Join our Slack Community](https://img.shields.io/badge/Slack-Join%20our%20Community-4A154B?style=for-the-badge&logo=slack&logoColor=white)](https://join.slack.com/t/curvineio/shared_invite/zt-4673r43cn-prajma_q5ZI3BUxuaY5kiQ)
+<p align="center">
+  <a href="https://join.slack.com/t/curvineio/shared_invite/zt-4673r43cn-prajma_q5ZI3BUxuaY5kiQ"><img src="https://img.shields.io/badge/Slack-Join%20our%20community-4A154B?style=for-the-badge&logo=slack&logoColor=white" alt="Join our Slack"></a>
+</p>
 
-> **Curvine: AI-Native & Cloud-Native File System** — A high-performance POSIX file semantic layer built on top of cloud object storage, with an integrated multi-tier distributed cache, designed from the ground up for large-scale AI workloads and AI Agent platforms.
+<p align="center">
+  <b>The AI-native, cloud-native file system.</b><br>
+  Full POSIX semantics on top of object storage, with a built-in multi-tier distributed cache.<br>
+  Built in Rust for AI training, inference, and AI agent platforms.
+</p>
 
-> **Name Origin** — "Curvine" is derived from *"Curvature Engine"*, the faster-than-light propulsion device in Liu Cixin's sci-fi novel *The Three-Body Problem*. It symbolizes the project's pursuit of extreme acceleration for data access.
+<p align="center">
+  <a href="#-quick-start">Quick Start</a> ·
+  <a href="https://curvineio.github.io/docs/">Documentation</a> ·
+  <a href="#-performance">Benchmarks</a> ·
+  <a href="#-community">Community</a>
+</p>
 
 ---
 
-## 📚 Documentation Resources
+## ✨ Why Curvine
 
-For more detailed information, please refer to:
+Object storage is cheap and durable, but AI workloads expect a fast local file system. Curvine sits between the two: your data stays in S3 (or any compatible store), and your applications see a POSIX file system backed by a memory, SSD, and HDD cache.
 
-- [Official Documentation](https://curvineio.github.io/docs/Overview/instroduction)
-- [Quick Start](https://curvineio.github.io/docs/Deploy/quick-start)
-- [Benchmark](https://curvineio.github.io/docs/category/benchmark)
-- [DeepWiki](https://deepwiki.com/CurvineIO/curvine)
-- [Best Practices](https://curvineio.github.io/docs/User-Manuals/best-practices)
-- [Curvine defeated the commercial version of Alluxio in the MLPerf benchmark tests](https://curvineio.github.io/blog/2026/09/07/mlperf-storage-curvine-vs-alluxio)
-- [Curvine passes LTP Test 1129 cases](https://curvineio.github.io/blog/2026/08/11/curvine-ltp-compatibility)
-- [Tiered KV cache for large LLMs on Amazon SageMaker HyperPod with Curvine](https://aws.amazon.com/cn/blogs/machine-learning/tiered-kv-cache-for-large-llms-on-amazon-sagemaker-hyperpod-with-curvine/)
-- [AI Agent Storage Selection: How Curvine Supports 10,000-Scale Agent Workloads on EKS](https://curvineio.github.io/blog/2026/07/07/ai-agent-storage-curvine-eks)
+- **Fast enough for GPUs.** In an [MLPerf Storage v2.0 comparison](https://curvineio.github.io/blog/2026/09/07/mlperf-storage-curvine-vs-alluxio) on the same AWS instance types, open-source Curvine beat Alluxio Enterprise AI's submitted results on accelerator utilization in 6 of 8 runs.
+- **Real POSIX compatibility.** The FUSE mount [passed 1,129 Linux Test Project (LTP) file system tests with zero failures](https://curvineio.github.io/blog/2026/08/11/curvine-ltp-compatibility), so tools like `git`, Vite, and `inotify` work without changes.
+- **Built for agents at scale.** A single cluster holds 5 billion files. On Kubernetes, a new volume is just a `mkdir`, so you can [run 10,000+ stateful agent pods on EKS](https://curvineio.github.io/blog/2026/07/07/ai-agent-storage-curvine-eks) without per-volume cloud API calls.
+- **Proven with LLM inference.** AWS published a reference architecture for [tiered KV cache on Amazon SageMaker HyperPod with Curvine](https://aws.amazon.com/blogs/machine-learning/tiered-kv-cache-for-large-llms-on-amazon-sagemaker-hyperpod-with-curvine/).
+- **No lock-in.** Files map 1:1 to object paths in S3. Data persisted to your bucket stays readable as plain objects, even when Curvine is down.
 
-## 🏗️ Architecture Design
+## 🚀 Quick Start
 
-Curvine is a high-performance distributed cache file system built in Rust. It layers a distributed POSIX file system over cloud object storage, exposing full POSIX semantics upward while using object storage as the durable persistence layer downward. The architecture is organized into four cooperating layers, each color-coded in the diagram below:
+### Try it with Docker
 
-![curvine-architecture](images/curvine-architecture.png)
+Start a single-node demo cluster (one master, one worker) with one command:
 
-- **Access Layer** — The workloads that use Curvine: AI Agent Pods (10,000+ stateful workloads), AI/big-data engines (training, inference, OLAP), and the native `cv` CLI.
-- **Protocol & Interface Layer** — Multiple access paths so existing tools work unmodified: POSIX FUSE (`curvine-fuse`), an S3-compatible gateway, an HDFS/UFS adapter, Java/Python/Rust SDKs, and a native Kubernetes CSI driver for PVC provisioning.
-- **Curvine Cluster Core** — The heart of the system, split into a **Control Plane** and a **Data Plane**:
-  - *Control Plane*: the **Master node** (Raft-replicated) manages metadata, namespace, scheduling, load balancing, and cluster coordination, alongside a **Web UI / API** for dashboarding, metrics, and management.
-  - *Data Plane*: a fleet of **Worker nodes** serving data from a multi-tier cache (Memory → SSD → HDD) with automatic hot-data promotion, eviction, and replication.
-- **Storage Layer** — The durable underbelly: multi-cloud object storage (AWS S3, Azure Blob, Google GCS, OSS, and any S3-compatible store such as MinIO or HDFS). Workers fetch from object storage on cache miss, and persist writes back to object storage for durability.
-
-**Data flow at a glance:** applications reach Curvine through any interface in the Protocol layer; metadata operations are routed to the Master via RPC, while data I/O is served directly by the Workers. On a cache miss, Workers fetch from — and persist back to — the underlying object storage. For Kubernetes workloads, the CSI driver mounts the FUSE file system directly as a PVC, so provisioning is just a `mkdir` on the shared namespace — millisecond-level, with no cloud control-plane API calls.
-
-## 🚀 Core Features
-
-- **AI-Native Positioning**: First-class support for AI training acceleration and AI Agent cloud-native storage as primary use cases, not an afterthought.
-- **Multi-Cloud Object Storage Backend**: Compatible with object storage services from multiple cloud providers as the durable underlying layer, enabling transparent data migration across vendors.
-- **Cloud-Native Kubernetes Integration**: Native CSI driver enables dynamic PVC provisioning, `Immediate` binding, volume expansion, and Helm-based cluster deployment.
-- **Multi-Tier Cache**: Memory → SSD → HDD automatic tiering; hot data is transparently promoted to faster tiers.
-- **Full POSIX Semantics via FUSE**: A high-performance FUSE layer presents distributed cached data as a local file system — `open`, `read`, `write`, `seek`, `rename`, `list` — enabling tools like Vite, `inotify`/`fswatch`, and `git` to work unmodified.
-- **S3 & HDFS Protocol Compatibility**: Read/write through both S3 and HDFS interfaces for seamless integration with AI and big-data ecosystems.
-- **Extreme Performance**: Rust core with Tokio async runtime, zero-copy data paths, and a GC-free memory model — ~100μs-class latency and 100K+ stable QPS.
-- **Massive Metadata Capacity**: A single cluster supports **5 billion** small files, absorbing the aggregate metadata pressure of tens of thousands of Agents.
-- **Metadata Independence**: Curvine's file metadata path maps **1:1** to the underlying S3 object path. Even if the Curvine service is unavailable, objects on S3 keep their original structure and remain independently accessible — fast and simple recovery.
-- **Raft Consensus**: Master metadata is replicated via Raft for consistency and high availability.
-- **Observability**: Built-in metrics system and Web UI for per-component performance monitoring.
-
-Access the Web UI after a local cluster is up:
-
+```bash
+curl -fsSL https://curvineio.github.io/install.sh | bash
 ```
-# Master Web (cluster console)
-http://your-hostname:9001
 
-# Worker Web (local metrics)
-http://your-hostname:9002
+The script prints the Web UI address and the commands for inspecting and removing the containers.
+
+### Deploy on Kubernetes
+
+```bash
+helm repo add curvineio https://curvineio.github.io/helm-charts
+helm repo update
+
+# Curvine cluster
+helm upgrade --install curvine curvineio/curvine -n curvine --create-namespace
+
+# CSI driver, once the cluster is reachable
+helm upgrade --install curvine-csi curvineio/curvine-csi -n curvine-system --create-namespace
 ```
+
+See the [Helm charts](https://github.com/CurvineIO/curvine-helm) for configuration and the [CSI driver guide](https://curvineio.github.io/docs/User-Manuals/K8S-CSI-Driver/) for creating a `StorageClass`.
+
+### Build and run from source
+
+Follow the [build instructions](https://curvineio.github.io/docs/Deploy/build-instructions/) to produce a package in `build/dist`, then:
+
+```bash
+cd build/dist
+export CURVINE_MASTER_HOSTNAME=localhost
+./bin/curvine-master.sh start
+./bin/curvine-worker.sh start
+./bin/curvine-fuse.sh start   # mounts at /curvine-fuse
+
+bin/cv report                 # check cluster status
+bin/cv fs mkdir /hello
+ls /curvine-fuse
+```
+
+To stop, run the same scripts with `stop` in reverse order: `curvine-fuse.sh`, `curvine-worker.sh`, then `curvine-master.sh`.
+
+Web UIs: master at `http://<host>:9001`, worker at `http://<host>:9002`.
+
+The [Quick Start guide](https://curvineio.github.io/docs/Deploy/quick-start/) covers each step in detail.
 
 ## 📈 Use Cases
 
 ![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.png)
 
-- **Case 1 — AI Agent Platform Storage**: Backing tens of thousands of stateful Agent Pods on Kubernetes with isolated POSIX workspaces, millisecond provisioning, and no per-node volume limits.
+| Use case | What Curvine does |
+| --- | --- |
+| **AI agent platform storage** | Gives tens of thousands of stateful agent pods their own POSIX workspaces, provisioned in milliseconds, with no per-node volume limits. |
+| **LLM training** | Caches datasets and checkpoints next to GPU nodes so training spends less time waiting on I/O. |
+| **Model distribution** | Distributes model weights across regions through the cache instead of pulling from object storage on every node. |
+| **Multimodal data lakes** | Serves images, video, and Lance datasets over POSIX without copying them to local disk. |
+| **OLAP acceleration** | Caches hot data for compute-storage separated engines such as StarRocks. |
+| **Multi-cloud caching** | Puts one cache layer in front of object storage from different cloud providers. |
 
-  <img src="images/use-cases/01-ai-agent-platform-storage.gif" alt="AI Agent Platform Storage" width="720">
+<details>
+<summary><b>See each use case in action</b></summary>
 
-- **Case 2 — LLM Training Acceleration**: Caching training datasets and checkpoints close to GPU nodes to shorten training cycles.
+**AI agent platform storage**
 
-  <img src="images/use-cases/02-llm-training-acceleration.gif" alt="LLM Training Acceleration" width="720">
+<img src="images/use-cases/01-ai-agent-platform-storage.gif" alt="AI agent platform storage" width="720">
 
-- **Case 3 — LLM Model Distribution Acceleration**: Fast multi-region model artifact distribution through the distributed cache.
+**LLM training**
 
-  <img src="images/use-cases/03-llm-model-distribution.gif" alt="LLM Model Distribution Acceleration" width="720">
+<img src="images/use-cases/02-llm-training-acceleration.gif" alt="LLM training acceleration" width="720">
 
-- **Case 4 — Multimodal Data Lake Access Acceleration**: POSIX access over multimodal lakes without copying data locally.
+**Model distribution**
 
-  <img src="images/use-cases/04-multimodal-data-lake.gif" alt="Multimodal Data Lake Access Acceleration" width="720">
+<img src="images/use-cases/03-llm-model-distribution.gif" alt="LLM model distribution" width="720">
 
-- **Case 5 — OLAP Query Acceleration**: Accelerating compute-storage separated OLAP engines with a hot data cache.
+**Multimodal data lakes**
 
-  <img src="images/use-cases/05-olap-query-acceleration.gif" alt="OLAP Query Acceleration" width="720">
+<img src="images/use-cases/04-multimodal-data-lake.gif" alt="Multimodal data lake access" width="720">
 
-- **Case 6 — Multi-Cloud Data Caching**: A unified cache layer across multi-cloud object storage backends.
+**OLAP acceleration**
 
-  <img src="images/use-cases/06-multi-cloud-data-caching.gif" alt="Multi-Cloud Data Caching" width="720">
+<img src="images/use-cases/05-olap-query-acceleration.gif" alt="OLAP query acceleration" width="720">
 
+**Multi-cloud caching**
+
+<img src="images/use-cases/06-multi-cloud-data-caching.gif" alt="Multi-cloud data caching" width="720">
+
+</details>
+
+## 🏗️ Architecture
+
+![curvine-architecture](images/curvine-architecture.png)
+
+Curvine has four layers, color-coded in the diagram above:
+
+- **Access layer.** The workloads on top: AI agent pods, training and inference jobs, OLAP and big-data engines, and the `cv` CLI.
+- **Protocol layer.** Existing tools connect without code changes through POSIX (FUSE), an S3-compatible gateway, the Hadoop FileSystem API, Java/Python/Rust SDKs, or the Kubernetes CSI driver.
+- **Cluster core.**
+  - The *control plane* is a Raft-replicated **master** that owns metadata, the namespace, scheduling, and cluster coordination. It also serves the Web UI and metrics.
+  - The *data plane* is a set of **workers** that serve data from a memory → SSD → HDD cache, promoting hot data and evicting cold data automatically.
+- **Storage layer.** Object storage keeps the durable copy: AWS S3, Azure Blob Storage, Google Cloud Storage, Alibaba Cloud OSS, MinIO, any other S3-compatible store, or HDFS.
+
+Metadata requests go to the master over RPC. Data flows directly between clients and workers. On a cache miss, workers read from object storage, and writes are persisted back to it. On Kubernetes, the CSI driver exposes the FUSE mount as a PVC, so creating a volume only creates a directory and takes milliseconds.
+
+## 🧩 Features
+
+| Area | Details |
+| --- | --- |
+| **Access** | POSIX via FUSE (`open`, `read`, `write`, `seek`, `rename`, `list`), S3 gateway, Hadoop FileSystem API, Java/Python/Rust SDKs |
+| **Kubernetes** | CSI driver with dynamic provisioning, `Immediate` binding, and volume expansion; Helm charts for the cluster |
+| **Storage backends** | AWS S3, Azure Blob Storage, Google Cloud Storage, Alibaba Cloud OSS, MinIO and other S3-compatible stores, HDFS |
+| **Caching** | Memory → SSD → HDD tiers, automatic hot-data promotion, eviction, and replication |
+| **Performance** | Rust and Tokio async I/O, zero-copy data paths, no garbage collector; around 100 µs latency and over 100K QPS sustained |
+| **Scale** | Up to 5 billion files in one cluster |
+| **Reliability** | Raft-replicated metadata; files map 1:1 to object paths, so data stays readable directly from object storage |
+| **Observability** | Built-in metrics and Web UI for every component |
 
 ## 📊 Performance
 
-Curvine is engineered for high-concurrency, low-latency workloads. Built on a Rust + Tokio async core with zero-copy data paths, it sustains ~100μs-class latency, 100K+ stable QPS, and 5 billion small files per cluster. The benchmarks below illustrate its edge in both metadata operations and raw data throughput.
+### Metadata operations
 
-### 1. Metadata Operation Performance
+40 concurrent clients. JuiceFS and OSS figures come from [JuiceFS's published benchmark](https://juicefs.com/en/blog/engineering/meta-perf-hdfs-oss-jfs).
 
-All benchmark comparisons were conducted with a concurrency level of 40.
-
-| Operation Type | Curvine (QPS) | JuiceFS (QPS) | OSS (QPS) |
+| Operation | Curvine (QPS) | JuiceFS (QPS) | OSS (QPS) |
 | --- | --- | --- | --- |
 | create | 19,985 | 16,000 | 2,000 |
 | open | 60,376 | 50,000 | 3,900 |
 | rename | 43,009 | 21,000 | 200 |
 | delete | 39,013 | 41,000 | 1,900 |
 
-> Industry benchmark test data of comparable products: https://juicefs.com/zh-cn/blog/engineering/meta-perf-hdfs-oss-jfs
+### Read throughput vs. Alluxio
 
-### 2. Data Read/Write Performance
+256 KB reads on identical hardware. Alluxio figures come from [Alluxio's own published comparison](https://www.alluxio.com.cn/alluxio-enterprise-vs-open-source/). "N/A" means Alluxio did not publish a result for that thread count.
 
-Benchmarking against Alluxio under identical hardware conditions.
+| Threads | Sequential: Curvine (GiB/s) | Sequential: Alluxio OSS (GiB/s) | Random: Curvine (GiB/s) | Random: Alluxio OSS (GiB/s) |
+| --- | --- | --- | --- | --- |
+| 1 | 2.2 | 0.6 | 0.3 | 0.0 |
+| 2 | 3.7 | 1.1 | 0.7 | 0.1 |
+| 4 | 6.8 | 2.3 | 1.4 | 0.1 |
+| 8 | 8.9 | 4.5 | 2.8 | 0.2 |
+| 16 | 9.2 | 7.9 | 5.2 | 0.4 |
+| 32 | 9.5 | 8.8 | 7.8 | 0.3 |
+| 64 | 9.2 | N/A | 8.7 | N/A |
+| 128 | 9.2 | N/A | 9.0 | N/A |
 
-**256K sequential read**
+### Resource usage
 
-| Thread count | Curvine Open Source Edition (GiB/s) | Open Source Alluxio (GiB/s) |
-| --- | --- | --- |
-| 1 | 2.2 | 0.6 |
-| 2 | 3.7 | 1.1 |
-| 4 | 6.8 | 2.3 |
-| 8 | 8.9 | 4.5 |
-| 16 | 9.2 | 7.9 |
-| 32 | 9.5 | 8.8 |
-| 64 | 9.2 | N/A |
-| 128 | 9.2 | N/A |
+In production big-data shuffle workloads, Curvine used over 90% less memory and over 50% less CPU than Alluxio.
 
-**256K random read**
+More results, including FIO and small-file reads, are in the [benchmark docs](https://curvineio.github.io/docs/Benchmark/).
 
-| Thread count | Curvine Open Source Edition (GiB/s) | Open Source Alluxio (GiB/s) |
-| --- | --- | --- |
-| 1 | 0.3 | 0.0 |
-| 2 | 0.7 | 0.1 |
-| 4 | 1.4 | 0.1 |
-| 8 | 2.8 | 0.2 |
-| 16 | 5.2 | 0.4 |
-| 32 | 7.8 | 0.3 |
-| 64 | 8.7 | N/A |
-| 128 | 9.0 | N/A |
+## 📚 Learn More
 
-> Data disclosure from Alluxio official website: https://www.alluxio.com.cn/alluxio-enterprise-vs-open-source/.
+- [Documentation](https://curvineio.github.io/docs/)
+- [Architecture deep dives](https://curvineio.github.io/docs/Architecture/)
+- [Best practices](https://curvineio.github.io/docs/User-Manuals/best-practices/)
+- [DeepWiki: ask questions about the codebase](https://deepwiki.com/CurvineIO/curvine)
+- [Blog](https://curvineio.github.io/blog)
 
-### 3. Resource Consumption
+## 💬 Community
 
-Benefiting from Rust language features, in big data shuffle acceleration scenarios, comparing resource consumption between Curvine and Alluxio in production environments shows that memory usage is reduced by over 90%, and CPU usage is reduced by over 50%.
+- **Chat:** [Slack](https://join.slack.com/t/curvineio/shared_invite/zt-4673r43cn-prajma_q5ZI3BUxuaY5kiQ) or [Discord](https://discord.gg/xfxMQKv3)
+- **Questions and ideas:** [GitHub Discussions](https://github.com/CurvineIO/curvine/discussions)
+- **Bugs and feature requests:** [GitHub Issues](https://github.com/CurvineIO/curvine/issues)
+- **Using Curvine?** Add your company to [ADOPTERS.md](ADOPTERS.md).
+- **Project direction:** see the [roadmap](ROADMAP.md) and [governance](GOVERNANCE.md).
 
-## Contributing
-Please read Curvine [Contribute guidelines](CONTRIBUTING.md)
+## 🤝 Contributing
 
-## 📜 License
-Curvine is licensed under the ​**​[Apache License 2.0](LICENSE)​**.
+Contributions are welcome. Read the [contributing guide](CONTRIBUTING.md) to get started, and look for issues labeled [`good first issue`](https://github.com/CurvineIO/curvine/labels/good%20first%20issue).
 
 <a href="https://github.com/CurvineIO/curvine/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=CurvineIO/curvine" />
+  <img src="https://contrib.rocks/image?repo=CurvineIO/curvine" alt="Contributors" />
 </a>
 
 Made with [contrib.rocks](https://contrib.rocks/).
+
+## 🪐 About the Name
+
+"Curvine" comes from *curvature engine*, the faster-than-light drive in Liu Cixin's science fiction novel *The Three-Body Problem*. We picked it because the project is about making data access as fast as possible.
+
+## ☁️ CNCF
+
+Curvine is a [Cloud Native Computing Foundation](https://www.cncf.io/) sandbox project.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/cncf/artwork/main/other/cncf/horizontal/color/cncf-color.svg" width="300" alt="CNCF logo">
+</p>
+
+## 📜 License
+
+Curvine is licensed under the [Apache License 2.0](LICENSE).

@@ -1107,6 +1107,7 @@ mod tests {
 
     #[test]
     fn standby_publishes_a_zero_gauge() {
+        let _metric_serial = Master::metric_test_serial();
         let fs = test_fs("standby-gauge");
         create_file(&fs, "/standby.log", "client-a");
         set_lock(&fs, "/standby.log", "client-a", true);
