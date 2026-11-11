@@ -224,12 +224,11 @@ The Curvine contributors hold regular video calls where new and current contribu
 
 Meeting details and schedule will be announced through:
 - GitHub Discussions
-- Project mailing list
 - Community chat channels
 
 ## Code of Conduct
 
-This project follows the [Apache Software Foundation Code of Conduct](https://www.apache.org/foundation/policies/conduct.html). Please be respectful and inclusive in all interactions.
+This project follows the [CNCF Code of Conduct](CODE_OF_CONDUCT.md). Please be respectful and inclusive in all interactions.
 
 ## License
 
