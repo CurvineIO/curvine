@@ -6,7 +6,7 @@ name: DCO
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
 
 permissions: {}
 
@@ -28,6 +28,17 @@ jobs:
               pull_number: context.payload.pull_request.number,
               per_page: 100,
             });
+
+            // listCommits caps at 250 commits even when paginated, so a larger PR
+            // would otherwise report success with the tail commits never checked.
+            const total = context.payload.pull_request.commits;
+            if (commits.length !== total) {
+              core.setFailed(
+                `Read ${commits.length} of ${total} commits: the GitHub API returns at most 250 commits per pull request, ` +
+                'so the remaining commits cannot be verified. Split the pull request so every commit can be checked.'
+              );
+              return;
+            }
 
             const signoff = /^Signed-off-by: (.+) <([^<>]+)>\s*$/gim;
             const failures = [];
