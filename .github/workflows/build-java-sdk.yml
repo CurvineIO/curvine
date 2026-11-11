@@ -12,8 +12,8 @@ on:
         type: string
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+  packages: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -225,6 +225,9 @@ jobs:
     needs: package-jar
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      packages: write
 
     steps:
       - name: Checkout code
