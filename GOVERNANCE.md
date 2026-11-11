@@ -16,7 +16,7 @@ Committers have shown sustained, high-quality contributions in one or more areas
 
 - Review and approve pull requests in their areas
 - Triage issues and help new contributors
-- Vote on new committers and maintainers
+- Comment on committer and maintainer nominations
 
 ### Maintainer
 
@@ -27,18 +27,28 @@ Maintainers are responsible for the project as a whole. In addition to committer
 - Manage repository settings, CI, and project infrastructure
 - Represent the project in the CNCF
 
-One maintainer serves as **lead maintainer** and coordinates releases and CNCF communication. The lead maintainer has no veto beyond a normal maintainer vote.
+One maintainer serves as **lead maintainer** and coordinates releases and CNCF communication. The lead maintainer has no veto and casts one binding vote like any other voter.
 
 The current committers and maintainers are listed in [MAINTAINERS.md](MAINTAINERS.md).
 
 ## Becoming a committer or maintainer
 
 1. A maintainer or committer nominates the candidate by opening a GitHub issue titled `New Committer Vote: <github-handle>` (or `New Maintainer Vote`). The issue summarizes the candidate's contributions with links: merged PRs, reviews, issues, and areas of work.
-2. The vote runs through [GitVote](https://github.com/cncf/gitvote) using the settings in [`.gitvote.yml`](.gitvote.yml): voting is open for 30 days, and the vote passes when at least 60% of binding votes are in favor. Votes may close early once the threshold is reached.
-3. Binding votes come from members of the `curvine-toc-voters` team and the users listed in `.gitvote.yml`.
-4. After the vote passes, a maintainer updates MAINTAINERS.md and grants repository permissions.
+2. The vote is started by commenting `/vote` on the issue. The vote follows the rules in [Voting](#voting).
+3. After the vote passes, a maintainer updates MAINTAINERS.md and grants repository permissions.
 
 There is no fixed contribution count. Voters look for sustained work over several months, sound technical judgment, helpful code reviews, and respectful collaboration.
+
+## Voting
+
+Formal votes run through [GitVote](https://github.com/cncf/gitvote) using the `default` profile in [`.gitvote.yml`](.gitvote.yml).
+
+- **Binding voters** are the teams and users listed under `allowed_voters` in `.gitvote.yml`: today, the members of the `curvine-toc-voters` GitHub team plus individually listed users. Other community members are welcome to comment, but their votes are non-binding.
+- **Duration:** a vote stays open for 30 days.
+- **Passing rule:** a vote passes when votes in favor reach at least 60% of **all binding voters**. Binding voters who do not vote count toward the total. For example, with 5 binding voters, 3 votes in favor are needed.
+- A vote closes early as soon as it passes.
+
+Changes to the binding voter list are made by pull request against `.gitvote.yml` and need a passing vote.
 
 ## Decision making
 
@@ -53,16 +63,16 @@ Larger changes need wider agreement:
 | Change | Process |
 | --- | --- |
 | New features, protocol or on-disk format changes, breaking API changes | Open an issue describing the design first. Wait for maintainer feedback before large implementation work. |
-| Changes to this document, the license, or the Code of Conduct | GitVote among maintainers, 60% in favor. |
+| Changes to this document, the license, or the Code of Conduct | GitVote, see [Voting](#voting). |
 | Adding or removing committers and maintainers | GitVote as described above. |
 
-We aim for consensus. When consensus cannot be reached, any maintainer can call a GitVote to decide.
+We aim for consensus. When consensus cannot be reached, any binding voter can call a GitVote to decide.
 
 ## Stepping down and inactivity
 
 Committers and maintainers can step down at any time by opening a pull request against MAINTAINERS.md. Those who step down are listed as emeritus.
 
-A committer or maintainer who has been inactive for 12 months may be moved to emeritus status by a maintainer vote, after being contacted first.
+A committer or maintainer who has been inactive for 12 months may be moved to emeritus status by a GitVote, after being contacted first.
 
 ## Vendor neutrality
 
@@ -77,4 +87,4 @@ Curvine welcomes contributors and maintainers from any company. Decisions are ma
 
 ## Changes to this document
 
-Changes to this document are proposed by pull request and need a passing maintainer GitVote.
+Changes to this document are proposed by pull request and need a passing GitVote, see [Voting](#voting).
