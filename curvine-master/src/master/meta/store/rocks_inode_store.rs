@@ -49,6 +49,11 @@ impl RocksInodeStore {
     /// not fixed width (uuid, `curvine-lancedb:<pid>`, ...).
     pub const PREFIX_CLIENT_OWNER: u8 = 0x03;
 
+    /// Allocator high-water mark (single key, no payload after the tag). Written
+    /// at checkpoint time (#2064) so a restore never rebuilds the allocator below
+    /// the historical max inode id, which would reuse already-allocated ids.
+    pub const KEY_LAST_INODE_ID: u8 = 0x04;
+
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
             .set_disable_wal(true)
@@ -307,6 +312,24 @@ impl RocksInodeStore {
             key.push(kind.as_u8());
         }
         Ok(key)
+    }
+
+    /// Persist the inode id allocator high-water mark. Written at checkpoint time
+    /// so it survives restarts where the live tree no longer contains the
+    /// highest-allocated inode (e.g. TTL deletes).
+    pub fn save_last_inode_id(&self, id: i64) -> CommonResult<()> {
+        self.db.put_cf(
+            Self::CF_COMMON,
+            [Self::KEY_LAST_INODE_ID],
+            RocksUtils::i64_to_bytes(id),
+        )
+    }
+
+    pub fn get_last_inode_id(&self) -> CommonResult<Option<i64>> {
+        match self.db.get_cf(Self::CF_COMMON, [Self::KEY_LAST_INODE_ID])? {
+            None => Ok(None),
+            Some(v) => Ok(Some(RocksUtils::i64_from_bytes(&v)?)),
+        }
     }
 
     pub(crate) fn client_owner_key(
