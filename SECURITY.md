@@ -16,19 +16,19 @@ If you run an older version, upgrade to the latest release to get security fixes
 ## Reporting a Vulnerability
 
 **Please do not report security vulnerabilities through public GitHub issues,
-discussions, or pull requests.**
-
-### Report through GitHub (preferred)
-
-Open a private report at
-<https://github.com/CurvineIO/curvine/security/advisories/new>
-(the **Report a vulnerability** button on the repository's **Security** tab).
-Only the maintainers can see the report, and the discussion and fix can happen
-in a private fork.
+discussions, or pull requests.** Use either private channel below.
 
 ### Report by email
 
-If you cannot use GitHub, email **curvine86@gmail.com**.
+Email **curvine86@gmail.com**.
+
+### Report through GitHub
+
+If the **Report a vulnerability** button is shown on the repository's
+**Security** tab, you can also open a private report at
+<https://github.com/CurvineIO/curvine/security/advisories/new>.
+Only the maintainers can see the report, and the discussion and fix can happen
+in a private fork. If the form is not available, use email.
 
 ### What to include
 
