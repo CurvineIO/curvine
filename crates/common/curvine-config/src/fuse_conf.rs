@@ -41,9 +41,10 @@ use std::time::Duration;
 //    - `enable_meta_cache` -> whether `NodeState` may serve metadata from the
 //      copies it already holds (cached status, directory-scan conclusions).
 //    - `meta_cache_timeout` -> optional freshness window for those copies.
-//      Unset (the default) follows the kernel `attr_timeout`, so a userspace
-//      window never outlives the promise the kernel made to callers; set it
-//      explicitly only to shrink (or deliberately widen) that window.
+//      Unset (the default) follows the kernel `attr_timeout`. The userspace
+//      window is independent of the kernel TTLs and may be longer; freshness
+//      is enforced by cache invalidation rather than by window expiry. Set it
+//      explicitly to shrink (or deliberately widen) that window.
 //    - `node_cache_timeout` -> TTL-based eviction of the inode/node map. This
 //      is memory reclamation, not a freshness promise.
 //

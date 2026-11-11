@@ -265,8 +265,10 @@ negative_timeout = 0      # negative-lookup (ENOENT) cache; 0 = disabled
 #   enable_meta_cache  omitted -> enabled iff the effective window is non-zero
 #   meta_cache_timeout omitted -> follows attr_timeout; 0 disables the window
 # Name lookups are skipped when entry_timeout = 0, because the kernel asks on
-# every lookup there; otherwise they reuse the window above, so keep
-# meta_cache_timeout within entry_timeout to avoid stale names.
+# every lookup there; otherwise they reuse the window above. The userspace
+# window is independent of the kernel TTLs and may be longer than
+# entry_timeout; freshness is enforced by cache invalidation, not by clamping
+# the window to the kernel timers.
 # A window longer than attr_timeout may serve metadata the kernel has already
 # dropped, so mount and validate-config warn instead of rejecting it.
 # enable_meta_cache = true
