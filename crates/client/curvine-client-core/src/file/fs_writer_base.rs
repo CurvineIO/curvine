@@ -45,6 +45,56 @@ impl PendingBlockWriter for BlockWriter {
     }
 }
 
+/// Records a commit that the worker already accepted: the local block length is
+/// updated and the block is marked durable, so cleanup never aborts it.
+fn record_durable_commit(
+    file_blocks: &mut WriteFileBlocks,
+    durable_blocks: &mut FastHashSet<i64>,
+    commit: CommitBlock,
+) -> FsResult<()> {
+    let block_id = commit.block_id;
+    file_blocks.add_commit(commit)?;
+    durable_blocks.insert(block_id);
+    Ok(())
+}
+
+/// Completes cached writers in FIFO order, recording every returned commit as
+/// soon as the writer reports it.
+///
+/// Cancellation safe: a writer leaves the cache only after its `complete()`
+/// returned a commit. Dropping this future mid-await keeps the in-flight writer
+/// and the writers not attempted yet available for a later retry or for
+/// `cancel`; draining the cache first would lose them, leaving the surviving
+/// writer with nothing to finalize or abort.
+///
+/// A writer that returned its commit has already finalized its block on the
+/// workers, so the commit becomes durable before the next writer is attempted.
+/// Collecting the commits first and recording them after the whole loop would
+/// drop the successful ones when a later writer fails, and the following
+/// cleanup would then abort blocks the workers already finalized.
+async fn complete_writers_in_place<W, R>(
+    writers: &mut LinkedHashMap<i64, W, BuildHasherDefault<FxHasher>>,
+    mut record: R,
+) -> FsResult<()>
+where
+    W: PendingBlockWriter,
+    R: FnMut(CommitBlock) -> FsResult<()>,
+{
+    while let Some(block_id) = writers.front().map(|(block_id, _)| *block_id) {
+        let commit = match writers.get_mut(&block_id) {
+            Some(writer) => writer.complete_block().await?,
+            None => break,
+        };
+
+        // The block is finalized on its workers now, so the commit must not stay
+        // attached to a writer that cleanup could still abort.
+        writers.remove(&block_id);
+        record(commit)?;
+    }
+
+    Ok(())
+}
+
 pub struct FsWriterBase {
     fs_context: Arc<FsContext>,
     fs_client: FsClient,
@@ -237,10 +287,7 @@ impl FsWriterBase {
     }
 
     fn add_durable_commit(&mut self, commit: CommitBlock) -> FsResult<()> {
-        let block_id = commit.block_id;
-        self.file_blocks.add_commit(commit)?;
-        self.durable_blocks.insert(block_id);
-        Ok(())
+        record_durable_commit(&mut self.file_blocks, &mut self.durable_blocks, commit)
     }
 
     fn restore_commit_blocks(&mut self, commits: &[CommitBlock]) {
@@ -348,49 +395,16 @@ impl FsWriterBase {
             self.cache_writers.insert(writer.block_id(), writer);
         };
 
-        let writers: Vec<(i64, BlockWriter)> = self.cache_writers.drain().collect();
-        match self.complete_writers(writers).await {
-            Ok(()) => Ok(()),
-            Err((unfinished, e)) => {
-                // Writers that did not report a commit keep their write sessions,
-                // so `cancel` can still finalize or abort them.
-                self.cache_writers.extend(unfinished);
-                Err(e)
-            }
-        }
-    }
-
-    /// Completes cached writers in FIFO order, recording every returned commit
-    /// as soon as the writer reports it.
-    ///
-    /// A writer that returned its commit has already finalized its block on the
-    /// workers, so the commit becomes durable before the next writer is
-    /// attempted. Collecting the commits first and recording them after the
-    /// whole loop would drop the successful ones when a later writer fails, and
-    /// the following cleanup would then abort blocks the workers already
-    /// finalized.
-    ///
-    /// On failure the failed writer and the writers not attempted yet are handed
-    /// back, because their fate still belongs to the caller's cleanup.
-    async fn complete_writers<W: PendingBlockWriter>(
-        &mut self,
-        writers: Vec<(i64, W)>,
-    ) -> Result<(), (Vec<(i64, W)>, FsError)> {
-        let mut writers = writers.into_iter();
-        while let Some((block_id, mut writer)) = writers.next() {
-            let recorded = match writer.complete_block().await {
-                Ok(commit) => self.add_durable_commit(commit),
-                Err(e) => Err(e),
-            };
-
-            if let Err(e) = recorded {
-                let mut unfinished = vec![(block_id, writer)];
-                unfinished.extend(writers);
-                return Err((unfinished, e));
-            }
-        }
-
-        Ok(())
+        let Self {
+            cache_writers,
+            file_blocks,
+            durable_blocks,
+            ..
+        } = self;
+        complete_writers_in_place(cache_writers, |commit| {
+            record_durable_commit(file_blocks, durable_blocks, commit)
+        })
+        .await
     }
 
     async fn complete0(
@@ -662,16 +676,25 @@ impl FsWriterBase {
 
 #[cfg(test)]
 mod tests {
-    use super::{needs_append_block, FsWriterBase, PendingBlockWriter};
-    use crate::file::FsContext;
-    use curvine_config::ClusterConf;
+    use super::{
+        complete_writers_in_place, needs_append_block, record_durable_commit, PendingBlockWriter,
+    };
     use curvine_error::{FsError, FsResult};
-    use curvine_fs_api::Path;
     use curvine_model::{
         CommitBlock, ExtendedBlock, FileBlocks, FileStatus, FileType, LocatedBlock, StorageType,
         WriteFileBlocks,
     };
-    use std::sync::Arc;
+    use curvine_runtime::common::FastHashSet;
+    use futures::FutureExt;
+    use fxhash::FxHasher;
+    use linked_hash_map::LinkedHashMap;
+    use std::cell::Cell;
+    use std::hash::BuildHasherDefault;
+    use std::rc::Rc;
+
+    /// FIFO cache of scripted writers, the same shape as `FsWriterBase`'s
+    /// `cache_writers`.
+    type WriterCache = LinkedHashMap<i64, ScriptedWriter, BuildHasherDefault<FxHasher>>;
 
     #[test]
     fn append_at_full_block_boundary_needs_a_new_block() {
@@ -692,43 +715,72 @@ mod tests {
         assert!(!needs_append_block(&blocks, block_size - 1, block_size - 1));
     }
 
-    /// Stands in for a cached `BlockWriter`: it either reports a commit or an
-    /// injected completion failure, without touching any worker.
-    #[derive(Debug)]
+    /// What the next `complete()` of a scripted writer does.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Step {
+        Commit,
+        Fail,
+        /// Never resolves: lets a test cancel the batch mid-await.
+        Pending,
+    }
+
+    /// Stands in for a cached `BlockWriter`: it reports a commit, an injected
+    /// completion failure, or stays pending, without touching any worker.
     struct ScriptedWriter {
         block_id: i64,
         block_len: i64,
-        fail: bool,
+        step: Rc<Cell<Step>>,
     }
 
     impl ScriptedWriter {
-        fn new(block_id: i64, block_len: i64, fail: bool) -> Self {
+        fn new(block_id: i64, block_len: i64, step: Step) -> Self {
             Self {
                 block_id,
                 block_len,
-                fail,
+                step: Rc::new(Cell::new(step)),
             }
+        }
+
+        fn set_step(&self, step: Step) {
+            self.step.set(step);
         }
     }
 
     impl PendingBlockWriter for ScriptedWriter {
         async fn complete_block(&mut self) -> FsResult<CommitBlock> {
-            if self.fail {
-                return Err(FsError::common("injected complete failure"));
+            match self.step.get() {
+                Step::Commit => Ok(CommitBlock {
+                    block_id: self.block_id,
+                    block_len: self.block_len,
+                    locations: Vec::new(),
+                }),
+                Step::Fail => Err(FsError::common("injected complete failure")),
+                Step::Pending => {
+                    std::future::pending::<()>().await;
+                    unreachable!("a pending completion is only ever cancelled")
+                }
             }
-
-            Ok(CommitBlock {
-                block_id: self.block_id,
-                block_len: self.block_len,
-                locations: Vec::new(),
-            })
         }
     }
 
-    /// An empty-file writer owning two pre-allocated blocks. Nothing here talks
-    /// to a master or a worker: only the batch commit bookkeeping is exercised.
-    fn writer_with_blocks(block_size: i64) -> FsWriterBase {
-        let status = FileBlocks::new(
+    fn writer_cache(steps: Vec<(i64, Step)>) -> WriterCache {
+        let mut writers = LinkedHashMap::with_capacity_and_hasher(
+            steps.len(),
+            BuildHasherDefault::<FxHasher>::default(),
+        );
+        for (block_id, step) in steps {
+            writers.insert(block_id, ScriptedWriter::new(block_id, 64, step));
+        }
+        writers
+    }
+
+    fn cached_block_ids(writers: &WriterCache) -> Vec<i64> {
+        writers.keys().copied().collect()
+    }
+
+    /// Two committed-eligible blocks of one file, as `FsWriterBase` tracks them.
+    fn two_block_file_blocks(block_size: i64) -> WriteFileBlocks {
+        WriteFileBlocks::new(FileBlocks::new(
             FileStatus {
                 len: 0,
                 block_size,
@@ -744,60 +796,99 @@ mod tests {
                     Vec::new(),
                 ),
             ],
-        );
-        let fs_context = Arc::new(FsContext::new(ClusterConf::default()).unwrap());
-        let path = Path::from_str("/batch-commit-test").unwrap();
-
-        FsWriterBase::new(fs_context, path, status, 0)
+        ))
     }
 
     #[test]
     fn batch_commit_failure_keeps_successful_commits_durable() {
-        let mut writer = writer_with_blocks(64);
-        let writers = vec![
-            (1, ScriptedWriter::new(1, 64, false)),
-            (2, ScriptedWriter::new(2, 64, true)),
-        ];
+        let mut writers = writer_cache(vec![(1, Step::Commit), (2, Step::Fail)]);
+        let mut file_blocks = two_block_file_blocks(64);
+        let mut durable_blocks = FastHashSet::default();
 
-        let (unfinished, err) = futures::executor::block_on(writer.complete_writers(writers))
-            .expect_err("a failing writer must fail the batch");
+        let err = futures::executor::block_on(complete_writers_in_place(&mut writers, |commit| {
+            record_durable_commit(&mut file_blocks, &mut durable_blocks, commit)
+        }))
+        .expect_err("a failing writer must fail the batch");
         assert!(
             err.to_string().contains("injected complete failure"),
             "the writer error must be the primary error, got: {err}"
         );
-        assert_eq!(unfinished.len(), 1, "only the failed writer is unfinished");
-        assert_eq!(unfinished[0].0, 2, "the failing writer is returned as-is");
 
         // The block finalized before the failure must stay durable: `cancel`
         // aborts every block missing from this set.
         assert!(
-            writer.durable_blocks.contains(&1),
+            durable_blocks.contains(&1),
             "the successfully committed block must be marked durable"
         );
-        assert!(!writer.durable_blocks.contains(&2));
+        assert!(!durable_blocks.contains(&2));
         assert!(
-            writer.file_blocks.has_commit_blocks(),
+            file_blocks.has_commit_blocks(),
             "the successful commit must still wait for the master"
         );
         assert_eq!(
-            writer.file_blocks.block_locs[0].block.len, 64,
+            file_blocks.block_locs[0].block.len, 64,
             "the recorded commit must update the local block length"
+        );
+        assert_eq!(
+            cached_block_ids(&writers),
+            vec![2],
+            "the failed writer must stay cached for cleanup"
         );
     }
 
     #[test]
+    fn dropped_completion_future_keeps_pending_writers_cached() {
+        let mut writers = writer_cache(vec![(1, Step::Commit), (2, Step::Pending)]);
+        let mut file_blocks = two_block_file_blocks(64);
+        let mut durable_blocks = FastHashSet::default();
+
+        // Poll the batch once: block 1 completes, block 2 never does, so the
+        // caller can drop the future exactly like a cancelled `flush()`.
+        let pending = complete_writers_in_place(&mut writers, |commit| {
+            record_durable_commit(&mut file_blocks, &mut durable_blocks, commit)
+        });
+        assert!(
+            pending.now_or_never().is_none(),
+            "the second writer must still be in flight"
+        );
+
+        assert!(durable_blocks.contains(&1));
+        assert!(!durable_blocks.contains(&2));
+        assert_eq!(
+            cached_block_ids(&writers),
+            vec![2],
+            "cancelling the batch must not drop the in-flight writer"
+        );
+
+        // The surviving writer is still usable: a later retry finishes it, and
+        // `cancel` would have had a writer to complete or abort.
+        writers
+            .get_mut(&2)
+            .expect("the cancelled writer stays cached")
+            .set_step(Step::Commit);
+        futures::executor::block_on(complete_writers_in_place(&mut writers, |commit| {
+            record_durable_commit(&mut file_blocks, &mut durable_blocks, commit)
+        }))
+        .expect("the retried writer completes");
+
+        assert!(durable_blocks.contains(&2));
+        assert!(writers.is_empty(), "every writer retired after its commit");
+    }
+
+    #[test]
     fn batch_commit_records_every_commit_when_all_writers_succeed() {
-        let mut writer = writer_with_blocks(64);
-        let writers = vec![
-            (1, ScriptedWriter::new(1, 64, false)),
-            (2, ScriptedWriter::new(2, 64, false)),
-        ];
+        let mut writers = writer_cache(vec![(1, Step::Commit), (2, Step::Commit)]);
+        let mut file_blocks = two_block_file_blocks(64);
+        let mut durable_blocks = FastHashSet::default();
 
-        futures::executor::block_on(writer.complete_writers(writers))
-            .expect("every writer completes");
+        futures::executor::block_on(complete_writers_in_place(&mut writers, |commit| {
+            record_durable_commit(&mut file_blocks, &mut durable_blocks, commit)
+        }))
+        .expect("every writer completes");
 
-        assert!(writer.durable_blocks.contains(&1));
-        assert!(writer.durable_blocks.contains(&2));
-        assert!(writer.file_blocks.has_commit_blocks());
+        assert!(durable_blocks.contains(&1));
+        assert!(durable_blocks.contains(&2));
+        assert!(file_blocks.has_commit_blocks());
+        assert!(writers.is_empty());
     }
 }
