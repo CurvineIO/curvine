@@ -1180,7 +1180,6 @@ impl InodeStore {
     pub fn create_checkpoint(&self, id: u64, last_inode_id: i64) -> CommonResult<String> {
         let spend = TimeSpent::new();
         let flushed = self
-            .store
             .save_last_inode_id(last_inode_id)
             .and_then(|_| self.store.db.flush(true));
         let flush_ms = spend.used_ms();
@@ -1190,6 +1189,17 @@ impl InodeStore {
             metrics.record_checkpoint(flush_ms, spend.used_ms(), result.is_ok());
         }
         result
+    }
+
+    /// Persist `last_inode_id`, never lowering the watermark an earlier checkpoint
+    /// already recorded: the persisted value must be monotonic even if a caller
+    /// passes a stale allocator value.
+    fn save_last_inode_id(&self, last_inode_id: i64) -> CommonResult<()> {
+        let watermark = match self.store.get_last_inode_id()? {
+            Some(stored) if stored > last_inode_id => stored,
+            _ => last_inode_id,
+        };
+        self.store.save_last_inode_id(watermark)
     }
 
     pub fn restore<T: AsRef<str>>(&mut self, path: T) -> CommonResult<()> {
@@ -1366,6 +1376,17 @@ mod tests {
         store.restore(&checkpoint_dir)?;
         let (restored_inode_id, _) = store.create_tree()?;
         assert_eq!(restored_inode_id, 145_164);
+
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_never_persists_a_lower_watermark() -> CommonResult<()> {
+        let store = new_store("watermark-monotonic")?;
+        store.create_checkpoint(1, 9000)?;
+        // A stale caller value must not lower the value already recorded.
+        store.create_checkpoint(2, 5)?;
+        assert_eq!(store.store.get_last_inode_id()?, Some(9000));
 
         Ok(())
     }
