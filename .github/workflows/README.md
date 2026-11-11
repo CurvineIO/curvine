@@ -75,4 +75,5 @@ Actions -> `Trigger Helm Release` -> Run workflow，填写 tag（如 `v0.3.0`）
 - 评论必须只包含命令本身（不区分大小写），句子中提到 `/assign` 不会触发
 - Issue 已被他人认领或已关闭时，机器人会回复说明，不会改动 assignees
 - PR 下的评论不会触发
+- 只有包含 `/assign` 或 `/unassign` 的评论才会启动 job；同一 Issue 的命令按顺序排队执行（`queue: max`），不会互相替换
 - 使用默认 `GITHUB_TOKEN`，只申请 `issues: write` 权限，无需额外配置 Secret

@@ -13,16 +13,23 @@ on:
 
 permissions: {}
 
-# Serialize commands on the same issue so two people cannot claim it at once.
-concurrency:
-  group: issue-self-assign-${{ github.event.issue.number }}
-  cancel-in-progress: false
-
 jobs:
   self-assign:
+    # Cheap pre-filter so ordinary comments skip the job and never enter the
+    # concurrency group. contains() is case-insensitive; the script still
+    # requires the comment to be exactly the command.
     if: >-
       !github.event.issue.pull_request &&
-      github.event.comment.user.type != 'Bot'
+      github.event.comment.user.type != 'Bot' &&
+      (contains(github.event.comment.body, '/assign') ||
+       contains(github.event.comment.body, '/unassign'))
+    # Serialize commands on the same issue so two people cannot claim it at once.
+    # queue: max keeps every pending command; the default replaces a pending run
+    # with the newest one.
+    concurrency:
+      group: issue-self-assign-${{ github.event.issue.number }}
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     permissions:
       issues: write
