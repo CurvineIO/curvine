@@ -75,7 +75,11 @@ The Deployment and the StatefulSet mount their volume at `/usr/share/nginx/html`
 and write an `index.html` there on startup:
 
 ```bash
-kubectl exec -n curvine deploy/curvine-test-deployment -- cat /usr/share/nginx/html/index.html
+# curvine-test-pod also carries app=curvine-test, so select a Deployment pod
+# by its pod-template-hash label instead of using deploy/curvine-test-deployment.
+POD=$(kubectl get pod -n curvine -l 'app=curvine-test,pod-template-hash' \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n curvine "$POD" -- cat /usr/share/nginx/html/index.html
 kubectl exec -n curvine curvine-statefulset-0 -- cat /usr/share/nginx/html/index.html
 ```
 
@@ -92,8 +96,17 @@ kubectl get pv curvine-pv
 kubectl get pvc curvine-pvc-static -n curvine
 ```
 
-To use it from a pod, copy `pod-curvine.yaml` and set
+To use it from a pod, copy `pod-curvine.yaml` to `pod-static.yaml`, change
+`metadata.name` to `curvine-test-pod-static`, and set
 `spec.volumes[0].persistentVolumeClaim.claimName` to `curvine-pvc-static`.
+Give the copy a new name: a Pod's volumes cannot be changed in place, so
+re-applying `curvine-test-pod` with a different claim is rejected if the
+dynamic example is still running.
+
+```bash
+kubectl apply -f pod-static.yaml
+kubectl wait --for=condition=Ready pod/curvine-test-pod-static -n curvine --timeout=120s
+```
 
 ## Troubleshooting
 
@@ -110,6 +123,7 @@ Delete workloads before their claims, and claims before the StorageClass:
 
 ```bash
 kubectl delete -f statefulset-curvine.yaml -f deployment-curvine.yaml -f pod-curvine.yaml --ignore-not-found
+kubectl delete pod curvine-test-pod-static -n curvine --ignore-not-found
 kubectl delete pvc -n curvine -l app=curvine-stateful --ignore-not-found
 kubectl delete -f pvc-curvine.yaml -f pvc-static.yaml --ignore-not-found
 kubectl delete -f pv-curvine.yaml -f storage-class.yaml --ignore-not-found
