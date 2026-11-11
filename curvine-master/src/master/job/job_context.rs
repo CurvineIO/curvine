@@ -15,9 +15,10 @@
 use curvine_config::ClientConf;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
+use curvine_fs_api::Path;
 use curvine_model::{
-    JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo,
-    WorkerAddress,
+    JobTaskProgress, JobTaskState, JobTaskType, LoadJobCommand, LoadJobInfo, LoadTaskInfo,
+    MountInfo, WorkerAddress,
 };
 use curvine_runtime::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
 use curvine_runtime::sync::{StateListener, StateMonitor};
@@ -41,6 +42,9 @@ impl TaskDetail {
 #[derive(Clone)]
 pub struct JobContext {
     pub info: LoadJobInfo,
+    /// `Export` when the job copies a Curvine source back to UFS (fs_mode),
+    /// `Load` when it imports a UFS source into Curvine.
+    pub kind: JobTaskType,
     pub run_id: u64,
     pub state: StateMonitor,
     pub progress: JobTaskProgress,
@@ -74,6 +78,11 @@ impl JobContext {
 
         let ttl_action = job_conf.ttl_action.unwrap_or(mnt.ttl_action);
 
+        let kind = match Path::from_str(&source_path) {
+            Ok(path) if path.is_cv() => JobTaskType::Export,
+            _ => JobTaskType::Load,
+        };
+
         let job = LoadJobInfo {
             job_id,
             source_path,
@@ -90,6 +99,7 @@ impl JobContext {
 
         JobContext {
             info: job,
+            kind,
             run_id,
             state: StateMonitor::new(JobTaskState::Pending.into()),
             progress: Default::default(),

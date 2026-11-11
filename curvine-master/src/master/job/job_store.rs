@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::JobContext;
+use crate::master::{JobContext, Master};
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_model::{JobTaskProgress, JobTaskState};
+use curvine_runtime::common::LocalTime;
 use curvine_runtime::sync::FastDashMap;
 use log::{debug, error, warn};
 use std::collections::HashMap;
@@ -137,19 +138,24 @@ impl JobStore {
             return Ok(());
         }
 
-        if !job.tasks.contains_key(task_id) {
-            debug!(
-                "ignore stale task report for job {}, unknown task {}",
-                job_id, task_id
-            );
-            return Ok(());
-        }
+        let previous = match job.tasks.get(task_id) {
+            Some(detail) => detail.progress.clone(),
+            None => {
+                debug!(
+                    "ignore stale task report for job {}, unknown task {}",
+                    job_id, task_id
+                );
+                return Ok(());
+            }
+        };
 
         job.update_progress(task_id, progress)?;
+        Self::record_task_report(&job, task_id, &previous);
 
         let new_state: JobTaskState = job.state.state();
 
         if old_state != new_state {
+            Self::record_transition(old_state, new_state, &job);
             let job_id_owned = job_id.to_string();
             let job_clone = (*job).clone();
             drop(job);
@@ -172,6 +178,7 @@ impl JobStore {
             let new_state = state;
 
             if old_state != new_state {
+                Self::record_transition(old_state, new_state, &job);
                 let job_clone = (*job).clone();
                 drop(job);
 
@@ -202,6 +209,7 @@ impl JobStore {
         let new_state = state;
 
         if old_state != new_state {
+            Self::record_transition(old_state, new_state, &job);
             let job_clone = (*job).clone();
             drop(job);
 
@@ -214,6 +222,28 @@ impl JobStore {
         }
 
         true
+    }
+
+    /// Counts a run that just reached a terminal state. Leaving one terminal
+    /// state for another (e.g. a dispatch failure after a cancel) is not a new
+    /// finish.
+    fn record_transition(old_state: JobTaskState, new_state: JobTaskState, job: &JobContext) {
+        if old_state.is_finish() || !new_state.is_finish() {
+            return;
+        }
+        if let Ok(metrics) = Master::get_metrics() {
+            let elapsed_ms = (LocalTime::mills() as i64).saturating_sub(job.info.create_time);
+            metrics.record_load_job_finished(job.kind, new_state, elapsed_ms.max(0) as u64);
+        }
+    }
+
+    fn record_task_report(job: &JobContext, task_id: &str, previous: &JobTaskProgress) {
+        let Some(detail) = job.tasks.get(task_id) else {
+            return;
+        };
+        if let Ok(metrics) = Master::get_metrics() {
+            metrics.record_load_task_report(job.kind, previous, &detail.progress);
+        }
     }
 
     pub fn remove_callbacks(&self, job_id: &str) -> FsResult<()> {
