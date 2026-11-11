@@ -153,6 +153,15 @@ fn main() -> ExitCode {
     }
 }
 
+/// Name users type for the CLI: `build/bin/cv` wraps the `curvine-cli` binary.
+const COMPLETION_BIN_NAME: &str = "cv";
+
+/// Write the completion script for `shell` to `out`.
+fn write_completion(shell: clap_complete::Shell, out: &mut dyn std::io::Write) {
+    let mut cmd = CurvineArgs::command();
+    clap_complete::generate(shell, &mut cmd, COMPLETION_BIN_NAME, out);
+}
+
 fn run() -> CommonResult<()> {
     let args = CurvineArgs::parse();
     if args.version_json {
@@ -173,6 +182,11 @@ fn run() -> CommonResult<()> {
     }
 
     Utils::set_panic_exit_hook();
+
+    if let Some(Commands::Completion { shell }) = args.command {
+        write_completion(shell, &mut std::io::stdout());
+        return Ok(());
+    }
 
     if matches!(args.command, Some(Commands::Version)) {
         println!("curvine-cli {}", env!("CARGO_PKG_VERSION"));
@@ -245,7 +259,7 @@ fn run() -> CommonResult<()> {
             Some(Commands::UnMount(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Node(cmd)) => cmd.execute(fs_client, conf.clone()).await,
             Some(Commands::Snapshot(cmd)) => cmd.execute(fs_client).await,
-            Some(Commands::Version) | None => Ok(()),
+            Some(Commands::Version) | Some(Commands::Completion { .. }) | None => Ok(()),
         }
     })
 }
@@ -335,6 +349,35 @@ mod tests {
             .expect("bare invocation should parse so main can emit MissingSubcommand");
 
         assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn completion_subcommand_parses_every_shell() {
+        for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+            let args = CurvineArgs::try_parse_from(["curvine", "completion", shell])
+                .unwrap_or_else(|e| panic!("completion {shell} should parse: {e}"));
+            assert!(matches!(args.command, Some(Commands::Completion { .. })));
+        }
+        assert!(CurvineArgs::try_parse_from(["curvine", "completion", "tcsh"]).is_err());
+        assert!(CurvineArgs::try_parse_from(["curvine", "completion"]).is_err());
+    }
+
+    #[test]
+    fn completion_scripts_generate_for_every_shell() {
+        use clap::ValueEnum;
+        for shell in clap_complete::Shell::value_variants() {
+            let mut out = Vec::new();
+            write_completion(*shell, &mut out);
+            let script = String::from_utf8(out).expect("completion script is UTF-8");
+            assert!(!script.is_empty(), "{shell} script is empty");
+            assert!(script.contains("cv"), "{shell} script does not mention cv");
+            for sub in ["fs", "report", "mount", "completion"] {
+                assert!(
+                    script.contains(sub),
+                    "{shell} script misses subcommand {sub}"
+                );
+            }
+        }
     }
 
     #[test]
