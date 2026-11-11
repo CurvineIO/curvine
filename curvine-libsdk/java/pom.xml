@@ -357,6 +357,10 @@
                                         <exclude>org/apache/hadoop/**</exclude>
                                         <exclude>io/curvine/S3aProxyFileSystem.class</exclude>
                                         <exclude>io/curvine/S3aProxyFileSystem$*</exclude>
+                                        <exclude>io/curvine/HdfsProxyFileSystem.class</exclude>
+                                        <exclude>io/curvine/HdfsProxyFileSystem$*</exclude>
+                                        <exclude>io/curvine/CurvineProxyOpener.class</exclude>
+                                        <exclude>io/curvine/CurvineProxyOpener$*</exclude>
                                         <exclude>io/curvine/CurvineFilesystemProvider.class</exclude>
                                         <exclude>io/curvine/CurvineFilesystemProvider$*</exclude>
                                         <exclude>io/curvine/CurvineFallbackInputStream.class</exclude>
