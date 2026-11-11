@@ -51,7 +51,7 @@ jobs:
       options: --privileged --device /dev/fuse
     
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       
       - name: Setup Rust toolchain
         run: |
@@ -165,7 +165,7 @@ jobs:
 
       - name: Checkout cvtest for POSIX smoke
         if: github.event_name == 'pull_request'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.CVTEST_REPO }}
           ref: ${{ env.CVTEST_REF }}
