@@ -88,12 +88,16 @@ helm upgrade --install curvine-csi curvineio/curvine-csi -n curvine-system --cre
 ```bash
 cd build/dist
 export CURVINE_MASTER_HOSTNAME=localhost
-./bin/restart-all.sh        # 启动 master、worker 和 FUSE（挂载在 /curvine-fuse）
+./bin/curvine-master.sh start
+./bin/curvine-worker.sh start
+./bin/curvine-fuse.sh start   # 挂载在 /curvine-fuse
 
-bin/cv report               # 查看集群状态
+bin/cv report                 # 查看集群状态
 bin/cv fs mkdir /hello
 ls /curvine-fuse
 ```
+
+停止时按相反顺序用 `stop` 参数执行这些脚本：先 `curvine-fuse.sh`，再 `curvine-worker.sh`，最后 `curvine-master.sh`。
 
 Web UI：master 位于 `http://<host>:9001`，worker 位于 `http://<host>:9002`。
 

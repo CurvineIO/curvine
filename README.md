@@ -88,12 +88,16 @@ Follow the [build instructions](https://curvineio.github.io/docs/Deploy/build-in
 ```bash
 cd build/dist
 export CURVINE_MASTER_HOSTNAME=localhost
-./bin/restart-all.sh        # starts master, worker, and FUSE (mounted at /curvine-fuse)
+./bin/curvine-master.sh start
+./bin/curvine-worker.sh start
+./bin/curvine-fuse.sh start   # mounts at /curvine-fuse
 
-bin/cv report               # check cluster status
+bin/cv report                 # check cluster status
 bin/cv fs mkdir /hello
 ls /curvine-fuse
 ```
+
+To stop, run the same scripts with `stop` in reverse order: `curvine-fuse.sh`, `curvine-worker.sh`, then `curvine-master.sh`.
 
 Web UIs: master at `http://<host>:9001`, worker at `http://<host>:9002`.
 
