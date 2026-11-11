@@ -222,7 +222,7 @@ impl UnifiedFileSystem {
         let state = self.mount_cache.get_mount(self, path).await?;
         if let Some(mnt) = state {
             if mnt.info.is_read_only_cache_mode() && Self::is_mount_write_rpc(rpc_code) {
-                return err_ext!(FsError::unsupported(format!(
+                return err_ext!(FsError::read_only_msg(format!(
                     "{} on read_only cache_mode mount {}",
                     rpc_code, path
                 )));
