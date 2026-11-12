@@ -121,10 +121,16 @@ fn fault_tests_run_in_isolated_processes() {
         let stdout_path = log_dir.join(format!("{safe_name}.stdout"));
         let stderr_path = log_dir.join(format!("{safe_name}.stderr"));
         std::fs::write(&stdout_path, &output.stdout).unwrap_or_else(|e| {
-            panic!("failed to save isolated run stdout to {}: {e}", stdout_path.display())
+            panic!(
+                "failed to save isolated run stdout to {}: {e}",
+                stdout_path.display()
+            )
         });
         std::fs::write(&stderr_path, &output.stderr).unwrap_or_else(|e| {
-            panic!("failed to save isolated run stderr to {}: {e}", stderr_path.display())
+            panic!(
+                "failed to save isolated run stderr to {}: {e}",
+                stderr_path.display()
+            )
         });
         if !output.status.success() {
             failures.push((*test, output.status.code()));
