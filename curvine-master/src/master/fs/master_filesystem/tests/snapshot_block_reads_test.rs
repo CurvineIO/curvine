@@ -200,21 +200,36 @@ fn block_locations_snapshot_fallback_rejects_corrupt_non_tail_block() {
         Ok(result) => Ok(result),
         Err(_) => rx.recv_timeout(std::time::Duration::from_secs(5)),
     };
-    // The final observation decides the join: a worker that never reported a
-    // result is reported as a timeout and is neither joined nor restored,
-    // since it may still hold locks the restore would contend on.
-    let finished = received.is_ok();
+    // Classify the final observation explicitly. A business result (an FsErr
+    // included) and a disconnected channel both mean the worker has finished;
+    // only a final Timeout means it is still running.
+    let delivered = matches!(&received, Ok(_));
+    let worker_exited = matches!(
+        &received,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    );
+    let stuck = matches!(&received, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+    let finished = delivered || worker_exited;
     let join_result = finished.then(|| worker.join());
     if finished {
         restore_live_edge(&fs, &inode_locks, owned);
     }
-    // Assertions come after cleanup.
+    // The stuck branch is the only one that skips the join and the restore, so
+    // it is reported first: with a final timeout `timely` is false and would
+    // mask this diagnosis.
+    assert!(
+        !stuck,
+        "the worker did not report a result within the recovery window; a stuck worker is not joined and the live edge is left as-is"
+    );
+    // A disconnected channel is its own failure, not a timeliness miss.
+    assert!(
+        !worker_exited,
+        "the worker exited without reporting a result"
+    );
+    // Completion path: join/restore are already collected above, so the
+    // timeliness bar is asserted only now.
     started.expect("worker must start within the bound");
     assert!(timely, "the fallback must not wait for a cold window");
-    assert!(
-        finished,
-        "the worker must report a result within the recovery window; a stuck worker is not joined"
-    );
     join_result
         .expect("a finished worker must be joinable")
         .expect("worker must not panic");
@@ -330,21 +345,36 @@ fn block_locations_snapshot_fallback_matches_the_live_result() {
         Ok(result) => Ok(result),
         Err(_) => rx.recv_timeout(std::time::Duration::from_secs(5)),
     };
-    // The final observation decides the join: a worker that never reported a
-    // result is reported as a timeout and is neither joined nor restored,
-    // since it may still hold locks the restore would contend on.
-    let finished = received.is_ok();
+    // Classify the final observation explicitly. A business result (an FsErr
+    // included) and a disconnected channel both mean the worker has finished;
+    // only a final Timeout means it is still running.
+    let delivered = matches!(&received, Ok(_));
+    let worker_exited = matches!(
+        &received,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    );
+    let stuck = matches!(&received, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+    let finished = delivered || worker_exited;
     let join_result = finished.then(|| worker.join());
     if finished {
         restore_live_edge(&fs, &inode_locks, owned);
     }
-    // All assertions come after the fixture is torn down.
+    // The stuck branch is the only one that skips the join and the restore, so
+    // it is reported first: with a final timeout `timely` is false and would
+    // mask this diagnosis.
+    assert!(
+        !stuck,
+        "the worker did not report a result within the recovery window; a stuck worker is not joined and the live edge is left as-is"
+    );
+    // A disconnected channel is its own failure, not a timeliness miss.
+    assert!(
+        !worker_exited,
+        "the worker exited without reporting a result"
+    );
+    // Completion path: join/restore are already collected above, so the
+    // timeliness bar is asserted only now.
     started.expect("worker must start within the bound");
     assert!(timely, "the fallback must not wait for a cold window");
-    assert!(
-        finished,
-        "the worker must report a result within the recovery window; a stuck worker is not joined"
-    );
     let received = received.expect("the worker must report a result");
     let blocks = received.expect("the snapshot fallback must serve the store-resident file");
 
