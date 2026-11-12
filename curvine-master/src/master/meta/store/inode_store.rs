@@ -1881,6 +1881,10 @@ impl<'a> InodeStoreSnapshot<'a> {
 mod journal_cursor_test;
 
 #[cfg(test)]
+#[path = "tests/snapshot_locks_test.rs"]
+mod snapshot_locks_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::master::meta::inode::ttl::TtlBucketList;
