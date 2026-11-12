@@ -35,6 +35,17 @@ actual="$(tag_to_release_version "v0.4.0-alpha")"
 actual="$(tag_to_release_version "v0.2.0")"
 [ "$actual" = "0.2.0" ] || fail "tag_to_release_version v0.2.0, got $actual"
 
+# --- normalize_release_version ---------------------------------------------
+actual="$(normalize_release_version "v0.4.0-alpha")"
+[ "$actual" = "0.4.0-alpha" ] || fail "normalize_release_version v0.4.0-alpha, got $actual"
+actual="$(normalize_release_version "0.4.0")"
+[ "$actual" = "0.4.0" ] || fail "normalize_release_version 0.4.0, got $actual"
+for invalid in "0.4" "latest" "v0.4.0.1" "0.4.0-"; do
+  if ( set +e; normalize_release_version "$invalid" ) >/dev/null 2>&1; then
+    fail "expected normalize_release_version '$invalid' to fail"
+  fi
+done
+
 # --- set_workspace_version --------------------------------------------------
 cat > "$TMP_DIR/Cargo.toml" <<'EOF'
 [workspace.package]
