@@ -37,6 +37,7 @@ use raft::StateRole;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(test)]
 use std::time::Duration;
 use std::{fs, mem};
 
@@ -52,10 +53,7 @@ pub struct JournalLoader {
     fsm_state: Arc<Mutex<FsmState>>,
     retain_checkpoint_num: usize,
     ignore_reply_error: bool,
-    max_retry_num: u64,
-    skip_failed_ufs_replay_after_retry: bool,
     batch_size: u64,
-    retry_interval: Duration,
     metrics: &'static MasterMetrics,
     has_apply_worker: bool,
     /// Shared raft-term handle, so the session lease epoch follows election
@@ -145,10 +143,7 @@ impl JournalLoader {
             fsm_state,
             retain_checkpoint_num: conf.retain_checkpoint_num,
             ignore_reply_error: conf.ignore_reply_error,
-            max_retry_num: conf.max_retry_num,
-            skip_failed_ufs_replay_after_retry: conf.skip_failed_ufs_replay_after_retry,
             batch_size: conf.scan_batch_size,
-            retry_interval: Duration::from_secs(conf.retry_interval_secs),
             metrics: Master::get_metrics()?,
             has_apply_worker: !testing,
             term,
@@ -420,28 +415,11 @@ impl JournalLoader {
         }
         Ok(())
     }
-    async fn next_apply_msg(
-        &self,
-        receiver: &mut AsyncReceiver<ApplyMsg>,
-        retry_msg: &mut Option<ApplyMsg>,
-    ) -> Option<ApplyMsg> {
-        match retry_msg.take() {
-            Some(msg) => {
-                tokio::time::sleep(self.retry_interval).await;
-                Some(msg)
-            }
-            None => receiver.recv().await,
-        }
-    }
-
     async fn run_apply(self, mut receiver: AsyncReceiver<ApplyMsg>) {
-        let mut retry_msg: Option<ApplyMsg> = None;
-        let mut retry_num: u64 = 0;
         let mut is_leader = false;
-        let mut logged_skip_ignored = false;
 
         loop {
-            let apply_msg = match self.next_apply_msg(&mut receiver, &mut retry_msg).await {
+            let apply_msg = match receiver.recv().await {
                 Some(v) => v,
                 None => break,
             };
@@ -451,14 +429,12 @@ impl JournalLoader {
                     if let Err(e) = tx.send(self.create_snapshot0(None)) {
                         warn!("send create snapshot result failed: {}", e);
                     }
-                    retry_num = 0;
                 }
 
                 ApplyMsg::ApplySnapshot((tx, snapshot)) => {
                     if let Err(e) = tx.send(self.apply_snapshot0(snapshot)) {
                         warn!("send apply snapshot result failed: {}", e);
                     }
-                    retry_num = 0;
                 }
 
                 ApplyMsg::RoleChange((role, tx)) => {
@@ -490,33 +466,9 @@ impl JournalLoader {
                 }
 
                 msg => match self.apply_msg(is_leader, &msg).await {
-                    Ok(()) => {
-                        retry_num = 0;
-                        Self::complete_entry_ack(msg, Ok(()));
-                    }
-
+                    Ok(()) => Self::complete_entry_ack(msg, Ok(())),
                     Err(error) => {
-                        // Metadata apply no longer owes a UFS side effect, so
-                        // skipping a failed UFS replay after retries has nothing
-                        // left to skip; the replayer owns that retry loop.
-                        if !logged_skip_ignored && self.skip_failed_ufs_replay_after_retry {
-                            error!(
-                                "skip_failed_ufs_replay_after_retry no longer applies: UFS side effects are replayed by the background worker (max_retry_num={})",
-                                self.max_retry_num
-                            );
-                            logged_skip_ignored = true;
-                        }
-
-                        retry_num += 1;
-                        if retry_num >= self.max_retry_num {
-                            Self::abort_on_fatal_apply_error(format!(
-                                "apply entry failed(retry_num={}): {}",
-                                retry_num, error
-                            ));
-                        } else {
-                            error!("apply entry failed(retry_num={}): {}", retry_num, error);
-                            retry_msg.replace(msg);
-                        }
+                        Self::abort_on_fatal_apply_error(format!("apply entry failed: {}", error))
                     }
                 },
             }
@@ -1287,6 +1239,40 @@ mod tests {
             (1, 1),
             "nothing is owed once the replayer caught up"
         );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn ufs_replayer_owes_a_release_writer_export() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("ufs-release-writer", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        let mut batch = JournalBatch::new(1);
+        batch.push(JournalEntry::ReleaseWriter(ReleaseWriterEntry {
+            op_id: 42,
+            rpc_id: 9,
+            ino: 4_000_000,
+            client: "client-a".to_string(),
+        }));
+        let entry = Entry {
+            index: 1,
+            term: 5,
+            data: SerdeUtils::serialize(&batch).unwrap(),
+            ..Default::default()
+        };
+
+        let owed = rt.block_on(loader.ufs_loader.replay_entry(&entry))?;
+        assert!(
+            owed.is_some(),
+            "a replayed release_writer carries a UFS effect and must be reported as owed"
+        );
+        assert_eq!(loader.get_fsm_state().ufs_applied.index, 1);
 
         drop(loader);
         js.shutdown();

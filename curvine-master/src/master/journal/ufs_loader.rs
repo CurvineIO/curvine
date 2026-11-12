@@ -31,7 +31,7 @@ use log::{debug, error, info, warn};
 use raft::eraftpb::{Entry, EntryType};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Result of replaying one raft entry in the background worker.
 enum Step {
@@ -40,7 +40,7 @@ enum Step {
     /// Leadership was lost while retrying: abandon the entry and re-evaluate
     /// instead of writing a shared UFS the new leader now owns.
     Paused,
-    /// The worker must exit: shutdown or unrecoverable damage.
+    /// The worker must exit because shutdown was requested while backing off.
     Stop,
 }
 
@@ -49,6 +49,12 @@ enum Step {
 /// nothing measurable and keeps every wake-up signal out of the design: there
 /// is no notification to lose, because there is no notification.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+const STALL_AFTER: Duration = Duration::from_secs(60);
+
+const UFS_PENDING: &str = "pending";
+const UFS_STALLED: &str = "stalled";
+const UFS_FAILED: &str = "failed";
 
 #[derive(Clone)]
 pub struct UfsLoader {
@@ -128,6 +134,20 @@ impl UfsLoader {
         }
     }
 
+    fn publish_ufs(&self, kind: &str, value: i64) {
+        self.metrics
+            .journal_ufs
+            .with_label_values(&[kind])
+            .set(value);
+    }
+
+    fn note_replay_failure(&self) {
+        self.metrics
+            .journal_ufs
+            .with_label_values(&[UFS_FAILED])
+            .inc();
+    }
+
     /// Replay every UFS side effect the watermarks still owe.
     ///
     /// Progress lives entirely in `ufs_applied`: there is no in-memory queue to
@@ -143,16 +163,14 @@ impl UfsLoader {
         info!("ufs replayer stopped");
     }
 
-    /// One poll cycle: replay the single entry the watermarks owe next. Returns
-    /// false when the worker must exit, either because shutdown was requested
-    /// or because the watermarks no longer describe recoverable state.
+    /// One poll cycle: replay the single entry the watermarks owe next.
     async fn cycle(&self) -> bool {
         if !self.is_leader.load(Ordering::Acquire) {
             return self.idle().await;
         }
 
         let Some((from, to)) = self.owed_range() else {
-            return false;
+            return self.idle().await;
         };
 
         if from >= to {
@@ -175,16 +193,8 @@ impl UfsLoader {
             }
         };
         if entries.len() != 1 || entries[0].index != next {
-            // The owed entry is gone from the log, so its UFS side effect can
-            // never run again. Stopping keeps the watermark where it is instead
-            // of skipping past effects that never happened.
-            error!(
-                "ufs replay: metadata invariant broken, ufs replay stopped at index {}, \
-                 but journal entry {} is not on disk",
-                from, next
-            );
-            self.stopped.store(true, Ordering::Release);
-            return false;
+            self.report_gap(from, next);
+            return self.idle().await;
         }
 
         let entry = entries.remove(0);
@@ -198,20 +208,47 @@ impl UfsLoader {
         }
     }
 
-    /// `(ufs_applied, applied]`, or `None` when the range cannot be read and the
-    /// worker stopped instead.
+    /// `(ufs_applied, applied]`, or `None` when the range cannot be read.
     fn owed_range(&self) -> Option<(u64, u64)> {
         match self.replay_range() {
-            Ok(range) => Some(range),
+            Ok((from, to)) => {
+                self.publish_ufs(UFS_PENDING, to.saturating_sub(from) as i64);
+                Some((from, to))
+            }
             Err(e) => {
-                error!(
-                    "ufs replay: cannot read watermarks, ufs replay stopped: {}",
-                    e
-                );
-                self.stopped.store(true, Ordering::Release);
+                if self.enter_stall() {
+                    error!(
+                        "ufs replay: cannot read the watermarks, the UFS backlog cannot drain: {}",
+                        e
+                    );
+                }
                 None
             }
         }
+    }
+
+    fn report_gap(&self, from: u64, next: u64) {
+        if self.enter_stall() {
+            error!(
+                "ufs replay: metadata invariant broken, ufs replay is stuck at index {}, \
+                 but journal entry {} is not on disk; the UFS backlog cannot drain while \
+                 compaction stays pinned at ufs_applied",
+                from, next
+            );
+        }
+    }
+
+    fn enter_stall(&self) -> bool {
+        let stalled = self.metrics.journal_ufs.with_label_values(&[UFS_STALLED]);
+        if stalled.get() == 1 {
+            return false;
+        }
+        stalled.set(1);
+        true
+    }
+
+    fn clear_stall(&self) {
+        self.publish_ufs(UFS_STALLED, 0);
     }
 
     /// One marker per replayed entry: a follower only needs the latest
@@ -268,14 +305,37 @@ impl UfsLoader {
 
     /// Apply one raft entry's UFS effects.
     async fn replay_one(&self, entry: &Entry) -> Step {
+        let mut failing_since: Option<Instant> = None;
+        let mut stall_logged = false;
+
         loop {
             match self.replay_entry(entry).await {
-                Ok(reached) => return Step::Applied(reached),
+                Ok(reached) => {
+                    self.clear_stall();
+                    return Step::Applied(reached);
+                }
                 Err(e) => {
                     // A demoted node must not keep retrying a shared UFS write:
                     // the new leader owns that side effect now.
                     if !self.is_leader.load(Ordering::Acquire) {
                         return Step::Paused;
+                    }
+                    self.note_replay_failure();
+
+                    let since = *failing_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= STALL_AFTER {
+                        self.publish_ufs(UFS_STALLED, 1);
+                        if !stall_logged {
+                            stall_logged = true;
+                            error!(
+                                "ufs replay: entry {} has been failing for {:?}, the UFS \
+                                 backlog cannot drain and journal compaction stays pinned at \
+                                 ufs_applied: {}",
+                                entry.index,
+                                since.elapsed(),
+                                e
+                            );
+                        }
                     }
                     warn!(
                         "ufs replay failed at index {}, retrying in {:?}: {}",
@@ -306,14 +366,12 @@ impl UfsLoader {
             applied.op_id = op_entry.op_id();
             applied.rpc_id = op_entry.rpc_id();
 
-            // Only these carry a UFS side effect. Everything else in the log is
-            // metadata, cache, or watermark bookkeeping that replay does not owe,
-            // so the list must stay in step with `apply_entry`.
             match &op_entry {
                 JournalEntry::Mkdir(_)
                 | JournalEntry::CompleteFile(_)
                 | JournalEntry::Rename(_)
-                | JournalEntry::Delete(_) => {}
+                | JournalEntry::Delete(_)
+                | JournalEntry::ReleaseWriter(_) => {}
                 _ => continue,
             }
 
