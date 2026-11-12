@@ -196,6 +196,69 @@ fn test_cache_mode_recaches_after_lost_worker_cleanup() {
     });
 }
 
+#[test]
+fn test_cache_mode_auto_caches_with_zero_ttl() {
+    let testing = Testing::builder().workers(1).build().unwrap();
+    let ufs_base = testing.ufs_path.clone();
+    testing.start_cluster().unwrap();
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+
+    rt.block_on(async move {
+        let mount_dir = "cache_mode_zero_ttl";
+        let cv_path = Path::from_str(format!("/{mount_dir}/data.log")).unwrap();
+        let ufs_path = Path::from_str(format!("{ufs_base}/{mount_dir}")).unwrap();
+        // ttl_ms = 0 means cached data never expires; it must not turn off auto-cache.
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .ttl_ms(0)
+            .auto_cache(true)
+            .build();
+        let ufs = UfsFileSystem::new(&ufs_path, opts.add_properties.clone(), None).unwrap();
+        ufs.mkdir(&ufs_path, true).await.unwrap();
+        fs.mount(
+            &ufs_path,
+            &Path::from_str(format!("/{mount_dir}")).unwrap(),
+            opts,
+        )
+        .await
+        .unwrap();
+
+        let (source_path, mount) = fs
+            .get_mount(&cv_path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mount.info.ttl_ms, 0);
+        assert!(mount.info.auto_cache());
+
+        let data = "zero ttl mounts are still cached automatically";
+        let mut writer = mount
+            .ufs()
+            .unwrap()
+            .create(&source_path, true)
+            .await
+            .unwrap();
+        writer.write_string(data.to_string()).await.unwrap();
+        writer.complete().await.unwrap();
+
+        // The first read misses, is served from UFS, and submits a cache job.
+        let mut miss = fs.open(&cv_path).await.unwrap();
+        assert!(!matches!(miss, UnifiedReader::Fallback(_)));
+        assert_eq!(miss.read_as_string().await.unwrap(), data);
+        fs.wait_job_complete(&cv_path, false).await.unwrap();
+
+        // The cached copy never expires and serves the next read.
+        let status = fs.cv().get_status(&cv_path).await.unwrap();
+        assert_eq!(status.storage_policy.ttl_ms, 0);
+        assert!(!status.is_expired());
+
+        let mut hit = fs.open(&cv_path).await.unwrap();
+        assert!(matches!(hit, UnifiedReader::Fallback(_)));
+        assert_eq!(hit.read_as_string().await.unwrap(), data);
+    });
+}
+
 async fn test_cache_read(fs: &UnifiedFileSystem, path: &Path) {
     let mut reader1 = fs.open(path).await.unwrap();
     assert!(

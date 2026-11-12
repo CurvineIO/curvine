@@ -24,6 +24,7 @@ pub mod consts;
 pub mod s3_utils;
 pub mod temp_file_manager;
 pub mod temp_storage;
+pub mod verifying_reader;
 #[derive(Debug)]
 pub struct BaseKv<K: PartialOrd, V> {
     pub key: K,
@@ -32,84 +33,10 @@ pub struct BaseKv<K: PartialOrd, V> {
 
 pub mod io {
     use std::ops::{Deref, DerefMut};
-    use tokio::io::AsyncReadExt;
 
-    // The Curvine reader is much larger than the other variants, so box it
-    // instead of inflating every reader value.
-    pub enum PollReaderEnum {
-        Body(crate::http::axum::BodyReader),
-        File(tokio::fs::File),
-        InMemory(InMemoryPollReader),
-        BufCursor(tokio::io::BufReader<std::io::Cursor<Vec<u8>>>),
-        /// Object body staged in Curvine when distributed temp storage is on.
-        Curvine(Box<curvine_client::unified::UnifiedReader>),
-    }
-
-    impl PollReaderEnum {
-        #[inline]
-        pub async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
-            match self {
-                PollReaderEnum::Body(r) => r.poll_read_impl().await,
-                PollReaderEnum::File(f) => {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    match f.read(&mut buf).await {
-                        Ok(0) => Ok(None),
-                        Ok(n) => {
-                            buf.truncate(n);
-                            Ok(Some(buf))
-                        }
-                        Err(e) => Err(e.to_string()),
-                    }
-                }
-                PollReaderEnum::InMemory(r) => r.poll_read_impl().await,
-                PollReaderEnum::BufCursor(r) => {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    match r.read(&mut buf).await {
-                        Ok(0) => Ok(None),
-                        Ok(n) => {
-                            buf.truncate(n);
-                            Ok(Some(buf))
-                        }
-                        Err(e) => Err(e.to_string()),
-                    }
-                }
-                PollReaderEnum::Curvine(r) => {
-                    use curvine_fs_api::Reader;
-                    let mut buf = vec![0u8; 64 * 1024];
-                    match r.read(&mut buf).await {
-                        Ok(0) => Ok(None),
-                        Ok(n) => {
-                            buf.truncate(n);
-                            Ok(Some(buf))
-                        }
-                        Err(e) => Err(e.to_string()),
-                    }
-                }
-            }
-        }
-    }
-
-    pub struct InMemoryPollReader {
-        pub data: Vec<u8>,
-        pub offset: usize,
-    }
-
-    impl InMemoryPollReader {
-        pub fn new(data: Vec<u8>) -> Self {
-            Self { data, offset: 0 }
-        }
-
-        #[inline]
-        pub async fn poll_read_impl(&mut self) -> Result<Option<Vec<u8>>, String> {
-            if self.offset >= self.data.len() {
-                return Ok(None);
-            }
-            let chunk_size = std::cmp::min(64 * 1024, self.data.len() - self.offset);
-            let chunk = self.data[self.offset..self.offset + chunk_size].to_vec();
-            self.offset += chunk_size;
-            Ok(Some(chunk))
-        }
-    }
+    // A request body is the only reader form; staged-file and in-memory
+    // variants were removed with the gateway temp-storage upload paths.
+    pub type PollReaderEnum = Box<dyn PollRead + Send>;
 
     pub enum PollWriterEnum<'a> {
         VecBuf(&'a mut Vec<u8>),
@@ -132,14 +59,7 @@ pub mod io {
         }
     }
 
-    /// Legacy trait for async reading - uses async_trait for object safety
-    ///
-    /// **Prefer `PollReaderEnum` for new code** - provides zero-allocation dispatch.
-    /// This trait is kept for backward compatibility with `dyn PollRead` usage.
-    ///
-    /// The reason we still use async_trait here is to maintain compatibility with
-    /// `dyn PollRead` usage in some places, which requires object safety.
-    /// async_trait provides this object safety by generating a vtable at compile time.
+    /// Async reading trait kept object-safe for streamed request bodies.
     #[async_trait::async_trait]
     pub trait PollRead: Send {
         async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String>;

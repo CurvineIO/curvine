@@ -259,6 +259,21 @@ attr_timeout = "1s"       # kernel attribute cache; 0 disables it
 entry_timeout = "1s"      # kernel dentry (name lookup) cache; 0 disables it
 negative_timeout = 0      # negative-lookup (ENOENT) cache; 0 = disabled
 
+# User-side metadata cache: the inode/status copies curvine-fuse keeps for
+# itself. Both keys are optional (tri-state): omitted = derive from the kernel
+# timers above, set = override.
+#   enable_meta_cache  omitted -> enabled iff the effective window is non-zero
+#   meta_cache_timeout omitted -> follows attr_timeout; 0 disables the window
+# Name lookups are skipped when entry_timeout = 0, because the kernel asks on
+# every lookup there; otherwise they reuse the window above. The userspace
+# window is independent of the kernel TTLs and may be longer than
+# entry_timeout; freshness is enforced by cache invalidation, not by clamping
+# the window to the kernel timers.
+# A window longer than attr_timeout may serve metadata the kernel has already
+# dropped, so mount and validate-config warn instead of rejecting it.
+# enable_meta_cache = true
+# meta_cache_timeout = "1s"
+
 # Route unlink/rmdir through the master's async delete lane: the name leaves the
 # namespace immediately and the master reclaims the blocks in the background
 # through /.Trash/.pending (see master.trash_purge_interval). Off by default

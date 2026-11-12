@@ -256,8 +256,11 @@ impl PutOperation {
         .await;
 
         if result.is_err() {
-            // Best effort: the staging object may not exist if create failed.
-            if let Err(e) = context.fs.delete(&staging, false).await {
+            // Staging is internal state, never user data: purge it instead of
+            // parking it in `/.Trash`, where it would be retained for
+            // `trash_retention` and let a client pin rejected bodies. Best
+            // effort: the staging object may not exist if create failed.
+            if let Err(e) = context.fs.delete_with_opts(&staging, false, true).await {
                 tracing::warn!("Failed to remove staging object {staging}: {e}");
             }
         }
@@ -312,7 +315,7 @@ impl PutOperation {
         if let Some(expected) = expect_length {
             if stats.total_written as usize != expected {
                 let _ = writer.cancel().await;
-                let _ = context.fs.delete(staging, false).await;
+                let _ = context.fs.delete_with_opts(staging, false, true).await;
                 return Err(format!(
                     "ContentLengthMismatch: received {} of {} bytes",
                     stats.total_written, expected
@@ -326,7 +329,7 @@ impl PutOperation {
         // Attach the S3 metadata while the object is still staging, so the
         // rename below publishes body and metadata together.
         if let Err(e) = metadata.write_to(&context.fs, staging, &digest).await {
-            let _ = context.fs.delete(staging, false).await;
+            let _ = context.fs.delete_with_opts(staging, false, true).await;
             return Err(e);
         }
 

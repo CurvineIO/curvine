@@ -114,6 +114,7 @@ impl S3ErrorCode {
             | Self::MissingRequestBodyError
             | Self::InvalidPart
             | Self::InvalidPartOrder
+            | Self::EntityTooSmall
             | Self::KeyTooLongError => StatusCode::BAD_REQUEST,
 
             // 416 Range Not Satisfiable
@@ -137,7 +138,7 @@ impl S3ErrorCode {
             Self::ServiceUnavailable | Self::SlowDown => StatusCode::SERVICE_UNAVAILABLE,
 
             // 500 Internal Server Error (default)
-            Self::InternalError | Self::EntityTooSmall => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -273,3 +274,35 @@ macro_rules! s3_error {
 }
 
 pub use s3_error;
+
+#[cfg(test)]
+mod status_tests {
+    use super::S3ErrorCode;
+
+    /// Every multipart validation failure is a client error. Answering 500 made
+    /// SDKs retry a Complete request that can never succeed.
+    #[test]
+    fn multipart_validation_errors_are_client_errors() {
+        for code in [
+            S3ErrorCode::InvalidPart,
+            S3ErrorCode::InvalidPartOrder,
+            S3ErrorCode::EntityTooSmall,
+            S3ErrorCode::InvalidArgument,
+        ] {
+            assert_eq!(
+                code.status_code(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{} must answer 400",
+                code.as_str()
+            );
+        }
+        assert_eq!(
+            S3ErrorCode::NoSuchUpload.status_code(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            S3ErrorCode::InternalError.status_code(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+}

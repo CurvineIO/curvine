@@ -50,6 +50,8 @@ pub struct MountCommand {
     #[arg(long = "read-verify-ufs", default_value_t = false)]
     read_verify_ufs: bool,
 
+    /// Lifetime of cached data, such as 1h or 7d. 0 means cached data never expires.
+    /// Independent of --auto-cache.
     #[arg(long, default_value = "7d")]
     ttl_ms: String,
 
@@ -77,7 +79,7 @@ pub struct MountCommand {
 
     #[arg(
         long,
-        help = "Whether to automatically submit a cache job on cache miss or invalid cache. Values: true, false. Default for new mounts: true."
+        help = "Whether to automatically submit a cache job on cache miss or invalid cache. Independent of --ttl-ms. Values: true, false. Default for new mounts: true."
     )]
     auto_cache: Option<bool>,
 
@@ -660,8 +662,43 @@ fn s3_uses_environment_credential(properties: &HashMap<String, String>) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::{display_config_value, is_sensitive_config_key, s3_uses_environment_credential};
+    use super::{
+        display_config_value, is_sensitive_config_key, s3_uses_environment_credential, MountCommand,
+    };
+    use clap::Parser;
+    use curvine_model::MountInfo;
     use std::collections::HashMap;
+
+    fn parse_mount_info(args: &[&str]) -> MountInfo {
+        let cmd = MountCommand::try_parse_from(
+            ["mount", "s3://bucket/data", "/data"]
+                .iter()
+                .chain(args.iter()),
+        )
+        .unwrap();
+        cmd.to_mnt_opts()
+            .unwrap()
+            .to_info(1, &cmd.cv_path, &cmd.ufs_path)
+    }
+
+    #[test]
+    fn ttl_ms_zero_does_not_disable_auto_cache() {
+        let info = parse_mount_info(&["--ttl-ms", "0"]);
+        assert_eq!(info.ttl_ms, 0);
+        assert!(info.auto_cache());
+
+        let info = parse_mount_info(&["--ttl-ms", "0", "--auto-cache", "true"]);
+        assert_eq!(info.ttl_ms, 0);
+        assert!(info.auto_cache());
+
+        let info = parse_mount_info(&["--ttl-ms", "0", "--auto-cache", "false"]);
+        assert_eq!(info.ttl_ms, 0);
+        assert!(!info.auto_cache());
+
+        let info = parse_mount_info(&["--ttl-ms", "7d", "--auto-cache", "false"]);
+        assert_eq!(info.ttl_ms, 7 * 24 * 60 * 60 * 1000);
+        assert!(!info.auto_cache());
+    }
 
     #[test]
     fn new_credential_keys_are_masked() {
