@@ -103,9 +103,9 @@ enum ShardedOutcome<R> {
 #[path = "master_filesystem/tests/memory_read_gates.rs"]
 pub(crate) mod memory_read_gates;
 
-/// Confirmation-window guard for the exclusive path: armed right after the
-/// cold owner is released, disarmed when `scope.wait` reports the real
-/// apply/cursor ack. On a confirmation error — or if the wait panics while
+/// Confirmation-window guard for the exclusive path: armed while the cold
+/// owner is still dropping (before the confirmation wait), disarmed only
+/// when `scope.wait` reports the real apply/cursor ack. On a confirmation error — or if the wait panics while
 /// armed — the namespace holder goes terminal before the exclusive gate
 /// guard is released. Single-purpose for this one call site.
 struct ExclusiveConfirmation<'a> {
@@ -114,8 +114,6 @@ struct ExclusiveConfirmation<'a> {
 }
 
 impl ExclusiveConfirmation<'_> {
-    fn arm(&mut self) {}
-
     fn disarm(&mut self) {
         self.handle = None;
     }
@@ -498,10 +496,10 @@ impl MasterFilesystem {
     /// returns `ShardedOutcome::Fallback` at its side-effect-free global-lock
     /// planning point; the original epoch is captured up front, the normal
     /// slot/view/locks are fully released, and `cold_body` then runs exactly
-    /// once against the exclusive owner's `&mut FsDir` (gate closed, cold
-    /// across body + scope.wait, original epoch re-verified with the original
-    /// ensure_metadata_epoch error, failure_seq honored, snapshot after gate
-    /// release).
+    /// once against the exclusive owner's `&mut FsDir` (gate closed and held
+    /// across the real confirmation, cold covering the body only, original
+    /// epoch re-verified with the original ensure_metadata_epoch error,
+    /// failure_seq honored, snapshot after gate release).
     pub(crate) fn run_metadata_write_with_fallback<R>(
         &self,
         hot: impl FnOnce() -> FsResult<ShardedOutcome<R>>,
@@ -592,7 +590,12 @@ impl MasterFilesystem {
                 // applier can take the view to advance the real ack.
                 drop(cold);
                 let commit = scope.wait();
-                confirmation.disarm();
+                // Only a confirmed wait disarms the guard; a confirmation
+                // error stays armed so the Drop below goes terminal before
+                // the gate opens.
+                if commit.is_ok() {
+                    confirmation.disarm();
+                }
                 drop(confirmation);
                 match (result, commit) {
                     (Ok(value), Ok(())) => {

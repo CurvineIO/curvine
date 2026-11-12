@@ -1,6 +1,7 @@
 use super::{
     CommitScopeEntry, JournalCommitScope, JournalWriter, RecoveryGate, JOURNAL_COMMIT_SCOPES,
 };
+use crate::master::journal::JournalSystem;
 use crate::master::Master;
 use curvine_config::{ClusterConf, JournalConf};
 use curvine_raft::raft::RaftClient;
@@ -160,4 +161,85 @@ fn rejected_post_mutation_enqueue_enters_safe_mode() {
     ));
     assert!(result.is_err());
     assert!(writer.recovery.is_safe_mode());
+}
+
+#[test]
+fn real_commit_failure_fails_the_exclusive_holder_closed() {
+    use crate::master::fs::DeleteMode;
+
+    // A real JournalSystem with an enabled journal: the writer thread runs,
+    // but the RaftClient has no raft node, so the proposal fails and the
+    // queued completion is dropped — the exclusive path's confirmation wait
+    // then fails for real.
+    Master::init_test_metrics();
+    // conf.testing must stay false so the writer requires real commit
+    // receipts (require_raft_commit = !testing); the meta dir is pinned to a
+    // unique temp path instead.
+    let mut conf = ClusterConf {
+        testing: false,
+        format_master: true,
+        journal: JournalConf {
+            enable: true,
+            writer_channel_size: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    conf.master.trash_enabled = true;
+    conf.master.meta_dir = std::env::temp_dir()
+        .join(format!(
+            "curvine-receipt-fail-meta-{}",
+            curvine_runtime::common::Utils::rand_str(8)
+        ))
+        .to_str()
+        .unwrap()
+        .to_string();
+    conf.journal.journal_dir = std::env::temp_dir()
+        .join(format!(
+            "curvine-receipt-fail-journal-{}",
+            curvine_runtime::common::Utils::rand_str(8)
+        ))
+        .to_str()
+        .unwrap()
+        .to_string();
+    let journal = JournalSystem::from_conf(&conf).unwrap();
+    let fs = journal.fs();
+    assert!(
+        fs.journal_writer.require_raft_commit,
+        "the writer must require real commit receipts"
+    );
+    fs.master_monitor
+        .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+
+    // The very first write already hits the real propose failure.
+    let create_result = fs.create("/dir/file", true);
+    // A recursive delete plans through the exclusive path (cold bridge): the
+    // confirmation is what fails for real here.
+    let delete_result = fs.delete("/dir", true);
+
+    // The proposal failed for real; the queued completion was dropped and the
+    // exclusive confirmation errored. The holder must be terminal.
+    assert!(
+        fs.fs_dir.is_failed(),
+        "a real confirmation failure must fail the exclusive holder closed"
+    );
+    // Preserve the real business errors (returned after the terminal check).
+    assert!(
+        create_result.is_err(),
+        "the create must surface the real confirmation error"
+    );
+    assert!(
+        delete_result.is_err(),
+        "the delete must surface the real confirmation error"
+    );
+    let view_err = fs.fs_dir.view().err();
+    assert!(
+        matches!(
+            view_err,
+            Some(crate::master::meta::NamespaceError::Unavailable)
+        ),
+        "the view must be Unavailable after the terminal failure, got {view_err:?}"
+    );
+
+    journal.shutdown();
 }
