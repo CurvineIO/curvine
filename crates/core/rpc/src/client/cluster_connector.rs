@@ -509,10 +509,20 @@ impl ClusterConnector {
         // At this time, the server may be performing the master selection operation, and it is not advisable to fail directly to return.
         self.change_leader(Self::DEFAULT_LEADER_ID);
         while policy.attempt().await {
+            // A zero retry budget still owes the caller one polling round at the
+            // per-attempt timeout: `TimeBondedRetry::attempt()` returns true on
+            // the first call, and a healthy node must be reachable in that
+            // single attempt. Only a budget that has actually been spent (or a
+            // zero `rpc_timeout`) stops the loop.
             let attempt_timeout = self.rpc_timeout.min(policy.remaining());
-            if attempt_timeout.is_zero() {
+            if attempt_timeout.is_zero() && policy.remaining().is_zero() {
                 break;
             }
+            let attempt_timeout = if attempt_timeout.is_zero() {
+                self.rpc_timeout
+            } else {
+                attempt_timeout
+            };
 
             // Membership can change while a request is retrying. Re-read the
             // complete snapshot for each attempt so a watch update takes effect
