@@ -86,6 +86,11 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
     // queued receipt.
     // Pre-operation opaque cursor handle: saved before the operation spawns.
     let pre_cursor = fs.fs_dir.view().unwrap().store.cursor_store();
+    let pre_cursor_probe = pre_cursor.get_applied_req(77);
+    assert!(
+        matches!(&pre_cursor_probe, Ok(None)),
+        "the live cursor must answer point lookups, got {pre_cursor_probe:?}"
+    );
     let worker_fs = fs.clone();
     let (delete_started_tx, delete_started_rx) = mpsc::channel();
     let (delete_done_tx, delete_done_rx) = mpsc::channel();
