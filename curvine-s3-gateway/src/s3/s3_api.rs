@@ -2128,6 +2128,14 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         404
     } else if err.starts_with("PreconditionFailed") {
         412
+    } else if err.starts_with("InvalidPart")
+        || err.starts_with("EntityTooSmall")
+        || err.starts_with("InvalidArgument")
+    {
+        // `InvalidPartOrder` shares the `InvalidPart` prefix. All of these are
+        // request errors; answering 500 would make clients retry a request that
+        // can never succeed.
+        400
     } else {
         500
     }
@@ -2399,6 +2407,26 @@ mod tests {
             );
         }
         assert_eq!(reject_streaming_part(&part_header("64", None)), Ok(()));
+    }
+
+    /// Complete reports protocol conditions as text; without these mappings an
+    /// invalid part list answered 500 and SDKs retried it forever.
+    #[test]
+    fn multipart_validation_errors_map_to_client_errors() {
+        for err in [
+            "InvalidPart: part 2 of upload u is not staged",
+            "InvalidPartOrder: part numbers must be strictly ascending (got 2 then 1)",
+            "EntityTooSmall: part 1 is 10 bytes, below the 5 MiB minimum for a non-final part",
+            "InvalidArgument: object keys may not start a segment with .curvine-s3-",
+        ] {
+            assert_eq!(status_for_error(err), 400, "{err}");
+        }
+        assert_eq!(
+            status_for_error("NoSuchUpload: upload u does not exist"),
+            404
+        );
+        assert_eq!(status_for_error("PreconditionFailed: nope"), 412);
+        assert_eq!(status_for_error("Failed to write to destination: io"), 500);
     }
 
     #[test]
