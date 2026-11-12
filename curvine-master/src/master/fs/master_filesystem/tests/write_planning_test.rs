@@ -58,14 +58,48 @@ fn write_planning_walks_live_edges_and_keeps_partial_ids() {
 
 #[test]
 fn get_lock_rejects_the_pending_staging_namespace() {
-    let fs = test_fs("get-lock-pending");
+    Master::init_test_metrics();
+    let mut conf = ClusterConf::format();
+    conf.testing = true;
+    conf.journal.enable = false;
+    conf.master.trash_enabled = true;
+    conf.master.meta_dir = Utils::test_sub_dir(format!(
+        "master-fs-getlock-pending/meta-{}",
+        Utils::rand_str(6)
+    ));
+    conf.journal.journal_dir = Utils::test_sub_dir(format!(
+        "master-fs-getlock-pending/journal-{}",
+        Utils::rand_str(6)
+    ));
+    let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+    fs.master_monitor
+        .set_role_for_test(curvine_raft::raft::RoleState::Leader);
 
-    // The pending staging directory is not client-visible: the public entry
-    // must reject it with the same FileNotFound boundary as resolve_path,
-    // for both the locked path and the snapshot fallback.
-    let err = fs
-        .get_lock("/.Trash/.pending/1-2", FileLock::default())
-        .unwrap_err();
+    // Build a real pending entry through the trash flow: create, soft-delete,
+    // then claim it into /.Trash/.pending.
+    fs.create("/data/a.log", true).unwrap();
+    fs.delete_with_mode("/data/a.log", false, DeleteMode::Default)
+        .unwrap();
+    let entry = fs.list_trash().unwrap().remove(0);
+    let claimed = fs.claim_trash_entry_for_purge(&entry.path).unwrap();
+    assert!(claimed.is_some(), "the entry must be claimable");
+    let pending_path = trash::pending_entry_path(entry.path.rsplit('/').next().unwrap());
+
+    // The pending entry really exists and resolves internally.
+    let internal = InodePath::resolve(
+        fs.fs_dir.view().unwrap().root_node(),
+        &pending_path,
+        &fs.fs_dir.view().unwrap().store,
+    )
+    .unwrap();
+    assert!(
+        internal.get_last_inode().is_some() && internal.is_full(),
+        "the pending entry must exist internally"
+    );
+
+    // The public entry must reject it with the same FileNotFound boundary as
+    // resolve_path, for the locked path and the snapshot fallback alike.
+    let err = fs.get_lock(&pending_path, FileLock::default()).unwrap_err();
     assert!(
         matches!(err, FsError::FileNotFound(_)),
         "get_lock on a pending path must be FileNotFound, got {err:?}"

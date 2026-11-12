@@ -1819,6 +1819,31 @@ impl JournalLoader {
     /// (epoch + ID presence); only an invalid/absent ID falls back to the
     /// path-chain protocol. The path stays as request context — it is never
     /// used to pick the write target when an ID is available.
+    /// Runs one replay cold-bridge body against the exclusive owner with the
+    /// agreed failure boundary: a body error is failed-closed only when the
+    /// journal recorded a publication failure during it (failure_seq moved);
+    /// a pure validation/store error leaves the handle OPEN for normal
+    /// backfill via replay.
+    fn with_replay_cold<T>(&self, body: impl FnOnce(&mut FsDir) -> FsResult<T>) -> CommonResult<T> {
+        let mut cold = self
+            .fs_dir
+            .begin_cold(DEFAULT_COLD_TIMEOUT)
+            .map_err(|e| e.to_string())?;
+        let failure_seq_before = cold.journal_writer.failure_seq();
+        let result = body(&mut cold);
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if cold.journal_writer.failure_seq() != failure_seq_before {
+                    // A publication failure was recorded during the body: the
+                    // holder must be fenced, not just the writer.
+                    cold.fail_closed();
+                }
+                Err(error.into())
+            }
+        }
+    }
+
     fn with_locked_replay_inode<T>(
         &self,
         path: &str,
@@ -1917,11 +1942,7 @@ impl JournalLoader {
             entry.paths.len()
         );
 
-        let mut fs_dir = self
-            .fs_dir
-            .begin_cold(DEFAULT_COLD_TIMEOUT)
-            .map_err(|e| e.to_string())?;
-        let res = fs_dir.purge_paths(&entry.paths, entry.mtime)?;
+        let res = self.with_replay_cold(|fs_dir| fs_dir.purge_paths(&entry.paths, entry.mtime))?;
         debug!(
             "TrashPurge: entry={} removed inodes={} bytes={}",
             entry.entry, res.inodes, res.bytes
@@ -1941,7 +1962,6 @@ impl JournalLoader {
 
     fn mkdir(&self, entry: MkdirEntry) -> CommonResult<()> {
         let entry_path = entry.path.clone();
-        let entry_path = entry.path.clone();
         self.with_locked_replay_view(&entry_path, false, |view, inp| {
             let name = inp.name().to_string();
             let _ = view.add_last_inode(inp, InodeView::new_dir(name, entry.dir))?;
@@ -1950,7 +1970,6 @@ impl JournalLoader {
     }
 
     fn create_file(&self, entry: CreateFileEntry) -> CommonResult<()> {
-        let entry_path = entry.path.clone();
         let entry_path = entry.path.clone();
         self.with_locked_replay_view(&entry_path, false, |view, inp| {
             if inp.is_full() {
@@ -1964,7 +1983,6 @@ impl JournalLoader {
     }
 
     fn reopen_file(&self, entry: ReopenFileEntry) -> CommonResult<()> {
-        let entry_path = entry.path.clone();
         let entry_path = entry.path.clone();
         self.with_locked_replay_view(&entry_path, false, |view, inp| {
             let mut inode = match inp.get_last_inode() {
@@ -1984,7 +2002,6 @@ impl JournalLoader {
     }
 
     fn overwrite_file(&self, entry: OverWriteFileEntry) -> CommonResult<()> {
-        let entry_path = entry.path.clone();
         let entry_path = entry.path.clone();
         self.with_locked_replay_view(&entry_path, false, |view, inp| {
             let mut inode = match inp.get_last_inode() {
@@ -2153,18 +2170,15 @@ impl JournalLoader {
                 .unwrap_or(false)
         };
         if is_dir {
-            let mut fs_dir = self
-                .fs_dir
-                .begin_cold(DEFAULT_COLD_TIMEOUT)
-                .map_err(|e| e.to_string())?;
-            let view = fs_dir.view();
-            let inp = InodePath::resolve(view.root_node(), &entry_path, &view.store)?;
-            if inp.get_last_inode().is_none() {
-                warn!("Delete: path not found: {}", entry_path);
-                return Ok(());
-            }
-            fs_dir.view().unprotected_delete(&inp, entry.mtime)?;
-            return Ok(());
+            return self.with_replay_cold(|fs_dir| {
+                let inp = InodePath::resolve(fs_dir.root_node(), &entry_path, &fs_dir.store)?;
+                if inp.get_last_inode().is_none() {
+                    warn!("Delete: path not found: {}", entry_path);
+                    return Ok(());
+                }
+                fs_dir.unprotected_delete(&inp, entry.mtime)?;
+                Ok(())
+            });
         }
         self.with_locked_replay_view(&entry_path, true, |view, inp| {
             if inp.get_last_inode().is_none() {
@@ -2181,22 +2195,16 @@ impl JournalLoader {
         // stripe locks — replay falls back to begin_cold for correctness
         // until c-2 adds subtree lock planning.
         if entry.recursive {
-            let mut fs_dir = self
-                .fs_dir
-                .begin_cold(DEFAULT_COLD_TIMEOUT)
-                .map_err(|e| e.to_string())?;
-            let inp =
-                InodePath::resolve(fs_dir.view().root_node(), &entry.path, &fs_dir.view().store)?;
-            let Some(inode) = inp.get_last_inode() else {
-                warn!("Free: path not found: {:?}", entry);
-                return Ok(());
-            };
-            fs_dir
-                .view()
-                .unprotected_free(inode, entry.mtime, entry.recursive)?;
-            return Ok(());
+            return self.with_replay_cold(|fs_dir| {
+                let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
+                let Some(inode) = inp.get_last_inode() else {
+                    warn!("Free: path not found: {:?}", entry);
+                    return Ok(());
+                };
+                fs_dir.unprotected_free(inode, entry.mtime, entry.recursive)?;
+                Ok(())
+            });
         }
-        let entry_path = entry.path.clone();
         let entry_path = entry.path.clone();
         self.with_locked_replay_view(&entry_path, true, |view, inp| {
             let Some(inode) = inp.get_last_inode() else {
@@ -2226,23 +2234,19 @@ impl JournalLoader {
         // stripe locks — replay falls back to begin_cold until c-2 adds
         // subtree lock planning.
         if entry.opts.recursive {
-            let mut fs_dir = self
-                .fs_dir
-                .begin_cold(DEFAULT_COLD_TIMEOUT)
-                .map_err(|e| e.to_string())?;
-            let inp =
-                InodePath::resolve(fs_dir.view().root_node(), &entry.path, &fs_dir.view().store)?;
-            let last_inode = match inp.get_last_inode() {
-                Some(v) => v,
-                None => {
-                    warn!("SetAttr: path not found: {:?}", entry);
-                    return Ok(());
-                }
-            };
-            fs_dir.view().unprotected_set_attr(last_inode, entry.opts)?;
-            return Ok(());
+            return self.with_replay_cold(|fs_dir| {
+                let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
+                let last_inode = match inp.get_last_inode() {
+                    Some(v) => v,
+                    None => {
+                        warn!("SetAttr: path not found: {:?}", entry);
+                        return Ok(());
+                    }
+                };
+                fs_dir.unprotected_set_attr(last_inode, entry.opts)?;
+                Ok(())
+            });
         }
-        let entry_path = entry.path.clone();
         let entry_path = entry.path.clone();
         self.with_locked_replay_view(&entry_path, false, |view, inp| {
             let last_inode = match inp.get_last_inode() {

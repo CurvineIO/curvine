@@ -16,7 +16,7 @@
 //! `apply_entry` (the replay path, not the RPC layer).
 
 use super::*;
-use crate::master::journal::{AddBlockEntry, LinkEntry, RenameEntry};
+use crate::master::journal::{AddBlockEntry, DeleteEntry, LinkEntry, RenameEntry};
 use crate::master::meta::inode::InodeView;
 use crate::master::Master;
 use curvine_config::ClusterConf;
@@ -193,6 +193,135 @@ fn add_block_replay_locks_the_recorded_inode_not_the_current_path() -> FsResult<
         panic!("replacement must be a file");
     };
     assert!(rf.blocks.is_empty(), "the replacement must stay untouched");
+
+    drop(loader);
+    drop(fs);
+    js.shutdown();
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn delete_dir_replay_via_cold_keeps_out_of_tree_alias() -> FsResult<()> {
+    let (conf, root) = tests::ignore_reply_error_conf("delete-dir-cold", true);
+    let js = JournalSystem::from_conf(&conf).unwrap();
+    let fs = js.fs();
+    let loader = js.journal_loader();
+
+    fs.mkdir("/dd/target", true).unwrap();
+    let file = fs.create("/dd/target/leaf", true).unwrap();
+    // Out-of-tree alias: the subtree DFS must decrement this hardlink without
+    // being excluded by the target-directory chain locks alone.
+    fs.link("/dd/target/leaf", "/keep").unwrap();
+
+    let entry = DeleteEntry {
+        op_id: 1,
+        rpc_id: 0,
+        path: "/dd/target".to_string(),
+        mtime: 5,
+    };
+
+    // Hold a namespace view: the directory replay must not start under it.
+    let held = fs.fs_dir.view().unwrap();
+    let loader2 = js.journal_loader();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let applier = std::thread::spawn(move || {
+        started_tx.send(()).expect("applier started channel");
+        tx.send(loader2.apply_entry(JournalEntry::Delete(entry)))
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("applier thread started");
+    // The cold bridge begins by begin_cold: wait until the applier is
+    // actually parked in the cold window (handle state COLD), which only
+    // happens while the view is still held.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !fs.fs_dir.is_cold() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        fs.fs_dir.is_cold(),
+        "directory replay must wait for the namespace view (cold window)"
+    );
+    drop(held);
+
+    let sent = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("replay must finish after the view is released");
+    applier.join().expect("applier thread must not panic");
+    sent.expect("directory delete replay must succeed");
+
+    // The subtree is gone; the out-of-tree alias keeps its id, nlink and data.
+    assert!(fs.file_status("/dd/target").is_err());
+    let alias = fs.file_status("/keep").unwrap();
+    assert_eq!(alias.id, file.id);
+    assert_eq!(alias.nlink, 1);
+    fs.restore_from_rocksdb().unwrap();
+    let alias = fs.file_status("/keep").unwrap();
+    assert_eq!(alias.id, file.id);
+    assert_eq!(alias.nlink, 1);
+
+    drop(loader);
+    drop(fs);
+    js.shutdown();
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn trash_purge_replay_publication_failure_fails_the_holder_closed() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+
+    let (conf, root) = tests::ignore_reply_error_conf("purge-replay-fail", true);
+    let js = JournalSystem::from_conf(&conf).unwrap();
+    let fs = js.fs();
+    let loader = js.journal_loader();
+
+    fs.create("/victim/a", true).unwrap();
+    fs.create("/victim/b", true).unwrap();
+    let batch = JournalEntry::TrashPurge(TrashPurgeEntry {
+        op_id: 1,
+        rpc_id: 0,
+        entry: "/victim".to_string(),
+        mtime: 5,
+        paths: vec!["/victim/a".to_string()],
+    });
+
+    let runtime = FaultRuntime::process();
+    let rule_id = "purge-replay-fail";
+    let rule = FaultRuleBuilder::named("master.metadata.purge.before_child_publication")
+        .matches("child_name", "a")
+        .unwrap()
+        .times(1)
+        .unwrap()
+        .return_error("injected replay purge publication failure")
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+
+    let result = loader.apply_entry(batch);
+    runtime.remove(rule_id).unwrap();
+
+    // The store committed the purge before the publication point, so the
+    // error is real and must fence the holder: is_failed now, and the view
+    // stays Unavailable afterwards.
+    assert!(
+        result.is_err(),
+        "the injected publication error must surface"
+    );
+    assert!(
+        fs.fs_dir.is_failed(),
+        "a publication failure during the cold body must fail the holder closed"
+    );
+    let view_err = fs.fs_dir.view().err();
+    assert!(
+        matches!(
+            view_err,
+            Some(crate::master::meta::NamespaceError::Unavailable)
+        ),
+        "the view must be Unavailable after fail_closed, got {view_err:?}"
+    );
 
     drop(loader);
     drop(fs);

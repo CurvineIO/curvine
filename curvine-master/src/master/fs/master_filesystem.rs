@@ -97,6 +97,12 @@ enum ShardedOutcome<R> {
     Fallback,
 }
 
+/// Test-only interleaving gate (see tests/memory_read_gates.rs); production
+/// code only reaches it behind #[cfg(test)].
+#[cfg(test)]
+#[path = "master_filesystem/tests/memory_read_gates.rs"]
+pub(crate) mod memory_read_gates;
+
 #[derive(Clone)]
 pub struct MasterFilesystem {
     pub fs_dir: Arc<FsDirHandle>,
@@ -177,56 +183,6 @@ impl MemoryReadPlan {
             && left.iter().zip(right.iter()).all(|((ln, le), (rn, re))| {
                 ln == rn && le.id() == re.id() && le.is_dir() == re.is_dir()
             })
-    }
-}
-
-/// Test-only gate that parks a memory-read thread inside its locked window
-/// until the driving test releases it, so lock-window tests confirm entry
-/// and writer arrival instead of racing a fixed sleep.
-#[cfg(test)]
-pub(crate) mod memory_read_gates {
-    use parking_lot::Mutex;
-    use std::collections::HashMap;
-    use std::sync::mpsc::{channel, Receiver, Sender};
-    use std::sync::LazyLock;
-    use std::time::Duration;
-
-    type GateEntry = (Receiver<()>, Option<Sender<()>>);
-
-    static GATES: LazyLock<Mutex<HashMap<String, GateEntry>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-
-    /// Registers a release channel for `point`; returns the release handle.
-    #[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
-    pub fn install(point: &str) -> Sender<()> {
-        let (sender, receiver) = channel();
-        GATES.lock().insert(point.to_string(), (receiver, None));
-        sender
-    }
-
-    /// Like [`install`], but also returns a channel that fires when the
-    /// worker actually reached the gate, so a test can confirm the
-    /// interleaving before acting instead of racing a sleep.
-    #[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
-    pub fn install_with_entered(point: &str) -> (Sender<()>, Receiver<()>) {
-        let (release_tx, release_rx) = channel();
-        let (entered_tx, entered_rx) = channel();
-        GATES
-            .lock()
-            .insert(point.to_string(), (release_rx, Some(entered_tx)));
-        (release_tx, entered_rx)
-    }
-
-    /// Blocks the caller until the gate is released or the safety timeout
-    /// expires, so a failing test can never hang the suite.
-    pub fn park(point: &str, timeout: Duration) {
-        let entry: Option<GateEntry> = GATES.lock().remove(point);
-        if let Some((receiver, entered)) = entry {
-            if let Some(entered) = entered {
-                let _ = entered.send(());
-            }
-            let _ = receiver.recv_timeout(timeout);
-        }
     }
 }
 
@@ -2437,20 +2393,21 @@ impl MasterFilesystem {
 
     /// State Free reconciliation needs for one file, read under one lock.
     pub fn fs_mode_snapshot(&self, inode_id: i64) -> FsResult<Option<FsModeSnapshot>> {
-        let mut fs_dir = self.cold_acquire_wait()?;
-        // Shared fs_dir readers include sharded writers; exclude them while
-        // resolving raw pointers and collecting the verification fields.
-
-        let path = match fs_dir.get_inode_path(inode_id) {
+        // The returned DTO only needs one consistent read of the inode row and
+        // its path identity: a shared-view snapshot covers both without
+        // draining the namespace per reconciled file.
+        let fs_dir = self.fs_dir.view()?;
+        let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+        let path = match FsDir::inode_path_in_snapshot(&snapshot, inode_id) {
             Ok(path) => path,
             Err(FsError::FileNotFound(_)) => return Ok(None),
             Err(err) => return Err(err),
         };
-        let inp = Self::resolve_path(&fs_dir, &path)?;
-        let Some(inode) = inp.get_last_inode() else {
+        let resolved = snapshot.resolve_path(&path)?;
+        let Some(inode) = resolved.target() else {
             return Ok(None);
         };
-        let InodeView::File(file) = inode.as_ref() else {
+        let InodeView::File(file) = &inode else {
             return Ok(None);
         };
         if file.id != inode_id {
@@ -4094,9 +4051,45 @@ impl MasterFilesystem {
         let (blocks, needs_touch, inode_id, restore_epoch) = match result {
             Some(result) => result,
             None => {
-                let fs_dir = self.cold_acquire_wait()?;
-                let inp = Self::resolve_path(&fs_dir, path)?;
-                read(&fs_dir, &inp)?
+                // Missing path or bounded retries exhausted: fall back to one
+                // consistent store snapshot (path, inode payload and block
+                // locations from the same read) instead of draining the whole
+                // namespace for a plain single-file read.
+                let fs_dir = self.fs_dir.view()?;
+                let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+                let resolved = snapshot.resolve_path(path)?;
+                let inode = resolved
+                    .target()
+                    .ok_or_else(|| FsError::file_not_found(path))?;
+                let needs_touch = inode.is_file() && Self::atime_refresh_due(&inode);
+                let inode_id = inode.id();
+                let file = inode.as_file_ref()?;
+                let mut block_locs = Vec::with_capacity(file.blocks.len());
+                for meta in &file.blocks {
+                    let extend_block = ExtendedBlock {
+                        id: meta.id,
+                        len: meta.len(),
+                        storage_type: file.storage_policy.storage_type,
+                        file_type: file.file_type,
+                        alloc_opts: meta.alloc_opts.clone(),
+                    };
+                    let locs = snapshot.get_block_locations(meta.id)?;
+                    let lc = try_option!(
+                        (!locs.is_empty()).then_some(locs),
+                        "File {}, block {} Lost (no worker can read)",
+                        path,
+                        meta.id
+                    );
+                    let wm = self.worker_manager.read();
+                    let lb = wm.create_locate_block(path, extend_block, &lc)?;
+                    block_locs.push(lb);
+                }
+                let blocks = FileBlocks {
+                    status: inode.to_file_status(path)?,
+                    block_locs,
+                };
+                let epoch = fs_dir.store_ref().scan_control().cancel_epoch();
+                (blocks, needs_touch, inode_id, epoch)
             }
         };
 
@@ -4232,14 +4225,23 @@ impl MasterFilesystem {
         let (status, block_snapshots, worker_snapshots) = {
             // The snapshot includes mutable inode content; exclude sharded
             // writers until it has the same inode-lock protocol as block reads.
-            let fs_dir = self.cold_acquire_wait()?;
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            let inode = match inp.get_last_inode() {
+            // One consistent store snapshot covers path, inode and location
+            // rows; a low-frequency single-file detail read does not need to
+            // drain the namespace. The evictor access hint still fires once.
+            let fs_dir = self.fs_dir.view()?;
+            let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+            let resolved = snapshot.resolve_path(path)?;
+            let inode = match resolved.target() {
                 Some(inode) => inode,
                 None => return err_ext!(FsError::file_not_found(path)),
             };
             let file = inode.as_file_ref()?;
-            let file_locs = fs_dir.get_file_locations(file)?;
+            let file_locs = {
+                let locs = snapshot.get_file_locations(file)?;
+                // Keep the original access hint: one notification per read.
+                fs_dir.evictor.on_access(file.id);
+                locs
+            };
             let status = inode.to_file_status(path)?;
             let mut offset = 0;
             let mut block_snapshots = Vec::with_capacity(file.blocks.len());

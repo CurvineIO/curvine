@@ -1797,6 +1797,45 @@ impl<'a> InodeStoreSnapshot<'a> {
         Ok(Some(inode))
     }
 
+    /// Point read of a block's locations within the same snapshot as inode
+    /// and path reads, so a fallback metadata read never pairs an old inode
+    /// with newer location rows.
+    pub fn get_block_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {
+        let prefix = RocksUtils::i64_to_bytes(block_id);
+        let iter = self
+            .snapshot
+            .prefix_scan(RocksInodeStore::CF_BLOCK, prefix)?;
+        let mut vec = Vec::with_capacity(8);
+        for item in iter {
+            let bytes = item?;
+            let location = MetadataCodec::decode::<BlockLocation>(&bytes.1)?;
+            vec.push(location);
+        }
+        Ok(vec)
+    }
+
+    /// Per-file location map from the same snapshot as the inode row, so a
+    /// fallback detail read never pairs an old inode with newer locations.
+    pub fn get_file_locations(
+        &self,
+        file: &InodeFile,
+    ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
+        if file.blocks.len() > 1 {
+            let ids = file.blocks.iter().map(|meta| meta.id);
+            let mut res = HashMap::with_capacity(file.blocks.len());
+            for id in ids {
+                res.insert(id, self.get_block_locations(id)?);
+            }
+            return Ok(res);
+        }
+        let mut res = HashMap::with_capacity(file.blocks.len());
+        for meta in &file.blocks {
+            let locs = self.get_block_locations(meta.id)?;
+            res.insert(meta.id, locs);
+        }
+        Ok(res)
+    }
+
     /// Scan the child edges of one parent directory within the snapshot.
     pub fn scan_children(&self, parent_id: i64) -> CommonResult<RocksIterator<'_>> {
         self.snapshot.prefix_scan(
