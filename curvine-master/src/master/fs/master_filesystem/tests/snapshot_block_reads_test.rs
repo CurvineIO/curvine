@@ -189,17 +189,36 @@ fn block_locations_snapshot_fallback_rejects_corrupt_non_tail_block() {
         tx.send(worker_fs.get_block_locations("/data/a.log"))
             .expect("result channel");
     });
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("worker started");
+    let started = started_rx.recv_timeout(std::time::Duration::from_secs(5));
     // Receive as a Result first: an old snapshot implementation could succeed
     // here, and the fixture must be torn down before any assertion.
-    let received = rx.recv_timeout(std::time::Duration::from_millis(500));
+    let received_500ms = rx.recv_timeout(std::time::Duration::from_millis(500));
+    let timely = received_500ms.is_ok();
     drop(held);
-    worker.join().expect("worker must not panic");
-    restore_live_edge(&fs, &inode_locks, owned);
-    // Bounded-timeliness assertion, after cleanup.
-    let received = received.expect("the fallback must not wait for a cold window");
+    // One bounded recovery window for the same worker, only when 500ms missed.
+    let received = match received_500ms {
+        Ok(result) => Ok(result),
+        Err(_) => rx.recv_timeout(std::time::Duration::from_secs(5)),
+    };
+    // The final observation decides the join: a worker that never reported a
+    // result is reported as a timeout and is neither joined nor restored,
+    // since it may still hold locks the restore would contend on.
+    let finished = received.is_ok();
+    let join_result = finished.then(|| worker.join());
+    if finished {
+        restore_live_edge(&fs, &inode_locks, owned);
+    }
+    // Assertions come after cleanup.
+    started.expect("worker must start within the bound");
+    assert!(timely, "the fallback must not wait for a cold window");
+    assert!(
+        finished,
+        "the worker must report a result within the recovery window; a stuck worker is not joined"
+    );
+    join_result
+        .expect("a finished worker must be joinable")
+        .expect("worker must not panic");
+    let received = received.expect("the worker must report a result");
     let err = received.unwrap_err();
     assert!(
         err.to_string().contains("block status abnormal"),
@@ -307,12 +326,25 @@ fn block_locations_snapshot_fallback_matches_the_live_result() {
     drop(held);
     // If the 500ms window missed, give the same worker one bounded recovery
     // window after the view is released (no unbounded join in between).
-    let received = received_500ms.or_else(|_| rx.recv_timeout(std::time::Duration::from_secs(5)));
-    let join_result = worker.join();
-    restore_live_edge(&fs, &inode_locks, owned);
-    // All assertions come after the fixture is fully torn down.
+    let received = match received_500ms {
+        Ok(result) => Ok(result),
+        Err(_) => rx.recv_timeout(std::time::Duration::from_secs(5)),
+    };
+    // The final observation decides the join: a worker that never reported a
+    // result is reported as a timeout and is neither joined nor restored,
+    // since it may still hold locks the restore would contend on.
+    let finished = received.is_ok();
+    let join_result = finished.then(|| worker.join());
+    if finished {
+        restore_live_edge(&fs, &inode_locks, owned);
+    }
+    // All assertions come after the fixture is torn down.
     started.expect("worker must start within the bound");
     assert!(timely, "the fallback must not wait for a cold window");
+    assert!(
+        finished,
+        "the worker must report a result within the recovery window; a stuck worker is not joined"
+    );
     let received = received.expect("the worker must report a result");
     let blocks = received.expect("the snapshot fallback must serve the store-resident file");
 
@@ -331,7 +363,9 @@ fn block_locations_snapshot_fallback_matches_the_live_result() {
             "each block must report the worker's full address"
         );
     }
-    join_result.expect("worker must not panic");
+    join_result
+        .expect("a finished worker must be joinable")
+        .expect("worker must not panic");
     // The hot path over the restored live edge agrees with the fallback:
     // same status id/len and the same block order with full addresses.
     let hot = fs.get_block_locations("/data/a.log").unwrap();
