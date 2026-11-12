@@ -419,59 +419,6 @@ impl LocalTempStorage {
         PartMeta::decode_trailer(&trailer)
     }
 
-    /// Stages a single-object body on local disk and returns the reader plus
-    /// the temp path to remove afterwards.
-    pub async fn stage_object<R: crate::utils::io::PollRead + Send>(
-        &self,
-        staging_id: &str,
-        body: &mut R,
-        expect: StageExpect<'_>,
-    ) -> Result<crate::utils::io::PollReaderEnum, String> {
-        use crate::utils::io::PollReaderEnum;
-        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-
-        let dir = format!("{}/{}", self.config.temp_dir, staging_id);
-        let path = format!("{}/body", dir);
-        create_private_dir(&dir).await?;
-
-        let mut file = open_private_writer(&path, true)
-            .await
-            .map_err(|e| format!("Failed to create staging file {}: {}", path, e))?;
-
-        let mut hasher = sha2::Sha256::new();
-        let mut staged: usize = 0;
-        while let Some(chunk) = body.poll_read().await? {
-            use sha2::Digest;
-            hasher.update(&chunk);
-            staged += chunk.len();
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| format!("Failed to stage body: {}", e))?;
-        }
-        file.flush()
-            .await
-            .map_err(|e| format!("Failed to flush staged body: {}", e))?;
-
-        use sha2::Digest;
-        expect.check(staged, &hex::encode(hasher.finalize()))?;
-
-        file.seek(std::io::SeekFrom::Start(0))
-            .await
-            .map_err(|e| format!("Failed to rewind staged body: {}", e))?;
-
-        Ok(PollReaderEnum::File(file))
-    }
-
-    /// Removes a staged single-object body.
-    pub async fn cleanup_object(&self, staging_id: &str) -> Result<(), String> {
-        let dir = format!("{}/{}", self.config.temp_dir, staging_id);
-        match tokio::fs::remove_dir_all(&dir).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("Failed to remove staging dir {}: {}", dir, e)),
-        }
-    }
-
     /// Whether an upload session exists.
     pub async fn upload_exists(&self, upload_id: &str) -> bool {
         tokio::fs::try_exists(self.dir_path(upload_id))
@@ -742,67 +689,6 @@ impl CurvineTempStorage {
         PartMeta::decode_xattr(&String::from_utf8_lossy(raw))
     }
 
-    /// Stages a single-object body in Curvine and returns a reader over it.
-    pub async fn stage_object<R: crate::utils::io::PollRead + Send>(
-        &self,
-        staging_id: &str,
-        body: &mut R,
-        expect: StageExpect<'_>,
-    ) -> Result<crate::utils::io::PollReaderEnum, String> {
-        use crate::utils::io::PollReaderEnum;
-        use sha2::Digest;
-
-        let path = Path::from_str(format!("{}/{}/body", self.config.temp_dir, staging_id))
-            .map_err(|e| format!("Invalid staging path: {}", e))?;
-        let mut writer = self
-            .fs
-            .create(&path, true)
-            .await
-            .map_err(|e| format!("Failed to create staging file in Curvine: {}", e))?;
-
-        let mut hasher = sha2::Sha256::new();
-        let mut staged: usize = 0;
-        while let Some(chunk) = body.poll_read().await? {
-            hasher.update(&chunk);
-            staged += chunk.len();
-            writer
-                .write(&chunk)
-                .await
-                .map_err(|e| format!("Failed to stage body in Curvine: {}", e))?;
-        }
-        writer
-            .complete()
-            .await
-            .map_err(|e| format!("Failed to complete staged body in Curvine: {}", e))?;
-
-        expect.check(staged, &hex::encode(hasher.finalize()))?;
-
-        let reader = self
-            .fs
-            .open(&path)
-            .await
-            .map_err(|e| format!("Failed to reopen staged body in Curvine: {}", e))?;
-        Ok(PollReaderEnum::Curvine(Box::new(reader)))
-    }
-
-    /// Removes a staged single-object body. Staging is internal state, so it
-    /// is purged permanently instead of being parked in `/.Trash`.
-    pub async fn cleanup_object(&self, staging_id: &str) -> Result<(), String> {
-        let path = Path::from_str(format!("{}/{}", self.config.temp_dir, staging_id))
-            .map_err(|e| format!("Invalid staging path: {}", e))?;
-        match self.fs.delete_with_opts(&path, true, true).await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("not found") || msg.contains("not exists") {
-                    Ok(())
-                } else {
-                    Err(format!("Failed to remove staging dir: {}", e))
-                }
-            }
-        }
-    }
-
     /// Whether an upload session exists.
     pub async fn upload_exists(&self, upload_id: &str) -> bool {
         match self.dir_path(upload_id) {
@@ -983,27 +869,6 @@ impl TempStorageEnum {
         match self {
             TempStorageEnum::Local(_) => "local",
             TempStorageEnum::Curvine(_) => "curvine",
-        }
-    }
-
-    /// Stages a single-object body in the configured temp storage.
-    pub async fn stage_object<R: crate::utils::io::PollRead + Send>(
-        &self,
-        staging_id: &str,
-        body: &mut R,
-        expect: StageExpect<'_>,
-    ) -> Result<crate::utils::io::PollReaderEnum, String> {
-        match self {
-            TempStorageEnum::Local(s) => s.stage_object(staging_id, body, expect).await,
-            TempStorageEnum::Curvine(s) => s.stage_object(staging_id, body, expect).await,
-        }
-    }
-
-    /// Removes a staged single-object body.
-    pub async fn cleanup_object(&self, staging_id: &str) -> Result<(), String> {
-        match self {
-            TempStorageEnum::Local(s) => s.cleanup_object(staging_id).await,
-            TempStorageEnum::Curvine(s) => s.cleanup_object(staging_id).await,
         }
     }
 
@@ -1543,25 +1408,6 @@ mod tests {
         let part = storage.part_path("upload-perm", 1);
         let part_mode = std::fs::metadata(&part).unwrap().permissions().mode() & 0o777;
         assert_eq!(part_mode, 0o600, "part file mode {part_mode:o}");
-
-        // The single-object staging body is the same kind of data.
-        let mut src = tokio::io::BufReader::new(Cursor::new(vec![2u8; 64]));
-        storage
-            .stage_object("stage-perm", &mut src, StageExpect::default())
-            .await
-            .unwrap();
-        let staged = format!("{}/stage-perm/body", temp_path);
-        let staged_mode = std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
-        assert_eq!(staged_mode, 0o600, "staged body mode {staged_mode:o}");
-        let staging_dir_mode = std::fs::metadata(format!("{}/stage-perm", temp_path))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            staging_dir_mode, 0o700,
-            "staging dir mode {staging_dir_mode:o}"
-        );
 
         storage.cleanup("upload-perm").await.unwrap();
         let _ = std::fs::remove_dir_all(&temp_path);

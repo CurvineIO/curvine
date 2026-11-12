@@ -90,7 +90,6 @@ pub trait GetObjectHandler: HeadHandler {
 
 extern crate serde;
 use serde::Serialize;
-use sha1::Digest;
 
 use crate::utils::io::PollWrite;
 
@@ -726,12 +725,6 @@ pub trait PutObjectHandler: Send + Sync {
         object: String,
         body: crate::utils::io::PollReaderEnum,
     ) -> impl std::future::Future<Output = Result<String, String>> + Send;
-
-    /// Temporary storage used to stage object bodies before Curvine sees them.
-    ///
-    /// Exposed instead of a bare directory path: with distributed temp storage
-    /// the staging area is a Curvine path, which `tokio::fs` cannot write.
-    fn temp_storage(&self) -> std::sync::Arc<crate::utils::temp_storage::TempStorageEnum>;
 }
 
 /// Parse bucket and object names from URL path for PUT operations
@@ -777,16 +770,17 @@ fn parse_put_object_path(url_path: &str) -> Result<(&str, &str), ()> {
 /// - `403 Forbidden`: Authentication failure
 /// - `405 Method Not Allowed`: Non-PUT request
 /// - `500 Internal Server Error`: Storage backend error
-pub async fn handle_put_object<
-    T: VRequest + BodyReader,
-    F: VResponse,
-    H: PutObjectHandler + Send + Sync,
->(
+pub async fn handle_put_object<T, F, H>(
     v4head: crate::auth::sig_v4::V4Head,
     req: T,
     resp: &mut F,
     handler: &H,
-) {
+) where
+    T: VRequest + BodyReader,
+    F: VResponse,
+    H: PutObjectHandler + Send + Sync,
+    <T as BodyReader>::BodyReader: 'static,
+{
     let _ = &v4head;
     if req.method() != "PUT" {
         resp.set_status(405);
@@ -900,7 +894,7 @@ pub async fn handle_put_object<
             return;
         }
     };
-    let mut r = match req.get_body_reader().await {
+    let r = match req.get_body_reader().await {
         Ok(val) => val,
         Err(err) => {
             log::error!(
@@ -912,126 +906,33 @@ pub async fn handle_put_object<
             return;
         }
     };
+    let expected_length = match opt.content_length {
+        Some(length) if length >= 0 => usize::try_from(length).ok().map(|value| value as u64),
+        Some(_) => {
+            log::warn!("invalid content length: {:?}", opt.content_length);
+            resp.set_status(400);
+            resp.send_header();
+            return;
+        }
+        None => None,
+    };
+
     let ret: Result<String, String> = match content_sha256 {
         ContentSha256::Hash(cs) => {
-            let content_length = match opt.content_length {
-                Some(val) => val as usize,
-                None => {
-                    log::error!("{}", curvine_core_error::err_msg!("Missing content length"));
-                    resp.set_status(404);
-                    resp.send_header();
-                    return;
-                }
+            let Some(expected_length) = expected_length else {
+                log::warn!("missing content length");
+                resp.set_status(400);
+                resp.send_header();
+                return;
             };
-            if content_length <= 10 << 20 {
-                match read_body_to_vec(r, &cs, content_length).await {
-                    Ok(vec) => {
-                        let reader = crate::utils::io::PollReaderEnum::InMemory(
-                            crate::utils::io::InMemoryPollReader::new(vec),
-                        );
-                        handler
-                            .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
-                            .await
-                    }
-                    Err(err) => {
-                        use crate::error::BodyParseError;
-                        match err {
-                            BodyParseError::HashMismatch => {
-                                log::warn!(
-                                    "{}",
-                                    curvine_core_error::err_msg!("Hash validation failed")
-                                );
-                                resp.set_status(400);
-                                resp.send_header();
-                                return;
-                            }
-                            BodyParseError::ContentLengthMismatch => {
-                                log::warn!(
-                                    "{}",
-                                    curvine_core_error::err_msg!("Content length mismatch")
-                                );
-                                resp.set_status(400);
-                                resp.send_header();
-                                return;
-                            }
-                            BodyParseError::InvalidEncoding(_) => {
-                                log::error!(
-                                    "{}",
-                                    curvine_core_error::err_msg!(
-                                        "Invalid content encoding: {}",
-                                        err
-                                    )
-                                );
-                                resp.set_status(400);
-                                resp.send_header();
-                                return;
-                            }
-                            BodyParseError::Io(_) => {
-                                log::error!(
-                                    "{}",
-                                    curvine_core_error::err_msg!(
-                                        "I/O error during body parsing: {}",
-                                        err
-                                    )
-                                );
-                                resp.set_status(500);
-                                resp.send_header();
-                                return;
-                            }
-                            BodyParseError::Unsupported(_) => {
-                                log::warn!(
-                                    "{}",
-                                    curvine_core_error::err_msg!(
-                                        "Unsupported body framing: {}",
-                                        err
-                                    )
-                                );
-                                resp.set_status(400);
-                                resp.send_header();
-                                return;
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Stage through the configured temp storage: with distributed
-                // staging the path lives in Curvine and `tokio::fs` cannot
-                // write it.
-                let storage = handler.temp_storage();
-                let staging_id = uuid::Uuid::new_v4().to_string();
-                let reader = match storage
-                    .stage_object(
-                        &staging_id,
-                        &mut r,
-                        crate::utils::temp_storage::StageExpect {
-                            sha256_hex: Some(&cs),
-                            content_length: Some(content_length),
-                        },
-                    )
-                    .await
-                {
-                    Ok(reader) => reader,
-                    Err(e) => {
-                        log::warn!("failed to stage PUT body: {e}");
-                        let _ = storage.cleanup_object(&staging_id).await;
-                        resp.set_status(if e.contains("does not match") {
-                            400
-                        } else {
-                            500
-                        });
-                        resp.send_header();
-                        return;
-                    }
-                };
-
-                let ret = handler
-                    .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
-                    .await;
-                if let Err(e) = storage.cleanup_object(&staging_id).await {
-                    log::warn!("failed to clean staging {staging_id}: {e}");
-                }
-                ret
-            }
+            let body = Box::new(crate::utils::verifying_reader::VerifyingReader::new(
+                r,
+                Some(cs),
+                Some(expected_length),
+            ));
+            handler
+                .handle(opt.clone(), bucket.to_string(), object.to_string(), body)
+                .await
         }
         ContentSha256::Streaming => {
             // Chunked SigV4 payloads are rejected earlier by `get_body_stream`;
@@ -1043,37 +944,14 @@ pub async fn handle_put_object<
             return;
         }
         ContentSha256::Unsigned => {
-            // No hash to verify, so the body can be staged through the
-            // configured temp storage (local or Curvine) and streamed to the
-            // handler; `tokio::fs` cannot address a Curvine staging path.
-            let storage = handler.temp_storage();
-            let staging_id = uuid::Uuid::new_v4().to_string();
-            let expect = crate::utils::temp_storage::StageExpect {
-                sha256_hex: None,
-                content_length: opt.content_length.and_then(|v| usize::try_from(v).ok()),
-            };
-            match storage.stage_object(&staging_id, &mut r, expect).await {
-                Ok(reader) => {
-                    let ret = handler
-                        .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
-                        .await;
-                    if let Err(e) = storage.cleanup_object(&staging_id).await {
-                        log::warn!("failed to clean staging {staging_id}: {e}");
-                    }
-                    ret
-                }
-                Err(e) => {
-                    log::warn!("failed to stage unsigned PUT body: {e}");
-                    let _ = storage.cleanup_object(&staging_id).await;
-                    resp.set_status(if e.contains("does not match") {
-                        400
-                    } else {
-                        500
-                    });
-                    resp.send_header();
-                    return;
-                }
-            }
+            let body = Box::new(crate::utils::verifying_reader::VerifyingReader::new(
+                r,
+                None,
+                expected_length,
+            ));
+            handler
+                .handle(opt.clone(), bucket.to_string(), object.to_string(), body)
+                .await
         }
     };
     match ret {
@@ -2128,6 +2006,8 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         404
     } else if err.starts_with("PreconditionFailed") {
         412
+    } else if err.starts_with("HashMismatch") || err.starts_with("ContentLengthMismatch") {
+        400
     } else if err.starts_with("InvalidPart")
         || err.starts_with("EntityTooSmall")
         || err.starts_with("InvalidArgument")
@@ -2140,9 +2020,6 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         500
     }
 }
-
-//utils
-pub use crate::error::BodyParseError as ParseBodyError;
 
 #[async_trait::async_trait]
 impl crate::utils::io::PollRead for tokio::io::BufReader<std::io::Cursor<Vec<u8>>> {
@@ -2175,59 +2052,6 @@ impl crate::utils::io::PollRead for tokio::fs::File {
         }
     }
 }
-// Helper: read entire body into Vec<u8> and verify sha256
-/// Core body reading and validation logic
-///
-/// This function provides the common logic for reading request bodies with
-/// SHA256 validation and content length checking.
-async fn read_and_validate_body<T>(
-    mut src: T,
-    expected_sha256: &str,
-    mut content_length: usize,
-) -> Result<(Vec<Vec<u8>>, sha2::digest::Output<sha2::Sha256>), ParseBodyError>
-where
-    T: crate::utils::io::PollRead + Send,
-{
-    use std::io::Write;
-    let mut hasher = sha2::Sha256::new();
-    let mut chunks = Vec::new();
-
-    while let Some(buff) = src.poll_read().await.map_err(ParseBodyError::Io)? {
-        let buff_len = buff.len();
-        if content_length < buff_len {
-            return Err(ParseBodyError::ContentLengthMismatch);
-        }
-        content_length -= buff_len;
-        let _ = hasher.write_all(&buff);
-        chunks.push(buff);
-    }
-
-    let hash_result = hasher.finalize();
-    let real_sha256 = hex::encode(hash_result);
-    if real_sha256.as_str() != expected_sha256 {
-        return Err(ParseBodyError::HashMismatch);
-    }
-
-    Ok((chunks, hash_result))
-}
-
-async fn read_body_to_vec<T: crate::utils::io::PollRead + Send>(
-    src: T,
-    expected_sha256: &str,
-    content_length: usize,
-) -> Result<Vec<u8>, ParseBodyError> {
-    let (chunks, _hash) = read_and_validate_body(src, expected_sha256, content_length).await?;
-
-    // Combine all chunks into a single Vec
-    let total_size = chunks.iter().map(|chunk| chunk.len()).sum();
-    let mut result = Vec::with_capacity(total_size);
-    for chunk in chunks {
-        result.extend_from_slice(&chunk);
-    }
-
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2426,6 +2250,22 @@ mod tests {
             404
         );
         assert_eq!(status_for_error("PreconditionFailed: nope"), 412);
+        assert_eq!(status_for_error("Failed to write to destination: io"), 500);
+    }
+
+    /// This arm is the only place a verification failure becomes the 400 that
+    /// #1990 requires; without it a rejected body is reported as 500.
+    #[test]
+    fn verification_failures_map_to_client_errors() {
+        assert_eq!(
+            status_for_error("HashMismatch: received aa, expected bb"),
+            400
+        );
+        assert_eq!(
+            status_for_error("ContentLengthMismatch: received 5 of 10 bytes (transport: eof)"),
+            400
+        );
+        // A genuine backend failure stays a server error.
         assert_eq!(status_for_error("Failed to write to destination: io"), 500);
     }
 
