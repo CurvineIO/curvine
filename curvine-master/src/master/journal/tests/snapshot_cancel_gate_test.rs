@@ -96,11 +96,15 @@ fn cancelling_the_caller_keeps_the_fence_until_the_snapshot_applies() {
 
     // Release the worker and let both the snapshot and the marker finish.
     drop(release);
-    let marker_result = runtime
+    // Three layers: timeout, the spawned task (Join/panic), the
+    // CallReceive transport, and finally the applied entry's own
+    // RaftResult — every layer must be checked.
+    let call_receive = runtime
         .block_on(async { tokio::time::timeout(Duration::from_secs(10), &mut marker).await })
         .expect("apply queue must resume after the snapshot completes")
         .expect("marker task must not panic");
-    marker_result.expect("the queued no-op must succeed after the snapshot");
+    let apply_result = call_receive.expect("the apply ack must be delivered");
+    apply_result.expect("the queued no-op must succeed after the snapshot");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while gate.try_enter().is_none() && Instant::now() < deadline {

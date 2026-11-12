@@ -293,11 +293,18 @@ fn build_located_blocks_reports_lost_blocks_like_the_live_path() {
 /// Removes the live child edge for `path` (a file under /data) while keeping
 /// the store row, forcing the public block-read to fall back to the store
 /// snapshot. Returns the owned inode view for restoration.
-fn hide_live_edge_for_snapshot_fallback(fs: &MasterFilesystem, name: &str) -> InodeView {
-    // Fixture-only live mutation: the shared-view guard below excludes sharded
-    // writers for the duration, and the public read runs after this guard is
-    // released, so no inode write lock is taken here (it would re-enter the
-    // same stripe the read later locks in this thread's debug checks).
+fn hide_live_edge_for_snapshot_fallback(
+    fs: &MasterFilesystem,
+    inode_locks: &InodeLockManager,
+    name: &str,
+) -> InodeView {
+    // Fixture-only live mutation under the parent's inode write lock. Every
+    // id is resolved before the lock: file_status inside the locked scope
+    // would take a read lock on the same stripe and trip the debug
+    // re-entrancy check.
+    let parent_id = fs.file_status("/data").unwrap().id;
+    let child_id = fs.file_status(&format!("/data/{name}")).unwrap().id;
+    let locks = inode_locks.write_inode(parent_id);
     let view = fs.fs_dir.view().unwrap();
     let root = view.root_node();
     let data_view = root
@@ -313,7 +320,7 @@ fn hide_live_edge_for_snapshot_fallback(fs: &MasterFilesystem, name: &str) -> In
         _ => panic!("data must be a directory"),
     };
     let owned = dir_node
-        .delete_child_edge(fs.file_status(&format!("/data/{name}")).unwrap().id, name)
+        .delete_child_edge(child_id, name)
         .expect("live edge must be removable");
     // Confirm the split: the live edge is gone, the store row remains.
     assert!(dir_node.children.get_child_edge(name).is_none());
@@ -323,10 +330,15 @@ fn hide_live_edge_for_snapshot_fallback(fs: &MasterFilesystem, name: &str) -> In
         assert!(resolved.target().is_some(), "the store row must remain");
     }
     drop(view);
+    drop(locks);
     owned
 }
 
-fn restore_live_edge(fs: &MasterFilesystem, owned: InodeView) {
+fn restore_live_edge(fs: &MasterFilesystem, inode_locks: &InodeLockManager, owned: InodeView) {
+    // Same pre-resolved id discipline: nothing inside the locked scope takes
+    // another inode lock.
+    let parent_id = fs.file_status("/data").unwrap().id;
+    let locks = inode_locks.write_inode(parent_id);
     let view = fs.fs_dir.view().unwrap();
     let root = view.root_node();
     let data_view = root
@@ -343,6 +355,7 @@ fn restore_live_edge(fs: &MasterFilesystem, owned: InodeView) {
     };
     dir_node.add_child_edge(owned).unwrap();
     drop(view);
+    drop(locks);
 }
 
 #[test]
@@ -412,15 +425,33 @@ fn block_locations_snapshot_fallback_rejects_corrupt_non_tail_block() {
         batch.commit().unwrap();
     }
 
-    let owned = hide_live_edge_for_snapshot_fallback(&fs, "a.log");
+    let inode_locks = fs.inode_locks_for_test();
+    let owned = hide_live_edge_for_snapshot_fallback(&fs, &inode_locks, "a.log");
     // Public entry, held shared view, store-only target: the fallback must
-    // run the shared builder's non-tail length check.
-    let err = fs.get_block_locations("/data/a.log").unwrap_err();
+    // run the shared builder's non-tail length check without any cold drain.
+    let held = fs.fs_dir.view().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel::<FsResult<FileBlocks>>();
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).expect("worker started channel");
+        tx.send(worker_fs.get_block_locations("/data/a.log"))
+            .expect("result channel");
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("worker started");
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_millis(500))
+        .expect("the fallback must not wait for a cold window");
+    worker.join().expect("worker must not panic");
+    let err = outcome.unwrap_err();
     assert!(
         err.to_string().contains("block status abnormal"),
         "the snapshot fallback must reject a corrupt non-tail block, got {err}"
     );
-    restore_live_edge(&fs, owned);
+    drop(held);
+    restore_live_edge(&fs, &inode_locks, owned);
     // The hot path over the restored live edge reports the same contract.
     let err = fs.get_block_locations("/data/a.log").unwrap_err();
     assert!(
@@ -497,11 +528,29 @@ fn block_locations_snapshot_fallback_matches_the_live_result() {
     };
     let live_status = fs.file_status("/data/a.log").unwrap();
 
-    let owned = hide_live_edge_for_snapshot_fallback(&fs, "a.log");
-    let blocks = fs
-        .get_block_locations("/data/a.log")
-        .expect("the snapshot fallback must serve the store-resident file");
-    restore_live_edge(&fs, owned);
+    let inode_locks = fs.inode_locks_for_test();
+    let owned = hide_live_edge_for_snapshot_fallback(&fs, &inode_locks, "a.log");
+    // Held shared view + bounded worker: the snapshot fallback must serve the
+    // store-resident file without any cold drain.
+    let held = fs.fs_dir.view().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel::<FsResult<FileBlocks>>();
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).expect("worker started channel");
+        tx.send(worker_fs.get_block_locations("/data/a.log"))
+            .expect("result channel");
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("worker started");
+    let blocks = rx
+        .recv_timeout(std::time::Duration::from_millis(500))
+        .expect("the fallback must not wait for a cold window");
+    worker.join().expect("worker must not panic");
+    let blocks = blocks.expect("the snapshot fallback must serve the store-resident file");
+    drop(held);
+    restore_live_edge(&fs, &inode_locks, owned);
 
     assert_eq!(blocks.status.id, file_id);
     assert_eq!(blocks.status.len, live_status.len);
