@@ -57,7 +57,7 @@ class S3TestClient:
             aws_access_key_id=config.access_key,
             aws_secret_access_key=config.secret_key,
             region_name=config.region,
-            config=Config(retries={'max_attempts': 1})
+            config=Config(signature_version='s3v4', retries={'max_attempts': 1})
         )
     
     def create_bucket(self) -> bool:
@@ -277,6 +277,30 @@ class S3BasicOperationsTest:
             self._record_test("List Objects", False)
             return False, []
     
+    def test_presigned_get(self) -> bool:
+        """#2093: a SigV4 presigned GET downloads the object; a tampered URL fails."""
+        import urllib.error
+        import urllib.request
+        s3, bucket, key = self.client.client, self.client.config.test_bucket, 'presigned.txt'
+        s3.put_object(Bucket=bucket, Key=key, Body=b'presigned body')
+        url = s3.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': key},
+                                        ExpiresIn=60)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def fetch(target):
+            try:
+                with opener.open(target, timeout=5) as response:
+                    return response.status, response.read()
+            except urllib.error.HTTPError as error:
+                return error.code, b''
+
+        # The URL is a bearer credential: never print it.
+        success = (fetch(url) == (200, b'presigned body')
+                   and fetch(url.replace(key, 'other.txt'))[0] == 403)
+        s3.delete_object(Bucket=bucket, Key=key)
+        self._record_test("Presigned GET (valid works, tampered rejected)", success)
+        return success
+
     def _record_test(self, test_name: str, success: bool):
         """Record test result"""
         self.test_results.append((test_name, success))
@@ -687,6 +711,9 @@ class ComprehensiveS3TestSuite:
         
         # A failed overwrite must not destroy the existing object
         if not basic_test.test_overwrite_is_atomic("overwrite-object"):
+            return False
+
+        if not basic_test.test_presigned_get():
             return False
 
         # Test list operations
