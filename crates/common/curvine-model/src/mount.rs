@@ -235,16 +235,13 @@ impl MountInfo {
         )
     }
 
+    /// Whether a cache miss should automatically submit a cache job.
+    ///
+    /// Controlled only by the `auto_cache` mount option. `ttl_ms` is the
+    /// lifetime of cached data and does not affect admission: `ttl_ms == 0`
+    /// means cached data never expires.
     pub fn auto_cache(&self) -> bool {
-        self.auto_cache && self.ttl_ms > 0
-    }
-
-    pub fn get_ttl(&self) -> Option<String> {
-        if self.auto_cache() {
-            None
-        } else {
-            Some(format!("{}s", self.ttl_ms / 1000))
-        }
+        self.auto_cache
     }
 
     pub fn get_ufs_path<P: CurvinePath>(&self, path: &P) -> CommonResult<P> {
@@ -710,6 +707,39 @@ mod tests {
                 .build(),
         );
         assert!(!merged.write_cache);
+    }
+
+    #[test]
+    fn test_auto_cache_is_independent_of_ttl() {
+        for (auto_cache, ttl_ms) in [(true, 0), (true, 60_000), (false, 0), (false, 60_000)] {
+            let info = MountOptions::builder()
+                .auto_cache(auto_cache)
+                .ttl_ms(ttl_ms)
+                .build()
+                .to_info(1, "/mnt", "s3://b");
+            assert_eq!(info.ttl_ms, ttl_ms);
+            assert_eq!(
+                info.auto_cache(),
+                auto_cache,
+                "auto_cache={auto_cache}, ttl_ms={ttl_ms}"
+            );
+
+            // Changing only the TTL of an existing mount keeps its auto-cache setting.
+            let new_ttl_ms = if ttl_ms == 0 { 60_000 } else { 0 };
+            let updated = info.merge_with(
+                MountOptions::builder()
+                    .update(true)
+                    .update_only_explicit()
+                    .ttl_ms(new_ttl_ms)
+                    .build(),
+            );
+            assert_eq!(updated.ttl_ms, new_ttl_ms);
+            assert_eq!(
+                updated.auto_cache(),
+                auto_cache,
+                "auto_cache={auto_cache}, updated ttl_ms={new_ttl_ms}"
+            );
+        }
     }
 
     #[test]

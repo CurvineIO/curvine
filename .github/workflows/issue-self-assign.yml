@@ -1,0 +1,113 @@
+# Let contributors assign or unassign themselves on an issue by commenting.
+#
+#   /assign    assign the issue to the commenter
+#   /unassign  remove the commenter from the issue's assignees
+#
+# issue_comment runs in the base repository context. This workflow never
+# checks out code and never interpolates comment text into a script.
+name: Issue Self Assign
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  self-assign:
+    # Cheap pre-filter so ordinary comments skip the job and never enter the
+    # concurrency group. contains() is case-insensitive; the script still
+    # requires the comment to be exactly the command.
+    if: >-
+      !github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot' &&
+      (contains(github.event.comment.body, '/assign') ||
+       contains(github.event.comment.body, '/unassign'))
+    # Serialize commands on the same issue so two people cannot claim it at once.
+    # queue: max keeps every pending command; the default replaces a pending run
+    # with the newest one.
+    concurrency:
+      group: issue-self-assign-${{ github.event.issue.number }}
+      cancel-in-progress: false
+      queue: max
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Handle /assign and /unassign
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const comment = context.payload.comment;
+            const issue_number = context.payload.issue.number;
+            const user = comment.user.login;
+
+            // The whole comment must be the command, so a sentence that merely
+            // mentions /assign does not trigger it.
+            const match = (comment.body || "").trim().match(/^\/(assign|unassign)$/i);
+            if (!match) {
+              core.info("Comment is not a self-assign command; skipping.");
+              return;
+            }
+            const command = match[1].toLowerCase();
+
+            const react = (content) =>
+              github.rest.reactions.createForIssueComment({
+                owner, repo, comment_id: comment.id, content,
+              });
+            const reply = (body) =>
+              github.rest.issues.createComment({ owner, repo, issue_number, body });
+
+            // Read the issue fresh; the event payload can be stale.
+            const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number });
+            const assignees = (issue.assignees || []).map((a) => a.login);
+            const isAssigned = assignees.some((a) => a.toLowerCase() === user.toLowerCase());
+
+            if (command === "unassign") {
+              if (!isAssigned) {
+                await reply(`@${user} you are not assigned to this issue.`);
+                return;
+              }
+              await github.rest.issues.removeAssignees({
+                owner, repo, issue_number, assignees: [user],
+              });
+              await react("+1");
+              return;
+            }
+
+            if (issue.state !== "open") {
+              await reply(`@${user} this issue is closed and cannot be assigned.`);
+              return;
+            }
+            if (isAssigned) {
+              await react("+1");
+              return;
+            }
+            if (assignees.length > 0) {
+              const owners = assignees.map((a) => `@${a}`).join(", ");
+              await reply(
+                `@${user} this issue is already assigned to ${owners}. ` +
+                "Please coordinate with them, or ask a maintainer to reassign it.",
+              );
+              return;
+            }
+
+            // The API ignores users it cannot assign instead of failing,
+            // so check the result.
+            const { data: updated } = await github.rest.issues.addAssignees({
+              owner, repo, issue_number, assignees: [user],
+            });
+            const ok = (updated.assignees || []).some(
+              (a) => a.login.toLowerCase() === user.toLowerCase(),
+            );
+            if (!ok) {
+              await reply(`@${user} GitHub did not allow assigning you. A maintainer will follow up.`);
+              core.warning(`Could not assign ${user} to #${issue_number}.`);
+              return;
+            }
+            await react("+1");
+            await reply(
+              `@${user} this issue is now assigned to you. ` +
+              "Comment `/unassign` if you can no longer work on it.",
+            );

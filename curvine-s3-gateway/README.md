@@ -77,10 +77,11 @@ S3 gateway supports configuration via Curvine cluster configuration file:
 listen = "0.0.0.0:9900"
 # S3 region identifier
 region = "us-east-1"
-# Staging directory for PUT bodies and multipart parts
+# Staging directory for multipart upload parts
 put_temp_dir = "/tmp/curvine-temp"
-# Body sizes kept in memory instead of staged to disk
+# Multipart part sizes kept in memory instead of written to the staging file
 put_memory_buffer_threshold = 1048576
+# Maximum buffer size used for multipart part staging
 put_max_memory_buffer = 16777216
 # Optional fixed credential pair (overrides the credential store)
 # access_key = "AKIA..."

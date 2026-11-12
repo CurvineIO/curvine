@@ -274,14 +274,6 @@ async fn sessions(
     Ok(Json(instance.fs.session_summary()?))
 }
 
-async fn workers1(
-    Extension(instance): Extension<Arc<MasterRouterHandler>>,
-) -> FsResult<Json<Vec<String>>> {
-    let fs = &instance.fs;
-    let wm = fs.worker_manager.read();
-    Ok(Json(wm.worker_list()))
-}
-
 impl RouterHandler for MasterRouterHandler {
     fn router(&self) -> Router {
         let instance = Arc::new(self.clone());
@@ -297,7 +289,6 @@ impl RouterHandler for MasterRouterHandler {
             .route("/add-dcm", get(add_dcm))
             .route("/get-dcm", get(get_dcm))
             .route("/remove-dcm", get(remove_dcm))
-            .route("/workers", get(workers1))
             .route("/api/sessions", get(sessions))
             .layer(Extension(instance));
 
