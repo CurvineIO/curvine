@@ -151,7 +151,19 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
         }
     }
 
-    let delete_done = delete_done_rx.recv_timeout(Duration::from_secs(10));
+    // Reuse the first probe if it already delivered the business result
+    // (Ok): no second recv. Only a first-probe Timeout goes to the final
+    // bounded wait; Disconnected stays as-is (the worker exited without
+    // sending).
+    let delete_done = match worker_probe {
+        Ok(result) => Ok(result),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            delete_done_rx.recv_timeout(Duration::from_secs(10))
+        }
+    };
     // Completed/Disconnected: safe to join. Timeout: report and skip join
     // and every teardown step that could wait on locks this worker holds.
     let completed = matches!(
@@ -223,7 +235,7 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
     );
     assert!(
         worker_still_pending,
-        "the delete must still be waiting for its confirmation, got {worker_probe:?}"
+        "the delete must still be waiting for its confirmation before the receipt was dropped"
     );
 
     let delete_err = delete_err.expect("the delete must finish once the confirmation fails");
