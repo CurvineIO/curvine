@@ -6,8 +6,11 @@
 //! tests interfere with each other when the lib suite runs with
 //! `--test-threads 8` (a record() rule counts another test's hook hits and a
 //! return_error rule fires on another test's operation). This harness runs
-//! each fault test in its own subprocess via `current_exe --exact`, reusing
-//! the established isolation pattern from meta/tests/block_lock_metrics_test.
+//! each fault test in its own subprocess by re-executing the lib test binary
+//! named by `CURVINE_LIB_TEST_BIN` with `--exact`, reusing the established
+//! isolation pattern from meta/tests/block_lock_metrics_test. The binary must
+//! be named explicitly: guessing it by mtime can silently pick the
+//! default-feature build, whose run then matches zero tests.
 //! The in-process tests keep their real multi-threaded interleavings and
 //! assertions; only the process boundary differs.
 
@@ -89,29 +92,48 @@ fn fault_tests_run_in_isolated_processes() {
         "CURVINE_LIB_TEST_BIN is not a file: {}",
         lib_exe.display()
     );
-    let log_dir = std::env::temp_dir().join("curvine-fault-isolated");
+    // Every run gets its own directory: a fixed path would let a second run
+    // overwrite the evidence of the first. pid + wall clock is enough to keep
+    // runs apart without adding a dependency.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let log_dir = std::env::temp_dir().join(format!(
+        "curvine-fault-isolated-{}-{stamp}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&log_dir).expect("create isolated fault log dir");
     let mut failures = Vec::new();
     let mut zero_test_runs = Vec::new();
     let mut wrong_shape = Vec::new();
+    let mut unparsable = Vec::new();
     for test in FAULT_TESTS {
         let output = std::process::Command::new(&lib_exe)
             .args(["--exact", test, "--nocapture", "--test-threads", "1"])
             .env(ENV_GUARD, "1")
             .output()
             .unwrap_or_else(|e| panic!("failed to spawn isolated run for {test}: {e}"));
-        // Persist the child's raw streams so a failure is diagnosable.
+        // Persist the child's raw streams so a failure is diagnosable. A save
+        // failure is itself a harness failure: silently dropping the evidence
+        // would leave an undiagnosable result.
         let safe_name = test.replace("::", "_");
-        let _ = std::fs::write(log_dir.join(format!("{safe_name}.stdout")), &output.stdout);
-        let _ = std::fs::write(log_dir.join(format!("{safe_name}.stderr")), &output.stderr);
+        let stdout_path = log_dir.join(format!("{safe_name}.stdout"));
+        let stderr_path = log_dir.join(format!("{safe_name}.stderr"));
+        std::fs::write(&stdout_path, &output.stdout).unwrap_or_else(|e| {
+            panic!("failed to save isolated run stdout to {}: {e}", stdout_path.display())
+        });
+        std::fs::write(&stderr_path, &output.stderr).unwrap_or_else(|e| {
+            panic!("failed to save isolated run stderr to {}: {e}", stderr_path.display())
+        });
         if !output.status.success() {
             failures.push((*test, output.status.code()));
             continue;
         }
         // Exactly one non-ignored test must have executed: the child's own
-        // summary line is authoritative.
-        // Parse only the libtest summary line so `--nocapture` output from
-        // the test itself cannot confuse the counters.
+        // summary line is authoritative. All three counters are mandatory -
+        // a missing or unparsable counter must not be read as zero, or an
+        // unexpected child output shape would pass silently.
         let stdout_text = String::from_utf8_lossy(&output.stdout);
         let summary = stdout_text
             .lines()
@@ -129,23 +151,29 @@ fn fault_tests_run_in_isolated_processes() {
                     })
                 })
         };
-        let passed = parse_count("passed").unwrap_or(0);
-        let failed = parse_count("failed").unwrap_or(usize::MAX);
-        let ignored = parse_count("ignored").unwrap_or(0);
-        if passed != 1 {
-            zero_test_runs.push(*test);
-        } else if ignored != 0 {
-            wrong_shape.push(*test);
-        } else if failed != 0 {
-            failures.push((*test, output.status.code()));
+        match (
+            parse_count("passed"),
+            parse_count("failed"),
+            parse_count("ignored"),
+        ) {
+            // The only accepted shape.
+            (Some(1), Some(0), Some(0)) => {}
+            (None, _, _) | (_, None, _) | (_, _, None) => {
+                unparsable.push((*test, summary.to_string()));
+            }
+            (Some(passed), _, _) if passed != 1 => zero_test_runs.push(*test),
+            (_, _, Some(ignored)) if ignored != 0 => wrong_shape.push(*test),
+            _ => failures.push((*test, output.status.code())),
         }
     }
     eprintln!(
-        "isolated fault harness: {} spawned, {} failures, {} zero-test, {} with-ignored, logs in {}",
+        "isolated fault harness: {} spawned, {} failures, {} zero-test, {} with-ignored, \
+         {} unparsable, logs in {}",
         FAULT_TESTS.len(),
         failures.len(),
         zero_test_runs.len(),
         wrong_shape.len(),
+        unparsable.len(),
         log_dir.display()
     );
     assert!(
@@ -159,6 +187,10 @@ fn fault_tests_run_in_isolated_processes() {
     assert!(
         wrong_shape.is_empty(),
         "isolated fault runs ignored tests: {wrong_shape:?}"
+    );
+    assert!(
+        unparsable.is_empty(),
+        "isolated fault runs had a missing or unparsable test-result summary: {unparsable:?}"
     );
     eprintln!(
         "isolated fault harness: {} tests spawned, {} failures",
