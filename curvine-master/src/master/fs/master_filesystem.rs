@@ -26,9 +26,8 @@ use crate::master::meta::inode::{
 use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::meta::{
     trash, BlockLocationLockManager, CacheInvalidationResult, ColdError, ColdFsDirGuard,
-    CommitGate, DirNode, FileSystemStats, FsDir, FsDirHandle, InodeId, InodeLockManager,
-    InodeLockMode, InodeLockRequest, InodeLockSet, NamespaceGuard, RestoredTrashEntry,
-    TrashListing, TrashScanPage,
+    CommitGate, FileSystemStats, FsDir, FsDirHandle, InodeId, InodeLockManager, InodeLockMode,
+    InodeLockRequest, InodeLockSet, RestoredTrashEntry, TrashListing, TrashScanPage,
 };
 
 use crate::master::fs::DeleteResult;
@@ -541,13 +540,10 @@ impl MasterFilesystem {
                 // Cold ownership spans f and scope.wait: the view borrow ends
                 // before the journal wait so the applier is never blocked on
                 // the cold handle during publication.
-                let mut cold = match self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT) {
-                    Ok(guard) => guard,
-                    Err(ColdError::Busy) => {
-                        continue;
-                    }
-                    Err(e) => return Err(e.into()),
-                };
+                // A held owner (a legitimate long cold read) must not turn
+                // this into an unbounded close-gate/open-gate spin: the typed
+                // Busy error propagates with the original epoch preserved.
+                let mut cold = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
                 // Re-verify the request's original epoch once the exclusive
                 // window is secured: a role fence between normal admission and
                 // this point must reject the operation with its own epoch.
@@ -2059,13 +2055,23 @@ impl MasterFilesystem {
         if !self.master_monitor.is_active() {
             return Ok(None);
         }
-        self.run_metadata_write(|| {
-            if !self.master_monitor.is_active() {
-                return Ok(None);
-            }
-            let fs_dir = self.fs_dir.view()?;
-            fs_dir.claim_trash_entry_for_purge(trash_path).map(Some)
-        })
+        // A journalled rename (trash -> pending staging): route through the
+        // trash cold bridge instead of a bare shared view.
+        self.run_metadata_write_with_fallback(
+            || {
+                if !self.master_monitor.is_active() {
+                    return Ok(ShardedOutcome::Done(None));
+                }
+                // Planning point: the claim rename needs the global lock.
+                Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| {
+                if !self.master_monitor.is_active() {
+                    return Ok(None);
+                }
+                fs_dir.claim_trash_entry_for_purge(trash_path).map(Some)
+            },
+        )
     }
 
     /// One bounded page of `/.Trash/.pending` entries, i.e. entries staged by
@@ -2743,7 +2749,16 @@ impl MasterFilesystem {
                 let dst_inp = Self::resolve_path(fs_dir, dst)?;
                 // POSIX same-inode rename is a no-op (kept from the hot path's
                 // dropped branch — journal replay unchanged for older leaders).
-                if !flags.no_replace() && !flags.exchange_mode() {
+                // Only a fully-resolved pair names a real target: a missing
+                // final component leaves inodes.last pointing at the parent,
+                // and comparing those ids would misreport two missing paths
+                // under one parent as "same inode". Let FsDir::rename produce
+                // the real FileNotFound in that case.
+                if src_inp.is_full()
+                    && dst_inp.is_full()
+                    && !flags.no_replace()
+                    && !flags.exchange_mode()
+                {
                     if let (Some(source), Some(target)) = (
                         src_inp.inodes.last().map(|inode| inode.id()),
                         dst_inp.inodes.last().map(|inode| inode.id()),
@@ -5238,19 +5253,6 @@ impl MasterFilesystem {
         })
     }
 
-    /// Collects every inode id reachable from a live directory node. The
-    /// caller holds the cold handle, so the tree is stable while walking.
-    fn collect_subtree_inode_ids(node: &Arc<DirNode>, out: &mut Vec<i64>) {
-        for child in node.children.read_all() {
-            out.push(child.id());
-            if let Ok(dir) = child.as_dir_ref() {
-                if let Some(handle) = dir.node.as_ref() {
-                    Self::collect_subtree_inode_ids(handle, out);
-                }
-            }
-        }
-    }
-
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
         self.run_metadata_write_with_fallback(
             || {
@@ -5268,31 +5270,9 @@ impl MasterFilesystem {
                 self.set_attr_single_path_sharded(path, opts.clone(), resolved)
             },
             |fs_dir| {
-                if opts.recursive {
-                    // Exclusive subtree sweep: locks serialize propagation
-                    // against sharded single-inode writers.
-                    let inp = Self::resolve_path(fs_dir, path.as_ref())?;
-                    Self::check_not_reserved_path(path.as_ref())?;
-                    let mut inode_ids = Vec::new();
-                    if let Some(root) = inp.get_last_inode() {
-                        inode_ids.push(root.id());
-                        if let Ok(dir) = root.as_ref().as_dir_ref() {
-                            if let Some(handle) = dir.node.as_ref() {
-                                Self::collect_subtree_inode_ids(handle, &mut inode_ids);
-                            }
-                        }
-                    }
-                    inode_ids.sort_unstable();
-                    inode_ids.dedup();
-                    let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = inode_ids
-                        .iter()
-                        .enumerate()
-                        .map(|(depth, id)| InodeLockRequest::write(depth, *id))
-                        .collect();
-                    let _locks = self.inode_locks.lock_many(&requests);
-                    let inp = Self::resolve_path(fs_dir, path.as_ref())?;
-                    return fs_dir.set_attr(inp, opts.clone());
-                }
+                // The exclusive owner has drained normal-writer admission and
+                // readers, so no extra subtree DFS / object locks are needed:
+                // one resolve, then the original recursive body.
                 let inp = Self::resolve_path(fs_dir, path.as_ref())?;
                 Self::check_not_reserved_path(path.as_ref())?;
                 fs_dir.set_attr(inp, opts.clone())
@@ -5328,15 +5308,16 @@ impl MasterFilesystem {
                 Self::check_not_reserved_path(&link)?;
                 let single_parent = !force && !resolved.2 && resolved.0.len() + 1 >= resolved.1;
                 if single_parent {
-                    self.symlink_single_parent_sharded(
+                    // The helper's Fallback must reach the exclusive protocol;
+                    // discarding it would report success without executing.
+                    return self.symlink_single_parent_sharded(
                         &target,
                         &link,
                         mode,
                         owner.clone(),
                         group.clone(),
                         resolved,
-                    )?;
-                    return Ok(ShardedOutcome::Done(()));
+                    );
                 }
                 // Planning point: symlink needs the global lock.
                 Ok(ShardedOutcome::Fallback)
@@ -5367,8 +5348,8 @@ impl MasterFilesystem {
                 Self::check_not_reserved_path(&dst_path)?;
                 let single_parent = src.2 && !dst.2 && dst.0.len() + 1 >= dst.1;
                 if single_parent {
-                    self.link_single_parent_sharded(&src_path, &dst_path, (src, dst))?;
-                    return Ok(ShardedOutcome::Done(()));
+                    // Same contract as symlink: propagate the helper outcome.
+                    return self.link_single_parent_sharded(&src_path, &dst_path, (src, dst));
                 }
                 // Planning point: link needs the global lock.
                 Ok(ShardedOutcome::Fallback)
@@ -5768,7 +5749,9 @@ impl MasterFilesystem {
         let inode = resolved
             .target()
             .ok_or_else(|| FsError::file_not_found(path))?;
-        let mut meta = fs_dir.store.get_locks(inode.id())?;
+        // Same-snapshot lock read: the live get_locks could pair the old
+        // snapshot's inode with a lock row written after a concurrent rename.
+        let mut meta = snapshot.get_locks(inode.id())?;
         Ok(meta.check_conflict(lock, self.conf.lock_expire_time_ms()))
     }
 

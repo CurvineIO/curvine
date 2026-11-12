@@ -1746,6 +1746,24 @@ impl<'a> InodeStoreSnapshot<'a> {
         }
     }
 
+    /// Point read of lock metadata from the same snapshot as inode and edge
+    /// reads. The live `get_locks` reads the current DB, which can pair an old
+    /// snapshot path resolution with a newer lock row; this keeps the read at
+    /// one point in time.
+    pub fn get_locks(&self, id: i64) -> CommonResult<LockMeta> {
+        let key = RocksUtils::u8_i64_to_bytes(RocksInodeStore::PREFIX_LOCK, id);
+        let bytes = self
+            .snapshot
+            .get_pinned_cf(RocksInodeStore::CF_COMMON, key)?;
+        match bytes {
+            Some(bytes) => {
+                let locks: Vec<FileLock> = MetadataCodec::decode(&bytes)?;
+                Ok(LockMeta::with_vec(locks))
+            }
+            None => Ok(LockMeta::default()),
+        }
+    }
+
     /// Point read of directory attributes from the same snapshot as inode and edge reads.
     pub fn get_directory_attributes(&self, id: i64) -> CommonResult<Option<DirectoryAttributes>> {
         let value = self
