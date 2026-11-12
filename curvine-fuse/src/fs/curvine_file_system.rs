@@ -698,7 +698,7 @@ impl CurvineFileSystem {
             return Ok(());
         }
 
-        let meta_ttl = self.conf.meta_cache_ttl.as_millis() as u64;
+        let meta_ttl = self.conf.effective_meta_cache_ttl().as_millis() as u64;
         // Snapshot the whole ancestor chain under one read guard so traversal cost
         // does not grow lock acquisitions with path depth.
         let (ancestors, missing) = {
@@ -2738,7 +2738,7 @@ mod tests {
         let rt = Arc::new(AsyncRuntime::single());
         let mut conf = ClusterConf::default();
         conf.fuse.check_permission = true;
-        conf.fuse.enable_meta_cache = true;
+        conf.fuse.enable_meta_cache = Some(true);
         conf.fuse.metrics_enabled = false;
         let fs = CurvineFileSystem::new(conf, rt.clone()).unwrap();
 
