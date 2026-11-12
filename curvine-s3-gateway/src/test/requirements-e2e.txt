@@ -1,0 +1,3 @@
+# Client versions used by the local cluster end-to-end report.
+boto3==1.44.1
+botocore==1.44.1

@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use super::types::{PutContext, PutOperation};
-use super::ListObjectContent;
 use super::ListObjectHandler;
 use super::ListObjectOption;
 use super::ListObjectVersionsHandler;
@@ -25,9 +24,7 @@ use super::PutObjectOption;
 use crate::s3::error_code::Error;
 use crate::s3::s3_api::HeadHandler;
 use crate::s3::s3_api::HeadObjectResult;
-use crate::utils::s3_utils::{
-    file_status_to_head_object_result, file_status_to_list_object_content,
-};
+use crate::utils::s3_utils::file_status_to_head_object_result;
 use crate::utils::temp_storage::{PartMeta, TempStorageEnum};
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
@@ -866,7 +863,7 @@ const STAGING_KEY_PREFIX: &str = ".curvine-s3-";
 ///
 /// Sound because the namespace is reserved on every write path; ListObjects and
 /// ListObjectVersions share this predicate so neither can expose staging.
-fn is_staging_name(name: &str) -> bool {
+pub(super) fn is_staging_name(name: &str) -> bool {
     name.starts_with(STAGING_KEY_PREFIX)
 }
 
@@ -1196,7 +1193,8 @@ impl ListObjectHandler for S3Handlers {
         &self,
         opt: &ListObjectOption,
         bucket: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<ListObjectContent>, String>> + Send {
+    ) -> impl std::future::Future<Output = Result<super::listing::ListObjectPage, String>> + Send
+    {
         let this = self.clone();
         let opt = opt.clone();
         let bucket = bucket.to_string();
@@ -1204,87 +1202,33 @@ impl ListObjectHandler for S3Handlers {
         async move {
             let bkt_path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
 
-            // S3 prefix semantics: prefix is for filtering, not path construction
-            // Only treat prefix as directory path if it ends with '/'
-            let (list_path, prefix_dir) = if let Some(prefix) = &opt.prefix {
-                if prefix.ends_with('/') {
-                    // Prefix is a directory path (e.g., "folder/")
-                    let dir_path = prefix.trim_end_matches('/');
-                    if dir_path.is_empty() {
-                        (bkt_path.clone(), String::new())
-                    } else {
-                        let full_path =
-                            Path::from_str(format!("{}/{}", bkt_path, dir_path).as_str())
-                                .map_err(|e| e.to_string())?;
-                        (full_path, dir_path.to_string())
-                    }
-                } else if prefix.contains('/') {
-                    // Prefix contains directory component (e.g., "folder/file")
-                    // List the parent directory and filter by full prefix
-                    let last_slash = prefix.rfind('/').unwrap();
-                    let dir_part = &prefix[..last_slash];
-                    if dir_part.is_empty() {
-                        (bkt_path.clone(), String::new())
-                    } else {
-                        let full_path =
-                            Path::from_str(format!("{}/{}", bkt_path, dir_part).as_str())
-                                .map_err(|e| e.to_string())?;
-                        (full_path, dir_part.to_string())
-                    }
-                } else {
-                    // Prefix is just a filename prefix (e.g., "small")
-                    // List bucket root and filter by prefix
-                    (bkt_path.clone(), String::new())
-                }
-            } else {
-                (bkt_path.clone(), String::new())
-            };
-
             // A missing bucket must be an error, not an empty listing: S3
             // answers 404, and clients rely on it to detect a wrong bucket
             // instead of concluding the bucket is empty.
-            let bucket_status = this
-                .fs
-                .get_status(&bkt_path)
-                .await
-                .map_err(|_| NO_SUCH_BUCKET.to_string())?;
+            let bucket_status = this.fs.get_status(&bkt_path).await.map_err(|e| match e {
+                curvine_error::FsError::FileNotFound(_) => NO_SUCH_BUCKET.to_string(),
+                other => other.to_string(),
+            })?;
             if !bucket_status.is_dir {
                 return Err(NO_SUCH_BUCKET.to_string());
             }
 
-            let list = this
-                .fs
-                .list_status(&list_path)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            let mut contents = Vec::new();
-
-            for st in list {
-                // Internal staging objects are build artefacts, not objects:
-                // a client listing the bucket must never see them.
-                if is_staging_name(&st.name) {
-                    continue;
+            super::listing::list_objects(&opt, |directory| {
+                let fs = &this.fs;
+                let bucket_path = &bkt_path;
+                async move {
+                    let path = if directory.is_empty() {
+                        bucket_path.clone()
+                    } else {
+                        // Directory names come from filesystem statuses, never
+                        // from the client's prefix or continuation token.
+                        Path::from_str(format!("{}/{}", bucket_path, directory))
+                            .map_err(|e| e.to_string())?
+                    };
+                    fs.list_status(&path).await.map_err(|e| e.to_string())
                 }
-
-                // Build the S3 key from file status
-                let key = if prefix_dir.is_empty() {
-                    st.name.clone()
-                } else {
-                    format!("{}/{}", prefix_dir, st.name)
-                };
-
-                // Apply prefix filter
-                if let Some(pref) = &opt.prefix {
-                    if !key.starts_with(pref) {
-                        continue;
-                    }
-                }
-
-                contents.push(file_status_to_list_object_content(&st, key));
-            }
-
-            Ok(contents)
+            })
+            .await
         }
     }
 }

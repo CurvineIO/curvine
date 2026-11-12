@@ -168,6 +168,10 @@ pub struct ListObjectResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_continuation_token: Option<String>,
@@ -187,6 +191,8 @@ impl Default for ListObjectResult {
             key_count: None,
             max_keys: None,
             delimiter: None,
+            encoding_type: None,
+            start_after: None,
             continuation_token: None,
             next_continuation_token: None,
             is_truncated: false,
