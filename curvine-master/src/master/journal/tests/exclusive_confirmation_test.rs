@@ -84,6 +84,8 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
     // Public recursive directory delete: the cold bridge routes it through
     // run_metadata_write_exclusive, whose confirmation waits on the real
     // queued receipt.
+    // Pre-operation opaque cursor handle: saved before the operation spawns.
+    let pre_cursor = fs.fs_dir.view().unwrap().store.cursor_store();
     let worker_fs = fs.clone();
     let (delete_started_tx, delete_started_rx) = mpsc::channel();
     let (delete_done_tx, delete_done_rx) = mpsc::channel();
@@ -118,10 +120,6 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
         queued.entry
     );
     let completion = queued.completion.expect("missing commit confirmation");
-
-    // Pre-operation opaque cursor handle: before the failure it answers
-    // point lookups normally.
-    let pre_cursor = fs.fs_dir.view().unwrap().store.cursor_store();
 
     // While the receipt is held: wait (bounded) for the body to finish and
     // the cold owner to be released — the view reopens and the live edge is
