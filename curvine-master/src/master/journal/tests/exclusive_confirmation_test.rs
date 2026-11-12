@@ -18,7 +18,7 @@
 
 use super::*;
 use crate::master::journal::journal_writer::tests::{build_writer, test_conf};
-use crate::master::journal::JournalSystem;
+use crate::master::journal::{JournalEntry, JournalSystem};
 use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use crate::master::meta::NamespaceError;
 use crate::master::Master;
@@ -37,6 +37,16 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
     // block on the un-consumed testing channel.
     conf.journal.snapshot_entries = 0;
     conf.journal.writer_channel_size = 8;
+    let meta_dir = std::env::temp_dir().join(format!(
+        "curvine-receipt-fail-meta-{}",
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    let journal_dir = std::env::temp_dir().join(format!(
+        "curvine-receipt-fail-journal-{}",
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    conf.master.meta_dir = meta_dir.to_str().unwrap().to_string();
+    conf.journal.journal_dir = journal_dir.to_str().unwrap().to_string();
     let journal = JournalSystem::from_conf(&conf)?;
     let fs = journal.fs();
     fs.master_monitor.set_role_for_test(RoleState::Leader);
@@ -96,10 +106,14 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
         .unwrap()
         .recv_timeout(Duration::from_secs(5))
         .expect("missing delete journal entry");
-    // The fixture's only real entry must be the directory delete: a path
-    // check pins the scenario without needing the full enum shape here.
+    // Typed check: the fixture's only real entry must be the directory
+    // delete for /dir.
+    let is_dir_delete = matches!(
+        &queued.entry,
+        JournalEntry::Delete(entry) if entry.path == "/dir"
+    );
     assert!(
-        format!("{:?}", queued.entry).contains("\"/dir\""),
+        is_dir_delete,
         "the queued entry must be the /dir delete, got {:?}",
         queued.entry
     );
@@ -129,6 +143,14 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
     // Drop the completion: the confirmation wait fails for real, the RAII
     // guard goes terminal before the exclusive gate opens.
     drop(completion);
+    // Drain the controlled queue before waiting on done/join (single writer
+    // Arc; this fixture's real entry was already received above).
+    loop {
+        match writer.receiver.as_ref().unwrap().lock().unwrap().try_recv() {
+            Ok(entry) => drop(entry),
+            Err(_) => break,
+        }
+    }
 
     let delete_done = delete_done_rx.recv_timeout(Duration::from_secs(10));
     // Only a completed observation may join; a Timeout must fail explicitly
@@ -170,29 +192,42 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
         Err(err) => err,
     };
 
-    // The holder is terminal: FAILED state, view/begin Unavailable, the
-    // writer is fenced and the opaque cursor store retired.
+    // Collect terminal observations while the fixture is alive.
+    let holder_failed = fs.fs_dir.is_failed();
+    let view_err = fs.fs_dir.view().err();
+    let begin_err = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).err();
+    let writer_fenced = writer.ensure_metadata_current().is_err();
+    let failure_seq_after = fs.journal_writer.failure_seq();
+    let cursor_err = pre_cursor
+        .get_applied_req(1)
+        .expect_err("the retired cursor must fail point lookups");
+
+    // Teardown: drop the filesystem handles and consume the journal system,
+    // then remove this case's unique temp paths.
+    drop(fs);
+    journal.shutdown();
+    let _ = std::fs::remove_dir_all(&meta_dir);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+
+    // Outer assertions, after full teardown.
     assert!(
-        fs.fs_dir.is_failed(),
+        holder_failed,
         "a dropped confirmation must fail the exclusive holder closed"
     );
-    let view_err = fs.fs_dir.view().err();
     assert!(
         matches!(view_err, Some(NamespaceError::Unavailable)),
         "the view must be Unavailable after the terminal failure, got {view_err:?}"
     );
-    let begin_err = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).err();
     assert!(
         matches!(begin_err, Some(crate::master::meta::ColdError::Unavailable)),
         "begin_cold must be Unavailable after the terminal failure, got {begin_err:?}"
     );
     assert!(
-        writer.ensure_metadata_current().is_err(),
+        writer_fenced,
         "the writer must remain fenced after the terminal failure"
     );
     assert_ne!(
-        fs.journal_writer.failure_seq(),
-        failure_seq_before,
+        failure_seq_after, failure_seq_before,
         "the confirmation failure must be recorded on the failure sequence"
     );
     assert!(
@@ -201,26 +236,11 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
             .contains("journal commit failed after metadata commit"),
         "the delete must surface the real commit error, got {delete_err}"
     );
-    // The pre-failure cursor handle must be retired: point lookups now
-    // surface the unavailable store instead of stale rows.
-    let cursor_err = pre_cursor
-        .get_applied_req(1)
-        .err()
-        .or_else(|| pre_cursor.get_applied_req(1).err());
     assert!(
-        cursor_err.is_some(),
-        "the opaque cursor store must be retired after the terminal failure"
+        cursor_err
+            .to_string()
+            .contains("cursor store unavailable during metadata restore"),
+        "the retired cursor must report the restore-unavailable error, got {cursor_err}"
     );
-
-    // Drain any remaining queued receipts (single writer Arc) so the channels
-    // exit cleanly, then consume the journal system.
-    loop {
-        match writer.receiver.as_ref().unwrap().lock().unwrap().try_recv() {
-            Ok(entry) => drop(entry),
-            Err(_) => break,
-        }
-    }
-    drop(fs);
-    journal.shutdown();
     Ok(())
 }
