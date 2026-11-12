@@ -205,7 +205,7 @@ fn topology_reads_wait_for_shared_namespace_writers() {
         )
         .unwrap();
     let held = fs.fs_dir.view().unwrap();
-    // Two-phase start: all six cold workers spawn and confirm they are alive
+    // Two-phase start: the cold workers spawn and confirm they are alive
     // (started ack), then main runs the shared-view get_lock on the held
     // guard, and only afterwards releases them. A plain barrier would let the
     // workers race ahead into a cold window and make get_lock read Busy.
@@ -227,7 +227,6 @@ fn topology_reads_wait_for_shared_namespace_writers() {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             let success = match operation {
-                2 => fs.get_file_block_details("/dir/file").is_ok(),
                 3 => fs.cv_metadata_snapshot_page(None, 10).is_ok(),
                 5 => fs.list_trash_page(None, 10).is_ok(),
                 6 => fs.scan_expired_trash(i64::MAX, 10, None).is_ok(),

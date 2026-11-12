@@ -27,18 +27,21 @@ fn link_fallback_surfaces_the_real_destination_conflict() {
     // Park the sharded helper after planning, before any inode lock, with a
     // driver-side entered ack; the named sender stays alive until the driver
     // has finished its own change, so the channel never closes early.
-    let (release, entered) = memory_read_gates::install_with_entered("link-plan-/dir/dst");
+    // A random destination keeps the process-global gate key unique per run.
+    let dst = format!("/dir/dst-{}", curvine_runtime::common::Utils::rand_str(8));
+    let (release, entered) = memory_read_gates::install_with_entered(&format!("link-plan-{dst}"));
     let worker_fs = fs.clone();
+    let dst_for_worker = dst.clone();
     let (tx, rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || tx.send(worker_fs.link("/src", "/dir/dst")));
+    let worker = std::thread::spawn(move || tx.send(worker_fs.link("/src", &dst_for_worker)));
 
     entered
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the link helper must reach its plan gate");
     // A normal sharded create on the parked worker's destination path: the
     // parent write is free because the helper holds no inode lock yet.
-    fs.create("/dir/dst", true).unwrap();
-    let driver_dst_id = fs.file_status("/dir/dst").unwrap().id;
+    fs.create(&dst, true).unwrap();
+    let driver_dst_id = fs.file_status(&dst).unwrap().id;
     release.send(()).unwrap();
     drop(release);
 
@@ -53,7 +56,7 @@ fn link_fallback_surfaces_the_real_destination_conflict() {
     );
     // The driver-created file is untouched (exact id and kind) and the link
     // did not exist.
-    let driver_file = fs.file_status("/dir/dst").unwrap();
+    let driver_file = fs.file_status(&dst).unwrap();
     assert_eq!(driver_file.id, driver_dst_id);
     assert_eq!(driver_file.file_type, FileType::File);
     assert_eq!(driver_file.nlink, 1);
