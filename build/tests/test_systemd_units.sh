@@ -109,10 +109,13 @@ grep -q '^ExecStopPost=.*mount-path-ready' "$UNIT_DIR/curvine-fuse@.service" \
     || fail "fuse unit cleanup is not gated on the mount marker"
 
 if command -v systemd-analyze > /dev/null 2>&1; then
-    # verify exits 0 on unknown keys or bad values and only warns, so any
-    # output is a failure. The FUSE template is checked through an instance.
+    # verify exits 0 on unknown keys or bad values and only warns, so any output
+    # about the rendered units is a failure. It also warns about unrelated units
+    # on the host, so only lines that mention the three units are considered.
+    # The FUSE template is checked through an instance.
     verify_out=$(systemd-analyze verify "$UNIT_DIR/curvine-master.service" "$UNIT_DIR/curvine-worker.service" \
-        "$UNIT_DIR/curvine-fuse@curvine\\x2dfuse.service" 2>&1) || fail "systemd-analyze verify failed: $verify_out"
+        "$UNIT_DIR/curvine-fuse@curvine\\x2dfuse.service" 2>&1 || true)
+    verify_out=$(grep -E 'curvine-(master|worker)\.service|curvine-fuse@' <<< "$verify_out" || true)
     [[ -z "$verify_out" ]] || fail "systemd-analyze verify reported problems: $verify_out"
 fi
 
