@@ -85,7 +85,7 @@ bash "$BUMP" 0.7.0 --cargo "$TMP_DIR/Cargo.toml" --pom "$TMP_DIR/pom.xml" --skip
 [ "$pom_sum" = "$(checksum "$TMP_DIR/pom.xml")" ] || fail "dry-run modified pom.xml"
 
 # --- invalid versions are rejected before any file changes ------------------
-for invalid in "0.7" "latest" "v0.7.0.1" "0.7.0-"; do
+for invalid in "0.7" "latest" "v0.7.0.1" "0.7.0-" "01.7.0" "0.7.0-01" "0.7.0-alpha..1"; do
   cargo_sum="$(checksum "$TMP_DIR/Cargo.toml")"
   if bash "$BUMP" "$invalid" --cargo "$TMP_DIR/Cargo.toml" --pom "$TMP_DIR/pom.xml" --skip-lock >/dev/null 2>&1; then
     fail "expected invalid version '$invalid' to fail"
@@ -167,6 +167,13 @@ grep -q '"ahash 0.8.12"' "$WS/Cargo.lock" || fail "dependency reference was rewr
 lock_sum="$(checksum "$WS/Cargo.lock")"
 bash "$BUMP" 0.9.0 --cargo "$WS/Cargo.toml" --pom "$TMP_DIR/pom.xml" >/dev/null
 [ "$lock_sum" = "$(checksum "$WS/Cargo.lock")" ] || fail "unchanged Cargo.lock was rewritten"
+
+# --- a rerun without --skip-lock rejects a lockfile a --skip-lock run left stale
+bash "$BUMP" 0.10.0 --cargo "$WS/Cargo.toml" --pom "$TMP_DIR/pom.xml" --skip-lock >/dev/null
+if bash "$BUMP" 0.10.0 --cargo "$WS/Cargo.toml" --pom "$TMP_DIR/pom.xml" >/dev/null 2>&1; then
+  fail "expected a stale Cargo.lock to fail after a --skip-lock bump"
+fi
+grep -A1 '^name = "curvine-a"$' "$WS/Cargo.lock" | grep -q '^version = "0.9.0"$' || fail "the stale lockfile check rewrote Cargo.lock"
 
 # --- missing inputs are usage errors ---------------------------------------
 if bash "$BUMP" 0.8.0 --cargo "$TMP_DIR/Cargo.toml" --pom "$TMP_DIR/missing.xml" --skip-lock >/dev/null 2>&1; then

@@ -198,17 +198,89 @@ tag_to_release_version() {
   printf '%s\n' "${tag#v}"
 }
 
+# True when $1 is a semver numeric identifier: digits only, and no leading
+# zero unless the identifier is exactly 0.
+is_semver_numeric() {
+  case "$1" in
+    '' | *[!0-9]*) return 1 ;;
+    0) return 0 ;;
+    0*) return 1 ;;
+  esac
+  return 0
+}
+
 # Normalize a user-supplied release version or tag to the bare release
 # version. Used by the manual release-prep workflow, which accepts both
 # 0.4.0-alpha and v0.4.0-alpha.
+#
+# The whole value must be one semver version that Cargo accepts:
+#   - only [0-9A-Za-z.-], so a newline or shell metacharacter cannot reach
+#     GITHUB_OUTPUT or a generated command line;
+#   - MAJOR.MINOR.PATCH with no leading zeros;
+#   - an optional prerelease of dot-separated, non-empty identifiers, where a
+#     numeric identifier has no leading zero.
+# Written with `case` instead of `[[ =~ ]]` because dash sources this file too.
 normalize_release_version() {
-  local version="${1:?version required}"
-  version="${version#v}"
-  if ! printf '%s\n' "$version" |
-    grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-    echo "invalid release version '$1' (expected X.Y.Z[-pre], e.g. 0.4.0-alpha)" >&2
+  local raw="${1:?version required}"
+  local version="${raw#v}"
+  local core pre rest major minor patch part
+
+  case "$version" in
+    '' | *[!0-9A-Za-z.-]*)
+      echo "invalid release version '$raw' (expected X.Y.Z[-pre], e.g. 0.4.0-alpha)" >&2
+      return 1
+      ;;
+  esac
+
+  case "$version" in
+    *-*)
+      core="${version%%-*}"
+      pre="${version#*-}"
+      ;;
+    *)
+      core="$version"
+      pre=""
+      ;;
+  esac
+
+  case "$core" in
+    *.*.*.*) core="" ;;
+    *.*.*) ;;
+    *) core="" ;;
+  esac
+  major="${core%%.*}"
+  rest="${core#*.}"
+  minor="${rest%%.*}"
+  patch="${rest#*.}"
+  if [ -z "$core" ] || ! is_semver_numeric "$major" ||
+    ! is_semver_numeric "$minor" || ! is_semver_numeric "$patch"; then
+    echo "invalid release version '$raw' (expected X.Y.Z[-pre] without leading zeros, e.g. 0.4.0-alpha)" >&2
     return 1
   fi
+
+  case "$version" in
+    *-*)
+      rest="$pre."
+      while [ -n "$rest" ]; do
+        part="${rest%%.*}"
+        rest="${rest#*.}"
+        case "$part" in
+          '')
+            echo "invalid release version '$raw' (empty prerelease identifier)" >&2
+            return 1
+            ;;
+          *[!0-9]*) ;;
+          *)
+            if ! is_semver_numeric "$part"; then
+              echo "invalid release version '$raw' (numeric prerelease identifier '$part' has a leading zero)" >&2
+              return 1
+            fi
+            ;;
+        esac
+      done
+      ;;
+  esac
+
   printf '%s\n' "$version"
 }
 
@@ -315,9 +387,9 @@ set_lockfile_workspace_version() {
     echo "Cargo.lock not found: $lock_file" >&2
     return 1
   fi
-  if [ "$old_version" = "$new_version" ]; then
-    return 0
-  fi
+  # No early return when old == new: a previous `--skip-lock` run may have
+  # moved Cargo.toml without the lockfile, and the verification below must
+  # still report those stale entries instead of calling the lockfile current.
 
   names_file="$(mktemp)" || return 1
   if ! get_workspace_package_names "$cargo_toml" > "$names_file"; then
@@ -394,6 +466,7 @@ set_lockfile_workspace_version() {
   rm -f "$names_file"
   if [ -n "$actual" ]; then
     echo "failed to verify workspace versions in $lock_file: $actual" >&2
+    echo "run 'cargo update --workspace' to refresh the workspace entries" >&2
     return 1
   fi
 }
