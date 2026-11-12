@@ -329,3 +329,47 @@ fn trash_purge_replay_publication_failure_fails_the_holder_closed() -> FsResult<
     let _ = fs::remove_dir_all(&root);
     Ok(())
 }
+
+#[test]
+fn trash_purge_replay_pre_commit_error_keeps_the_holder_open() -> FsResult<()> {
+    let (conf, root) = tests::ignore_reply_error_conf("purge-replay-open", true);
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = js.fs();
+    let loader = js.journal_loader();
+
+    fs.create("/victim/a", true)?;
+    fs.create("/victim/b", true)?;
+
+    // A relative path makes purge_paths fail at InodePath::resolve, before
+    // any store commit: a real input error, no fault point needed.
+    let batch = JournalEntry::TrashPurge(TrashPurgeEntry {
+        op_id: 1,
+        rpc_id: 0,
+        entry: "/victim".to_string(),
+        mtime: 5,
+        paths: vec!["relative-not-a-path".to_string()],
+    });
+
+    let result = loader.apply_entry(batch);
+    assert!(result.is_err(), "the invalid path must fail the replay");
+
+    // Pre-commit error: the holder stays OPEN and the view still works.
+    assert!(
+        !fs.fs_dir.is_failed(),
+        "a pre-commit replay error must not fail the holder"
+    );
+    fs.fs_dir.view().map_err(|e| {
+        FsError::common(format!(
+            "the view must still work after a pre-commit error: {e}"
+        ))
+    })?;
+    // The untouched entries are still present for a later replay.
+    assert!(fs.file_status("/victim/a").is_ok());
+    assert!(fs.file_status("/victim/b").is_ok());
+
+    drop(loader);
+    drop(fs);
+    js.shutdown();
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}

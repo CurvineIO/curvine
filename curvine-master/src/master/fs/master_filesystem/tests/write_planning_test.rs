@@ -105,3 +105,103 @@ fn get_lock_rejects_the_pending_staging_namespace() {
         "get_lock on a pending path must be FileNotFound, got {err:?}"
     );
 }
+
+#[test]
+fn get_block_locations_missing_path_is_timely_under_a_shared_view() {
+    let fs = test_fs("gbl-missing-shared-view");
+    fs.create("/data/a.log", true).unwrap();
+
+    let held = fs.fs_dir.view().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel::<FsResult<FileBlocks>>();
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).expect("worker started channel");
+        tx.send(worker_fs.get_block_locations("/data/missing.log"))
+            .expect("result channel");
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("worker started");
+
+    // The shared view is held: the read must return the real error promptly,
+    // not queue behind a 30s cold drain.
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_millis(500))
+        .expect("get_block_locations must not wait for a cold window");
+    worker.join().expect("worker must not panic");
+    let err = outcome.unwrap_err();
+    assert!(
+        matches!(err, FsError::FileNotFound(_)),
+        "a missing path must be FileNotFound, got {err:?}"
+    );
+    drop(held);
+}
+
+#[test]
+fn get_file_block_details_missing_path_is_timely_under_a_shared_view() {
+    let fs = test_fs("gfd-missing-shared-view");
+    fs.create("/data/a.log", true).unwrap();
+
+    let held = fs.fs_dir.view().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel::<FsResult<FileBlockDetails>>();
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).expect("worker started channel");
+        tx.send(worker_fs.get_file_block_details("/data/missing.log"))
+            .expect("result channel");
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("worker started");
+
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_millis(500))
+        .expect("get_file_block_details must not wait for a cold window");
+    worker.join().expect("worker must not panic");
+    let err = outcome.unwrap_err();
+    assert!(
+        matches!(err, FsError::FileNotFound(_)),
+        "a missing path must be FileNotFound, got {err:?}"
+    );
+    drop(held);
+}
+
+#[test]
+fn fs_mode_snapshot_succeeds_under_a_shared_view() {
+    let fs = test_fs("fsm-shared-view");
+    fs.create("/data/a.log", true).unwrap();
+    let id = fs.file_status("/data/a.log").unwrap().id;
+    // Reference DTO taken without a held view: the shared-view read must
+    // return the same identity fields.
+    let reference = fs
+        .fs_mode_snapshot(id)
+        .unwrap()
+        .expect("reference snapshot");
+
+    let held = fs.fs_dir.view().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel::<FsResult<Option<FsModeSnapshot>>>();
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).expect("worker started channel");
+        tx.send(worker_fs.fs_mode_snapshot(id))
+            .expect("result channel");
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("worker started");
+
+    let snapshot = rx
+        .recv_timeout(std::time::Duration::from_millis(500))
+        .expect("fs_mode_snapshot must not wait for a cold window")
+        .expect("snapshot read must succeed")
+        .expect("the file must have a snapshot");
+    worker.join().expect("worker must not panic");
+    assert_eq!(snapshot.path, reference.path);
+    assert_eq!(snapshot.gen, reference.gen);
+    assert_eq!(snapshot.state, reference.state);
+    assert_eq!(snapshot.ufs_mtime, reference.ufs_mtime);
+    drop(held);
+}
