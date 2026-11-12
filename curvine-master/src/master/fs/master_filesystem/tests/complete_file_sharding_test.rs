@@ -1455,13 +1455,18 @@ fn delete_does_not_hold_namespace_read_while_waiting_for_block_lock() {
 fn delete_serializes_with_worker_location_cleanup() {
     let fs = test_fs("delete-worker-cleanup-race");
     let block_id = replication_file(&fs, "/file");
-    let reader = fs.fs_dir.view().unwrap();
+
+    // Driver holds the block stripe. Cleanup takes its worker session mutex
+    // first and then blocks on this stripe, so the critical section stays
+    // observable until we release it — a shared namespace view no longer
+    // fences cleanup, and polling for a transient window proved nothing.
+    let block_guard = fs.block_location_locks.write_blocks(&[block_id]);
 
     let cleanup_fs = fs.clone();
     let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
     let cleanup = std::thread::spawn(move || cleanup_tx.send(cleanup_fs.delete_locations(100)));
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline && fs.worker_location_lock(100).try_lock().is_some()
     {
         std::thread::yield_now();
@@ -1471,16 +1476,13 @@ fn delete_serializes_with_worker_location_cleanup() {
         "worker cleanup did not enter the worker-location critical section"
     );
 
-    // The shared namespace view no longer fences writers against each other;
-    // delete and cleanup serialize on the file inode's write lock instead.
-    // Cleanup completes inside its worker-location critical section first
-    // (asserted above), then delete runs to completion with the same
-    // end-state guarantees.
+    // Delete contends on the same worker stripe, so it cannot overtake the
+    // cleanup that already owns the critical section.
     let delete_fs = fs.clone();
     let (delete_tx, delete_rx) = std::sync::mpsc::channel();
     let delete = std::thread::spawn(move || delete_tx.send(delete_fs.delete("/file", false)));
 
-    drop(reader);
+    drop(block_guard);
     cleanup.join().unwrap();
     let cleanup_result = cleanup_rx.recv().unwrap();
     assert_eq!(cleanup_result.unwrap().removed_block_ids, vec![block_id]);
