@@ -549,7 +549,7 @@ class S3ErrorHandlingTest:
                 s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload,
                                              MultipartUpload={'Parts': parts})
             except ClientError as e:
-                return e.response['Error']['Code']
+                return e.response['ResponseMetadata']['HTTPStatusCode'], e.response['Error']['Code']
 
         upload = s3.create_multipart_upload(Bucket=bucket, Key=key)['UploadId']
         parts = [{'PartNumber': n, 'ETag': s3.upload_part(
@@ -558,7 +558,8 @@ class S3ErrorHandlingTest:
         observed = [code(parts[::-1]), code([dict(parts[0], ETag='"00"')]), code(parts[1:])]
         s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload)
         observed.append(code(parts[:1]))
-        success = observed == ['InvalidPartOrder', 'InvalidPart', 'EntityTooSmall', 'NoSuchUpload']
+        success = observed == [(400, 'InvalidPartOrder'), (400, 'InvalidPart'),
+                               (400, 'EntityTooSmall'), (404, 'NoSuchUpload')]
         self._record_test(f"Multipart error codes {observed}", success)
         return success
 
