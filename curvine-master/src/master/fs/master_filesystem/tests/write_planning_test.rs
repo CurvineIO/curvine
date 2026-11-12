@@ -277,8 +277,8 @@ fn build_located_blocks_reports_lost_blocks_like_the_live_path() {
     let mut file = InodeFile::new(3, 0);
     file.block_size = 1024;
     file.blocks = vec![BlockMeta::new(301, 1024)];
-    // No location row for the block: the shared builder must report the same
-    // lost-block error as the live path.
+    // Missing map key for the block: the shared builder must report the
+    // same lost-block error as the live path.
     let locations = HashMap::new();
 
     let err = fs

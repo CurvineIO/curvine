@@ -299,17 +299,21 @@ fn block_locations_snapshot_fallback_matches_the_live_result() {
         tx.send(worker_fs.get_block_locations("/data/a.log"))
             .expect("result channel");
     });
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("worker started");
+    let started = started_rx.recv_timeout(std::time::Duration::from_secs(5));
     // Keep the receive Result: a slow/old implementation must not abort the
     // fixture before held/worker/restore are torn down.
-    let received = rx.recv_timeout(std::time::Duration::from_millis(500));
+    let received_500ms = rx.recv_timeout(std::time::Duration::from_millis(500));
+    let timely = received_500ms.is_ok();
     drop(held);
-    worker.join().expect("worker must not panic");
+    // If the 500ms window missed, give the same worker one bounded recovery
+    // window after the view is released (no unbounded join in between).
+    let received = received_500ms.or_else(|_| rx.recv_timeout(std::time::Duration::from_secs(5)));
+    let join_result = worker.join();
     restore_live_edge(&fs, &inode_locks, owned);
-    // Bounded-timeliness assertion, after cleanup.
-    let received = received.expect("the fallback must not wait for a cold window");
+    // All assertions come after the fixture is fully torn down.
+    started.expect("worker must start within the bound");
+    assert!(timely, "the fallback must not wait for a cold window");
+    let received = received.expect("the worker must report a result");
     let blocks = received.expect("the snapshot fallback must serve the store-resident file");
 
     assert_eq!(blocks.status.id, file_id);
@@ -327,6 +331,7 @@ fn block_locations_snapshot_fallback_matches_the_live_result() {
             "each block must report the worker's full address"
         );
     }
+    join_result.expect("worker must not panic");
     // The hot path over the restored live edge agrees with the fallback:
     // same status id/len and the same block order with full addresses.
     let hot = fs.get_block_locations("/data/a.log").unwrap();
