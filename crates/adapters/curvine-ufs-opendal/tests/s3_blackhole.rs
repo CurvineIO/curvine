@@ -87,6 +87,10 @@ fn conf(port: u16) -> HashMap<String, String> {
             OpendalConf::OPERATION_TIMEOUT.to_string(),
             format!("{}ms", BUDGET.as_millis()),
         ),
+        (
+            OpendalConf::COMMIT_TIMEOUT.to_string(),
+            format!("{}ms", BUDGET.as_millis()),
+        ),
     ])
 }
 
@@ -169,6 +173,7 @@ fn create_on_blackholed_endpoint_times_out() {
 }
 
 /// One HTTP request seen by [`scripted_endpoint`].
+#[derive(Clone)]
 struct Request {
     method: String,
     target: String,
@@ -190,38 +195,46 @@ impl Request {
 /// bounded. This endpoint answers that setup and stalls only the request under
 /// test. It returns every stalled request, so a test can prove the deadline
 /// fired at the intended call rather than at an earlier one.
-fn scripted_endpoint(
-    script: fn(&Request) -> Option<&'static str>,
-) -> (u16, Arc<Mutex<Vec<String>>>) {
+fn scripted_endpoint(script: fn(&Request) -> Option<&'static str>) -> (u16, Log) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local scripted endpoint");
     let port = listener.local_addr().unwrap().port();
-    let stalled = Arc::new(Mutex::new(Vec::new()));
+    let log = Log::default();
 
-    let seen = stalled.clone();
+    let shared = log.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
-            let seen = seen.clone();
-            std::thread::spawn(move || serve(stream, script, seen));
+            let shared = shared.clone();
+            std::thread::spawn(move || serve(stream, script, shared));
         }
     });
 
-    (port, stalled)
+    (port, log)
+}
+
+/// What [`scripted_endpoint`] saw: every request, and the stalled ones.
+#[derive(Clone, Default)]
+struct Log {
+    seen: Arc<Mutex<Vec<String>>>,
+    stalled: Arc<Mutex<Vec<String>>>,
+}
+
+impl Log {
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
 }
 
 /// Serve keep-alive requests on one connection until a request is stalled or
 /// the client closes it.
-fn serve(
-    stream: TcpStream,
-    script: fn(&Request) -> Option<&'static str>,
-    stalled: Arc<Mutex<Vec<String>>>,
-) {
+fn serve(stream: TcpStream, script: fn(&Request) -> Option<&'static str>, log: Log) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone the accepted socket"));
     let mut writer = stream;
     loop {
         let Some(req) = read_request(&mut reader) else {
             return;
         };
+        log.seen.lock().unwrap().push(req.describe());
         match script(&req) {
             Some(response) => {
                 if writer.write_all(response.as_bytes()).is_err() {
@@ -229,7 +242,7 @@ fn serve(
                 }
             }
             None => {
-                stalled.lock().unwrap().push(req.describe());
+                log.stalled.lock().unwrap().push(req.describe());
                 // Keep the socket open and silent, like a blackholed path.
                 loop {
                     std::thread::sleep(Duration::from_secs(60));
@@ -298,16 +311,14 @@ fn answer_open_setup(req: &Request) -> Option<&'static str> {
     }
 }
 
-fn scripted_fs(
-    script: fn(&Request) -> Option<&'static str>,
-) -> (OpendalFileSystem, Arc<Mutex<Vec<String>>>) {
-    let (port, stalled) = scripted_endpoint(script);
+fn scripted_fs(script: fn(&Request) -> Option<&'static str>) -> (OpendalFileSystem, Log) {
+    let (port, log) = scripted_endpoint(script);
     let path = Path::new("s3://bucket/object.bin").unwrap();
-    (OpendalFileSystem::new(&path, conf(port)).unwrap(), stalled)
+    (OpendalFileSystem::new(&path, conf(port)).unwrap(), log)
 }
 
-fn assert_stalled_at(stalled: &Arc<Mutex<Vec<String>>>, method: &str) {
-    let stalled = stalled.lock().unwrap();
+fn assert_stalled_at(log: &Log, method: &str) {
+    let stalled = log.stalled.lock().unwrap();
     assert!(
         !stalled.is_empty() && stalled.iter().all(|r| r.starts_with(method)),
         "the deadline must fire at the {} request, stalled requests: {:?}",
@@ -373,6 +384,11 @@ fn write_on_stalled_upload_times_out_and_poisons_the_writer() {
             "complete must report the earlier upload failure: {}",
             err
         );
+        assert!(
+            matches!(err, FsError::Timeout(_)),
+            "a timed-out writer must keep failing with Timeout (ETIMEDOUT), got: {}",
+            err
+        );
     });
     assert_stalled_at(&stalled, "POST");
 }
@@ -408,12 +424,163 @@ fn complete_on_stalled_close_times_out_and_stays_failed() {
             .expect_err("a retried complete must not commit an empty object");
         assert!(
             err.to_string().contains("already failed")
-                && err
-                    .to_string()
-                    .contains("exceeded opendal.operation_timeout"),
+                && err.to_string().contains("exceeded opendal.commit_timeout"),
             "the retry must report the original cause: {}",
             err
         );
+        assert!(
+            matches!(err, FsError::Timeout(_)),
+            "a timed-out writer must keep failing with Timeout (ETIMEDOUT), got: {}",
+            err
+        );
+    });
+    assert_stalled_at(&stalled, "PUT");
+}
+
+const NO_CONTENT: &str = "HTTP/1.1 204 No Content\r\n\r\n";
+const FORBIDDEN: &str = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+
+fn initiate_multipart_ok() -> &'static str {
+    static RESPONSE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RESPONSE.get_or_init(|| {
+        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<InitiateMultipartUploadResult><Bucket>bucket</Bucket><Key>object.bin</Key>\
+<UploadId>upload-1</UploadId></InitiateMultipartUploadResult>";
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    })
+}
+
+/// A multipart upload that starts, then has `part` answer every UploadPart.
+/// The abort (`DELETE ?uploadId=`) succeeds and every other request stalls.
+fn answer_multipart(req: &Request, part: &'static str) -> Option<&'static str> {
+    match req.method.as_str() {
+        "HEAD" => Some(NOT_FOUND),
+        "PUT" if req.body_len == 0 => Some(PUT_OK),
+        "POST" if req.target.contains("uploads") => Some(initiate_multipart_ok()),
+        "PUT" if req.target.contains("partNumber=") => Some(part),
+        "DELETE" if req.target.contains("uploadId=upload-1") => Some(NO_CONTENT),
+        _ => None,
+    }
+}
+
+fn answer_multipart_part_forbidden(req: &Request) -> Option<&'static str> {
+    answer_multipart(req, FORBIDDEN)
+}
+
+fn answer_multipart_part_ok(req: &Request) -> Option<&'static str> {
+    answer_multipart(req, PUT_OK)
+}
+
+fn assert_aborted(log: &Log) {
+    let seen = log.seen();
+    assert!(
+        seen.iter()
+            .any(|r| r.starts_with("DELETE") && r.contains("uploadId=upload-1")),
+        "the multipart upload must be aborted, requests: {:?}",
+        seen
+    );
+}
+
+/// A failed part upload aborts the multipart upload instead of leaving its
+/// parts in the object store.
+#[test]
+fn failed_part_upload_aborts_the_multipart_upload() {
+    let (fs, log) = scripted_fs(answer_multipart_part_forbidden);
+    let path = Path::new("s3://bucket/object.bin").unwrap();
+    let rt = AsyncRuntime::single();
+
+    rt.block_on(async move {
+        let mut writer = fs
+            .create(&path, true)
+            .await
+            .expect("create must pass its setup");
+        let data = vec![7u8; 8 * 1024 * 1024 + 1];
+        writer
+            .write(&data)
+            .await
+            .expect("the first chunk is only cached");
+        let err = writer
+            .write(&data)
+            .await
+            .expect_err("a rejected part upload must not succeed");
+        assert!(
+            !matches!(err, FsError::Timeout(_)),
+            "a rejected part is not a timeout: {}",
+            err
+        );
+        let err = writer
+            .complete()
+            .await
+            .expect_err("complete after a failed upload must not report success");
+        assert!(
+            !matches!(err, FsError::Timeout(_)),
+            "the retried call keeps the original kind: {}",
+            err
+        );
+    });
+    assert_aborted(&log);
+}
+
+/// `cancel` aborts a multipart upload that has already uploaded parts.
+#[test]
+fn cancel_aborts_the_multipart_upload() {
+    let (fs, log) = scripted_fs(answer_multipart_part_ok);
+    let path = Path::new("s3://bucket/object.bin").unwrap();
+    let rt = AsyncRuntime::single();
+
+    rt.block_on(async move {
+        let mut writer = fs
+            .create(&path, true)
+            .await
+            .expect("create must pass its setup");
+        let data = vec![7u8; 8 * 1024 * 1024 + 1];
+        writer
+            .write(&data)
+            .await
+            .expect("the first chunk is cached");
+        writer
+            .write(&data)
+            .await
+            .expect("the second chunk uploads part 1");
+        writer.cancel().await.expect("cancel never fails");
+    });
+    assert_aborted(&log);
+}
+
+/// Setup for a file rename on S3: the source stat HEAD succeeds. S3 has no
+/// native rename, so the fallback copy (a PUT with `x-amz-copy-source`) stalls.
+fn answer_rename_setup(req: &Request) -> Option<&'static str> {
+    match req.method.as_str() {
+        "HEAD" => Some(HEAD_16_BYTES),
+        _ => None,
+    }
+}
+
+/// The rename fallback copies the whole object on the server, so the copy is
+/// bounded by `opendal.commit_timeout` rather than `opendal.operation_timeout`.
+#[test]
+fn rename_copy_is_bounded_by_commit_timeout() {
+    let (fs, stalled) = scripted_fs(answer_rename_setup);
+    let src = Path::new("s3://bucket/object.bin").unwrap();
+    let dst = Path::new("s3://bucket/renamed.bin").unwrap();
+    let rt = AsyncRuntime::single();
+
+    rt.block_on(async move {
+        let start = Instant::now();
+        let err = fs
+            .rename(&src, &dst)
+            .await
+            .expect_err("a stalled copy must not succeed");
+        assert!(
+            err.to_string().contains("exceeded opendal.commit_timeout"),
+            "the copy must be bounded by commit_timeout: {}",
+            err
+        );
+        assert_bounded_timeout(start, err);
     });
     assert_stalled_at(&stalled, "PUT");
 }

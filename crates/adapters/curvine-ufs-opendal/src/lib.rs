@@ -320,11 +320,18 @@ impl S3OperatorSettings {
     }
 }
 
-/// The error returned when a UFS operation exceeds `opendal.operation_timeout`.
+/// The error returned when a UFS operation exceeds its deadline.
 ///
 /// It is built from the elapsed timer so it converts to `FsError::Timeout`,
-/// which FUSE maps to `ETIMEDOUT` instead of a generic `EIO`.
-fn deadline_error(operation: &str, path: &str, timeout: Duration, elapsed: Elapsed) -> FsError {
+/// which FUSE maps to `ETIMEDOUT` instead of a generic `EIO`. `knob` names the
+/// setting that bounds this operation so the message says what to tune.
+fn deadline_error(
+    operation: &str,
+    path: &str,
+    knob: &str,
+    timeout: Duration,
+    elapsed: Elapsed,
+) -> FsError {
     log::warn!(
         "UFS operation {} on {} exceeded the {:?} deadline ({})",
         operation,
@@ -333,9 +340,20 @@ fn deadline_error(operation: &str, path: &str, timeout: Duration, elapsed: Elaps
         elapsed
     );
     FsError::from(elapsed).ctx(format!(
-        "{} {} exceeded opendal.operation_timeout {:?}",
-        operation, path, timeout
+        "{} {} exceeded {} {:?}",
+        operation, path, knob, timeout
     ))
+}
+
+/// A fresh `FsError::Timeout` with the given context.
+///
+/// `tokio::time::error::Elapsed` has no public constructor, so take one from
+/// a timer that has already expired.
+async fn timeout_error(ctx: String) -> FsError {
+    match tokio::time::timeout(Duration::ZERO, std::future::pending::<()>()).await {
+        Err(elapsed) => FsError::from(elapsed).ctx(ctx),
+        Ok(()) => unreachable!("a pending future never completes"),
+    }
 }
 
 /// Bound one UFS operation by a single hard deadline.
@@ -352,9 +370,27 @@ async fn with_deadline<T>(
     path: &str,
     fut: impl std::future::Future<Output = FsResult<T>>,
 ) -> FsResult<T> {
+    with_named_deadline(
+        OpendalConf::OPERATION_TIMEOUT,
+        timeout,
+        operation,
+        path,
+        fut,
+    )
+    .await
+}
+
+/// [`with_deadline`] for an operation bounded by the setting `knob`.
+async fn with_named_deadline<T>(
+    knob: &str,
+    timeout: Duration,
+    operation: &str,
+    path: &str,
+    fut: impl std::future::Future<Output = FsResult<T>>,
+) -> FsResult<T> {
     match tokio::time::timeout(timeout, fut).await {
         Ok(res) => res,
-        Err(elapsed) => Err(deadline_error(operation, path, timeout, elapsed)),
+        Err(elapsed) => Err(deadline_error(operation, path, knob, timeout, elapsed)),
     }
 }
 
@@ -539,35 +575,88 @@ pub struct OpendalWriter {
     chunk: BytesMut,
     chunk_size: usize,
     writer: Option<opendal::Writer>,
-    /// Hard upper bound for one write/close, including opendal's own retries.
+    /// Hard upper bound for one chunk upload or abort, including opendal's own
+    /// retries.
     operation_timeout: Duration,
-    /// Cause of the first failed upload step. A failed or timed-out chunk upload
-    /// has already drained its bytes from `chunk`, and a failed close has already
+    /// Hard upper bound for the close that commits the object.
+    commit_timeout: Duration,
+    /// The first failed upload step. A failed or timed-out chunk upload has
+    /// already drained its bytes from `chunk`, and a failed close has already
     /// dropped `writer`, so the object can no longer be committed correctly.
     /// Once set, every later write, flush, and complete fails instead of
     /// reporting a partial or missing upload as committed.
-    failed: Option<String>,
+    failed: Option<WriterFailure>,
+}
+
+/// The first failure of an [`OpendalWriter`], kept so a retried call reports
+/// the same kind of error: a timeout stays `FsError::Timeout` (ETIMEDOUT)
+/// instead of degrading to a generic error (EIO).
+struct WriterFailure {
+    timed_out: bool,
+    cause: String,
 }
 
 impl OpendalWriter {
-    fn check_not_failed(&self) -> FsResult<()> {
-        match &self.failed {
-            Some(cause) => err_box!(format!(
-                "UFS writer for {} already failed and cannot be completed: {}",
-                self.object_path, cause
-            )),
-            None => Ok(()),
+    async fn check_not_failed(&self) -> FsResult<()> {
+        let Some(failure) = &self.failed else {
+            return Ok(());
+        };
+        let msg = format!(
+            "UFS writer for {} already failed and cannot be completed: {}",
+            self.object_path, failure.cause
+        );
+        if failure.timed_out {
+            Err(timeout_error(msg).await)
+        } else {
+            err_box!(msg)
         }
     }
 
-    /// Make the first upload failure sticky; see [`Self::failed`].
-    fn record_failure<T>(&mut self, res: FsResult<T>) -> FsResult<T> {
+    /// Make the first upload failure sticky (see [`Self::failed`]) and abort
+    /// the multipart upload it leaves behind.
+    async fn record_failure<T>(&mut self, res: FsResult<T>) -> FsResult<T> {
         if let Err(e) = &res {
             if self.failed.is_none() {
-                self.failed = Some(e.to_string());
+                self.failed = Some(WriterFailure {
+                    timed_out: matches!(e, FsError::Timeout(_)),
+                    cause: e.to_string(),
+                });
             }
+            self.abort_upload().await;
         }
         res
+    }
+
+    /// Best-effort abort of the multipart upload, bounded by
+    /// `opendal.operation_timeout`, so a failed or cancelled writer does not
+    /// leave an incomplete upload whose parts the object store keeps billing.
+    ///
+    /// The abort only reaches the store while `writer` is intact. opendal's
+    /// `RetryLayer` moves the inner writer into a running `write`/`close`, so
+    /// when the deadline drops that call the upload id is dropped with it and
+    /// nothing can abort the upload from here; a bucket lifecycle rule
+    /// (`AbortIncompleteMultipartUpload`) has to clean up that case. A failed
+    /// abort is only logged: the caller keeps the error that caused it.
+    async fn abort_upload(&mut self) {
+        let Some(mut writer) = self.writer.take() else {
+            return;
+        };
+        let object_path = self.object_path.clone();
+        let abort_path = object_path.clone();
+        let res = with_deadline(self.operation_timeout, "abort", &object_path, async move {
+            writer
+                .abort()
+                .await
+                .map_err(|e| opendal_error("Failed to abort writer", &abort_path, e))
+        })
+        .await;
+        if let Err(e) = res {
+            log::warn!(
+                "Failed to abort the upload of {}, its parts may stay in the object store: {}",
+                object_path,
+                e
+            );
+        }
     }
 
     /// Upload one chunk without the outer deadline; see [`Writer::write_chunk`].
@@ -620,7 +709,7 @@ impl Writer for OpendalWriter {
     }
 
     async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
-        self.check_not_failed()?;
+        self.check_not_failed().await?;
         let timeout = self.operation_timeout;
         let object_path = self.object_path.clone();
         let res = with_deadline(
@@ -630,11 +719,11 @@ impl Writer for OpendalWriter {
             self.write_chunk_inner(chunk),
         )
         .await;
-        self.record_failure(res)
+        self.record_failure(res).await
     }
 
     async fn flush(&mut self) -> FsResult<()> {
-        self.check_not_failed()?;
+        self.check_not_failed().await?;
         self.flush_chunk().await?;
         Ok(())
     }
@@ -642,26 +731,38 @@ impl Writer for OpendalWriter {
     async fn complete(&mut self) -> FsResult<()> {
         self.flush().await?;
 
-        if let Some(mut writer) = self.writer.take() {
-            let timeout = self.operation_timeout;
+        if self.writer.is_some() {
+            // `close` uploads the last part and, for a multipart upload, sends
+            // CompleteMultipartUpload, whose duration grows with the number of
+            // parts, so it is bounded by `opendal.commit_timeout`.
+            let timeout = self.commit_timeout;
             let object_path = self.object_path.clone();
-            let close_path = object_path.clone();
-            let res = with_deadline(timeout, "complete", &object_path, async move {
-                writer
-                    .close()
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| opendal_error("Failed to close writer", &close_path, e))
-            })
+            let writer = try_option_mut!(self.writer);
+            let res = with_named_deadline(
+                OpendalConf::COMMIT_TIMEOUT,
+                timeout,
+                "complete",
+                &object_path,
+                async {
+                    writer
+                        .close()
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| opendal_error("Failed to close writer", &object_path, e))
+                },
+            )
             .await;
-            self.record_failure(res)?;
+            if res.is_ok() {
+                self.writer = None;
+            }
+            self.record_failure(res).await?;
         }
 
         Ok(())
     }
 
     async fn cancel(&mut self) -> FsResult<()> {
-        self.writer = None;
+        self.abort_upload().await;
         Ok(())
     }
 
@@ -687,6 +788,9 @@ pub struct OpendalFileSystem {
     /// Hard upper bound for one UFS operation, including opendal's internal
     /// retries. Configured through `opendal.operation_timeout`.
     operation_timeout: Duration,
+    /// Hard upper bound for a UFS operation whose duration grows with the
+    /// object size. Configured through `opendal.commit_timeout`.
+    commit_timeout: Duration,
 }
 
 impl OpendalFileSystem {
@@ -708,10 +812,20 @@ impl OpendalFileSystem {
             .map_err(|e| FsError::common(format!("Failed to parse OpenDAL config: {}", e)))?;
 
         let total_timeout_ms = opendal_conf.total_timeout_ms();
+        // The per-attempt limit of non-IO operations (opendal default 60s) also
+        // applies to a server-side `copy`, so keep it at least as long as
+        // `opendal.commit_timeout`; otherwise every copy attempt would fail at
+        // 60s whatever that setting says. Short operations are still bounded by
+        // `opendal.operation_timeout` outside the retry loop.
+        let attempt_timeout = opendal_conf.commit_timeout.max(Duration::from_secs(60));
 
         let op = base_op
             .layer(LoggingLayer::default())
-            .layer(TimeoutLayer::new().with_io_timeout(Duration::from_millis(total_timeout_ms)))
+            .layer(
+                TimeoutLayer::new()
+                    .with_timeout(attempt_timeout)
+                    .with_io_timeout(Duration::from_millis(total_timeout_ms)),
+            )
             .layer(
                 RetryLayer::new()
                     .with_min_delay(Duration::from_millis(opendal_conf.retry_interval_ms))
@@ -914,6 +1028,7 @@ impl OpendalFileSystem {
             read_chunk_size: opendal_conf.read_chunk_size,
             read_concurrent: opendal_conf.read_concurrent,
             operation_timeout: opendal_conf.operation_timeout,
+            commit_timeout: opendal_conf.commit_timeout,
         })
     }
 
@@ -1244,6 +1359,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             chunk_size: 8 * 1024 * 1024,
             writer: None,
             operation_timeout: self.operation_timeout,
+            commit_timeout: self.commit_timeout,
             failed: None,
         })
     }
@@ -1280,6 +1396,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                         chunk_size: 8 * 1024 * 1024,
                         writer: None,
                         operation_timeout: self.operation_timeout,
+                        commit_timeout: self.commit_timeout,
                         failed: None,
                     });
                 }
@@ -1358,25 +1475,40 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         } else {
             let src_path = self.get_object_path(src)?;
             let dst_path = self.get_object_path(dst)?;
-            self.with_deadline("rename", &src_path, async {
-                if let Err(e) = self.operator.rename(&src_path, &dst_path).await {
-                    if e.kind() == ErrorKind::Unsupported {
+            let native = self
+                .with_deadline("rename", &src_path, async {
+                    match self.operator.rename(&src_path, &dst_path).await {
+                        Ok(()) => Ok(true),
+                        Err(e) if e.kind() == ErrorKind::Unsupported => Ok(false),
+                        Err(e) => Err(opendal_error("Failed to rename file", &src_path, e)),
+                    }
+                })
+                .await?;
+            if !native {
+                // Backends without a native rename (e.g. S3) copy the whole
+                // object on the server, which takes longer for larger objects,
+                // so the copy gets `opendal.commit_timeout`. The delete that
+                // follows is a single short request.
+                with_named_deadline(
+                    OpendalConf::COMMIT_TIMEOUT,
+                    self.commit_timeout,
+                    "rename-copy",
+                    &src_path,
+                    async {
                         self.operator
                             .copy(&src_path, &dst_path)
                             .await
-                            .map_err(|e| {
-                                opendal_error("Failed to copy for rename", &src_path, e)
-                            })?;
-                        self.operator.delete(&src_path).await.map_err(|e| {
-                            opendal_error("Failed to delete source for rename", &src_path, e)
-                        })?;
-                    } else {
-                        return Err(opendal_error("Failed to rename file", &src_path, e));
-                    }
-                }
-                Ok(())
-            })
-            .await?;
+                            .map_err(|e| opendal_error("Failed to copy for rename", &src_path, e))
+                    },
+                )
+                .await?;
+                self.with_deadline("rename-delete", &src_path, async {
+                    self.operator.delete(&src_path).await.map_err(|e| {
+                        opendal_error("Failed to delete source for rename", &src_path, e)
+                    })
+                })
+                .await?;
+            }
         }
 
         Ok(true)
@@ -1560,7 +1692,13 @@ fn bound_stream_by_deadline(
             Ok(Some(item)) => Some((item, Some((stream, timeout, path)))),
             Ok(None) => None,
             Err(elapsed) => Some((
-                Err(deadline_error("list-next", &path, timeout, elapsed)),
+                Err(deadline_error(
+                    "list-next",
+                    &path,
+                    OpendalConf::OPERATION_TIMEOUT,
+                    timeout,
+                    elapsed,
+                )),
                 None,
             )),
         }
@@ -1602,6 +1740,7 @@ mod range_read_tests {
                     read_chunk_size: chunk_size,
                     read_concurrent: OpendalConf::DEFAULT_READ_CONCURRENT,
                     operation_timeout: Duration::from_secs(30),
+                    commit_timeout: Duration::from_secs(600),
                 };
                 let mut reader = fs.open(&path).await.unwrap();
 

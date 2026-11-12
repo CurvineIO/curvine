@@ -199,8 +199,20 @@ pub struct OpendalConf {
     /// one call is `(retry_times + 1)` attempts plus backoff. This bound wraps
     /// the whole call instead, so a blackholed object-store path fails with a
     /// `Timeout` (ETIMEDOUT) instead of staying started indefinitely.
+    ///
+    /// Covers the operations whose cost does not grow with the object size:
+    /// stat, create_dir, create, open, the native rename, delete, list (each
+    /// page pull), one read chunk, one write chunk, and the best-effort abort
+    /// of a failed upload. Whole-object operations use
+    /// [`Self::commit_timeout`] instead.
     /// Configured by [`Self::OPERATION_TIMEOUT`].
     pub operation_timeout: Duration,
+    /// Hard upper bound for a UFS operation whose duration grows with the
+    /// object size: the server-side `copy` of the rename fallback on backends
+    /// without a native rename (e.g. S3), and the writer `close`, which uploads
+    /// the last part and commits a multipart upload.
+    /// Configured by [`Self::COMMIT_TIMEOUT`].
+    pub commit_timeout: Duration,
 }
 
 impl S3Conf {
@@ -587,6 +599,7 @@ impl OpendalConf {
     pub const READ_CHUNK_SIZE: &'static str = "opendal.read_chunk_size";
     pub const READ_CONCURRENT: &'static str = "opendal.read_concurrent";
     pub const OPERATION_TIMEOUT: &'static str = "opendal.operation_timeout";
+    pub const COMMIT_TIMEOUT: &'static str = "opendal.commit_timeout";
 
     // Default values - using S3Conf defaults for consistency
     pub const DEFAULT_RETRY_TIMES: u32 = S3Conf::DEFAULT_RETRY_TIMES; // 3
@@ -600,6 +613,9 @@ impl OpendalConf {
                                                   // budget even after the retry loop, and still allows ~2.2 Mbps for one 8 MiB
                                                   // write chunk. Mounts on very slow links can raise it per mount.
     pub const DEFAULT_OPERATION_TIMEOUT: &'static str = "30s";
+    // A server-side CopyObject or CompleteMultipartUpload of a multi-GiB object
+    // can take minutes; 600s still ends a blackholed commit in bounded time.
+    pub const DEFAULT_COMMIT_TIMEOUT: &'static str = "600s";
 
     /// Create OpendalConf from configuration map
     pub fn from_map(properties: &HashMap<String, String>) -> CommonResult<Self> {
@@ -650,6 +666,14 @@ impl OpendalConf {
             return err_box!("{} must be greater than 0", Self::OPERATION_TIMEOUT);
         }
 
+        let commit_timeout_str = map
+            .get_string(Self::COMMIT_TIMEOUT)
+            .unwrap_or(Self::DEFAULT_COMMIT_TIMEOUT.to_string());
+        let commit_timeout = DurationUnit::from_str(&commit_timeout_str)?.as_duration();
+        if commit_timeout.is_zero() {
+            return err_box!("{} must be greater than 0", Self::COMMIT_TIMEOUT);
+        }
+
         Ok(Self {
             retry_times,
             connect_timeout,
@@ -659,6 +683,7 @@ impl OpendalConf {
             read_chunk_size,
             read_concurrent,
             operation_timeout,
+            commit_timeout,
         })
     }
 
@@ -775,6 +800,24 @@ mod opendal_conf_tests {
                 .as_duration()
         );
         assert_eq!(conf.operation_timeout, Duration::from_secs(30));
+        assert_eq!(conf.commit_timeout, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn commit_timeout_is_user_overridable_and_rejects_zero() {
+        let props = HashMap::from([(OpendalConf::COMMIT_TIMEOUT.to_string(), "90s".to_string())]);
+        let conf = OpendalConf::from_map(&props).unwrap();
+        assert_eq!(conf.commit_timeout, Duration::from_secs(90));
+        assert_eq!(conf.operation_timeout, Duration::from_secs(30));
+
+        for value in ["0", "0s", "not-a-duration"] {
+            let props =
+                HashMap::from([(OpendalConf::COMMIT_TIMEOUT.to_string(), value.to_string())]);
+            assert!(
+                OpendalConf::from_map(&props).is_err(),
+                "{value} should be rejected"
+            );
+        }
     }
 
     #[test]
