@@ -126,3 +126,55 @@ fn rename_with_a_missing_path_reports_file_not_found() {
         .rename("/p/exists", "/p/exists", RenameFlags::empty())
         .unwrap());
 }
+
+#[test]
+fn pending_reads_are_rejected_by_the_public_block_read_entries() {
+    Master::init_test_metrics();
+    let mut conf = ClusterConf::format();
+    conf.testing = true;
+    conf.journal.enable = false;
+    conf.master.trash_enabled = true;
+    conf.master.meta_dir = Utils::test_sub_dir(format!(
+        "master-fs-pending-reads/meta-{}",
+        Utils::rand_str(6)
+    ));
+    conf.journal.journal_dir = Utils::test_sub_dir(format!(
+        "master-fs-pending-reads/journal-{}",
+        Utils::rand_str(6)
+    ));
+    let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+    fs.master_monitor
+        .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+
+    // Build a real pending entry through the trash flow.
+    fs.create("/data/a.log", true).unwrap();
+    fs.delete_with_mode("/data/a.log", false, DeleteMode::Default)
+        .unwrap();
+    let entry = fs.list_trash().unwrap().remove(0);
+    let claimed = fs.claim_trash_entry_for_purge(&entry.path).unwrap();
+    assert!(claimed.is_some(), "the entry must be claimable");
+    let pending_path = trash::pending_entry_path(entry.path.rsplit('/').next().unwrap());
+
+    // The pending entry resolves internally but both public block-read
+    // entries reject it with the resolve_path FileNotFound boundary.
+    let internal = InodePath::resolve(
+        fs.fs_dir.view().unwrap().root_node(),
+        &pending_path,
+        &fs.fs_dir.view().unwrap().store,
+    )
+    .unwrap();
+    assert!(internal.is_full() && internal.get_last_inode().is_some());
+
+    let locations = fs.get_block_locations(&pending_path);
+    let details = fs.get_file_block_details(&pending_path);
+    for (entry_name, err) in [
+        ("get_block_locations", locations.err()),
+        ("get_file_block_details", details.err()),
+    ] {
+        let err = err.unwrap_or_else(|| panic!("{entry_name} must fail on a pending path"));
+        assert!(
+            matches!(err, FsError::FileNotFound(_)),
+            "{entry_name} on a pending path must be FileNotFound, got {err:?}"
+        );
+    }
+}

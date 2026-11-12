@@ -4000,6 +4000,9 @@ impl MasterFilesystem {
     pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
         const MAX_RETRIES: usize = 3;
         let path = path.as_ref();
+        // Client-facing boundary: the pending staging namespace is invisible
+        // to RPC reads, hot path and snapshot fallback alike.
+        Self::check_not_pending_path(path)?;
         let read = |fs_dir: &FsDir, inp: &InodePath| -> FsResult<_> {
             let inode = inp
                 .get_last_inode()
@@ -4221,6 +4224,8 @@ impl MasterFilesystem {
 
     pub fn get_file_block_details<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlockDetails> {
         let path = path.as_ref();
+        // Same client-facing boundary as get_block_locations.
+        Self::check_not_pending_path(path)?;
 
         let (status, block_snapshots, worker_snapshots) = {
             // The snapshot includes mutable inode content; exclude sharded
