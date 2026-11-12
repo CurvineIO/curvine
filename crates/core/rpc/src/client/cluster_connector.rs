@@ -314,10 +314,20 @@ impl ClusterConnector {
         }
 
         while policy.attempt().await {
+            // A zero retry budget still owes the caller one polling round at the
+            // per-attempt timeout: `TimeBondedRetry::attempt()` returns true on
+            // the first call, and a healthy node must be reachable in that
+            // single attempt. Only a budget that has actually been spent (or a
+            // zero `rpc_timeout`) stops the loop.
             let attempt_timeout = self.rpc_timeout.min(policy.remaining());
-            if attempt_timeout.is_zero() {
+            if attempt_timeout.is_zero() && policy.remaining().is_zero() {
                 break;
             }
+            let attempt_timeout = if attempt_timeout.is_zero() {
+                self.rpc_timeout
+            } else {
+                attempt_timeout
+            };
 
             let mut futures: Vec<_> = node_list
                 .iter()
