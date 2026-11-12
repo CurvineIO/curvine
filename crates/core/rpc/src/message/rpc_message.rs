@@ -27,6 +27,7 @@ use std::time::Instant;
 // header length (4 bytes) + body length (4 bytes) + code (1 byte) + status (1 byte) + req_id (8 bytes) + seqId (4 bytes)
 // If an error is returned, the error message is saved in data as a byte array.
 pub const PROTOCOL_SIZE: i32 = 22;
+pub const PROTOCOL_USIZE: usize = PROTOCOL_SIZE as usize;
 
 // Head length
 pub const HEAD_SIZE: i32 = PROTOCOL_SIZE - 4;
@@ -38,6 +39,8 @@ pub const END_SEQ_ID: i32 = -2;
 pub const EMPTY_REQ_ID: i64 = -1;
 
 pub const MAX_DATE_SIZE: i32 = 16 * 1024 * 1024;
+
+pub const MAX_FRAME_SIZE: i32 = 64 * 1024 * 1024;
 
 #[repr(i8)]
 #[derive(Debug, Copy, Clone, PartialEq, IntoPrimitive, FromPrimitive)]
@@ -114,13 +117,17 @@ impl Protocol {
         }
     }
 
-    pub fn create(buf: &mut BytesMut) -> Self {
+    pub fn create(buf: &mut impl Buf) -> Self {
         Protocol {
             code: buf.get_i8(),
             status: Status::from(buf.get_i8()),
             req_id: buf.get_i64(),
             seq_id: buf.get_i32(),
         }
+    }
+
+    pub fn is_heartbeat(&self) -> bool {
+        self.status.0 == RequestStatus::Heartbeat
     }
 }
 
@@ -225,6 +232,10 @@ impl RpcMessage {
         Self::new(protocol, header, data)
     }
 
+    pub fn total_len(&self) -> usize {
+        PROTOCOL_USIZE + self.header_len() + self.data_len()
+    }
+
     pub fn header_len(&self) -> usize {
         match &self.header {
             Some(v) => v.len(),
@@ -279,7 +290,7 @@ impl RpcMessage {
     }
 
     pub fn is_heartbeat(&self) -> bool {
-        self.request_status() == RequestStatus::Heartbeat
+        self.protocol.is_heartbeat()
     }
 
     pub fn to_error_msg(&self) -> String {
@@ -300,7 +311,7 @@ impl RpcMessage {
         }
     }
 
-    pub fn encode_protocol(&self, buf: &mut BytesMut) {
+    pub fn encode_protocol(&self, mut buf: impl BufMut) {
         let header_len = self.header_len();
         let data_len = self.data_len();
 
@@ -325,12 +336,25 @@ impl RpcMessage {
     /// * Protocol - The protocol object created by parsing
     /// * i32 - Header size
     /// * i32 - Data size
-    pub fn decode_protocol(buf: &mut BytesMut) -> IOResult<(Protocol, i32, i32)> {
+    pub fn decode_protocol(buf: &mut impl Buf) -> IOResult<(Protocol, i32, i32)> {
         let total_size = buf.get_i32();
         let header_size = buf.get_i32();
-        let data_size = total_size - header_size - HEAD_SIZE;
+
+        if header_size < 0 {
+            return err_box!("header length is negative: {}", header_size);
+        } else if total_size > MAX_FRAME_SIZE {
+            return err_box!(
+                "Frame exceeds maximum size: {} > {}",
+                total_size,
+                MAX_FRAME_SIZE
+            );
+        }
+
+        let data_size = total_size
+            .saturating_sub(header_size)
+            .saturating_sub(HEAD_SIZE);
         if data_size < 0 {
-            return err_box!("data length is negative");
+            return err_box!("data length is negative: {}", data_size);
         } else if data_size > MAX_DATE_SIZE {
             return err_box!("Data exceeds maximum size: {}", MAX_DATE_SIZE);
         }
@@ -340,13 +364,19 @@ impl RpcMessage {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) -> IOResult<()> {
-        self.encode_protocol(buf);
+        let slice = match &self.data {
+            DataSlice::IOSlice(_) => {
+                return err_box!("Message::encode cannot encode an IOSlice payload")
+            }
+            data => data.as_slice(),
+        };
+
+        self.encode_protocol(&mut *buf);
 
         if let Some(header) = &self.header {
             buf.put_slice(header);
         }
 
-        let slice = self.data.as_slice();
         if !slice.is_empty() {
             buf.put_slice(slice);
         }
@@ -356,9 +386,29 @@ impl RpcMessage {
 
     pub fn decode(buf: &mut BytesMut) -> IOResult<Self> {
         // The BytesMut returned by tokio does not contain the first length byte.
-        let header_size = buf.get_u32() as usize;
+        if buf.remaining() < HEAD_SIZE as usize {
+            return err_box!("frame too short: {} bytes", buf.len());
+        }
 
+        let header_size = buf.get_u32() as usize;
         let protocol = Protocol::create(buf);
+
+        if header_size > buf.remaining() {
+            return err_box!(
+                "header length {} exceeds the frame body {}",
+                header_size,
+                buf.remaining()
+            );
+        }
+
+        let data_size = buf.remaining() - header_size;
+        if data_size > MAX_DATE_SIZE as usize {
+            return err_box!(
+                "Data exceeds maximum size: {} > {}",
+                data_size,
+                MAX_DATE_SIZE
+            );
+        }
 
         let header = if header_size > 0 {
             Some(buf.split_to(header_size))

@@ -220,8 +220,10 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
 mod tests {
     use super::{BlockedRequestGuard, BufferHandler, BLOCKED_REQUESTS};
     use crate::handler::{MessageHandler, RpcFrame, TestMessageHandler};
-    use crate::message::{Message, ResponseStatus};
+    use crate::message::{Builder, Message, ResponseStatus, MAX_FRAME_SIZE};
+    use bytes::BytesMut;
     use curvine_core_error::CommonErrorExt;
+    use curvine_io::DataSlice;
     use curvine_runtime::runtime::{RpcRuntime, Runtime};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
@@ -235,6 +237,20 @@ mod tests {
     struct RuntimeRoutingHandler {
         rt: Runtime,
         executed_on: mpsc::Sender<String>,
+    }
+
+    // Replies with a header the frame budget cannot carry.
+    struct OversizedResponseHandler;
+
+    impl MessageHandler for OversizedResponseHandler {
+        type Error = CommonErrorExt;
+
+        fn handle(&self, msg: &Message) -> Result<Message, Self::Error> {
+            Ok(msg.success_with_data(
+                Some(BytesMut::zeroed(MAX_FRAME_SIZE as usize)),
+                DataSlice::Empty,
+            ))
+        }
     }
 
     impl MessageHandler for RuntimeRoutingHandler {
@@ -308,6 +324,35 @@ mod tests {
         });
 
         drop(held);
+    }
+
+    #[test]
+    fn oversized_response_becomes_an_error_for_that_request() {
+        let runtime = Arc::new(Runtime::current_thread("oversized-response-test"));
+        let limit = Arc::new(Semaphore::new(1));
+        let handler = Arc::new(OversizedResponseHandler);
+        let request = Builder::new_rpc(1i8).build();
+        let req_id = request.req_id();
+
+        runtime.clone().block_on(async {
+            let response = BufferHandler::<RpcFrame, OversizedResponseHandler>::process_request(
+                &runtime,
+                &handler,
+                &limit,
+                Duration::from_millis(50),
+                request,
+            )
+            .await
+            .expect("an oversized response must still answer the request");
+
+            assert_eq!(response.req_id(), req_id);
+            assert_ne!(response.response_status(), ResponseStatus::Success);
+            assert!(
+                response.total_len() <= MAX_FRAME_SIZE as usize,
+                "an oversized reply must never reach the writer, got {} bytes",
+                response.total_len()
+            );
+        });
     }
 
     #[test]
