@@ -3,6 +3,9 @@ name = "curvine-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine master and worker server."
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
