@@ -18,10 +18,13 @@ use curvine_core_error::{err_box, CommonResult};
 use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ProtoUtils;
-use curvine_model::{AccessMode, MountOptions, Provider, StorageType, TtlAction, WriteType};
+use curvine_model::{
+    AccessMode, MountInfo, MountOptions, Provider, StorageType, TtlAction, WriteType,
+};
 use curvine_runtime::common::{ByteUnit, DurationUnit};
 use curvine_unified_fs::{UfsFileSystem, UnifiedFileSystem};
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
@@ -111,6 +114,11 @@ pub struct MountCommand {
     #[arg(long, default_value_t = false)]
     dry_run: bool,
 
+    /// Show the full effective configuration of the mount point that contains the given
+    /// Curvine path, including every `-c` property stored on the master.
+    #[arg(long)]
+    info: Option<String>,
+
     #[arg(long, default_value_t = false)]
     verbose: bool,
 }
@@ -184,6 +192,11 @@ impl MountCommand {
     pub async fn execute(&self, fs: UnifiedFileSystem) -> CommonResult<()> {
         if self.ufs_path.trim() == "resync" {
             return self.execute_resync(fs).await;
+        }
+
+        // Show the full configuration of a single mount point.
+        if let Some(path) = self.info.as_deref() {
+            return self.execute_info(fs, path).await;
         }
 
         // If no path argument is given, all mount points are listed.
@@ -370,6 +383,22 @@ impl MountCommand {
             println!("│ 🔄 first mount detected, start resync...");
             self.run_resync(&fs, &cv_path, "auto").await?;
         }
+        Ok(())
+    }
+
+    async fn execute_info(&self, fs: UnifiedFileSystem, path: &str) -> CommonResult<()> {
+        let path = path.trim();
+        if path.is_empty() {
+            return err_box!("--info requires a Curvine path, e.g. `cv mount --info /mount/point`");
+        }
+
+        let cv_path = Path::from_str(path)?;
+        let mount = match fs.fs_client().get_mount_info(&cv_path).await? {
+            Some(v) => v,
+            None => return err_box!("no mount point found for path: {}", path),
+        };
+
+        print!("{}", format_mount_detail(&mount));
         Ok(())
     }
 
@@ -624,6 +653,118 @@ fn display_config_value<'a>(key: &str, value: &'a str) -> &'a str {
     }
 }
 
+const CLUSTER_DEFAULT: &str = "(cluster default)";
+
+fn write_type_str(write_type: &WriteType) -> &'static str {
+    match write_type {
+        WriteType::CacheMode => "cache_mode",
+        WriteType::FsMode => "fs_mode",
+    }
+}
+
+fn access_mode_str(access_mode: &AccessMode) -> &'static str {
+    match access_mode {
+        AccessMode::ReadOnly => "read_only",
+        AccessMode::ReadWrite => "read_write",
+    }
+}
+
+fn ttl_action_str(ttl_action: &TtlAction) -> &'static str {
+    match ttl_action {
+        TtlAction::None => "none",
+        TtlAction::Delete => "delete",
+        TtlAction::Free => "free",
+    }
+}
+
+fn storage_type_str(storage_type: Option<StorageType>) -> String {
+    match storage_type {
+        None => CLUSTER_DEFAULT.to_string(),
+        Some(v) => match v {
+            StorageType::Mem => "mem".to_string(),
+            StorageType::Ssd => "ssd".to_string(),
+            StorageType::Hdd => "hdd".to_string(),
+            StorageType::Ufs => "ufs".to_string(),
+            StorageType::Disk => "disk".to_string(),
+            StorageType::SpdkDisk => "spdk_disk".to_string(),
+        },
+    }
+}
+
+fn provider_str(provider: Option<Provider>) -> String {
+    match provider {
+        None => CLUSTER_DEFAULT.to_string(),
+        Some(Provider::Auto) => "auto".to_string(),
+        Some(Provider::OssHdfs) => "oss-hdfs".to_string(),
+        Some(Provider::Opendal) => "opendal".to_string(),
+    }
+}
+
+fn duration_str(ttl_ms: i64) -> String {
+    if ttl_ms < 0 {
+        return ttl_ms.to_string();
+    }
+    DurationUnit::new(ttl_ms as u64).to_string()
+}
+
+fn block_size_str(block_size: Option<i64>) -> String {
+    match block_size {
+        None => CLUSTER_DEFAULT.to_string(),
+        Some(v) if v < 0 => v.to_string(),
+        Some(v) => ByteUnit::new(v as u64).to_string(),
+    }
+}
+
+fn replicas_str(replicas: Option<i32>) -> String {
+    match replicas {
+        None => CLUSTER_DEFAULT.to_string(),
+        Some(v) => v.to_string(),
+    }
+}
+
+fn format_mount_detail(mount: &MountInfo) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "Mount point: {}", mount.cv_path);
+    let mut field = |name: &str, value: String| {
+        let _ = writeln!(out, "  {:<16}{}", format!("{}:", name), value);
+    };
+
+    field("Mount ID", mount.mount_id.to_string());
+    field("UFS Path", mount.ufs_path.clone());
+    field("Provider", provider_str(mount.provider));
+    field("Write Type", write_type_str(&mount.write_type).to_string());
+    field(
+        "Access Mode",
+        access_mode_str(&mount.access_mode).to_string(),
+    );
+    field("Auto Cache", (mount.auto_cache).to_string());
+    field("Write Cache", (mount.write_cache).to_string());
+    field("Read Verify UFS", (mount.read_verify_ufs).to_string());
+    field("TTL", duration_str(mount.ttl_ms));
+    field("TTL Action", ttl_action_str(&mount.ttl_action).to_string());
+    field("Storage Type", storage_type_str(mount.storage_type));
+    field("Block Size", block_size_str(mount.block_size));
+    field("Replicas", replicas_str(mount.replicas));
+
+    if mount.properties.is_empty() {
+        let _ = writeln!(out, "  Properties: (none)");
+    } else {
+        let _ = writeln!(out, "  Properties ({}):", mount.properties.len());
+        let mut keys: Vec<&String> = mount.properties.keys().collect();
+        keys.sort();
+        for key in keys {
+            let _ = writeln!(
+                out,
+                "    {} = {}",
+                key,
+                display_config_value(key, &mount.properties[key])
+            );
+        }
+    }
+
+    out
+}
+
 fn is_sensitive_config_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
 
@@ -663,10 +804,12 @@ fn s3_uses_environment_credential(properties: &HashMap<String, String>) -> bool 
 #[cfg(test)]
 mod tests {
     use super::{
-        display_config_value, is_sensitive_config_key, s3_uses_environment_credential, MountCommand,
+        display_config_value, format_mount_detail, is_sensitive_config_key,
+        s3_uses_environment_credential, MountCommand,
     };
     use clap::Parser;
-    use curvine_model::MountInfo;
+    use curvine_model::{AccessMode, MountInfo, Provider, TtlAction, WriteType};
+    use curvine_runtime::common::DurationUnit;
     use std::collections::HashMap;
 
     fn parse_mount_info(args: &[&str]) -> MountInfo {
@@ -698,6 +841,74 @@ mod tests {
         let info = parse_mount_info(&["--ttl-ms", "7d", "--auto-cache", "false"]);
         assert_eq!(info.ttl_ms, 7 * 24 * 60 * 60 * 1000);
         assert!(!info.auto_cache());
+    }
+
+    #[test]
+    fn mount_detail_shows_all_fields_and_masks_secrets() {
+        let mount = MountInfo {
+            cv_path: "/hll_dwb.db/dwb_order_base_1d_tm".to_string(),
+            ufs_path: "cosn://bigdatahll2/warehouse/table".to_string(),
+            mount_id: 3,
+            properties: HashMap::from([
+                ("cosn.region".to_string(), "ap-guangzhou".to_string()),
+                (
+                    "fs.cosn.userinfo.appid".to_string(),
+                    "1252161381".to_string(),
+                ),
+                (
+                    "s3.credentials.secret".to_string(),
+                    "super-secret-value".to_string(),
+                ),
+            ]),
+            ttl_ms: DurationUnit::DAY as i64,
+            ttl_action: TtlAction::Delete,
+            read_verify_ufs: true,
+            storage_type: None,
+            block_size: None,
+            replicas: Some(3),
+            write_type: WriteType::CacheMode,
+            provider: Some(Provider::Auto),
+            auto_cache: true,
+            access_mode: AccessMode::ReadOnly,
+            write_cache: false,
+        };
+
+        let out = format_mount_detail(&mount);
+
+        // Structural fields are all visible.
+        for expected in [
+            "Mount point: /hll_dwb.db/dwb_order_base_1d_tm",
+            "UFS Path:",
+            "cosn://bigdatahll2/warehouse/table",
+            "Write Type:",
+            "cache_mode",
+            "Access Mode:",
+            "read_only",
+            "Read Verify UFS:",
+            "TTL:",
+            "1d",
+            "TTL Action:",
+            "delete",
+            "Replicas:",
+            "3",
+            "(cluster default)",
+            "Properties (3):",
+        ] {
+            assert!(
+                out.contains(expected),
+                "missing `{}` in:\n{}",
+                expected,
+                out
+            );
+        }
+
+        // Non-secret properties are shown in full.
+        assert!(out.contains("cosn.region = ap-guangzhou"));
+        assert!(out.contains("fs.cosn.userinfo.appid = 1252161381"));
+
+        // Secret properties are masked.
+        assert!(out.contains("s3.credentials.secret = ******"));
+        assert!(!out.contains("super-secret-value"));
     }
 
     #[test]
