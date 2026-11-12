@@ -5696,6 +5696,10 @@ impl MasterFilesystem {
 
     pub fn get_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
+        // The pending staging directory is not client-visible; reject it once
+        // at the entry so the locked path and the snapshot fallback share the
+        // same boundary (same pattern as the file_status entry).
+        Self::check_not_pending_path(path)?;
 
         // Shared-view read under the target chain's inode read locks, the same
         // plan/lock/re-verify protocol as file_status_memory: the lock metadata

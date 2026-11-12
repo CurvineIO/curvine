@@ -55,3 +55,19 @@ fn write_planning_walks_live_edges_and_keeps_partial_ids() {
     let (_, _, _, planned) = fs.resolve_edge_ids("/a").unwrap();
     assert_eq!(planned, epoch);
 }
+
+#[test]
+fn get_lock_rejects_the_pending_staging_namespace() {
+    let fs = test_fs("get-lock-pending");
+
+    // The pending staging directory is not client-visible: the public entry
+    // must reject it with the same FileNotFound boundary as resolve_path,
+    // for both the locked path and the snapshot fallback.
+    let err = fs
+        .get_lock("/.Trash/.pending/1-2", FileLock::default())
+        .unwrap_err();
+    assert!(
+        matches!(err, FsError::FileNotFound(_)),
+        "get_lock on a pending path must be FileNotFound, got {err:?}"
+    );
+}
