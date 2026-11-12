@@ -530,9 +530,10 @@ impl MasterFilesystem {
         }
     }
 
-    /// The single exclusive path: closes the commit gate, holds the cold
-    /// handle across the whole operation, and fails closed when publication
-    /// or the commit wait fails.
+    /// The single exclusive path: closes the commit gate across the whole
+    /// operation; the cold owner covers the body and is released before the
+    /// real confirmation wait; publication or confirmation failure fails the
+    /// holder closed.
     fn run_metadata_write_exclusive<R>(
         &self,
         epoch: u64,
@@ -555,6 +556,13 @@ impl MasterFilesystem {
                     drop(_gate);
                     return Err(e);
                 }
+                // The confirmation guard is armed while the cold owner still
+                // holds the unique view: a confirmation error — or a panic in
+                // the wait — goes terminal before the gate guard is released.
+                let mut confirmation = ExclusiveConfirmation {
+                    handle: Some(&self.fs_dir),
+                    writer: &self.journal_writer,
+                };
                 let result = body(&mut cold);
                 // Terminal check while the cold owner still holds the unique
                 // view: a publication failure recorded during the body must
@@ -563,14 +571,19 @@ impl MasterFilesystem {
                     // The guard's own terminal path retires the taken view,
                     // fences the writer and removes the slot.
                     cold.fail_closed();
-                    drop(_gate);
+                    // The exclusive gate stays closed across the real wait
+                    // even for a FAILED holder: snapshot/restore rely on this
+                    // static boundary, not on RPC view rejection.
                     let commit = scope.wait();
-                    if let Err(commit_err) = commit {
-                        return Err(commit_err);
-                    }
-                    return Err(FsError::common(
-                        "metadata publication failed; namespace fenced",
-                    ));
+                    confirmation.disarm();
+                    drop(_gate);
+                    // The original operation error keeps its variant and
+                    // context; op Err takes priority over a commit error.
+                    return match (result, commit) {
+                        (Err(op_err), _) => Err(op_err),
+                        (Ok(_), Err(commit_err)) => Err(commit_err),
+                        (Ok(value), Ok(())) => Ok(value),
+                    };
                 }
                 // Body complete (or a pure validation/store error that allows
                 // backfill): release the cold owner before the confirmation
@@ -578,27 +591,8 @@ impl MasterFilesystem {
                 // RPC writes, snapshots and restores cannot cross it; the
                 // applier can take the view to advance the real ack.
                 drop(cold);
-                // Guards the confirmation window: disarmed on success,
-                // terminal on confirmation error or wait panic, all before
-                // the gate guard is released.
-                let mut confirmation = ExclusiveConfirmation {
-                    handle: Some(&self.fs_dir),
-                    writer: &self.journal_writer,
-                };
-                confirmation.arm();
                 let commit = scope.wait();
-                let commit = match commit {
-                    Ok(()) => {
-                        confirmation.disarm();
-                        Ok(())
-                    }
-                    Err(commit_err) => {
-                        // The confirmation failed: terminal before the gate
-                        // opens. The commit error keeps its original meaning.
-                        confirmation.fail_terminal();
-                        Err(commit_err)
-                    }
-                };
+                confirmation.disarm();
                 drop(confirmation);
                 match (result, commit) {
                     (Ok(value), Ok(())) => {
