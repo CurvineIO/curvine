@@ -589,8 +589,8 @@ class S3MetadataTest:
             )
             retrieved_metadata = response.get('Metadata', {})
             
-            # Check if all metadata keys are present
-            success = all(key in retrieved_metadata for key in metadata.keys())
+            # Exactly the uploaded metadata: no internal fields injected (#2094)
+            success = retrieved_metadata == metadata
             self._record_test("Custom Metadata Retrieval", success)
             
             if success:
