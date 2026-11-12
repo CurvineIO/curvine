@@ -269,9 +269,17 @@ impl ClusterConnector {
             // With other members to fail over to, the probe may use at most half
             // of the budget; otherwise a stalled leader would consume the whole
             // budget and the call would fail without trying any other node.
-            let mut leader_timeout = self.rpc_timeout.min(policy.remaining());
+            let remaining = policy.remaining();
+            if remaining.is_zero() {
+                // Budget already spent (e.g. a prior attempt consumed it): do
+                // not issue a zero-timeout probe, which would only report
+                // "deadline has elapsed" instead of "no budget left".
+                let err = err_msg!("rpc budget exhausted");
+                return Err(IOError::create(err).into());
+            }
+            let mut leader_timeout = self.rpc_timeout.min(remaining);
             if self.group.len() > 1 {
-                leader_timeout = leader_timeout.min(policy.remaining() / 2);
+                leader_timeout = leader_timeout.min(remaining / 2);
             }
             match self
                 .timeout_rpc_within(id, msg.clone(), leader_timeout)
