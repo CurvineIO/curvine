@@ -99,14 +99,10 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
         let result = worker_fs.delete("/dir", true);
         delete_done_tx.send(result).unwrap();
     });
-    delete_started_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("delete worker started");
+    let started = delete_started_rx.recv_timeout(Duration::from_secs(5));
 
-    // The queued receipt arrives with its completion still held: the delete
-    // is applied to the live namespace but NOT yet confirmed. Every
-    // observation is saved as a Result/bool — nothing asserts mid-flow.
-    let queued = writer
+    // Phase 2: hold the unique receipt and observe the body completing.
+    let mut queued = writer
         .receiver
         .as_ref()
         .unwrap()
@@ -120,11 +116,12 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
             JournalEntry::Delete(entry) if entry.path == "/dir"
         )
     );
-    let completion = queued.as_ref().ok().and_then(|q| q.completion.clone());
+    // Take the unique Sender out of the queued entry (no clone): dropping it
+    // is the real confirmation break.
+    let completion = queued.as_mut().ok().and_then(|q| q.completion.take());
+    let completion_present = completion.is_some();
 
-    // While the receipt is held: wait (bounded) for the body to finish and
-    // the cold owner to be released — the view reopens and the live edge is
-    // already deleted, while the confirmation is still pending.
+    // Phase 2 observations (no asserts yet).
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let view_while_held = loop {
         match fs.fs_dir.view() {
@@ -138,12 +135,15 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
     let dir_live = fs.file_status("/dir");
     let seq_while_held = fs.journal_writer.failure_seq();
     let worker_probe = delete_done_rx.recv_timeout(Duration::from_millis(100));
+    let worker_still_pending = matches!(
+        worker_probe,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
 
-    // Drop the completion: the confirmation wait fails for real, the RAII
-    // guard goes terminal before the exclusive gate opens.
+    // Phase 3: drop the unique receipt (real confirmation break), drain the
+    // controlled queue, then classify the final done observation. Only a
+    // completed/Disconnected observation may join.
     drop(completion);
-    // Drain the controlled queue before waiting on done/join (single writer
-    // Arc; this fixture's real entry was already received above).
     loop {
         match writer.receiver.as_ref().unwrap().lock().unwrap().try_recv() {
             Ok(entry) => drop(entry),
@@ -152,35 +152,45 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
     }
 
     let delete_done = delete_done_rx.recv_timeout(Duration::from_secs(10));
-    // Only a completed observation may join; a Timeout must fail explicitly
-    // without joining a still-running worker or touching locks it may hold.
     let worker_join = match &delete_done {
         Ok(_) => Some(worker.join()),
-        Err(_) => None, // Timeout: do not join a still-running worker
+        // Disconnected: the worker exited without sending (already safe to
+        // join for panic evidence).
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(worker.join()),
+        // Timeout: do not join a still-running worker; report and skip any
+        // teardown step that could wait on locks this worker holds.
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
     };
 
-    // Collect terminal observations while the fixture is alive.
+    // Phase 4: terminal observations while the fixture is alive (completed
+    // paths only).
     let holder_failed = fs.fs_dir.is_failed();
     let view_err = fs.fs_dir.view().err();
     let begin_err = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).err();
     let writer_fenced = writer.ensure_metadata_current().is_err();
     let failure_seq_after = fs.journal_writer.failure_seq();
-    let cursor_err = pre_cursor.get_applied_req(1);
-
-    // Teardown: drop the filesystem handles and consume the journal system,
-    // then remove this case's unique temp paths. remove_dir_all errors are
-    // saved, not swallowed.
-    drop(fs);
-    journal.shutdown();
+    let cursor_after = pre_cursor.get_applied_req(77);
+    let delete_err = delete_done
+        .as_ref()
+        .ok()
+        .and_then(|result| result.as_ref().err())
+        .map(|err| err.to_string());
     let meta_cleanup = std::fs::remove_dir_all(&meta_dir);
     let journal_cleanup = std::fs::remove_dir_all(&journal_dir);
+    drop(fs);
+    drop(writer);
+    journal.shutdown();
 
-    // Outer assertions, after full teardown.
-    let queued = queued.expect("the delete journal entry must be queued");
+    // Phase 5: outer assertions.
+    started.expect("worker must start within the bound");
     assert!(
         is_dir_delete,
         "the queued entry must be the /dir delete, got {:?}",
-        queued.entry
+        queued
+    );
+    assert!(
+        completion_present,
+        "the queued entry must carry a commit confirmation"
     );
     assert!(
         view_while_held.is_none(),
@@ -195,18 +205,17 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
         "no publication failure should be recorded while the receipt is held"
     );
     assert!(
-        matches!(
-            worker_probe,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ),
+        worker_still_pending,
         "the delete must still be waiting for its confirmation, got {worker_probe:?}"
     );
 
-    let delete_result = delete_done.expect("the delete must finish once the confirmation fails");
-    let delete_err = match delete_result {
-        Ok(_) => panic!("the delete must fail on a dropped confirmation"),
-        Err(err) => err,
-    };
+    let delete_err = delete_err.expect("the delete must finish once the confirmation fails");
+    assert!(
+        delete_err
+            .to_string()
+            .contains("journal commit failed after metadata commit"),
+        "the delete must surface the real commit error, got {delete_err}"
+    );
 
     assert!(
         holder_failed,
@@ -228,13 +237,7 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
         failure_seq_after, failure_seq_before,
         "the confirmation failure must be recorded on the failure sequence"
     );
-    assert!(
-        delete_err
-            .to_string()
-            .contains("journal commit failed after metadata commit"),
-        "the delete must surface the real commit error, got {delete_err}"
-    );
-    let cursor_err = cursor_err.expect_err("the retired cursor must fail point lookups");
+    let cursor_err = cursor_after.expect_err("the retired cursor must fail point lookups");
     assert!(
         cursor_err
             .to_string()
