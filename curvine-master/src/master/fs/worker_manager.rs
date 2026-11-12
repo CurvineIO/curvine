@@ -483,14 +483,6 @@ impl WorkerManager {
         }
         res
     }
-
-    pub fn worker_list(&self) -> Vec<String> {
-        let mut res = vec![];
-        for (_, worker) in self.worker_map.workers.iter() {
-            res.push(worker.simple_string())
-        }
-        res
-    }
 }
 
 impl Display for WorkerManager {
