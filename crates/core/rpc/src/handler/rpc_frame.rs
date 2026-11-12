@@ -326,16 +326,21 @@ mod tests {
 
         let mut head = [0u8; PROTOCOL_USIZE];
         peer_read.read_exact(&mut head).await.unwrap();
-        let mut rest = Vec::new();
-        let extra = tokio::time::timeout(
+
+        // The peer keeps the connection open, so read_to_end could only report
+        // the timeout and would hide a leak: one leaked byte must surface as a
+        // successful read before the deadline.
+        let mut extra = [0u8; 1];
+        let read = tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            peer_read.read_to_end(&mut rest),
+            peer_read.read(&mut extra),
         )
         .await;
         assert!(
-            extra.is_err(),
-            "send leaked buffered read-ahead bytes: {:?}",
-            rest
+            read.is_err(),
+            "send leaked buffered read-ahead byte {:?}: {:?}",
+            extra[0],
+            read
         );
     }
 

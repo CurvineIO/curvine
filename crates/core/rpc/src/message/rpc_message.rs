@@ -401,6 +401,15 @@ impl RpcMessage {
             );
         }
 
+        let data_size = buf.remaining() - header_size;
+        if data_size > MAX_DATE_SIZE as usize {
+            return err_box!(
+                "Data exceeds maximum size: {} > {}",
+                data_size,
+                MAX_DATE_SIZE
+            );
+        }
+
         let header = if header_size > 0 {
             Some(buf.split_to(header_size))
         } else {

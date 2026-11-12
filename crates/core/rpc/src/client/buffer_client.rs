@@ -186,6 +186,8 @@ impl BufferClient {
                 client_state.set_error(e);
                 break;
             }
+
+            msgs.clear();
         }
 
         Self::check_calls(call_map, client_state)

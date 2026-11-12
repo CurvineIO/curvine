@@ -70,7 +70,7 @@ impl Default for RpcCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::HEAD_SIZE;
+    use crate::message::{HEAD_SIZE, MAX_DATE_SIZE};
     use bytes::BufMut;
 
     #[test]
@@ -84,6 +84,31 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_u32(64);
         buf.put_bytes(0, (HEAD_SIZE - 4) as usize);
+        assert!(Message::decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn decode_accepts_header_above_max_date_size() {
+        // Large header-only responses such as ListStatus are legitimate: the
+        // producer-side frame budget bounds them, not the data-section budget.
+        let header = 17 * 1024 * 1024;
+        let mut buf = BytesMut::new();
+        buf.put_u32(header as u32);
+        buf.put_bytes(0, (HEAD_SIZE - 4) as usize);
+        buf.put_bytes(0, header);
+
+        let msg = Message::decode(&mut buf).expect("a header above the data limit is legal");
+        assert_eq!(msg.header_len(), header);
+    }
+
+    #[test]
+    fn decode_rejects_data_section_above_max_date_size() {
+        // Same frame the frame decoder rejects: no header, 17 MiB of data.
+        let mut buf = BytesMut::new();
+        buf.put_u32(0);
+        buf.put_bytes(0, (HEAD_SIZE - 4) as usize);
+        buf.put_bytes(0, MAX_DATE_SIZE as usize + 1024 * 1024);
+
         assert!(Message::decode(&mut buf).is_err());
     }
 }

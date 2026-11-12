@@ -153,10 +153,9 @@ impl IOUtils {
         buf: &mut FrameBuf,
         need: usize,
     ) -> IOResult<bool> {
-        let shortfall = need
-            .saturating_sub(buf.len())
-            .max(FrameBuf::DEFAULT_BUF_SIZE);
-        buf.reserve(shortfall);
+        let shortfall = need.saturating_sub(buf.len());
+        let step = shortfall.min(buf.len().max(FrameBuf::DEFAULT_BUF_SIZE));
+        buf.reserve(step.max(1));
         Ok(io.read_buf(buf.deref_mut()).await? > 0)
     }
 
@@ -320,5 +319,48 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+    }
+
+    #[tokio::test]
+    async fn fill_reserves_by_received_bytes_not_declared_length() {
+        use crate::handler::FrameBuf;
+        use crate::message::{HEAD_SIZE, PROTOCOL_USIZE};
+        use bytes::BufMut;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (mut server_read, _) = tokio::io::split(server);
+        let (_, mut client_write) = tokio::io::split(client);
+
+        // Head only: a legal 60 MiB header, and no body byte ever arrives.
+        let mut head = bytes::BytesMut::with_capacity(PROTOCOL_USIZE);
+        head.put_i32(60 * 1024 * 1024);
+        head.put_i32(60 * 1024 * 1024 - HEAD_SIZE);
+        head.put_i8(1);
+        head.put_i8(1);
+        head.put_i64(1);
+        head.put_i32(0);
+        assert_eq!(head.len(), PROTOCOL_USIZE);
+        client_write.write_all(&head).await.unwrap();
+        client_write.flush().await.unwrap();
+
+        let mut buf = FrameBuf::new(0);
+        let res = tokio::time::timeout(
+            Duration::from_millis(100),
+            IOUtils::receive_buffered(&mut server_read, &mut buf),
+        )
+        .await;
+        assert!(res.is_err(), "receive must wait for the declared body");
+
+        assert!(
+            buf.capacity() <= 64 * 1024,
+            "a head-only frame must not reserve the declared length, capacity = {}",
+            buf.capacity()
+        );
     }
 }
