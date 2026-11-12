@@ -50,6 +50,12 @@ enum StatProbe {
     Miss(Path),
 }
 
+struct DotTarget<'a> {
+    ino: u64,
+    name: Cow<'a, str>,
+    root_status: Option<FileStatus>,
+}
+
 /// Outcome of one `NodeState::clear` sweep over the dcache.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EvictStats {
@@ -226,15 +232,18 @@ impl NodeState {
     ) -> FuseResult<fuse_attr> {
         let record = is_real_lookup && metrics_enabled;
 
+        let caller_status = status.clone();
         let mut dir = self.dir_write();
         let cache_hit = record && dir.get_inode(parent, Some(name)).is_some();
         let before = dir.inode_lens();
-        let attr = {
-            let inode = dir.lookup(parent, name, status.clone(), true)?;
-            inode.to_attr(&self.conf)?
-        };
+        let status = dir
+            .lookup(parent, name, caller_status, true)?
+            .status
+            .clone();
         let after = dir.inode_lens();
         drop(dir);
+
+        let attr = FuseUtils::status_to_attr(&self.conf, &status)?;
 
         for _ in 0..after.saturating_sub(before) {
             FuseMetrics::with(|m| {
@@ -1046,38 +1055,53 @@ impl NodeState {
         Ok(status)
     }
 
-    pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
-        if name == FUSE_CURRENT_DIR || name == FUSE_PARENT_DIR {
-            let dir = self.dir_read();
-            let inode = dir.get_inode_check(ino, None)?;
-            let to_root = inode.is_root()
-                || (name == FUSE_PARENT_DIR && dir.get_inode_check(inode.parent, None)?.is_root());
-            if to_root {
-                let root = dir.get_inode_check(FUSE_ROOT_ID, None)?;
-                if self.conf.metrics_enabled {
-                    FuseMetrics::with(|m| m.record_node_cache_lookup(CACHE_RESULT_HIT));
-                }
-                let mut attr = root.to_attr(&self.conf)?;
-                attr.ino = FUSE_ROOT_ID;
-                return Ok(attr);
-            }
-        }
-
-        let (ino, cow_name) = if name == FUSE_CURRENT_DIR {
-            let dir = self.dir_read();
-            let inode = dir.get_inode_check(ino, None)?;
-            (inode.parent, Cow::Owned(inode.name.to_owned()))
-        } else if name == FUSE_PARENT_DIR {
-            let dir = self.dir_read();
-            let inode = dir.get_inode_check(ino, None)?;
-            let parent_inode = dir.get_inode_check(inode.parent, None)?;
-            (
-                parent_inode.parent,
-                Cow::Owned(parent_inode.name.to_owned()),
-            )
+    fn resolve_dot<'a>(&self, ino: u64, name: &'a str) -> FuseResult<DotTarget<'a>> {
+        let dir = self.dir_read();
+        let inode = dir.get_inode_check(ino, None)?;
+        let parent_inode = if name == FUSE_PARENT_DIR && !inode.is_root() {
+            Some(dir.get_inode_check(inode.parent, None)?)
         } else {
-            (ino, Cow::Borrowed(name))
+            None
         };
+        let to_root = inode.is_root() || parent_inode.is_some_and(|p| p.is_root());
+
+        if to_root {
+            Ok(DotTarget {
+                ino: FUSE_ROOT_ID,
+                name: Cow::Borrowed(name),
+                root_status: Some(dir.get_inode_check(FUSE_ROOT_ID, None)?.status.clone()),
+            })
+        } else if let Some(parent_inode) = parent_inode {
+            Ok(DotTarget {
+                ino: parent_inode.parent,
+                name: Cow::Owned(parent_inode.name.to_owned()),
+                root_status: None,
+            })
+        } else {
+            Ok(DotTarget {
+                ino: inode.parent,
+                name: Cow::Owned(inode.name.to_owned()),
+                root_status: None,
+            })
+        }
+    }
+
+    pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
+        let (ino, cow_name, root_status) = if name == FUSE_CURRENT_DIR || name == FUSE_PARENT_DIR {
+            let dot = self.resolve_dot(ino, name)?;
+            (dot.ino, dot.name, dot.root_status)
+        } else {
+            (ino, Cow::Borrowed(name), None)
+        };
+
+        if let Some(status) = root_status {
+            if self.conf.metrics_enabled {
+                FuseMetrics::with(|m| m.record_node_cache_lookup(CACHE_RESULT_HIT));
+            }
+            let mut attr = FuseUtils::status_to_attr(&self.conf, &status)?;
+            attr.ino = FUSE_ROOT_ID;
+            return Ok(attr);
+        }
 
         let name = cow_name.as_ref();
 
@@ -1109,19 +1133,19 @@ impl NodeState {
     }
 
     pub async fn update_writer_len(&self, attr: &mut fuse_attr) {
-        if let Some(len) = self.get_writer_len(attr.ino).await {
-            attr.size = attr.size.max(len)
-        }
+        let Some(writer) = self.find_writer(attr.ino).await else {
+            return;
+        };
 
-        if let Some(mtime) = self.get_writer_mtime(attr.ino).await {
-            (attr.mtime, attr.mtimensec) = FuseUtils::millis_to_fuse_timestamp(mtime);
-            if FuseUtils::fuse_timestamp_is_later(
-                (attr.mtime, attr.mtimensec),
-                (attr.ctime, attr.ctimensec),
-            ) {
-                attr.ctime = attr.mtime;
-                attr.ctimensec = attr.mtimensec;
-            }
+        attr.size = attr.size.max(writer.len() as u64);
+
+        (attr.mtime, attr.mtimensec) = FuseUtils::millis_to_fuse_timestamp(writer.mtime());
+        if FuseUtils::fuse_timestamp_is_later(
+            (attr.mtime, attr.mtimensec),
+            (attr.ctime, attr.ctimensec),
+        ) {
+            attr.ctime = attr.mtime;
+            attr.ctimensec = attr.mtimensec;
         }
     }
 
@@ -2354,6 +2378,59 @@ mod test {
                 .await
                 .unwrap();
             assert_eq!(parent.ino, FUSE_ROOT_ID);
+        });
+    }
+
+    #[test]
+    fn fs_lookup_non_root_dot_and_grandchild_dotdot_resolve_to_expected_inodes() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.enable_meta_cache = Some(true);
+            conf.fuse.metrics_enabled = false;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let (a_ino, b_ino) = {
+                let mut dir = state.dir_write();
+                let a_ino = dir
+                    .lookup(
+                        FUSE_ROOT_ID,
+                        "a",
+                        FileStatus::with_name(41, "a".to_string(), true),
+                        true,
+                    )
+                    .unwrap()
+                    .ino;
+                let b_ino = dir
+                    .lookup(
+                        a_ino,
+                        "b",
+                        FileStatus::with_name(42, "b".to_string(), true),
+                        true,
+                    )
+                    .unwrap()
+                    .ino;
+                (a_ino, b_ino)
+            };
+
+            let dot = state
+                .fs_lookup(b_ino, crate::FUSE_CURRENT_DIR)
+                .await
+                .unwrap();
+            assert_eq!(
+                dot.ino, b_ino,
+                "'.' on a non-root inode must resolve to that inode"
+            );
+
+            let dotdot = state
+                .fs_lookup(b_ino, crate::FUSE_PARENT_DIR)
+                .await
+                .unwrap();
+            assert_eq!(
+                dotdot.ino, a_ino,
+                "'..' on a grandchild must resolve to its parent"
+            );
         });
     }
 
