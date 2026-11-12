@@ -23,86 +23,6 @@ use curvine_model::state::FileType;
 use curvine_model::BlockLocation;
 use std::collections::HashMap;
 
-#[test]
-fn build_located_blocks_rejects_short_non_tail_block_like_the_live_path() {
-    let fs = test_fs("located-blocks-builder");
-
-    // Two blocks: the non-tail one is shorter than the file's block size —
-    // the same corruption the live path rejects.
-    let mut file = InodeFile::new(1, 0);
-    file.block_size = 1024;
-    file.blocks = vec![BlockMeta::new(101, 512), BlockMeta::new(102, 256)];
-    let mut locations = HashMap::new();
-    locations.insert(101, vec![BlockLocation::with_id(100)]);
-    locations.insert(102, vec![BlockLocation::with_id(100)]);
-
-    let err = fs
-        .build_located_blocks("/file", &file, locations)
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("block status abnormal"),
-        "the non-tail length check must fire, got {err}"
-    );
-}
-
-#[test]
-fn build_located_blocks_orders_blocks_and_reports_status() {
-    let fs = test_fs("located-blocks-builder-ok");
-    let mut worker = WorkerInfo::default();
-    worker.address.worker_id = 100;
-    fs.add_test_worker(worker);
-
-    let mut file = InodeFile::new(2, 0);
-    file.block_size = 1024;
-    file.blocks = vec![BlockMeta::new(201, 1024), BlockMeta::new(202, 512)];
-    let mut locations = HashMap::new();
-    locations.insert(201, vec![BlockLocation::with_id(100)]);
-    locations.insert(202, vec![BlockLocation::with_id(100)]);
-
-    let blocks = fs.build_located_blocks("/file", &file, locations).unwrap();
-    assert_eq!(blocks.len(), 2);
-    assert_eq!(blocks[0].block.id, 201);
-    assert_eq!(blocks[0].block.len, 1024);
-    assert_eq!(
-        blocks[0]
-            .locs
-            .iter()
-            .map(|l| l.worker_id)
-            .collect::<Vec<_>>(),
-        vec![100]
-    );
-    assert_eq!(blocks[1].block.id, 202);
-    assert_eq!(blocks[1].block.len, 512);
-    assert_eq!(
-        blocks[1]
-            .locs
-            .iter()
-            .map(|l| l.worker_id)
-            .collect::<Vec<_>>(),
-        vec![100]
-    );
-}
-
-#[test]
-fn build_located_blocks_reports_lost_blocks_like_the_live_path() {
-    let fs = test_fs("located-blocks-builder-lost");
-
-    let mut file = InodeFile::new(3, 0);
-    file.block_size = 1024;
-    file.blocks = vec![BlockMeta::new(301, 1024)];
-    // No location row for the block: the shared builder must report the same
-    // lost-block error as the live path.
-    let locations = HashMap::new();
-
-    let err = fs
-        .build_located_blocks("/file", &file, locations)
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("Lost (no worker can read)"),
-        "the lost-block check must fire, got {err}"
-    );
-}
-
 /// Removes the live child edge for `path` (a file under /data) while keeping
 /// the store row, forcing the public block-read to fall back to the store
 /// snapshot. Returns the owned inode view for restoration.
@@ -171,10 +91,19 @@ fn restore_live_edge(fs: &MasterFilesystem, inode_locks: &InodeLockManager, owne
             .unwrap_or_else(|| DirNode::for_edge(&data_view)),
         _ => panic!("data must be a directory"),
     };
+    // Save the owned identity before the move, then verify the restored edge
+    // carries the exact same inode id and name.
+    let owned_name = owned.name().to_string();
+    let owned_id = owned.id();
     dir_node.add_child_edge(owned).unwrap();
-    assert!(
-        dir_node.children.get_child_edge("a.log").is_some(),
-        "the restored edge must be back under /data"
+    let restored = dir_node
+        .children
+        .get_child_edge(&owned_name)
+        .expect("the restored edge must be back under /data");
+    assert_eq!(
+        restored.id(),
+        owned_id,
+        "the restored edge must keep the id"
     );
     drop(view);
     drop(locks);
@@ -265,15 +194,13 @@ fn block_locations_snapshot_fallback_rejects_corrupt_non_tail_block() {
         .expect("worker started");
     // Receive as a Result first: an old snapshot implementation could succeed
     // here, and the fixture must be torn down before any assertion.
-    let received = rx
-        .recv_timeout(std::time::Duration::from_millis(500))
-        .map_err(|_| panic!("the fallback must not wait for a cold window"));
+    let received = rx.recv_timeout(std::time::Duration::from_millis(500));
     drop(held);
     worker.join().expect("worker must not panic");
     restore_live_edge(&fs, &inode_locks, owned);
-    // Now assert on the preserved outcome.
-    let outcome = received.expect("the worker must report a result");
-    let err = outcome.unwrap_err();
+    // Bounded-timeliness assertion, after cleanup.
+    let received = received.expect("the fallback must not wait for a cold window");
+    let err = received.unwrap_err();
     assert!(
         err.to_string().contains("block status abnormal"),
         "the snapshot fallback must reject a corrupt non-tail block, got {err}"
@@ -291,6 +218,8 @@ fn block_locations_snapshot_fallback_matches_the_live_result() {
     let fs = test_fs("gbl-fallback-match");
     let mut worker = WorkerInfo::default();
     worker.address.worker_id = 100;
+    worker.address.hostname = "fallback-worker-100".to_string();
+    let worker_address = worker.address.clone();
     fs.add_test_worker(worker);
     fs.mkdir("/data", true).unwrap();
     fs.create_with_opts(
@@ -341,6 +270,9 @@ fn block_locations_snapshot_fallback_matches_the_live_result() {
         };
         if let InodeView::File(f) = &mut inode {
             f.blocks.push(BlockMeta::new(second_id, full_len));
+            // The inode row must stay self-consistent: file len covers both
+            // full-size blocks.
+            f.len = full_len * 2;
         } else {
             panic!("expected a file inode");
         }
@@ -370,18 +302,19 @@ fn block_locations_snapshot_fallback_matches_the_live_result() {
     started_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("worker started");
-    let received = rx
-        .recv_timeout(std::time::Duration::from_millis(500))
-        .map_err(|_| panic!("the fallback must not wait for a cold window"));
+    // Keep the receive Result: a slow/old implementation must not abort the
+    // fixture before held/worker/restore are torn down.
+    let received = rx.recv_timeout(std::time::Duration::from_millis(500));
     drop(held);
     worker.join().expect("worker must not panic");
     restore_live_edge(&fs, &inode_locks, owned);
-    let blocks = received
-        .expect("the worker must report a result")
-        .expect("the snapshot fallback must serve the store-resident file");
+    // Bounded-timeliness assertion, after cleanup.
+    let received = received.expect("the fallback must not wait for a cold window");
+    let blocks = received.expect("the snapshot fallback must serve the store-resident file");
 
     assert_eq!(blocks.status.id, file_id);
     assert_eq!(blocks.status.len, live_status.len);
+    assert_eq!(live_status.len, full_len * 2);
     assert_eq!(blocks.block_locs.len(), 2);
     assert_eq!(blocks.block_locs[0].block.id, first.block.id);
     assert_eq!(blocks.block_locs[0].block.len, full_len);
@@ -389,13 +322,25 @@ fn block_locations_snapshot_fallback_matches_the_live_result() {
     assert_eq!(blocks.block_locs[1].block.len, full_len);
     for located in &blocks.block_locs {
         assert_eq!(
-            located.locs.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
-            vec![100]
+            located.locs,
+            vec![worker_address.clone()],
+            "each block must report the worker's full address"
         );
     }
-    // The hot path over the restored live edge agrees with the fallback.
+    // The hot path over the restored live edge agrees with the fallback:
+    // same status id/len and the same block order with full addresses.
     let hot = fs.get_block_locations("/data/a.log").unwrap();
-    let hot_ids: Vec<_> = hot.block_locs.iter().map(|l| l.block.id).collect();
-    let fallback_ids: Vec<_> = blocks.block_locs.iter().map(|l| l.block.id).collect();
-    assert_eq!(hot_ids, fallback_ids);
+    assert_eq!(hot.status.id, blocks.status.id);
+    assert_eq!(hot.status.len, blocks.status.len);
+    let hot_blocks: Vec<_> = hot
+        .block_locs
+        .iter()
+        .map(|l| (l.block.id, l.block.len, l.locs.clone()))
+        .collect();
+    let fallback_blocks: Vec<_> = blocks
+        .block_locs
+        .iter()
+        .map(|l| (l.block.id, l.block.len, l.locs.clone()))
+        .collect();
+    assert_eq!(hot_blocks, fallback_blocks);
 }

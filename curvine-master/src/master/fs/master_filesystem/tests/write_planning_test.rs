@@ -209,3 +209,83 @@ fn fs_mode_snapshot_succeeds_under_a_shared_view() {
     assert_eq!(snapshot.ufs_mtime, reference.ufs_mtime);
     drop(held);
 }
+
+#[test]
+fn build_located_blocks_rejects_short_non_tail_block_like_the_live_path() {
+    let fs = test_fs("located-blocks-builder");
+
+    // Two blocks: the non-tail one is shorter than the file's block size —
+    // the same corruption the live path rejects.
+    let mut file = InodeFile::new(1, 0);
+    file.block_size = 1024;
+    file.blocks = vec![BlockMeta::new(101, 512), BlockMeta::new(102, 256)];
+    let mut locations = HashMap::new();
+    locations.insert(101, vec![BlockLocation::with_id(100)]);
+    locations.insert(102, vec![BlockLocation::with_id(100)]);
+
+    let err = fs
+        .build_located_blocks("/file", &file, locations)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("block status abnormal"),
+        "the non-tail length check must fire, got {err}"
+    );
+}
+
+#[test]
+fn build_located_blocks_orders_blocks_and_reports_status() {
+    let fs = test_fs("located-blocks-builder-ok");
+    let mut worker = WorkerInfo::default();
+    worker.address.worker_id = 100;
+    fs.add_test_worker(worker);
+
+    let mut file = InodeFile::new(2, 0);
+    file.block_size = 1024;
+    file.blocks = vec![BlockMeta::new(201, 1024), BlockMeta::new(202, 512)];
+    let mut locations = HashMap::new();
+    locations.insert(201, vec![BlockLocation::with_id(100)]);
+    locations.insert(202, vec![BlockLocation::with_id(100)]);
+
+    let blocks = fs.build_located_blocks("/file", &file, locations).unwrap();
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].block.id, 201);
+    assert_eq!(blocks[0].block.len, 1024);
+    assert_eq!(
+        blocks[0]
+            .locs
+            .iter()
+            .map(|l| l.worker_id)
+            .collect::<Vec<_>>(),
+        vec![100]
+    );
+    assert_eq!(blocks[1].block.id, 202);
+    assert_eq!(blocks[1].block.len, 512);
+    assert_eq!(
+        blocks[1]
+            .locs
+            .iter()
+            .map(|l| l.worker_id)
+            .collect::<Vec<_>>(),
+        vec![100]
+    );
+}
+
+#[test]
+fn build_located_blocks_reports_lost_blocks_like_the_live_path() {
+    let fs = test_fs("located-blocks-builder-lost");
+
+    let mut file = InodeFile::new(3, 0);
+    file.block_size = 1024;
+    file.blocks = vec![BlockMeta::new(301, 1024)];
+    // No location row for the block: the shared builder must report the same
+    // lost-block error as the live path.
+    let locations = HashMap::new();
+
+    let err = fs
+        .build_located_blocks("/file", &file, locations)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Lost (no worker can read)"),
+        "the lost-block check must fire, got {err}"
+    );
+}
