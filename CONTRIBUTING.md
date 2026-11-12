@@ -94,6 +94,23 @@ cargo bench
 - Reference issue numbers when applicable
 - [Commit convention](https://github.com/CurvineIO/curvine/blob/main/COMMIT_CONVENTION.md)
 
+### Sign Your Commits
+
+Curvine uses the [Developer Certificate of Origin](DCO) (DCO). Every commit must carry a `Signed-off-by:` line whose email matches the commit author, which certifies that you wrote the change or have the right to submit it under the project license.
+
+Add the line with `git commit -s`:
+
+```bash
+git commit -s -m "fix(client): handle empty paths (#123)"
+```
+
+The `DCO` check on each pull request fails if a commit is not signed off. To sign off commits already on your branch:
+
+```bash
+git rebase --signoff origin/main
+git push --force-with-lease
+```
+
 ### Pull Request Guidelines
 - Create feature branches from `main`
 - Keep PRs focused and reasonably sized
