@@ -153,9 +153,10 @@ impl IOUtils {
         buf: &mut FrameBuf,
         need: usize,
     ) -> IOResult<bool> {
-        let shortfall = need.saturating_sub(buf.len());
-        let step = shortfall.min(buf.len().max(FrameBuf::DEFAULT_BUF_SIZE));
-        buf.reserve(step.max(1));
+        let shortfall = need
+            .saturating_sub(buf.len())
+            .max(FrameBuf::DEFAULT_BUF_SIZE);
+        buf.reserve(shortfall.max(1));
         Ok(io.read_buf(buf.deref_mut()).await? > 0)
     }
 
@@ -322,45 +323,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fill_reserves_by_received_bytes_not_declared_length() {
+    async fn receive_coalesces_small_frames_into_few_reads() {
         use crate::handler::FrameBuf;
         use crate::message::{HEAD_SIZE, PROTOCOL_USIZE};
         use bytes::BufMut;
-        use std::time::Duration;
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::{TcpListener, TcpStream};
+        use std::io;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, ReadBuf};
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).await.unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        let (mut server_read, _) = tokio::io::split(server);
-        let (_, mut client_write) = tokio::io::split(client);
+        struct Scripted {
+            data: Vec<u8>,
+            pos: usize,
+            reads: usize,
+        }
 
-        // Head only: a legal 60 MiB header, and no body byte ever arrives.
-        let mut head = bytes::BytesMut::with_capacity(PROTOCOL_USIZE);
-        head.put_i32(60 * 1024 * 1024);
-        head.put_i32(60 * 1024 * 1024 - HEAD_SIZE);
-        head.put_i8(1);
-        head.put_i8(1);
-        head.put_i64(1);
-        head.put_i32(0);
-        assert_eq!(head.len(), PROTOCOL_USIZE);
-        client_write.write_all(&head).await.unwrap();
-        client_write.flush().await.unwrap();
+        impl AsyncRead for Scripted {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let me = self.get_mut();
+                me.reads += 1;
+                let n = buf.remaining().min(me.data.len() - me.pos);
+                let start = me.pos;
+                buf.put_slice(&me.data[start..start + n]);
+                me.pos += n;
+                Poll::Ready(Ok(()))
+            }
+        }
 
+        fn frame(data_len: usize) -> Vec<u8> {
+            let mut out = bytes::BytesMut::with_capacity(PROTOCOL_USIZE + data_len);
+            out.put_i32((HEAD_SIZE as usize + data_len) as i32);
+            out.put_i32(0);
+            out.put_i8(1);
+            out.put_i8(1);
+            out.put_i64(1);
+            out.put_i32(0);
+            out.extend_from_slice(&vec![7u8; data_len]);
+            out.to_vec()
+        }
+
+        let frames = 200;
+        let mut io = Scripted {
+            data: (0..frames).flat_map(|_| frame(200)).collect(),
+            pos: 0,
+            reads: 0,
+        };
         let mut buf = FrameBuf::new(0);
-        let res = tokio::time::timeout(
-            Duration::from_millis(100),
-            IOUtils::receive_buffered(&mut server_read, &mut buf),
-        )
-        .await;
-        assert!(res.is_err(), "receive must wait for the declared body");
+        for _ in 0..frames {
+            IOUtils::receive_buffered(&mut io, &mut buf).await.unwrap();
+        }
 
         assert!(
-            buf.capacity() <= 64 * 1024,
-            "a head-only frame must not reserve the declared length, capacity = {}",
-            buf.capacity()
+            io.reads < frames / 8,
+            "{frames} small frames took {} reads, the spare capacity is not kept at the 8 KiB floor",
+            io.reads
         );
     }
 }
