@@ -221,18 +221,26 @@ impl UnifiedFileSystem {
 
         let state = self.mount_cache.get_mount(self, path).await?;
         if let Some(mnt) = state {
-            if mnt.info.is_read_only_cache_mode() && Self::is_mount_write_rpc(rpc_code) {
-                return err_ext!(FsError::unsupported(format!(
-                    "{} on read_only cache_mode mount {}",
-                    rpc_code, path
-                )));
-            }
+            Self::check_mount_write(&mnt.info, rpc_code, path)?;
 
             let ufs_path = mnt.get_ufs_path(path)?;
             Ok(Some((ufs_path, mnt)))
         } else {
             Ok(None)
         }
+    }
+
+    // Reject a write rpc aimed at a read-only cache_mode mount.
+    // Kept free of cache lookups so the verdict can be unit tested: the mount
+    // cache is only populated from master RPCs.
+    fn check_mount_write(mnt: &MountInfo, rpc_code: RpcCode, path: &Path) -> FsResult<()> {
+        if mnt.is_read_only_cache_mode() && Self::is_mount_write_rpc(rpc_code) {
+            return err_ext!(FsError::read_only_msg(format!(
+                "{} on read_only cache_mode mount {}",
+                rpc_code, path
+            )));
+        }
+        Ok(())
     }
 
     fn is_mount_write_rpc(rpc_code: RpcCode) -> bool {
@@ -1439,10 +1447,13 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_restore_dst_supported, AsyncCacheAdmission, AsyncCachePending, MountValue};
-    use curvine_error::FsError;
-    use curvine_fs_api::Path;
-    use curvine_model::{MountInfo, WriteType};
+    use super::{
+        ensure_restore_dst_supported, AsyncCacheAdmission, AsyncCachePending, MountValue,
+        UnifiedFileSystem,
+    };
+    use curvine_error::{ErrorKind, FsError};
+    use curvine_fs_api::{Path, RpcCode};
+    use curvine_model::{AccessMode, MountInfo, WriteType};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1532,6 +1543,33 @@ mod tests {
         assert!(pending.paths.lock().contains("ufs://bucket/b"));
         drop(second_pending);
         assert!(pending.paths.lock().is_empty());
+    }
+
+    #[test]
+    fn check_mount_write_rejects_write_rpcs_on_read_only_cache_mount() {
+        // MountInfo::default() is already a read-only cache_mode mount.
+        let mnt = MountInfo::default();
+        let path = Path::from_str("/mnt/cache/a.log").unwrap();
+
+        for rpc_code in [
+            RpcCode::Mkdir,
+            RpcCode::Delete,
+            RpcCode::CreateFile,
+            RpcCode::Rename,
+            RpcCode::SetAttr,
+        ] {
+            let err = UnifiedFileSystem::check_mount_write(&mnt, rpc_code, &path)
+                .expect_err("write rpc must be rejected on a read-only cache_mode mount");
+            assert!(matches!(err.kind(), ErrorKind::ReadOnly), "{rpc_code}");
+        }
+
+        assert!(UnifiedFileSystem::check_mount_write(&mnt, RpcCode::FileStatus, &path).is_ok());
+
+        let read_write = MountInfo {
+            access_mode: AccessMode::ReadWrite,
+            ..MountInfo::default()
+        };
+        assert!(UnifiedFileSystem::check_mount_write(&read_write, RpcCode::Delete, &path).is_ok());
     }
 
     #[test]
