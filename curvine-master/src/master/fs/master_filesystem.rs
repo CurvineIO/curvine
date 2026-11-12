@@ -191,22 +191,40 @@ pub(crate) mod memory_read_gates {
     use std::sync::LazyLock;
     use std::time::Duration;
 
-    static GATES: LazyLock<Mutex<HashMap<String, Receiver<()>>>> =
+    type GateEntry = (Receiver<()>, Option<Sender<()>>);
+
+    static GATES: LazyLock<Mutex<HashMap<String, GateEntry>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
     /// Registers a release channel for `point`; returns the release handle.
     #[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
     pub fn install(point: &str) -> Sender<()> {
         let (sender, receiver) = channel();
-        GATES.lock().insert(point.to_string(), receiver);
+        GATES.lock().insert(point.to_string(), (receiver, None));
         sender
+    }
+
+    /// Like [`install`], but also returns a channel that fires when the
+    /// worker actually reached the gate, so a test can confirm the
+    /// interleaving before acting instead of racing a sleep.
+    #[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
+    pub fn install_with_entered(point: &str) -> (Sender<()>, Receiver<()>) {
+        let (release_tx, release_rx) = channel();
+        let (entered_tx, entered_rx) = channel();
+        GATES
+            .lock()
+            .insert(point.to_string(), (release_rx, Some(entered_tx)));
+        (release_tx, entered_rx)
     }
 
     /// Blocks the caller until the gate is released or the safety timeout
     /// expires, so a failing test can never hang the suite.
     pub fn park(point: &str, timeout: Duration) {
-        let receiver: Option<Receiver<()>> = GATES.lock().remove(point);
-        if let Some(receiver) = receiver {
+        let entry: Option<GateEntry> = GATES.lock().remove(point);
+        if let Some((receiver, entered)) = entry {
+            if let Some(entered) = entered {
+                let _ = entered.send(());
+            }
             let _ = receiver.recv_timeout(timeout);
         }
     }
@@ -1502,12 +1520,12 @@ impl MasterFilesystem {
                     }
                 })
                 .collect();
-            let _locks = self.lock_sharded_requests(requests, parent_index == 0);
-            // Test-only interleave: parked after taking the locks, so the
-            // driver can create the destination; on resume the is_full check
-            // forces the fallback contract to produce the real AlreadyExists.
+            // Test-only interleave: parked before any inode lock, so the
+            // driver's sharded create of the destination cannot deadlock on
+            // us; on resume the is_full check forces the fallback contract.
             #[cfg(test)]
             memory_read_gates::park(&plan_gate, std::time::Duration::from_secs(10));
+            let _locks = self.lock_sharded_requests(requests, parent_index == 0);
             let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -2714,17 +2732,23 @@ impl MasterFilesystem {
                 Ok(ShardedOutcome::Fallback)
             },
             |fs_dir| {
+                // The exact same path keeps the original false contract
+                // (bff4e7dc5 / b1d6bd568 both returned Ok(false) here); it is
+                // not a same-inode rename of two distinct hardlink names.
+                if src == dst {
+                    return Ok((false, None));
+                }
                 Self::check_not_reserved_path(src)?;
                 Self::check_not_reserved_path(dst)?;
                 let src_inp = Self::resolve_path(fs_dir, src)?;
                 let dst_inp = Self::resolve_path(fs_dir, dst)?;
-                // POSIX same-inode rename is a no-op (kept from the hot path's
-                // dropped branch — journal replay unchanged for older leaders).
-                // Only a fully-resolved pair names a real target: a missing
-                // final component leaves inodes.last pointing at the parent,
-                // and comparing those ids would misreport two missing paths
-                // under one parent as "same inode". Let FsDir::rename produce
-                // the real FileNotFound in that case.
+                // POSIX same-inode rename of two distinct names is a no-op
+                // (kept from the hot path's dropped branch — journal replay
+                // unchanged for older leaders). Only a fully-resolved pair
+                // names a real target: a missing final component leaves
+                // inodes.last pointing at the parent, and comparing those ids
+                // would misreport two missing paths under one parent as "same
+                // inode". Let FsDir::rename produce the real FileNotFound.
                 if src_inp.is_full()
                     && dst_inp.is_full()
                     && !flags.no_replace()

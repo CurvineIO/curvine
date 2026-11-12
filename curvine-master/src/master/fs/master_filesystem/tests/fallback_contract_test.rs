@@ -22,17 +22,36 @@ use curvine_model::state::FileType;
 fn link_fallback_surfaces_the_real_destination_conflict() {
     let fs = test_fs("link-fallback");
     fs.create("/src", true).unwrap();
-    // Destination exists: the single-parent plan is not eligible, so the entry
-    // escalates to the exclusive body. The real cold body must run and report
-    // the conflict — not fabricate a Done(()) from a discarded Fallback.
-    fs.create("/dst", true).unwrap();
+    fs.mkdir("/dir", true).unwrap();
 
-    let err = fs.link("/src", "/dst").unwrap_err();
+    // Park the sharded helper after planning, before any inode lock, with a
+    // driver-side entered ack; the named sender stays alive until the driver
+    // has finished its own change, so the channel never closes early.
+    let (release, entered) = memory_read_gates::install_with_entered("link-plan-/dir/dst");
+    let worker_fs = fs.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || tx.send(worker_fs.link("/src", "/dir/dst")));
+
+    entered
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the link helper must reach its plan gate");
+    // A normal sharded create on the parked worker's destination path: the
+    // parent write is free because the helper holds no inode lock yet.
+    fs.create("/dir/dst", true).unwrap();
+    release.send(()).unwrap();
+    drop(release);
+
+    let sent = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("link must finish after the gate is released");
+    let err = sent.unwrap_err();
     assert!(
         matches!(err, FsError::FileAlreadyExists(_)),
-        "link fallback must run the real cold body, got {err:?}"
+        "the helper's Fallback must run the real cold body, got {err:?}"
     );
-    assert_eq!(fs.file_status("/dst").unwrap().nlink, 1);
+    // The driver-created file is untouched and the link did not exist.
+    let dst = fs.file_status("/dir/dst").unwrap();
+    assert_eq!(dst.nlink, 1);
     assert_eq!(fs.file_status("/src").unwrap().nlink, 1);
 }
 
@@ -40,16 +59,31 @@ fn link_fallback_surfaces_the_real_destination_conflict() {
 fn symlink_fallback_surfaces_the_real_destination_conflict() {
     let fs = test_fs("symlink-fallback");
     fs.create("/real", true).unwrap();
-    fs.create("/link", true).unwrap();
+    fs.mkdir("/dir", true).unwrap();
 
-    let err = fs
-        .symlink_with_owner_group("/real", "/link", false, 0o644, None, None)
-        .unwrap_err();
+    let (release, entered) = memory_read_gates::install_with_entered("symlink-plan-/dir/link");
+    let worker_fs = fs.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tx.send(worker_fs.symlink_with_owner_group("/real", "/dir/link", false, 0o644, None, None))
+    });
+
+    entered
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the symlink helper must reach its plan gate");
+    fs.create("/dir/link", true).unwrap();
+    release.send(()).unwrap();
+    drop(release);
+
+    let sent = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("symlink must finish after the gate is released");
+    let err = sent.unwrap_err();
     assert!(
         matches!(err, FsError::FileAlreadyExists(_)),
-        "symlink fallback must run the real cold body, got {err:?}"
+        "the helper's Fallback must run the real cold body, got {err:?}"
     );
-    assert_eq!(fs.file_status("/link").unwrap().file_type, FileType::File);
+    assert_eq!(fs.file_status("/dir/link").unwrap().nlink, 1);
 }
 
 #[test]
@@ -76,8 +110,9 @@ fn rename_with_a_missing_path_reports_file_not_found() {
     assert!(matches!(err, FsError::FileNotFound(_)), "got {err:?}");
     assert!(fs.file_status("/p/exists").is_ok());
 
-    // Existing self-rename keeps the established bool semantics.
-    assert!(fs
+    // Exact same path keeps the original false contract (bff4e7dc5,
+    // b1d6bd568); two distinct hardlink names of one inode still report true.
+    assert!(!fs
         .rename("/p/exists", "/p/exists", RenameFlags::empty())
         .unwrap());
 }
