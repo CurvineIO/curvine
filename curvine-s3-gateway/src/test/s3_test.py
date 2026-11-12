@@ -277,6 +277,74 @@ class S3BasicOperationsTest:
             self._record_test("List Objects", False)
             return False, []
     
+    def test_list_objects_v2_pagination(self) -> bool:
+        """Regress #2091 using the suite's client and disposable test bucket."""
+        from urllib.parse import quote
+
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        root = 'listing-v2/'
+        keys = [root + key for key in ('.visible', 'a-', 'a/deep/1', 'a/deep/2',
+                                      'a/file', 'a0', 'root', '中文/空格+%.txt')]
+        uploaded = []
+        success = False
+        try:
+            for key in keys:
+                s3.put_object(Bucket=bucket, Key=key, Body=b'listing')
+                uploaded.append(key)
+            for suffix in ('', 'a/d', 'missing/', '中文/空'):
+                prefix = root + suffix
+                for delimiter in ('', '/', 'deep'):
+                    expected = set()
+                    for key in keys:
+                        if key.startswith(prefix):
+                            at = key.find(delimiter, len(prefix)) if delimiter else -1
+                            expected.add(key[:at + len(delimiter)] if at >= 0 else key)
+                    for size in (1, 3):
+                        actual = []
+                        pages = s3.get_paginator('list_objects_v2').paginate(
+                            Bucket=bucket, Prefix=prefix, Delimiter=delimiter,
+                            PaginationConfig={'PageSize': size})
+                        for number, page in enumerate(pages):
+                            assert number <= len(expected), 'pagination did not terminate'
+                            entries = [item['Key'] for item in page.get('Contents', [])]
+                            entries += [item['Prefix'] for item in page.get('CommonPrefixes', [])]
+                            assert page['KeyCount'] == len(entries) <= size, 'incorrect page count'
+                            actual.extend(sorted(entries))
+                        assert actual == sorted(expected), 'missing, duplicate or unordered entries'
+            zero = s3.list_objects_v2(Bucket=bucket, Prefix=root, Delimiter='/', MaxKeys=0)
+            assert zero['KeyCount'] == zero['MaxKeys'] == 0 and not zero['IsTruncated']
+            first = s3.list_objects_v2(Bucket=bucket, Prefix=root, StartAfter=root + 'a/', MaxKeys=1)
+            assert first['Contents'][0]['Key'] == root + 'a/deep/1'
+            token = first['NextContinuationToken']
+            second = s3.list_objects_v2(Bucket=bucket, Prefix=root, StartAfter=root + 'z',
+                                       ContinuationToken=token, MaxKeys=1)
+            assert second['Contents'][0]['Key'] == root + 'a/deep/2'
+            for params in ({'ContinuationToken': 'invalid'},
+                           {'Prefix': root + 'a/', 'ContinuationToken': token},
+                           {'Delimiter': '/', 'ContinuationToken': token}):
+                args = dict(Bucket=bucket, Prefix=root)
+                args.update(params)
+                try:
+                    s3.list_objects_v2(**args)
+                except ClientError as error:
+                    assert error.response['ResponseMetadata']['HTTPStatusCode'] == 400
+                else:
+                    raise AssertionError('invalid continuation token was accepted')
+            encoded = s3.list_objects_v2(Bucket=bucket, Prefix=root + '中文/', EncodingType='url')
+            assert encoded['EncodingType'] == 'url'
+            assert [item['Key'] for item in encoded.get('Contents', [])] == [quote(keys[-1], safe='')]
+            success = True
+        except (ClientError, AssertionError) as error:
+            print(f'ListObjectsV2 regression failed: {error}')
+        finally:
+            for key in uploaded:
+                try:
+                    s3.delete_object(Bucket=bucket, Key=key)
+                except ClientError:
+                    success = False
+            self._record_test('ListObjectsV2 recursive and grouped pagination (#2091)', success)
+        return success
+
     def _record_test(self, test_name: str, success: bool):
         """Record test result"""
         self.test_results.append((test_name, success))
@@ -687,6 +755,10 @@ class ComprehensiveS3TestSuite:
         
         # A failed overwrite must not destroy the existing object
         if not basic_test.test_overwrite_is_atomic("overwrite-object"):
+            return False
+
+        # Required regression: nested keys and delimiter groups share pagination.
+        if not basic_test.test_list_objects_v2_pagination():
             return False
 
         # Test list operations

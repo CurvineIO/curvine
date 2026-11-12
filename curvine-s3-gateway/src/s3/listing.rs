@@ -18,6 +18,9 @@
 //! not materialize the bucket recursively; traversal stops after one lookahead
 //! entry, and irrelevant/already-consumed subtrees are skipped. Later requests
 //! may relist directories; concurrent mutations do not provide snapshot paging.
+//! Continuation tokens are opaque cursors bound to bucket/prefix/delimiter, not
+//! authorization credentials. Restart in-flight listings after upgrading from
+//! the previous raw-key tokens, which are no longer accepted.
 
 use super::dto::{CommonPrefix, ListObjectContent};
 use super::handlers::is_staging_name;
