@@ -51,6 +51,26 @@ prepare_mount_path() {
     mkdir -p "$MNT_PATH"
 }
 
+# One mount per process: the systemd unit only cleans up MNT_PATH itself, not
+# the mnt-0, mnt-1, ... submounts created by fuse.mnt_number > 1.
+reject_multiple_mounts() {
+    local i arg value
+    for ((i = 0; i < ${#PARAMS[@]}; i++)); do
+        arg=${PARAMS[$i]}
+        if [[ "$arg" == --mnt-number=* ]]; then
+            value="${arg#*=}"
+        elif [[ "$arg" == "--mnt-number" ]]; then
+            value=${PARAMS[$((i + 1))]:-}
+        else
+            continue
+        fi
+        if [[ "$value" != "1" ]]; then
+            echo "run supports a single mount, got --mnt-number ${value}" >&2
+            return 1
+        fi
+    done
+}
+
 main() {
     local arg
     MNT_PATH=/curvine-fuse
@@ -97,7 +117,12 @@ main() {
             ;;
         run)
             # Foreground mode used by the systemd units (systemd/README.md).
+            reject_multiple_mounts || exit 1
             prepare_mount_path || exit 1
+            # Tells the unit's ExecStopPost= that the path is ours to detach.
+            if [ -n "${RUNTIME_DIRECTORY:-}" ]; then
+                : > "${RUNTIME_DIRECTORY}/mount-path-ready" || exit 1
+            fi
             exec "${BIN_DIR}/launch-process.sh" fuse run "${PARAMS[@]}"
             ;;
         stop|reload)

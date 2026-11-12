@@ -73,6 +73,18 @@ shell_pid=$(sed -n 's/^shell=//p' <<< "$out")
 grep -qx "arg=$MNT" <<< "$out" || fail "fuse run lost --mnt-path: $out"
 grep -qx 'arg=-d' <<< "$out" || fail "fuse run lost extra options: $out"
 grep -qx "arg=$HOME_DIR/conf/curvine-cluster.toml" <<< "$out" || fail "fuse run did not default --conf: $out"
+mkdir -p "$WORK/rt"
+RUNTIME_DIRECTORY="$WORK/rt" "$HOME_DIR/bin/curvine-fuse.sh" run --mnt-path "$MNT" --mnt-number 1 > /dev/null
+[[ -e "$WORK/rt/mount-path-ready" ]] || fail "fuse run did not leave the mount marker"
+# Several mounts per unit are rejected before anything is prepared.
+for bad in "--mnt-number 2" "--mnt-number=2"; do
+    rm -f "$WORK/rt/mount-path-ready"
+    # shellcheck disable=SC2086
+    if RUNTIME_DIRECTORY="$WORK/rt" "$HOME_DIR/bin/curvine-fuse.sh" run --mnt-path "$MNT" $bad > /dev/null 2>&1; then
+        fail "fuse run accepted $bad"
+    fi
+    [[ ! -e "$WORK/rt/mount-path-ready" ]] || fail "rejected start left the mount marker ($bad)"
+done
 
 # Render the units into a staging directory.
 UNIT_DIR="$WORK/units"
@@ -91,8 +103,10 @@ grep -qx "ExecStart=$HOME_DIR/bin/curvine-master.sh run" "$UNIT_DIR/curvine-mast
     || fail "master unit has the wrong ExecStart="
 grep -qx "ExecStart=$HOME_DIR/bin/curvine-worker.sh run" "$UNIT_DIR/curvine-worker.service" \
     || fail "worker unit has the wrong ExecStart="
-grep -qx "ExecStart=$HOME_DIR/bin/curvine-fuse.sh run --mnt-path %f \$CURVINE_FUSE_OPTS" "$UNIT_DIR/curvine-fuse@.service" \
+grep -qx "ExecStart=$HOME_DIR/bin/curvine-fuse.sh run --mnt-path %f --mnt-number 1 \$CURVINE_FUSE_OPTS" "$UNIT_DIR/curvine-fuse@.service" \
     || fail "fuse unit has the wrong ExecStart="
+grep -q '^ExecStopPost=.*mount-path-ready' "$UNIT_DIR/curvine-fuse@.service" \
+    || fail "fuse unit cleanup is not gated on the mount marker"
 
 if command -v systemd-analyze > /dev/null 2>&1; then
     # verify exits 0 on unknown keys or bad values and only warns, so any

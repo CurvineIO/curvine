@@ -37,12 +37,17 @@ User=@CURVINE_USER@
 Group=@CURVINE_GROUP@
 WorkingDirectory=@CURVINE_HOME@
 Environment=CURVINE_FUSE_OPTS=
-ExecStart=@CURVINE_HOME@/bin/curvine-fuse.sh run --mnt-path %f $CURVINE_FUSE_OPTS
+# One mount per unit: cleanup below only knows about %f, not mnt-0, mnt-1, ...
+ExecStart=@CURVINE_HOME@/bin/curvine-fuse.sh run --mnt-path %f --mnt-number 1 $CURVINE_FUSE_OPTS
 # A crashed or killed curvine-fuse leaves a dead mount behind ("Transport
 # endpoint is not connected"), which would make every restart attempt fail.
 # Detach it after each stop; after a clean stop the path is already unmounted
-# and the error is ignored.
-ExecStopPost=-+/bin/umount -l %f
+# and the error is ignored. ExecStopPost= also runs when startup is refused,
+# so only detach when "run" left its marker in the runtime directory, which it
+# does after the mount path passed the checks. A mount that was already there
+# is never touched.
+RuntimeDirectory=curvine-fuse-%i
+ExecStopPost=-+/bin/sh -c '[ -e "$$RUNTIME_DIRECTORY/mount-path-ready" ] && exec /bin/umount -l "$$1"' sh %f
 Restart=on-failure
 RestartSec=5s
 KillSignal=SIGTERM

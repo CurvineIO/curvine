@@ -74,12 +74,16 @@ Environment="CURVINE_FUSE_OPTS=--web-port 9013 --conf /etc/curvine/fuse-data.tom
 ```
 
 `--mnt-path` comes from the instance name and must not be repeated there.
-Options are split on whitespace.
+The unit pins `--mnt-number 1`: one unit manages one mount, and `run` rejects
+any other `--mnt-number`, because the cleanup below only knows the mount path
+itself and not the `mnt-0`, `mnt-1` submounts. Options are split on whitespace.
 
 If `curvine-fuse` crashes or is killed, the kernel keeps a dead mount that
 answers with `Transport endpoint is not connected`. The unit detaches that
 mount with `umount -l` after every stop so that the automatic restart can
-mount the path again. Applications still holding files open on the dead
+mount the path again. The cleanup only runs for a path that passed the
+startup checks, so a path that was already mounted when the unit started is
+refused and left untouched. Applications still holding files open on the dead
 mount have to reopen them.
 
 Hot reload (`curvine-fuse.sh reload`, `SIGUSR1`) is not supported for units
