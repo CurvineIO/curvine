@@ -246,27 +246,31 @@ class S3BasicOperationsTest:
             return False
     
     def test_presigned_get(self) -> bool:
-        """#2093: a SigV4 presigned GET downloads the object; a tampered URL fails."""
+        """#2093: presigned GET/HEAD work; tampered or method-swapped URLs fail."""
         import urllib.error
         import urllib.request
         s3, bucket, key = self.client.client, self.client.config.test_bucket, 'presigned.txt'
         s3.put_object(Bucket=bucket, Key=key, Body=b'presigned body')
-        url = s3.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': key},
-                                        ExpiresIn=60)
+        params = {'Bucket': bucket, 'Key': key}
+        get = s3.generate_presigned_url('get_object', Params=params, ExpiresIn=60)
+        head = s3.generate_presigned_url('head_object', Params=params, ExpiresIn=60)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-        def fetch(target):
+        def fetch(url, method='GET'):
             try:
-                with opener.open(target, timeout=5) as response:
-                    return response.status, response.read()
+                with opener.open(urllib.request.Request(url, method=method), timeout=5) as r:
+                    return r.status, r.headers.get('Content-Length'), r.read()
             except urllib.error.HTTPError as error:
-                return error.code, b''
+                return error.code, None, b''
 
-        # The URL is a bearer credential: never print it.
-        success = (fetch(url) == (200, b'presigned body')
-                   and fetch(url.replace(key, 'other.txt'))[0] == 403)
+        # The URLs are bearer credentials: never print them.
+        success = (fetch(get) == (200, '14', b'presigned body')
+                   and fetch(head, 'HEAD') == (200, '14', b'')
+                   and fetch(get.replace(key, 'other.txt'))[0] == 403
+                   and fetch(get, 'HEAD')[0] == 403
+                   and fetch(head)[0] == 403)
         s3.delete_object(Bucket=bucket, Key=key)
-        self._record_test("Presigned GET (valid works, tampered rejected)", success)
+        self._record_test("Presigned GET/HEAD (valid works, tampered or swapped rejected)", success)
         return success
 
     def test_delete_object(self, key: str) -> bool:

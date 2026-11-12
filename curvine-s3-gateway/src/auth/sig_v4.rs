@@ -245,6 +245,12 @@ pub fn extract_presigned(query: &str) -> Option<Result<Presigned, AuthError>> {
     }))
 }
 
+/// SigV4 canonical header value: trimmed, with internal whitespace runs
+/// collapsed to one space, as SDKs sign it.
+fn canonical_value(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Verify a presigned GET/HEAD at `now`. Unlike header signatures it is valid
 /// for its whole `X-Amz-Expires` lifetime, with clock-skew tolerance only for
 /// a signing time in the future.
@@ -273,7 +279,7 @@ pub fn verify_presigned(
     let mut canonical_headers = String::new();
     for name in &p.signed_headers {
         let value = header(name).ok_or("a signed header is missing")?;
-        canonical_headers.push_str(&format!("{name}:{}\n", value.trim()));
+        canonical_headers.push_str(&format!("{name}:{}\n", canonical_value(&value)));
     }
     let canonical_request = format!(
         "{method}\n{encoded_path}\n{}\n{canonical_headers}\n{}\nUNSIGNED-PAYLOAD",
@@ -577,6 +583,9 @@ mod tests {
         assert!(verify_presigned(&p, "GET", "/test.txt", query, secret, host, at).is_ok());
         assert!(verify_presigned(&p, "GET", "/other.txt", query, secret, host, at).is_err());
         assert!(verify_presigned(&p, "PUT", "/test.txt", query, secret, host, at).is_err());
+        // A GET URL replayed as HEAD signs a different canonical method.
+        assert!(verify_presigned(&p, "HEAD", "/test.txt", query, secret, host, at).is_err());
+        assert_eq!(canonical_value(" \"a\",\t  \"b\" "), "\"a\", \"b\"");
         let expired = at + 86400;
         assert!(verify_presigned(&p, "GET", "/test.txt", query, secret, host, expired).is_err());
         let longer = query.replace("Expires=86400", "Expires=604801");
