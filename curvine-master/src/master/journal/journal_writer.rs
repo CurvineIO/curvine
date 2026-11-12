@@ -829,3 +829,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/commit_scope_test.rs"]
 mod commit_scope_test;
+
+#[cfg(test)]
+#[path = "tests/exclusive_confirmation_test.rs"]
+mod exclusive_confirmation_test;

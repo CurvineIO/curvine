@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-fn test_conf(name: &str) -> ClusterConf {
+pub(crate) fn test_conf(name: &str) -> ClusterConf {
     let mut conf = ClusterConf {
         testing: true,
         format_master: true,
@@ -26,7 +26,7 @@ fn test_conf(name: &str) -> ClusterConf {
     conf
 }
 
-fn build_writer(conf: &ClusterConf) -> FsResult<JournalWriter> {
+pub(crate) fn build_writer(conf: &ClusterConf) -> FsResult<JournalWriter> {
     Master::init_test_metrics();
 
     let rt = conf.journal.create_runtime();
@@ -1215,130 +1215,5 @@ fn journal_backpressure_and_fence_semantics() -> FsResult<()> {
         fenced.to_string().contains("not accepting writes"),
         "unexpected error: {fenced}"
     );
-    Ok(())
-}
-
-#[test]
-fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<()> {
-    use crate::master::meta::NamespaceError;
-
-    let conf = test_conf("exclusive-delete-confirmation-fail");
-    let journal = JournalSystem::from_conf(&conf)?;
-    let fs = journal.fs();
-    fs.master_monitor
-        .set_role_for_test(curvine_raft::raft::RoleState::Leader);
-    fs.mkdir("/dir", true)?;
-    fs.create("/dir/file", true)?;
-    let failure_seq_before = fs.journal_writer.failure_seq();
-
-    // Swap in a real receipts writer (require_raft_commit=true) into both the
-    // FsDir and the local fs clone — the established pattern from
-    // lost_commit_confirmation, applied to the public exclusive path.
-    let mut writer = build_writer(&conf)?;
-    writer.require_raft_commit = true;
-    writer.recovery = journal.master_monitor().recovery();
-    let writer = Arc::new(writer);
-    fs.fs_dir
-        .begin_cold(DEFAULT_COLD_TIMEOUT)?
-        .journal_writer = writer.clone();
-    let mut fs = fs;
-    fs.journal_writer = writer.clone();
-
-    // Public recursive directory delete: the cold bridge routes it through
-    // run_metadata_write_exclusive, whose confirmation waits on the real
-    // queued receipt.
-    let worker_fs = fs.clone();
-    let (delete_started_tx, delete_started_rx) = mpsc::channel();
-    let (delete_done_tx, delete_done_rx) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        delete_started_tx.send(()).unwrap();
-        let result = worker_fs.delete("/dir", true);
-        delete_done_tx.send(result).unwrap();
-    });
-    delete_started_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("delete worker started");
-
-    // The queued receipt arrives with its completion still held: the delete
-    // is applied to the live namespace but NOT yet confirmed.
-    let queued = writer
-        .receiver
-        .as_ref()
-        .unwrap()
-        .lock()
-        .unwrap()
-        .recv_timeout(Duration::from_secs(5))
-        .expect("missing delete journal entry");
-    let completion = queued.completion.expect("missing commit confirmation");
-
-    // While the receipt is held: the view is still reachable, the directory
-    // is deleted in the live tree, and no publication failure was recorded.
-    assert!(fs.fs_dir.view().is_ok(), "the view must stay reachable while the receipt is held");
-    assert!(fs.file_status("/dir").is_err(), "the directory must be deleted in the live tree");
-    assert_eq!(
-        fs.journal_writer.failure_seq(),
-        failure_seq_before,
-        "no publication failure should be recorded while the receipt is held"
-    );
-    let worker_probe = delete_done_rx.recv_timeout(Duration::from_millis(100));
-    assert!(
-        worker_probe.is_err(),
-        "the delete must still be waiting for its confirmation"
-    );
-
-    // Drop the completion: the confirmation wait fails for real, the RAII
-    // guard goes terminal before the exclusive gate opens.
-    drop(completion);
-
-    let delete_result = delete_done_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the delete must finish once the confirmation fails");
-    let delete_err = match delete_result {
-        Ok(_) => panic!("the delete must fail on a dropped confirmation"),
-        Err(err) => err,
-    };
-    worker.join().expect("delete worker must not panic");
-
-    // The holder is terminal: FAILED state, view/begin Unavailable, the
-    // writer is fenced.
-    assert!(
-        fs.fs_dir.is_failed(),
-        "a dropped confirmation must fail the exclusive holder closed"
-    );
-    let view_err = fs.fs_dir.view().err();
-    assert!(
-        matches!(view_err, Some(NamespaceError::Unavailable)),
-        "the view must be Unavailable after the terminal failure, got {view_err:?}"
-    );
-    assert!(
-        writer.ensure_metadata_current().is_err(),
-        "the writer must remain fenced after the terminal failure"
-    );
-    assert!(
-        fs.journal_writer.failure_seq() != failure_seq_before,
-        "the confirmation failure must be recorded on the failure sequence"
-    );
-    assert!(
-        delete_err
-            .to_string()
-            .contains("journal commit failed after metadata commit"),
-        "the delete must surface the real commit error, got {delete_err}"
-    );
-
-    // Drain any remaining queued receipts so the sender task exits cleanly.
-    loop {
-        match writer
-            .receiver
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .recv_timeout(Duration::from_millis(50))
-        {
-            Ok(queued) => drop(queued),
-            Err(_) => break,
-        }
-    }
-    journal.shutdown();
     Ok(())
 }
