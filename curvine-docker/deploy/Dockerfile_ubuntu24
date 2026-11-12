@@ -149,8 +149,8 @@ RUN ARCH=$(uname -m) && \
 ENV JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
 
 # Runtime image contains master, worker and transfer service binaries, CLI/FUSE helpers, and WebUI.
-# Override with --build-arg BUILD_ARGS="..." when building SDKs, WebUI, tests, or alternate UFS sets.
-ARG BUILD_ARGS="-p server -p client -p cli -p fuse -p web --skip-java-sdk --skip-python-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs --ufs opendal-webhdfs --ufs oss-hdfs"
+# Includes COSN (`--ufs cosn`: libhdfs + hadoop-cos). Override with --build-arg BUILD_ARGS="...".
+ARG BUILD_ARGS="-p server -p client -p cli -p fuse -p web --skip-java-sdk --skip-python-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs --ufs opendal-webhdfs --ufs oss-hdfs --ufs cosn"
 
 # Copy and build source code if building from source
 COPY . /workspace/

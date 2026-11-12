@@ -52,6 +52,7 @@ opendal-cos = ["curvine-unified-fs/opendal-cos"]
 opendal-hdfs = ["curvine-unified-fs/opendal-hdfs"]
 opendal-webhdfs = ["curvine-unified-fs/opendal-webhdfs"]
 opendal-hdfs-native = ["curvine-unified-fs/opendal-hdfs-native"]
+cosn = ["curvine-unified-fs/cosn"]
 oss-hdfs = ["curvine-unified-fs/oss-hdfs"]
 
 [lints.rust]

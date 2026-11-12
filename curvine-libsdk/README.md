@@ -29,6 +29,7 @@ Rust SDK facade for Java (JNI), Python (PyO3), and Rust consumers. The public co
 | `opendal-webhdfs` | `curvine-sdk-core/opendal-webhdfs` and selected binding crate |
 | `opendal-hdfs` | `curvine-sdk-core/opendal-hdfs` and selected binding crate |
 | `opendal-hdfs-native` | `curvine-sdk-core/opendal-hdfs-native` and selected binding crate |
+| `cosn` | Tencent COSN via libhdfs + `hadoop-cos` (`curvine-ufs-cosn`); per-mount `cosn.*` / `fs.cosn.*` credentials |
 | `internal-oss-hdfs-jindo`, `oss-hdfs` | Explicit internal OSS-HDFS/Jindo profile; needs `JINDOSDK_HOME` |
 
 **Rust consumers**
@@ -53,11 +54,16 @@ make build ARGS='--package java'
 # Java JNI .so with OSS-HDFS/Jindo only
 make build ARGS='--package java --ufs oss-hdfs'
 
+# Java / Python SDK with Tencent COSN (needs libhdfs + hadoop-cos on the runtime classpath)
+make build ARGS='--package java --ufs cosn'
+
 # Python wheel with an extra OpenDAL backend
 make build ARGS='--package python --ufs opendal-oss'
 ```
 
 `oss-hdfs` requires JindoSDK at build/link time (`JINDOSDK_HOME`, default `/opt/jindosdk`). Do not enable it for default public artifacts unless that native SDK is available on the build host.
+
+`cosn` links against libhdfs (`hdfs_3_1`) and expects the vendor `hadoop-cos` jar on the Hadoop classpath at runtime. Mount credentials are supplied per mount (`cosn.secretId` / `cosn.secretKey` / `cosn.region`, or the Hadoop `fs.cosn.*` equivalents); they are not limited to `core-site.xml`.
 
 ---
 

@@ -3177,6 +3177,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-ufs-cosn"
+version = "0.2.2"
+dependencies = [
+ "bytes",
+ "curvine-core-error",
+ "curvine-error",
+ "curvine-fs-api",
+ "curvine-io",
+ "curvine-model",
+ "curvine-runtime",
+ "curvine-ufs-api",
+ "hdfs-sys",
+ "libc",
+ "log",
+ "tokio",
+]
+
+[[package]]
 name = "curvine-ufs-opendal"
 version = "0.2.2"
 dependencies = [
@@ -3231,6 +3249,7 @@ dependencies = [
  "curvine-model",
  "curvine-proto",
  "curvine-runtime",
+ "curvine-ufs-cosn",
  "curvine-ufs-opendal",
  "curvine-ufs-oss-hdfs",
  "log",
