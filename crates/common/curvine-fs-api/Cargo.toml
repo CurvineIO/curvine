@@ -3,6 +3,9 @@ name = "curvine-fs-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine filesystem API."
 
 [dependencies]
 curvine-error = { workspace = true }

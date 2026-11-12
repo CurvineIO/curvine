@@ -2,6 +2,7 @@
 name = "curvine-tests"
 version = "0.1.0"
 description = "Curvine integration and regression test harness"
+repository.workspace = true
 edition = "2021"
 publish = false
 

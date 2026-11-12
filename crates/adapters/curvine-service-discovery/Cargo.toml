@@ -3,6 +3,8 @@ name = "curvine-service-discovery"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Curvine service discovery abstractions and providers."
 
 [features]

@@ -3,6 +3,9 @@ name = "curvine-model"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine shared model types."
 
 [dependencies]
 curvine-error = { workspace = true }
