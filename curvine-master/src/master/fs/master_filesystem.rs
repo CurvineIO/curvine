@@ -3961,8 +3961,20 @@ impl MasterFilesystem {
         file: &InodeFile,
     ) -> FsResult<Vec<LocatedBlock>> {
         let file_locs = fs_dir.get_file_locations(file)?;
-        // Location reads only need the caller's namespace guard. Acquire worker
-        // state afterwards so RocksDB lookups do not delay heartbeats.
+        self.build_located_blocks(path, file, file_locs)
+    }
+
+    /// Shared LocatedBlock construction for the live and snapshot block-read
+    /// paths: the non-tail length check, the lost-block error text and a
+    /// single worker_manager read guard per build.
+    fn build_located_blocks(
+        &self,
+        path: &str,
+        file: &InodeFile,
+        file_locs: HashMap<i64, Vec<BlockLocation>>,
+    ) -> FsResult<Vec<LocatedBlock>> {
+        // Acquire worker state after the location reads so RocksDB lookups do
+        // not delay heartbeats.
         let wm = self.worker_manager.read();
         let mut block_locs = Vec::with_capacity(file_locs.len());
 
@@ -4067,26 +4079,11 @@ impl MasterFilesystem {
                 let needs_touch = inode.is_file() && Self::atime_refresh_due(&inode);
                 let inode_id = inode.id();
                 let file = inode.as_file_ref()?;
-                let mut block_locs = Vec::with_capacity(file.blocks.len());
-                for meta in &file.blocks {
-                    let extend_block = ExtendedBlock {
-                        id: meta.id,
-                        len: meta.len(),
-                        storage_type: file.storage_policy.storage_type,
-                        file_type: file.file_type,
-                        alloc_opts: meta.alloc_opts.clone(),
-                    };
-                    let locs = snapshot.get_block_locations(meta.id)?;
-                    let lc = try_option!(
-                        (!locs.is_empty()).then_some(locs),
-                        "File {}, block {} Lost (no worker can read)",
-                        path,
-                        meta.id
-                    );
-                    let wm = self.worker_manager.read();
-                    let lb = wm.create_locate_block(path, extend_block, &lc)?;
-                    block_locs.push(lb);
-                }
+                // Same snapshot for inode payload and locations; the evictor
+                // hint and the shared builder keep parity with the live path.
+                let file_locs = snapshot.get_file_locations(file)?;
+                fs_dir.evictor.on_access(file.id);
+                let block_locs = self.build_located_blocks(path, file, file_locs)?;
                 let blocks = FileBlocks {
                     status: inode.to_file_status(path)?,
                     block_locs,
@@ -4228,8 +4225,6 @@ impl MasterFilesystem {
         Self::check_not_pending_path(path)?;
 
         let (status, block_snapshots, worker_snapshots) = {
-            // The snapshot includes mutable inode content; exclude sharded
-            // writers until it has the same inode-lock protocol as block reads.
             // One consistent store snapshot covers path, inode and location
             // rows; a low-frequency single-file detail read does not need to
             // drain the namespace. The evictor access hint still fires once.
