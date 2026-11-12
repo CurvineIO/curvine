@@ -1814,6 +1814,60 @@ impl JournalLoader {
             .collect())
     }
 
+    /// Replay mutation addressed by an inode ID. When the ID is valid the
+    /// actual object's Write lock is planned and re-validated under the locks
+    /// (epoch + ID presence); only an invalid/absent ID falls back to the
+    /// path-chain protocol. The path stays as request context — it is never
+    /// used to pick the write target when an ID is available.
+    fn with_locked_replay_inode<T>(
+        &self,
+        path: &str,
+        inode_id: Option<i64>,
+        op: impl FnOnce(&crate::master::meta::NamespaceGuard<'_>) -> CommonResult<T>,
+    ) -> CommonResult<T> {
+        let plan_epoch = {
+            let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+            let control = view.store.scan_control();
+            if control.is_restoring() {
+                return err_box!("replay planning rejected: snapshot restore pending");
+            }
+            (control.cancel_epoch(), inode_id.filter(|id| *id > 0))
+        };
+        let (plan_epoch, valid_id) = plan_epoch;
+        let locks = match valid_id {
+            Some(id) => self.inode_locks.write_inode(id),
+            None => {
+                let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+                let requests = Self::plan_replay_locks_mode(&view, path, false)?;
+                self.inode_locks.lock_many(&requests)
+            }
+        };
+        let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+        let control = view.store.scan_control();
+        if control.is_restoring() {
+            return err_box!("replay lock validation failed: snapshot restore pending");
+        }
+        if control.cancel_epoch() != plan_epoch {
+            return err_box!(
+                "replay lock validation failed for {}: epoch moved ({} -> {})",
+                path,
+                plan_epoch,
+                control.cancel_epoch()
+            );
+        }
+        if let Some(id) = valid_id {
+            if view.store.get_inode(id, None)?.is_none() {
+                return Err(FsError::file_not_found(path)
+                    .ctx(format!("inode_id={}", id))
+                    .into());
+            }
+        }
+        let result = op(&view);
+        drop(locks);
+        drop(view);
+        result
+    }
+
     pub fn apply_entry(&self, entry: JournalEntry) -> CommonResult<()> {
         debug!("replay entry: {:?}", entry);
 
@@ -1953,17 +2007,20 @@ impl JournalLoader {
     }
 
     fn add_block(&self, entry: AddBlockEntry) -> CommonResult<()> {
+        let inode_id = entry.blocks.first().map(|v| InodeId::get_id(v.id));
         let entry_path = entry.path.clone();
-        self.with_locked_replay_view(&entry_path, false, |view, _inp| {
-            let inode_id = entry.blocks.first().map(|v| InodeId::get_id(v.id));
-
+        self.with_locked_replay_inode(&entry_path, inode_id, |view| {
             let mut inode = match MasterFilesystem::resolve_file_inode(view, &entry.path, inode_id)
             {
                 Ok(v) => v,
-                Err(e) => {
+                Err(e) if matches!(e.kind(), curvine_error::ErrorKind::FileNotFound) => {
+                    // A path the entry cannot resolve any more (e.g. it was
+                    // deleted by a later entry replayed first) is an idempotent
+                    // skip; store/lifecycle errors must surface.
                     warn!("add_block: file not found: {:?} {}", entry, e);
                     return Ok(());
                 }
+                Err(e) => return Err(e.into()),
             };
             let file = inode.as_file_mut()?;
             let _ = mem::replace(&mut file.blocks, entry.blocks);
@@ -1976,17 +2033,20 @@ impl JournalLoader {
 
     fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
         let entry_path = entry.path.clone();
-        self.with_locked_replay_view(&entry_path, false, |view, _inp| {
+        self.with_locked_replay_inode(&entry_path, Some(entry.file.id), |view| {
             let mut inode = match MasterFilesystem::resolve_file_inode(
                 view,
                 &entry.path,
                 Some(entry.file.id),
             ) {
                 Ok(v) => v,
-                Err(e) => {
+                Err(e) if matches!(e.kind(), curvine_error::ErrorKind::FileNotFound) => {
+                    // Same idempotent-skip contract as add_block: only a real
+                    // "not found" is replayable-absent.
                     warn!("complete_file: file not found: {:?} {}", entry, e);
                     return Ok(());
                 }
+                Err(e) => return Err(e.into()),
             };
             let file = inode.as_file_mut()?;
 
@@ -2003,17 +2063,22 @@ impl JournalLoader {
         // planned identities (plus epoch) once the locks are held: a path
         // replaced between planning and locking would otherwise be mutated
         // under the old object's locks.
-        let (plan_epoch, requests) = {
+        let (plan_epoch, (src_requests, dst_requests)) = {
             let view = self.fs_dir.view().map_err(|e| e.to_string())?;
             let control = view.store.scan_control();
             if control.is_restoring() {
                 return err_box!("rename replay rejected: snapshot restore pending");
             }
             let epoch = control.cancel_epoch();
-            let mut r = Self::plan_replay_locks_mode(&view, &entry.src, true)?;
-            r.extend(Self::plan_replay_locks_mode(&view, &entry.dst, true)?);
-            (epoch, r)
+            let src_reqs = Self::plan_replay_locks_mode(&view, &entry.src, true)?;
+            let dst_reqs = Self::plan_replay_locks_mode(&view, &entry.dst, true)?;
+            (epoch, (src_reqs, dst_reqs))
         };
+        // Keep the two chains' boundaries: each is compared in order against
+        // its own locked segment, so per-path identity survives (a merged,
+        // deduped set could not tell which path owns which inode).
+        let mut requests = src_requests.clone();
+        requests.extend(dst_requests.iter().cloned());
         let _locks = self.inode_locks.lock_many(&requests);
         let view = self.fs_dir.view().map_err(|e| e.to_string())?;
         let control = view.store.scan_control();
@@ -2032,16 +2097,24 @@ impl JournalLoader {
         let dst_inp = InodePath::resolve(view.root_node(), entry.dst, &view.store)?;
         let src_ids: Vec<i64> = src_inp.inodes.iter().map(|e| e.id()).collect();
         let dst_ids: Vec<i64> = dst_inp.inodes.iter().map(|e| e.id()).collect();
-        let planned: Vec<i64> = requests.iter().map(|r| r.inode_id).collect();
-        let mut planned_sorted = planned.clone();
-        planned_sorted.sort_unstable();
-        let mut live_sorted = [src_ids.clone(), dst_ids.clone()].concat();
-        live_sorted.sort_unstable();
-        live_sorted.dedup();
-        if planned_sorted != live_sorted {
+        let (src_locked, dst_locked) = {
+            let src: Vec<i64> = requests
+                .iter()
+                .take(src_requests.len())
+                .map(|r| r.inode_id)
+                .collect();
+            let dst: Vec<i64> = requests
+                .iter()
+                .skip(src_requests.len())
+                .map(|r| r.inode_id)
+                .collect();
+            (src, dst)
+        };
+        if src_locked != src_ids || dst_locked != dst_ids {
             return err_box!(
-                "rename replay validation failed: locked={:?} live={:?}+{:?}",
-                planned,
+                "rename replay validation failed: locked src={:?} dst={:?} live src={:?} dst={:?}",
+                src_locked,
+                dst_locked,
                 src_ids,
                 dst_ids
             );
@@ -2180,17 +2253,21 @@ impl JournalLoader {
         // Link replaces the destination edge (and touches the source's
         // nlink): both chains planned with parent-write, and the planning
         // epoch + both ID chains are revalidated under the locks.
-        let (plan_epoch, requests) = {
+        let (plan_epoch, (src_requests, dst_requests)) = {
             let view = self.fs_dir.view().map_err(|e| e.to_string())?;
             let control = view.store.scan_control();
             if control.is_restoring() {
                 return err_box!("link replay rejected: snapshot restore pending");
             }
             let epoch = control.cancel_epoch();
-            let mut r = Self::plan_replay_locks_mode(&view, &entry.src_path, true)?;
-            r.extend(Self::plan_replay_locks_mode(&view, &entry.dst_path, true)?);
-            (epoch, r)
+            let src_reqs = Self::plan_replay_locks_mode(&view, &entry.src_path, true)?;
+            let dst_reqs = Self::plan_replay_locks_mode(&view, &entry.dst_path, true)?;
+            (epoch, (src_reqs, dst_reqs))
         };
+        // Same per-chain validation as rename: the two locked segments are
+        // compared in order, keeping per-path identity.
+        let mut requests = src_requests.clone();
+        requests.extend(dst_requests.iter().cloned());
         let _locks = self.inode_locks.lock_many(&requests);
         let view = self.fs_dir.view().map_err(|e| e.to_string())?;
         let control = view.store.scan_control();
@@ -2208,16 +2285,21 @@ impl JournalLoader {
         let new_path = InodePath::resolve(view.root_node(), &entry.dst_path, &view.store)?;
         let src_ids: Vec<i64> = old_path.inodes.iter().map(|e| e.id()).collect();
         let dst_ids: Vec<i64> = new_path.inodes.iter().map(|e| e.id()).collect();
-        let planned: Vec<i64> = requests.iter().map(|r| r.inode_id).collect();
-        let mut planned_sorted = planned.clone();
-        planned_sorted.sort_unstable();
-        let mut live_sorted = [src_ids.clone(), dst_ids.clone()].concat();
-        live_sorted.sort_unstable();
-        live_sorted.dedup();
-        if planned_sorted != live_sorted {
+        let src_locked: Vec<i64> = requests
+            .iter()
+            .take(src_requests.len())
+            .map(|r| r.inode_id)
+            .collect();
+        let dst_locked: Vec<i64> = requests
+            .iter()
+            .skip(src_requests.len())
+            .map(|r| r.inode_id)
+            .collect();
+        if src_locked != src_ids || dst_locked != dst_ids {
             return err_box!(
-                "link replay validation failed: locked={:?} live={:?}+{:?}",
-                planned,
+                "link replay validation failed: locked src={:?} dst={:?} live src={:?} dst={:?}",
+                src_locked,
+                dst_locked,
                 src_ids,
                 dst_ids
             );
@@ -2543,6 +2625,180 @@ mod tests {
             data: b"corrupt".to_vec(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn rename_replay_accepts_same_parent_and_cross_parent() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("rename-replay", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let fs = js.fs();
+        let loader = js.journal_loader();
+
+        // Same parent: both chains share the root and the parent, so the old
+        // merged-dedup validation (which kept duplicate roots) rejected it.
+        fs.mkdir("/same", true)?;
+        let a = fs.create("/same/a", true)?;
+        let b = fs.create("/same/b", true)?;
+        let src_id = fs.file_status("/same/a")?.id;
+        loader.apply_entry(JournalEntry::Rename(RenameEntry {
+            op_id: 1,
+            rpc_id: 0,
+            src: "/same/a".to_string(),
+            dst: "/same/c".to_string(),
+            mtime: 5,
+            flags: 0,
+            src_inode_id: 0,
+            dst_inode_id: 0,
+        }))?;
+        assert!(fs.file_status("/same/a").is_err());
+        assert_eq!(fs.file_status("/same/c")?.id, src_id);
+        assert_eq!(fs.file_status("/same/b")?.id, b.id);
+
+        // Cross parent: two distinct parents under the shared root.
+        fs.mkdir("/x", true)?;
+        fs.mkdir("/y", true)?;
+        let moved_id = fs.file_status("/same/c")?.id;
+        loader.apply_entry(JournalEntry::Rename(RenameEntry {
+            op_id: 2,
+            rpc_id: 0,
+            src: "/same/c".to_string(),
+            dst: "/y/c".to_string(),
+            mtime: 6,
+            flags: 0,
+            src_inode_id: 0,
+            dst_inode_id: 0,
+        }))?;
+        assert!(fs.file_status("/same/c").is_err());
+        assert_eq!(fs.file_status("/y/c")?.id, moved_id);
+        assert!(fs.file_status("/x").is_ok());
+
+        drop(loader);
+        drop(fs);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn link_replay_accepts_same_parent_and_cross_parent() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("link-replay", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let fs = js.fs();
+        let loader = js.journal_loader();
+
+        fs.mkdir("/ld", true)?;
+        let f = fs.create("/ld/a", true)?;
+        loader.apply_entry(JournalEntry::Link(LinkEntry {
+            op_id: 1,
+            rpc_id: 0,
+            mtime: 5,
+            src_path: "/ld/a".to_string(),
+            dst_path: "/ld/b".to_string(),
+        }))?;
+        assert_eq!(fs.file_status("/ld/b")?.id, f.id);
+        assert_eq!(fs.file_status("/ld/b")?.nlink, 2);
+
+        fs.mkdir("/l2", true)?;
+        loader.apply_entry(JournalEntry::Link(LinkEntry {
+            op_id: 2,
+            rpc_id: 0,
+            mtime: 6,
+            src_path: "/ld/a".to_string(),
+            dst_path: "/l2/b".to_string(),
+        }))?;
+        assert_eq!(fs.file_status("/l2/b")?.id, f.id);
+
+        drop(loader);
+        drop(fs);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn add_block_replay_locks_the_recorded_inode_not_the_current_path() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("add-block-replay", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let fs = js.fs();
+        let loader = js.journal_loader();
+
+        fs.mkdir("/ab", true)?;
+        fs.create("/ab/file", true)?;
+        let old = fs.file_status("/ab/file")?;
+        // Build the replay entry from the pre-rename identity, then replace
+        // the path with a different inode before replaying it. A hard link
+        // keeps the recorded inode row alive after the rename.
+        use crate::master::meta::{BlockMeta, InodeId};
+        let block_id = InodeId::create_block_id(old.id, 1)?;
+        let blocks = vec![BlockMeta::new(block_id, 4_096)];
+        let commit = vec![curvine_model::CommitBlock {
+            block_id,
+            block_len: 4_096,
+            locations: vec![],
+        }];
+        let entry = AddBlockEntry {
+            op_id: 1,
+            rpc_id: 0,
+            path: "/ab/file".to_string(),
+            blocks: blocks.clone(),
+            commit_block: commit,
+        };
+        fs.link("/ab/file", "/ab/keep")?;
+        fs.delete("/ab/file", false)?;
+        fs.create("/ab/file", true)?;
+
+        // Holding the recorded inode's read lock must block the replay.
+        let inode_locks = fs.inode_locks_for_test();
+        let held = inode_locks.read_inode(old.id);
+        let loader2 = js.journal_loader();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let applier =
+            std::thread::spawn(move || tx.send(loader2.apply_entry(JournalEntry::AddBlock(entry))));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // The replay must still be waiting: the path lock (the protocol it
+        // used before) would not cover the recorded inode.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "add_block replay must wait for the recorded inode's write lock"
+        );
+        drop(held);
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("replay must finish after the lock is released");
+        result?;
+
+        // Only the recorded inode got the block; the path replacement is
+        // untouched.
+        let replaced_id = fs.file_status("/ab/file")?.id;
+        assert_ne!(replaced_id, old.id);
+        let recorded = fs
+            .fs_dir
+            .view()?
+            .store
+            .get_inode(old.id, None)?
+            .expect("recorded inode still exists via hard-link semantics");
+        let InodeView::File(file) = &recorded else {
+            panic!("recorded inode must be a file");
+        };
+        assert_eq!(file.blocks.len(), 1);
+        assert_eq!(file.blocks[0].id, block_id);
+        let replaced = fs
+            .fs_dir
+            .view()?
+            .store
+            .get_inode(replaced_id, None)?
+            .unwrap();
+        let InodeView::File(rf) = &replaced else {
+            panic!("replacement must be a file");
+        };
+        assert!(rf.blocks.is_empty(), "the replacement must stay untouched");
+
+        drop(loader);
+        drop(fs);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
