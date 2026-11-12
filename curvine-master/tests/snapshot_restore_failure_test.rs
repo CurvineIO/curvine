@@ -450,7 +450,13 @@ fn drained_lease_releases_store_before_restore_proceeds() {
             }
             assert!(control.is_restoring());
             drop(lease);
-            worker.join().unwrap();
+            // Two layers: the thread must not panic, and the restore itself
+            // must succeed. Dropping the inner Result would hide a business
+            // error behind a clean thread exit.
+            worker
+                .join()
+                .expect("restore worker must not panic")
+                .expect("restore must succeed once the scan lease is released");
         });
     }
 }
@@ -488,8 +494,16 @@ fn overlapping_restores_cannot_reopen_scan_admission() {
             assert!(store.begin_restore(Duration::from_secs(1)).is_err());
             assert!(store.begin_snapshot_scan().is_err());
             drop(lease);
-            let pending = worker.join().unwrap();
-            assert!(store.begin_snapshot_scan().is_err());
+            // `begin_restore` returns the guard itself, so unwrap it to hold a
+            // real guard: dropping the Result only simulates holding one.
+            let pending = worker
+                .join()
+                .expect("restore worker must not panic")
+                .expect("restore must acquire the guard once the scan lease is released");
+            assert!(
+                store.begin_snapshot_scan().is_err(),
+                "scan admission must stay closed while the restore guard is held"
+            );
             drop(pending);
         });
         assert!(store.begin_snapshot_scan().is_ok());
