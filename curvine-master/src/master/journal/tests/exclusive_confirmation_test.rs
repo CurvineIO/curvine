@@ -152,18 +152,32 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
     }
 
     let delete_done = delete_done_rx.recv_timeout(Duration::from_secs(10));
-    let worker_join = match &delete_done {
-        Ok(_) => Some(worker.join()),
-        // Disconnected: the worker exited without sending (already safe to
-        // join for panic evidence).
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(worker.join()),
-        // Timeout: do not join a still-running worker; report and skip any
-        // teardown step that could wait on locks this worker holds.
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+    // Completed/Disconnected: safe to join. Timeout: report and skip join
+    // and every teardown step that could wait on locks this worker holds.
+    let completed = matches!(
+        &delete_done,
+        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    );
+    let worker_join = if completed {
+        Some(worker.join())
+    } else {
+        None // Timeout: no join, no lock-touching teardown
     };
 
-    // Phase 4: terminal observations while the fixture is alive (completed
-    // paths only).
+    if !completed {
+        // Real Timeout: report precisely; the worker is still running, so
+        // begin_cold / shutdown / directory removal are all skipped to avoid
+        // waiting on locks this worker may hold.
+        assert!(
+            worker_join.is_none(),
+            "a timed-out worker must not have been joined"
+        );
+        panic!(
+            "the delete did not complete within the bounded confirmation window              (timed out after 10s); worker left running, no terminal teardown performed"
+        );
+    }
+
+    // Completed path: terminal observations while the fixture is alive.
     let holder_failed = fs.fs_dir.is_failed();
     let view_err = fs.fs_dir.view().err();
     let begin_err = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).err();
@@ -175,13 +189,16 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
         .ok()
         .and_then(|result| result.as_ref().err())
         .map(|err| err.to_string());
-    let meta_cleanup = std::fs::remove_dir_all(&meta_dir);
-    let journal_cleanup = std::fs::remove_dir_all(&journal_dir);
+
+    // Completed-path teardown: drop handles, shutdown (consumes self), then
+    // remove this case's unique temp paths.
     drop(fs);
     drop(writer);
     journal.shutdown();
+    let meta_cleanup = std::fs::remove_dir_all(&meta_dir);
+    let journal_cleanup = std::fs::remove_dir_all(&journal_dir);
 
-    // Phase 5: outer assertions.
+    // Outer assertions.
     started.expect("worker must start within the bound");
     assert!(
         is_dir_delete,
@@ -246,5 +263,9 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
     );
     meta_cleanup.expect("the meta dir must be removable");
     journal_cleanup.expect("the journal dir must be removable");
+    // The joined worker must have reported its result successfully.
+    worker_join
+        .expect("the joined worker must not panic")
+        .expect("the delete worker must report success");
     Ok(())
 }
