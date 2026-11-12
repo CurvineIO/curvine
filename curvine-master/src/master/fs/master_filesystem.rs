@@ -103,6 +103,36 @@ enum ShardedOutcome<R> {
 #[path = "master_filesystem/tests/memory_read_gates.rs"]
 pub(crate) mod memory_read_gates;
 
+/// Confirmation-window guard for the exclusive path: armed right after the
+/// cold owner is released, disarmed when `scope.wait` reports the real
+/// apply/cursor ack. On a confirmation error — or if the wait panics while
+/// armed — the namespace holder goes terminal before the exclusive gate
+/// guard is released. Single-purpose for this one call site.
+struct ExclusiveConfirmation<'a> {
+    handle: Option<&'a FsDirHandle>,
+    writer: &'a JournalWriter,
+}
+
+impl ExclusiveConfirmation<'_> {
+    fn arm(&mut self) {}
+
+    fn disarm(&mut self) {
+        self.handle = None;
+    }
+
+    fn fail_terminal(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.fail_closed(self.writer);
+        }
+    }
+}
+
+impl Drop for ExclusiveConfirmation<'_> {
+    fn drop(&mut self) {
+        self.fail_terminal();
+    }
+}
+
 #[derive(Clone)]
 pub struct MasterFilesystem {
     pub fs_dir: Arc<FsDirHandle>,
@@ -512,9 +542,6 @@ impl MasterFilesystem {
             if let Some(_gate) = self.metadata_commit_gate.close_and_enter_if_open() {
                 let scope = self.journal_writer.begin_commit_scope();
                 let failure_seq_before = self.journal_writer.failure_seq();
-                // Cold ownership spans f and scope.wait: the view borrow ends
-                // before the journal wait so the applier is never blocked on
-                // the cold handle during publication.
                 // A held owner (a legitimate long cold read) must not turn
                 // this into an unbounded close-gate/open-gate spin: the typed
                 // Busy error propagates with the original epoch preserved.
@@ -529,38 +556,73 @@ impl MasterFilesystem {
                     return Err(e);
                 }
                 let result = body(&mut cold);
+                // Terminal check while the cold owner still holds the unique
+                // view: a publication failure recorded during the body must
+                // fence the holder before the half-published view reopens.
+                if result.is_err() && self.journal_writer.failure_seq() != failure_seq_before {
+                    // The guard's own terminal path retires the taken view,
+                    // fences the writer and removes the slot.
+                    cold.fail_closed();
+                    drop(_gate);
+                    let commit = scope.wait();
+                    if let Err(commit_err) = commit {
+                        return Err(commit_err);
+                    }
+                    return Err(FsError::common(
+                        "metadata publication failed; namespace fenced",
+                    ));
+                }
+                // Body complete (or a pure validation/store error that allows
+                // backfill): release the cold owner before the confirmation
+                // wait. The exclusive gate stays closed across the wait, so
+                // RPC writes, snapshots and restores cannot cross it; the
+                // applier can take the view to advance the real ack.
+                drop(cold);
+                // Guards the confirmation window: disarmed on success,
+                // terminal on confirmation error or wait panic, all before
+                // the gate guard is released.
+                let mut confirmation = ExclusiveConfirmation {
+                    handle: Some(&self.fs_dir),
+                    writer: &self.journal_writer,
+                };
+                confirmation.arm();
                 let commit = scope.wait();
+                let commit = match commit {
+                    Ok(()) => {
+                        confirmation.disarm();
+                        Ok(())
+                    }
+                    Err(commit_err) => {
+                        // The confirmation failed: terminal before the gate
+                        // opens. The commit error keeps its original meaning.
+                        confirmation.fail_terminal();
+                        Err(commit_err)
+                    }
+                };
+                drop(confirmation);
                 match (result, commit) {
                     (Ok(value), Ok(())) => {
-                        // Release the owner and the gate first: the snapshot
-                        // path re-closes the gate and would deadlock against
-                        // an in-flight slot if called earlier.
-                        drop(cold);
+                        // Release the gate first: the snapshot path re-closes
+                        // the gate and would deadlock against an in-flight
+                        // slot if called earlier.
                         drop(_gate);
                         self.maybe_create_periodic_snapshot(epoch);
                         return Ok(value);
                     }
                     (Ok(_), Err(commit_err)) => {
-                        cold.fail_closed();
+                        drop(_gate);
                         return Err(commit_err);
                     }
                     (Err(op_err), Ok(())) => {
-                        if self.journal_writer.failure_seq() != failure_seq_before {
-                            // A publication failure was recorded during the
-                            // operation: the namespace must fail closed even
-                            // though the op itself also errored.
-                            cold.fail_closed();
-                            return Err(op_err);
-                        }
                         // Pure validation/planning/store error: normal
                         // backfill via journal replay; the handle reopens.
-                        drop(cold);
+                        drop(_gate);
                         return Err(op_err);
                     }
                     (Err(op_err), Err(_commit_err)) => {
-                        // Publication also failed: fail closed, keep the
-                        // operation error as the primary cause.
-                        cold.fail_closed();
+                        // Publication also failed: keep the operation error
+                        // as the primary cause.
+                        drop(_gate);
                         return Err(op_err);
                     }
                 }
