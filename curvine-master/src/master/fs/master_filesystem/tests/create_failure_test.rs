@@ -59,12 +59,13 @@ fn link_replans_after_source_parent_replacement() {
     // The worker resolves /a/file after the driver's identity change, so the
     // alias points at the replacement inode (the by-path contract).
     result.unwrap();
+    // The worker resolves /a/file after the driver's identity change, so the
+    // alias points at the replacement inode (the by-path contract).
     assert_eq!(fs.file_status("/d/alias").unwrap().id, new_file.id);
     fs.restore_from_rocksdb().unwrap();
-    // Restore re-assigns inode ids: only existence and file-ness survive.
-    let alias = fs.file_status("/d/alias");
-    assert!(alias.is_ok());
-    assert!(alias.unwrap().is_dir == false);
+    // Restore rebuilds from the store rows and only advances the allocator:
+    // existing inode ids are preserved, not reassigned.
+    assert_eq!(fs.file_status("/d/alias").unwrap().id, new_file.id);
 }
 
 #[cfg(feature = "fault-injection")]

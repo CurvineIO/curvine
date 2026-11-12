@@ -442,11 +442,13 @@ fn rename_replans_after_source_parent_replacement() {
     // The worker's rename raced the identity change and completed on the
     // moved-away path (by-path contract); the replacement was created after.
     result.unwrap();
+    // The worker resolved /a/file after the driver's identity change: the
+    // rename landed on the replacement created by the driver.
+    let moved = fs.file_status("/d/moved").unwrap();
+    assert_eq!(moved.id, new_file.id);
     fs.restore_from_rocksdb().unwrap();
-    // Restore re-assigns inode ids: existence and file-ness survive.
-    let moved = fs.file_status("/d/moved");
-    assert!(moved.is_ok());
-    assert!(moved.unwrap().is_dir == false);
+    // Restore rebuilds from the store rows: inode ids are preserved.
+    assert_eq!(fs.file_status("/d/moved").unwrap().id, new_file.id);
 }
 
 #[cfg(feature = "fault-injection")]
