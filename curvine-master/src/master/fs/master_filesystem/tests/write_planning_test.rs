@@ -8,7 +8,6 @@ use crate::master::meta::BlockMeta;
 use curvine_model::BlockLocation;
 use std::collections::HashMap;
 
-
 #[test]
 fn write_planning_walks_live_edges_and_keeps_partial_ids() {
     let fs = test_fs("write-planning-edges");
@@ -218,19 +217,10 @@ fn build_located_blocks_rejects_short_non_tail_block_like_the_live_path() {
     // the same corruption the live path rejects.
     let mut file = InodeFile::new(1, 0);
     file.block_size = 1024;
-    file.blocks = vec![
-        BlockMeta::new(101, 512),
-        BlockMeta::new(102, 256),
-    ];
+    file.blocks = vec![BlockMeta::new(101, 512), BlockMeta::new(102, 256)];
     let mut locations = HashMap::new();
-    locations.insert(
-        101,
-        vec![BlockLocation::with_id(100)],
-    );
-    locations.insert(
-        102,
-        vec![BlockLocation::with_id(100)],
-    );
+    locations.insert(101, vec![BlockLocation::with_id(100)]);
+    locations.insert(102, vec![BlockLocation::with_id(100)]);
 
     let err = fs
         .build_located_blocks("/file", &file, locations)
@@ -250,28 +240,31 @@ fn build_located_blocks_orders_blocks_and_reports_status() {
 
     let mut file = InodeFile::new(2, 0);
     file.block_size = 1024;
-    file.blocks = vec![
-        BlockMeta::new(201, 1024),
-        BlockMeta::new(202, 512),
-    ];
+    file.blocks = vec![BlockMeta::new(201, 1024), BlockMeta::new(202, 512)];
     let mut locations = HashMap::new();
     locations.insert(201, vec![BlockLocation::with_id(100)]);
     locations.insert(202, vec![BlockLocation::with_id(100)]);
 
-    let blocks = fs
-        .build_located_blocks("/file", &file, locations)
-        .unwrap();
+    let blocks = fs.build_located_blocks("/file", &file, locations).unwrap();
     assert_eq!(blocks.len(), 2);
     assert_eq!(blocks[0].block.id, 201);
     assert_eq!(blocks[0].block.len, 1024);
     assert_eq!(
-        blocks[0].locs.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+        blocks[0]
+            .locs
+            .iter()
+            .map(|l| l.worker_id)
+            .collect::<Vec<_>>(),
         vec![100]
     );
     assert_eq!(blocks[1].block.id, 202);
     assert_eq!(blocks[1].block.len, 512);
     assert_eq!(
-        blocks[1].locs.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+        blocks[1]
+            .locs
+            .iter()
+            .map(|l| l.worker_id)
+            .collect::<Vec<_>>(),
         vec![100]
     );
 }
