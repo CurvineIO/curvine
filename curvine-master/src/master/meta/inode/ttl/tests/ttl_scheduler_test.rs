@@ -138,9 +138,10 @@ fn standby_skips_scheduled_ttl_cleanup_and_resumes_after_promotion() {
         1,
         "the promoted pass must count as one TTL execution"
     );
+    let deleted = fs.file_status("/ttl/standby.log");
     assert!(
-        fs.file_status("/ttl/standby.log").is_err(),
-        "the active master must delete the expired file"
+        matches!(&deleted, Err(error) if matches!(error.kind(), ErrorKind::FileNotFound)),
+        "the active master must delete the expired file with FileNotFound, got: {deleted:?}"
     );
     assert_eq!(bucket_list.total_inodes(), 0);
 }
@@ -170,9 +171,10 @@ fn non_active_cleanup_requeues_inodes_until_promotion() {
     fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
     assert!(manager.is_active());
     assert_eq!(manager.cleanup().unwrap(), 1);
+    let deleted = fs.file_status("/ttl/requeue.log");
     assert!(
-        fs.file_status("/ttl/requeue.log").is_err(),
-        "the active master must delete the expired file"
+        matches!(&deleted, Err(error) if matches!(error.kind(), ErrorKind::FileNotFound)),
+        "the active master must delete the expired file with FileNotFound, got: {deleted:?}"
     );
     assert_eq!(bucket_list.total_inodes(), 0);
 }
