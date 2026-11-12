@@ -2162,12 +2162,12 @@ fn assign_worker_waits_for_conflicting_block_location_lock() {
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
     drop(held);
-    worker.join().unwrap();
     let located = done_rx
-        .recv()
+        .recv_timeout(std::time::Duration::from_secs(2))
         .expect("assign_worker must finish after the lock is released")
         .expect("assign_worker must succeed after the lock is released");
-    assert!(located.block.id != 0);
+    worker.join().unwrap();
+    assert_eq!(located.block.id, block);
 }
 
 #[test]
@@ -2232,13 +2232,13 @@ fn resize_waits_for_conflicting_block_location_lock() {
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
     drop(held);
-    worker.join().unwrap();
     let blocks = done_rx
-        .recv()
+        .recv_timeout(std::time::Duration::from_secs(2))
         .expect("resize must finish after the lock is released")
         .expect("resize must succeed after the lock is released");
-    // truncate(0) legitimately leaves the file with no located blocks; the
-    // business success itself is the contract under test.
+    worker.join().unwrap();
+    let status = fs.file_status("/file").unwrap();
+    assert_eq!(status.len, 0);
     assert!(blocks.block_locs.is_empty());
 }
 
@@ -2362,6 +2362,8 @@ fn add_block_waits_for_conflicting_block_location_lock() {
             None,
         )
         .unwrap();
+    let first_block_id = first.block.id;
+    let file_id = fs.file_status("/file").unwrap().id;
     let held = fs.block_location_locks.write_blocks(&[first.block.id]);
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -2385,14 +2387,17 @@ fn add_block_waits_for_conflicting_block_location_lock() {
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
     drop(held);
-    worker.join().unwrap();
     let located = done_rx
-        .recv()
+        .recv_timeout(std::time::Duration::from_secs(2))
         .expect("add_block must finish after the lock is released")
         .expect("add_block must succeed after the lock is released");
-    assert!(
-        located.block.id != 0,
-        "add_block must return the newly allocated block"
+    worker.join().unwrap();
+    // The newly allocated block must belong to the same file inode and differ
+    // from the pre-wait first block.
+    assert_ne!(located.block.id, first_block_id);
+    assert_eq!(
+        crate::master::meta::InodeId::get_id(located.block.id),
+        file_id
     );
 }
 
