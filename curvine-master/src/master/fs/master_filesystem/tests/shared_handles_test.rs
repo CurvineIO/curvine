@@ -187,7 +187,23 @@ fn namespace_validation_checks_first_missing_component() {
 #[test]
 fn topology_reads_wait_for_shared_namespace_writers() {
     let fs = test_fs("status-list-exclusive");
+    let mut worker = WorkerInfo::default();
+    worker.address.worker_id = 100;
+    fs.add_test_worker(worker);
     fs.create("/dir/file", true).unwrap();
+    // Allocate a real block so the shared-view get_file_block_details has
+    // content to report.
+    let block = fs
+        .add_block(
+            "/dir/file",
+            None,
+            ClientAddress::default(),
+            vec![],
+            vec![],
+            0,
+            None,
+        )
+        .unwrap();
     let held = fs.fs_dir.view().unwrap();
     // Two-phase start: all six cold workers spawn and confirm they are alive
     // (started ack), then main runs the shared-view get_lock on the held
@@ -195,9 +211,12 @@ fn topology_reads_wait_for_shared_namespace_writers() {
     // workers race ahead into a cold window and make get_lock read Busy.
     let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
     let mut release_senders: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
+    let shared = fs.clone();
+    // get_file_block_details (op 2) is a shared-view read since cb9ba3dae:
+    // confirmed separately below, not a cold participant.
     let (tx, rx) = std::sync::mpsc::channel();
     let mut threads = Vec::new();
-    let cold_ops: [u8; 6] = [2, 3, 5, 6, 7, 8];
+    let cold_ops: [u8; 5] = [3, 5, 6, 7, 8];
     for (index, &operation) in cold_ops.iter().enumerate() {
         let fs = fs.clone();
         let started_tx = started_tx.clone();
@@ -220,15 +239,22 @@ fn topology_reads_wait_for_shared_namespace_writers() {
         }));
     }
     drop(started_tx);
-    for _ in 0..6 {
+    for _ in 0..5 {
         started_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("all cold workers started");
     }
-    // get_lock is a shared-view read: it succeeds while the view is held and
-    // before any cold read begins.
+    // Shared-view reads succeed while the view is held, before any cold read
+    // begins: get_lock (per-path locks) and get_file_block_details (snapshot).
     fs.get_lock("/dir/file", FileLock::default())
         .expect("get_lock must succeed on the shared view");
+    let details = shared
+        .get_file_block_details("/dir/file")
+        .expect("get_file_block_details must succeed on the shared view");
+    assert!(details
+        .blocks
+        .iter()
+        .any(|detail| detail.block_id == block.block.id));
     // Release the cold workers; the held guard must drain them all.
     for sender in release_senders.iter() {
         sender.send(()).unwrap();
@@ -246,7 +272,7 @@ fn topology_reads_wait_for_shared_namespace_writers() {
     for thread in threads {
         thread.join().unwrap();
     }
-    for _ in 0..6 {
+    for _ in 0..5 {
         let (op, success) = rx.recv().unwrap();
         assert!(success, "cold read op {op} failed");
     }
@@ -781,17 +807,22 @@ fn link_and_symlink_do_not_wait_for_shared_namespace_readers() {
             .and_then(|_| worker_fs.symlink("/source", "/sym", false, 0o777));
         tx.send(result).unwrap();
     });
-    let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+    let outer = rx.recv_timeout(std::time::Duration::from_secs(5));
     drop(held);
-    worker.join().unwrap();
-    result.unwrap();
+    // Both layers must succeed: the channel delivery and the link+symlink
+    // business result itself.
+    let inner = outer.expect("worker must report within the bound");
+    worker.join().expect("worker must not panic");
+    inner.expect("link and symlink must succeed on the shared view");
     assert_eq!(
         fs.file_status("/hard").unwrap().id,
-        fs.file_status("/source").unwrap().id
+        fs.file_status("/source").unwrap().id,
+        "the hardlink must share the source inode id"
     );
     assert_eq!(
         fs.file_status("/sym").unwrap().target.as_deref(),
-        Some("/source")
+        Some("/source"),
+        "the symlink must target the source path"
     );
 }
 

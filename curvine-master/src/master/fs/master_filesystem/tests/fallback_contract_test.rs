@@ -66,18 +66,29 @@ fn symlink_fallback_surfaces_the_real_destination_conflict() {
     fs.create("/real", true).unwrap();
     fs.mkdir("/dir", true).unwrap();
 
-    let (release, entered) = memory_read_gates::install_with_entered("symlink-plan-/dir/link");
+    // Same per-run uniqueness for the symlink gate key.
+    let link = format!("/dir/link-{}", curvine_runtime::common::Utils::rand_str(8));
+    let (release, entered) =
+        memory_read_gates::install_with_entered(&format!("symlink-plan-{link}"));
     let worker_fs = fs.clone();
+    let link_for_worker = link.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        tx.send(worker_fs.symlink_with_owner_group("/real", "/dir/link", false, 0o644, None, None))
+        tx.send(worker_fs.symlink_with_owner_group(
+            "/real",
+            &link_for_worker,
+            false,
+            0o644,
+            None,
+            None,
+        ))
     });
 
     entered
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the symlink helper must reach its plan gate");
-    fs.create("/dir/link", true).unwrap();
-    let driver_link_id = fs.file_status("/dir/link").unwrap().id;
+    fs.create(&link, true).unwrap();
+    let driver_link_id = fs.file_status(&link).unwrap().id;
     release.send(()).unwrap();
     drop(release);
 
@@ -90,7 +101,7 @@ fn symlink_fallback_surfaces_the_real_destination_conflict() {
         matches!(err, FsError::FileAlreadyExists(_)),
         "the helper's Fallback must run the real cold body, got {err:?}"
     );
-    let driver_file = fs.file_status("/dir/link").unwrap();
+    let driver_file = fs.file_status(&link).unwrap();
     assert_eq!(driver_file.id, driver_link_id);
     assert_eq!(driver_file.file_type, FileType::File);
     assert_eq!(driver_file.nlink, 1);
