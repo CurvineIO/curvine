@@ -50,7 +50,7 @@ cv mount cosn://mybucket-1250000000/ /mnt/cosn \
   --provider cosn
 ```
 
-The mount URI may use the short Hive bucket name (`cosn://mybucket/...`). Pass appid so native HeadBucket still uses `mybucket-1250000000`:
+Hive LOCATION using the short bucket (`cosn://mybucket/...`) must keep that short name on the mount UFS path so CosnProxy can map prefixes. Pass appid so native HeadBucket still uses `mybucket-1250000000`:
 
 ```bash
 cv mount cosn://mybucket/warehouse/db/hot_table/ /cache/db/hot_table \
@@ -61,6 +61,17 @@ cv mount cosn://mybucket/warehouse/db/hot_table/ /cache/db/hot_table \
   -c cosn.appid=1250000000 \
   -c fs.cosn.trsf.fs.ofs.use.short.bucketname=true
 ```
+
+## Hive cache proxy (no table LOCATION change)
+
+Use `io.curvine.CosnProxyFileSystem` as `fs.cosn.impl` so Hive keeps `cosn://...` locations:
+
+- **Reads** of paths mounted in Curvine → Curvine (miss can fall back to COSN)
+- **Reads** of unmounted paths → native CosFileSystem
+- **All writes** → native CosFileSystem (never through Curvine)
+- Per-job switch: `fs.cv.proxy.enabled=true|false`
+
+See [hive-cosn-cache.md](../../curvine-libsdk/hive-cosn-cache.md).
 
 ## Limitations
 

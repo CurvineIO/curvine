@@ -119,6 +119,14 @@ JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`j
 
 The canonical HDFS backend selector is `hdfs.provider=native` (or `jvm` for the JVM-backed OpenDAL HDFS provider). The legacy boolean `hdfs.native=true` remains supported when `hdfs.provider` is absent.
 
+### Transparent acceleration proxies
+
+`S3aProxyFileSystem` and `CosnProxyFileSystem` let Hive/Spark/Tez jobs read
+mounted paths through Curvine without changing table LOCATIONs - the job opts
+in via Hadoop configuration (`fs.cosn.impl` / `fs.s3a.impl` plus
+`fs.cv.proxy.*`). Per-job usage and the ZooKeeper global kill switch are
+documented in [hive-cosn-cache.md](hive-cosn-cache.md).
+
 **`cannot allocate memory in static TLS block`** (large JNI `.so` + glibc): load from a real **`build/dist/lib`** path first (`CurvineNative` scans `java.library.path` entries); if it still fails, try preloading **`LD_PRELOAD`** with the same **`libcurvine_libsdk_<os>_<arch>_64.so`**, or use a host/OS image validated for Curvine JNI.
 
 ### Transfer load routing
