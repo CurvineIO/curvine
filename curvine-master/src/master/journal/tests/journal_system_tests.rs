@@ -318,8 +318,56 @@ mod recovery_metrics_tests {
         Ok(())
     }
 
+    /// The journal gauges live in the process-global `MASTER_METRICS`, so a
+    /// concurrently running journal system in the same lib process can refresh
+    /// them to its own state. Run the body in a child process of this test
+    /// binary so no other loader shares the gauges with it.
+    const METRICS_ISOLATION_ENV: &str = "CURVINE_JOURNAL_METRICS_ISOLATED";
+
+    const METRICS_CASE: &str = "master::journal::journal_system::journal_system_tests::recovery_metrics_tests::snapshot_restore_and_hard_state_only_changes_refresh_journal_metrics";
+
+    fn run_isolated_metrics_child() -> FsResult<()> {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                METRICS_CASE,
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(METRICS_ISOLATION_ENV, "1")
+            .output()?;
+
+        // Keep the child's raw streams in this run's evidence.
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+
+        assert!(
+            output.status.success(),
+            "isolated journal metrics child failed: {}",
+            output.status
+        );
+        // A successful exit alone would also accept a mistyped --exact filter
+        // that selected nothing, so the harness summary is checked too.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let summary = stdout
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("test result:"))
+            .unwrap_or("");
+        assert!(
+            summary.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "isolated journal metrics child must run exactly one non-ignored passing test, got summary: {summary:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn snapshot_restore_and_hard_state_only_changes_refresh_journal_metrics() -> FsResult<()> {
+        if std::env::var_os(METRICS_ISOLATION_ENV).is_none() {
+            return run_isolated_metrics_child();
+        }
+
         let root = std::env::temp_dir().join(format!("curvine-1718-metrics-{}", Utils::rand_id()));
         let conf = ClusterConf {
             testing: true,
