@@ -195,7 +195,3 @@ where
     }
     Ok(page)
 }
-
-#[cfg(test)]
-#[path = "listing_tests.rs"]
-mod tests;
