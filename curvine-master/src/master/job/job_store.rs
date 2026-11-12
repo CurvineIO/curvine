@@ -149,6 +149,16 @@ impl JobStore {
             }
         };
 
+        // A finished task is final. A delayed report must not reopen it, or the
+        // task would be counted as finished twice.
+        if previous.state.is_finish() {
+            debug!(
+                "ignore task report for finished task {}, job {}, state {:?}",
+                task_id, job_id, previous.state
+            );
+            return Ok(());
+        }
+
         job.update_progress(task_id, progress)?;
         Self::record_task_report(&job, task_id, &previous);
 
@@ -283,5 +293,67 @@ impl Deref for JobStore {
 
     fn deref(&self) -> &Self::Target {
         &self.jobs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::job::TaskDetail;
+    use curvine_config::ClientConf;
+    use curvine_model::{LoadJobCommand, LoadTaskInfo, MountInfo, WorkerAddress};
+
+    fn progress(state: JobTaskState, loaded_size: i64) -> JobTaskProgress {
+        JobTaskProgress {
+            state,
+            loaded_size,
+            total_size: 200,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn delayed_report_does_not_reopen_a_finished_task() {
+        let source = "s3://bucket/a";
+        let mut job = JobContext::with_conf(
+            &LoadJobCommand::builder(source).build(),
+            "job-1".to_string(),
+            source.to_string(),
+            "/target".to_string(),
+            &MountInfo::default(),
+            &ClientConf::default(),
+            1,
+        );
+        for task_id in ["task-1", "task-2"] {
+            job.add_task_detail(
+                task_id.to_string(),
+                TaskDetail::new(LoadTaskInfo {
+                    job: job.info.clone(),
+                    task_id: task_id.to_string(),
+                    worker: WorkerAddress::default(),
+                    source_path: source.to_string(),
+                    target_path: "/target".to_string(),
+                    create_time: 0,
+                    source_read_plan_json: String::new(),
+                    transfer_report: None,
+                }),
+            );
+        }
+        let jobs = JobStore::new();
+        jobs.insert("job-1".to_string(), job);
+
+        jobs.update_progress("job-1", "task-1", progress(JobTaskState::Completed, 200))
+            .unwrap();
+        // The delayed report of the same task arrives after its completion.
+        jobs.update_progress("job-1", "task-1", progress(JobTaskState::Loading, 100))
+            .unwrap();
+
+        let job = jobs.get("job-1").unwrap();
+        let task = &job.tasks["task-1"].progress;
+        assert_eq!(task.state, JobTaskState::Completed);
+        assert_eq!(task.loaded_size, 200);
+        assert_eq!(job.progress.loaded_size, 200);
+        let state: JobTaskState = job.state.state();
+        assert_eq!(state, JobTaskState::Loading);
     }
 }

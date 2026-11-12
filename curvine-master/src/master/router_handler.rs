@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::Query;
 use axum::routing::get;
@@ -41,6 +41,9 @@ pub struct MasterRouterHandler {
     fault_http: FaultHttpControl,
     journal_store: RocksLogStorage,
     jobs: JobStore,
+    /// Serializes the `load_jobs` refresh with the rendering that follows it,
+    /// so that concurrent scrapes never see a half rebuilt gauge.
+    render_lock: Arc<Mutex<()>>,
 }
 
 impl MasterRouterHandler {
@@ -60,10 +63,12 @@ impl MasterRouterHandler {
             fault_http,
             journal_store,
             jobs,
+            render_lock: Arc::new(Mutex::new(())),
         }
     }
 
     fn text_output(&self) -> FsResult<String> {
+        let _guard = self.render_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.metrics.refresh_load_jobs(&self.jobs);
         Ok(self
             .metrics
