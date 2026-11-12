@@ -96,7 +96,18 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
         .unwrap()
         .recv_timeout(Duration::from_secs(5))
         .expect("missing delete journal entry");
+    // The fixture's only real entry must be the directory delete: a path
+    // check pins the scenario without needing the full enum shape here.
+    assert!(
+        format!("{:?}", queued.entry).contains("\"/dir\""),
+        "the queued entry must be the /dir delete, got {:?}",
+        queued.entry
+    );
     let completion = queued.completion.expect("missing commit confirmation");
+
+    // Pre-operation opaque cursor handle: before the failure it answers
+    // point lookups normally.
+    let pre_cursor = fs.fs_dir.view().unwrap().store.cursor_store();
 
     // While the receipt is held: wait (bounded) for the body to finish and
     // the cold owner to be released — the view reopens and the live edge is
@@ -120,10 +131,19 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
     drop(completion);
 
     let delete_done = delete_done_rx.recv_timeout(Duration::from_secs(10));
-    let worker_join = worker.join();
+    // Only a completed observation may join; a Timeout must fail explicitly
+    // without joining a still-running worker or touching locks it may hold.
+    let worker_join = match &delete_done {
+        Ok(_) => Some(worker.join()),
+        Err(_) => None, // Timeout: do not join a still-running worker
+    };
 
-    // All assertions after full teardown of held receipt/worker.
-    worker_join.expect("delete worker must not panic");
+    // All assertions come after the fixture teardown (receipt dropped, done
+    // observed, worker joined when completed).
+    worker_join
+        .expect("delete worker must not panic")
+        .expect("delete worker must report a result");
+
     assert!(
         view_while_held.is_none(),
         "the view must reopen once the body completes, got {view_while_held:?}"
@@ -181,19 +201,26 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
             .contains("journal commit failed after metadata commit"),
         "the delete must surface the real commit error, got {delete_err}"
     );
+    // The pre-failure cursor handle must be retired: point lookups now
+    // surface the unavailable store instead of stale rows.
+    let cursor_err = pre_cursor
+        .get_applied_req(1)
+        .err()
+        .or_else(|| pre_cursor.get_applied_req(1).err());
+    assert!(
+        cursor_err.is_some(),
+        "the opaque cursor store must be retired after the terminal failure"
+    );
 
-    // Drain any remaining queued receipts so the channels exit cleanly.
-    for receiver in [
-        writer.receiver.as_ref().unwrap(),
-        fs.journal_writer.receiver.as_ref().unwrap(),
-    ] {
-        loop {
-            match receiver.lock().unwrap().try_recv() {
-                Ok(entry) => drop(entry),
-                Err(_) => break,
-            }
+    // Drain any remaining queued receipts (single writer Arc) so the channels
+    // exit cleanly, then consume the journal system.
+    loop {
+        match writer.receiver.as_ref().unwrap().lock().unwrap().try_recv() {
+            Ok(entry) => drop(entry),
+            Err(_) => break,
         }
     }
+    drop(fs);
     journal.shutdown();
     Ok(())
 }
