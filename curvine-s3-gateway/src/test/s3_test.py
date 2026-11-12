@@ -277,6 +277,42 @@ class S3BasicOperationsTest:
             self._record_test("List Objects", False)
             return False, []
     
+    def test_list_objects_v2_pagination(self) -> bool:
+        """#2091: nested keys and CommonPrefixes page together without gaps."""
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        keys = ['ls/' + k for k in ('a-', 'a/deep/1', 'a/deep/2', 'a/file', 'a0', '中文 +%.txt')]
+        success = False
+        try:
+            for key in keys:
+                s3.put_object(Bucket=bucket, Key=key, Body=b'x')
+            for prefix, delimiter, size in (('ls/', '', 1), ('ls/', '/', 1),
+                                            ('ls/a/d', '', 3), ('ls/', 'deep', 2)):
+                expected = set()
+                for key in filter(lambda k: k.startswith(prefix), keys):
+                    at = key.find(delimiter, len(prefix)) if delimiter else -1
+                    expected.add(key[:at + len(delimiter)] if at >= 0 else key)
+                actual = []
+                for page in s3.get_paginator('list_objects_v2').paginate(
+                        Bucket=bucket, Prefix=prefix, Delimiter=delimiter,
+                        PaginationConfig={'PageSize': size}):
+                    actual += [i['Key'] for i in page.get('Contents', [])]
+                    actual += [i['Prefix'] for i in page.get('CommonPrefixes', [])]
+                    assert len(actual) <= len(expected), 'pagination did not terminate'
+                assert sorted(actual) == sorted(expected), f'{prefix!r} {delimiter!r}: {actual}'
+            zero = s3.list_objects_v2(Bucket=bucket, Prefix='ls/', MaxKeys=0)
+            assert zero['KeyCount'] == 0 and not zero['IsTruncated'], 'MaxKeys=0'
+            success = True
+        except (ClientError, AssertionError) as error:
+            print(f'ListObjectsV2 regression failed: {error}')
+        finally:
+            for key in keys:
+                try:
+                    s3.delete_object(Bucket=bucket, Key=key)
+                except ClientError:
+                    pass
+            self._record_test('ListObjectsV2 nested keys and CommonPrefixes (#2091)', success)
+        return success
+
     def _record_test(self, test_name: str, success: bool):
         """Record test result"""
         self.test_results.append((test_name, success))
@@ -687,6 +723,10 @@ class ComprehensiveS3TestSuite:
         
         # A failed overwrite must not destroy the existing object
         if not basic_test.test_overwrite_is_atomic("overwrite-object"):
+            return False
+
+        # Required regression: nested keys and delimiter groups share pagination.
+        if not basic_test.test_list_objects_v2_pagination():
             return False
 
         # Test list operations

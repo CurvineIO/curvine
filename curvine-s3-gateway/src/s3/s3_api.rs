@@ -96,7 +96,7 @@ use crate::utils::io::PollWrite;
 pub use crate::s3::dto::{Bucket, Buckets, CommonPrefix, ListAllMyBucketsResult, Owner};
 pub use crate::s3::dto::{ListObjectContent, ListObjectResult};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ListObjectOption {
     pub bucket: String,
@@ -138,7 +138,7 @@ pub trait ListObjectHandler: Send + Sync {
         &self,
         opt: &ListObjectOption,
         bucket: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<ListObjectContent>, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<super::listing::ListObjectPage, String>> + Send;
 }
 
 pub use crate::s3::dto::{DeleteMarker, ListObjectVersionsResult, ObjectVersion};
@@ -489,14 +489,23 @@ pub async fn handle_get_list_object<
         return;
     };
 
+    let max_keys = match req.get_query("max-keys") {
+        Some(value) => match value.parse::<u64>() {
+            Ok(value) => Some(value.min(1000) as i32),
+            Err(_) => {
+                resp.set_status(400);
+                resp.send_header();
+                return;
+            }
+        },
+        None => None,
+    };
     let opt = ListObjectOption {
         bucket: bucket.clone(),
         continuation_token: req.get_query("continuation-token"),
         delimiter: req.get_query("delimiter"),
         expected_bucket_owner: req.get_query("expected-bucket-owner"),
-        max_keys: req
-            .get_query("max-keys")
-            .and_then(|v| v.parse::<i32>().ok()),
+        max_keys,
         optional_object_attributes: None,
         request_payer: req.get_header("x-amz-request-payer"),
         start_after: req.get_query("start-after"),
@@ -516,54 +525,37 @@ pub async fn handle_get_list_object<
     let ret = handler.handle(&opt, bucket.as_str()).await;
     match ret {
         Ok(ans) => {
-            let (mut contents, common_prefixes) = if let Some(ref delim) = opt.delimiter {
-                let files = ans
-                    .into_iter()
-                    .filter(|item| !item.key.ends_with(delim))
-                    .collect();
-                (files, vec![])
-            } else {
-                (ans, vec![])
-            };
-
-            // S3 requires lexicographic key order and honours
-            // `max-keys`/`continuation-token`; without this a directory with
-            // more than 1000 objects was returned in one response.
-            contents.sort_by(|a, b| a.key.cmp(&b.key));
-            if let Some(start_after) = opt.start_after.as_deref() {
-                contents.retain(|item| item.key.as_str() > start_after);
-            }
-            if let Some(token) = opt.continuation_token.as_deref() {
-                contents.retain(|item| item.key.as_str() > token);
-            }
-
-            let max_keys = opt.max_keys.unwrap_or(1000).max(1) as usize;
-            let is_truncated = contents.len() > max_keys;
-            if is_truncated {
-                contents.truncate(max_keys);
-            }
-            let next_continuation_token = if is_truncated {
-                contents.last().map(|item| item.key.clone())
-            } else {
-                None
-            };
-
-            let total_count = contents.len() + common_prefixes.len();
-
-            let result = ListObjectResult {
+            // Traversal, grouping and pagination happen together in the backend;
+            // the HTTP layer must not collect or paginate the bucket a second time.
+            let total_count = ans.contents.len() + ans.common_prefixes.len();
+            let mut result = ListObjectResult {
                 xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
                 name: bucket,
                 prefix: opt.prefix,
                 key_count: Some(total_count as u32),
-                max_keys: Some(max_keys as u32),
+                max_keys: Some(opt.max_keys.unwrap_or(1000).min(1000) as u32),
                 delimiter: opt.delimiter,
+                encoding_type: opt.encoding_type,
+                start_after: opt.start_after,
                 continuation_token: opt.continuation_token,
-                next_continuation_token,
-                is_truncated,
-                contents,
-                common_prefixes,
+                next_continuation_token: ans.next_continuation_token,
+                is_truncated: ans.is_truncated,
+                contents: ans.contents,
+                common_prefixes: ans.common_prefixes,
             };
 
+            if result.encoding_type.as_deref() == Some("url") {
+                let encode = |value: &str| urlencoding::encode(value).into_owned();
+                result.prefix = result.prefix.as_deref().map(encode);
+                result.delimiter = result.delimiter.as_deref().map(encode);
+                result.start_after = result.start_after.as_deref().map(encode);
+                for item in &mut result.contents {
+                    item.key = encode(&item.key);
+                }
+                for group in &mut result.common_prefixes {
+                    group.prefix = encode(&group.prefix);
+                }
+            }
             match quick_xml::se::to_string(&result) {
                 Ok(data) => {
                     log::debug!("ListObjectsV2 XML => {data}");

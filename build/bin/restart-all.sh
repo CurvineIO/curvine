@@ -155,32 +155,46 @@ wait_for_port() {
     return 1
 }
 
-umount -l /curvine-fuse
-pkill -9 -f "curvine"
-
-# Wait a moment for processes to be killed
-sleep 3
+# Stop only the services this script manages, in reverse start order. Each
+# service's stop goes through launch-process.sh, which signals just the PID
+# recorded in that service's pid file. The previous `pkill -9 -f "curvine"`
+# killed every process whose command line mentioned curvine: an editor with a
+# file open in a curvine checkout, a tail on a log, another deployment on the
+# same host.
+"${BIN_DIR}/curvine-fuse.sh" stop
+# The fuse daemon usually unmounts during its graceful stop; drop a leftover
+# lazy mount so the start below does not refuse the existing mountpoint
+# (see prepare_mount_path in curvine-fuse.sh).
+umount -l /curvine-fuse 2>/dev/null || true
+if transfer_enabled; then
+    "${BIN_DIR}/curvine-transfer.sh" stop
+fi
+"${BIN_DIR}/curvine-worker.sh" stop
+"${BIN_DIR}/curvine-master.sh" stop
 
 MASTER_PORT=$(read_rpc_port "master" 8995)
 WORKER_PORT=$(read_rpc_port "worker" 8997)
 TRANSFER_PORT=$(read_rpc_port "transfer" 9010)
 
-# Start master and worker services
-${BIN_DIR}/curvine-master.sh start
+# Start master and worker services. A failed start must abort: when a service
+# keeps running without a pid file (started by hand, pid file deleted), the
+# stop above leaves it alone and wait_for_process/wait_for_port would find
+# that old process and report success for the old binary.
+${BIN_DIR}/curvine-master.sh start || exit 1
 wait_for_process "master" || exit 1
 wait_for_port "master" "$MASTER_PORT" 180 || exit 1
 
-${BIN_DIR}/curvine-worker.sh start
+${BIN_DIR}/curvine-worker.sh start || exit 1
 
 # Wait for master and worker to start
 wait_for_process "worker" || exit 1
 wait_for_port "worker" "$WORKER_PORT" 60 || exit 1
 
 if transfer_enabled; then
-    ${BIN_DIR}/curvine-transfer.sh start
+    ${BIN_DIR}/curvine-transfer.sh start || exit 1
     wait_for_process "transfer" || exit 1
     wait_for_port "transfer" "$TRANSFER_PORT" 60 || exit 1
 fi
 
 # Start fuse service
-${BIN_DIR}/curvine-fuse.sh start
+${BIN_DIR}/curvine-fuse.sh start || exit 1
