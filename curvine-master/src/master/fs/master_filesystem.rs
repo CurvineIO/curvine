@@ -6895,6 +6895,8 @@ mod tests {
     mod set_attr_lock_test;
     #[path = "shared_handles_test.rs"]
     mod shared_handles_test;
+    #[path = "snapshot_block_reads_test.rs"]
+    mod snapshot_block_reads_test;
     #[path = "worker_recovery_test.rs"]
     mod worker_recovery_test;
     #[path = "write_planning_test.rs"]
