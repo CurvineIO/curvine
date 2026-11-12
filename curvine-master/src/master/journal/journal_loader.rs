@@ -64,45 +64,11 @@ mod role_queue_fence_test;
 #[path = "tests/scan_worker_test.rs"]
 mod scan_worker_test;
 
-/// Test-only gate that parks the apply worker inside its `CreateSnapshot`
-/// branch until the driving test releases it, so the cancellation test can
-/// confirm the snapshot is queued and in progress instead of relying on a
-/// cold namespace guard (which the worker no longer waits on).
+/// Test-only gate used by the snapshot-cancellation regression. The
+/// implementation lives with the tests; the core file only wires it in.
 #[cfg(test)]
-pub(crate) mod snapshot_apply_gates {
-    use parking_lot::Mutex;
-    use std::collections::HashMap;
-    use std::sync::mpsc::{channel, Receiver, Sender};
-    use std::sync::LazyLock;
-    use std::time::Duration;
-
-    type Entry = (Receiver<()>, Sender<()>);
-
-    static GATES: LazyLock<Mutex<HashMap<String, Entry>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-
-    /// Registers a gate for `point`. Returns the release handle plus a channel
-    /// that fires once the worker actually entered the gate, so the test can
-    /// confirm the interleaving instead of racing a sleep.
-    pub fn install(point: &str) -> (Sender<()>, Receiver<()>) {
-        let (release_tx, release_rx) = channel();
-        let (entered_tx, entered_rx) = channel();
-        GATES
-            .lock()
-            .insert(point.to_string(), (release_rx, entered_tx));
-        (release_tx, entered_rx)
-    }
-
-    /// Blocks the apply worker until the gate is released or the safety
-    /// timeout expires, so a failing test can never hang the suite.
-    pub fn park(point: &str, timeout: Duration) {
-        let entry: Option<Entry> = GATES.lock().remove(point);
-        if let Some((release_rx, entered_tx)) = entry {
-            let _ = entered_tx.send(());
-            let _ = release_rx.recv_timeout(timeout);
-        }
-    }
-}
+#[path = "tests/snapshot_apply_gate.rs"]
+pub(crate) mod snapshot_apply_gate;
 
 #[cfg(test)]
 #[path = "tests/snapshot_cancel_gate_test.rs"]
@@ -1005,14 +971,11 @@ impl JournalLoader {
                             raft::StorageError::SnapshotTemporarilyUnavailable,
                         )))
                     } else {
-                        // Test-only interleaving point: the driving test
-                        // confirms the snapshot reached the apply worker and
-                        // releases it explicitly.
+                        // Test-only interleaving point: keyed by this
+                        // loader's meta dir so a concurrent loader cannot
+                        // consume another test's gate.
                         #[cfg(test)]
-                        snapshot_apply_gates::park(
-                            "master.journal.create_snapshot_apply",
-                            std::time::Duration::from_secs(10),
-                        );
+                        snapshot_apply_gate::park(&self.meta_data_dir);
                         self.create_snapshot0(None)
                     };
                     if let Err(e) = tx.send(result) {

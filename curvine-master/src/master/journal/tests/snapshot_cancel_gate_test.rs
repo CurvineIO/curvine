@@ -32,8 +32,6 @@ use curvine_runtime::common::Utils;
 use curvine_runtime::sync::channel::CallChannel;
 use std::time::{Duration, Instant};
 
-const GATE: &str = "master.journal.create_snapshot_apply";
-
 #[test]
 fn cancelling_the_caller_keeps_the_fence_until_the_snapshot_applies() {
     Master::init_test_metrics();
@@ -53,7 +51,7 @@ fn cancelling_the_caller_keeps_the_fence_until_the_snapshot_applies() {
         .unwrap();
 
     // Hold the apply worker inside the snapshot branch before it starts.
-    let (release, entered) = snapshot_apply_gates::install(GATE);
+    let (release, entered) = snapshot_apply_gate::install(&loader.meta_data_dir);
 
     let snapshot_loader = loader.clone();
     let snapshot = runtime.spawn(async move { snapshot_loader.create_snapshot().await });
