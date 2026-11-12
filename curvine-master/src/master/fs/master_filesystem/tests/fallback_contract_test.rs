@@ -27,8 +27,7 @@ fn link_fallback_surfaces_the_real_destination_conflict() {
     // Park the sharded helper after planning, before any inode lock, with a
     // driver-side entered ack; the named sender stays alive until the driver
     // has finished its own change, so the channel never closes early.
-    let (release, entered) =
-        memory_read_gates::install_with_entered("link-fallback/link-plan-/dir/dst");
+    let (release, entered) = memory_read_gates::install_with_entered("link-plan-/dir/dst");
     let worker_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || tx.send(worker_fs.link("/src", "/dir/dst")));
@@ -67,8 +66,7 @@ fn symlink_fallback_surfaces_the_real_destination_conflict() {
     fs.create("/real", true).unwrap();
     fs.mkdir("/dir", true).unwrap();
 
-    let (release, entered) =
-        memory_read_gates::install_with_entered("symlink-fallback/symlink-plan-/dir/link");
+    let (release, entered) = memory_read_gates::install_with_entered("symlink-plan-/dir/link");
     let worker_fs = fs.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {

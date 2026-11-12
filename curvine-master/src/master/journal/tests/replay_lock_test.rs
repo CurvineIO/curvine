@@ -271,7 +271,7 @@ fn delete_dir_replay_via_cold_keeps_out_of_tree_alias() -> FsResult<()> {
 
 #[cfg(feature = "fault-injection")]
 #[test]
-fn trash_purge_replay_publication_failure_fails_the_holder_closed() {
+fn trash_purge_replay_publication_failure_fails_the_holder_closed() -> FsResult<()> {
     use curvine_fault::{FaultRuleBuilder, FaultRuntime};
 
     let (conf, root) = tests::ignore_reply_error_conf("purge-replay-fail", true);
