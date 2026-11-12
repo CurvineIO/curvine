@@ -60,8 +60,12 @@ fn concurrent_watermark_advances_do_not_reuse_ids() {
                     ids.advance_to(value as i64);
                     inode_ids.push(ids.next().unwrap());
                     let guard = dir.view().unwrap();
-                    let _ = guard.update_op_id(value);
-                    guard.update_last_inode_id(value as i64);
+                    // `update_op_id` returns (); only the fallible watermark
+                    // write needs its Result checked.
+                    guard.update_op_id(value);
+                    guard
+                        .update_last_inode_id(value as i64)
+                        .expect("advancing the inode-id watermark must succeed");
                     op_ids.push(guard.next_op_id());
                 }
                 (op_ids, inode_ids)
