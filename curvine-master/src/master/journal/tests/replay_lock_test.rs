@@ -141,26 +141,32 @@ fn add_block_replay_locks_the_recorded_inode_not_the_current_path() -> FsResult<
     fs.delete("/ab/file", false)?;
     fs.create("/ab/file", true)?;
 
-    // Holding the recorded inode's read lock must block the replay.
+    // Holding the recorded inode's read lock must block the replay: the
+    // entry's ID, not the current path occupant, is what gets locked.
     let inode_locks = fs.inode_locks_for_test();
     let held = inode_locks.read_inode(old.id);
     let loader2 = js.journal_loader();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
     let (tx, rx) = std::sync::mpsc::channel();
-    let applier =
-        std::thread::spawn(move || tx.send(loader2.apply_entry(JournalEntry::AddBlock(entry))));
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    // The replay must still be waiting: the path lock (the protocol it
-    // used before) would not cover the recorded inode.
+    let applier = std::thread::spawn(move || {
+        started_tx.send(()).expect("applier started channel");
+        tx.send(loader2.apply_entry(JournalEntry::AddBlock(entry)))
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("applier thread started");
+    // The replay must still be waiting while the read lock is held.
     assert!(
         rx.recv_timeout(std::time::Duration::from_millis(100))
             .is_err(),
         "add_block replay must wait for the recorded inode's write lock"
     );
     drop(held);
-    let result = rx
+    let sent = rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("replay must finish after the lock is released");
-    result?;
+    applier.join().expect("applier thread must not panic");
+    sent?;
 
     // Only the recorded inode got the block; the path replacement is
     // untouched.
