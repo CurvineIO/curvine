@@ -301,7 +301,7 @@ mod tests {
     use super::*;
     use crate::master::job::TaskDetail;
     use curvine_config::ClientConf;
-    use curvine_model::{LoadJobCommand, LoadTaskInfo, MountInfo, WorkerAddress};
+    use curvine_model::{JobTaskType, LoadJobCommand, LoadTaskInfo, MountInfo, WorkerAddress};
 
     fn progress(state: JobTaskState, loaded_size: i64) -> JobTaskProgress {
         JobTaskProgress {
@@ -323,6 +323,7 @@ mod tests {
             &MountInfo::default(),
             &ClientConf::default(),
             1,
+            JobTaskType::Load,
         );
         for task_id in ["task-1", "task-2"] {
             job.add_task_detail(

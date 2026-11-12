@@ -39,7 +39,12 @@ fn serial() -> MutexGuard<'static, ()> {
     guard
 }
 
-fn job_context(job_id: &str, source_path: &str, target_path: &str) -> JobContext {
+fn job_context(
+    job_id: &str,
+    kind: JobTaskType,
+    source_path: &str,
+    target_path: &str,
+) -> JobContext {
     JobContext::with_conf(
         &LoadJobCommand::builder(source_path).build(),
         job_id.to_string(),
@@ -48,6 +53,7 @@ fn job_context(job_id: &str, source_path: &str, target_path: &str) -> JobContext
         &MountInfo::default(),
         &ClientConf::default(),
         1,
+        kind,
     )
 }
 
@@ -105,13 +111,18 @@ fn loaded_bytes(kind: &str) -> i64 {
 }
 
 #[test]
-fn job_kind_follows_the_source_path() {
+fn job_context_keeps_the_given_kind() {
     let _serial = serial();
 
-    let load = job_context("kind-load", "s3://bucket/data", "/data");
+    let load = job_context("kind-load", JobTaskType::Load, "s3://bucket/data", "/data");
     assert_eq!(load.kind, JobTaskType::Load);
 
-    let export = job_context("kind-export", "/data", "s3://bucket/data");
+    let export = job_context(
+        "kind-export",
+        JobTaskType::Export,
+        "/data",
+        "s3://bucket/data",
+    );
     assert_eq!(export.kind, JobTaskType::Export);
 }
 
@@ -127,7 +138,7 @@ fn finished_runs_are_counted_once_by_kind_and_state() -> FsResult<()> {
     let job_id = "finished-load";
     store.insert(
         job_id.to_string(),
-        job_context(job_id, "s3://bucket/load", "/load"),
+        job_context(job_id, JobTaskType::Load, "s3://bucket/load", "/load"),
     );
     store.update_state(job_id, JobTaskState::Loading, "planned")?;
     assert_eq!(finished("load", "failed"), load_failed);
@@ -145,7 +156,7 @@ fn finished_runs_are_counted_once_by_kind_and_state() -> FsResult<()> {
     assert_eq!(finished("load", "failed"), load_failed + 1);
 
     let job_id = "finished-export";
-    let job = job_context(job_id, "/export", "s3://bucket/export");
+    let job = job_context(job_id, JobTaskType::Export, "/export", "s3://bucket/export");
     let run_id = job.run_id;
     store.insert(job_id.to_string(), job);
     assert!(store.update_state_if_run(job_id, run_id, JobTaskState::Canceled, "canceled"));
@@ -167,7 +178,7 @@ fn task_reports_count_copied_bytes_and_terminal_states() -> FsResult<()> {
     let job_failed = finished("export", "failed");
 
     let job_id = "report-export";
-    let mut job = job_context(job_id, "/report", "s3://bucket/report");
+    let mut job = job_context(job_id, JobTaskType::Export, "/report", "s3://bucket/report");
     let first = load_task(&job, "task-0");
     let second = load_task(&job, "task-1");
     job.add_task(first);

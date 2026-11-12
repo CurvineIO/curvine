@@ -15,7 +15,6 @@
 use curvine_config::ClientConf;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
-use curvine_fs_api::Path;
 use curvine_model::{
     JobTaskProgress, JobTaskState, JobTaskType, LoadJobCommand, LoadJobInfo, LoadTaskInfo,
     MountInfo, WorkerAddress,
@@ -61,6 +60,7 @@ impl JobContext {
         mnt: &MountInfo,
         client_conf: &ClientConf,
         run_id: u64,
+        kind: JobTaskType,
     ) -> Self {
         let replicas = job_conf
             .replicas
@@ -77,11 +77,6 @@ impl JobContext {
         let ttl_ms = job_conf.ttl_ms.unwrap_or(mnt.ttl_ms);
 
         let ttl_action = job_conf.ttl_action.unwrap_or(mnt.ttl_action);
-
-        let kind = match Path::from_str(&source_path) {
-            Ok(path) if path.is_cv() => JobTaskType::Export,
-            _ => JobTaskType::Load,
-        };
 
         let job = LoadJobInfo {
             job_id,

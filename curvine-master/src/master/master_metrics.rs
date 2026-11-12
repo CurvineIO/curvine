@@ -39,12 +39,13 @@ const CLIENT_VERSION_UNKNOWN: &str = "unknown";
 /// `load_jobs` exports every combination, with 0 when no job is in it, so a
 /// dashboard series does not disappear while the store is empty.
 const LOAD_JOB_KINDS: [JobTaskType; 2] = [JobTaskType::Load, JobTaskType::Export];
-const LOAD_JOB_STATES: [JobTaskState; 5] = [
+const LOAD_JOB_STATES: [JobTaskState; 6] = [
     JobTaskState::Pending,
     JobTaskState::Loading,
     JobTaskState::Completed,
     JobTaskState::Failed,
     JobTaskState::Canceled,
+    JobTaskState::PartialSuccess,
 ];
 
 fn job_kind_label(kind: JobTaskType) -> &'static str {
@@ -977,7 +978,7 @@ mod tests {
         );
     }
 
-    fn job(job_id: &str, source_path: &str, state: JobTaskState) -> JobContext {
+    fn job(job_id: &str, source_path: &str, kind: JobTaskType, state: JobTaskState) -> JobContext {
         let mut job = JobContext::with_conf(
             &LoadJobCommand::builder(source_path).build(),
             job_id.to_string(),
@@ -986,6 +987,7 @@ mod tests {
             &MountInfo::default(),
             &ClientConf::default(),
             1,
+            kind,
         );
         job.state.advance_state(state, true);
         job
@@ -1000,14 +1002,39 @@ mod tests {
         };
 
         let jobs = JobStore::new();
-        for (job_id, source_path, state) in [
-            ("load-1", "s3://bucket/a", JobTaskState::Loading),
-            ("load-2", "s3://bucket/b", JobTaskState::Loading),
-            ("load-3", "s3://bucket/c", JobTaskState::Failed),
-            ("export-1", "/fs/a", JobTaskState::Pending),
-            ("export-2", "/fs/b", JobTaskState::PartialSuccess),
+        for (job_id, source_path, kind, state) in [
+            (
+                "load-1",
+                "s3://bucket/a",
+                JobTaskType::Load,
+                JobTaskState::Loading,
+            ),
+            (
+                "load-2",
+                "s3://bucket/b",
+                JobTaskType::Load,
+                JobTaskState::Loading,
+            ),
+            (
+                "load-3",
+                "s3://bucket/c",
+                JobTaskType::Load,
+                JobTaskState::Failed,
+            ),
+            (
+                "export-1",
+                "/fs/a",
+                JobTaskType::Export,
+                JobTaskState::Pending,
+            ),
+            (
+                "export-2",
+                "/fs/b",
+                JobTaskType::Export,
+                JobTaskState::PartialSuccess,
+            ),
         ] {
-            jobs.insert(job_id.to_string(), job(job_id, source_path, state));
+            jobs.insert(job_id.to_string(), job(job_id, source_path, kind, state));
         }
 
         MasterMetrics::refresh_load_job_counts(&metric, &jobs);
@@ -1018,6 +1045,7 @@ mod tests {
             series("load", "pending", 0),
             series("load", "completed", 0),
             series("load", "canceled", 0),
+            series("load", "partial_success", 0),
             series("export", "pending", 1),
             series("export", "partial_success", 1),
             series("export", "loading", 0),
@@ -1025,7 +1053,7 @@ mod tests {
             assert!(output.contains(&expected), "missing {expected}: {output}");
         }
 
-        // Every job left the store: known states report 0, the rest disappear.
+        // Every job left the store: all known states report 0.
         jobs.clear();
         MasterMetrics::refresh_load_job_counts(&metric, &jobs);
         let output = Metrics::text_output().unwrap();
@@ -1033,9 +1061,7 @@ mod tests {
         assert!(output.contains(&series("load", "failed", 0)), "{output}");
         assert!(output.contains(&series("export", "pending", 0)), "{output}");
         assert!(
-            !output.contains(&format!(
-                "{metric_name}{{kind=\"export\",state=\"partial_success\"}}"
-            )),
+            output.contains(&series("export", "partial_success", 0)),
             "{output}"
         );
     }
