@@ -17,7 +17,7 @@ use crate::worker::handler::{DirWriteMetrics, WriteContext};
 use crate::worker::storage::BlockWriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_core_error::{err_box, ternary, try_option_mut, CommonResult};
-use curvine_error::{FsError, FsResult};
+use curvine_error::{ErrorKind, FsError, FsResult};
 use curvine_model::{ExtendedBlock, FileAllocMode};
 use curvine_proto::{BlockWriteResponse, DataHeaderProto};
 use curvine_rpc::message::{Builder, Message, RequestStatus};
@@ -46,6 +46,37 @@ fn map_storage_open_error(e: curvine_core_error::CommonError) -> FsError {
     }
 }
 
+/// An abort that failed non-terminally and must be retried as-is on the
+/// next Complete/Cancel, instead of falling through to commit_block().
+pub(crate) struct PendingAbort {
+    pub(crate) block: ExtendedBlock,
+    /// Retry with abort_block_uncertain() instead of abort_block().
+    pub(crate) uncertain: bool,
+    /// The original failure, re-returned on every retry. Only `IO` keeps its kind;
+    /// every other kind is answered as `Common` with the same message.
+    /// TODO: store the error wire-encoded (`ErrorExt::encode`/`decode`) to preserve every kind.
+    pub(crate) kind: ErrorKind,
+    pub(crate) error: String,
+}
+
+impl PendingAbort {
+    fn new(block: &ExtendedBlock, uncertain: bool, error: &FsError) -> Self {
+        Self {
+            block: block.clone(),
+            uncertain,
+            kind: error.kind(),
+            error: error.to_string(),
+        }
+    }
+
+    fn to_error(&self) -> FsError {
+        match self.kind {
+            ErrorKind::IO => FsError::io(std::io::Error::other(self.error.clone())),
+            _ => FsError::common(&self.error),
+        }
+    }
+}
+
 pub struct WriteHandler {
     pub(crate) store: BlockStore,
     pub(crate) context: Option<WriteContext>,
@@ -55,6 +86,7 @@ pub struct WriteHandler {
     pub(crate) io_slow_us: u64,
     pub(crate) metrics: &'static WorkerMetrics,
     pub(crate) client_addr: String,
+    pub(crate) pending_abort: Option<PendingAbort>,
 }
 
 impl WriteHandler {
@@ -70,6 +102,7 @@ impl WriteHandler {
             io_slow_us: conf.worker.io_slow_us(),
             metrics,
             client_addr,
+            pending_abort: None,
         })
     }
 
@@ -362,25 +395,31 @@ impl WriteHandler {
         }
     }
 
-    /// Abort (quarantine if `uncertain`), then latch only if terminal.
-    fn abort_and_latch(&mut self, block: &ExtendedBlock, uncertain: bool, reason: &str) {
-        let abort_result = if uncertain {
-            self.store.abort_block_uncertain(block)
+    /// Abort (quarantine if `pending.uncertain`), then latch if terminal or
+    /// park `pending` unchanged for the next retry. Returns the client error,
+    /// never re-derived, so the message is stable across retries.
+    fn abort_or_defer(&mut self, pending: PendingAbort) -> FsError {
+        let abort_result = if pending.uncertain {
+            self.store.abort_block_uncertain(&pending.block)
         } else {
-            self.store.abort_block(block)
+            self.store.abort_block(&pending.block)
         };
         if let Err(abort_err) = abort_result {
             log::warn!(
                 "failed to abort block {} after {}: {}",
-                block.id,
-                reason,
+                pending.block.id,
+                pending.error,
                 abort_err
             );
         }
-        if self.block_is_terminal(block.id) {
+        let error = pending.to_error();
+        if self.block_is_terminal(pending.block.id) {
             self.is_commit = true;
             self.lease.take();
+        } else {
+            self.pending_abort = Some(pending);
         }
+        error
     }
 
     pub fn complete(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
@@ -390,6 +429,12 @@ impl WriteHandler {
             } else {
                 Ok(msg.success())
             };
+        }
+
+        // A prior abort failed non-terminally: self.file is already gone, so
+        // retry only that abort. Never fall through to commit_block().
+        if let Some(pending) = self.pending_abort.take() {
+            return Err(self.abort_or_defer(pending));
         }
 
         let write_dir_id = self.context.as_ref().map(|c| c.dir_id);
@@ -408,37 +453,28 @@ impl WriteHandler {
                 if let Some(dir_id) = write_dir_id {
                     Self::record_write_error(self.metrics, dir_id, &flush_err);
                 }
-                self.abort_and_latch(&context.block, uncertain, "flush error");
-                return Err(flush_err.into());
+                let error: FsError = flush_err.into();
+                let pending = PendingAbort::new(&context.block, uncertain, &error);
+                return Err(self.abort_or_defer(pending));
             }
             if uncertain {
                 // Data may still be in flight: never free or publish this extent.
-                self.abort_and_latch(&context.block, true, "uncertain write");
-                return Err(FsError::io(std::io::Error::other(format!(
+                let error = FsError::io(std::io::Error::other(format!(
                     "block {} write outcome uncertain, extent quarantined",
                     context.block.id
-                ))));
+                )));
+                let pending = PendingAbort::new(&context.block, true, &error);
+                return Err(self.abort_or_defer(pending));
             }
         }
 
         if context.block.len > context.block_size {
-            if let Err(abort_err) = self.store.abort_block(&context.block) {
-                log::warn!(
-                    "failed to abort block {} after length check failed: {}",
-                    context.block.id,
-                    abort_err
-                );
-            }
-            // Same as above.
-            if self.block_is_terminal(context.block.id) {
-                self.is_commit = true;
-                self.lease.take();
-            }
-            return err_box!(
+            let error = FsError::common(format!(
                 "Invalid block length: {}, block size: {}",
-                context.block.len,
-                context.block_size
-            );
+                context.block.len, context.block_size
+            ));
+            let pending = PendingAbort::new(&context.block, false, &error);
+            return Err(self.abort_or_defer(pending));
         }
 
         if let Err(commit_err) = self.commit_block(&context.block, commit) {
@@ -497,7 +533,7 @@ mod tests {
     use crate::worker::storage::{BlockWriteContext, Dataset};
     use crate::worker::Worker;
     use curvine_config::{ClusterConf, WorkerConf};
-    use curvine_error::{FsError, FsResult};
+    use curvine_error::{ErrorKind, FsError, FsResult};
     use curvine_io::{BlockIO, DataSlice};
     use curvine_model::{ExtendedBlock, FileType, StorageType};
     use curvine_proto::DataHeaderProto;
@@ -914,6 +950,7 @@ mod tests {
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
+            pending_abort: None,
         };
         Ok((store, handler))
     }
@@ -976,6 +1013,7 @@ mod tests {
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
+            pending_abort: None,
         };
 
         let header = DataHeaderProto {
@@ -1036,6 +1074,7 @@ mod tests {
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
+            pending_abort: None,
         };
 
         let header = DataHeaderProto {
@@ -1156,6 +1195,7 @@ mod tests {
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
+            pending_abort: None,
         };
 
         let msg = Builder::new()
@@ -1235,6 +1275,7 @@ mod tests {
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
+            pending_abort: None,
         };
 
         let msg = Builder::new()
@@ -1470,6 +1511,7 @@ mod tests {
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
+            pending_abort: None,
         };
 
         let msg = Builder::new()
@@ -1601,6 +1643,7 @@ mod tests {
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
+            pending_abort: None,
         };
 
         let msg = Builder::new()
@@ -1693,6 +1736,7 @@ mod tests {
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
+            pending_abort: None,
         };
 
         let msg = Builder::new()
@@ -1803,6 +1847,7 @@ mod tests {
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
+            pending_abort: None,
         };
         let first_msg = Builder::new()
             .code(curvine_fs_api::RpcCode::WriteBlock)
@@ -1870,6 +1915,7 @@ mod tests {
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
+            pending_abort: None,
         };
         let msg = Builder::new()
             .code(curvine_fs_api::RpcCode::WriteBlock)
@@ -1985,6 +2031,7 @@ mod tests {
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
+            pending_abort: None,
         };
 
         let msg = Builder::new()
@@ -2049,9 +2096,12 @@ mod tests {
             .data(DataSlice::Empty)
             .build();
         let second = handler.complete(&cancel_msg, false);
+        // The abort is retried and now succeeds, but the call must still
+        // report the original flush failure, not success.
+        let err = second.expect_err("retry after a failed flush must not report success");
         assert!(
-            second.is_ok(),
-            "retried cancel must actually abort the block: {second:?}"
+            err.to_string().contains("flush failed"),
+            "retry must re-report the original flush error: {err}"
         );
         assert!(
             handler.is_commit,
@@ -2117,6 +2167,7 @@ mod tests {
             io_slow_us: 0,
             metrics: Worker::get_metrics()?,
             client_addr: "test".to_string(),
+            pending_abort: None,
         };
 
         let msg = Builder::new()
@@ -2183,6 +2234,428 @@ mod tests {
                 .is_none(),
             "block must be fully removed after a successful abort"
         );
+
+        Ok(())
+    }
+
+    /// Complete/Cancel message for `block` with the given seq_id.
+    fn complete_msg(block: &ExtendedBlock, block_size: i64, seq_id: i32) -> Message {
+        Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(seq_id)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build()
+    }
+
+    /// Cancel retry after an uncertain flush whose quarantine-abort failed:
+    /// the retry must re-run abort_block_uncertain (not plain abort_block
+    /// via commit_block), so the extent ends Quarantined, not freed.
+    #[test]
+    fn cancel_retry_after_failed_uncertain_abort_quarantines_instead_of_freeing() -> FsResult<()> {
+        let block_size = 4096_i64;
+        let block = ExtendedBlock::new(47, block_size, StorageType::SpdkDisk, FileType::File);
+
+        let _worker = Worker::with_conf(ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                data_dir: vec!["[MEM:1KB]../testing/write-handler-pending-abort-cancel".to_string()],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        })?;
+        let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)
+            .map_err(FsError::from)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        store.open_block(&block).map_err(FsError::from)?;
+        let available_before = store.read().map_err(FsError::from)?.available();
+
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                FailingFlushUncertainBlockIO,
+                0,
+                block_size,
+                0,
+            )?),
+            lease: None,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+            pending_abort: None,
+        };
+
+        // RPC 1: uncertain flush, and the quarantine-abort itself fails.
+        store.set_force_transient_abort_failure_for_test(true);
+        let err = handler
+            .complete(&complete_msg(&block, block_size, 1), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("flush timed out"), "{err}");
+        assert!(!handler.is_commit, "must stay retryable");
+        assert!(
+            handler.pending_abort.is_some(),
+            "must remember the pending abort"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Writing),
+        );
+
+        // RPC 2: client Cancel. Must retry the uncertain abort, NOT fall
+        // through to commit_block(_, false) -> plain abort_block.
+        let err = handler
+            .complete(&complete_msg(&block, block_size, 2), false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("flush timed out"),
+            "retry must re-report the original flush error: {err}"
+        );
+        assert!(handler.is_commit, "quarantine is terminal: must latch");
+        assert!(
+            handler.pending_abort.is_none(),
+            "pending abort must be cleared"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Quarantined),
+            "uncertain extent must be quarantined, not freed"
+        );
+        assert_eq!(
+            store.read().map_err(FsError::from)?.available(),
+            available_before,
+            "quarantine must keep the extent reserved; available() must not grow"
+        );
+
+        Ok(())
+    }
+
+    /// Complete retry after a flush failure whose abort failed: the retry
+    /// must re-run the abort, never finalize_block() on unflushed data.
+    #[test]
+    fn complete_retry_after_failed_abort_never_finalizes_unflushed_data() -> FsResult<()> {
+        // len = 0 so the length check passes and only the flush failure
+        // stands between the retry and finalize_block().
+        let block_size = 0_i64;
+        let block = ExtendedBlock::new(48, block_size, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("pending-abort-complete")?;
+        store.open_block(&block).map_err(FsError::from)?;
+
+        let lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                FailingFlushBlockIO,
+                0,
+                block_size,
+                0,
+            )?),
+            lease,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+            pending_abort: None,
+        };
+
+        // RPC 1: flush fails, abort fails too.
+        store.set_force_transient_abort_failure_for_test(true);
+        let first = handler
+            .complete(&complete_msg(&block, block_size, 1), true)
+            .unwrap_err();
+        assert!(first.to_string().contains("flush failed"), "{first}");
+        assert!(matches!(first.kind(), ErrorKind::IO), "{:?}", first.kind());
+        assert!(!handler.is_commit, "must stay retryable");
+        assert!(
+            handler.pending_abort.is_some(),
+            "must remember the pending abort"
+        );
+
+        // RPC 2: client retries Complete(commit=true). Must retry the abort,
+        // NOT reach commit_block(_, true) -> finalize_block().
+        let err = handler
+            .complete(&complete_msg(&block, block_size, 2), true)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("flush failed"),
+            "retry must re-report the original flush error, not succeed: {err}"
+        );
+        assert_eq!(
+            err.kind() as i32,
+            first.kind() as i32,
+            "retry must keep the original error kind"
+        );
+        assert_eq!(
+            err.to_string().matches("ERROR:").count(),
+            first.to_string().matches("ERROR:").count(),
+            "retry must not re-wrap the message: {err}"
+        );
+        assert!(handler.is_commit, "removed block is terminal: must latch");
+        assert!(
+            handler.lease.is_none(),
+            "lease must be released once terminal"
+        );
+        assert!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .is_none(),
+            "block must be aborted (removed), never Finalized"
+        );
+
+        Ok(())
+    }
+
+    /// Two non-terminal retries in a row: the deferred error must come back
+    /// byte-identical each time, not grow a ": " per round trip.
+    #[test]
+    fn deferred_abort_error_message_is_stable_across_retries() -> FsResult<()> {
+        let block_size = 0_i64;
+        let block = ExtendedBlock::new(53, block_size, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("pending-abort-stable-message")?;
+        store.open_block(&block).map_err(FsError::from)?;
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                FailingFlushBlockIO,
+                0,
+                block_size,
+                0,
+            )?),
+            lease: store
+                .ordinary_write_lease(block.id)
+                .map_err(FsError::from)?,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+            pending_abort: None,
+        };
+
+        store.set_force_transient_abort_failure_for_test(true);
+        let first = handler
+            .complete(&complete_msg(&block, block_size, 1), false)
+            .unwrap_err();
+        store.set_force_transient_abort_failure_for_test(true);
+        let second = handler
+            .complete(&complete_msg(&block, block_size, 2), false)
+            .unwrap_err();
+        assert!(
+            !handler.is_commit,
+            "second abort also failed: stay retryable"
+        );
+        let third = handler
+            .complete(&complete_msg(&block, block_size, 3), false)
+            .unwrap_err();
+        assert!(handler.is_commit, "third abort succeeded: latch");
+
+        assert_eq!(second.to_string(), first.to_string());
+        assert_eq!(third.to_string(), first.to_string());
+        Ok(())
+    }
+
+    /// Writer B finalizes the block between A's failed abort and A's retry;
+    /// the retried abort must leave B's acked replica intact.
+    #[test]
+    fn complete_retry_after_failed_abort_preserves_replica_finalized_by_other_writer(
+    ) -> FsResult<()> {
+        let block_size = 0_i64;
+        let block = ExtendedBlock::new(49, block_size, StorageType::Disk, FileType::File);
+
+        let store = create_test_store("pending-abort-two-writers")?;
+        store.open_block(&block).map_err(FsError::from)?;
+
+        // Writer A: flush fails, abort fails too -> pending abort.
+        let lease_a = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        let mut handler_a = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                FailingFlushBlockIO,
+                0,
+                block_size,
+                0,
+            )?),
+            lease: lease_a,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "writer-a".to_string(),
+            pending_abort: None,
+        };
+        store.set_force_transient_abort_failure_for_test(true);
+        handler_a
+            .complete(&complete_msg(&block, block_size, 1), true)
+            .unwrap_err();
+        assert!(handler_a.pending_abort.is_some(), "A must defer its abort");
+
+        // Writer B: second ordinary lease is allowed; B finalizes the block.
+        let lease_b = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        assert!(lease_b.is_some(), "ordinary leases are not exclusive");
+        store.open_block(&block).map_err(FsError::from)?;
+        store.finalize_block(&block).map_err(FsError::from)?;
+        assert!(
+            store.get_block(block.id).map_err(FsError::from)?.is_final(),
+            "setup: B's replica must be finalized"
+        );
+
+        // Writer A retries. The replayed abort must not touch B's replica.
+        let err = handler_a
+            .complete(&complete_msg(&block, block_size, 2), true)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("flush failed"),
+            "A must still get its original error: {err}"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Finalized),
+            "B's finalized replica must survive A's retried abort"
+        );
+        assert!(
+            handler_a.is_commit,
+            "finalized block is terminal: must latch"
+        );
+        assert!(handler_a.lease.is_none(), "A's lease must be released");
+
+        Ok(())
+    }
+
+    /// Uncertain-path twin: A's failed quarantine is replayed after B
+    /// finalized the same SPDK block; B's replica must stay Finalized.
+    #[test]
+    fn uncertain_retry_after_failed_abort_preserves_replica_finalized_by_other_writer(
+    ) -> FsResult<()> {
+        let block = ExtendedBlock::new(52, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler_a) = spdk_handler(
+            "pending-abort-two-writers-uncertain",
+            &block,
+            FailingFlushUncertainBlockIO,
+        )?;
+        handler_a.lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+
+        // Writer A: uncertain flush fails, quarantine fails too -> pending abort.
+        store.set_force_transient_abort_failure_for_test(true);
+        handler_a
+            .complete(&spdk_complete_msg(&block), false)
+            .unwrap_err();
+        let pending = handler_a
+            .pending_abort
+            .as_ref()
+            .expect("A must defer its abort");
+        assert!(pending.uncertain, "deferred abort must stay uncertain");
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Writing),
+        );
+
+        // Writer B: second ordinary lease is allowed; B finalizes the block.
+        let lease_b = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        assert!(lease_b.is_some(), "ordinary leases are not exclusive");
+        store.open_block(&block).map_err(FsError::from)?;
+        store.finalize_block(&block).map_err(FsError::from)?;
+        let available = store.read().map_err(FsError::from)?.available();
+
+        // Writer A retries. The replayed quarantine must not touch B's replica.
+        let err = handler_a
+            .complete(&spdk_complete_msg(&block), false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("flush timed out"),
+            "A must still get its original error: {err}"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Finalized),
+            "B's finalized replica must not be quarantined by A's retry"
+        );
+        assert_eq!(
+            store.read().map_err(FsError::from)?.available(),
+            available,
+            "B's extent must stay accounted to B"
+        );
+        assert!(
+            handler_a.is_commit,
+            "finalized block is terminal: must latch"
+        );
+        assert!(handler_a.lease.is_none(), "A's lease must be released");
 
         Ok(())
     }
