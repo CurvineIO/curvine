@@ -843,10 +843,8 @@ impl MasterFilesystem {
             return Ok(ShardedOutcome::Done((fs_dir.file_status(&inp)?, None)));
         }
 
-        err_ext!(FsError::common(format!(
-            "namespace changed while creating {}",
-            path
-        )))
+        // Retries exhausted with identity churn: side-effect-free fallback.
+        Ok(ShardedOutcome::Fallback)
     }
 
     fn overwrite_file_sharded(
@@ -1549,10 +1547,8 @@ impl MasterFilesystem {
             return Ok(ShardedOutcome::Done(()));
         }
 
-        err_ext!(FsError::common(format!(
-            "namespace changed while creating symlink {}",
-            link
-        )))
+        // Retries exhausted with identity churn: side-effect-free fallback.
+        Ok(ShardedOutcome::Fallback)
     }
 
     fn symlink_with_global_lock_body(
@@ -1639,10 +1635,8 @@ impl MasterFilesystem {
             return Ok(ShardedOutcome::Done(()));
         }
 
-        err_ext!(FsError::common(format!(
-            "namespace changed while linking {} to {}",
-            src, dst
-        )))
+        // Retries exhausted with identity churn: side-effect-free fallback.
+        Ok(ShardedOutcome::Fallback)
     }
 
     fn link_with_global_lock_body(&self, fs_dir: &mut FsDir, src: &str, dst: &str) -> FsResult<()> {
