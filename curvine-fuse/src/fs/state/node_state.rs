@@ -232,11 +232,12 @@ impl NodeState {
     ) -> FuseResult<fuse_attr> {
         let record = is_real_lookup && metrics_enabled;
 
+        let caller_status = status.clone();
         let mut dir = self.dir_write();
         let cache_hit = record && dir.get_inode(parent, Some(name)).is_some();
         let before = dir.inode_lens();
         let status = dir
-            .lookup(parent, name, status.clone(), true)?
+            .lookup(parent, name, caller_status, true)?
             .status
             .clone();
         let after = dir.inode_lens();
@@ -2377,6 +2378,59 @@ mod test {
                 .await
                 .unwrap();
             assert_eq!(parent.ino, FUSE_ROOT_ID);
+        });
+    }
+
+    #[test]
+    fn fs_lookup_non_root_dot_and_grandchild_dotdot_resolve_to_expected_inodes() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.enable_meta_cache = Some(true);
+            conf.fuse.metrics_enabled = false;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let (a_ino, b_ino) = {
+                let mut dir = state.dir_write();
+                let a_ino = dir
+                    .lookup(
+                        FUSE_ROOT_ID,
+                        "a",
+                        FileStatus::with_name(41, "a".to_string(), true),
+                        true,
+                    )
+                    .unwrap()
+                    .ino;
+                let b_ino = dir
+                    .lookup(
+                        a_ino,
+                        "b",
+                        FileStatus::with_name(42, "b".to_string(), true),
+                        true,
+                    )
+                    .unwrap()
+                    .ino;
+                (a_ino, b_ino)
+            };
+
+            let dot = state
+                .fs_lookup(b_ino, crate::FUSE_CURRENT_DIR)
+                .await
+                .unwrap();
+            assert_eq!(
+                dot.ino, b_ino,
+                "'.' on a non-root inode must resolve to that inode"
+            );
+
+            let dotdot = state
+                .fs_lookup(b_ino, crate::FUSE_PARENT_DIR)
+                .await
+                .unwrap();
+            assert_eq!(
+                dotdot.ino, a_ino,
+                "'..' on a grandchild must resolve to its parent"
+            );
         });
     }
 
