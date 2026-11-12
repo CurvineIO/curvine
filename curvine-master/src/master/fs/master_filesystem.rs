@@ -87,9 +87,11 @@ struct CompleteFileOptions {
     set_attr_opts: Option<SetAttrOpts>,
 }
 
-/// Sentinel for sharded write admission: `Done` carries the operation result,
-/// `Fallback` asks the caller to escalate to the single-writer exclusive path
-/// because the shared view was busy (cold window or FAILED state).
+/// Sentinel for sharded write admission: `Done` carries the operation result.
+/// `Fallback` marks a side-effect-free planning point that needs the global
+/// lock (unresolved path, identity churn, retries exhausted); it escalates to
+/// the single-writer exclusive path. A busy or failed view is an `Err`, not a
+/// `Fallback`.
 enum ShardedOutcome<R> {
     Done(R),
     Fallback,
@@ -526,8 +528,7 @@ impl MasterFilesystem {
 
     /// The single exclusive path: closes the commit gate, holds the cold
     /// handle across the whole operation, and fails closed when publication
-    /// or the commit wait fails. `f` must be untouched (None means the normal
-    /// path already consumed it successfully).
+    /// or the commit wait fails.
     fn run_metadata_write_exclusive<R>(
         &self,
         epoch: u64,
@@ -1233,35 +1234,6 @@ impl MasterFilesystem {
         Ok(ShardedOutcome::Fallback)
     }
 
-    fn rename_with_global_lock_body(
-        &self,
-        fs_dir: &mut FsDir,
-        src: &str,
-        dst: &str,
-        flags: RenameFlags,
-    ) -> FsResult<bool> {
-        let src_inp = Self::resolve_path(fs_dir, src)?;
-        let dst_inp = Self::resolve_path(fs_dir, dst)?;
-        // POSIX rename of two names for the same inode is a no-op (kept from
-        // the hot path's dropped branch — journal replay unchanged for older
-        // leaders).
-        if !flags.no_replace() && !flags.exchange_mode() {
-            if let (Some(source), Some(target)) = (
-                src_inp.inodes.last().map(|inode| inode.id()),
-                dst_inp.inodes.last().map(|inode| inode.id()),
-            ) {
-                if source == target {
-                    return Ok(true);
-                }
-            }
-        }
-        let deleted = fs_dir.rename(&src_inp, &dst_inp, flags)?;
-        if let Some(deleted) = deleted {
-            self.worker_manager.write().remove_blocks(&deleted);
-        }
-        Ok(true)
-    }
-
     fn set_attr_single_path_sharded(
         &self,
         path: &str,
@@ -1372,14 +1344,16 @@ impl MasterFilesystem {
                 return Ok(ShardedOutcome::Fallback);
             }
 
+            // Success returns immediately: nothing after this point reuses
+            // the arguments, so the single-shot path can move them.
             let completed = fs_dir.complete_file(
                 path,
                 &mut inode,
                 len,
-                commit_blocks.clone(),
-                client_name.clone(),
+                commit_blocks,
+                client_name,
                 options.only_flush,
-                options.set_attr_opts.clone(),
+                options.set_attr_opts,
             )?;
 
             if options.only_flush && options.return_file_blocks {
@@ -1504,6 +1478,8 @@ impl MasterFilesystem {
     ) -> FsResult<ShardedOutcome<()>> {
         const MAX_RETRIES: usize = 3;
         let mut initial = Some(initial);
+        #[cfg(test)]
+        let plan_gate = format!("symlink-plan-{}", link);
 
         for _ in 0..MAX_RETRIES {
             let (ids, components_len, full, restore_epoch) = match initial.take() {
@@ -1527,6 +1503,11 @@ impl MasterFilesystem {
                 })
                 .collect();
             let _locks = self.lock_sharded_requests(requests, parent_index == 0);
+            // Test-only interleave: parked after taking the locks, so the
+            // driver can create the destination; on resume the is_full check
+            // forces the fallback contract to produce the real AlreadyExists.
+            #[cfg(test)]
+            memory_read_gates::park(&plan_gate, std::time::Duration::from_secs(10));
             let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -1552,21 +1533,6 @@ impl MasterFilesystem {
 
         // Retries exhausted with identity churn: side-effect-free fallback.
         Ok(ShardedOutcome::Fallback)
-    }
-
-    fn symlink_with_global_lock_body(
-        &self,
-        fs_dir: &mut FsDir,
-        target: &str,
-        link: &str,
-        force: bool,
-        mode: u32,
-        owner: Option<String>,
-        group: Option<String>,
-    ) -> FsResult<()> {
-        let inp = Self::resolve_path(fs_dir, link)?;
-        Self::check_not_reserved_path(inp.path())?;
-        fs_dir.symlink(target.to_string(), inp, force, mode, owner, group)
     }
 
     fn link_single_parent_sharded(
@@ -1618,6 +1584,11 @@ impl MasterFilesystem {
                     description: "Link paths resolved before inode locks",
                 context: {"path" => src},
             }
+            #[cfg(test)]
+            memory_read_gates::park(
+                &format!("link-plan-{}", dst),
+                std::time::Duration::from_secs(10),
+            );
             let _locks = self.lock_sharded_requests(requests, destination_parent == 0);
             let fs_dir = self.fs_dir.view()?;
             let epoch = Self::checked_live_epoch(&fs_dir)?;
@@ -5021,7 +4992,7 @@ impl MasterFilesystem {
                     );
                     return Ok(false);
                 }
-                self.apply_block_report_batch_locked(worker_id, batch.clone(), false)?;
+                self.apply_block_report_batch_locked(worker_id, batch, false)?;
                 Ok(true)
             })?;
             if !applied {
@@ -5109,7 +5080,7 @@ impl MasterFilesystem {
                 )));
             }
             let view = self.fs_dir.view()?;
-            let added = view.add_replication_location_if_needed(block_id, location.clone())?;
+            let added = view.add_replication_location_if_needed(block_id, location)?;
             // Completion is newer evidence even if the location was already
             // present, so an older full report cannot safely reconcile it.
             self.invalidate_full_block_state(worker_id);
@@ -6878,6 +6849,8 @@ mod tests {
     mod create_failure_test;
     #[path = "expect_gen_test.rs"]
     mod expect_gen_test;
+    #[path = "fallback_contract_test.rs"]
+    mod fallback_contract_test;
     #[path = "fs_mode_release_gate_test.rs"]
     mod fs_mode_release_gate_test;
     #[path = "get_block_locations_batch_test.rs"]
