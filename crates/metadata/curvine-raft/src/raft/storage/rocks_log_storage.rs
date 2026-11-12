@@ -323,6 +323,25 @@ mod tests {
         snap
     }
 
+    // Installing a snapshot must not drop the entries it covers: UFS replay can
+    // still owe the range above `ufs_applied`, and that range is only readable
+    // from the log.
+    #[test]
+    fn apply_snapshot_keeps_the_covered_entries_replayable() {
+        let store = test_store("snapshot-keeps-log", 10, 1);
+        store.append(&indexed_entries(1, 10)).unwrap();
+
+        store.apply_snapshot(snapshot_at(6, 2)).unwrap();
+
+        assert_eq!(store.first_index().unwrap(), 7);
+        let replay = store.scan_entries(5, 8).unwrap();
+        assert_eq!(
+            replay.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![5, 6, 7],
+            "entries covered by the snapshot must stay replayable"
+        );
+    }
+
     // A snapshot installed from a newer term invalidates any vote cast in the
     // old term. Keeping the stale vote could let a crash-restart appear to vote
     // twice in the higher term and break election safety.

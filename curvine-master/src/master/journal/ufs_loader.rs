@@ -13,30 +13,78 @@
 //  limitations under the License.
 
 use crate::master::journal::{
-    CompleteFileEntry, DeleteEntry, JournalEntry, MkdirEntry, ReleaseWriterEntry, RenameEntry,
+    CompleteFileEntry, DeleteEntry, JournalBatch, JournalEntry, JournalWriter, MkdirEntry,
+    ReleaseWriterEntry, RenameEntry,
 };
-use crate::master::{JobManager, SyncFsDir};
+use crate::master::{JobManager, Master, MasterMetrics, SyncFsDir};
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::{JobTaskState, LoadJobCommand};
+use curvine_raft::proto::raft::{AppliedIndex, FsmState};
+use curvine_raft::raft::storage::{LogStorage, RocksLogStorage};
 use curvine_runtime::common::DurationUnit;
 use curvine_unified_fs::MountValue;
-use log::{info, warn};
-use std::sync::Arc;
+use log::{debug, error, info, warn};
+use raft::eraftpb::{Entry, EntryType};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Result of replaying one raft entry in the background worker.
+enum Step {
+    /// Replayed; carries the watermark when the entry owed a UFS effect.
+    Applied(Option<AppliedIndex>),
+    /// Leadership was lost while retrying: abandon the entry and re-evaluate
+    /// instead of writing a shared UFS the new leader now owns.
+    Paused,
+    /// The worker must exit: shutdown or unrecoverable damage.
+    Stop,
+}
+
+/// How often the worker re-reads the watermarks while it believes it has
+/// nothing to do. A UFS copy takes minutes, so polling once a second costs
+/// nothing measurable and keeps every wake-up signal out of the design: there
+/// is no notification to lose, because there is no notification.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct UfsLoader {
     job_manager: Arc<JobManager>,
     fs_dir: SyncFsDir,
     copy_timeout: Duration,
+
+    // ---- asynchronous UFS replay ----
+    //
+    // The metadata apply loop never touches UFS: a slow or failing object store
+    // cannot stall raft apply, and every UFS op below is idempotent, so a role
+    // change may abandon an entry and the next leader redoes it.
+    /// Local leadership. UFS is a single writer shared by the whole cluster, so
+    /// followers must never repeat these effects.
+    is_leader: Arc<AtomicBool>,
+    /// Set at shutdown. The worker polls it like every other input, so there is
+    /// no signal that can be missed.
+    stopped: Arc<AtomicBool>,
+    /// The log is the work queue: `(ufs_applied, applied]` needs its UFS side
+    /// effects, and this worker reads it directly instead of buffering entries.
+    log_store: RocksLogStorage,
+    journal_writer: Arc<JournalWriter>,
+    fsm_state: Arc<Mutex<FsmState>>,
+    retry_interval: Duration,
+    metrics: &'static MasterMetrics,
 }
 
 impl UfsLoader {
-    pub fn new(job_manager: Arc<JobManager>, fs_dir: SyncFsDir, conf: &JournalConf) -> Self {
+    pub(crate) fn new(
+        job_manager: Arc<JobManager>,
+        fs_dir: SyncFsDir,
+        conf: &JournalConf,
+        log_store: RocksLogStorage,
+        journal_writer: Arc<JournalWriter>,
+        fsm_state: Arc<Mutex<FsmState>>,
+    ) -> CommonResult<Self> {
         let copy_timeout = match DurationUnit::from_str(&conf.ufs_copy_timeout) {
             Ok(unit) => unit.as_duration(),
             Err(e) => {
@@ -48,11 +96,260 @@ impl UfsLoader {
             }
         };
 
-        Self {
+        Ok(Self {
             job_manager,
             fs_dir,
             copy_timeout,
+            is_leader: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            log_store,
+            journal_writer,
+            fsm_state,
+            retry_interval: Duration::from_secs(conf.retry_interval_secs),
+            metrics: Master::get_metrics()?,
+        })
+    }
+
+    /// Publish local leadership. UFS is a single writer shared by the whole
+    /// cluster, so the worker only replays while this node leads.
+    pub fn set_leader(&self, is_leader: bool) {
+        self.is_leader.store(is_leader, Ordering::Release);
+    }
+
+    /// Ask the replayer to exit. It notices within one poll interval.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    fn fsm_state_snapshot(&self) -> CommonResult<FsmState> {
+        match self.fsm_state.lock() {
+            Ok(state) => Ok(state.clone()),
+            Err(e) => err_box!("fsm_state lock poisoned: {}", e),
         }
+    }
+
+    /// Replay every UFS side effect the watermarks still owe.
+    ///
+    /// Progress lives entirely in `ufs_applied`: there is no in-memory queue to
+    /// lose on restart, and a replayed entry that was already applied is a no-op
+    /// because every UFS op is idempotent.
+    pub async fn run(&self) {
+        while self.cycle().await {
+            // One entry per cycle is mostly synchronous work (decode, watermark,
+            // lock), so a long backlog would never hit an await point. Yield
+            // after every entry instead of monopolising the runtime thread.
+            tokio::task::yield_now().await;
+        }
+        info!("ufs replayer stopped");
+    }
+
+    /// One poll cycle: replay the single entry the watermarks owe next. Returns
+    /// false when the worker must exit, either because shutdown was requested
+    /// or because the watermarks no longer describe recoverable state.
+    async fn cycle(&self) -> bool {
+        if !self.is_leader.load(Ordering::Acquire) {
+            return self.idle().await;
+        }
+
+        let Some((from, to)) = self.owed_range() else {
+            return false;
+        };
+
+        if from >= to {
+            return self.idle().await;
+        }
+
+        // Exactly one entry per cycle. `scan_entries` silently skips a missing
+        // key, so a wider window could advance `ufs_applied` past side effects
+        // that never ran; a single index makes the hole impossible to miss, and
+        // losing leadership then abandons at most one entry.
+        let next = from + 1;
+        let mut entries = match self.log_store.scan_entries(next, next + 1) {
+            Ok(entries) => entries,
+            Err(e) => {
+                error!(
+                    "ufs replay: scanning journal entry {} failed, retrying: {}",
+                    next, e
+                );
+                return self.sleep_or_stop().await;
+            }
+        };
+        if entries.len() != 1 || entries[0].index != next {
+            // The owed entry is gone from the log, so its UFS side effect can
+            // never run again. Stopping keeps the watermark where it is instead
+            // of skipping past effects that never happened.
+            error!(
+                "ufs replay: metadata invariant broken, ufs replay stopped at index {}, \
+                 but journal entry {} is not on disk",
+                from, next
+            );
+            self.stopped.store(true, Ordering::Release);
+            return false;
+        }
+
+        let entry = entries.remove(0);
+        match self.replay_one(&entry).await {
+            Step::Applied(reached) => {
+                self.record_watermark(reached);
+                true
+            }
+            Step::Paused => true,
+            Step::Stop => false,
+        }
+    }
+
+    /// `(ufs_applied, applied]`, or `None` when the range cannot be read and the
+    /// worker stopped instead.
+    fn owed_range(&self) -> Option<(u64, u64)> {
+        match self.replay_range() {
+            Ok(range) => Some(range),
+            Err(e) => {
+                error!(
+                    "ufs replay: cannot read watermarks, ufs replay stopped: {}",
+                    e
+                );
+                self.stopped.store(true, Ordering::Release);
+                None
+            }
+        }
+    }
+
+    /// One marker per replayed entry: a follower only needs the latest
+    /// watermark to resume from. Losing a marker is harmless because a follower
+    /// that promotes replays the unmarked suffix, which is idempotent.
+    fn record_watermark(&self, reached: Option<AppliedIndex>) {
+        if !self.is_leader.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(applied) = reached else {
+            return;
+        };
+        if let Err(e) =
+            self.journal_writer
+                .log_ufs_applied(applied.op_id, applied.term, applied.index)
+        {
+            warn!(
+                "ufs replay: recording watermark {} failed, continuing: {}",
+                applied.index, e
+            );
+        }
+    }
+
+    /// Sleep one poll interval. Returns false when shutdown was requested.
+    async fn idle(&self) -> bool {
+        if self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+        !self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Back off before retrying a failed entry, in poll sized steps so shutdown
+    /// is still noticed promptly.
+    async fn sleep_or_stop(&self) -> bool {
+        let mut left = self.retry_interval;
+        while !left.is_zero() {
+            let step = left.min(POLL_INTERVAL);
+            tokio::time::sleep(step).await;
+            if self.stopped.load(Ordering::Acquire) {
+                return false;
+            }
+            left = left.saturating_sub(step);
+        }
+        true
+    }
+
+    /// `(ufs_applied, applied]`: what metadata apply already committed but the
+    /// UFS side effect has not caught up with yet.
+    pub(super) fn replay_range(&self) -> CommonResult<(u64, u64)> {
+        let state = self.fsm_state_snapshot()?;
+        Ok((state.ufs_applied.index, state.applied.index))
+    }
+
+    /// Apply one raft entry's UFS effects.
+    async fn replay_one(&self, entry: &Entry) -> Step {
+        loop {
+            match self.replay_entry(entry).await {
+                Ok(reached) => return Step::Applied(reached),
+                Err(e) => {
+                    // A demoted node must not keep retrying a shared UFS write:
+                    // the new leader owns that side effect now.
+                    if !self.is_leader.load(Ordering::Acquire) {
+                        return Step::Paused;
+                    }
+                    warn!(
+                        "ufs replay failed at index {}, retrying in {:?}: {}",
+                        entry.index, self.retry_interval, e
+                    );
+                    if !self.sleep_or_stop().await {
+                        return Step::Stop;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Replay one raft entry's UFS effects and advance the watermark. Returns
+    /// the watermark when the entry owed a UFS effect.
+    pub(super) async fn replay_entry(&self, entry: &Entry) -> CommonResult<Option<AppliedIndex>> {
+        if entry.get_entry_type() != EntryType::EntryNormal || entry.data.is_empty() {
+            let applied = Self::build_applied(entry);
+            self.advance(applied)?;
+            return Ok(None);
+        }
+
+        let batch = JournalBatch::deserialize_compat(&entry.data)?;
+        let mut applied = Self::build_applied(entry);
+        let mut has_ufs_affecting = false;
+
+        for op_entry in batch.batch {
+            applied.op_id = op_entry.op_id();
+            applied.rpc_id = op_entry.rpc_id();
+
+            // Only these carry a UFS side effect. Everything else in the log is
+            // metadata, cache, or watermark bookkeeping that replay does not owe,
+            // so the list must stay in step with `apply_entry`.
+            match &op_entry {
+                JournalEntry::Mkdir(_)
+                | JournalEntry::CompleteFile(_)
+                | JournalEntry::Rename(_)
+                | JournalEntry::Delete(_) => {}
+                _ => continue,
+            }
+
+            has_ufs_affecting = true;
+            self.apply_entry(&op_entry).await?;
+        }
+
+        self.advance(applied.clone())?;
+        Ok(if has_ufs_affecting {
+            Some(applied)
+        } else {
+            None
+        })
+    }
+
+    fn build_applied(entry: &Entry) -> AppliedIndex {
+        AppliedIndex {
+            term: entry.term,
+            index: entry.index,
+            ..Default::default()
+        }
+    }
+
+    /// Advance `ufs_applied` for one replayed entry.
+    fn advance(&self, applied: AppliedIndex) -> CommonResult<()> {
+        let mut state = match self.fsm_state.lock() {
+            Ok(state) => state,
+            Err(e) => return err_box!("fsm_state lock poisoned: {}", e),
+        };
+        if applied.index >= state.ufs_applied.index {
+            state.ufs_applied = applied;
+        }
+        self.metrics
+            .journal_ufs_applied
+            .set(state.ufs_applied.index as i64);
+        Ok(())
     }
 
     pub fn get_real_path(&self, inode_id: i64) -> FsResult<Path> {
@@ -246,16 +543,19 @@ impl UfsLoader {
 
     pub async fn delete(&self, e: &DeleteEntry) -> CommonResult<()> {
         let path = Path::from_str(&e.path)?;
-        if let Some((ufs_path, mnt)) = self.get_mnt(&path)? {
-            let ufs = mnt.ufs()?;
-            if ufs.exists(&ufs_path).await? {
-                ufs.delete(&ufs_path, true).await?;
-            } else {
-                warn!("delete: src file not exists: {}", ufs_path);
+        let Some((ufs_path, mnt)) = self.get_mnt(&path)? else {
+            return Ok(());
+        };
+        // `delete` stats the path itself, so an `exists` pre-check only adds
+        // round trips and turns a racing delete into a retried entry. A missing
+        // object is the expected steady state here, not an error.
+        match mnt.ufs()?.delete(&ufs_path, true).await {
+            Ok(_) => Ok(()),
+            Err(FsError::FileNotFound(_)) => {
+                debug!("delete: {} not on UFS, nothing to remove", ufs_path);
+                Ok(())
             }
-            Ok(())
-        } else {
-            Ok(())
+            Err(e) => Err(e.into()),
         }
     }
 }
