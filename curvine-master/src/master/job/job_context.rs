@@ -52,6 +52,7 @@ pub struct JobContext {
 }
 
 impl JobContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn with_conf(
         job_conf: &LoadJobCommand,
         job_id: String,
