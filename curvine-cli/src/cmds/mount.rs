@@ -51,9 +51,9 @@ pub struct MountCommand {
     read_verify_ufs: bool,
 
     /// Lifetime of cached data, such as 1h or 7d. 0 means cached data never expires.
-    /// Independent of --auto-cache.
-    #[arg(long, default_value = "7d")]
-    ttl_ms: String,
+    /// Independent of --auto-cache. Default for new mounts: 7d. Omitted when used with --update.
+    #[arg(long)]
+    ttl_ms: Option<String>,
 
     #[arg(long)]
     replicas: Option<i32>,
@@ -560,29 +560,45 @@ impl MountCommand {
 
     pub fn to_mnt_opts(&self) -> CommonResult<MountOptions> {
         let write_type = WriteType::try_from(self.write_type.as_str())?;
-        let ttl_ms = DurationUnit::from_str(self.ttl_ms.as_str())?.as_millis() as i64;
+        // `--ttl-ms` only shapes the lifetime that is actually sent; when it is
+        // omitted a new mount keeps the builder default (7d) and an update keeps
+        // the stored lifetime.
+        let ttl_ms = self
+            .ttl_ms
+            .as_deref()
+            .map(|ttl| DurationUnit::from_str(ttl).map(|v| v.as_millis() as i64))
+            .transpose()?;
         let conf_map = self.get_config_map()?;
-
-        let ttl_action = if matches!(write_type, WriteType::FsMode) {
-            TtlAction::Free
-        } else {
-            TtlAction::Delete
-        };
 
         let mut opts = MountOptions::builder();
         if self.update {
             // On update, only explicitly provided optional fields are sent so
-            // omitted toggles (auto_cache/access_mode/write_cache) keep their
-            // existing mount values instead of being reset to defaults.
+            // omitted fields (auto_cache/access_mode/write_cache/ttl_ms) keep
+            // their existing mount values instead of being reset to defaults.
             opts = opts.update_only_explicit();
         }
         let mut opts = opts
             .update(self.update)
             .set_properties(conf_map)
             .write_type(write_type)
-            .read_verify_ufs(self.read_verify_ufs)
-            .ttl_ms(ttl_ms)
-            .ttl_action(ttl_action);
+            .read_verify_ufs(self.read_verify_ufs);
+
+        if !self.update {
+            // A new mount binds `ttl_action` to the requested write type. An
+            // update must not send a request-derived action: the master keeps
+            // the stored write type (`MountInfo::merge_with`), so the stored
+            // action is the only one consistent with it.
+            let ttl_action = if matches!(write_type, WriteType::FsMode) {
+                TtlAction::Free
+            } else {
+                TtlAction::Delete
+            };
+            opts = opts.ttl_action(ttl_action);
+        }
+
+        if let Some(ttl_ms) = ttl_ms {
+            opts = opts.ttl_ms(ttl_ms);
+        }
 
         if let Some(replicas) = self.replicas {
             opts = opts.replicas(replicas);
@@ -666,7 +682,7 @@ mod tests {
         display_config_value, is_sensitive_config_key, s3_uses_environment_credential, MountCommand,
     };
     use clap::Parser;
-    use curvine_model::MountInfo;
+    use curvine_model::{MountInfo, TtlAction};
     use std::collections::HashMap;
 
     fn parse_mount_info(args: &[&str]) -> MountInfo {
@@ -679,6 +695,84 @@ mod tests {
         cmd.to_mnt_opts()
             .unwrap()
             .to_info(1, &cmd.cv_path, &cmd.ufs_path)
+    }
+
+    fn parse_mnt_opts(args: &[&str]) -> curvine_model::MountOptions {
+        let cmd = MountCommand::try_parse_from(
+            ["mount", "s3://bucket/data", "/data"]
+                .iter()
+                .chain(args.iter()),
+        )
+        .unwrap();
+        cmd.to_mnt_opts().unwrap()
+    }
+
+    #[test]
+    fn new_mount_keeps_default_ttl_when_omitted() {
+        // Non-update calls never run `update_only_explicit()`, so the builder
+        // default (`MountOptionsBuilder::DEFAULT_TTL_MS`) survives.
+        let opts = parse_mnt_opts(&[]);
+        assert_eq!(
+            opts.ttl_ms,
+            Some(curvine_model::MountOptionsBuilder::DEFAULT_TTL_MS)
+        );
+        // The default write type is fs_mode, so the derived action is Free.
+        assert_eq!(opts.ttl_action, Some(TtlAction::Free));
+    }
+
+    #[test]
+    fn update_without_ttl_ms_keeps_existing_lifetime() {
+        let opts = parse_mnt_opts(&["--update", "--auto-cache", "false"]);
+        assert_eq!(opts.ttl_ms, None, "omitted --ttl-ms must not be sent");
+        assert_eq!(opts.ttl_action, None);
+        assert_eq!(opts.auto_cache, Some(false));
+
+        // A mount without a TTL (0 = never expires) must stay that way.
+        let existing = MountInfo {
+            cv_path: "/data".to_string(),
+            ufs_path: "s3://bucket/data".to_string(),
+            ttl_ms: 0,
+            ttl_action: TtlAction::Delete,
+            ..Default::default()
+        };
+        let merged = existing.merge_with(opts);
+        assert_eq!(merged.ttl_ms, 0);
+        assert_eq!(merged.ttl_action, TtlAction::Delete);
+        assert!(!merged.auto_cache);
+    }
+
+    #[test]
+    fn update_with_explicit_ttl_ms_still_applies() {
+        let opts = parse_mnt_opts(&["--update", "--ttl-ms", "1h"]);
+        assert_eq!(opts.ttl_ms, Some(60 * 60 * 1000));
+        // The action is not request-derived: the master keeps the stored write
+        // type, so only the stored action stays consistent with it.
+        assert_eq!(opts.ttl_action, None);
+
+        // A cache_mode mount keeps `Delete` (file reclaimed) instead of being
+        // switched to the `Free` that the default `--write-type fs_mode` would
+        // derive for an update.
+        let existing = MountInfo {
+            cv_path: "/data".to_string(),
+            ufs_path: "s3://bucket/data".to_string(),
+            ttl_ms: 0,
+            ttl_action: TtlAction::Delete,
+            write_type: curvine_model::WriteType::CacheMode,
+            ..Default::default()
+        };
+        let merged = existing.merge_with(opts);
+        assert_eq!(merged.ttl_ms, 60 * 60 * 1000);
+        assert_eq!(merged.ttl_action, TtlAction::Delete);
+        assert_eq!(merged.write_type, curvine_model::WriteType::CacheMode);
+    }
+
+    #[test]
+    fn new_mount_derives_ttl_action_from_write_type() {
+        let defaults = parse_mnt_opts(&[]);
+        assert_eq!(defaults.ttl_action, Some(TtlAction::Free));
+
+        let cache_mode = parse_mnt_opts(&["--write-type", "cache_mode"]);
+        assert_eq!(cache_mode.ttl_action, Some(TtlAction::Delete));
     }
 
     #[test]
