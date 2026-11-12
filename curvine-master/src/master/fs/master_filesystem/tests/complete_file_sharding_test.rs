@@ -1453,36 +1453,54 @@ fn delete_does_not_hold_namespace_read_while_waiting_for_block_lock() {
 
 #[test]
 fn delete_serializes_with_worker_location_cleanup() {
+    use std::time::Instant;
     let fs = test_fs("delete-worker-cleanup-race");
     let block_id = replication_file(&fs, "/file");
 
-    // Driver holds the block stripe. Cleanup takes its worker session mutex
-    // first and then blocks on this stripe, so the critical section stays
-    // observable until we release it — a shared namespace view no longer
-    // fences cleanup, and polling for a transient window proved nothing.
-    let block_guard = fs.block_location_locks.write_blocks(&[block_id]);
+    // Driver holds the target file inode's read lock. Cleanup's final
+    // invalidation takes that inode's write lock, so cleanup is observable in
+    // its "locations removed, invalidation still pending" phase: the block is
+    // already gone but the call has not returned. Polling a transient lock
+    // window proves nothing — the session mutex is not even the stripe delete
+    // contends on.
+    let inode_locks = fs.inode_locks_for_test();
+    let file_id = fs.file_status("/file").unwrap().id;
+    let held = inode_locks.read_inode(file_id);
 
     let cleanup_fs = fs.clone();
     let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
     let cleanup = std::thread::spawn(move || cleanup_tx.send(cleanup_fs.delete_locations(100)));
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline && fs.worker_location_lock(100).try_lock().is_some()
-    {
+    let removed = loop {
+        let removed = fs
+            .fs_dir
+            .view()
+            .unwrap()
+            .get_block_locations(block_id)
+            .unwrap()
+            .is_empty();
+        if removed && Instant::now() < deadline {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
         std::thread::yield_now();
-    }
+    };
+    // Cleanup must still be running (blocked on the inode write lock we hold).
     assert!(
-        fs.worker_location_lock(100).try_lock().is_none(),
-        "worker cleanup did not enter the worker-location critical section"
+        removed && cleanup_rx.try_recv().is_err(),
+        "cleanup must be past location removal but inside its invalidation window"
     );
 
-    // Delete contends on the same worker stripe, so it cannot overtake the
-    // cleanup that already owns the critical section.
+    // Delete contends on the same inode write lock, so it cannot overtake the
+    // invalidation; after the lock is released both proceed in lock order.
     let delete_fs = fs.clone();
     let (delete_tx, delete_rx) = std::sync::mpsc::channel();
     let delete = std::thread::spawn(move || delete_tx.send(delete_fs.delete("/file", false)));
 
-    drop(block_guard);
+    drop(held);
     cleanup.join().unwrap();
     let cleanup_result = cleanup_rx.recv().unwrap();
     assert_eq!(cleanup_result.unwrap().removed_block_ids, vec![block_id]);
