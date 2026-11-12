@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Lifecycle tests for the S6-a namespace view holder: hot guards block cold
-// exclusivity until released (including cross-thread), cold windows reject
-// new views, timeouts and panics never reopen a half-mutated view, and every
-// exit path restores access or fails closed.
+// Lifecycle tests for the S6-a namespace view holder: guards block cold
+// exclusivity, cold windows reject new views, timeouts/panics never reopen a
+// half-mutated view, and every exit restores access or fails closed.
 
 use crate::master::journal::JournalWriter;
 use crate::master::meta::fs_dir_handle::{ColdError, FsDirHandle, NamespaceError};
@@ -186,22 +185,11 @@ fn cold_guard_leaves_no_stale_strong_reference() {
     ));
 }
 
-// ---------------------------------------------------------------------------
-// Terminal failure capability.
-//
-// `FsDirHandle::fail_closed(writer)` is the entry a failed confirmation uses
-// when it may not own the view. The reopen path is shared by a normal cold
-// drop and a drain timeout; a terminal failure may land at any point of it.
-//
-// Interleavings are real cross-thread handovers: the reopen thread announces
-// the fixed point over a channel and blocks there, the driver thread performs
-// the terminal failure, then releases the reopen thread. Assertions run after
-// all threads are joined and the hook is cleared, so no failure unwinds
-// through a live guard or leaks the FsDir behind a reference cycle.
-// ---------------------------------------------------------------------------
+// Terminal failure: `fail_closed(writer)` for a failed confirmation that may
+// not own the view. Interleavings are real cross-thread handovers.
 
-/// Terminal from OPEN: one-way FAILED, view and cold rejected, parked view
-/// retired, writer fenced, cursor invalidated, and a repeat call never revives.
+/// Terminal from OPEN: FAILED, view/cold rejected, view retired, writer
+/// fenced, cursor invalidated, and a repeat call never revives.
 #[test]
 fn terminal_failure_from_open_retires_the_view_and_fences() {
     let (handle, writer) = build("terminal-open");
@@ -244,8 +232,8 @@ fn terminal_failure_from_open_retires_the_view_and_fences() {
     assert!(matches!(handle.view(), Err(NamespaceError::Unavailable)));
 }
 
-/// Terminal while another cold owner is draining: the drain must retire the
-/// view it took and report the terminal state, never a new owner.
+/// Terminal during another owner's drain: retire the taken view, report the
+/// terminal state, never a new owner.
 #[test]
 fn terminal_during_drain_retires_the_taken_view() {
     let (handle, writer) = build("terminal-drain");
@@ -284,19 +272,26 @@ fn terminal_during_drain_retires_the_taken_view() {
     handle.fail_closed(&writer);
     drop(held);
 
-    let outcome = drain_done_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("the drain thread must finish after the terminal");
-    drain_thread
-        .join()
-        .expect("the drain thread must not panic");
-    // Assertions only after the drain thread is finished and joined.
+    let drain_done = drain_done_rx.recv_timeout(Duration::from_secs(5));
+    let drain_finished = drain_done.is_ok();
+    let drain_outcome: Result<(), ColdError> = match drain_done {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        // A stuck drain cannot be killed safely; report the timeout.
+        Err(_) => panic!("drain thread did not finish in time"),
+    };
+    let drain_join = drain_finished.then(|| drain_thread.join());
+    // Assertions only after the drain thread is finished or known stuck.
     assert!(
         drain_took_view,
         "fixture: the drain must really take the view into the cold state"
     );
     assert!(
-        matches!(outcome, Err(ColdError::Unavailable)),
+        matches!(&drain_join, Some(Ok(_))),
+        "the drain thread must be joined, not timed out"
+    );
+    assert!(
+        matches!(drain_outcome, Err(ColdError::Unavailable)),
         "a draining cold acquisition must report the terminal state"
     );
     assert!(handle.is_failed());
@@ -338,12 +333,9 @@ fn drain_timeout_without_terminal_still_reopens_the_same_view() {
     assert_eq!(handle.view().unwrap().last_inode_id(), next_id - 1);
 }
 
-/// Terminal at each reopen point, driven by a real cross-thread handover: the
-/// reopen thread parks at the fixed point, the driver thread performs the
-/// terminal there and releases it. Every combination asserts the outcome per
-/// linearization and the full final state after all threads are joined:
-/// FAILED, no late slot, cursor invalidated, view and cold rejected, writer
-/// fenced.
+/// Terminal at each reopen point via a cross-thread handover. Asserts the
+/// outcome per linearization plus the full final state: FAILED, no late slot,
+/// cursor invalidated, view and cold rejected, writer fenced.
 #[test]
 fn terminal_at_every_reopen_point_asserts_final_state() {
     const POINTS: [&str; 4] = ["before_store", "after_store", "before_cas", "after_cas"];
@@ -384,10 +376,9 @@ fn terminal_at_every_reopen_point_asserts_final_state() {
             // never got there).
             let reached = reached_rx.recv_timeout(Duration::from_secs(5));
 
-            // The driver performs the terminal from another real thread. Its
-            // completion is observed through a bounded done channel; even a
-            // panicking terminal must not leave the parked thread stuck, so
-            // the release happens regardless of the terminal's fate.
+            // Terminal from another real thread; its completion is observed
+            // through a bounded channel and the parked thread is released even
+            // if the terminal panicked.
             let (terminal_done_tx, terminal_done_rx) = mpsc::channel();
             let terminal = {
                 let handle = Arc::clone(&handle);
@@ -399,9 +390,8 @@ fn terminal_at_every_reopen_point_asserts_final_state() {
                     let _ = terminal_done_tx.send(outcome.is_ok());
                 })
             };
-            let terminal_ok = terminal_done_rx
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap_or(false);
+            let terminal_done = terminal_done_rx.recv_timeout(Duration::from_secs(5));
+            let terminal_ok = matches!(&terminal_done, Ok(true));
 
             // Release the parked thread; if the point was never reached, drop
             // the release end so the hook falls through and the reopen thread
@@ -412,15 +402,26 @@ fn terminal_at_every_reopen_point_asserts_final_state() {
                 }
                 Err(_) => drop(release_tx),
             }
-            // Bounded completion observation of the reopen thread before
-            // joining it.
-            let outcome = match reopen_done_rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(outcome) => outcome,
-                Err(_) => Err("reopen thread did not finish in time".to_string()),
-            };
-            reopen.join().expect("reopen thread must not panic");
-            terminal.join().expect("terminal thread must not panic");
-            handle.clear_reopen_hook();
+
+            // Join only threads whose completion was observed: a timed-out
+            // observation must not become an unbounded join. Rust cannot kill
+            // a stuck thread, so the timeout is reported instead.
+            let (outcome, reopen_finished) =
+                match reopen_done_rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(outcome) => (outcome, true),
+                    Err(_) => (
+                        Err("reopen thread did not finish in time".to_string()),
+                        false,
+                    ),
+                };
+            let reopen_join = reopen_finished.then(|| reopen.join());
+            let terminal_join = terminal_done.is_ok().then(|| terminal.join());
+            // A stuck thread may still hold the hook mutex.
+            let both_joined =
+                matches!(&reopen_join, Some(Ok(_))) && matches!(&terminal_join, Some(Ok(_)));
+            if both_joined {
+                handle.clear_reopen_hook();
+            }
 
             // The fixed point must actually have been reached: a scenario
             // whose hook never fired cannot pass on its final state alone.
@@ -431,6 +432,14 @@ fn terminal_at_every_reopen_point_asserts_final_state() {
             assert!(
                 terminal_ok,
                 "{path} at {point}: the terminal thread must complete cleanly"
+            );
+            assert!(
+                matches!(&reopen_join, Some(Ok(_))),
+                "{path} at {point}: the reopen thread must be joined, not timed out"
+            );
+            assert!(
+                matches!(&terminal_join, Some(Ok(_))),
+                "{path} at {point}: the terminal thread must be joined"
             );
 
             // Outcome per path and linearization. A drop itself never returns
