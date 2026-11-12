@@ -416,3 +416,58 @@ fn optimize_all_tolerates_concurrent_writers() {
     );
     assert_eq!(list.buckets_len(), total_buckets as usize);
 }
+
+/// The TTL index counts bucket entries, not distinct inodes. One inode whose
+/// expiration lands in two buckets contributes one entry to each, so
+/// `total_inodes` reports 2 while re-adding it to the same bucket still
+/// dedups. This is the semantics the scheduler fixture depends on.
+#[test]
+fn same_inode_in_two_buckets_counts_one_entry_per_bucket() {
+    let list = ttl_bucket_list();
+    // mtime 0 + ttl 500 expires at 500 (bucket start 0);
+    // mtime 1500 + ttl 500 expires at 2000 (bucket start 2000).
+    let early = file_with_ttl(7, 0, 500);
+    let late = file_with_ttl(7, 1500, 500);
+
+    list.add(&early);
+    list.add(&late);
+
+    let starts: Vec<i64> = list.buckets.lock().keys().copied().collect();
+    assert_eq!(
+        starts,
+        [0, 2000],
+        "the two expirations must land in two buckets"
+    );
+    assert_eq!(
+        list.total_inodes(),
+        2,
+        "one inode in two buckets is two bucket entries"
+    );
+    for bucket in list.buckets.lock().values() {
+        assert!(
+            bucket.inodes.lock().contains(7),
+            "bucket {} must hold the inode",
+            bucket.interval_start_ms
+        );
+    }
+
+    // Re-adding the same inode to the same bucket dedups inside that bucket.
+    list.add(&early);
+    assert_eq!(
+        list.total_inodes(),
+        2,
+        "re-adding to the same bucket must not add a second entry"
+    );
+
+    // Draining yields the same inode once per bucket: two entries, not one
+    // distinct inode.
+    let mut drained_ids = Vec::new();
+    for bucket in list.get_expired_buckets_at(i64::MAX) {
+        drained_ids.extend(bucket.inodes.lock().iter());
+    }
+    assert_eq!(
+        drained_ids,
+        [7, 7],
+        "the same inode must appear once per bucket"
+    );
+}
