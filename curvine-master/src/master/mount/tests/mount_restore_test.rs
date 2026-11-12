@@ -51,4 +51,20 @@ fn restore_reports_a_closed_namespace_instead_of_panicking() {
 
     drop(cold);
     manager.restore().unwrap();
+
+    // A FAILED namespace is terminal: restore reports Unavailable (not a
+    // retryable InProgress) and the best-effort variant exits without
+    // panicking. No retry is attempted on this state.
+    let cold2 = manager
+        .master_fs
+        .fs_dir
+        .begin_cold(DEFAULT_COLD_TIMEOUT)
+        .unwrap();
+    cold2.fail_closed();
+    let err = manager.restore().unwrap_err();
+    assert!(
+        err.to_string().contains("JournalUnavailable"),
+        "a FAILED namespace must surface as Unavailable, got {err:?}"
+    );
+    manager.restore_best_effort();
 }
