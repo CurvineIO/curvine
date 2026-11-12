@@ -2,16 +2,15 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-
-use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT; // You may obtain a copy of the License at
-                                                              //
-                                                              //     http://www.apache.org/licenses/LICENSE-2.0
-                                                              //
-                                                              // Unless required by applicable law or agreed to in writing, software
-                                                              // distributed under the License is distributed on an "AS IS" BASIS,
-                                                              // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-                                                              // See the License for the specific language governing permissions and
-                                                              // limitations under the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::meta::FsDir;
@@ -22,7 +21,7 @@ use curvine_error::FsResult;
 use curvine_fs_api::{self, Path};
 use curvine_model::{MkdirOpts, MountInfo, MountOptions};
 use curvine_ufs_api::S3Conf;
-use log::info;
+use log::warn;
 use std::sync::Arc;
 
 pub struct MountManager {
@@ -39,14 +38,20 @@ impl MountManager {
     }
 
     /// recovery mount points from store
+    ///
+    /// A cold window or a FAILED namespace surfaces as a retryable error: the
+    /// caller decides whether to propagate it or fall back to best-effort.
     pub fn restore(&self) -> FsResult<()> {
-        let fs_dir = self.master_fs.fs_dir.view().unwrap();
+        let fs_dir = self.master_fs.fs_dir.view()?;
         self.mount_table.restore(&fs_dir)
     }
 
+    /// Startup/recovery variant: a transient namespace state must not abort
+    /// the master, so the error is logged instead of panicking.
     pub fn restore_best_effort(&self) {
-        let fs_dir = self.master_fs.fs_dir.view().unwrap();
-        self.mount_table.restore_best_effort(&fs_dir)
+        if let Err(e) = self.restore() {
+            warn!("failed to restore mount table: {}", e);
+        }
     }
 
     fn create_mount_point(&self, mount_path: &str) -> FsResult<bool> {
@@ -241,5 +246,41 @@ mod tests {
         let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadOnly, false);
 
         MountManager::normalize_mount_config(&mut info).unwrap();
+    }
+
+    #[test]
+    fn restore_reports_a_closed_namespace_instead_of_panicking() {
+        use crate::master::journal::JournalSystem;
+        use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
+        use crate::master::Master;
+        use curvine_config::ClusterConf;
+        use curvine_runtime::common::Utils;
+
+        Master::init_test_metrics();
+        let mut conf = ClusterConf {
+            testing: true,
+            ..Default::default()
+        };
+        conf.journal.enable = false;
+        conf.change_test_meta_dir(format!("mount-restore-cold-{}", Utils::rand_str(8)));
+        let journal = JournalSystem::fs_only_for_test(&conf).unwrap();
+        let manager = MountManager::new(journal);
+
+        // A cold window closes the shared view: recovery must surface a
+        // retryable error and the best-effort variant must log and return.
+        let cold = manager
+            .master_fs
+            .fs_dir
+            .begin_cold(DEFAULT_COLD_TIMEOUT)
+            .unwrap();
+        let err = manager.restore().unwrap_err();
+        assert!(
+            matches!(err, curvine_error::FsError::InProgress(_)),
+            "a closed namespace must surface as retryable, got {err:?}"
+        );
+        manager.restore_best_effort();
+
+        drop(cold);
+        manager.restore().unwrap();
     }
 }
