@@ -127,6 +127,7 @@ Curvine is a Cargo workspace with smaller Go (`curvine-csi`), Java (`curvine-lib
 - **Updates:** [Dependabot](.github/dependabot.yml) opens weekly, grouped update PRs for Cargo, Go modules, Maven, npm, and GitHub Actions. Maintainers review and merge them after CI passes. Major version bumps are reviewed individually.
 - **Security fixes:** dependencies with known vulnerabilities are updated as soon as a fixed version is available. Report vulnerabilities in Curvine itself as described in [SECURITY.md](SECURITY.md).
 - **GitHub Actions:** workflows request the minimum token permissions they need, and write permissions are granted per job.
+- **Pinned actions:** workflows reference every action by its full commit SHA, with the release in a trailing comment (`uses: actions/checkout@<sha> # v7.0.1`). Dependabot updates the SHA and the comment together.
 
 ## AI-Assisted Contribution Workflow
 
