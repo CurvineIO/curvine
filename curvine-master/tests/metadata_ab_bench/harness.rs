@@ -38,9 +38,7 @@ use std::time::Instant;
 /// set it, otherwise the two builds would be compared on a reduced workload.
 pub fn ops_per_thread() -> u64 {
     match std::env::var("BENCH_OPS") {
-        Ok(v) => v
-            .parse()
-            .expect("BENCH_OPS must be a positive integer"),
+        Ok(v) => v.parse().expect("BENCH_OPS must be a positive integer"),
         Err(_) => 1000,
     }
 }
@@ -209,9 +207,7 @@ pub fn run(
             };
             // Build every per-call argument (path formatting included) before
             // the barrier, so the timed region holds one API call only.
-            let mut prepared: Vec<Arg> = (0..env.ops)
-                .map(|seq| args(&env, thread, seq))
-                .collect();
+            let mut prepared: Vec<Arg> = (0..env.ops).map(|seq| args(&env, thread, seq)).collect();
             barrier.wait();
             let started = Instant::now();
             for seq in 0..env.ops {

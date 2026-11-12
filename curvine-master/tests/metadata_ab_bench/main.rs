@@ -79,7 +79,8 @@ fn new_fs() -> (MasterFilesystem, Vec<String>) {
         Utils::test_sub_dir(format!("metadata-ab-bench/journal-{}", Utils::rand_str(6)));
     conf.master.meta_dir = meta_dir.clone();
     conf.journal.journal_dir = journal_dir.clone();
-    let fs = JournalSystem::fs_only_for_test(&conf).expect("failed to build the metadata filesystem");
+    let fs =
+        JournalSystem::fs_only_for_test(&conf).expect("failed to build the metadata filesystem");
     (fs, vec![meta_dir, journal_dir])
 }
 

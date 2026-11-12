@@ -173,7 +173,6 @@ pub(crate) fn list_arg(env: &Env, thread: usize, _seq: u64) -> Arg {
     arg(env.dir(thread))
 }
 
-
 pub(crate) fn client() -> ClientAddress {
     ClientAddress {
         client_name: CLIENT_NAME.to_string(),

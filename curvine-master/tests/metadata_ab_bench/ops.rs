@@ -204,15 +204,7 @@ pub const CASES: &[Case] = &[
             // Closing a freshly created empty file. Empty commit_blocks and
             // len 0 are consistent (complete_len == 0 == len), so this is the
             // real close path, not a retry shortcut.
-            fs.complete_file(
-                arg.a.as_str(),
-                None,
-                0,
-                vec![],
-                arg.b.as_str(),
-                false,
-                None,
-            )?;
+            fs.complete_file(arg.a.as_str(), None, 0, vec![], arg.b.as_str(), false, None)?;
             Ok(())
         },
     },
