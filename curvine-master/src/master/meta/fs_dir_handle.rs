@@ -123,10 +123,21 @@ impl std::error::Error for ColdError {}
 pub struct FsDirHandle {
     current: ArcSwapOption<FsDir>,
     state: AtomicU8,
-    /// Test-only interleaving hook for the reopen path. Production builds
-    /// carry no extra field, lock or state.
+    /// Test-only interleaving hook for the reopen path: a fixed point, an
+    /// out-channel announcing it was reached and an in-channel the driver
+    /// releases. The hook closure never captures the handle, so no reference
+    /// cycle keeps the FsDir alive. Production builds carry no extra field.
     #[cfg(test)]
-    reopen_hook: std::sync::Mutex<Option<Box<dyn Fn(&'static str) + Send + Sync>>>,
+    reopen_hook: std::sync::Mutex<Option<ReopenHookChannels>>,
+}
+
+/// Channels of the test-only reopen hook. `Mutex<Option<_>>` on the holder;
+/// the driver owns the far ends.
+#[cfg(test)]
+struct ReopenHookChannels {
+    point: &'static str,
+    reached: std::sync::mpsc::Sender<&'static str>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 impl FsDirHandle {
@@ -139,10 +150,26 @@ impl FsDirHandle {
         }
     }
 
-    /// Installs a test-only hook fired at fixed points of the reopen path.
+    /// Installs a test-only hook that announces one fixed point of the reopen
+    /// path and blocks there until the driver releases it.
     #[cfg(test)]
-    pub(crate) fn set_reopen_hook(&self, hook: Box<dyn Fn(&'static str) + Send + Sync>) {
-        *self.reopen_hook.lock().unwrap() = Some(hook);
+    pub(crate) fn set_reopen_hook(
+        &self,
+        point: &'static str,
+        reached: std::sync::mpsc::Sender<&'static str>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.reopen_hook.lock().unwrap() = Some(ReopenHookChannels {
+            point,
+            reached,
+            release,
+        });
+    }
+
+    /// Removes the hook so a finished scenario cannot block a later one.
+    #[cfg(test)]
+    pub(crate) fn clear_reopen_hook(&self) {
+        *self.reopen_hook.lock().unwrap() = None;
     }
 
     /// Test-only: whether the view slot is currently empty.
@@ -151,11 +178,19 @@ impl FsDirHandle {
         self.current.load().is_none()
     }
 
+    /// Fires the test-only hook. Announces the reached point over the
+    /// out-channel and waits for the driver's release; an already-closed
+    /// channel pair simply falls through.
     #[cfg(test)]
     fn fire_reopen_hook(&self, point: &'static str) {
         let hook = self.reopen_hook.lock().unwrap();
         if let Some(hook) = hook.as_ref() {
-            hook(point);
+            if hook.point == point {
+                // A send error only means the driver is gone; fall through.
+                let _ = hook.reached.send(point);
+                // A receive error only means the driver is gone; fall through.
+                let _ = hook.release.recv();
+            }
         }
     }
 
@@ -219,7 +254,9 @@ impl FsDirHandle {
     fn publish_reopen(&self, owned: Arc<FsDir>) -> bool {
         #[cfg(test)]
         self.fire_reopen_hook("before_store");
-        self.current.store(Some(owned.clone()));
+        // Move the view into the slot: no extra Arc copy keeps a new cold
+        // window waiting for a reference that only this helper still held.
+        self.current.store(Some(owned));
         #[cfg(test)]
         self.fire_reopen_hook("after_store");
         #[cfg(test)]
@@ -231,9 +268,12 @@ impl FsDirHandle {
         #[cfg(test)]
         self.fire_reopen_hook("after_cas");
         if !reopened {
-            // A terminal failure won: retract the late slot and retire it.
-            self.current.store(None);
-            owned.store.invalidate_cursor_store();
+            // A terminal failure won: take the late view back out and retire
+            // it. A None here means the terminal already swapped it away and
+            // is retiring it itself.
+            if let Some(late) = self.current.swap(None) {
+                late.store.invalidate_cursor_store();
+            }
         }
         reopened
     }

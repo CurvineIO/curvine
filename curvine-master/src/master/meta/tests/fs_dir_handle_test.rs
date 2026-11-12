@@ -192,6 +192,12 @@ fn cold_guard_leaves_no_stale_strong_reference() {
 // `FsDirHandle::fail_closed(writer)` is the entry a failed confirmation uses
 // when it may not own the view. The reopen path is shared by a normal cold
 // drop and a drain timeout; a terminal failure may land at any point of it.
+//
+// Interleavings are real cross-thread handovers: the reopen thread announces
+// the fixed point over a channel and blocks there, the driver thread performs
+// the terminal failure, then releases the reopen thread. Assertions run after
+// all threads are joined and the hook is cleared, so no failure unwinds
+// through a live guard or leaks the FsDir behind a reference cycle.
 // ---------------------------------------------------------------------------
 
 /// Terminal from OPEN: one-way FAILED, view and cold rejected, parked view
@@ -200,18 +206,15 @@ fn cold_guard_leaves_no_stale_strong_reference() {
 fn terminal_failure_from_open_retires_the_view_and_fences() {
     let (handle, writer) = build("terminal-open");
     let view = handle.view().unwrap();
+    let cursor = view.store.cursor_store();
     assert!(
-        view.store.cursor_store_available(),
-        "fixture: the cursor store starts available"
+        cursor.get_applied_req(77).is_ok(),
+        "fixture: the cursor store starts usable"
     );
 
     handle.fail_closed(&writer);
 
     assert!(handle.is_failed());
-    assert!(
-        !view.store.cursor_store_available(),
-        "the retired view's cursor store must be invalidated"
-    );
     drop(view);
     assert!(matches!(handle.view(), Err(NamespaceError::Unavailable)));
     assert!(matches!(
@@ -225,6 +228,13 @@ fn terminal_failure_from_open_retires_the_view_and_fences() {
     assert!(
         writer.ensure_metadata_current().is_err(),
         "terminal must fence the writer unconditionally"
+    );
+    let error = cursor
+        .get_applied_req(77)
+        .expect_err("the terminal must have invalidated the cursor store");
+    assert!(
+        error.to_string().contains("cursor store unavailable"),
+        "unexpected cursor error: {error}"
     );
 
     // Idempotent: a second terminal call must not revive anything.
@@ -240,12 +250,21 @@ fn terminal_failure_from_open_retires_the_view_and_fences() {
 fn terminal_during_drain_retires_the_taken_view() {
     let (handle, writer) = build("terminal-drain");
     let handle = Arc::new(handle);
-    let writer = Arc::new(writer);
     let held = handle.view().unwrap();
+    let cursor = held.store.cursor_store();
+    assert!(cursor.get_applied_req(78).is_ok());
 
-    let drain_handle = Arc::clone(&handle);
-    let drain =
-        std::thread::spawn(move || drain_handle.begin_cold(Duration::from_secs(5)).map(|_| ()));
+    // The drain runs on its own thread and reports through a channel. `handle`
+    // is owned here, so the thread borrows nothing from this frame beyond the
+    // channel.
+    let (drain_done_tx, drain_done_rx) = mpsc::channel();
+    let drain_thread = {
+        let handle = Arc::clone(&handle);
+        std::thread::spawn(move || {
+            let outcome = handle.begin_cold(Duration::from_secs(5)).map(|_| ());
+            let _ = drain_done_tx.send(outcome);
+        })
+    };
 
     // Wait until the drain is in the cold state *and* has taken the slot:
     // the state flips before the swap, so both must be observed.
@@ -262,10 +281,16 @@ fn terminal_during_drain_retires_the_taken_view() {
     handle.fail_closed(&writer);
     drop(held);
 
-    let outcome = drain.join().expect("drain thread must not panic");
+    let outcome = drain_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the drain thread must finish after the terminal");
+    drain_thread
+        .join()
+        .expect("the drain thread must not panic");
+    // Assertions only after the drain thread is finished and joined.
     assert!(
         matches!(outcome, Err(ColdError::Unavailable)),
-        "a draining cold acquisition must report the terminal state, got: {outcome:?}"
+        "a draining cold acquisition must report the terminal state"
     );
     assert!(handle.is_failed());
     assert!(
@@ -273,77 +298,15 @@ fn terminal_during_drain_retires_the_taken_view() {
         "no late view may be published after the terminal failure"
     );
     assert!(matches!(handle.view(), Err(NamespaceError::Unavailable)));
-}
-
-/// Terminal injected at each fixed point of the reopen path, for both the
-/// normal drop and the drain-timeout path. In every combination the final
-/// state is FAILED with no late slot.
-#[test]
-fn terminal_at_every_reopen_step_leaves_no_late_slot() {
-    const POINTS: [&str; 4] = ["before_store", "after_store", "before_cas", "after_cas"];
-    for point in POINTS {
-        // Path 1: normal drop publishes the taken view back.
-        {
-            let (handle, writer) = build(&format!("terminal-drop-{point}"));
-            let handle = Arc::new(handle);
-            let writer = Arc::new(writer);
-            let hook_handle = Arc::clone(&handle);
-            let hook_writer = Arc::clone(&writer);
-            handle.set_reopen_hook(Box::new(move |fired| {
-                if fired == point {
-                    hook_handle.fail_closed(&hook_writer);
-                }
-            }));
-            let cold = handle.begin_cold(Duration::from_secs(1)).unwrap();
-            drop(cold);
-            assert!(
-                handle.is_failed(),
-                "drop path at {point}: the terminal must win"
-            );
-            assert!(
-                handle.slot_is_empty(),
-                "drop path at {point}: no late slot may remain"
-            );
-            assert!(matches!(handle.view(), Err(NamespaceError::Unavailable)));
-        }
-
-        // Path 2: the drain times out and publishes the same view back.
-        {
-            let (handle, writer) = build(&format!("terminal-timeout-{point}"));
-            let handle = Arc::new(handle);
-            let writer = Arc::new(writer);
-            let hook_handle = Arc::clone(&handle);
-            let hook_writer = Arc::clone(&writer);
-            handle.set_reopen_hook(Box::new(move |fired| {
-                if fired == point {
-                    hook_handle.fail_closed(&hook_writer);
-                }
-            }));
-            let held = handle.view().unwrap();
-            let outcome = handle.begin_cold(Duration::from_millis(20));
-            // At `after_cas` the reopen CAS has already succeeded, so the
-            // reopen linearizes before the terminal and the original
-            // DrainTimeout is the honest result. Before that point the
-            // terminal wins and must be reported.
-            let expected = if point == "after_cas" {
-                matches!(outcome, Err(ColdError::DrainTimeout))
-            } else {
-                matches!(outcome, Err(ColdError::Unavailable))
-            };
-            assert!(
-                expected,
-                "timeout path at {point}: unexpected outcome (terminal must win \
-                 unless the reopen already completed)"
-            );
-            drop(held);
-            assert!(handle.is_failed());
-            assert!(
-                handle.slot_is_empty(),
-                "timeout path at {point}: no late slot may remain"
-            );
-            assert!(matches!(handle.view(), Err(NamespaceError::Unavailable)));
-        }
-    }
+    assert!(matches!(
+        handle.begin_cold(Duration::from_secs(1)),
+        Err(ColdError::Unavailable)
+    ));
+    let error = cursor
+        .get_applied_req(78)
+        .expect_err("the retired view's cursor store must be invalidated");
+    assert!(error.to_string().contains("cursor store unavailable"));
+    assert!(writer.ensure_metadata_current().is_err());
 }
 
 /// Without a terminal failure the drain timeout still restores the same view
@@ -366,4 +329,127 @@ fn drain_timeout_without_terminal_still_reopens_the_same_view() {
         "the same view must be back in the slot"
     );
     assert_eq!(handle.view().unwrap().last_inode_id(), next_id - 1);
+}
+
+/// Terminal at each reopen point, driven by a real cross-thread handover: the
+/// reopen thread parks at the fixed point, the driver thread performs the
+/// terminal there and releases it. Every combination asserts the outcome per
+/// linearization and the full final state after all threads are joined:
+/// FAILED, no late slot, cursor invalidated, view and cold rejected, writer
+/// fenced.
+#[test]
+fn terminal_at_every_reopen_point_asserts_final_state() {
+    const POINTS: [&str; 4] = ["before_store", "after_store", "before_cas", "after_cas"];
+    for point in POINTS {
+        for path in ["drop", "timeout"] {
+            let (handle, writer) = build(&format!("terminal-final-{path}-{point}"));
+            let handle = Arc::new(handle);
+            let (reached_tx, reached_rx) = mpsc::channel::<&'static str>();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            handle.set_reopen_hook(point, reached_tx, release_rx);
+            let cursor = handle.view().unwrap().store.cursor_store();
+            assert!(cursor.get_applied_req(80).is_ok());
+
+            let reopen = {
+                let handle = Arc::clone(&handle);
+                std::thread::spawn(move || -> Result<Result<(), ColdError>, String> {
+                    if path == "drop" {
+                        let cold = handle
+                            .begin_cold(Duration::from_secs(1))
+                            .map_err(|e| format!("begin_cold failed: {e}"))?;
+                        drop(cold);
+                        Ok(Ok(()))
+                    } else {
+                        let held = handle.view().unwrap();
+                        let outcome = handle.begin_cold(Duration::from_millis(20));
+                        drop(held);
+                        Ok(outcome.map(|_| ()))
+                    }
+                })
+            };
+
+            // The reopen thread parks at the fixed point (or reports that it
+            // never got there).
+            let reached = reached_rx.recv_timeout(Duration::from_secs(5));
+
+            // The driver performs the terminal from another actual thread and
+            // is joined *before* the reopen thread is released: the FAILED
+            // state is therefore fully written while the reopen thread still
+            // parks at the hook, which makes the interleaving deterministic
+            // instead of racing the release.
+            let terminal = {
+                let handle = Arc::clone(&handle);
+                let writer = writer.clone();
+                std::thread::spawn(move || handle.fail_closed(&writer))
+            };
+            terminal.join().expect("terminal thread must not panic");
+
+            // Release the parked thread; if the point was never reached, drop
+            // the release end so the hook falls through and the reopen thread
+            // can still finish.
+            match reached {
+                Ok(_) => {
+                    let _ = release_tx.send(());
+                }
+                Err(_) => drop(release_tx),
+            }
+            let outcome = match reopen.join() {
+                Ok(outcome) => outcome,
+                Err(_) => Err("reopen thread panicked".to_string()),
+            };
+            handle.clear_reopen_hook();
+
+            // Outcome per path and linearization. A drop itself never returns
+            // an error, so its outcome is always "reopen ok": the terminal's
+            // effect on a drop is asserted through the final state below. A
+            // timeout reports its result: at `after_cas` the reopen CAS
+            // already succeeded and the caller keeps the original
+            // DrainTimeout; before that point the terminal wins.
+            match (path, point) {
+                ("drop", _) => assert!(
+                    matches!(&outcome, Ok(Ok(()))),
+                    "drop at {point}: reopen must complete"
+                ),
+                ("timeout", "after_cas") => assert!(
+                    matches!(&outcome, Ok(Err(ColdError::DrainTimeout))),
+                    "timeout at {point}: original DrainTimeout must be reported, got {outcome:?}"
+                ),
+                ("timeout", _) => assert!(
+                    matches!(&outcome, Ok(Err(ColdError::Unavailable))),
+                    "timeout at {point}: terminal must be reported, got {outcome:?}"
+                ),
+                _ => unreachable!(),
+            }
+
+            // Final state, asserted after all threads are joined and the hook
+            // is cleared.
+            assert!(handle.is_failed(), "{path} at {point}: must be FAILED");
+            assert!(
+                handle.slot_is_empty(),
+                "{path} at {point}: no late slot may remain"
+            );
+            assert!(
+                matches!(handle.view(), Err(NamespaceError::Unavailable)),
+                "{path} at {point}: reads must be rejected"
+            );
+            assert!(
+                matches!(
+                    handle.begin_cold(Duration::from_millis(20)),
+                    Err(ColdError::Unavailable)
+                ),
+                "{path} at {point}: cold windows must be rejected"
+            );
+            let error = cursor
+                .get_applied_req(80)
+                .expect_err("the cursor store must end invalidated");
+            assert!(
+                error.to_string().contains("cursor store unavailable"),
+                "{path} at {point}: unexpected cursor error: {error}"
+            );
+            assert!(
+                writer.ensure_metadata_current().is_err(),
+                "{path} at {point}: the writer must stay fenced"
+            );
+        }
+    }
 }
