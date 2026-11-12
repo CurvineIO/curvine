@@ -1213,22 +1213,43 @@ impl ListObjectHandler for S3Handlers {
                 return Err(NO_SUCH_BUCKET.to_string());
             }
 
-            super::listing::list_objects(&opt, |directory| {
-                let fs = &this.fs;
-                let bucket_path = &bkt_path;
-                async move {
-                    let path = if directory.is_empty() {
-                        bucket_path.clone()
-                    } else {
-                        // Directory names come from filesystem statuses, never
-                        // from the client's prefix or continuation token.
-                        Path::from_str(format!("{}/{}", bucket_path, directory))
-                            .map_err(|e| e.to_string())?
-                    };
-                    fs.list_status(&path).await.map_err(|e| e.to_string())
-                }
-            })
-            .await
+            let dirs = BucketDirs {
+                fs: &this.fs,
+                bucket: &bkt_path,
+            };
+            super::listing::list_objects(&opt, &dirs).await
+        }
+    }
+}
+
+/// Bucket-relative directory reads for ListObjects. Directory names come from
+/// filesystem statuses, never from the client's prefix or continuation token.
+struct BucketDirs<'a> {
+    fs: &'a UnifiedFileSystem,
+    bucket: &'a Path,
+}
+
+impl BucketDirs<'_> {
+    fn path(&self, dir: &str) -> FsResult<Path> {
+        if dir.is_empty() {
+            return Ok(self.bucket.clone());
+        }
+        Ok(Path::from_str(format!("{}/{}", self.bucket, dir))?)
+    }
+}
+
+impl super::listing::DirSource for BucketDirs<'_> {
+    async fn list(&self, dir: &str) -> FsResult<Vec<curvine_model::FileStatus>> {
+        self.fs.list_status(&self.path(dir)?).await
+    }
+
+    async fn stream(&self, dir: &str) -> FsResult<curvine_fs_api::ListStream> {
+        let path = self.path(dir)?;
+        let page = curvine_model::ListOptions::with_limit(32);
+        match self.fs.list_stream(&path, page).await {
+            // Backends without paged listing report it as a plain error.
+            Err(curvine_error::FsError::Common(_)) => Ok(self.fs.list_status(&path).await?.into()),
+            other => other,
         }
     }
 }

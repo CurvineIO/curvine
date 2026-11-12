@@ -27,9 +27,55 @@ use super::handlers::is_staging_name;
 use super::s3_api::ListObjectOption;
 use crate::utils::s3_utils::file_status_to_list_object_content;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use curvine_error::{FsError, FsResult};
+use curvine_fs_api::ListStream;
 use curvine_model::FileStatus;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
+
+/// Directory reads used by the traversal; `dir` is relative to the bucket.
+pub(super) trait DirSource: Send + Sync {
+    /// Every child of `dir`.
+    fn list(&self, dir: &str) -> impl Future<Output = FsResult<Vec<FileStatus>>> + Send;
+    /// Children of `dir` as a lazily paged stream, so a reader can stop early.
+    fn stream(&self, dir: &str) -> impl Future<Output = FsResult<ListStream>> + Send;
+}
+
+/// A directory removed after its parent was read: the listing is not a
+/// snapshot, so it is skipped instead of failing the whole request.
+fn vanished(e: &FsError) -> bool {
+    matches!(e, FsError::FileNotFound(_))
+}
+
+/// Whether `dir`'s subtree holds an object. It descends depth-first and stops
+/// at the first file, so a CommonPrefix costs a few bounded pages, not a read
+/// of every object below it.
+async fn has_object<S: DirSource>(src: &S, dir: &str) -> FsResult<bool> {
+    let mut stack: Vec<(String, ListStream)> = Vec::new();
+    let mut open = Some(dir.to_string());
+    loop {
+        if let Some(dir) = open.take() {
+            match src.stream(&dir).await {
+                Ok(stream) => stack.push((dir, stream)),
+                Err(e) if vanished(&e) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let Some((dir, stream)) = stack.last_mut() else {
+            return Ok(false);
+        };
+        match stream.next().await {
+            Some(Ok(st)) if is_staging_name(&st.name) => {}
+            Some(Ok(st)) if !st.is_dir => return Ok(true),
+            Some(Ok(st)) => open = Some(format!("{dir}{}/", st.name)),
+            Some(Err(e)) if !vanished(&e) => return Err(e),
+            Some(Err(_)) | None => {
+                stack.pop();
+            }
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct ListObjectPage {
@@ -115,14 +161,10 @@ fn entries(directory: &str, statuses: Vec<FileStatus>) -> std::vec::IntoIter<(St
     entries.into_iter()
 }
 
-pub(super) async fn list_objects<F, Fut>(
+pub(super) async fn list_objects<S: DirSource>(
     opt: &ListObjectOption,
-    mut list_directory: F,
-) -> Result<ListObjectPage, String>
-where
-    F: FnMut(String) -> Fut + Send,
-    Fut: Future<Output = Result<Vec<FileStatus>, String>> + Send,
-{
+    src: &S,
+) -> Result<ListObjectPage, String> {
     if opt.max_keys.is_some_and(|max| max < 0)
         || opt.encoding_type.as_deref().is_some_and(|v| v != "url")
     {
@@ -136,7 +178,8 @@ where
     }
     let prefix = opt.prefix.as_deref().unwrap_or("");
     let delimiter = delimiter(opt);
-    let mut stack = vec![entries("", list_directory(String::new()).await?)];
+    let root = src.list("").await.map_err(|e| e.to_string())?;
+    let mut stack = vec![entries("", root)];
     let mut last_entry: Option<String> = None;
     let mut last_group: Option<String> = None;
     while let Some(frame) = stack.last_mut() {
@@ -144,6 +187,7 @@ where
             stack.pop();
             continue;
         };
+        let group = common_prefix(&key, prefix, delimiter);
         if st.is_dir {
             if !(prefix.starts_with(&key) || key.starts_with(prefix)) {
                 continue;
@@ -156,21 +200,24 @@ where
             {
                 continue;
             }
-            if let Some(group) = common_prefix(&key, prefix, delimiter) {
-                if after.as_deref().is_some_and(|m| group <= m)
-                    || last_group.as_deref() == Some(group)
-                {
-                    continue;
+            let Some(g) = group else {
+                match src.list(&key).await {
+                    Ok(statuses) => stack.push(entries(&key, statuses)),
+                    Err(e) if vanished(&e) => {}
+                    Err(e) => return Err(e.to_string()),
                 }
+                continue;
+            };
+            // Every key below shares this group, so one object proves it.
+            if after.as_deref().is_some_and(|m| g <= m)
+                || last_group.as_deref() == Some(g)
+                || !has_object(src, &key).await.map_err(|e| e.to_string())?
+            {
+                continue;
             }
-            let statuses = list_directory(key.clone()).await?;
-            stack.push(entries(&key, statuses));
+        } else if !key.starts_with(prefix) {
             continue;
         }
-        if !key.starts_with(prefix) {
-            continue;
-        }
-        let group = common_prefix(&key, prefix, delimiter);
         let entry = group.unwrap_or(&key);
         if after.as_deref().is_some_and(|m| entry <= m)
             || group.is_some_and(|g| last_group.as_deref() == Some(g))
@@ -194,4 +241,72 @@ where
         }
     }
     Ok(page)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use std::sync::Arc;
+
+    /// Directory tree whose reads count every entry handed to the traversal.
+    struct Tree(BTreeMap<String, Vec<FileStatus>>, Arc<AtomicUsize>);
+
+    impl Tree {
+        fn children(&self, dir: &str) -> FsResult<Vec<FileStatus>> {
+            self.0
+                .get(dir)
+                .cloned()
+                .ok_or_else(|| FsError::file_not_found(dir))
+        }
+    }
+
+    impl DirSource for Tree {
+        async fn list(&self, dir: &str) -> FsResult<Vec<FileStatus>> {
+            let children = self.children(dir)?;
+            self.1.fetch_add(children.len(), Relaxed);
+            Ok(children)
+        }
+
+        async fn stream(&self, dir: &str) -> FsResult<ListStream> {
+            let fetched = self.1.clone();
+            let children = futures::stream::iter(self.children(dir)?);
+            Ok(ListStream::new(children.map(move |st| {
+                fetched.fetch_add(1, Relaxed);
+                Ok(st)
+            })))
+        }
+    }
+
+    #[tokio::test]
+    async fn groups_stop_at_one_object_and_vanished_dirs_are_skipped() {
+        let status = |name: &str, dir| FileStatus::with_name(1, name.to_string(), dir);
+        let mut tree = BTreeMap::new();
+        let mut root: Vec<_> = ["a", "b", "gone"].map(|name| status(name, true)).into();
+        root.push(status("root", false));
+        tree.insert(String::new(), root);
+        for dir in ["a/", "b/"] {
+            let files = (0..100).map(|i| status(&i.to_string(), false)).collect();
+            tree.insert(dir.to_string(), files);
+        }
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let tree = Tree(tree, fetched.clone());
+        let mut opt = ListObjectOption {
+            bucket: "bucket".into(),
+            delimiter: Some("/".into()),
+            ..Default::default()
+        };
+        let page = list_objects(&opt, &tree).await.unwrap();
+        let groups: Vec<_> = page.common_prefixes.iter().map(|p| &p.prefix).collect();
+        assert_eq!(groups, ["a/", "b/"]);
+        assert_eq!(page.contents.len(), 1);
+        // The four root entries plus one probed object per group, not 200.
+        assert_eq!(fetched.load(Relaxed), 6);
+
+        // `gone/` was listed by its parent but no longer exists.
+        opt.delimiter = None;
+        let page = list_objects(&opt, &tree).await.unwrap();
+        assert_eq!(page.contents.len(), 201);
+    }
 }
