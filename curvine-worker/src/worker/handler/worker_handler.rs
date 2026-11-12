@@ -934,6 +934,7 @@ mod tests {
 
     fn worker_handler(name: &str) -> FsResult<WorkerHandler> {
         let conf = ClusterConf {
+            format_worker: true,
             worker: WorkerConf {
                 dir_reserved: "0".to_string(),
                 data_dir: vec![format!("[MEM:1KB]../testing/worker-handler-{name}")],
