@@ -354,15 +354,15 @@ impl MasterFilesystem {
 
     /// Coordinates namespace mutations with snapshot barriers. Role fencing
     /// rejects new admissions separately; admitted writes are not yet drained.
+    pub fn metadata_commit_gate(&self) -> Arc<CommitGate> {
+        self.metadata_commit_gate.clone()
+    }
+
     /// Test-only access to the shared inode lock manager so journal-replay
     /// regressions can hold a real lock while driving an interleaving.
     #[cfg(test)]
-    pub fn inode_locks_for_test(&self) -> Arc<InodeLockManager> {
+    pub(crate) fn inode_locks_for_test(&self) -> Arc<InodeLockManager> {
         self.inode_locks.clone()
-    }
-
-    pub fn metadata_commit_gate(&self) -> Arc<CommitGate> {
-        self.metadata_commit_gate.clone()
     }
 
     /// Install the fs_mode release gate. Called once at startup when transfer is

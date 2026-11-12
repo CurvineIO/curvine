@@ -1494,8 +1494,9 @@ fn delete_serializes_with_worker_location_cleanup() {
         "cleanup must be past location removal but inside its invalidation window"
     );
 
-    // Delete contends on the same inode write lock, so it cannot overtake the
-    // invalidation; after the lock is released both proceed in lock order.
+    // Delete and the cleanup's final invalidation serialize on the same
+    // inode write lock; the release order between the two writers is not
+    // guaranteed, only the mutual exclusion itself.
     let delete_fs = fs.clone();
     let (delete_tx, delete_rx) = std::sync::mpsc::channel();
     let delete = std::thread::spawn(move || delete_tx.send(delete_fs.delete("/file", false)));
