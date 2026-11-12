@@ -198,6 +198,92 @@ tag_to_release_version() {
   printf '%s\n' "${tag#v}"
 }
 
+# True when $1 is a semver numeric identifier: digits only, and no leading
+# zero unless the identifier is exactly 0.
+is_semver_numeric() {
+  case "$1" in
+    '' | *[!0-9]*) return 1 ;;
+    0) return 0 ;;
+    0*) return 1 ;;
+  esac
+  return 0
+}
+
+# Normalize a user-supplied release version or tag to the bare release
+# version. Used by the manual release-prep workflow, which accepts both
+# 0.4.0-alpha and v0.4.0-alpha.
+#
+# The whole value must be one semver version that Cargo accepts:
+#   - only [0-9A-Za-z.-], so a newline or shell metacharacter cannot reach
+#     GITHUB_OUTPUT or a generated command line;
+#   - MAJOR.MINOR.PATCH with no leading zeros;
+#   - an optional prerelease of dot-separated, non-empty identifiers, where a
+#     numeric identifier has no leading zero.
+# Written with `case` instead of `[[ =~ ]]` because dash sources this file too.
+normalize_release_version() {
+  local raw="${1:?version required}"
+  local version="${raw#v}"
+  local core pre rest major minor patch part
+
+  case "$version" in
+    '' | *[!0-9A-Za-z.-]*)
+      echo "invalid release version '$raw' (expected X.Y.Z[-pre], e.g. 0.4.0-alpha)" >&2
+      return 1
+      ;;
+  esac
+
+  case "$version" in
+    *-*)
+      core="${version%%-*}"
+      pre="${version#*-}"
+      ;;
+    *)
+      core="$version"
+      pre=""
+      ;;
+  esac
+
+  case "$core" in
+    *.*.*.*) core="" ;;
+    *.*.*) ;;
+    *) core="" ;;
+  esac
+  major="${core%%.*}"
+  rest="${core#*.}"
+  minor="${rest%%.*}"
+  patch="${rest#*.}"
+  if [ -z "$core" ] || ! is_semver_numeric "$major" ||
+    ! is_semver_numeric "$minor" || ! is_semver_numeric "$patch"; then
+    echo "invalid release version '$raw' (expected X.Y.Z[-pre] without leading zeros, e.g. 0.4.0-alpha)" >&2
+    return 1
+  fi
+
+  case "$version" in
+    *-*)
+      rest="$pre."
+      while [ -n "$rest" ]; do
+        part="${rest%%.*}"
+        rest="${rest#*.}"
+        case "$part" in
+          '')
+            echo "invalid release version '$raw' (empty prerelease identifier)" >&2
+            return 1
+            ;;
+          *[!0-9]*) ;;
+          *)
+            if ! is_semver_numeric "$part"; then
+              echo "invalid release version '$raw' (numeric prerelease identifier '$part' has a leading zero)" >&2
+              return 1
+            fi
+            ;;
+        esac
+      done
+      ;;
+  esac
+
+  printf '%s\n' "$version"
+}
+
 # Overwrite the version declared in [workspace.package]. Used by the release
 # build to drive Python SDK packaging (maturin with dynamic version reads the
 # Cargo workspace version). Local builds without BUILD_VERSION never call this.
@@ -236,6 +322,151 @@ set_workspace_version() {
   fi
   if [ "$actual" != "$version" ]; then
     echo "expected workspace version $version after update, got $actual" >&2
+    return 1
+  fi
+}
+
+# Print the package names of workspace members that inherit
+# [workspace.package].version via `version.workspace = true`.
+get_workspace_package_names() {
+  local cargo_toml="${1:?Cargo.toml path required}"
+  local root members_file member member_toml
+  root="$(cd "$(dirname "$cargo_toml")" && pwd)"
+  members_file="$(mktemp)" || return 1
+
+  awk '
+    /^[[:space:]]*members[[:space:]]*=[[:space:]]*\[/ { in_members = 1 }
+    in_members {
+      line = $0
+      sub(/#.*/, "", line)
+      while (match(line, /"[^"]+"/)) {
+        print substr(line, RSTART + 1, RLENGTH - 2)
+        line = substr(line, RSTART + RLENGTH)
+      }
+      if (line ~ /\]/) in_members = 0
+    }
+  ' "$cargo_toml" > "$members_file"
+
+  while IFS= read -r member; do
+    [ -n "$member" ] || continue
+    member_toml="$root/$member/Cargo.toml"
+    if [ ! -f "$member_toml" ]; then
+      echo "workspace member manifest not found: $member_toml" >&2
+      rm -f "$members_file"
+      return 1
+    fi
+    if ! grep -Eq '^[[:space:]]*(version\.workspace[[:space:]]*=[[:space:]]*true|version[[:space:]]*=[[:space:]]*\{[[:space:]]*workspace[[:space:]]*=[[:space:]]*true)' "$member_toml"; then
+      continue
+    fi
+    awk '
+      /^\[package\]/ { in_package = 1; next }
+      /^\[/ { in_package = 0 }
+      in_package && /^[[:space:]]*name[[:space:]]*=/ {
+        sub(/^[[:space:]]*name[[:space:]]*=[[:space:]]*"/, "")
+        sub(/".*/, "")
+        print
+        exit
+      }
+    ' "$member_toml"
+  done < "$members_file"
+  rm -f "$members_file"
+}
+
+# Move the workspace package versions recorded in Cargo.lock to new_version.
+# Only packages that inherit the workspace version are touched; dependency
+# entries and packages with an explicit version (for example curvine-tests)
+# are left alone.
+set_lockfile_workspace_version() {
+  local cargo_toml="${1:?Cargo.toml path required}"
+  local lock_file="${2:?Cargo.lock path required}"
+  local old_version="${3:?old version required}"
+  local new_version="${4:?new version required}"
+  local names_file actual
+
+  if [ ! -f "$lock_file" ]; then
+    echo "Cargo.lock not found: $lock_file" >&2
+    return 1
+  fi
+  # No early return when old == new: a previous `--skip-lock` run may have
+  # moved Cargo.toml without the lockfile, and the verification below must
+  # still report those stale entries instead of calling the lockfile current.
+
+  names_file="$(mktemp)" || return 1
+  if ! get_workspace_package_names "$cargo_toml" > "$names_file"; then
+    rm -f "$names_file"
+    return 1
+  fi
+  if [ ! -s "$names_file" ]; then
+    rm -f "$names_file"
+    echo "failed to resolve workspace packages inheriting the version from $cargo_toml" >&2
+    return 1
+  fi
+
+  if ! awk -v names_file="$names_file" -v old="$old_version" -v new="$new_version" '
+    BEGIN {
+      while ((getline name < names_file) > 0) inherit[name] = 1
+      close(names_file)
+    }
+    /^\[\[package\]\]/ { in_package = 1; package_name = ""; print; next }
+    in_package && /^[[:space:]]*name[[:space:]]*=/ {
+      package_name = $0
+      sub(/^[[:space:]]*name[[:space:]]*=[[:space:]]*"/, "", package_name)
+      sub(/".*/, "", package_name)
+      print
+      next
+    }
+    in_package && /^[[:space:]]*version[[:space:]]*=/ {
+      if (package_name in inherit) {
+        current = $0
+        sub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/, "", current)
+        sub(/".*/, "", current)
+        if (current == old) {
+          sub(/version[[:space:]]*=[[:space:]]*"[^"]*"/, "version = \"" new "\"")
+        }
+      }
+      print
+      next
+    }
+    { print }
+  ' "$lock_file" > "${lock_file}.tmp"; then
+    rm -f "$names_file" "${lock_file}.tmp"
+    echo "failed to update workspace versions in $lock_file" >&2
+    return 1
+  fi
+  mv "${lock_file}.tmp" "$lock_file"
+
+  actual="$(awk -v names_file="$names_file" -v expected="$new_version" '
+    BEGIN {
+      while ((getline name < names_file) > 0) inherit[name] = 1
+      close(names_file)
+    }
+    /^\[\[package\]\]/ { in_package = 1; package_name = ""; next }
+    in_package && /^[[:space:]]*name[[:space:]]*=/ {
+      package_name = $0
+      sub(/^[[:space:]]*name[[:space:]]*=[[:space:]]*"/, "", package_name)
+      sub(/".*/, "", package_name)
+      next
+    }
+    in_package && /^[[:space:]]*version[[:space:]]*=/ {
+      if (package_name in inherit) {
+        seen[package_name] = 1
+        current = $0
+        sub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/, "", current)
+        sub(/".*/, "", current)
+        if (current != expected) print package_name "=" current
+      }
+      next
+    }
+    END {
+      for (name in inherit) {
+        if (!(name in seen)) print name "=missing"
+      }
+    }
+  ' "$lock_file")"
+  rm -f "$names_file"
+  if [ -n "$actual" ]; then
+    echo "failed to verify workspace versions in $lock_file: $actual" >&2
+    echo "run 'cargo update --workspace' to refresh the workspace entries" >&2
     return 1
   fi
 }

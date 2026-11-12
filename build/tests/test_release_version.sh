@@ -35,6 +35,28 @@ actual="$(tag_to_release_version "v0.4.0-alpha")"
 actual="$(tag_to_release_version "v0.2.0")"
 [ "$actual" = "0.2.0" ] || fail "tag_to_release_version v0.2.0, got $actual"
 
+# --- normalize_release_version ---------------------------------------------
+actual="$(normalize_release_version "v0.4.0-alpha")"
+[ "$actual" = "0.4.0-alpha" ] || fail "normalize_release_version v0.4.0-alpha, got $actual"
+actual="$(normalize_release_version "0.4.0")"
+[ "$actual" = "0.4.0" ] || fail "normalize_release_version 0.4.0, got $actual"
+for valid in "0.0.0" "10.20.30" "1.0.0-rc.1" "1.0.0-0" "1.0.0-alpha-1" "1.0.0-x.7.z.92"; do
+  actual="$(normalize_release_version "$valid")"
+  [ "$actual" = "$valid" ] || fail "normalize_release_version $valid, got $actual"
+done
+# Shapes Cargo cannot parse (leading zeros, empty prerelease identifiers) and
+# anything that is not one plain line of [0-9A-Za-z.-]: the workflow writes
+# this value to GITHUB_OUTPUT, so a newline would inject extra outputs.
+NL='
+'
+for invalid in "0.4" "latest" "v0.4.0.1" "0.4.0-" "v" \
+  "01.2.3" "1.02.3" "1.2.03" "1.2.3-01" "0.9.0-alpha..1" "1.2.3-alpha." "1.2.3-.a" \
+  "1.2.3+build" "1.2.3 " "1.2.3;id" "0.6.1${NL}branch=x"; do
+  if ( set +e; normalize_release_version "$invalid" ) >/dev/null 2>&1; then
+    fail "expected normalize_release_version '$invalid' to fail"
+  fi
+done
+
 # --- set_workspace_version --------------------------------------------------
 cat > "$TMP_DIR/Cargo.toml" <<'EOF'
 [workspace.package]
