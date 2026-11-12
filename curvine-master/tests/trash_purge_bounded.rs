@@ -2,20 +2,20 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-
-use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT; // You may obtain a copy of the License at
-                                                                       //
-                                                                       //     http://www.apache.org/licenses/LICENSE-2.0
-                                                                       //
-                                                                       // Unless required by applicable law or agreed to in writing, software
-                                                                       // distributed under the License is distributed on an "AS IS" BASIS,
-                                                                       // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-                                                                       // See the License for the specific language governing permissions and
-                                                                       // limitations under the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use curvine_config::ClusterConf;
 use curvine_master::master::fs::{DeleteMode, MasterFilesystem, TrashPurger};
 use curvine_master::master::journal::JournalSystem;
+use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use curvine_master::Master;
 use curvine_raft::raft::RoleState;
 use curvine_runtime::common::Utils;
@@ -77,7 +77,10 @@ fn purge_batch_preserves_external_hard_link() {
     fs.delete_with_mode("/victim", true, DeleteMode::Default)
         .unwrap();
     let entry = fs.list_trash().unwrap().remove(0).path;
-    purger(&fs).purge_entry(&entry).unwrap();
+    purger(&fs)
+        .purge_entry(&entry)
+        .expect("purge must succeed")
+        .expect("an existing trashed entry must produce a purge outcome");
     let survivor = fs.file_status("/survivor").unwrap();
     assert_eq!(survivor.id, original.id);
     assert_eq!(survivor.nlink, 1);
@@ -86,10 +89,15 @@ fn purge_batch_preserves_external_hard_link() {
     assert_eq!((restored.id, restored.nlink), (original.id, 1));
 }
 
+/// A missing entry needs only a read walk: `purge_entry` collects one page
+/// under the shared namespace view, finds nothing to write, and returns. It
+/// can therefore complete while another shared view is held. Only a real
+/// purge batch needs the exclusive window, and that contract is covered by
+/// the batch tests in this file.
 #[test]
-fn missing_entry_walk_waits_for_namespace_readers() {
+fn missing_entry_read_walk_completes_under_a_shared_namespace_view() {
     let _serial = TEST_LOCK.lock().unwrap();
-    let fs = trash_fs("walk-lock", 8, 0);
+    let fs = trash_fs("walk-read-only", 8, 0);
     let fs_dir = fs.fs_dir.clone();
     let held = fs_dir.view().unwrap();
     let worker_fs = fs.clone();
@@ -98,11 +106,18 @@ fn missing_entry_walk_waits_for_namespace_readers() {
         tx.send(purger(&worker_fs).purge_entry("/.Trash/missing"))
             .unwrap();
     });
-    let early = rx.recv_timeout(Duration::from_millis(100));
+    // Bounded wait: the read walk is expected to complete, not to block.
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("missing-entry read walk must complete while a shared view is held");
     drop(held);
-    worker.join().unwrap();
-    assert!(early.is_err(), "trash walk bypassed the namespace lock");
-    assert!(rx.recv().unwrap().is_ok());
+    worker.join().expect("purger thread must not panic");
+    let outcome = outcome
+        .expect("purge_entry must not fail for a missing entry")
+        .expect("a missing entry must still report an outcome");
+    assert_eq!(outcome.batches, 0, "a missing entry has no batch to write");
+    assert_eq!(outcome.inodes, 0);
+    assert_eq!(outcome.bytes, 0);
 }
 
 #[test]
@@ -212,9 +227,12 @@ fn purge_survives_a_restart_and_replaying_a_finished_entry_is_a_no_op() {
     assert!(fs.list_trash().unwrap().is_empty());
 
     // A second cycle for the same (now missing) entry must not fail.
-    let replay = purger(&fs).purge_entry(&entry).unwrap();
-    assert_eq!(replay.unwrap().batches, 0);
-    assert_eq!(replay.unwrap().inodes, 0);
+    let replay = purger(&fs)
+        .purge_entry(&entry)
+        .expect("replaying a finished entry must not fail")
+        .expect("a missing entry must still report an outcome");
+    assert_eq!(replay.batches, 0);
+    assert_eq!(replay.inodes, 0);
 }
 
 #[test]
@@ -228,9 +246,12 @@ fn purges_a_trashed_single_file_entry() {
 
     // A trashed entry can be a plain file: the walk must emit the root itself
     // instead of descending into it.
-    let outcome = purger(&fs).purge_entry(&entry).unwrap();
-    assert_eq!(outcome.unwrap().batches, 1);
-    assert_eq!(outcome.unwrap().inodes, 1);
+    let outcome = purger(&fs)
+        .purge_entry(&entry)
+        .expect("purge must succeed")
+        .expect("an existing trashed entry must produce a purge outcome");
+    assert_eq!(outcome.batches, 1);
+    assert_eq!(outcome.inodes, 1);
     assert!(!fs.exists(&entry).unwrap());
     assert!(fs.list_trash().unwrap().is_empty());
     // (dirs, files): the surviving /data parent and the trash root, no files.
@@ -277,6 +298,9 @@ fn bounds_batches_by_path_bytes_as_well_as_inodes() {
     fs.delete_with_mode("/victim", true, DeleteMode::Default)
         .unwrap();
     let entry = fs.list_trash().unwrap().remove(0).path;
-    let outcome = purger(&fs).purge_entry(&entry).unwrap();
-    assert_eq!(outcome.unwrap().batches, 1);
+    let outcome = purger(&fs)
+        .purge_entry(&entry)
+        .expect("purge must succeed")
+        .expect("an existing trashed entry must produce a purge outcome");
+    assert_eq!(outcome.batches, 1);
 }
