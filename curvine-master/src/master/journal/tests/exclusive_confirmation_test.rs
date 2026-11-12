@@ -104,27 +104,23 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
         .expect("delete worker started");
 
     // The queued receipt arrives with its completion still held: the delete
-    // is applied to the live namespace but NOT yet confirmed.
+    // is applied to the live namespace but NOT yet confirmed. Every
+    // observation is saved as a Result/bool — nothing asserts mid-flow.
     let queued = writer
         .receiver
         .as_ref()
         .unwrap()
         .lock()
         .unwrap()
-        .recv_timeout(Duration::from_secs(5))
-        .expect("missing delete journal entry");
-    // Typed check: the fixture's only real entry must be the directory
-    // delete for /dir.
+        .recv_timeout(Duration::from_secs(5));
     let is_dir_delete = matches!(
-        &queued.entry,
-        JournalEntry::Delete(entry) if entry.path == "/dir"
+        &queued,
+        Ok(q) if matches!(
+            &q.entry,
+            JournalEntry::Delete(entry) if entry.path == "/dir"
+        )
     );
-    assert!(
-        is_dir_delete,
-        "the queued entry must be the /dir delete, got {:?}",
-        queued.entry
-    );
-    let completion = queued.completion.expect("missing commit confirmation");
+    let completion = queued.as_ref().ok().and_then(|q| q.completion.clone());
 
     // While the receipt is held: wait (bounded) for the body to finish and
     // the cold owner to be released — the view reopens and the live edge is
@@ -163,12 +159,29 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
         Err(_) => None, // Timeout: do not join a still-running worker
     };
 
-    // All assertions come after the fixture teardown (receipt dropped, done
-    // observed, worker joined when completed).
-    worker_join
-        .expect("delete worker must not panic")
-        .expect("delete worker must report a result");
+    // Collect terminal observations while the fixture is alive.
+    let holder_failed = fs.fs_dir.is_failed();
+    let view_err = fs.fs_dir.view().err();
+    let begin_err = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).err();
+    let writer_fenced = writer.ensure_metadata_current().is_err();
+    let failure_seq_after = fs.journal_writer.failure_seq();
+    let cursor_err = pre_cursor.get_applied_req(1);
 
+    // Teardown: drop the filesystem handles and consume the journal system,
+    // then remove this case's unique temp paths. remove_dir_all errors are
+    // saved, not swallowed.
+    drop(fs);
+    journal.shutdown();
+    let meta_cleanup = std::fs::remove_dir_all(&meta_dir);
+    let journal_cleanup = std::fs::remove_dir_all(&journal_dir);
+
+    // Outer assertions, after full teardown.
+    let queued = queued.expect("the delete journal entry must be queued");
+    assert!(
+        is_dir_delete,
+        "the queued entry must be the /dir delete, got {:?}",
+        queued.entry
+    );
     assert!(
         view_while_held.is_none(),
         "the view must reopen once the body completes, got {view_while_held:?}"
@@ -195,24 +208,6 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
         Err(err) => err,
     };
 
-    // Collect terminal observations while the fixture is alive.
-    let holder_failed = fs.fs_dir.is_failed();
-    let view_err = fs.fs_dir.view().err();
-    let begin_err = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).err();
-    let writer_fenced = writer.ensure_metadata_current().is_err();
-    let failure_seq_after = fs.journal_writer.failure_seq();
-    let cursor_err = pre_cursor
-        .get_applied_req(1)
-        .expect_err("the retired cursor must fail point lookups");
-
-    // Teardown: drop the filesystem handles and consume the journal system,
-    // then remove this case's unique temp paths.
-    drop(fs);
-    journal.shutdown();
-    let _ = std::fs::remove_dir_all(&meta_dir);
-    let _ = std::fs::remove_dir_all(&journal_dir);
-
-    // Outer assertions, after full teardown.
     assert!(
         holder_failed,
         "a dropped confirmation must fail the exclusive holder closed"
@@ -239,11 +234,14 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
             .contains("journal commit failed after metadata commit"),
         "the delete must surface the real commit error, got {delete_err}"
     );
+    let cursor_err = cursor_err.expect_err("the retired cursor must fail point lookups");
     assert!(
         cursor_err
             .to_string()
             .contains("cursor store unavailable during metadata restore"),
         "the retired cursor must report the restore-unavailable error, got {cursor_err}"
     );
+    meta_cleanup.expect("the meta dir must be removable");
+    journal_cleanup.expect("the journal dir must be removable");
     Ok(())
 }
