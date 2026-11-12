@@ -386,10 +386,12 @@ fn rename_reloads_inode_after_a_hard_link_is_added() {
     let rename_result = result_rx.recv_timeout(Duration::from_secs(60));
     runtime.remove(rule_id).unwrap();
     assert!(planned, "rename did not reach lock planning");
-    link_result.unwrap();
+    link_result
+        .expect("the driver-side link must have run")
+        .expect("the driver-side link must succeed");
     rename_result
         .expect("rename worker did not finish")
-        .unwrap();
+        .expect("the rename must succeed");
     fs.delete("/b/alias", false).unwrap();
     fs.delete("/c/alias", false).unwrap();
     assert_eq!(fs.file_status("/d/moved").unwrap().id, original.id);

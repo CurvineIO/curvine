@@ -597,7 +597,11 @@ fn role_change_fences_before_apply_worker_acknowledges() {
             ApplyMsg::RoleChange((StateRole::Follower, _, tx)) => tx.send(Ok(())).unwrap(),
             _ => panic!("unexpected apply message"),
         }
-        task.await.unwrap();
+        // The joined task carries role_change's own result: assert it, not
+        // just the Join handle.
+        task.await
+            .expect("role change task must not panic")
+            .expect("fenced role change must succeed after unfence");
     });
     journal.shutdown();
 }

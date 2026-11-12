@@ -107,7 +107,10 @@ fn close_file_waits_for_commit_gate() {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout)
     ));
     assert!(writing);
-    done_rx.recv().unwrap();
+    let cleanup = done_rx
+        .recv()
+        .expect("the cleanup must finish once the gate opens");
+    cleanup.expect("the lost-worker cleanup must succeed");
     let dir = fs.fs_dir.view().unwrap();
     let path = MasterFilesystem::resolve_path(&dir, "/file").unwrap();
     assert!(!path
@@ -272,7 +275,10 @@ fn block_report_waits_for_commit_gate() {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout)
     ));
     assert!(locations.iter().all(|location| location.worker_id != 300));
-    done_rx.recv().unwrap();
+    let report = done_rx
+        .recv()
+        .expect("the block report must finish once the gate opens");
+    report.expect("the lost-worker block report must succeed");
     assert!(fs
         .fs_dir
         .view()

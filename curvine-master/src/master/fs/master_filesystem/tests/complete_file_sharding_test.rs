@@ -48,10 +48,12 @@ fn delete_reloads_inode_after_a_hard_link_is_added() {
     let delete_result = result_rx.recv_timeout(Duration::from_secs(60));
     runtime.remove(rule_id).unwrap();
     assert!(planned, "delete did not reach lock planning");
-    link_result.unwrap();
+    link_result
+        .expect("the driver-side link must have run")
+        .expect("the driver-side link must succeed");
     delete_result
         .expect("delete worker did not finish")
-        .unwrap();
+        .expect("the delete must succeed");
     fs.delete("/b/alias", false).unwrap();
     assert_eq!(fs.file_status("/c/alias").unwrap().id, original.id);
     fs.restore_from_rocksdb().unwrap();
@@ -748,7 +750,10 @@ fn overwrite_waits_for_conflicting_block_location_lock() {
         .is_err());
     drop(held);
     worker.join().unwrap();
-    done_rx.recv().unwrap();
+    let inner = done_rx
+        .recv()
+        .expect("the create must finish after the location lock is released");
+    inner.expect("the create must succeed on the shared view");
 }
 
 #[test]
@@ -1387,7 +1392,10 @@ fn delete_serializes_with_a_concurrent_block_report() {
 
     drop(held);
     report.join().unwrap();
-    report_rx.recv().unwrap();
+    let report_inner = report_rx
+        .recv()
+        .expect("the block report must finish after the lock is released");
+    report_inner.expect("the block report must succeed");
     delete.join().unwrap();
     let result = delete_rx.recv().unwrap();
     assert_eq!(result.unwrap().inodes, 1);
@@ -2155,6 +2163,11 @@ fn assign_worker_waits_for_conflicting_block_location_lock() {
         .is_err());
     drop(held);
     worker.join().unwrap();
+    let located = done_rx
+        .recv()
+        .expect("assign_worker must finish after the lock is released")
+        .expect("assign_worker must succeed after the lock is released");
+    assert!(located.block.id != 0);
 }
 
 #[test]
@@ -2220,6 +2233,13 @@ fn resize_waits_for_conflicting_block_location_lock() {
         .is_err());
     drop(held);
     worker.join().unwrap();
+    let blocks = done_rx
+        .recv()
+        .expect("resize must finish after the lock is released")
+        .expect("resize must succeed after the lock is released");
+    // truncate(0) legitimately leaves the file with no located blocks; the
+    // business success itself is the contract under test.
+    assert!(blocks.block_locs.is_empty());
 }
 
 #[cfg(feature = "fault-injection")]
@@ -2366,6 +2386,14 @@ fn add_block_waits_for_conflicting_block_location_lock() {
         .is_err());
     drop(held);
     worker.join().unwrap();
+    let located = done_rx
+        .recv()
+        .expect("add_block must finish after the lock is released")
+        .expect("add_block must succeed after the lock is released");
+    assert!(
+        located.block.id != 0,
+        "add_block must return the newly allocated block"
+    );
 }
 
 #[cfg(feature = "fault-injection")]

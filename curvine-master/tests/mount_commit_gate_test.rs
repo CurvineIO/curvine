@@ -61,7 +61,10 @@ fn mount_mutations_wait_for_commit_gate() {
     worker.join().unwrap();
     assert!(matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)));
     assert!(!before.iter().any(|mount| mount.cv_path == "/mnt"));
-    done_rx.recv().unwrap();
+    done_rx
+        .recv()
+        .expect("the worker must finish once the gate opens")
+        .expect("the umount must succeed once the gate opens");
     assert!(manager
         .get_mount_table()
         .unwrap()
@@ -95,7 +98,10 @@ fn mount_mutations_wait_for_commit_gate() {
     worker.join().unwrap();
     assert!(matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)));
     assert_ne!(before.ttl_ms, 1234);
-    done_rx.recv().unwrap();
+    done_rx
+        .recv()
+        .expect("the worker must finish once the gate opens")
+        .expect("the update must succeed once the gate opens");
     assert_eq!(
         manager
             .get_mount_table()
@@ -122,7 +128,10 @@ fn mount_mutations_wait_for_commit_gate() {
     worker.join().unwrap();
     assert!(matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)));
     assert!(before.iter().any(|mount| mount.cv_path == "/mnt"));
-    done_rx.recv().unwrap();
+    done_rx
+        .recv()
+        .expect("the worker must finish once the gate opens")
+        .expect("the add must succeed once the gate opens");
     assert!(!manager
         .get_mount_table()
         .unwrap()
@@ -197,7 +206,10 @@ fn mount_publication_waits_for_namespace_lock() {
     worker.join().unwrap();
     assert!(matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)));
     assert!(snapshot.entries.is_empty());
-    done_rx.recv().unwrap();
+    done_rx
+        .recv()
+        .expect("the worker must finish once the gate opens")
+        .expect("the mount mutation must succeed once the gate opens");
     let version = table.snapshot().unwrap().version;
     {
         let fs_dir = fs.fs_dir.view().unwrap();
