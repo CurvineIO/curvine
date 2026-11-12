@@ -185,3 +185,185 @@ fn cold_guard_leaves_no_stale_strong_reference() {
         Ok(_)
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Terminal failure capability.
+//
+// `FsDirHandle::fail_closed(writer)` is the entry a failed confirmation uses
+// when it may not own the view. The reopen path is shared by a normal cold
+// drop and a drain timeout; a terminal failure may land at any point of it.
+// ---------------------------------------------------------------------------
+
+/// Terminal from OPEN: one-way FAILED, view and cold rejected, parked view
+/// retired, writer fenced, cursor invalidated, and a repeat call never revives.
+#[test]
+fn terminal_failure_from_open_retires_the_view_and_fences() {
+    let (handle, writer) = build("terminal-open");
+    let view = handle.view().unwrap();
+    assert!(
+        view.store.cursor_store_available(),
+        "fixture: the cursor store starts available"
+    );
+
+    handle.fail_closed(&writer);
+
+    assert!(handle.is_failed());
+    assert!(
+        !view.store.cursor_store_available(),
+        "the retired view's cursor store must be invalidated"
+    );
+    drop(view);
+    assert!(matches!(handle.view(), Err(NamespaceError::Unavailable)));
+    assert!(matches!(
+        handle.begin_cold(Duration::from_secs(1)),
+        Err(ColdError::Unavailable)
+    ));
+    assert!(
+        handle.slot_is_empty(),
+        "terminal must retract the parked view instead of leaving a late slot"
+    );
+    assert!(
+        writer.ensure_metadata_current().is_err(),
+        "terminal must fence the writer unconditionally"
+    );
+
+    // Idempotent: a second terminal call must not revive anything.
+    handle.fail_closed(&writer);
+    assert!(handle.is_failed());
+    assert!(handle.slot_is_empty());
+    assert!(matches!(handle.view(), Err(NamespaceError::Unavailable)));
+}
+
+/// Terminal while another cold owner is draining: the drain must retire the
+/// view it took and report the terminal state, never a new owner.
+#[test]
+fn terminal_during_drain_retires_the_taken_view() {
+    let (handle, writer) = build("terminal-drain");
+    let handle = Arc::new(handle);
+    let writer = Arc::new(writer);
+    let held = handle.view().unwrap();
+
+    let drain_handle = Arc::clone(&handle);
+    let drain =
+        std::thread::spawn(move || drain_handle.begin_cold(Duration::from_secs(5)).map(|_| ()));
+
+    // Wait until the drain is in the cold state *and* has taken the slot:
+    // the state flips before the swap, so both must be observed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !(handle.is_cold() && handle.slot_is_empty()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the drain never took the view into the cold state"
+        );
+        std::thread::yield_now();
+    }
+
+    // The confirmation fails while the drain still holds the view.
+    handle.fail_closed(&writer);
+    drop(held);
+
+    let outcome = drain.join().expect("drain thread must not panic");
+    assert!(
+        matches!(outcome, Err(ColdError::Unavailable)),
+        "a draining cold acquisition must report the terminal state, got: {outcome:?}"
+    );
+    assert!(handle.is_failed());
+    assert!(
+        handle.slot_is_empty(),
+        "no late view may be published after the terminal failure"
+    );
+    assert!(matches!(handle.view(), Err(NamespaceError::Unavailable)));
+}
+
+/// Terminal injected at each fixed point of the reopen path, for both the
+/// normal drop and the drain-timeout path. In every combination the final
+/// state is FAILED with no late slot.
+#[test]
+fn terminal_at_every_reopen_step_leaves_no_late_slot() {
+    const POINTS: [&str; 4] = ["before_store", "after_store", "before_cas", "after_cas"];
+    for point in POINTS {
+        // Path 1: normal drop publishes the taken view back.
+        {
+            let (handle, writer) = build(&format!("terminal-drop-{point}"));
+            let handle = Arc::new(handle);
+            let writer = Arc::new(writer);
+            let hook_handle = Arc::clone(&handle);
+            let hook_writer = Arc::clone(&writer);
+            handle.set_reopen_hook(Box::new(move |fired| {
+                if fired == point {
+                    hook_handle.fail_closed(&hook_writer);
+                }
+            }));
+            let cold = handle.begin_cold(Duration::from_secs(1)).unwrap();
+            drop(cold);
+            assert!(
+                handle.is_failed(),
+                "drop path at {point}: the terminal must win"
+            );
+            assert!(
+                handle.slot_is_empty(),
+                "drop path at {point}: no late slot may remain"
+            );
+            assert!(matches!(handle.view(), Err(NamespaceError::Unavailable)));
+        }
+
+        // Path 2: the drain times out and publishes the same view back.
+        {
+            let (handle, writer) = build(&format!("terminal-timeout-{point}"));
+            let handle = Arc::new(handle);
+            let writer = Arc::new(writer);
+            let hook_handle = Arc::clone(&handle);
+            let hook_writer = Arc::clone(&writer);
+            handle.set_reopen_hook(Box::new(move |fired| {
+                if fired == point {
+                    hook_handle.fail_closed(&hook_writer);
+                }
+            }));
+            let held = handle.view().unwrap();
+            let outcome = handle.begin_cold(Duration::from_millis(20));
+            // At `after_cas` the reopen CAS has already succeeded, so the
+            // reopen linearizes before the terminal and the original
+            // DrainTimeout is the honest result. Before that point the
+            // terminal wins and must be reported.
+            let expected = if point == "after_cas" {
+                matches!(outcome, Err(ColdError::DrainTimeout))
+            } else {
+                matches!(outcome, Err(ColdError::Unavailable))
+            };
+            assert!(
+                expected,
+                "timeout path at {point}: unexpected outcome (terminal must win \
+                 unless the reopen already completed)"
+            );
+            drop(held);
+            assert!(handle.is_failed());
+            assert!(
+                handle.slot_is_empty(),
+                "timeout path at {point}: no late slot may remain"
+            );
+            assert!(matches!(handle.view(), Err(NamespaceError::Unavailable)));
+        }
+    }
+}
+
+/// Without a terminal failure the drain timeout still restores the same view
+/// and reports the original DrainTimeout.
+#[test]
+fn drain_timeout_without_terminal_still_reopens_the_same_view() {
+    let (handle, _) = build("timeout-no-terminal");
+    let next_id = handle.view().unwrap().last_inode_id() + 1;
+    {
+        let held = handle.view().unwrap();
+        assert_eq!(held.last_inode_id(), next_id - 1);
+        assert!(matches!(
+            handle.begin_cold(Duration::from_millis(20)),
+            Err(ColdError::DrainTimeout)
+        ));
+    }
+    assert!(!handle.is_failed());
+    assert!(
+        !handle.slot_is_empty(),
+        "the same view must be back in the slot"
+    );
+    assert_eq!(handle.view().unwrap().last_inode_id(), next_id - 1);
+}

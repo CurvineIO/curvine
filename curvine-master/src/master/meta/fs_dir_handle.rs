@@ -34,6 +34,7 @@
 //! hot planning guards are released before `lock_many` and re-taken for the
 //! locked window; no guard is held across a journal commit wait.
 
+use crate::master::journal::JournalWriter;
 use crate::master::meta::FsDir;
 use arc_swap::{ArcSwapOption, Guard};
 use curvine_error::FsError;
@@ -122,6 +123,10 @@ impl std::error::Error for ColdError {}
 pub struct FsDirHandle {
     current: ArcSwapOption<FsDir>,
     state: AtomicU8,
+    /// Test-only interleaving hook for the reopen path. Production builds
+    /// carry no extra field, lock or state.
+    #[cfg(test)]
+    reopen_hook: std::sync::Mutex<Option<Box<dyn Fn(&'static str) + Send + Sync>>>,
 }
 
 impl FsDirHandle {
@@ -129,6 +134,28 @@ impl FsDirHandle {
         Self {
             current: ArcSwapOption::from_pointee(view),
             state: AtomicU8::new(STATE_OPEN),
+            #[cfg(test)]
+            reopen_hook: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Installs a test-only hook fired at fixed points of the reopen path.
+    #[cfg(test)]
+    pub(crate) fn set_reopen_hook(&self, hook: Box<dyn Fn(&'static str) + Send + Sync>) {
+        *self.reopen_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Test-only: whether the view slot is currently empty.
+    #[cfg(test)]
+    pub(crate) fn slot_is_empty(&self) -> bool {
+        self.current.load().is_none()
+    }
+
+    #[cfg(test)]
+    fn fire_reopen_hook(&self, point: &'static str) {
+        let hook = self.reopen_hook.lock().unwrap();
+        if let Some(hook) = hook.as_ref() {
+            hook(point);
         }
     }
 
@@ -161,6 +188,56 @@ impl FsDirHandle {
         self.state.load(std::sync::atomic::Ordering::Acquire) == STATE_COLD
     }
 
+    /// Terminal failure for a holder that may not own the view right now.
+    ///
+    /// One-way: the state becomes FAILED and never returns to OPEN/COLD. The
+    /// given writer is fenced unconditionally — not only when the slot still
+    /// holds a view — because the caller is reporting a failed confirmation.
+    /// A view still parked in the slot is retired and its cursor invalidated.
+    ///
+    /// When another cold owner or drain has already taken the view, this call
+    /// cannot reach that store: the cursor invalidation for it is completed by
+    /// that owner when it exits. From this call onwards every new `view` and
+    /// `begin_cold` is rejected.
+    pub(crate) fn fail_closed(&self, writer: &JournalWriter) {
+        self.state.store(STATE_FAILED, Ordering::Release);
+        writer.fail_metadata_restore();
+        if let Some(fs_dir) = self.current.swap(None) {
+            fs_dir.store.invalidate_cursor_store();
+        }
+    }
+
+    /// Publishes a taken view back into the slot and reopens access.
+    ///
+    /// Order matters: the slot is filled first and only then CAS COLD→OPEN, so
+    /// an OPEN state never coexists with an empty slot. If the state turned
+    /// FAILED in the meantime, the just-published slot is retracted and its
+    /// store invalidated instead of leaving a late `Some` behind.
+    ///
+    /// Returns true when access was reopened, false when a concurrent terminal
+    /// failure won the race.
+    fn publish_reopen(&self, owned: Arc<FsDir>) -> bool {
+        #[cfg(test)]
+        self.fire_reopen_hook("before_store");
+        self.current.store(Some(owned.clone()));
+        #[cfg(test)]
+        self.fire_reopen_hook("after_store");
+        #[cfg(test)]
+        self.fire_reopen_hook("before_cas");
+        let reopened = self
+            .state
+            .compare_exchange(STATE_COLD, STATE_OPEN, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        #[cfg(test)]
+        self.fire_reopen_hook("after_cas");
+        if !reopened {
+            // A terminal failure won: retract the late slot and retire it.
+            self.current.store(None);
+            owned.store.invalidate_cursor_store();
+        }
+        reopened
+    }
+
     /// Takes exclusive mutable access to the current view.
     ///
     /// Caller constraint: never wait here while holding this handle's view
@@ -188,21 +265,37 @@ impl FsDirHandle {
             return Err(ColdError::Unavailable);
         };
         loop {
+            // A terminal failure while we are still draining must not hand a
+            // view to a new owner: retire it and report the terminal state.
+            if self.is_failed() {
+                taken.store.invalidate_cursor_store();
+                return Err(ColdError::Unavailable);
+            }
             // Safety proof: the swap's wait_for_readers converts every live
             // guard's debt into a strong reference, so a strong count of one
             // means no guard and no outside `Arc` holder remains; only then is
             // `Arc::get_mut` a safe-Rust uniqueness proof.
             if Arc::strong_count(&taken) == 1 && Arc::get_mut(&mut taken).is_some() {
+                // Re-check immediately before handing ownership out: a
+                // terminal that arrived after the last observation must not be
+                // reported as a successful cold acquisition.
+                if self.is_failed() {
+                    taken.store.invalidate_cursor_store();
+                    return Err(ColdError::Unavailable);
+                }
                 return Ok(ColdFsDirGuard {
                     handle: self,
                     taken: Some(taken),
                 });
             }
             if Instant::now() >= deadline {
-                // Put the same view back and reopen access: the database is
-                // not touched and the view is not dropped.
-                self.current.store(Some(taken));
-                self.state.store(STATE_OPEN, Ordering::Release);
+                // Put the same view back and reopen access through the checked
+                // path: without a terminal failure this is the same view and
+                // the original DrainTimeout; with one, the late slot is
+                // retracted and the caller sees the terminal state.
+                if !self.publish_reopen(taken) {
+                    return Err(ColdError::Unavailable);
+                }
                 return Err(ColdError::DrainTimeout);
             }
             // ponytail: cold-only 1ms polling; add notifications if its latency matters.
@@ -256,11 +349,15 @@ impl ColdFsDirGuard<'_> {
     }
 
     fn discard_view(&mut self) {
+        // Share the terminal retirement with `FsDirHandle::fail_closed`: the
+        // taken store is invalidated, the writer fenced, the state set to
+        // FAILED and any parked slot removed so no late view survives.
+        self.handle.state.store(STATE_FAILED, Ordering::Release);
         if let Some(fs_dir) = self.taken.take() {
             fs_dir.store.invalidate_cursor_store();
             fs_dir.journal_writer.fail_metadata_restore();
         }
-        self.handle.state.store(STATE_FAILED, Ordering::Release);
+        self.handle.current.store(None);
     }
 }
 
@@ -280,11 +377,12 @@ impl std::ops::DerefMut for ColdFsDirGuard<'_> {
 
 impl Drop for ColdFsDirGuard<'_> {
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        // A guard whose handle is already terminal must never reopen access or
+        // leave a parked slot: it retires whatever it still owns.
+        if std::thread::panicking() || self.handle.is_failed() {
             self.discard_view();
         } else if let Some(taken) = self.taken.take() {
-            self.handle.current.store(Some(taken));
-            self.handle.state.store(STATE_OPEN, Ordering::Release);
+            self.handle.publish_reopen(taken);
         }
     }
 }
