@@ -267,13 +267,16 @@ fn terminal_during_drain_retires_the_taken_view() {
     };
 
     // Wait until the drain is in the cold state *and* has taken the slot:
-    // the state flips before the swap, so both must be observed.
+    // the state flips before the swap, so both must be observed. Whether the
+    // window was really reached is asserted only after the resources are
+    // settled, so a missed deadline cannot panic through live guards.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !(handle.is_cold() && handle.slot_is_empty()) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the drain never took the view into the cold state"
-        );
+    let mut drain_took_view = false;
+    while std::time::Instant::now() < deadline {
+        if handle.is_cold() && handle.slot_is_empty() {
+            drain_took_view = true;
+            break;
+        }
         std::thread::yield_now();
     }
 
@@ -288,6 +291,10 @@ fn terminal_during_drain_retires_the_taken_view() {
         .join()
         .expect("the drain thread must not panic");
     // Assertions only after the drain thread is finished and joined.
+    assert!(
+        drain_took_view,
+        "fixture: the drain must really take the view into the cold state"
+    );
     assert!(
         matches!(outcome, Err(ColdError::Unavailable)),
         "a draining cold acquisition must report the terminal state"
@@ -372,17 +379,24 @@ fn terminal_at_every_reopen_point_asserts_final_state() {
             // never got there).
             let reached = reached_rx.recv_timeout(Duration::from_secs(5));
 
-            // The driver performs the terminal from another actual thread and
-            // is joined *before* the reopen thread is released: the FAILED
-            // state is therefore fully written while the reopen thread still
-            // parks at the hook, which makes the interleaving deterministic
-            // instead of racing the release.
+            // The driver performs the terminal from another real thread. Its
+            // completion is observed through a bounded done channel; even a
+            // panicking terminal must not leave the parked thread stuck, so
+            // the release happens regardless of the terminal's fate.
+            let (terminal_done_tx, terminal_done_rx) = mpsc::channel();
             let terminal = {
                 let handle = Arc::clone(&handle);
                 let writer = writer.clone();
-                std::thread::spawn(move || handle.fail_closed(&writer))
+                std::thread::spawn(move || {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle.fail_closed(&writer)
+                    }));
+                    let _ = terminal_done_tx.send(outcome.is_ok());
+                })
             };
-            terminal.join().expect("terminal thread must not panic");
+            let terminal_ok = terminal_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or(false);
 
             // Release the parked thread; if the point was never reached, drop
             // the release end so the hook falls through and the reopen thread
@@ -393,11 +407,24 @@ fn terminal_at_every_reopen_point_asserts_final_state() {
                 }
                 Err(_) => drop(release_tx),
             }
+            // Bounded completion of the reopen thread before joining it.
             let outcome = match reopen.join() {
                 Ok(outcome) => outcome,
                 Err(_) => Err("reopen thread panicked".to_string()),
             };
+            terminal.join().expect("terminal thread must not panic");
             handle.clear_reopen_hook();
+
+            // The fixed point must actually have been reached: a scenario
+            // whose hook never fired cannot pass on its final state alone.
+            assert!(
+                matches!(reached, Ok(fired) if fired == point),
+                "{path} at {point}: the reopen path never reached the fixed point"
+            );
+            assert!(
+                terminal_ok,
+                "{path} at {point}: the terminal thread must complete cleanly"
+            );
 
             // Outcome per path and linearization. A drop itself never returns
             // an error, so its outcome is always "reopen ok": the terminal's
