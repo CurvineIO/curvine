@@ -48,7 +48,7 @@ fn map_storage_open_error(e: curvine_core_error::CommonError) -> FsError {
 
 /// How a block left the Writing state, as seen by the raw meta.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Terminal {
+enum Terminal {
     Removed,
     Quarantined,
     /// A committed generation survives (rollback or another writer's
@@ -131,6 +131,7 @@ pub struct WriteHandler {
     pub(crate) pending_abort: Option<PendingAbort>,
     /// Closed without this writer's commit (Cancel succeeded, an abort landed,
     /// or finalize was refused on a terminal block): refuse a later Complete.
+    /// Per handler object: `WorkerHandler::handle` keeps the handler after an error reply so the retry lands here.
     pub(crate) aborted: bool,
 }
 
