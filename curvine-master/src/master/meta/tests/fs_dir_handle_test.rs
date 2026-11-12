@@ -357,21 +357,26 @@ fn terminal_at_every_reopen_point_asserts_final_state() {
             let cursor = handle.view().unwrap().store.cursor_store();
             assert!(cursor.get_applied_req(80).is_ok());
 
+            let (reopen_done_tx, reopen_done_rx) =
+                mpsc::channel::<Result<Result<(), ColdError>, String>>();
             let reopen = {
                 let handle = Arc::clone(&handle);
-                std::thread::spawn(move || -> Result<Result<(), ColdError>, String> {
-                    if path == "drop" {
-                        let cold = handle
-                            .begin_cold(Duration::from_secs(1))
-                            .map_err(|e| format!("begin_cold failed: {e}"))?;
-                        drop(cold);
-                        Ok(Ok(()))
+                std::thread::spawn(move || {
+                    let outcome = if path == "drop" {
+                        match handle.begin_cold(Duration::from_secs(1)) {
+                            Ok(cold) => {
+                                drop(cold);
+                                Ok(Ok(()))
+                            }
+                            Err(e) => Err(format!("begin_cold failed: {e}")),
+                        }
                     } else {
                         let held = handle.view().unwrap();
                         let outcome = handle.begin_cold(Duration::from_millis(20));
                         drop(held);
                         Ok(outcome.map(|_| ()))
-                    }
+                    };
+                    let _ = reopen_done_tx.send(outcome);
                 })
             };
 
@@ -407,11 +412,13 @@ fn terminal_at_every_reopen_point_asserts_final_state() {
                 }
                 Err(_) => drop(release_tx),
             }
-            // Bounded completion of the reopen thread before joining it.
-            let outcome = match reopen.join() {
+            // Bounded completion observation of the reopen thread before
+            // joining it.
+            let outcome = match reopen_done_rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(outcome) => outcome,
-                Err(_) => Err("reopen thread panicked".to_string()),
+                Err(_) => Err("reopen thread did not finish in time".to_string()),
             };
+            reopen.join().expect("reopen thread must not panic");
             terminal.join().expect("terminal thread must not panic");
             handle.clear_reopen_hook();
 
