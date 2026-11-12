@@ -34,6 +34,12 @@
 //!   entry point is deliberately not in this matrix because the baseline has
 //!   no counterpart to compare against.
 //!
+//! Isolation: every cell gets its own `MasterFilesystem` on its own meta
+//! directory, which is deleted afterwards. Sharing one store across cells
+//! would let earlier cells accumulate tombstones and compaction debt, and the
+//! two builds write-amplify differently, so that debt would bias them
+//! asymmetrically.
+//!
 //! Run (release is mandatory, debug numbers are meaningless):
 //!
 //! ```text
@@ -45,7 +51,9 @@
 //! set it: both builds have to run the identical, default workload.
 
 mod background;
+mod fixtures;
 mod harness;
+mod hot;
 mod ops;
 
 use curvine_config::ClusterConf;
@@ -59,20 +67,34 @@ use std::sync::Arc;
 /// Thread counts required by the acceptance matrix.
 const THREADS: [usize; 3] = [1, 8, 32];
 
-fn new_fs() -> MasterFilesystem {
+/// Fresh filesystem on its own meta directory. Returns the directories too, so
+/// the caller can delete them once the store is closed.
+fn new_fs() -> (MasterFilesystem, Vec<String>) {
     Master::init_test_metrics();
     let mut conf = ClusterConf::format();
     conf.testing = true;
     conf.journal.enable = false;
-    conf.master.meta_dir = Utils::test_sub_dir(format!(
-        "metadata-ab-bench/meta-{}",
-        Utils::rand_str(6)
-    ));
-    conf.journal.journal_dir = Utils::test_sub_dir(format!(
-        "metadata-ab-bench/journal-{}",
-        Utils::rand_str(6)
-    ));
-    JournalSystem::fs_only_for_test(&conf).expect("failed to build the metadata filesystem")
+    let meta_dir = Utils::test_sub_dir(format!("metadata-ab-bench/meta-{}", Utils::rand_str(6)));
+    let journal_dir =
+        Utils::test_sub_dir(format!("metadata-ab-bench/journal-{}", Utils::rand_str(6)));
+    conf.master.meta_dir = meta_dir.clone();
+    conf.journal.journal_dir = journal_dir.clone();
+    let fs = JournalSystem::fs_only_for_test(&conf).expect("failed to build the metadata filesystem");
+    (fs, vec![meta_dir, journal_dir])
+}
+
+/// Runs `body` against a private filesystem, then closes the store and deletes
+/// its directories. Store setup and teardown are outside the timed region.
+fn isolated<R>(body: impl FnOnce(&Arc<MasterFilesystem>) -> R) -> R {
+    let (fs, dirs) = new_fs();
+    let fs = Arc::new(fs);
+    ops::register_worker(&fs);
+    let out = body(&fs);
+    drop(fs);
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    out
 }
 
 #[test]
@@ -82,17 +104,16 @@ fn metadata_ab_bench() {
     let ver = std::env::var("BENCH_VER").unwrap_or_else(|_| "unknown".to_string());
     println!("# metadata A/B bench ver={ver} ops_per_thread={ops} journal=disabled");
 
-    let fs = Arc::new(new_fs());
-    ops::register_worker(&fs);
-
     for case in ops::CASES {
         for layout in Layout::ALL {
             for threads in THREADS {
-                let env = Arc::new(Env::new(case.name, layout, threads, ops));
-                (case.prepare)(&fs, &env).expect("fixture preparation failed");
-                let report = harness::run(&fs, &env, case.body);
-                println!("{}", report.line(&ver, case.name, layout, threads));
-                ops::cleanup(&fs, &env);
+                let line = isolated(|fs| {
+                    let env = Arc::new(Env::new(case.name, layout, threads, ops));
+                    (case.prepare)(fs, &env).expect("fixture preparation failed");
+                    let report = harness::run(fs, &env, case.args, case.body);
+                    report.line(&ver, case.name, layout, threads)
+                });
+                println!("{line}");
             }
         }
     }
@@ -100,16 +121,18 @@ fn metadata_ab_bench() {
     // Background-load scenario: hot parent under continuous create/delete
     // while foreground threads share one deep child path.
     for threads in THREADS {
-        ops::prepare_hot_parent(&fs).expect("hot-parent fixture preparation failed");
-        let hot = background::run_hot_parent(
-            &fs,
-            threads,
-            ops,
-            background::HOT_PARENT_TARGET_OPS_PER_SEC,
-        );
-        for line in hot.lines(&ver, threads) {
+        let lines = isolated(|fs| {
+            hot::prepare_hot_parent(fs).expect("hot-parent fixture preparation failed");
+            let hot = background::run_hot_parent(
+                fs,
+                threads,
+                ops,
+                background::HOT_PARENT_TARGET_OPS_PER_SEC,
+            );
+            hot.lines(&ver, threads)
+        });
+        for line in lines {
             println!("{line}");
         }
-        ops::cleanup_hot_parent(&fs);
     }
 }

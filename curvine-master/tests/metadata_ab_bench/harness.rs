@@ -20,9 +20,12 @@
 //!
 //! Timing accuracy: one `Instant::now()` + `elapsed()` pair costs roughly
 //! 25-50 ns on x86-64, so it is below 1% of the measured operations (all of
-//! which take microseconds). No allocation, locking or printing happens
-//! inside the timed region.
+//! which take microseconds). The timed region contains one `MasterFilesystem`
+//! call and nothing else: every per-call argument, including its path strings,
+//! is built beforehand (see `ops::Case::args`). The only allocations that can
+//! still occur inside it are the ones the API itself performs.
 
+use crate::ops::Arg;
 use curvine_error::FsResult;
 use curvine_master::master::fs::MasterFilesystem;
 use std::sync::{Arc, Barrier};
@@ -184,10 +187,12 @@ pub(crate) struct ThreadResult {
 /// percentiles: mixing failure paths into the success distribution would
 /// misreport the operation being measured. The first error text is reported
 /// so a broken fixture cannot pass silently.
-pub fn run<F>(fs: &Arc<MasterFilesystem>, env: &Arc<Env>, body: F) -> Report
-where
-    F: Fn(&MasterFilesystem, &Env, usize, u64) -> FsResult<()> + Send + Sync + Copy + 'static,
-{
+pub fn run(
+    fs: &Arc<MasterFilesystem>,
+    env: &Arc<Env>,
+    args: fn(&Env, usize, u64) -> Arg,
+    body: fn(&MasterFilesystem, &mut Arg) -> FsResult<()>,
+) -> Report {
     let barrier = Arc::new(Barrier::new(env.threads + 1));
     let mut handles = Vec::with_capacity(env.threads);
     for thread in 0..env.threads {
@@ -202,12 +207,18 @@ where
                 first_err: None,
                 elapsed_ns: 0,
             };
+            // Build every per-call argument (path formatting included) before
+            // the barrier, so the timed region holds one API call only.
+            let mut prepared: Vec<Arg> = (0..env.ops)
+                .map(|seq| args(&env, thread, seq))
+                .collect();
             barrier.wait();
             let started = Instant::now();
             for seq in 0..env.ops {
-                let started = Instant::now();
-                let result = body(&fs, &env, thread, seq);
-                let ns = started.elapsed().as_nanos() as u64;
+                let arg = &mut prepared[seq as usize];
+                let t0 = Instant::now();
+                let result = body(&fs, arg);
+                let ns = t0.elapsed().as_nanos() as u64;
                 match result {
                     Ok(()) => {
                         out.ok += 1;

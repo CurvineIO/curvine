@@ -42,12 +42,35 @@ lock comparison.
 
 | File | Responsibility |
 |---|---|
-| `main.rs` | Entry test, scenario loop, output |
+| `main.rs` | Entry test, per-cell isolation, output |
 | `harness.rs` | Layout/env, main matrix runner, latency statistics |
 | `background.rs` | Hot-parent background scenario (separate thread topology) |
-| `ops.rs` | Per-operation fixtures and measured calls |
+| `ops.rs` | Case table: one `MasterFilesystem` call per case |
+| `fixtures.rs` | Fixture preparation and per-call argument builders |
+| `hot.rs` | Hot-parent scenario fixtures |
 
 Each file stays well under 500 lines and has one job.
+
+## Isolation between cells
+
+Every cell gets its own `MasterFilesystem` on its own meta directory, which is
+deleted afterwards; the worker is re-registered per cell. Sharing one store
+across cells would let earlier cells accumulate delete tombstones and
+compaction debt, and the two builds write-amplify differently, so that debt
+would bias them asymmetrically. Store setup and teardown are outside the timed
+region, so they do not enter any number.
+
+## What each layout measures
+
+* `same` — all threads work in one parent directory. Writes contend on the same
+  parent, reads share one ancestor chain.
+* `multi` — one parent per thread. No parent contention; this is the parallel
+  ceiling.
+
+For the list cases both layouts list directories of exactly `LIST_SIZE` (256)
+entries: `same` has one such directory shared by all threads, `multi` has one
+per thread. Directory size is deliberately held constant so a `same` vs `multi`
+difference comes from contention, not from a differently sized listing.
 
 ## Running
 
@@ -160,6 +183,15 @@ API that exists on both builds, so this file needs no `cfg` split.
 * **Every operation is timed**, no sampling and no per-thread truncation. One
   `Instant::now()` + `elapsed()` pair costs roughly 25-50 ns on x86-64, which
   is below 1% of the measured calls (all in the microsecond range).
+* **The timed region holds one `MasterFilesystem` call and nothing else.**
+  Every per-call argument, including path strings and the `ClientAddress`
+  `add_block` takes by value, is built before the barrier. Path formatting is a
+  heap allocation; leaving it inside the timed region would add allocator noise
+  to every sample and compress the difference between the two builds. The only
+  allocations that can still occur inside the timed region are the ones the
+  API itself performs (`CreateFileOpts::with_create` and
+  `SetAttrOptsBuilder::new` use zero-capacity strings, so they allocate
+  nothing).
 * **Percentiles** are nearest-rank over the merged raw samples of all threads,
   sorted with `sort_unstable`. Merging raw samples means a high-throughput
   thread contributes proportionally more samples, so threads are not equally
@@ -170,7 +202,23 @@ API that exists on both builds, so this file needs no `cfg` split.
   excluded from the latency distribution (mixing error paths into the success
   distribution would misreport the operation) and the first error text is
   printed, so a broken fixture cannot pass silently.
-* **Memory** per thread is `ops` `u64`s: 8 KB at the default 1000.
+* **Background target rate is an offered rate.** The background throttle never
+  pushes past `HOT_PARENT_TARGET_OPS_PER_SEC` per thread, but it cannot make a
+  saturated store keep up, so `rate_ratio` below 1 means the store could not
+  absorb the offered load - not that the load was reduced. Two builds are only
+  comparable when their achieved background rates are close; if one build
+  reports a much lower `rate_ratio`, the foreground numbers are taken under
+  lighter pressure and must not be compared as if identical.
+* **The background runs until the last foreground thread finishes.** Both sides
+  doing a fixed count would let whichever finished first leave the other
+  running without contention, and that tail would drag its p99 down -
+  differently on the two builds. Background counters therefore cover only the
+  foreground's lifetime, so its sample count is much larger than the
+  foreground's.
+* **Memory** per thread is `ops` `u64`s for the matrix cases: 8 KB at the
+  default 1000. In the background scenario the background accumulates one
+  sample per offered cycle, so its vectors are sized by the foreground's
+  duration, not by `ops`.
 * Single-round numbers carry system noise. The acceptance decision must come
   from alternating same-round A/B runs (at least two rounds) with identical
   workloads, not from one run per build.
@@ -189,8 +237,8 @@ conclusion):
 
 | Run | Log | Result |
 |---|---|---|
-| Baseline `bff4e7dc5` | `/tmp/bench-smoke5.log` | exit 0, 123 lines, all `err=0` |
-| Candidate `0b7eff494` | `/tmp/bench-smoke5-candidate.log` | exit 0, 123 lines, all `err=0` |
+| Baseline `bff4e7dc5` | `/tmp/bench-smoke6.log` | exit 0, 123 lines, all `err=0` |
+| Candidate `0b7eff494` | `/tmp/bench-smoke6-candidate.log` | exit 0, 123 lines, all `err=0` |
 
 Candidate compile log: `/tmp/bench-check-candidate.log` (exit 0).
 

@@ -17,17 +17,35 @@
 //!
 //! Kept apart from `harness.rs` so each module stays small and the main
 //! matrix runner does not grow a second, differently-shaped thread topology.
+//!
+//! Shutdown rule: the foreground does a fixed number of operations and the
+//! background keeps offering load until the last foreground thread finishes.
+//! If both sides simply ran a fixed count, whichever finished first would
+//! leave the other running without contention, and that tail would drag its
+//! p99 down - differently on the two builds. All foreground samples are
+//! therefore taken under the same background pressure.
+//!
+//! Every path is formatted before the barrier; the timed region holds one
+//! `MasterFilesystem` call only.
 
 use crate::harness::{merge_into, Layout, Report, ThreadResult};
+use crate::hot;
 use curvine_master::master::fs::MasterFilesystem;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 /// Hot-parent background scenario constants. `target_rate` is per background
-/// thread; the throttle keeps the offered load identical on both builds so a
-/// foreground tail-latency win cannot come from doing less background work.
+/// thread and is an *offered* rate: the throttle never pushes the background
+/// faster than this, but it cannot make a saturated store keep up. When the
+/// achieved rate is below target, `rate_ratio` reports it; two builds are only
+/// comparable when their achieved background rates are close.
 pub const HOT_PARENT_TARGET_OPS_PER_SEC: u64 = 20_000;
 pub const HOT_PARENT_DEPTH: usize = 4;
+
+/// Hard ceiling on background cycles, so a foreground panic cannot leave a
+/// background thread spinning forever.
+const BG_MAX_CYCLES: u64 = 100_000_000;
 
 /// Background: hot parent directory under continuous create/delete.
 /// Foreground: a shared deep child path, concurrently read and written.
@@ -49,13 +67,27 @@ pub fn run_hot_parent(
     target_rate: u64,
 ) -> HotParent {
     let barrier = Arc::new(Barrier::new(threads * 2 + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+    let fg_remaining = Arc::new(AtomicUsize::new(threads));
+    let parent = hot::hot_parent_dir();
+    let deep = hot::hot_deep_dir();
+    let probe = format!("{deep}/probe");
+
     let mut bg_handles = Vec::with_capacity(threads);
     let mut fg_handles = Vec::with_capacity(threads);
 
     for thread in 0..threads {
         let fs = fs.clone();
         let barrier = barrier.clone();
+        let stop = stop.clone();
+        let parent = parent.clone();
         bg_handles.push(std::thread::spawn(move || {
+            // Paths are recycled across cycles: create+delete on the same name
+            // is a valid cycle and keeps the offered load steady.
+            let paths: Vec<String> = (0..ops)
+                .map(|seq| format!("{parent}/{thread}-{seq}"))
+                .collect();
+            let interval_ns = 1_000_000_000u64 / target_rate.max(1);
             let mut out = ThreadResult {
                 ok: 0,
                 err: 0,
@@ -63,21 +95,21 @@ pub fn run_hot_parent(
                 first_err: None,
                 elapsed_ns: 0,
             };
-            let interval_ns = 1_000_000_000u64 / target_rate.max(1);
             barrier.wait();
             let started = Instant::now();
-            for seq in 0..ops {
+            let mut cycle = 0u64;
+            while !stop.load(Ordering::Relaxed) && cycle < BG_MAX_CYCLES {
                 // Throttle outside the timed region.
-                if seq % 64 == 0 {
-                    let expected = interval_ns.saturating_mul(seq);
+                if cycle % 64 == 0 {
+                    let expected = interval_ns.saturating_mul(cycle);
                     let actual = started.elapsed().as_nanos() as u64;
                     if expected > actual {
                         std::thread::sleep(Duration::from_nanos(expected - actual));
                     }
                 }
-                let path = format!("{}/{thread}-{seq}", crate::ops::hot_parent_dir());
+                let path = &paths[(cycle as usize) % paths.len()];
                 let t0 = Instant::now();
-                let result = crate::ops::hot_parent_cycle(fs.as_ref(), &path);
+                let result = hot::hot_parent_cycle(fs.as_ref(), path);
                 let ns = t0.elapsed().as_nanos() as u64;
                 match result {
                     Ok(()) => {
@@ -91,6 +123,7 @@ pub fn run_hot_parent(
                         }
                     }
                 }
+                cycle += 1;
             }
             out.elapsed_ns = started.elapsed().as_nanos() as u64;
             out
@@ -100,7 +133,14 @@ pub fn run_hot_parent(
     for thread in 0..threads {
         let fs = fs.clone();
         let barrier = barrier.clone();
+        let stop = stop.clone();
+        let fg_remaining = fg_remaining.clone();
+        let deep = deep.clone();
+        let probe = probe.clone();
         fg_handles.push(std::thread::spawn(move || {
+            let create_paths: Vec<String> = (0..ops)
+                .map(|seq| format!("{deep}/c{thread}-{seq}"))
+                .collect();
             let mut status = ThreadResult {
                 ok: 0,
                 err: 0,
@@ -119,7 +159,7 @@ pub fn run_hot_parent(
             let fg_started = Instant::now();
             for seq in 0..ops {
                 let t0 = Instant::now();
-                let r = crate::ops::hot_parent_status(fs.as_ref());
+                let r = hot::hot_parent_status(fs.as_ref(), &probe);
                 let ns = t0.elapsed().as_nanos() as u64;
                 match r {
                     Ok(()) => {
@@ -135,7 +175,7 @@ pub fn run_hot_parent(
                 }
 
                 let t1 = Instant::now();
-                let r = crate::ops::hot_parent_create(fs.as_ref(), thread, seq);
+                let r = hot::hot_parent_create(fs.as_ref(), &create_paths[seq as usize]);
                 let ns = t1.elapsed().as_nanos() as u64;
                 match r {
                     Ok(()) => {
@@ -153,6 +193,10 @@ pub fn run_hot_parent(
             let fg_ns = fg_started.elapsed().as_nanos() as u64;
             status.elapsed_ns = fg_ns;
             create.elapsed_ns = fg_ns;
+            // Last foreground thread out releases the background.
+            if fg_remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                stop.store(true, Ordering::Release);
+            }
             (status, create)
         }));
     }
@@ -210,10 +254,10 @@ fn finish(mut acc: ThreadResult) -> Report {
 impl HotParent {
     /// Three machine-parsable lines: background, foreground read, foreground
     /// write. `rate_ratio` is achieved/target, so a background that fell short
-    /// of its target rate is visible next to the foreground numbers.
+    /// of its offered rate is visible next to the foreground numbers.
     pub fn lines(&self, ver: &str, threads: usize) -> [String; 3] {
         let total = self.bg.ok + self.bg.err;
-        let ratio = if total == 0 {
+        let ratio = if self.target_rate == 0 {
             0.0
         } else {
             self.bg.qps() / self.target_rate as f64

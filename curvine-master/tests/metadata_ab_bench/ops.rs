@@ -1,24 +1,23 @@
-// Copyright 2025 OPPO.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-//! One case per metadata operation. Each case separates fixture preparation
-//! (untimed) from the measured call, and every measured call works on its own
-//! pre-built object so a case never times setup or cleanup.
+//! One case per metadata operation.
+//!
+//! Each case has three parts, and only the third runs inside the timed region:
+//!
+//! 1. `prepare` builds the objects the timed phase consumes.
+//! 2. `args` builds every per-call argument, including path strings. Path
+//!    formatting is a heap allocation, and leaving it inside the timed region
+//!    would add allocator noise to every sample and compress the difference
+//!    between the two builds.
+//! 3. `body` calls exactly one `MasterFilesystem` method.
+//!
+//! `CreateFileOpts::with_create` and `SetAttrOptsBuilder::new` are built inside
+//! `body` on purpose: both use zero-capacity strings, `HashMap::new` and
+//! `vec![]`, so they allocate nothing. Only path strings and `ClientAddress`
+//! (four non-empty strings) need pre-building.
 //!
 //! Only `MasterFilesystem` public API present in both `bff4e7dc5` and the
 //! candidate branch is used, so this file compiles unchanged on both.
 
+use crate::fixtures::*;
 use crate::harness::{Env, Layout};
 use curvine_error::FsResult;
 use curvine_master::master::fs::MasterFilesystem;
@@ -27,19 +26,32 @@ use curvine_model::{
     SetAttrOptsBuilder, WorkerAddress, WorkerInfo, WorkerStatus,
 };
 
-/// Children per listed directory. Fixed so both builds list the same shape.
-const LIST_SIZE: usize = 256;
+/// Children per listed directory. Fixed so both layouts list the same shape.
+pub const LIST_SIZE: usize = 256;
 /// Page size for `list_options`.
 const LIST_PAGE: usize = 64;
 /// Attribute written by the `set_attr` case; re-applying it is idempotent.
 const SET_ATTR_MODE: u32 = 0o640;
+
+/// Everything one measured call needs, built before the timed region.
+pub struct Arg {
+    /// Primary path: source, target or directory.
+    pub a: String,
+    /// Secondary path (rename/link destination), or the close client name.
+    pub b: String,
+    /// Owned address for `add_block`, which takes it by value.
+    pub client: ClientAddress,
+}
 
 pub struct Case {
     pub name: &'static str,
     /// Builds the objects the timed phase consumes. Runs outside the timed
     /// region and fails loudly: a broken fixture must not pass silently.
     pub prepare: fn(&MasterFilesystem, &Env) -> FsResult<()>,
-    pub body: fn(&MasterFilesystem, &Env, usize, u64) -> FsResult<()>,
+    /// Builds this call's arguments outside the timed region.
+    pub args: fn(&Env, usize, u64) -> Arg,
+    /// The single measured call.
+    pub body: fn(&MasterFilesystem, &mut Arg) -> FsResult<()>,
 }
 
 /// Registers one live worker with ample capacity. Needed by cases that
@@ -58,191 +70,108 @@ pub fn register_worker(fs: &MasterFilesystem) {
     fs.add_test_worker(worker);
 }
 
-fn client() -> ClientAddress {
-    ClientAddress {
-        client_name: "bench".to_string(),
-        hostname: "localhost".to_string(),
-        ip_addr: "127.0.0.1".to_string(),
-        port: 0,
-    }
-}
-
-/// Creates each distinct working directory exactly once (`Same` shares one).
-fn make_dirs(fs: &MasterFilesystem, env: &Env) -> FsResult<()> {
-    let mut seen: Vec<String> = Vec::with_capacity(env.threads());
-    for thread in 0..env.threads() {
-        let dir = env.dir(thread);
-        if seen.contains(&dir) {
-            continue;
-        }
-        fs.mkdir(&dir, true)?;
-        seen.push(dir);
-    }
-    Ok(())
-}
-
-/// One empty file per measured call.
-fn make_files(fs: &MasterFilesystem, env: &Env) -> FsResult<()> {
-    make_dirs(fs, env)?;
-    for thread in 0..env.threads() {
-        for seq in 0..env.ops() {
-            fs.create(env.path(thread, seq), false)?;
-        }
-    }
-    Ok(())
-}
-
-/// One shared read target per thread: enough for the layout matrix without
-/// turning fixture preparation into the dominant cost.
-fn make_read_targets(fs: &MasterFilesystem, env: &Env) -> FsResult<()> {
-    make_dirs(fs, env)?;
-    for thread in 0..env.threads() {
-        fs.create(env.path(thread, 0), false)?;
-    }
-    Ok(())
-}
-
-fn list_entry(env: &Env, thread: usize, i: usize) -> String {
-    match env.layout() {
-        Layout::Same => format!("{}/e{i}", env.dir(thread)),
-        Layout::Multi => format!("{}/e{thread}-{i}", env.dir(thread)),
-    }
-}
-
-fn make_list_dirs(fs: &MasterFilesystem, env: &Env) -> FsResult<()> {
-    make_dirs(fs, env)?;
-    match env.layout() {
-        Layout::Same => {
-            for i in 0..LIST_SIZE {
-                fs.create(list_entry(env, 0, i), false)?;
-            }
-        }
-        Layout::Multi => {
-            for thread in 0..env.threads() {
-                for i in 0..LIST_SIZE {
-                    fs.create(list_entry(env, thread, i), false)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn rename_dst_dir(env: &Env, thread: usize) -> String {
-    format!("{}/dst{thread}", env.root())
-}
-
-fn make_rename_cross_dirs(fs: &MasterFilesystem, env: &Env) -> FsResult<()> {
-    make_files(fs, env)?;
-    let mut seen: Vec<String> = Vec::with_capacity(env.threads());
-    for thread in 0..env.threads() {
-        let dir = rename_dst_dir(env, thread);
-        if seen.contains(&dir) {
-            continue;
-        }
-        fs.mkdir(&dir, true)?;
-        seen.push(dir);
-    }
-    Ok(())
-}
-
-fn make_block_targets(fs: &MasterFilesystem, env: &Env) -> FsResult<()> {
-    make_read_targets(fs, env)?;
-    for thread in 0..env.threads() {
-        fs.add_block(env.path(thread, 0), None, client(), vec![], vec![], 0, None)?;
-    }
-    Ok(())
-}
+// ---------------------------------------------------------------------------
+// Cases.
+// ---------------------------------------------------------------------------
 
 pub const CASES: &[Case] = &[
     Case {
         name: "create",
         prepare: make_dirs,
-        body: |fs, env, t, seq| {
-            fs.create(env.path(t, seq), false)?;
+        args: path_arg,
+        body: |fs, arg| {
+            fs.create(&arg.a, false)?;
             Ok(())
         },
     },
     Case {
         name: "mkdir",
         prepare: make_dirs,
-        body: |fs, env, t, seq| {
-            fs.mkdir(format!("{}/d{t}-{seq}", env.dir(t)), false)?;
+        args: mkdir_arg,
+        body: |fs, arg| {
+            fs.mkdir(&arg.a, false)?;
             Ok(())
         },
     },
     Case {
         name: "delete",
         prepare: make_files,
-        body: |fs, env, t, seq| {
-            fs.delete(env.path(t, seq), false)?;
+        args: path_arg,
+        body: |fs, arg| {
+            fs.delete(&arg.a, false)?;
             Ok(())
         },
     },
     Case {
         name: "rename_same",
         prepare: make_files,
-        body: |fs, env, t, seq| {
-            let dst = format!("{}/r{t}-{seq}", env.dir(t));
-            fs.rename(env.path(t, seq), dst, RenameFlags::empty())?;
+        args: rename_same_arg,
+        body: |fs, arg| {
+            fs.rename(&arg.a, &arg.b, RenameFlags::empty())?;
             Ok(())
         },
     },
     Case {
         name: "rename_cross",
         prepare: make_rename_cross_dirs,
-        body: |fs, env, t, seq| {
-            let dst = format!("{}/f{t}-{seq}", rename_dst_dir(env, t));
-            fs.rename(env.path(t, seq), dst, RenameFlags::empty())?;
+        args: rename_cross_arg,
+        body: |fs, arg| {
+            fs.rename(&arg.a, &arg.b, RenameFlags::empty())?;
             Ok(())
         },
     },
     Case {
         name: "set_attr",
         prepare: make_files,
-        body: |fs, env, t, seq| {
+        args: path_arg,
+        body: |fs, arg| {
+            // Builder allocates nothing: all fields are `None`, plus an empty
+            // HashMap and an empty Vec.
             let opts = SetAttrOptsBuilder::new().mode(SET_ATTR_MODE).build();
-            fs.set_attr(env.path(t, seq), opts)?;
+            fs.set_attr(&arg.a, opts)?;
             Ok(())
         },
     },
     Case {
         name: "link",
         prepare: make_files,
-        body: |fs, env, t, seq| {
-            let dst = format!("{}/l{t}-{seq}", env.dir(t));
-            fs.link(env.path(t, seq), dst)?;
+        args: link_arg,
+        body: |fs, arg| {
+            fs.link(&arg.a, &arg.b)?;
             Ok(())
         },
     },
     Case {
         name: "symlink",
         prepare: make_dirs,
-        body: |fs, env, t, seq| {
-            let link = format!("{}/s{t}-{seq}", env.dir(t));
-            fs.symlink("/bench-target".to_string(), link, false, 0o777)?;
+        args: symlink_arg,
+        body: |fs, arg| {
+            fs.symlink(arg.a.as_str(), arg.b.as_str(), false, 0o777)?;
             Ok(())
         },
     },
     Case {
         name: "overwrite",
         prepare: make_files,
-        body: |fs, env, t, seq| {
+        args: path_arg,
+        body: |fs, arg| {
             // `create` sets O_TRUNC, so an existing path takes the overwrite
             // branch (`FsDir::overwrite_file`) rather than the create branch.
-            fs.create(env.path(t, seq), false)?;
+            fs.create(&arg.a, false)?;
             Ok(())
         },
     },
     Case {
         name: "open",
         prepare: make_files,
-        body: |fs, env, t, seq| {
+        args: path_arg,
+        body: |fs, arg| {
             // Write-only without O_TRUNC/O_CREAT takes `FsDir::reopen_file`,
             // the real client open-for-write path. Read-only would just
             // delegate to `get_block_locations` and measure nothing new.
+            // `with_create` uses zero-capacity strings, so it allocates nothing.
             fs.open_file(
-                env.path(t, seq),
+                &arg.a,
                 CreateFileOpts::with_create(false),
                 OpenFlags::new_write_only(),
             )?;
@@ -252,24 +181,35 @@ pub const CASES: &[Case] = &[
     Case {
         name: "add_block",
         prepare: make_files,
-        body: |fs, env, t, seq| {
-            fs.add_block(env.path(t, seq), None, client(), vec![], vec![], 0, None)?;
+        args: path_arg,
+        body: |fs, arg| {
+            // `add_block` takes the address by value; it was built untimed.
+            fs.add_block(
+                &arg.a,
+                None,
+                std::mem::take(&mut arg.client),
+                vec![],
+                vec![],
+                0,
+                None,
+            )?;
             Ok(())
         },
     },
     Case {
         name: "complete_file",
         prepare: make_files,
-        body: |fs, env, t, seq| {
+        args: close_arg,
+        body: |fs, arg| {
             // Closing a freshly created empty file. Empty commit_blocks and
             // len 0 are consistent (complete_len == 0 == len), so this is the
             // real close path, not a retry shortcut.
             fs.complete_file(
-                env.path(t, seq),
+                arg.a.as_str(),
                 None,
                 0,
                 vec![],
-                "bench".to_string(),
+                arg.b.as_str(),
                 false,
                 None,
             )?;
@@ -279,40 +219,46 @@ pub const CASES: &[Case] = &[
     Case {
         name: "free",
         prepare: make_files,
-        body: |fs, env, t, seq| {
-            fs.free(env.path(t, seq), false)?;
+        args: path_arg,
+        body: |fs, arg| {
+            fs.free(&arg.a, false)?;
             Ok(())
         },
     },
     Case {
         name: "resize",
         prepare: make_files,
-        body: |fs, env, t, seq| {
-            fs.resize(env.path(t, seq), FileAllocOpts::with_truncate(0))?;
+        args: path_arg,
+        body: |fs, arg| {
+            // `with_truncate` builds a plain struct, no allocation.
+            fs.resize(&arg.a, FileAllocOpts::with_truncate(0))?;
             Ok(())
         },
     },
     Case {
         name: "file_status",
         prepare: make_read_targets,
-        body: |fs, env, t, _seq| {
-            fs.file_status(env.path(t, 0))?;
+        args: read_arg,
+        body: |fs, arg| {
+            fs.file_status(&arg.a)?;
             Ok(())
         },
     },
     Case {
         name: "exists",
         prepare: make_read_targets,
-        body: |fs, env, t, _seq| {
-            fs.exists(env.path(t, 0))?;
+        args: read_arg,
+        body: |fs, arg| {
+            fs.exists(&arg.a)?;
             Ok(())
         },
     },
     Case {
         name: "list_status",
         prepare: make_list_dirs,
-        body: |fs, env, t, _seq| {
-            let entries = fs.list_status(env.dir(t))?;
+        args: list_arg,
+        body: |fs, arg| {
+            let entries = fs.list_status(&arg.a)?;
             assert_eq!(entries.len(), LIST_SIZE, "list_status returned wrong count");
             Ok(())
         },
@@ -320,9 +266,10 @@ pub const CASES: &[Case] = &[
     Case {
         name: "list_page",
         prepare: make_list_dirs,
-        body: |fs, env, t, _seq| {
+        args: list_arg,
+        body: |fs, arg| {
             let entries = fs.list_options(
-                env.dir(t),
+                &arg.a,
                 ListOptions {
                     limit: Some(LIST_PAGE),
                     start_after: None,
@@ -335,69 +282,10 @@ pub const CASES: &[Case] = &[
     Case {
         name: "get_block_locations",
         prepare: make_block_targets,
-        body: |fs, env, t, _seq| {
-            fs.get_block_locations(env.path(t, 0))?;
+        args: read_arg,
+        body: |fs, arg| {
+            fs.get_block_locations(&arg.a)?;
             Ok(())
         },
     },
 ];
-
-/// Removes a scenario's whole tree so the next case starts from a clean
-/// namespace. Runs outside the timed region.
-pub fn cleanup(fs: &MasterFilesystem, env: &Env) {
-    let _ = fs.delete(env.root(), true);
-}
-
-// ---------------------------------------------------------------------------
-// Hot-parent background scenario fixtures.
-//
-// Shape: `/bench/hot/parent` is the contended hot parent. A deep chain under
-// it is the foreground target, so foreground ancestor read locks and
-// background parent write locks contend on the same subtree.
-// ---------------------------------------------------------------------------
-
-const HOT_ROOT: &str = "/bench/hot";
-const HOT_PROBE: &str = "probe";
-
-pub fn hot_parent_dir() -> String {
-    format!("{HOT_ROOT}/parent")
-}
-
-fn hot_deep_dir() -> String {
-    let mut path = hot_parent_dir();
-    path.push_str("/deep");
-    for depth in 0..crate::background::HOT_PARENT_DEPTH {
-        path.push_str(&format!("/d{depth}"));
-    }
-    path
-}
-
-pub fn prepare_hot_parent(fs: &MasterFilesystem) -> FsResult<()> {
-    let deep = hot_deep_dir();
-    fs.mkdir(&deep, true)?;
-    fs.create(format!("{deep}/{HOT_PROBE}"), false)?;
-    Ok(())
-}
-
-/// One background cycle on the hot parent: create then delete. Both calls are
-/// timed together as one background operation, because the background is an
-/// offered load, not a per-call measurement.
-pub fn hot_parent_cycle(fs: &MasterFilesystem, path: &str) -> FsResult<()> {
-    fs.create(path, false)?;
-    fs.delete(path, false)?;
-    Ok(())
-}
-
-pub fn hot_parent_status(fs: &MasterFilesystem) -> FsResult<()> {
-    fs.file_status(format!("{}/{HOT_PROBE}", hot_deep_dir()))?;
-    Ok(())
-}
-
-pub fn hot_parent_create(fs: &MasterFilesystem, thread: usize, seq: u64) -> FsResult<()> {
-    fs.create(format!("{}/c{thread}-{seq}", hot_deep_dir()), false)?;
-    Ok(())
-}
-
-pub fn cleanup_hot_parent(fs: &MasterFilesystem) {
-    let _ = fs.delete(HOT_ROOT, true);
-}
