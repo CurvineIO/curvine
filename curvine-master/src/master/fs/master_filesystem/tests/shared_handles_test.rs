@@ -189,19 +189,24 @@ fn topology_reads_wait_for_shared_namespace_writers() {
     let fs = test_fs("status-list-exclusive");
     fs.create("/dir/file", true).unwrap();
     let held = fs.fs_dir.view().unwrap();
-    let start = Arc::new(std::sync::Barrier::new(6));
+    // Two-phase start: all six cold workers spawn and confirm they are alive
+    // (started ack), then main runs the shared-view get_lock on the held
+    // guard, and only afterwards releases them. A plain barrier would let the
+    // workers race ahead into a cold window and make get_lock read Busy.
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let mut release_senders: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
     let (tx, rx) = std::sync::mpsc::channel();
     let mut threads = Vec::new();
-    // Six cold reads traverse mutable inode content, so a held view guard
-    // drains them until it is dropped. get_lock is a shared-view read and is
-    // asserted separately below.
     let cold_ops: [u8; 6] = [2, 3, 5, 6, 7, 8];
-    for &operation in cold_ops.iter() {
+    for (index, &operation) in cold_ops.iter().enumerate() {
         let fs = fs.clone();
-        let start = start.clone();
+        let started_tx = started_tx.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        release_senders.push(release_tx);
         let tx = tx.clone();
         threads.push(std::thread::spawn(move || {
-            start.wait();
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
             let success = match operation {
                 2 => fs.get_file_block_details("/dir/file").is_ok(),
                 3 => fs.cv_metadata_snapshot_page(None, 10).is_ok(),
@@ -214,12 +219,29 @@ fn topology_reads_wait_for_shared_namespace_writers() {
             tx.send((operation, success)).unwrap();
         }));
     }
-    // get_lock (shared view) must succeed while the reader holds the guard.
-    // get_lock (shared view) must succeed while the reader holds the guard.
-    let lock_result = fs.get_lock("/dir/file", FileLock::default());
-    if let Err(error) = &lock_result {
-        panic!("get_lock failed on shared view: {error}");
+    drop(started_tx);
+    for _ in 0..6 {
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("all cold workers started");
     }
+    // get_lock is a shared-view read: it succeeds while the view is held and
+    // before any cold read begins.
+    fs.get_lock("/dir/file", FileLock::default())
+        .expect("get_lock must succeed on the shared view");
+    // Release the cold workers; the held guard must drain them all.
+    for sender in release_senders.iter() {
+        sender.send(()).unwrap();
+    }
+    release_senders.clear();
+    let mut early = Vec::new();
+    while let Ok(result) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
+        early.push(result);
+    }
+    assert!(
+        early.is_empty(),
+        "cold reads completed while the view was held: {early:?}"
+    );
     drop(held);
     for thread in threads {
         thread.join().unwrap();

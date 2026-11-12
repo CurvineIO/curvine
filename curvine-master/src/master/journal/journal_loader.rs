@@ -2140,6 +2140,32 @@ impl JournalLoader {
 
     pub fn delete(&self, entry: DeleteEntry) -> CommonResult<()> {
         let entry_path = entry.path;
+        // A directory delete reaches outside the target chain: the store's
+        // DFS walks every subtree file and adjusts the nlink of its tree-wide
+        // hardlinks, which the directory-chain locks do not exclude. Route
+        // that case through the same cold bridge as recursive free/set_attr;
+        // a plain file keeps the ordered sharded locks.
+        let is_dir = {
+            let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+            let inp = InodePath::resolve(view.root_node(), &entry_path, &view.store)?;
+            inp.get_last_inode()
+                .map(|inode| inode.is_dir())
+                .unwrap_or(false)
+        };
+        if is_dir {
+            let mut fs_dir = self
+                .fs_dir
+                .begin_cold(DEFAULT_COLD_TIMEOUT)
+                .map_err(|e| e.to_string())?;
+            let view = fs_dir.view();
+            let inp = InodePath::resolve(view.root_node(), &entry_path, &view.store)?;
+            if inp.get_last_inode().is_none() {
+                warn!("Delete: path not found: {}", entry_path);
+                return Ok(());
+            }
+            fs_dir.view().unprotected_delete(&inp, entry.mtime)?;
+            return Ok(());
+        }
         self.with_locked_replay_view(&entry_path, true, |view, inp| {
             if inp.get_last_inode().is_none() {
                 warn!("Delete: path not found: {}", entry_path);
