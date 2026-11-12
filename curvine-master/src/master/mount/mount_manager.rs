@@ -39,8 +39,9 @@ impl MountManager {
 
     /// recovery mount points from store
     ///
-    /// A cold window or a FAILED namespace surfaces as a retryable error: the
-    /// caller decides whether to propagate it or fall back to best-effort.
+    /// A cold window surfaces as retryable `InProgress`; a FAILED namespace
+    /// surfaces as terminal `Unavailable`. The caller decides whether to
+    /// propagate the error or fall back to best-effort.
     pub fn restore(&self) -> FsResult<()> {
         let fs_dir = self.master_fs.fs_dir.view()?;
         self.mount_table.restore(&fs_dir)
@@ -201,6 +202,10 @@ impl MountManager {
 }
 
 #[cfg(test)]
+#[path = "tests/mount_restore_test.rs"]
+mod mount_restore_test;
+
+#[cfg(test)]
 mod tests {
     use super::MountManager;
     use curvine_model::{AccessMode, MountInfo, MountOptions, WriteType};
@@ -246,41 +251,5 @@ mod tests {
         let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadOnly, false);
 
         MountManager::normalize_mount_config(&mut info).unwrap();
-    }
-
-    #[test]
-    fn restore_reports_a_closed_namespace_instead_of_panicking() {
-        use crate::master::journal::JournalSystem;
-        use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
-        use crate::master::Master;
-        use curvine_config::ClusterConf;
-        use curvine_runtime::common::Utils;
-
-        Master::init_test_metrics();
-        let mut conf = ClusterConf {
-            testing: true,
-            ..Default::default()
-        };
-        conf.journal.enable = false;
-        conf.change_test_meta_dir(format!("mount-restore-cold-{}", Utils::rand_str(8)));
-        let journal = JournalSystem::fs_only_for_test(&conf).unwrap();
-        let manager = MountManager::new(journal);
-
-        // A cold window closes the shared view: recovery must surface a
-        // retryable error and the best-effort variant must log and return.
-        let cold = manager
-            .master_fs
-            .fs_dir
-            .begin_cold(DEFAULT_COLD_TIMEOUT)
-            .unwrap();
-        let err = manager.restore().unwrap_err();
-        assert!(
-            matches!(err, curvine_error::FsError::InProgress(_)),
-            "a closed namespace must surface as retryable, got {err:?}"
-        );
-        manager.restore_best_effort();
-
-        drop(cold);
-        manager.restore().unwrap();
     }
 }
