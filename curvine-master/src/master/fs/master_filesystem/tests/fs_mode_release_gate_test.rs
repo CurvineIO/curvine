@@ -269,7 +269,6 @@ fn a_deferred_free_reports_no_pending_once_released() {
     let inode_id = releasable_file(&fs, "/done.log");
     let snapshot = fs.fs_mode_snapshot(inode_id).unwrap().unwrap();
 
-    let view = fs.fs_dir.view().unwrap();
     assert!(fs
         .release_verified(inode_id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime)
         .unwrap());
@@ -293,7 +292,6 @@ fn a_verified_release_frees_exactly_the_verified_version() {
     // The gate stays installed: a verified release must not loop back into it.
     fs.set_fs_mode_releaser(Arc::new(RecordingReleaser::deferring()));
 
-    let view = fs.fs_dir.view().unwrap();
     assert!(fs
         .release_verified(inode_id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime)
         .unwrap());
@@ -314,8 +312,7 @@ fn a_verified_release_refuses_a_renamed_file() {
     fs.rename("/before.log", "/after.log", RenameFlags::empty())
         .unwrap();
 
-    let view = fs.fs_dir.view().unwrap();
-    assert!(fs
+    assert!(!fs
         .release_verified(inode_id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime)
         .unwrap());
     assert_eq!(
@@ -339,8 +336,7 @@ fn a_verified_release_refuses_a_changed_file() {
     )
     .unwrap();
 
-    let view = fs.fs_dir.view().unwrap();
-    assert!(fs
+    assert!(!fs
         .release_verified(inode_id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime)
         .unwrap());
 
@@ -350,8 +346,7 @@ fn a_verified_release_refuses_a_changed_file() {
     fs.rename("/other.log", "/changed.log", RenameFlags::empty())
         .unwrap();
 
-    let view = fs.fs_dir.view().unwrap();
-    assert!(fs
+    assert!(!fs
         .release_verified(inode_id, &snapshot.path, snapshot.gen, snapshot.ufs_mtime)
         .unwrap());
     assert_eq!(

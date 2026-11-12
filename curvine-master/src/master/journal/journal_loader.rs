@@ -23,14 +23,17 @@ use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::store::{JournalCursorStore, RocksInodeStore};
-use crate::master::meta::FsDirHandle;
-use crate::master::meta::{CommitGate, FsDir, InodeId};
+use crate::master::meta::{
+    ColdError, ColdFsDirGuard, CommitGate, FsDir, InodeId, InodeLockRequest, NamespaceGuard,
+};
+use crate::master::meta::{FsDirHandle, InodeLockManager};
+
 use crate::master::space::MetadataScanControl;
 use crate::master::{JobManager, Master, MasterMetrics, MountManager, SyncWorkerManager};
 use curvine_config::DBConf;
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, ternary, CommonResult, ErrorExt};
-use curvine_error::FsError;
+use curvine_error::{FsError, FsResult};
 use curvine_model::RenameFlags;
 use curvine_raft::conf::JournalConfExt;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData};
@@ -76,6 +79,7 @@ pub struct JournalLoader {
     client: RaftClient,
     group_size: usize,
     fs_dir: Arc<FsDirHandle>,
+    inode_locks: Arc<InodeLockManager>,
     meta_data_dir: String,
     scan_control: Arc<MetadataScanControl>,
     inode_id: Arc<InodeId>,
@@ -162,6 +166,7 @@ impl JournalLoader {
 
     pub fn new_replay_loader(
         fs_dir: Arc<FsDirHandle>,
+        inode_locks: Arc<InodeLockManager>,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
         job_manager: Arc<JobManager>,
@@ -177,6 +182,7 @@ impl JournalLoader {
         Self::build(
             rt,
             fs_dir,
+            inode_locks,
             mnt_mgr,
             conf,
             job_manager,
@@ -192,6 +198,7 @@ impl JournalLoader {
     pub(crate) fn new(
         rt: Arc<Runtime>,
         fs_dir: Arc<FsDirHandle>,
+        inode_locks: Arc<InodeLockManager>,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
         job_manager: Arc<JobManager>,
@@ -203,6 +210,7 @@ impl JournalLoader {
         Self::build(
             rt,
             fs_dir,
+            inode_locks,
             mnt_mgr,
             conf,
             job_manager,
@@ -225,6 +233,7 @@ impl JournalLoader {
     fn build(
         rt: Arc<Runtime>,
         fs_dir: Arc<FsDirHandle>,
+        inode_locks: Arc<InodeLockManager>,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
         job_manager: Arc<JobManager>,
@@ -326,6 +335,7 @@ impl JournalLoader {
             worker_manager,
             worker_notify,
             recovery,
+            inode_locks,
             is_leader: Arc::new(AtomicBool::new(false)),
             ufs_wake: Arc::new(Notify::new()),
             log_store,
@@ -1341,30 +1351,30 @@ impl JournalLoader {
     }
 
     fn deferred_ufs_records(&self) -> CommonResult<Vec<(u64, Vec<u8>)>> {
-        let fs_dir = self
+        let view = self
             .fs_dir
             .view()
             .map_err(|e| RaftError::from(e.to_string()))?;
-        fs_dir.store.ensure_available()?;
-        fs_dir.store.store().ufs_deferred_records()
+        view.store.ensure_available()?;
+        view.store.store().ufs_deferred_records()
     }
 
     fn put_deferred_ufs(&self, index: u64, payload: &[u8]) -> CommonResult<()> {
-        let fs_dir = self
+        let view = self
             .fs_dir
             .view()
             .map_err(|e| RaftError::from(e.to_string()))?;
-        fs_dir.store.ensure_available()?;
-        fs_dir.store.store().put_ufs_deferred(index, payload)
+        view.store.ensure_available()?;
+        view.store.store().put_ufs_deferred(index, payload)
     }
 
     fn delete_deferred_ufs(&self, index: u64) -> CommonResult<()> {
-        let fs_dir = self
+        let view = self
             .fs_dir
             .view()
             .map_err(|e| RaftError::from(e.to_string()))?;
-        fs_dir.store.ensure_available()?;
-        fs_dir.store.store().delete_ufs_deferred(index)
+        view.store.ensure_available()?;
+        view.store.store().delete_ufs_deferred(index)
     }
 
     /// Copy the current log entry's UFS ops into the metadata store and move
@@ -1603,33 +1613,41 @@ impl JournalLoader {
             .fs_dir
             .begin_cold(DEFAULT_COLD_TIMEOUT)
             .map_err(|e| RaftError::from(e.to_string()))?;
-        fs_dir
-            .restore(&restore_path, checkpoint_size)
-            .map_err(|e| {
-                let msg = format!(
-                    "failed to restore metadata from checkpoint {} (checkpoint_size {} bytes); \
+        if let Err(e) = fs_dir.restore(&restore_path, checkpoint_size) {
+            // FsDir::restore owns the failure semantics: a pre-replacement
+            // failure leaves the old store live (normal backfill via replay),
+            // but a post-replacement failure must fence the view too —
+            // fail_metadata_restore only fences the journal writer, so an
+            // unavailable cursor store marks the handle FAILED here.
+            if !fs_dir.store.cursor_store_available() {
+                fs_dir.fail_closed();
+            }
+            let msg = format!(
+                "failed to restore metadata from checkpoint {} (checkpoint_size {} bytes); \
                  local meta data_dir is {}: {}",
-                    restore_path,
-                    checkpoint_size,
-                    fs_dir.store.store().db.conf().data_dir,
-                    e
-                );
-                if Self::meta_dir_missing(e.as_ref()) {
-                    RaftError::storage(msg)
-                } else {
-                    RaftError::from(msg)
-                }
-            })?;
+                restore_path, checkpoint_size, self.meta_data_dir, e
+            );
+            return Err(if Self::meta_dir_missing(e.as_ref()) {
+                RaftError::storage(msg)
+            } else {
+                RaftError::from(msg)
+            });
+        }
         // The checkpoint can predate its snapshot journal entry. Persist the
         // snapshot's actual applied index before reporting a successful restore.
         // This does not make the replacement itself crash-atomic.
-        self.persist_applied(&snapshot.fsm_state.applied)
-            .map_err(|e| {
-                fs_dir.store.invalidate_cursor_store();
-                RaftError::storage(e.to_string())
-            })?;
+        if let Err(e) = self.persist_applied(&snapshot.fsm_state.applied) {
+            // The restored store's cursor row is invalid: the namespace cannot
+            // safely reopen. FsDir::restore already recorded the lifecycle
+            // failure for post-replacement paths; this cursor failure is
+            // post-replacement too.
+            fs_dir.store.invalidate_cursor_store();
+            fs_dir.fail_closed();
+            return Err(RaftError::storage(e.to_string()));
+        }
         if let Err(error) = fs_dir.store.store().db.flush(true) {
             fs_dir.store.invalidate_cursor_store();
+            fs_dir.fail_closed();
             let message = format!("failed to flush restored journal cursor: {}", error);
             self.recovery.enter_safe_mode(&message);
             return Err(RaftError::storage(message));
@@ -1653,6 +1671,132 @@ impl JournalLoader {
         );
 
         Ok(())
+    }
+
+    /// Plans the stripe lock requests for a path's ancestor chain and target.
+    /// Uses the shared InodeLockManager to serialize with RPC-side writers.
+    fn plan_replay_locks(
+        &self,
+        view: &crate::master::meta::FsDir,
+        path: &str,
+    ) -> FsResult<smallvec::SmallVec<[InodeLockRequest; 8]>> {
+        Self::plan_replay_locks_mode(view, path, false)
+    }
+
+    /// Lock plan for a replay path. Mutations that replace an existing child
+    /// edge (delete/rename/link/force symlink) also write the parent edge, so
+    /// both the target and its parent are locked Write; ancestors stay Read.
+    fn plan_replay_locks_mode(
+        view: &crate::master::meta::FsDir,
+        path: &str,
+        parent_write: bool,
+    ) -> FsResult<smallvec::SmallVec<[InodeLockRequest; 8]>> {
+        let inp = InodePath::resolve(view.root_node(), path, &view.store)?;
+        let full = inp.is_full();
+        let ids: Vec<i64> = inp.inodes.iter().map(|e| e.id()).collect();
+        let last = ids.len().saturating_sub(1);
+        // The modified parent depends on whether the target itself exists:
+        // an existing target replaces its edge in the parent (parent is the
+        // second-to-last entry); a missing target only creates a new edge in
+        // the existing parent (parent is the last entry). Root (depth 0)
+        // always takes Write — it has no ancestor lock to serialize with.
+        let parent = if full { last.saturating_sub(1) } else { last };
+        Ok(ids
+            .iter()
+            .enumerate()
+            .map(|(depth, id)| {
+                let write = depth == last || (parent_write && depth == parent);
+                if write {
+                    InodeLockRequest::write(depth, *id)
+                } else {
+                    InodeLockRequest::read(depth, *id)
+                }
+            })
+            .collect())
+    }
+
+    /// Plans locks, acquires them, then re-resolves the path under the locks
+    /// and validates that the locked ID chain matches the re-resolved chain.
+    /// Returns the resolved InodePath for unprotected mutation.
+    /// Locks a replay path with full guard coverage: plan from one view, drop
+    /// it, acquire the stripe set (guards live for the caller's scope), then
+    /// re-open the view and revalidate every locked identity. Returns the
+    /// view guard and the revalidated path; the caller keeps both alive until
+    /// the mutation and its store publication complete.
+    /// Plans the stripe set from one view, acquires the locks, re-opens the
+    /// view, revalidates every locked identity, then runs `op` with the locks
+    /// and the view guard held across the whole mutation and its store
+    /// publication. The guards never outlive this helper; the operation never
+    /// runs without them.
+    fn with_locked_replay_view<T>(
+        &self,
+        path: &str,
+        parent_write: bool,
+        op: impl FnOnce(&crate::master::meta::NamespaceGuard<'_>, InodePath) -> CommonResult<T>,
+    ) -> CommonResult<T> {
+        // Capture the scan epoch while planning: a restore between planning
+        // and locking invalidates the same-ID chain (IDs can be reused), so
+        // the epoch is re-checked under the locks alongside the identities.
+        let plan_epoch = {
+            let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+            let control = view.store.scan_control();
+            if control.is_restoring() {
+                return err_box!("replay planning rejected: snapshot restore pending");
+            }
+            let epoch = control.cancel_epoch();
+            let requests = Self::plan_replay_locks_mode(&view, path, parent_write)?;
+            (epoch, requests)
+        };
+        let (plan_epoch, requests) = plan_epoch;
+        let locks = self.inode_locks.lock_many(&requests);
+        let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+        let control = view.store.scan_control();
+        if control.is_restoring() {
+            return err_box!("replay lock validation failed: snapshot restore pending");
+        }
+        let live_epoch = control.cancel_epoch();
+        if live_epoch != plan_epoch {
+            return err_box!(
+                "replay lock validation failed for {}: epoch moved ({} -> {})",
+                path,
+                plan_epoch,
+                live_epoch
+            );
+        }
+        let inp = InodePath::resolve(view.root_node(), path, &view.store)?;
+        let ids: Vec<i64> = inp.inodes.iter().map(|e| e.id()).collect();
+        let locked: Vec<i64> = requests.iter().map(|r| r.inode_id).collect();
+        if ids != locked {
+            return err_box!(
+                "replay lock validation failed for {}: locked={:?} resolved={:?}",
+                path,
+                locked,
+                ids
+            );
+        }
+        let result = op(&view, inp);
+        drop(locks);
+        result
+    }
+
+    fn plan_replay_locks_by_inode(
+        &self,
+        view: &crate::master::meta::FsDir,
+        inode_id: i64,
+    ) -> FsResult<smallvec::SmallVec<[InodeLockRequest; 8]>> {
+        Ok(smallvec::smallvec![InodeLockRequest::write(0, inode_id)])
+    }
+
+    /// Plans stripe locks for a set of inode IDs (for CacheInvalidation entries).
+    fn plan_replay_locks_by_inodes(
+        &self,
+        view: &crate::master::meta::FsDir,
+        inodes: &[InodeView],
+    ) -> FsResult<smallvec::SmallVec<[InodeLockRequest; 8]>> {
+        Ok(inodes
+            .iter()
+            .map(|inode| InodeLockRequest::write(0, inode.id()))
+            .collect())
     }
 
     pub fn apply_entry(&self, entry: JournalEntry) -> CommonResult<()> {
@@ -1710,7 +1854,7 @@ impl JournalLoader {
         let mut fs_dir = self
             .fs_dir
             .begin_cold(DEFAULT_COLD_TIMEOUT)
-            .map_err(|e| RaftError::from(e.to_string()))?;
+            .map_err(|e| e.to_string())?;
         let res = fs_dir.purge_paths(&entry.paths, entry.mtime)?;
         debug!(
             "TrashPurge: entry={} removed inodes={} bytes={}",
@@ -1720,121 +1864,178 @@ impl JournalLoader {
     }
 
     fn cache_invalidation(&self, entry: CacheInvalidationEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
-        fs_dir.store.apply_cache_invalidations(entry.inodes)
+        let requests = {
+            let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+            self.plan_replay_locks_by_inodes(&view, &entry.inodes)?
+        };
+        let _locks = self.inode_locks.lock_many(&requests);
+        let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+        view.store.apply_cache_invalidations(entry.inodes)
     }
 
     fn mkdir(&self, entry: MkdirEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
-        let inp = InodePath::resolve(fs_dir.root_node(), entry.path, &fs_dir.store)?;
-        let name = inp.name().to_string();
-        let _ = fs_dir.add_last_inode(inp, InodeView::new_dir(name, entry.dir))?;
-        Ok(())
+        let entry_path = entry.path.clone();
+        let entry_path = entry.path.clone();
+        self.with_locked_replay_view(&entry_path, false, |view, inp| {
+            let name = inp.name().to_string();
+            let _ = view.add_last_inode(inp, InodeView::new_dir(name, entry.dir))?;
+            Ok(())
+        })
     }
 
     fn create_file(&self, entry: CreateFileEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
-        let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
-
-        if inp.is_full() {
-            warn!("create_file: file already exists: {:?}", entry);
-            return Ok(());
-        }
-        let name = inp.name().to_string();
-        let _ = fs_dir.add_last_inode(inp, InodeView::new_file(name, entry.file))?;
-        Ok(())
+        let entry_path = entry.path.clone();
+        let entry_path = entry.path.clone();
+        self.with_locked_replay_view(&entry_path, false, |view, inp| {
+            if inp.is_full() {
+                warn!("create_file: file already exists: {:?}", entry);
+                return Ok(());
+            }
+            let name = inp.name().to_string();
+            let _ = view.add_last_inode(inp, InodeView::new_file(name, entry.file))?;
+            Ok(())
+        })
     }
 
     fn reopen_file(&self, entry: ReopenFileEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
-        let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
+        let entry_path = entry.path.clone();
+        let entry_path = entry.path.clone();
+        self.with_locked_replay_view(&entry_path, false, |view, inp| {
+            let mut inode = match inp.get_last_inode() {
+                Some(v) => v,
+                None => {
+                    warn!("reopen_file: file not found: {:?}", entry);
+                    return Ok(());
+                }
+            };
+            let file = inode.as_file_mut()?;
+            let _ = mem::replace(file, entry.file);
 
-        let mut inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => {
-                warn!("reopen_file: file not found: {:?}", entry);
-                return Ok(());
-            }
-        };
-        let file = inode.as_file_mut()?;
-        let _ = mem::replace(file, entry.file);
+            view.store.apply_reopen_file(inode.as_ref())?;
 
-        fs_dir.store.apply_reopen_file(inode.as_ref())?;
-
-        Ok(())
+            Ok(())
+        })
     }
 
     fn overwrite_file(&self, entry: OverWriteFileEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
-        let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
+        let entry_path = entry.path.clone();
+        let entry_path = entry.path.clone();
+        self.with_locked_replay_view(&entry_path, false, |view, inp| {
+            let mut inode = match inp.get_last_inode() {
+                Some(v) => v,
+                None => {
+                    warn!("overwrite_file: file not found: {:?}", entry);
+                    return Ok(());
+                }
+            };
+            let file = inode.as_file_mut()?;
+            let _ = mem::replace(file, entry.file);
 
-        let mut inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => {
-                warn!("overwrite_file: file not found: {:?}", entry);
-                return Ok(());
-            }
-        };
-        let file = inode.as_file_mut()?;
-        let _ = mem::replace(file, entry.file);
+            view.store.apply_overwrite_file(inode.as_ref())?;
 
-        fs_dir.store.apply_overwrite_file(inode.as_ref())?;
-
-        Ok(())
+            Ok(())
+        })
     }
 
     fn add_block(&self, entry: AddBlockEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
+        let entry_path = entry.path.clone();
+        self.with_locked_replay_view(&entry_path, false, |view, _inp| {
+            let inode_id = entry.blocks.first().map(|v| InodeId::get_id(v.id));
 
-        let inode_id = entry.blocks.first().map(|v| InodeId::get_id(v.id));
+            let mut inode = match MasterFilesystem::resolve_file_inode(view, &entry.path, inode_id)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("add_block: file not found: {:?} {}", entry, e);
+                    return Ok(());
+                }
+            };
+            let file = inode.as_file_mut()?;
+            let _ = mem::replace(&mut file.blocks, entry.blocks);
+            view.store
+                .apply_new_block(inode.as_ref(), &entry.commit_block)?;
 
-        let mut inode = match MasterFilesystem::resolve_file_inode(&fs_dir, &entry.path, inode_id) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("add_block: file not found: {:?} {}", entry, e);
-                return Ok(());
-            }
-        };
-        let file = inode.as_file_mut()?;
-        let _ = mem::replace(&mut file.blocks, entry.blocks);
-        fs_dir
-            .store
-            .apply_new_block(inode.as_ref(), &entry.commit_block)?;
-
-        Ok(())
+            Ok(())
+        })
     }
 
     fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
-
-        let mut inode =
-            match MasterFilesystem::resolve_file_inode(&fs_dir, &entry.path, Some(entry.file.id)) {
+        let entry_path = entry.path.clone();
+        self.with_locked_replay_view(&entry_path, false, |view, _inp| {
+            let mut inode = match MasterFilesystem::resolve_file_inode(
+                view,
+                &entry.path,
+                Some(entry.file.id),
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("complete_file: file not found: {:?} {}", entry, e);
                     return Ok(());
                 }
             };
-        let file = inode.as_file_mut()?;
+            let file = inode.as_file_mut()?;
 
-        let _ = mem::replace(file, entry.file);
-        // Update block location
-        fs_dir
-            .store
-            .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
+            let _ = mem::replace(file, entry.file);
+            // Update block location
+            view.store
+                .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
 
-        Ok(())
+            Ok(())
+        })
     }
     pub fn rename(&self, entry: RenameEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
+        // Both chains must stay in the locked set and still match their
+        // planned identities (plus epoch) once the locks are held: a path
+        // replaced between planning and locking would otherwise be mutated
+        // under the old object's locks.
+        let (plan_epoch, requests) = {
+            let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+            let control = view.store.scan_control();
+            if control.is_restoring() {
+                return err_box!("rename replay rejected: snapshot restore pending");
+            }
+            let epoch = control.cancel_epoch();
+            let mut r = Self::plan_replay_locks_mode(&view, &entry.src, true)?;
+            r.extend(Self::plan_replay_locks_mode(&view, &entry.dst, true)?);
+            (epoch, r)
+        };
+        let _locks = self.inode_locks.lock_many(&requests);
+        let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+        let control = view.store.scan_control();
+        if control.is_restoring() {
+            return err_box!("rename replay rejected: snapshot restore pending");
+        }
+        if control.cancel_epoch() != plan_epoch {
+            return err_box!(
+                "rename replay validation failed: epoch moved ({} -> {})",
+                plan_epoch,
+                control.cancel_epoch()
+            );
+        }
         let entry_src = entry.src;
-        let src_inp = InodePath::resolve(fs_dir.root_node(), &entry_src, &fs_dir.store)?;
-        let dst_inp = InodePath::resolve(fs_dir.root_node(), entry.dst, &fs_dir.store)?;
+        let src_inp = InodePath::resolve(view.root_node(), &entry_src, &view.store)?;
+        let dst_inp = InodePath::resolve(view.root_node(), entry.dst, &view.store)?;
+        let src_ids: Vec<i64> = src_inp.inodes.iter().map(|e| e.id()).collect();
+        let dst_ids: Vec<i64> = dst_inp.inodes.iter().map(|e| e.id()).collect();
+        let planned: Vec<i64> = requests.iter().map(|r| r.inode_id).collect();
+        let mut planned_sorted = planned.clone();
+        planned_sorted.sort_unstable();
+        let mut live_sorted = [src_ids.clone(), dst_ids.clone()].concat();
+        live_sorted.sort_unstable();
+        live_sorted.dedup();
+        if planned_sorted != live_sorted {
+            return err_box!(
+                "rename replay validation failed: locked={:?} live={:?}+{:?}",
+                planned,
+                src_ids,
+                dst_ids
+            );
+        }
         if src_inp.get_last_inode().is_none() {
             warn!("Rename: source path not found: {}", entry_src);
             return Ok(());
         }
-        fs_dir.unprotected_rename(
+        view.unprotected_rename(
             &src_inp,
             &dst_inp,
             entry.mtime,
@@ -1853,73 +2054,159 @@ impl JournalLoader {
     }
 
     pub fn delete(&self, entry: DeleteEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
         let entry_path = entry.path;
-        let inp = InodePath::resolve(fs_dir.root_node(), &entry_path, &fs_dir.store)?;
-        if inp.get_last_inode().is_none() {
-            warn!("Delete: path not found: {}", entry_path);
-            return Ok(());
-        }
-        fs_dir.unprotected_delete(&inp, entry.mtime)?;
-        Ok(())
+        self.with_locked_replay_view(&entry_path, true, |view, inp| {
+            if inp.get_last_inode().is_none() {
+                warn!("Delete: path not found: {}", entry_path);
+                return Ok(());
+            }
+            view.unprotected_delete(&inp, entry.mtime)?;
+            Ok(())
+        })
     }
 
     pub fn free(&self, entry: FreeEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
-        let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
-        let Some(inode) = inp.get_last_inode() else {
-            warn!("Free: path not found: {:?}", entry);
+        // ponytail: recursive free touches the whole subtree without child
+        // stripe locks — replay falls back to begin_cold for correctness
+        // until c-2 adds subtree lock planning.
+        if entry.recursive {
+            let mut fs_dir = self
+                .fs_dir
+                .begin_cold(DEFAULT_COLD_TIMEOUT)
+                .map_err(|e| e.to_string())?;
+            let inp =
+                InodePath::resolve(fs_dir.view().root_node(), &entry.path, &fs_dir.view().store)?;
+            let Some(inode) = inp.get_last_inode() else {
+                warn!("Free: path not found: {:?}", entry);
+                return Ok(());
+            };
+            fs_dir
+                .view()
+                .unprotected_free(inode, entry.mtime, entry.recursive)?;
             return Ok(());
-        };
-        fs_dir.unprotected_free(inode, entry.mtime, entry.recursive)?;
-        Ok(())
+        }
+        let entry_path = entry.path.clone();
+        let entry_path = entry.path.clone();
+        self.with_locked_replay_view(&entry_path, true, |view, inp| {
+            let Some(inode) = inp.get_last_inode() else {
+                warn!("Free: path not found: {:?}", entry);
+                return Ok(());
+            };
+            view.unprotected_free(inode, entry.mtime, entry.recursive)?;
+            Ok(())
+        })
     }
 
     pub fn mount(&self, entry: MountEntry) -> CommonResult<()> {
         // Namespace first, then the mount table transaction: the same order
-        // as the online RPC path.
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
-        Ok(self.mnt_mgr.replay_mount(&fs_dir, entry.info)?)
+        // as the online RPC path. Replay shares the view + mount business lock
+        // (same protocol as the online path after S6-b).
+        let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+        Ok(self.mnt_mgr.replay_mount(&view, entry.info)?)
     }
 
     pub fn unmount(&self, entry: UnMountEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
-        Ok(self.mnt_mgr.replay_unmount(&fs_dir, entry.id)?)
+        let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+        Ok(self.mnt_mgr.replay_unmount(&view, entry.id)?)
     }
 
     pub fn set_attr(&self, entry: SetAttrEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
-        let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
-        let last_inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => {
-                warn!("SetAttr: path not found: {:?}", entry);
-                return Ok(());
-            }
-        };
+        // ponytail: recursive set_attr propagates into children without child
+        // stripe locks — replay falls back to begin_cold until c-2 adds
+        // subtree lock planning.
+        if entry.opts.recursive {
+            let mut fs_dir = self
+                .fs_dir
+                .begin_cold(DEFAULT_COLD_TIMEOUT)
+                .map_err(|e| e.to_string())?;
+            let inp =
+                InodePath::resolve(fs_dir.view().root_node(), &entry.path, &fs_dir.view().store)?;
+            let last_inode = match inp.get_last_inode() {
+                Some(v) => v,
+                None => {
+                    warn!("SetAttr: path not found: {:?}", entry);
+                    return Ok(());
+                }
+            };
+            fs_dir.view().unprotected_set_attr(last_inode, entry.opts)?;
+            return Ok(());
+        }
+        let entry_path = entry.path.clone();
+        let entry_path = entry.path.clone();
+        self.with_locked_replay_view(&entry_path, false, |view, inp| {
+            let last_inode = match inp.get_last_inode() {
+                Some(v) => v,
+                None => {
+                    warn!("SetAttr: path not found: {:?}", entry);
+                    return Ok(());
+                }
+            };
 
-        fs_dir.unprotected_set_attr(last_inode, entry.opts)?;
-        Ok(())
+            view.unprotected_set_attr(last_inode, entry.opts)?;
+            Ok(())
+        })
     }
 
     pub fn symlink(&self, entry: SymlinkEntry) -> CommonResult<()> {
         let link_path = entry.link;
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
-        let inp = InodePath::resolve(fs_dir.root_node(), &link_path, &fs_dir.store)?;
-        match fs_dir.unprotected_symlink(inp, entry.new_inode, entry.force) {
-            Ok(_) => Ok(()),
-            Err(FsError::FileAlreadyExists(_)) => {
-                warn!("Symlink: file already exists: {:?}", link_path);
-                Ok(())
+        self.with_locked_replay_view(&link_path, true, |view, inp| {
+            match view.unprotected_symlink(inp, entry.new_inode, entry.force) {
+                Ok(_) => Ok(()),
+                Err(FsError::FileAlreadyExists(_)) => {
+                    warn!("Symlink: file already exists: {:?}", link_path);
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
             }
-            Err(e) => Err(e.into()),
-        }
+        })
     }
 
     pub fn link(&self, entry: LinkEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
-        let old_path = InodePath::resolve(fs_dir.root_node(), &entry.src_path, &fs_dir.store)?;
-        let new_path = InodePath::resolve(fs_dir.root_node(), &entry.dst_path, &fs_dir.store)?;
+        // Link replaces the destination edge (and touches the source's
+        // nlink): both chains planned with parent-write, and the planning
+        // epoch + both ID chains are revalidated under the locks.
+        let (plan_epoch, requests) = {
+            let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+            let control = view.store.scan_control();
+            if control.is_restoring() {
+                return err_box!("link replay rejected: snapshot restore pending");
+            }
+            let epoch = control.cancel_epoch();
+            let mut r = Self::plan_replay_locks_mode(&view, &entry.src_path, true)?;
+            r.extend(Self::plan_replay_locks_mode(&view, &entry.dst_path, true)?);
+            (epoch, r)
+        };
+        let _locks = self.inode_locks.lock_many(&requests);
+        let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+        let control = view.store.scan_control();
+        if control.is_restoring() {
+            return err_box!("link replay rejected: snapshot restore pending");
+        }
+        if control.cancel_epoch() != plan_epoch {
+            return err_box!(
+                "link replay validation failed: epoch moved ({} -> {})",
+                plan_epoch,
+                control.cancel_epoch()
+            );
+        }
+        let old_path = InodePath::resolve(view.root_node(), &entry.src_path, &view.store)?;
+        let new_path = InodePath::resolve(view.root_node(), &entry.dst_path, &view.store)?;
+        let src_ids: Vec<i64> = old_path.inodes.iter().map(|e| e.id()).collect();
+        let dst_ids: Vec<i64> = new_path.inodes.iter().map(|e| e.id()).collect();
+        let planned: Vec<i64> = requests.iter().map(|r| r.inode_id).collect();
+        let mut planned_sorted = planned.clone();
+        planned_sorted.sort_unstable();
+        let mut live_sorted = [src_ids.clone(), dst_ids.clone()].concat();
+        live_sorted.sort_unstable();
+        live_sorted.dedup();
+        if planned_sorted != live_sorted {
+            return err_box!(
+                "link replay validation failed: locked={:?} live={:?}+{:?}",
+                planned,
+                src_ids,
+                dst_ids
+            );
+        }
 
         // Get the original inode ID
         let original_inode_id = match old_path.get_last_inode() {
@@ -1936,7 +2223,7 @@ impl JournalLoader {
             }
         }
 
-        match fs_dir.unprotected_link(new_path, original_inode_id, entry.mtime as u64) {
+        match view.unprotected_link(new_path, original_inode_id, entry.mtime as u64) {
             Ok(_) => Ok(()),
             Err(FsError::FileAlreadyExists(_)) => {
                 warn!("Link: dst_path already exists: {:?}", entry);
@@ -1947,8 +2234,13 @@ impl JournalLoader {
     }
 
     pub fn set_locks(&self, entry: SetLocksEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT)?;
-        fs_dir.store.apply_set_locks(entry.ino, &entry.locks)
+        let requests = {
+            let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+            self.plan_replay_locks_by_inode(&view, entry.ino)?
+        };
+        let _locks = self.inode_locks.lock_many(&requests);
+        let view = self.fs_dir.view().map_err(|e| e.to_string())?;
+        view.store.apply_set_locks(entry.ino, &entry.locks)
     }
 
     pub fn ufs_applied(&self, entry: UfsAppliedEntry) -> CommonResult<()> {

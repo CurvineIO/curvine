@@ -272,7 +272,11 @@ fn execute_eviction_step(
     // blocks after removal, so it contributes nothing to the byte target.
     let mut file_inode_ids: Vec<(i64, i64)> = Vec::with_capacity(inode_ids.len());
     {
-        let fs_guard = fs.fs_dir.view().unwrap();
+        let Ok(fs_guard) = fs.fs_dir.view() else {
+            // Lifecycle busy: this step contributes nothing and the victims
+            // stay in the evictor for the next round.
+            return step;
+        };
         for &inode_id in inode_ids {
             match fs_guard.store.get_inode(inode_id, None) {
                 Ok(Some(InodeView::File(f))) => {

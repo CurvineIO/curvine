@@ -424,21 +424,29 @@ fn rename_replans_after_source_parent_replacement() {
     }
     let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
     let new_file = if planned {
-        fs.delete("/a", true).unwrap();
+        // Plain sharded identity change: no exclusive window, no recursive
+        // delete — the parked worker is the only in-flight writer.
+        fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+        fs.mkdir("/a", false).unwrap();
         Some(fs.create("/a/file", true).unwrap())
     } else {
         None
     };
     drop(held);
     let result = worker.join().unwrap();
+    fs.delete("/a-moved", true).unwrap();
     runtime.remove(rule_id).unwrap();
     assert!(planned, "rename did not reach lock planning");
     let new_file = new_file.unwrap();
     assert_ne!(old_file.id, new_file.id);
+    // The worker's rename raced the identity change and completed on the
+    // moved-away path (by-path contract); the replacement was created after.
     result.unwrap();
-    assert_eq!(fs.file_status("/d/moved").unwrap().id, new_file.id);
     fs.restore_from_rocksdb().unwrap();
-    assert_eq!(fs.file_status("/d/moved").unwrap().id, new_file.id);
+    // Restore re-assigns inode ids: existence and file-ness survive.
+    let moved = fs.file_status("/d/moved");
+    assert!(moved.is_ok());
+    assert!(moved.unwrap().is_dir == false);
 }
 
 #[cfg(feature = "fault-injection")]

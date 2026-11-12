@@ -15,7 +15,7 @@
 use crate::master::fs::{MasterFilesystem, WorkerManager};
 use crate::master::journal::{JournalLoader, JournalWriter};
 use crate::master::meta::inode::ttl::TtlBucketList;
-use crate::master::meta::{FsDir, FsDirHandle};
+use crate::master::meta::{FsDir, FsDirHandle, InodeLockManager};
 use crate::master::quota::eviction::evictor::{Evictor, LFUEvictor, LRUEvictor};
 use crate::master::quota::eviction::types::EvictionPolicy;
 use crate::master::quota::eviction::EvictionConf;
@@ -55,6 +55,7 @@ struct FsInitParts {
     worker_manager: SyncWorkerManager,
     journal_writer: Arc<JournalWriter>,
     fs_dir: Arc<FsDirHandle>,
+    inode_locks: Arc<InodeLockManager>,
     fs: MasterFilesystem,
     mount_manager: Arc<MountManager>,
     quota_manager: Arc<QuotaManager>,
@@ -98,6 +99,7 @@ impl JournalSystem {
         master_monitor: MasterMonitor,
     ) -> FsResult<FsInitParts> {
         let worker_manager = SyncWorkerManager::new(WorkerManager::new(conf)?);
+        let inode_locks = Arc::new(InodeLockManager::default());
         let client = RaftClient::from_conf(rt.clone(), &conf.journal);
         let journal_writer = Arc::new(JournalWriter::new(
             conf.testing,
@@ -126,6 +128,7 @@ impl JournalSystem {
         let fs = MasterFilesystem::new(
             conf,
             fs_dir.clone(),
+            inode_locks.clone(),
             worker_manager.clone(),
             master_monitor.clone(),
         );
@@ -149,6 +152,7 @@ impl JournalSystem {
             worker_manager,
             journal_writer,
             fs_dir,
+            inode_locks,
             fs,
             mount_manager,
             quota_manager,
@@ -322,6 +326,7 @@ impl JournalSystem {
             JournalLoader::new(
                 rt.clone(),
                 parts.fs_dir.clone(),
+                parts.inode_locks.clone(),
                 parts.mount_manager.clone(),
                 &conf.journal,
                 parts.job_manager.clone(),

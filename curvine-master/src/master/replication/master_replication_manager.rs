@@ -326,12 +326,17 @@ impl MasterReplicationManager {
             };
             let generation = self.repairs.lock().blocks.get(&block_id).copied();
             // Never hold the demand mutex across filesystem reads or tracker operations.
-            let state = self
-                .fs
-                .fs_dir
-                .view()
-                .unwrap()
-                .replication_block_state(block_id);
+            let Ok(view) = self.fs.fs_dir.view() else {
+                log::warn!(
+                    "replication repair: namespace unavailable, retiring block {} attempt",
+                    block_id
+                );
+                self.repairs
+                    .lock()
+                    .retire_if_unchanged(block_id, generation, now_ms);
+                return;
+            };
+            let state = view.replication_block_state(block_id);
             if matches!(state, Ok(None))
                 || matches!(&state, Ok(Some(s)) if s.locations.len() >= s.replicas as usize)
             {
@@ -395,12 +400,12 @@ impl MasterReplicationManager {
         else {
             return Ok(());
         };
-        let state = self
-            .fs
-            .fs_dir
-            .view()
-            .unwrap()
-            .replication_block_state(item.block_id)?;
+        let Ok(view) = self.fs.fs_dir.view() else {
+            // Lifecycle busy: leave the attempt in place; the retry pass
+            // re-runs it once the namespace reopens.
+            return Ok(());
+        };
+        let state = view.replication_block_state(item.block_id)?;
         if state.is_none() || state.is_some_and(|s| s.locations.len() >= s.replicas as usize) {
             if self.remove_attempt(item.block_id, &item.attempt_id) {
                 self.release_target(item.block_id, &attempt);

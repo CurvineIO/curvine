@@ -25,8 +25,9 @@ use crate::master::meta::inode::{
 };
 use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::meta::{
-    trash, BlockLocationLockManager, CacheInvalidationResult, CommitGate, FsDir, FsDirHandle,
-    InodeLockManager, InodeLockMode, InodeLockRequest, InodeLockSet, RestoredTrashEntry,
+    trash, BlockLocationLockManager, CacheInvalidationResult, ColdError, ColdFsDirGuard,
+    CommitGate, DirNode, FileSystemStats, FsDir, FsDirHandle, InodeId, InodeLockManager,
+    InodeLockMode, InodeLockRequest, InodeLockSet, NamespaceGuard, RestoredTrashEntry,
     TrashListing, TrashScanPage,
 };
 
@@ -87,9 +88,21 @@ struct CompleteFileOptions {
     set_attr_opts: Option<SetAttrOpts>,
 }
 
+/// Sentinel for sharded write admission: `Done` carries the operation result,
+/// `Fallback` asks the caller to escalate to the single-writer exclusive path
+/// because the shared view was busy (cold window or FAILED state).
+enum ShardedOutcome<R> {
+    Done(R),
+    Fallback,
+}
+
 #[derive(Clone)]
 pub struct MasterFilesystem {
     pub fs_dir: Arc<FsDirHandle>,
+    /// Same counter/stats instances the live FsDir owns, kept for metrics
+    /// accessors that must read real values while the view is closed.
+    inode_id_counter: Arc<InodeId>,
+    fs_stats_counter: Arc<FileSystemStats>,
     pub worker_manager: SyncWorkerManager,
     pub master_monitor: MasterMonitor,
     pub conf: Arc<MasterConf>,
@@ -297,15 +310,24 @@ impl MasterFilesystem {
     pub fn new(
         conf: &ClusterConf,
         fs_dir: Arc<FsDirHandle>,
+        inode_locks: Arc<InodeLockManager>,
         worker_manager: SyncWorkerManager,
         master_monitor: MasterMonitor,
     ) -> Self {
-        let journal_writer = {
-            let dir = fs_dir.view().unwrap();
-            dir.journal_writer.clone()
+        let (journal_writer, inode_id_counter, fs_stats_counter) = {
+            let dir = fs_dir
+                .view()
+                .expect("journal_writer: fs_dir must be OPEN during construction");
+            (
+                dir.journal_writer.clone(),
+                dir.inode_id_handle(),
+                dir.fs_stats_handle(),
+            )
         };
         Self {
             fs_dir,
+            inode_id_counter,
+            fs_stats_counter,
             worker_manager,
             master_monitor,
             conf: Arc::new(conf.master.clone()),
@@ -317,7 +339,7 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
             block_location_locks: Arc::new(BlockLocationLockManager::default()),
-            inode_locks: Arc::new(InodeLockManager::default()),
+            inode_locks,
             worker_location_locks: Arc::new(
                 (0..WORKER_LOCATION_LOCK_STRIPES)
                     .map(|_| Mutex::new(()))
@@ -349,8 +371,16 @@ impl MasterFilesystem {
 
     pub fn with_js(conf: &ClusterConf, js: &JournalSystem) -> Self {
         let fs_dir = js.fs().fs_dir.clone();
+        let (inode_id_counter, fs_stats_counter) = {
+            let dir = fs_dir
+                .view()
+                .expect("with_js: fs_dir must be OPEN during construction");
+            (dir.inode_id_handle(), dir.fs_stats_handle())
+        };
         Self {
             fs_dir,
+            inode_id_counter,
+            fs_stats_counter,
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
             conf: Arc::new(conf.master.clone()),
@@ -402,6 +432,28 @@ impl MasterFilesystem {
     /// gate-closing snapshot can drain the write. The second role check rejects
     /// requests delayed at admission; it does not drain writers already admitted
     /// when a role change installs its fence.
+    /// Acquires the cold handle for a global-lock path. A competing cold
+    /// owner queues the caller: Busy retries are bounded by the same
+    /// DEFAULT_COLD_TIMEOUT budget (the drain-timeout boundary is preserved
+    /// per attempt); FAILED is terminal.
+    pub(crate) fn cold_acquire_wait(&self) -> FsResult<ColdFsDirGuard<'_>> {
+        let deadline = std::time::Instant::now() + DEFAULT_COLD_TIMEOUT;
+        loop {
+            match self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT) {
+                Ok(guard) => {
+                    return Ok(guard);
+                }
+                Err(ColdError::Busy) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ColdError::Busy.into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     pub(crate) fn run_metadata_write<R>(&self, f: impl FnOnce() -> FsResult<R>) -> FsResult<R> {
         let epoch = self.journal_writer.metadata_epoch()?;
         self.run_metadata_write_epoch(epoch, f)
@@ -412,14 +464,134 @@ impl MasterFilesystem {
         epoch: u64,
         f: impl FnOnce() -> FsResult<R>,
     ) -> FsResult<R> {
+        // Single admission: commit-gate slot, epoch check, commit scope, then
+        // the closure runs exactly once. A closed view (cold window) surfaces
+        // as view()/cold errors from the closure itself — there is no
+        // probe/retry layer here; the typed exclusive protocol lives in
+        // run_metadata_write_with_fallback.
         let commit_guard = self.metadata_commit_gate.enter();
         self.journal_writer.ensure_metadata_epoch(epoch)?;
-        let result = self.run_admitted_metadata_write(f);
+        let scope = self.journal_writer.begin_commit_scope();
+        let result = f();
+        let commit = scope.wait();
         drop(commit_guard);
-        if result.is_ok() {
-            self.maybe_create_periodic_snapshot(epoch);
+        let result = result?;
+        commit?;
+        self.maybe_create_periodic_snapshot(epoch);
+        Ok(result)
+    }
+
+    /// Metadata write with an explicit global-lock fallback body, following
+    /// the agreed type protocol: `hot` runs once under normal admission and
+    /// returns `ShardedOutcome::Fallback` at its side-effect-free global-lock
+    /// planning point; the original epoch is captured up front, the normal
+    /// slot/view/locks are fully released, and `cold_body` then runs exactly
+    /// once against the exclusive owner's `&mut FsDir` (gate closed, cold
+    /// across body + scope.wait, original epoch re-verified with the original
+    /// ensure_metadata_epoch error, failure_seq honored, snapshot after gate
+    /// release).
+    pub(crate) fn run_metadata_write_with_fallback<R>(
+        &self,
+        hot: impl FnOnce() -> FsResult<ShardedOutcome<R>>,
+        cold_body: impl FnOnce(&mut FsDir) -> FsResult<R>,
+    ) -> FsResult<R> {
+        let epoch = self.journal_writer.metadata_epoch()?;
+        // Normal admission: hot runs once; a genuine error is a genuine error.
+        let commit_guard = self.metadata_commit_gate.enter();
+        self.journal_writer.ensure_metadata_epoch(epoch)?;
+        let outcome = {
+            let scope = self.journal_writer.begin_commit_scope();
+            let outcome = hot();
+            scope.wait()?;
+            outcome?
+        };
+        drop(commit_guard);
+        match outcome {
+            ShardedOutcome::Done(value) => {
+                self.maybe_create_periodic_snapshot(epoch);
+                Ok(value)
+            }
+            ShardedOutcome::Fallback => {
+                // Normal slot, view and object locks are all released here.
+                self.run_metadata_write_exclusive(epoch, cold_body)
+            }
         }
-        result
+    }
+
+    /// The single exclusive path: closes the commit gate, holds the cold
+    /// handle across the whole operation, and fails closed when publication
+    /// or the commit wait fails. `f` must be untouched (None means the normal
+    /// path already consumed it successfully).
+    fn run_metadata_write_exclusive<R>(
+        &self,
+        epoch: u64,
+        body: impl FnOnce(&mut FsDir) -> FsResult<R>,
+    ) -> FsResult<R> {
+        loop {
+            if let Some(_gate) = self.metadata_commit_gate.close_and_enter_if_open() {
+                let scope = self.journal_writer.begin_commit_scope();
+                let failure_seq_before = self.journal_writer.failure_seq();
+                // Cold ownership spans f and scope.wait: the view borrow ends
+                // before the journal wait so the applier is never blocked on
+                // the cold handle during publication.
+                let mut cold = match self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT) {
+                    Ok(guard) => guard,
+                    Err(ColdError::Busy) => {
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                // Re-verify the request's original epoch once the exclusive
+                // window is secured: a role fence between normal admission and
+                // this point must reject the operation with its own epoch.
+                if let Err(e) = self.journal_writer.ensure_metadata_epoch(epoch) {
+                    // Keep the original epoch-fence error.
+                    drop(cold);
+                    drop(_gate);
+                    return Err(e);
+                }
+                let result = body(&mut cold);
+                let commit = scope.wait();
+                match (result, commit) {
+                    (Ok(value), Ok(())) => {
+                        // Release the owner and the gate first: the snapshot
+                        // path re-closes the gate and would deadlock against
+                        // an in-flight slot if called earlier.
+                        drop(cold);
+                        drop(_gate);
+                        self.maybe_create_periodic_snapshot(epoch);
+                        return Ok(value);
+                    }
+                    (Ok(_), Err(commit_err)) => {
+                        cold.fail_closed();
+                        return Err(commit_err);
+                    }
+                    (Err(op_err), Ok(())) => {
+                        if self.journal_writer.failure_seq() != failure_seq_before {
+                            // A publication failure was recorded during the
+                            // operation: the namespace must fail closed even
+                            // though the op itself also errored.
+                            cold.fail_closed();
+                            return Err(op_err);
+                        }
+                        // Pure validation/planning/store error: normal
+                        // backfill via journal replay; the handle reopens.
+                        drop(cold);
+                        return Err(op_err);
+                    }
+                    (Err(op_err), Err(_commit_err)) => {
+                        // Publication also failed: fail closed, keep the
+                        // operation error as the primary cause.
+                        cold.fail_closed();
+                        return Err(op_err);
+                    }
+                }
+            }
+            // Gate already closed (snapshot/role fence in progress): wait for
+            // it to reopen, then retry the exclusive attempt.
+            let _guard = self.metadata_commit_gate.enter();
+            drop(_guard);
+        }
     }
 
     fn maybe_create_periodic_snapshot(&self, epoch: u64) {
@@ -442,31 +614,26 @@ impl MasterFilesystem {
         }
     }
 
-    fn run_admitted_metadata_write<R>(&self, f: impl FnOnce() -> FsResult<R>) -> FsResult<R> {
-        // Every caller already re-checked the read barrier immediately after
-        // taking its commit-gate slot (see run_metadata_write_epoch / atime
-        // touch), and nothing waits between that check and `f` — the scope
-        // registration is purely local. A third barrier read here would only
-        // re-read the same uncontended state.
-        let scope = self.journal_writer.begin_commit_scope();
-        let result = f();
-        scope.wait()?;
-        result
-    }
-
     // Plan from live child edges rather than reading store rows before taking
     // the inode locks. The IDs are only a plan and are revalidated against the
     // live tree under the locks, so no RocksDB snapshot (which takes the DB
     // mutex) or inode decode is needed here. Files have no edges, so the walk
     // stops at a file component.
     fn resolve_edge_ids(&self, path: &str) -> FsResult<(Vec<i64>, usize, bool, u64)> {
+        let fs_dir = self.fs_dir.view()?;
+        Self::resolve_edge_ids_on(&fs_dir, path)
+    }
+
+    /// Edge-id planning against a caller-supplied namespace borrow: the
+    /// admitted closure receives the view (normal) or cold handle (exclusive)
+    /// so it never re-enters `self.fs_dir` while the owner holds it.
+    fn resolve_edge_ids_on(fs_dir: &FsDir, path: &str) -> FsResult<(Vec<i64>, usize, bool, u64)> {
         let components = InodeView::path_components(path)?;
         if components.last().is_none_or(String::is_empty) {
             return err_box!("Path {} is invalid", path);
         }
         Self::check_not_pending_path(path)?;
-        let fs_dir = self.fs_dir.view().unwrap();
-        let epoch = Self::checked_live_epoch(&fs_dir)?;
+        let epoch = Self::checked_live_epoch(fs_dir)?;
         fs_dir.store.ensure_available()?;
         // Plan from live child edges only: the fs_dir guard excludes global
         // restore windows (sharded writers still hold fs_dir.read and do not
@@ -566,7 +733,7 @@ impl MasterFilesystem {
                 })
                 .collect();
             let _locks = self.lock_sharded_requests(requests, !full && parent_index == 0);
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
@@ -597,20 +764,22 @@ impl MasterFilesystem {
         )))
     }
 
-    fn create_single_parent_sharded(
+    fn create_single_parent_sharded_with_plan(
         &self,
         path: &str,
         opts: CreateFileOpts,
         flags: OpenFlags,
-    ) -> FsResult<(FileStatus, Option<DeleteResult>)> {
+        initial: (Vec<i64>, usize, bool, u64),
+    ) -> FsResult<ShardedOutcome<(FileStatus, Option<DeleteResult>)>> {
         const MAX_RETRIES: usize = 3;
+        let mut initial = Some(initial);
 
         for _ in 0..MAX_RETRIES {
-            let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
+            let (ids, components_len, full, restore_epoch) = match initial.take() {
+                Some(resolved) => resolved,
+                None => self.resolve_edge_ids(path)?,
+            };
             Self::check_not_reserved_path(path)?;
-            if ids.len() + 1 < components_len {
-                return self.create_with_global_lock(path, opts, flags);
-            }
             if full {
                 {
                     let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
@@ -619,7 +788,7 @@ impl MasterFilesystem {
                         .map(|(depth, id)| InodeLockRequest::read(depth, *id))
                         .collect();
                     let _locks = self.lock_sharded_requests(requests, false);
-                    let fs_dir = self.fs_dir.view().unwrap();
+                    let fs_dir = self.fs_dir.view()?;
                     if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                         continue;
                     }
@@ -637,14 +806,14 @@ impl MasterFilesystem {
                         return err_ext!(FsError::file_exists(inp.path()));
                     }
                 }
-                if let Some(result) = self.overwrite_file_sharded(
+                if let ShardedOutcome::Done(result) = self.overwrite_file_sharded(
                     path,
                     opts.clone(),
                     Some((ids, components_len, full, restore_epoch, None)),
                 )? {
-                    return Ok((result.0, Some(result.1)));
+                    return Ok(ShardedOutcome::Done((result.0, Some(result.1))));
                 }
-                return self.create_with_global_lock(path, opts, flags);
+                return Ok(ShardedOutcome::Fallback);
             }
 
             let parent_index = ids.len().saturating_sub(1);
@@ -660,7 +829,7 @@ impl MasterFilesystem {
                 })
                 .collect();
             let _locks = self.lock_sharded_requests(requests, !full && parent_index == 0);
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
@@ -671,7 +840,7 @@ impl MasterFilesystem {
                 Self::check_parent(&inp)?;
             }
             let inp = fs_dir.create_file(inp, opts.clone())?;
-            return Ok((fs_dir.file_status(&inp)?, None));
+            return Ok(ShardedOutcome::Done((fs_dir.file_status(&inp)?, None)));
         }
 
         err_ext!(FsError::common(format!(
@@ -685,7 +854,7 @@ impl MasterFilesystem {
         path: &str,
         opts: CreateFileOpts,
         mut initial: Option<(Vec<i64>, usize, bool, u64, Option<InodeView>)>,
-    ) -> FsResult<Option<(FileStatus, DeleteResult)>> {
+    ) -> FsResult<ShardedOutcome<(FileStatus, DeleteResult)>> {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
@@ -697,28 +866,28 @@ impl MasterFilesystem {
                 }
             };
             if !full || ids.len() < 2 {
-                return Ok(None);
+                return Ok(ShardedOutcome::Fallback);
             }
             let target_id = *ids.last().expect("full path has a target");
             let target_depth = ids.len() - 1;
             let target = match target {
                 Some(target) => Some(target),
                 None => {
-                    let fs_dir = self.fs_dir.view().unwrap();
+                    let fs_dir = self.fs_dir.view()?;
                     fs_dir.store.get_inode(target_id, None)?
                 }
             };
             let Some(target) = target.filter(|inode| inode.is_file()) else {
-                return Ok(None);
+                return Ok(ShardedOutcome::Fallback);
             };
             let block_ids = target.as_file_ref()?.block_ids();
             let worker_ids = {
-                let fs_dir = self.fs_dir.view().unwrap();
+                let fs_dir = self.fs_dir.view()?;
                 let mut worker_ids = HashSet::new();
                 for block_id in &block_ids {
                     let locations = match fs_dir.get_block_locations(*block_id) {
                         Ok(locations) => locations,
-                        Err(_) => return Ok(None),
+                        Err(_) => return Ok(ShardedOutcome::Fallback),
                     };
                     worker_ids.extend(locations.into_iter().map(|location| location.worker_id));
                 }
@@ -752,7 +921,7 @@ impl MasterFilesystem {
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
 
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
@@ -774,7 +943,7 @@ impl MasterFilesystem {
                 for block_id in &block_ids {
                     let locations = match fs_dir.get_block_locations(*block_id) {
                         Ok(locations) => locations,
-                        Err(_) => return Ok(None),
+                        Err(_) => return Ok(ShardedOutcome::Fallback),
                     };
                     current_workers
                         .extend(locations.into_iter().map(|location| location.worker_id));
@@ -791,20 +960,22 @@ impl MasterFilesystem {
 
             let deleted = fs_dir.overwrite_file(&inp, opts.clone())?;
             let status = fs_dir.file_status(&inp)?;
-            return Ok(Some((status, deleted)));
+            return Ok(ShardedOutcome::Done((status, deleted)));
         }
 
-        Ok(None)
+        Ok(ShardedOutcome::Fallback)
     }
 
-    fn create_with_global_lock(
+    /// The global-lock create body, run against an owner-provided namespace
+    /// (normal: a self-acquired cold handle; exclusive: the owner borrow).
+    fn create_with_global_lock_body(
         &self,
+        fs_dir: &mut FsDir,
         path: &str,
         opts: CreateFileOpts,
         flags: OpenFlags,
     ) -> FsResult<(FileStatus, Option<DeleteResult>)> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let inp = Self::resolve_path(fs_dir, path)?;
         Self::check_not_reserved_path(inp.path())?;
         let last_inode = inp.get_last_inode();
         if let Some(inode) = &last_inode {
@@ -838,16 +1009,16 @@ impl MasterFilesystem {
         ids: Vec<i64>,
         components_len: usize,
         restore_epoch: u64,
-    ) -> FsResult<DeleteResult> {
+    ) -> FsResult<ShardedOutcome<DeleteResult>> {
         const MAX_RETRIES: usize = 3;
         let mut ids = Some(ids);
 
         for _ in 0..MAX_RETRIES {
             let Some(ids) = ids.take() else {
-                return self.delete_with_global_lock(path);
+                return Ok(ShardedOutcome::Fallback);
             };
             if ids.len() != components_len || ids.len() < 2 {
-                return self.delete_with_global_lock(path);
+                return Ok(ShardedOutcome::Fallback);
             }
 
             let target_index = ids.len() - 1;
@@ -876,7 +1047,7 @@ impl MasterFilesystem {
                 std::time::Duration::from_secs(5),
             );
             let _locks = self.lock_sharded_requests(requests, parent_index == 0);
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
@@ -886,7 +1057,7 @@ impl MasterFilesystem {
             let Some(target) = inp.get_last_inode() else {
                 drop(fs_dir);
                 drop(_locks);
-                return self.delete_with_global_lock(path);
+                return Ok(ShardedOutcome::Fallback);
             };
             let block_ids = target
                 .as_file_ref()
@@ -896,7 +1067,7 @@ impl MasterFilesystem {
             // An empty block list has no locations to fence: sampling would
             // build two empty sets and take the same no-op locks.
             if block_ids.is_empty() {
-                return fs_dir.delete(&inp, false);
+                return Ok(ShardedOutcome::Done(fs_dir.delete(&inp, false)?));
             }
             let worker_ids = {
                 let mut worker_ids = HashSet::new();
@@ -906,7 +1077,7 @@ impl MasterFilesystem {
                         Err(_) => {
                             drop(fs_dir);
                             drop(_locks);
-                            return self.delete_with_global_lock(path);
+                            return Ok(ShardedOutcome::Fallback);
                         }
                     };
                     worker_ids.extend(locations.into_iter().map(|location| location.worker_id));
@@ -926,7 +1097,7 @@ impl MasterFilesystem {
             let _location_locks = self
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
@@ -954,7 +1125,7 @@ impl MasterFilesystem {
                             drop(fs_dir);
                             drop(_location_locks);
                             drop(_locks);
-                            return self.delete_with_global_lock(path);
+                            return Ok(ShardedOutcome::Fallback);
                         }
                     };
                     current_workers
@@ -969,15 +1140,10 @@ impl MasterFilesystem {
             {
                 continue;
             }
-            return fs_dir.delete(&inp, false);
+            return Ok(ShardedOutcome::Done(fs_dir.delete(&inp, false)?));
         }
 
-        self.delete_with_global_lock(path)
-    }
-
-    fn delete_with_global_lock(&self, path: &str) -> FsResult<DeleteResult> {
-        let mut fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        self.delete_locked(&mut fs_dir, path, false, DeleteMode::SkipTrash)
+        Ok(ShardedOutcome::Fallback)
     }
 
     fn rename_sharded(
@@ -986,7 +1152,7 @@ impl MasterFilesystem {
         dst: &str,
         flags: RenameFlags,
         initial: ((Vec<i64>, usize, bool, u64), (Vec<i64>, usize, bool, u64)),
-    ) -> FsResult<bool> {
+    ) -> FsResult<ShardedOutcome<bool>> {
         const MAX_RETRIES: usize = 3;
         let mut initial = Some(initial);
 
@@ -1003,7 +1169,8 @@ impl MasterFilesystem {
                 || destination_ids.len() + 1 < destination_components
                 || source_ids.len() < 2
             {
-                return self.rename_with_global_lock(src, dst, flags);
+                // Side-effect-free internal fallback: needs the global lock.
+                return Ok(ShardedOutcome::Fallback);
             }
 
             let source_parent = source_ids.len() - 2;
@@ -1041,7 +1208,7 @@ impl MasterFilesystem {
             let _locks =
                 self.lock_sharded_requests(requests, source_parent == 0 || destination_parent == 0);
 
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             let epoch = Self::checked_live_epoch(&fs_dir)?;
             if source_epoch != epoch || destination_epoch != epoch {
                 continue;
@@ -1057,16 +1224,36 @@ impl MasterFilesystem {
                 continue;
             };
             fs_dir.rename(&source_path, &destination_path, flags)?;
-            return Ok(true);
+            return Ok(ShardedOutcome::Done(true));
         }
 
-        self.rename_with_global_lock(src, dst, flags)
+        // Retries exhausted with identity churn: side-effect-free, needs the
+        // global lock.
+        Ok(ShardedOutcome::Fallback)
     }
 
-    fn rename_with_global_lock(&self, src: &str, dst: &str, flags: RenameFlags) -> FsResult<bool> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let src_inp = Self::resolve_path(&fs_dir, src)?;
-        let dst_inp = Self::resolve_path(&fs_dir, dst)?;
+    fn rename_with_global_lock_body(
+        &self,
+        fs_dir: &mut FsDir,
+        src: &str,
+        dst: &str,
+        flags: RenameFlags,
+    ) -> FsResult<bool> {
+        let src_inp = Self::resolve_path(fs_dir, src)?;
+        let dst_inp = Self::resolve_path(fs_dir, dst)?;
+        // POSIX rename of two names for the same inode is a no-op (kept from
+        // the hot path's dropped branch — journal replay unchanged for older
+        // leaders).
+        if !flags.no_replace() && !flags.exchange_mode() {
+            if let (Some(source), Some(target)) = (
+                src_inp.inodes.last().map(|inode| inode.id()),
+                dst_inp.inodes.last().map(|inode| inode.id()),
+            ) {
+                if source == target {
+                    return Ok(true);
+                }
+            }
+        }
         let deleted = fs_dir.rename(&src_inp, &dst_inp, flags)?;
         if let Some(deleted) = deleted {
             self.worker_manager.write().remove_blocks(&deleted);
@@ -1079,7 +1266,7 @@ impl MasterFilesystem {
         path: &str,
         opts: SetAttrOpts,
         initial: (Vec<i64>, usize, bool, u64),
-    ) -> FsResult<FileStatus> {
+    ) -> FsResult<ShardedOutcome<FileStatus>> {
         const MAX_RETRIES: usize = 3;
         let mut initial = Some(initial);
 
@@ -1089,9 +1276,9 @@ impl MasterFilesystem {
                 None => self.resolve_edge_ids(path)?,
             };
             if !full {
-                let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-                let inp = Self::resolve_path(&fs_dir, path)?;
-                return fs_dir.set_attr(inp, opts);
+                // Side-effect-free planning point: an unresolved path needs
+                // the global lock (exclusive owner body).
+                return Ok(ShardedOutcome::Fallback);
             }
 
             let target_depth = ids.len() - 1;
@@ -1107,19 +1294,18 @@ impl MasterFilesystem {
                 })
                 .collect();
             let _locks = self.lock_sharded_requests(requests, target_depth == 0);
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
             let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
                 continue;
             };
-            return fs_dir.set_attr(inp, opts);
+            return Ok(ShardedOutcome::Done(fs_dir.set_attr(inp, opts)?));
         }
 
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-        fs_dir.set_attr(inp, opts)
+        // Retries exhausted with identity churn: side-effect-free fallback.
+        Ok(ShardedOutcome::Fallback)
     }
 
     fn complete_file_sharded(
@@ -1130,7 +1316,7 @@ impl MasterFilesystem {
         commit_blocks: Vec<CommitBlock>,
         client_name: &str,
         options: CompleteFileOptions,
-    ) -> FsResult<Option<FileBlocks>> {
+    ) -> FsResult<ShardedOutcome<Option<FileBlocks>>> {
         const MAX_RETRIES: usize = 3;
 
         let block_ids: Vec<_> = commit_blocks.iter().map(|block| block.block_id).collect();
@@ -1142,14 +1328,8 @@ impl MasterFilesystem {
         for _ in 0..MAX_RETRIES {
             let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
             if !full || ids.len() < 2 || inode_id.is_some_and(|id| ids.last() != Some(&id)) {
-                return self.complete_file_with_global_lock(
-                    path,
-                    inode_id,
-                    len,
-                    commit_blocks,
-                    client_name,
-                    options,
-                );
+                // Side-effect-free planning point: needs the global lock.
+                return Ok(ShardedOutcome::Fallback);
             }
 
             let target_depth = ids.len() - 1;
@@ -1176,7 +1356,7 @@ impl MasterFilesystem {
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
 
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
@@ -1187,50 +1367,38 @@ impl MasterFilesystem {
                 .get_last_inode()
                 .ok_or_else(|| FsError::file_not_found(path))?;
             if !inode.is_file() || inode_id.is_some_and(|id| id != inode.id()) {
-                drop(fs_dir);
-                drop(_location_locks);
-                drop(_inode_locks);
-                return self.complete_file_with_global_lock(
-                    path,
-                    inode_id,
-                    len,
-                    commit_blocks,
-                    client_name,
-                    options,
-                );
+                // Identity mismatch: side-effect-free fallback (locks drop).
+                return Ok(ShardedOutcome::Fallback);
             }
 
-            fs_dir.complete_file(
+            let completed = fs_dir.complete_file(
                 path,
                 &mut inode,
                 len,
-                commit_blocks,
-                client_name,
+                commit_blocks.clone(),
+                client_name.clone(),
                 options.only_flush,
-                options.set_attr_opts,
+                options.set_attr_opts.clone(),
             )?;
 
             if options.only_flush && options.return_file_blocks {
                 let file = inode.as_file_ref()?;
                 let locs = self.get_block_locs(path, &fs_dir, file)?;
                 let status = inode.to_file_status(path)?;
-                return Ok(Some(FileBlocks::new(status, locs)));
+                let mut blocks = FileBlocks::new(status, locs);
+                blocks.status.is_complete = completed;
+                return Ok(ShardedOutcome::Done(Some(blocks)));
             }
-            return Ok(None);
+            return Ok(ShardedOutcome::Done(None));
         }
 
-        self.complete_file_with_global_lock(
-            path,
-            inode_id,
-            len,
-            commit_blocks,
-            client_name,
-            options,
-        )
+        // Retries exhausted with identity churn: side-effect-free fallback.
+        Ok(ShardedOutcome::Fallback)
     }
 
-    fn complete_file_with_global_lock(
+    fn complete_file_with_global_lock_body(
         &self,
+        fs_dir: &mut FsDir,
         path: &str,
         inode_id: Option<i64>,
         len: i64,
@@ -1238,9 +1406,10 @@ impl MasterFilesystem {
         client_name: &str,
         options: CompleteFileOptions,
     ) -> FsResult<Option<FileBlocks>> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
-        fs_dir.complete_file(
+        // By-id/stale-path contract: the id resolves from the store even when
+        // the request path has since been renamed.
+        let mut inode = Self::resolve_file_inode(fs_dir, path, inode_id)?;
+        let completed = fs_dir.complete_file(
             path,
             &mut inode,
             len,
@@ -1249,23 +1418,26 @@ impl MasterFilesystem {
             options.only_flush,
             options.set_attr_opts,
         )?;
-
         if options.only_flush && options.return_file_blocks {
             let file = inode.as_file_ref()?;
-            let locs = self.get_block_locs(path, &fs_dir, file)?;
+            let locs = self.get_block_locs(path, fs_dir, file)?;
             let status = inode.to_file_status(path)?;
-            return Ok(Some(FileBlocks::new(status, locs)));
+            let mut blocks = FileBlocks::new(status, locs);
+            blocks.status.is_complete = completed;
+            return Ok(Some(blocks));
         }
         Ok(None)
     }
 
-    fn close_file_sharded(&self, path: &str, client_name: &str) -> FsResult<()> {
+    fn close_file_sharded(&self, path: &str, client_name: &str) -> FsResult<ShardedOutcome<()>> {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
             let (ids, components_len, _, restore_epoch) = match self.resolve_edge_ids(path) {
                 Ok(value) => value,
-                Err(error) if matches!(error.kind(), ErrorKind::FileNotFound) => return Ok(()),
+                Err(error) if matches!(error.kind(), ErrorKind::FileNotFound) => {
+                    return Ok(ShardedOutcome::Done(()))
+                }
                 Err(error) => return Err(error),
             };
             let target_depth = ids.len() - 1;
@@ -1288,26 +1460,33 @@ impl MasterFilesystem {
                 context: {"path" => path},
             }
             let _locks = self.lock_sharded_requests(requests, false);
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
             let inp = match Self::resolve_locked_path(&fs_dir, path, &ids, components_len) {
                 Ok(Some(inp)) => inp,
                 Ok(None) => continue,
-                Err(error) if matches!(error.kind(), ErrorKind::FileNotFound) => return Ok(()),
+                Err(error) if matches!(error.kind(), ErrorKind::FileNotFound) => {
+                    return Ok(ShardedOutcome::Done(()))
+                }
                 Err(error) => return Err(error),
             };
             fs_dir.close_writer(&inp, client_name)?;
-            return Ok(());
+            return Ok(ShardedOutcome::Done(()));
         }
 
-        self.close_file_with_global_lock(path, client_name)
+        // Planning point: close needs the global lock.
+        Ok(ShardedOutcome::Fallback)
     }
 
-    fn close_file_with_global_lock(&self, path: &str, client_name: &str) -> FsResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let Ok(inp) = Self::resolve_path(&fs_dir, path) else {
+    fn close_file_with_global_lock_body(
+        &self,
+        fs_dir: &mut FsDir,
+        path: &str,
+        client_name: &str,
+    ) -> FsResult<()> {
+        let Ok(inp) = Self::resolve_path(fs_dir, path) else {
             return Ok(());
         };
         fs_dir.close_writer(&inp, client_name)
@@ -1321,7 +1500,7 @@ impl MasterFilesystem {
         owner: Option<String>,
         group: Option<String>,
         initial: (Vec<i64>, usize, bool, u64),
-    ) -> FsResult<()> {
+    ) -> FsResult<ShardedOutcome<()>> {
         const MAX_RETRIES: usize = 3;
         let mut initial = Some(initial);
 
@@ -1331,7 +1510,7 @@ impl MasterFilesystem {
                 None => self.resolve_edge_ids(link)?,
             };
             if full || ids.len() + 1 < components_len {
-                return self.symlink_with_global_lock(target, link, false, mode, owner, group);
+                return Ok(ShardedOutcome::Fallback);
             }
 
             let parent_index = ids.len() - 1;
@@ -1347,7 +1526,7 @@ impl MasterFilesystem {
                 })
                 .collect();
             let _locks = self.lock_sharded_requests(requests, parent_index == 0);
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
@@ -1357,7 +1536,7 @@ impl MasterFilesystem {
             if inp.is_full() {
                 drop(fs_dir);
                 drop(_locks);
-                return self.symlink_with_global_lock(target, link, false, mode, owner, group);
+                return Ok(ShardedOutcome::Fallback);
             }
             fs_dir.symlink(
                 target.to_string(),
@@ -1367,7 +1546,7 @@ impl MasterFilesystem {
                 owner.clone(),
                 group.clone(),
             )?;
-            return Ok(());
+            return Ok(ShardedOutcome::Done(()));
         }
 
         err_ext!(FsError::common(format!(
@@ -1376,8 +1555,9 @@ impl MasterFilesystem {
         )))
     }
 
-    fn symlink_with_global_lock(
+    fn symlink_with_global_lock_body(
         &self,
+        fs_dir: &mut FsDir,
         target: &str,
         link: &str,
         force: bool,
@@ -1385,8 +1565,7 @@ impl MasterFilesystem {
         owner: Option<String>,
         group: Option<String>,
     ) -> FsResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let inp = Self::resolve_path(&fs_dir, link)?;
+        let inp = Self::resolve_path(fs_dir, link)?;
         Self::check_not_reserved_path(inp.path())?;
         fs_dir.symlink(target.to_string(), inp, force, mode, owner, group)
     }
@@ -1396,7 +1575,7 @@ impl MasterFilesystem {
         src: &str,
         dst: &str,
         initial: ((Vec<i64>, usize, bool, u64), (Vec<i64>, usize, bool, u64)),
-    ) -> FsResult<()> {
+    ) -> FsResult<ShardedOutcome<()>> {
         const MAX_RETRIES: usize = 3;
         let mut initial = Some(initial);
 
@@ -1412,7 +1591,7 @@ impl MasterFilesystem {
                 || destination_full
                 || destination_ids.len() + 1 < destination_components
             {
-                return self.link_with_global_lock(src, dst);
+                return Ok(ShardedOutcome::Fallback);
             }
 
             let mut requests = smallvec::SmallVec::<[InodeLockRequest; 8]>::with_capacity(
@@ -1441,7 +1620,7 @@ impl MasterFilesystem {
                 context: {"path" => src},
             }
             let _locks = self.lock_sharded_requests(requests, destination_parent == 0);
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             let epoch = Self::checked_live_epoch(&fs_dir)?;
             if source_epoch != epoch || destination_epoch != epoch {
                 continue;
@@ -1457,7 +1636,7 @@ impl MasterFilesystem {
                 continue;
             };
             fs_dir.link(source_path, destination_path)?;
-            return Ok(());
+            return Ok(ShardedOutcome::Done(()));
         }
 
         err_ext!(FsError::common(format!(
@@ -1466,17 +1645,16 @@ impl MasterFilesystem {
         )))
     }
 
-    fn link_with_global_lock(&self, src: &str, dst: &str) -> FsResult<()> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let src_path = Self::resolve_path(&fs_dir, src)?;
-        let dst_path = Self::resolve_path(&fs_dir, dst)?;
+    fn link_with_global_lock_body(&self, fs_dir: &mut FsDir, src: &str, dst: &str) -> FsResult<()> {
+        let src_path = Self::resolve_path(fs_dir, src)?;
+        let dst_path = Self::resolve_path(fs_dir, dst)?;
         Self::check_not_reserved_path(src_path.path())?;
         Self::check_not_reserved_path(dst_path.path())?;
         fs_dir.link(src_path, dst_path)
     }
 
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
-        self.run_metadata_write(|| self.mkdir_single_parent_sharded(path.as_ref(), opts))
+        self.run_metadata_write(|| self.mkdir_single_parent_sharded(path.as_ref(), opts.clone()))
     }
 
     pub fn mkdir<T: AsRef<str>>(&self, path: T, create_parent: bool) -> FsResult<FileStatus> {
@@ -1497,21 +1675,28 @@ impl MasterFilesystem {
         recursive: bool,
         mode: DeleteMode,
     ) -> FsResult<DeleteResult> {
-        let mut delete_res = self.run_metadata_write(|| {
-            let path = path.as_ref();
-            let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
-            let sharded = matches!(mode, DeleteMode::SkipTrash)
-                && !recursive
-                && full
-                && components_len > 1
-                && path != trash::TRASH_ROOT;
-            if sharded {
-                self.delete_single_parent_sharded(path, ids, components_len, restore_epoch)
-            } else {
-                let mut fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-                self.delete_locked(&mut fs_dir, path, recursive, mode)
-            }
-        })?;
+        let mut delete_res = self.run_metadata_write_with_fallback(
+            || {
+                let path = path.as_ref();
+                let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
+                let sharded = matches!(mode, DeleteMode::SkipTrash)
+                    && !recursive
+                    && full
+                    && components_len > 1
+                    && path != trash::TRASH_ROOT;
+                if sharded {
+                    return self.delete_single_parent_sharded(
+                        path,
+                        ids,
+                        components_len,
+                        restore_epoch,
+                    );
+                }
+                // Planning point: recursive/trash delete needs the global lock.
+                Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| self.delete_locked(fs_dir, path.as_ref(), recursive, mode),
+        )?;
         self.release_deleted_blocks(&mut delete_res);
 
         Ok(delete_res)
@@ -1523,14 +1708,20 @@ impl MasterFilesystem {
         inode_id: i64,
         mode: DeleteMode,
     ) -> FsResult<Option<(DeleteResult, InodeView)>> {
-        let result = self.run_metadata_write(|| {
-            if matches!(mode, DeleteMode::SkipTrash) {
-                if let Some(result) = self.delete_expired_inode_sharded(path, inode_id)? {
-                    return Ok(Some(result));
+        let result = self.run_metadata_write_with_fallback(
+            || {
+                if matches!(mode, DeleteMode::SkipTrash) {
+                    if let ShardedOutcome::Done(result) =
+                        self.delete_expired_inode_sharded(path, inode_id)?
+                    {
+                        return Ok(ShardedOutcome::Done(Some(result)));
+                    }
                 }
-            }
-            self.delete_expired_inode_with_global_lock(path, inode_id, mode)
-        })?;
+                // Planning point: expired delete needs the global lock.
+                Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| self.delete_expired_inode_with_global_lock_body(fs_dir, path, inode_id, mode),
+        )?;
         let Some((mut result, inode)) = result else {
             return Ok(None);
         };
@@ -1538,14 +1729,14 @@ impl MasterFilesystem {
         Ok(Some((result, inode)))
     }
 
-    fn delete_expired_inode_with_global_lock(
+    fn delete_expired_inode_with_global_lock_body(
         &self,
+        fs_dir: &mut FsDir,
         path: &str,
         inode_id: i64,
         mode: DeleteMode,
     ) -> FsResult<Option<(DeleteResult, InodeView)>> {
-        let mut fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let inp = Self::resolve_path(fs_dir, path)?;
         let Some(inode) = inp.get_last_inode() else {
             return Ok(None);
         };
@@ -1558,7 +1749,7 @@ impl MasterFilesystem {
             return Ok(None);
         }
         let current = inode.as_ref().clone_metadata();
-        self.delete_locked(&mut fs_dir, path, true, mode)
+        self.delete_locked(fs_dir, path, true, mode)
             .map(|result| Some((result, current)))
     }
 
@@ -1566,26 +1757,26 @@ impl MasterFilesystem {
         &self,
         path: &str,
         inode_id: i64,
-    ) -> FsResult<Option<(DeleteResult, InodeView)>> {
+    ) -> FsResult<ShardedOutcome<(DeleteResult, InodeView)>> {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
             let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
             if !full || ids.len() < 2 || ids.last() != Some(&inode_id) {
-                return Ok(None);
+                return Ok(ShardedOutcome::Fallback);
             }
             let target = {
-                let fs_dir = self.fs_dir.view().unwrap();
+                let fs_dir = self.fs_dir.view()?;
                 fs_dir.store.get_inode(inode_id, None)?
             };
             let Some(target) = target else {
-                return Ok(None);
+                return Ok(ShardedOutcome::Fallback);
             };
             if !target.is_expired()?
                 || target.storage_policy()?.ttl_action != TtlAction::Delete
                 || matches!(&target, InodeView::File(file) if file.is_writing())
             {
-                return Ok(None);
+                return Ok(ShardedOutcome::Fallback);
             }
 
             let target_index = ids.len() - 1;
@@ -1595,12 +1786,12 @@ impl MasterFilesystem {
                 .map(|file| file.block_ids())
                 .unwrap_or_default();
             let worker_ids = {
-                let fs_dir = self.fs_dir.view().unwrap();
+                let fs_dir = self.fs_dir.view()?;
                 let mut worker_ids = HashSet::new();
                 for block_id in &block_ids {
                     let locations = match fs_dir.get_block_locations(*block_id) {
                         Ok(locations) => locations,
-                        Err(_) => return Ok(None),
+                        Err(_) => return Ok(ShardedOutcome::Fallback),
                     };
                     worker_ids.extend(locations.into_iter().map(|location| location.worker_id));
                 }
@@ -1629,7 +1820,7 @@ impl MasterFilesystem {
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
 
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
@@ -1654,7 +1845,7 @@ impl MasterFilesystem {
                 for block_id in &block_ids {
                     let locations = match fs_dir.get_block_locations(*block_id) {
                         Ok(locations) => locations,
-                        Err(_) => return Ok(None),
+                        Err(_) => return Ok(ShardedOutcome::Fallback),
                     };
                     current_workers
                         .extend(locations.into_iter().map(|location| location.worker_id));
@@ -1669,7 +1860,7 @@ impl MasterFilesystem {
                 continue;
             }
             if inp.path() == trash::TRASH_ROOT {
-                return Ok(None);
+                return Ok(ShardedOutcome::Fallback);
             }
             let Some(inode) = inp.get_last_inode() else {
                 continue;
@@ -1680,15 +1871,13 @@ impl MasterFilesystem {
                 || matches!(inode.as_ref(), InodeView::File(file) if file.is_writing())
                 || (inode.is_dir() && !inp.is_empty_dir())
             {
-                return Ok(None);
+                return Ok(ShardedOutcome::Fallback);
             }
             let current = inode.as_ref().clone_metadata();
-            return fs_dir
-                .delete(&inp, false)
-                .map(|result| Some((result, current)));
+            return Ok(ShardedOutcome::Done((fs_dir.delete(&inp, false)?, current)));
         }
 
-        Ok(None)
+        Ok(ShardedOutcome::Fallback)
     }
 
     /// Variant of `delete_with_mode` that also checks the active-master
@@ -1704,14 +1893,22 @@ impl MasterFilesystem {
         if !self.master_monitor.is_active() {
             return Ok(None);
         }
-        let result = self.run_metadata_write(|| {
-            let mut fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-            if !self.master_monitor.is_active() {
-                return Ok(None);
-            }
-            self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)
-                .map(Some)
-        })?;
+        let result = self.run_metadata_write_with_fallback(
+            || {
+                if !self.master_monitor.is_active() {
+                    return Ok(ShardedOutcome::Done(None));
+                }
+                // Planning point: delete needs the global lock.
+                Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| {
+                if !self.master_monitor.is_active() {
+                    return Ok(None);
+                }
+                self.delete_locked(fs_dir, path.as_ref(), recursive, mode)
+                    .map(Some)
+            },
+        )?;
         let Some(mut delete_res) = result else {
             return Ok(None);
         };
@@ -1721,7 +1918,7 @@ impl MasterFilesystem {
 
     fn delete_locked(
         &self,
-        fs_dir: &mut FsDir,
+        fs_dir: &FsDir,
         path: &str,
         recursive: bool,
         mode: DeleteMode,
@@ -1785,18 +1982,25 @@ impl MasterFilesystem {
         if !self.master_monitor.is_active() {
             return Ok(None);
         }
-        let result = self.run_metadata_write(|| {
-            let mut fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-            if !self.master_monitor.is_active() {
-                return Ok(None);
-            }
-
-            let mtime = LocalTime::mills() as i64;
-            let delete_res = fs_dir.purge_paths(paths, mtime)?;
-            let writer = fs_dir.journal_writer.clone();
-            writer.log_trash_purge(&fs_dir, entry, mtime, paths.to_vec())?;
-            Ok(Some(delete_res))
-        })?;
+        let result = self.run_metadata_write_with_fallback(
+            || {
+                if !self.master_monitor.is_active() {
+                    return Ok(ShardedOutcome::Done(None));
+                }
+                // Planning point: a purge batch needs the global lock.
+                Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| {
+                if !self.master_monitor.is_active() {
+                    return Ok(None);
+                }
+                let mtime = LocalTime::mills() as i64;
+                let delete_res = fs_dir.purge_paths(paths, mtime)?;
+                let writer = fs_dir.journal_writer.clone();
+                writer.log_trash_purge(fs_dir, entry, mtime, paths.to_vec())?;
+                Ok(Some(delete_res))
+            },
+        )?;
         let Some(mut delete_res) = result else {
             return Ok(None);
         };
@@ -1809,7 +2013,7 @@ impl MasterFilesystem {
         after: Option<&trash::TrashCursor>,
         limit: usize,
     ) -> FsResult<TrashListing> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let mut fs_dir = self.cold_acquire_wait()?;
         fs_dir.list_trash(after, limit)
     }
 
@@ -1828,7 +2032,7 @@ impl MasterFilesystem {
     }
 
     pub fn restore_dst<T: AsRef<str>>(&self, path: T, dst: Option<&str>) -> FsResult<String> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let mut fs_dir = self.cold_acquire_wait()?;
         fs_dir.restore_dst(path.as_ref(), dst)
     }
 
@@ -1840,7 +2044,7 @@ impl MasterFilesystem {
         limit: usize,
         start_after: Option<&str>,
     ) -> FsResult<TrashScanPage> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let mut fs_dir = self.cold_acquire_wait()?;
         fs_dir.scan_expired_trash(cutoff_ms, limit, start_after)
     }
 
@@ -1855,10 +2059,10 @@ impl MasterFilesystem {
             return Ok(None);
         }
         self.run_metadata_write(|| {
-            let mut fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
             if !self.master_monitor.is_active() {
                 return Ok(None);
             }
+            let fs_dir = self.fs_dir.view()?;
             fs_dir.claim_trash_entry_for_purge(trash_path).map(Some)
         })
     }
@@ -1870,7 +2074,7 @@ impl MasterFilesystem {
         limit: usize,
         start_after: Option<&str>,
     ) -> FsResult<TrashScanPage> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let mut fs_dir = self.cold_acquire_wait()?;
         fs_dir.scan_pending_trash(limit, start_after)
     }
 
@@ -1880,10 +2084,13 @@ impl MasterFilesystem {
         dst: Option<&str>,
         overwrite: bool,
     ) -> FsResult<RestoredTrashEntry> {
-        let restored = self.run_metadata_write(|| {
-            let mut fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-            fs_dir.restore_trash(path.as_ref(), dst, overwrite)
-        })?;
+        let restored = self.run_metadata_write_with_fallback(
+            || {
+                // Planning point: restore needs the global lock.
+                Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| fs_dir.restore_trash(path.as_ref(), dst, overwrite),
+        )?;
 
         // Overwriting an existing destination deletes it; release its blocks
         // just like a regular rename-with-replace.
@@ -1907,22 +2114,23 @@ impl MasterFilesystem {
 
         // Snapshot the names once: entries added after the snapshot stay for the
         // next empty, and each batch releases the write lock between renames.
-        let names = self
-            .fs_dir
-            .begin_cold(DEFAULT_COLD_TIMEOUT)
-            .unwrap()
-            .trash_entry_names()?;
+        let names = self.fs_dir.view()?.trash_entry_names()?;
         let mut staged = 0;
         for batch in names.chunks(BATCH_SIZE) {
-            staged += self.run_metadata_write(|| {
-                let mut fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-                if !self.master_monitor.is_active() {
-                    return err_ext!(FsError::not_leader(
-                        "empty-trash staging lost leadership mid-sweep"
-                    ));
-                }
-                fs_dir.stage_trash_entries(batch)
-            })?;
+            staged += self.run_metadata_write_with_fallback(
+                || {
+                    // Planning point: staging renames need the global lock.
+                    Ok(ShardedOutcome::Fallback)
+                },
+                |fs_dir| {
+                    if !self.master_monitor.is_active() {
+                        return err_ext!(FsError::not_leader(
+                            "empty-trash staging lost leadership mid-sweep"
+                        ));
+                    }
+                    fs_dir.stage_trash_entries(batch)
+                },
+            )?;
         }
         Ok(staged)
     }
@@ -2039,75 +2247,93 @@ impl MasterFilesystem {
         recursive: bool,
         expected_id: Option<i64>,
     ) -> FsResult<Option<(FreeOutcome, InodeView)>> {
-        let mut outcome = self.run_metadata_write(|| {
-        if let Some(releaser) = self.fs_mode_releaser() {
-            if releaser.is_fs_mode(path) {
-                let Some((pending, cleanup, inode)) = self.fs_mode_release_candidates(path, recursive, expected_id)? else {
-                    return Ok(None);
-                };
-                let count = pending.len();
-                if cleanup {
-                    releaser.defer_cleanup(path)?;
+        let mut outcome = self.run_metadata_write_with_fallback(
+            || {
+            if let Some(releaser) = self.fs_mode_releaser() {
+                if releaser.is_fs_mode(path) {
+                    let Some((pending, cleanup, inode)) =
+                        self.fs_mode_release_candidates(path, recursive, expected_id)?
+                    else {
+                        return Ok(ShardedOutcome::Done(None));
+                    };
+                    let count = pending.len();
+                    if cleanup {
+                        releaser.defer_cleanup(path)?;
+                    }
+                    for inode_id in pending {
+                        releaser.defer_release(inode_id);
+                    }
+                    return Ok(ShardedOutcome::Done(Some((
+                        FreeOutcome::Deferred { pending: count },
+                        inode,
+                    ))));
                 }
-                for inode_id in pending {
-                    releaser.defer_release(inode_id);
+                if recursive && releaser.contains_fs_mode_mount(path) {
+                    return err_box!(
+                        "free {} would release fs_mode files without UFS verification; free each fs_mode mount separately",
+                        path
+                    );
                 }
-                return Ok(Some((FreeOutcome::Deferred { pending: count }, inode)));
             }
-            if recursive && releaser.contains_fs_mode_mount(path) {
-                return err_box!(
-                    "free {} would release fs_mode files without UFS verification; free each fs_mode mount separately",
-                    path
-                );
+
+            if !recursive && expected_id.is_none() {
+                if let ShardedOutcome::Done((free_res, inode)) =
+                    self.free_single_file_sharded(path)?
+                {
+                    return Ok(ShardedOutcome::Done(Some((
+                        FreeOutcome::Freed(free_res),
+                        inode,
+                    ))));
+                }
             }
-        }
 
-        if !recursive && expected_id.is_none() {
-            if let Some((free_res, inode)) = self.free_single_file_sharded(path)? {
-                return Ok(Some((FreeOutcome::Freed(free_res), inode)));
-            }
-        }
+            // Planning point: free-target free needs the global lock.
+            Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| {
+            let inp = Self::resolve_path(fs_dir, path)?;
+            Self::check_not_reserved_path(inp.path())?;
+            let Some(inode) = Self::free_target(&inp, expected_id)? else {
+                return Ok(None);
+            };
 
-        let mut fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-        Self::check_not_reserved_path(inp.path())?;
-        let Some(inode) = Self::free_target(&inp, expected_id)? else {
-            return Ok(None);
-        };
-
-        let free_res = fs_dir.free(&inp, recursive)?;
-        Ok(Some((FreeOutcome::Freed(free_res), inode)))
-        })?;
+            let free_res = fs_dir.free(&inp, recursive)?;
+            Ok(Some((FreeOutcome::Freed(free_res), inode)))
+            },
+        )?;
         if let Some((FreeOutcome::Freed(ref mut result), _)) = outcome {
             self.remove_freed_blocks(result);
         }
         Ok(outcome)
     }
 
-    fn free_single_file_sharded(&self, path: &str) -> FsResult<Option<(FreeResult, InodeView)>> {
+    fn free_single_file_sharded(
+        &self,
+        path: &str,
+    ) -> FsResult<ShardedOutcome<(FreeResult, InodeView)>> {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
             let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
             if !full || ids.len() < 2 {
-                return Ok(None);
+                return Ok(ShardedOutcome::Fallback);
             }
             let target_id = *ids.last().expect("full path has a target");
             let target = {
-                let fs_dir = self.fs_dir.view().unwrap();
+                let fs_dir = self.fs_dir.view()?;
                 fs_dir.store.get_inode(target_id, None)?
             };
             let Some(target) = target.filter(|inode| inode.is_file()) else {
-                return Ok(None);
+                return Ok(ShardedOutcome::Fallback);
             };
             let block_ids = target.as_file_ref()?.block_ids();
             let worker_ids = {
-                let fs_dir = self.fs_dir.view().unwrap();
+                let fs_dir = self.fs_dir.view()?;
                 let mut worker_ids = HashSet::new();
                 for block_id in &block_ids {
                     let locations = match fs_dir.get_block_locations(*block_id) {
                         Ok(locations) => locations,
-                        Err(_) => return Ok(None),
+                        Err(_) => return Ok(ShardedOutcome::Fallback),
                     };
                     worker_ids.extend(locations.into_iter().map(|location| location.worker_id));
                 }
@@ -2137,7 +2363,7 @@ impl MasterFilesystem {
                 .block_location_locks
                 .write_workers_blocks(&worker_ids, &block_ids);
 
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
@@ -2159,7 +2385,7 @@ impl MasterFilesystem {
                 for block_id in &block_ids {
                     let locations = match fs_dir.get_block_locations(*block_id) {
                         Ok(locations) => locations,
-                        Err(_) => return Ok(None),
+                        Err(_) => return Ok(ShardedOutcome::Fallback),
                     };
                     current_workers
                         .extend(locations.into_iter().map(|location| location.worker_id));
@@ -2176,10 +2402,10 @@ impl MasterFilesystem {
             Self::check_not_reserved_path(inp.path())?;
             let original = live_inode.as_ref().clone_metadata();
             let free_res = fs_dir.free_file(&inp, LocalTime::mills() as i64)?;
-            return Ok(Some((free_res, original)));
+            return Ok(ShardedOutcome::Done((free_res, original)));
         }
 
-        Ok(None)
+        Ok(ShardedOutcome::Fallback)
     }
 
     fn free_target(inp: &InodePath, expected_id: Option<i64>) -> FsResult<Option<InodeView>> {
@@ -2215,9 +2441,10 @@ impl MasterFilesystem {
 
     /// State Free reconciliation needs for one file, read under one lock.
     pub fn fs_mode_snapshot(&self, inode_id: i64) -> FsResult<Option<FsModeSnapshot>> {
+        let mut fs_dir = self.cold_acquire_wait()?;
         // Shared fs_dir readers include sharded writers; exclude them while
         // resolving raw pointers and collecting the verification fields.
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+
         let path = match fs_dir.get_inode_path(inode_id) {
             Ok(path) => path,
             Err(FsError::FileNotFound(_)) => return Ok(None),
@@ -2251,8 +2478,10 @@ impl MasterFilesystem {
         gen: FileGen,
         ufs_mtime: i64,
     ) -> FsResult<bool> {
-        let result = self
-            .run_metadata_write(|| self.release_verified_sharded(inode_id, path, gen, ufs_mtime))?;
+        let result = self.run_metadata_write_with_fallback(
+            || self.release_verified_sharded(inode_id, path, gen, ufs_mtime),
+            |fs_dir| fs_dir.free_verified(inode_id, path, gen, ufs_mtime),
+        )?;
         let Some(mut free_res) = result else {
             return Ok(false);
         };
@@ -2266,26 +2495,27 @@ impl MasterFilesystem {
         path: &str,
         gen: FileGen,
         ufs_mtime: i64,
-    ) -> FsResult<Option<FreeResult>> {
+    ) -> FsResult<ShardedOutcome<Option<FreeResult>>> {
         const MAX_RETRIES: usize = 3;
 
         for _ in 0..MAX_RETRIES {
             let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
             if !full || ids.len() < 2 || ids.last() != Some(&inode_id) {
-                return Ok(None);
+                return Ok(ShardedOutcome::Fallback);
             }
             let target = {
-                let fs_dir = self.fs_dir.view().unwrap();
+                let fs_dir = self.fs_dir.view()?;
                 fs_dir.store.get_inode(inode_id, None)?
             };
             let Some(InodeView::File(file)) = target else {
-                return Ok(None);
+                return Ok(ShardedOutcome::Done(None));
             };
             if file.gen() != gen
                 || file.storage_policy.state != StorageState::Both
                 || file.storage_policy.ufs_mtime != ufs_mtime
             {
-                return Ok(None);
+                // The file changed since verification: nothing to release.
+                return Ok(ShardedOutcome::Done(None));
             }
 
             let block_ids = file.block_ids();
@@ -2303,8 +2533,16 @@ impl MasterFilesystem {
                 }
                 Ok(workers)
             };
-            let Ok(worker_ids) = read_workers(&*self.fs_dir.view().unwrap()) else {
-                break;
+            // Sample inside its own block: the view guard must end before the
+            // fault point and any inode/location lock wait (the guard's debt
+            // converts to a strong reference across the cold swap, which a
+            // concurrent global-lock delete would otherwise wait on).
+            let worker_ids = {
+                let view = self.fs_dir.view()?;
+                match read_workers(&view) {
+                    Ok(workers) => workers,
+                    Err(_) => break,
+                }
             };
             #[cfg(test)]
             crate::fault_point! {
@@ -2330,7 +2568,7 @@ impl MasterFilesystem {
                 .block_location_locks
                 .write_workers_blocks(&worker_ids.iter().copied().collect::<Vec<_>>(), &block_ids);
 
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
@@ -2355,11 +2593,13 @@ impl MasterFilesystem {
             {
                 continue;
             }
-            return Ok(Some(fs_dir.free_file(&inp, LocalTime::mills() as i64)?));
+            return Ok(ShardedOutcome::Done(Some(
+                fs_dir.free_file(&inp, LocalTime::mills() as i64)?,
+            )));
         }
 
-        let mut fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        fs_dir.free_verified(inode_id, path, gen, ufs_mtime)
+        // Retries exhausted with identity churn: side-effect-free fallback.
+        Ok(ShardedOutcome::Fallback)
     }
 
     /// Files under `path` that still hold Curvine data and must be routed
@@ -2372,8 +2612,9 @@ impl MasterFilesystem {
         recursive: bool,
         expected_id: Option<i64>,
     ) -> FsResult<Option<(Vec<i64>, bool, InodeView)>> {
+        let mut fs_dir = self.cold_acquire_wait()?;
         // Recursive collection needs a stable tree and inode content.
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+
         let inp = Self::resolve_path(&fs_dir, path)?;
         Self::check_not_reserved_path(inp.path())?;
         if inp.is_root() {
@@ -2437,75 +2678,84 @@ impl MasterFilesystem {
             }
         }
 
-        let (renamed, deleted) = self.run_metadata_write(|| {
-            // Live-tree pre-check. The store-snapshot read this replaces cost
-            // two RocksDB walk rounds per rename and only fed the sharded
-            // routing decision, which the sharded loop re-resolves live
-            // anyway. A live view can briefly lag a committed store batch
-            // (durable-before-live), so a misjudgment here degrades to the
-            // global-lock path — never to an incorrect rename.
-            let source = self.resolve_edge_ids(src)?;
-            let destination = self.resolve_edge_ids(dst)?;
+        let (renamed, deleted) = self.run_metadata_write_with_fallback(
+            || {
+                // Live-tree pre-check. The store-snapshot read this replaces cost
+                // two RocksDB walk rounds per rename and only fed the sharded
+                // routing decision, which the sharded loop re-resolves live
+                // anyway. A live view can briefly lag a committed store batch
+                // (durable-before-live), so a misjudgment here degrades to the
+                // global-lock path — never to an incorrect rename.
+                let source = self.resolve_edge_ids(src)?;
+                let destination = self.resolve_edge_ids(dst)?;
 
-            Self::check_not_reserved_path(src)?;
-            Self::check_not_reserved_path(dst)?;
+                Self::check_not_reserved_path(src)?;
+                Self::check_not_reserved_path(dst)?;
 
-            if source.1 <= 1 {
-                return err_box!("Cannot rename root path");
-            }
+                if source.1 <= 1 {
+                    return err_box!("Cannot rename root path");
+                }
 
-            if src == dst {
-                let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-                Self::checked_live_epoch(&fs_dir)?;
-                Self::resolve_path(&fs_dir, src)?;
-                return Ok((false, None));
-            }
+                if src == dst {
+                    // No-op planning check: needs a view for the epoch sanity but
+                    // the global body re-resolves everything — explicit fallback.
+                    return Ok(ShardedOutcome::Fallback);
+                }
 
-            // POSIX rename of two names for the same inode is a no-op.
-            // Keep NO_REPLACE's existing destination-exists error and leave
-            // journal replay unchanged for entries written by older leaders.
-            if !flags.no_replace() && !flags.exchange_mode() {
-                if let (Some(source), Some(target)) = (
-                    source.0.last().filter(|_| source.2),
-                    destination.0.last().filter(|_| destination.2),
-                ) {
-                    if source == target {
-                        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-                        let src_inp = Self::resolve_path(&fs_dir, src)?;
-                        let dst_inp = Self::resolve_path(&fs_dir, dst)?;
-                        if src_inp.is_full()
-                            && dst_inp.is_full()
-                            && src_inp.inodes.last().map(|inode| inode.id())
-                                == dst_inp.inodes.last().map(|inode| inode.id())
-                        {
-                            return Ok((true, None));
+                // POSIX rename of two names for the same inode is a no-op.
+                // Keep NO_REPLACE's existing destination-exists error and leave
+                // journal replay unchanged for entries written by older leaders.
+                if !flags.no_replace() && !flags.exchange_mode() {
+                    if let (Some(source), Some(target)) = (
+                        source.0.last().filter(|_| source.2),
+                        destination.0.last().filter(|_| destination.2),
+                    ) {
+                        if source == target {
+                            return Ok(ShardedOutcome::Fallback);
                         }
-                        let deleted = fs_dir.rename(&src_inp, &dst_inp, flags)?;
-                        return Ok((true, deleted));
                     }
                 }
-            }
 
-            let sharded = !flags.exchange_mode()
-                && !flags.trash()
-                && !flags.restore()
-                && source.2
-                && !destination.2
-                && source.0.len() >= 2
-                && destination.0.len() + 1 >= destination.1;
-            if sharded {
-                return Ok((
-                    self.rename_sharded(src, dst, flags, (source, destination))?,
-                    None,
-                ));
-            }
+                let sharded = !flags.exchange_mode()
+                    && !flags.trash()
+                    && !flags.restore()
+                    && source.2
+                    && !destination.2
+                    && source.0.len() >= 2
+                    && destination.0.len() + 1 >= destination.1;
+                if sharded {
+                    match self.rename_sharded(src, dst, flags, (source, destination))? {
+                        ShardedOutcome::Done(renamed) => {
+                            return Ok(ShardedOutcome::Done((renamed, None)));
+                        }
+                        ShardedOutcome::Fallback => return Ok(ShardedOutcome::Fallback),
+                    }
+                }
 
-            let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-            let src_inp = Self::resolve_path(&fs_dir, src)?;
-            let dst_inp = Self::resolve_path(&fs_dir, dst)?;
-            let deleted = fs_dir.rename(&src_inp, &dst_inp, flags)?;
-            Ok((true, deleted))
-        })?;
+                // Planning point: this rename needs the global lock.
+                Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| {
+                Self::check_not_reserved_path(src)?;
+                Self::check_not_reserved_path(dst)?;
+                let src_inp = Self::resolve_path(fs_dir, src)?;
+                let dst_inp = Self::resolve_path(fs_dir, dst)?;
+                // POSIX same-inode rename is a no-op (kept from the hot path's
+                // dropped branch — journal replay unchanged for older leaders).
+                if !flags.no_replace() && !flags.exchange_mode() {
+                    if let (Some(source), Some(target)) = (
+                        src_inp.inodes.last().map(|inode| inode.id()),
+                        dst_inp.inodes.last().map(|inode| inode.id()),
+                    ) {
+                        if source == target {
+                            return Ok((true, None));
+                        }
+                    }
+                }
+                let deleted = fs_dir.rename(&src_inp, &dst_inp, flags)?;
+                Ok((true, deleted))
+            },
+        )?;
         if let Some(deleted) = deleted {
             self.worker_manager.write().remove_blocks(&deleted);
         }
@@ -2549,8 +2799,23 @@ impl MasterFilesystem {
             );
         }
 
-        let (status, deleted) =
-            self.run_metadata_write(|| self.create_single_parent_sharded(path, opts, flags))?;
+        let (status, deleted) = self.run_metadata_write_with_fallback(
+            || {
+                // Plan first: a missing parent needs the global lock — an
+                // explicit side-effect-free Fallback, not a cold re-entry.
+                let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
+                if ids.len() + 1 < components_len {
+                    return Ok(ShardedOutcome::Fallback);
+                }
+                self.create_single_parent_sharded_with_plan(
+                    path,
+                    opts.clone(),
+                    flags,
+                    (ids, components_len, full, restore_epoch),
+                )
+            },
+            |fs_dir| self.create_with_global_lock_body(fs_dir, path, opts.clone(), flags),
+        )?;
         if let Some(deleted) = deleted {
             self.worker_manager.write().remove_blocks(&deleted);
         }
@@ -2564,7 +2829,6 @@ impl MasterFilesystem {
         flags: OpenFlags,
     ) -> FsResult<FileBlocks> {
         let path = path.as_ref();
-
         if flags.read_only() {
             if flags.truncate() {
                 return err_box!("cannot combine O_RDONLY with O_TRUNC");
@@ -2575,60 +2839,75 @@ impl MasterFilesystem {
             return self.get_block_locations(path);
         }
 
-        let opened = self.run_metadata_write(|| {
-            let (ids, components_len, full, epoch) = self.resolve_edge_ids(path)?;
-            Self::check_not_reserved_path(path)?;
-            if flags.truncate() {
-                let initial = (ids, components_len, full, epoch, None);
-                if let Some((status, deleted)) =
-                    self.overwrite_file_sharded(path, opts.clone(), Some(initial))?
-                {
-                    return Ok(Ok((FileBlocks::new(status, vec![]), Some(deleted))));
-                }
-            } else if full {
-                let initial = (ids, components_len, full, epoch);
-                let blocks = self.reopen_file_sharded(path, &opts.client_name, initial)?;
-                return Ok(Ok((blocks, None)));
-            }
-            #[cfg(test)]
-            crate::fault_point! {
-                sync,
-                name: "master.metadata.open_fallback",
-                description: "Open fallback before taking the namespace write lock",
-                context: {"path" => path},
-            }
-            let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-            Self::checked_live_epoch(&fs_dir)?;
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            Self::check_not_reserved_path(path)?;
-
-            match inp.get_last_inode().filter(|_| inp.is_full()) {
-                None => {
-                    return if flags.create() {
-                        Ok(Err(opts))
-                    } else {
-                        err_ext!(FsError::file_not_found(path))
+        let opened = self.run_metadata_write_with_fallback(
+            || {
+                let (ids, components_len, full, epoch) = self.resolve_edge_ids(path)?;
+                Self::check_not_reserved_path(path)?;
+                if flags.truncate() {
+                    let initial = (ids, components_len, full, epoch, None);
+                    if let ShardedOutcome::Done((status, deleted)) =
+                        self.overwrite_file_sharded(path, opts.clone(), Some(initial))?
+                    {
+                        return Ok(ShardedOutcome::Done(Ok((
+                            FileBlocks::new(status, vec![]),
+                            Some(deleted),
+                        ))));
+                    }
+                } else if full {
+                    let initial = (ids, components_len, full, epoch);
+                    if let ShardedOutcome::Done(blocks) =
+                        self.reopen_file_sharded(path, &opts.client_name, initial)?
+                    {
+                        return Ok(ShardedOutcome::Done(Ok((blocks, None))));
                     }
                 }
-                Some(inode) if inode.is_dir() => {
-                    return err_box!("{} is a directory", path);
+                #[cfg(test)]
+                crate::fault_point! {
+                    sync,
+                    name: "master.metadata.open_fallback",
+                    description: "Open fallback before taking the namespace write lock",
+                    context: {"path" => path},
                 }
-                Some(_) => {}
-            }
 
-            if !flags.truncate() {
-                drop(inp);
-                drop(fs_dir);
-                let initial = self.resolve_edge_ids(path)?;
-                let blocks = self.reopen_file_sharded(path, &opts.client_name, initial)?;
-                return Ok(Ok((blocks, None)));
-            }
+                // Planning point: this open needs the global lock.
+                Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| {
+                Self::checked_live_epoch(fs_dir)?;
+                let inp = Self::resolve_path(fs_dir, path)?;
+                Self::check_not_reserved_path(path)?;
 
-            Self::check_not_reserved_path(inp.path())?;
-            let deleted = fs_dir.overwrite_file(&inp, opts)?;
-            let status = fs_dir.file_status(&inp)?;
-            return Ok(Ok((FileBlocks::new(status, vec![]), Some(deleted))));
-        })?;
+                match inp.get_last_inode().filter(|_| inp.is_full()) {
+                    None => {
+                        return if flags.create() {
+                            Ok(Err(opts.clone()))
+                        } else {
+                            err_ext!(FsError::file_not_found(path))
+                        }
+                    }
+                    Some(inode) if inode.is_dir() => {
+                        return err_box!("{} is a directory", path);
+                    }
+                    Some(_) => {}
+                }
+
+                if !flags.truncate() {
+                    // Exclusive owner: reopen directly, no sharded re-entry.
+                    let status = fs_dir.reopen_file(&inp, &opts.client_name)?;
+                    let inode = inp
+                        .get_last_inode()
+                        .ok_or_else(|| FsError::file_not_found(path))?;
+                    let file = inode.as_file_ref()?;
+                    let blocks = self.get_block_locs(path, fs_dir, file)?;
+                    return Ok(Ok((FileBlocks::new(status, blocks), None)));
+                }
+
+                Self::check_not_reserved_path(inp.path())?;
+                let deleted = fs_dir.overwrite_file(&inp, opts.clone())?;
+                let status = fs_dir.file_status(&inp)?;
+                Ok(Ok((FileBlocks::new(status, vec![]), Some(deleted))))
+            },
+        )?;
         match opened {
             Ok((blocks, deleted)) => {
                 if let Some(deleted) = deleted {
@@ -2648,7 +2927,7 @@ impl MasterFilesystem {
         path: &str,
         client_name: &str,
         initial: (Vec<i64>, usize, bool, u64),
-    ) -> FsResult<FileBlocks> {
+    ) -> FsResult<ShardedOutcome<FileBlocks>> {
         const MAX_RETRIES: usize = 3;
         let mut initial = Some(initial);
 
@@ -2681,7 +2960,7 @@ impl MasterFilesystem {
             }
             let _locks = self.lock_sharded_requests(requests, false);
 
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
@@ -2700,18 +2979,12 @@ impl MasterFilesystem {
             let status = fs_dir.reopen_file(&inp, client_name)?;
             let file = inode.as_file_ref()?;
             let blocks = self.get_block_locs(path, &fs_dir, file)?;
-            return Ok(FileBlocks::new(status, blocks));
+            return Ok(ShardedOutcome::Done(FileBlocks::new(status, blocks)));
         }
 
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-        let status = fs_dir.reopen_file(&inp, client_name)?;
-        let inode = inp
-            .get_last_inode()
-            .ok_or_else(|| FsError::file_not_found(path))?;
-        let file = inode.as_file_ref()?;
-        let blocks = self.get_block_locs(path, &fs_dir, file)?;
-        Ok(FileBlocks::new(status, blocks))
+        // Retries exhausted (or the path is not a full identity): the reopen
+        // write must run under the exclusive owner.
+        Ok(ShardedOutcome::Fallback)
     }
 
     pub fn file_status<T: AsRef<str>>(&self, path: T) -> FsResult<FileStatus> {
@@ -2757,7 +3030,10 @@ impl MasterFilesystem {
     /// correct unfinished state either way.
     pub fn close_file<T: AsRef<str>>(&self, path: T, client_name: &str) -> FsResult<()> {
         let path = path.as_ref();
-        self.run_metadata_write(|| self.close_file_sharded(path, client_name))
+        self.run_metadata_write_with_fallback(
+            || self.close_file_sharded(path, client_name),
+            |fs_dir| self.close_file_with_global_lock_body(fs_dir, path, client_name),
+        )
     }
 
     pub fn file_status_by_id<T: AsRef<str>>(
@@ -2769,7 +3045,7 @@ impl MasterFilesystem {
         if let Some(id) = inode_id.filter(|id| *id > 0) {
             // Directory inode fields and its separate attributes must come
             // from the same generation, even when another writer holds a read guard.
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
             let Some(inode) = snapshot.get_inode(id)? else {
                 return err_ext!(FsError::file_not_found(path).ctx(format!("inode_id={}", id)));
@@ -2854,7 +3130,7 @@ impl MasterFilesystem {
     /// inode holds its write lock first, so meta and attributes cannot tear.
     fn file_status_memory(&self, path: &str) -> FsResult<FileStatus> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             // Reads stay available while the restore flag is set: the
             // snapshot protocol is the pre-S4 safe reader in that window.
             let plan_epoch = match Self::checked_live_epoch(&fs_dir) {
@@ -2867,7 +3143,7 @@ impl MasterFilesystem {
             let plan = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
             drop(fs_dir);
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
                 Ok(epoch) => epoch,
                 Err(_) => {
@@ -2926,7 +3202,7 @@ impl MasterFilesystem {
     /// directory attributes together. Also the safe reader while the restore
     /// flag is set, mirroring the old hot-path semantics.
     fn file_status_snapshot(&self, path: &str) -> FsResult<FileStatus> {
-        let fs_dir = self.fs_dir.view().unwrap();
+        let fs_dir = self.fs_dir.view()?;
         let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
         let resolved = snapshot.resolve_path(path)?;
         let inode = resolved
@@ -2940,7 +3216,7 @@ impl MasterFilesystem {
     /// identity protocol as [`Self::file_status_memory`].
     fn exists_memory(&self, path: &str) -> FsResult<bool> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             let plan_epoch = match Self::checked_live_epoch(&fs_dir) {
                 Ok(epoch) => epoch,
                 Err(_) => {
@@ -2951,7 +3227,7 @@ impl MasterFilesystem {
             let plan = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
             drop(fs_dir);
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
                 Ok(epoch) => epoch,
                 Err(_) => {
@@ -2984,7 +3260,7 @@ impl MasterFilesystem {
     /// inode rows, so a row deleted ahead of its journal publication never
     /// reports the live edge alone.
     fn exists_snapshot(&self, path: &str) -> FsResult<bool> {
-        let fs_dir = self.fs_dir.view().unwrap();
+        let fs_dir = self.fs_dir.view()?;
         let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
         Ok(snapshot.resolve_path(path)?.is_full())
     }
@@ -3004,7 +3280,7 @@ impl MasterFilesystem {
             Ok(_) | Err(_) => {
                 // After publication failure, the committed store and live tree
                 // may disagree in either direction. Wait for writers to drain.
-                let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+                let fs_dir = self.cold_acquire_wait()?;
                 let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
                 if snapshot.resolve_path(path)?.is_full() {
                     return Ok(Self::resolve_path(&fs_dir, path)?.is_full());
@@ -3028,7 +3304,7 @@ impl MasterFilesystem {
         let (is_glob_pattern, _) = parse_glob_pattern(path);
         if is_glob_pattern {
             // Glob resolution still traverses live inode pointers.
-            let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+            let fs_dir = self.cold_acquire_wait()?;
             let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path)?;
             let mut all_statuses = Vec::new();
             for path in &paths {
@@ -3084,7 +3360,7 @@ impl MasterFilesystem {
         page_opts: &ListOptions,
     ) -> FsResult<Vec<FileStatus>> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             let plan_epoch = match Self::checked_live_epoch(&fs_dir) {
                 Ok(epoch) => epoch,
                 Err(_) => {
@@ -3095,7 +3371,7 @@ impl MasterFilesystem {
             let plan = Self::plan_memory_read(&fs_dir, path, true, page_opts)?;
             drop(fs_dir);
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
                 Ok(epoch) => epoch,
                 Err(_) => {
@@ -3179,7 +3455,7 @@ impl MasterFilesystem {
         path: &str,
         page_opts: &ListOptions,
     ) -> FsResult<Vec<FileStatus>> {
-        let fs_dir = self.fs_dir.view().unwrap();
+        let fs_dir = self.fs_dir.view()?;
         let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
         let resolved = snapshot.resolve_path(path)?;
         let inode = resolved
@@ -3376,28 +3652,31 @@ impl MasterFilesystem {
         last_block: Option<ExtendedBlock>,
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
-        self.run_metadata_write(|| {
-            if let Some(located) = self.add_block_sharded(
-                path,
-                inode_id,
-                client_addr.clone(),
-                commit_blocks.clone(),
-                exclude_workers.clone(),
-                file_len,
-                last_block.clone(),
-            )? {
-                return Ok(located);
-            }
-            self.add_block_with_global_lock(
-                path,
-                inode_id,
-                client_addr,
-                commit_blocks,
-                exclude_workers,
-                file_len,
-                last_block,
-            )
-        })
+        self.run_metadata_write_with_fallback(
+            || {
+                self.add_block_sharded(
+                    path,
+                    inode_id,
+                    client_addr.clone(),
+                    commit_blocks.clone(),
+                    exclude_workers.clone(),
+                    file_len,
+                    last_block.clone(),
+                )
+            },
+            |fs_dir| {
+                self.add_block_with_global_lock_body(
+                    fs_dir,
+                    path,
+                    inode_id,
+                    client_addr.clone(),
+                    commit_blocks.clone(),
+                    exclude_workers.clone(),
+                    file_len,
+                    last_block.clone(),
+                )
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3410,7 +3689,7 @@ impl MasterFilesystem {
         exclude_workers: Vec<u32>,
         file_len: i64,
         last_block: Option<ExtendedBlock>,
-    ) -> FsResult<Option<LocatedBlock>> {
+    ) -> FsResult<ShardedOutcome<LocatedBlock>> {
         const MAX_RETRIES: usize = 3;
         let mut commit_block_ids: Vec<i64> =
             commit_blocks.iter().map(|block| block.block_id).collect();
@@ -3426,11 +3705,11 @@ impl MasterFilesystem {
         for _ in 0..MAX_RETRIES {
             let (ids, components_len, full, restore_epoch) = match self.resolve_edge_ids(path) {
                 Ok(value) => value,
-                Err(_) if expected_id.is_some() => return Ok(None),
+                Err(_) if expected_id.is_some() => return Ok(ShardedOutcome::Fallback),
                 Err(error) => return Err(error),
             };
             if !full || ids.len() < 2 || expected_id.is_some_and(|id| ids.last() != Some(&id)) {
-                return Ok(None);
+                return Ok(ShardedOutcome::Fallback);
             }
             let target_depth = ids.len() - 1;
             let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
@@ -3454,10 +3733,10 @@ impl MasterFilesystem {
             let _inode_locks = self.lock_sharded_requests(requests, false);
 
             let next_id = {
-                let fs_dir = self.fs_dir.view().unwrap();
+                let fs_dir = self.fs_dir.view()?;
                 let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
                     Ok(epoch) => epoch,
-                    Err(_) if expected_id.is_some() => return Ok(None),
+                    Err(_) if expected_id.is_some() => return Ok(ShardedOutcome::Fallback),
                     Err(error) => return Err(error),
                 };
                 if locked_epoch != restore_epoch {
@@ -3466,14 +3745,14 @@ impl MasterFilesystem {
                 let inp = match Self::resolve_locked_path(&fs_dir, path, &ids, components_len) {
                     Ok(Some(inp)) => inp,
                     Ok(None) => continue,
-                    Err(_) if expected_id.is_some() => return Ok(None),
+                    Err(_) if expected_id.is_some() => return Ok(ShardedOutcome::Fallback),
                     Err(error) => return Err(error),
                 };
                 let Some(inode) = inp.get_last_inode() else {
                     continue;
                 };
                 if expected_id.is_some_and(|id| id != inode.id()) || !inode.is_file() {
-                    return Ok(None);
+                    return Ok(ShardedOutcome::Fallback);
                 }
                 inode
                     .as_file_ref()?
@@ -3488,7 +3767,7 @@ impl MasterFilesystem {
                 .block_location_locks
                 .write_workers_blocks(&commit_worker_ids, &block_ids);
 
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
@@ -3516,7 +3795,11 @@ impl MasterFilesystem {
                     file_type: file.file_type,
                     alloc_opts: next.alloc_opts.clone(),
                 };
-                return Ok(Some(self.create_locate_block(path, extend_block, &locs)?));
+                return Ok(ShardedOutcome::Done(self.create_locate_block(
+                    path,
+                    extend_block,
+                    &locs,
+                )?));
             }
 
             let block_size = file.block_size as i64;
@@ -3541,18 +3824,19 @@ impl MasterFilesystem {
                     return Err(error);
                 }
             };
-            return Ok(Some(LocatedBlock {
+            return Ok(ShardedOutcome::Done(LocatedBlock {
                 block,
                 locs: choose_workers,
                 has_spdk,
             }));
         }
 
-        Ok(None)
+        Ok(ShardedOutcome::Fallback)
     }
 
-    fn add_block_with_global_lock(
+    fn add_block_with_global_lock_body(
         &self,
+        fs_dir: &mut FsDir,
         path: &str,
         inode_id: Option<i64>,
         client_addr: ClientAddress,
@@ -3561,8 +3845,7 @@ impl MasterFilesystem {
         file_len: i64,
         last_block: Option<ExtendedBlock>,
     ) -> FsResult<LocatedBlock> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        let inode = Self::resolve_file_inode(fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
 
         // File allows concurrent writes, 'previous' is the previous block,
@@ -3666,9 +3949,29 @@ impl MasterFilesystem {
     ) -> FsResult<Option<FileBlocks>> {
         let path = path.as_ref();
         let client_name = client_name.as_ref().to_string();
-        self.run_metadata_write(|| {
-            self.complete_file_sharded(path, inode_id, len, commit_blocks, &client_name, options)
-        })
+        self.run_metadata_write_with_fallback(
+            || {
+                self.complete_file_sharded(
+                    path,
+                    inode_id,
+                    len,
+                    commit_blocks.clone(),
+                    &client_name,
+                    options.clone(),
+                )
+            },
+            |fs_dir| {
+                self.complete_file_with_global_lock_body(
+                    fs_dir,
+                    path,
+                    inode_id,
+                    len,
+                    commit_blocks.clone(),
+                    &client_name,
+                    options.clone(),
+                )
+            },
+        )
     }
 
     pub fn get_file_blocks(
@@ -3767,7 +4070,7 @@ impl MasterFilesystem {
                 context: {"path" => path},
             }
             let _locks = self.lock_sharded_requests(requests, false);
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
@@ -3780,7 +4083,7 @@ impl MasterFilesystem {
         let (blocks, needs_touch, inode_id, restore_epoch) = match result {
             Some(result) => result,
             None => {
-                let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+                let fs_dir = self.cold_acquire_wait()?;
                 let inp = Self::resolve_path(&fs_dir, path)?;
                 read(&fs_dir, &inp)?
             }
@@ -3794,9 +4097,9 @@ impl MasterFilesystem {
                     // window the same as the blocking write path.
                     let epoch_check = self.journal_writer.ensure_metadata_epoch(epoch);
                     let result = epoch_check.and_then(|()| {
-                        self.run_admitted_metadata_write(|| {
-                            self.touch_atime_sharded(path, inode_id, restore_epoch)
-                        })
+                        let scope = self.journal_writer.begin_commit_scope();
+                        let r = self.touch_atime_sharded(path, inode_id, restore_epoch);
+                        scope.wait().and(r)
                     });
                     drop(commit_guard);
                     if result.is_ok() {
@@ -3849,7 +4152,7 @@ impl MasterFilesystem {
             }
             let _locks = self.lock_sharded_requests(requests, false);
 
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             let Ok(locked_epoch) = Self::checked_live_epoch(&fs_dir) else {
                 return Ok(());
             };
@@ -3918,7 +4221,7 @@ impl MasterFilesystem {
         let (status, block_snapshots, worker_snapshots) = {
             // The snapshot includes mutable inode content; exclude sharded
             // writers until it has the same inode-lock protocol as block reads.
-            let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+            let fs_dir = self.cold_acquire_wait()?;
             let inp = Self::resolve_path(&fs_dir, path)?;
             let inode = match inp.get_last_inode() {
                 Some(inode) => inode,
@@ -4000,12 +4303,13 @@ impl MasterFilesystem {
         page_token: Option<String>,
         page_size: usize,
     ) -> FsResult<CvMetadataSnapshotPage> {
+        let mut fs_dir = self.cold_acquire_wait()?;
         if page_size == 0 {
             return err_box!("cv metadata snapshot page_size must be greater than 0");
         }
 
         // Traversal reads mutable inode contents as well as directory topology.
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+
         let epoch = fs_dir.op_id.get();
         let start_after = page_token.filter(|token| !token.is_empty());
         let mut entries = Vec::with_capacity(page_size.saturating_add(1));
@@ -4169,7 +4473,7 @@ impl MasterFilesystem {
         let Some(_snapshot_guard) = self.metadata_commit_gate.close_and_enter_if_open() else {
             return err_box!("metadata commit gate is already closed");
         };
-        let fs_dir = self.fs_dir.view().unwrap();
+        let fs_dir = self.fs_dir.view()?;
         fs_dir.create_snapshot(force)
     }
 
@@ -4180,36 +4484,39 @@ impl MasterFilesystem {
     }
 
     pub fn sum_hash(&self) -> CommonResult<u128> {
+        let mut fs_dir = self.cold_acquire_wait()?;
         // Hashing traverses and clones live inode contents, not just topology.
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+
         fs_dir.sum_hash()
     }
 
     pub fn last_inode_id(&self) -> i64 {
-        let fs_dir = self.fs_dir.view().unwrap();
-        fs_dir.last_inode_id()
+        // Same counter instance the live FsDir owns: a closed view (cold
+        // window / FAILED) must not fabricate a zero for metrics scrapes.
+        self.inode_id_counter.current()
     }
 
     pub fn get_file_counts(&self) -> (i64, i64) {
-        let fs_dir = self.fs_dir.view().unwrap();
-        fs_dir.get_file_counts()
+        // Same FileSystemStats instance the live store owns: a closed view
+        // must not fabricate zeros for metrics scrapes.
+        self.fs_stats_counter.counts()
     }
 
     // Create a directory number based on rocksdb data for testing.
     pub fn create_tree(&self) -> CommonResult<InodeView> {
-        let fs_dir = self.fs_dir.view().unwrap();
+        let fs_dir = self.fs_dir.view()?;
         fs_dir.create_tree()
     }
 
     // Restore in-memory tree from RocksDB (for testing without Raft).
     // In production, Raft automatically restores via apply_snapshot().
     pub fn restore_from_rocksdb(&self) -> CommonResult<()> {
-        let mut fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let mut fs_dir = self.cold_acquire_wait()?;
         fs_dir.restore_from_rocksdb()
     }
 
     fn block_inode_state(&self, id: i64) -> FsResult<BlockInodeState> {
-        let fs_dir = self.fs_dir.view().unwrap();
+        let fs_dir = self.fs_dir.view()?;
         fs_dir.block_inode_state(id)
     }
 
@@ -4299,7 +4606,7 @@ impl MasterFilesystem {
             let _location_locks = self
                 .block_location_locks
                 .write_worker_blocks(list.worker_id, &block_ids);
-            self.block_report_locked(list, replication_handler)
+            self.block_report_locked(&list, replication_handler.clone())
         })
     }
 
@@ -4322,7 +4629,7 @@ impl MasterFilesystem {
             let _location_locks = self
                 .block_location_locks
                 .write_worker_blocks(list.worker_id, &block_ids);
-            self.block_report_locked(list, replication_handler)
+            self.block_report_locked(&list, replication_handler.clone())
         })
         .map(Some)
     }
@@ -4372,14 +4679,14 @@ impl MasterFilesystem {
             let _location_locks = self
                 .block_location_locks
                 .write_worker_blocks(list.worker_id, &block_ids);
-            self.block_report_locked(list, replication_handler)
+            self.block_report_locked(&list, replication_handler.clone())
         })
         .map(Some)
     }
 
     fn block_report_locked(
         &self,
-        list: BlockReportList,
+        list: &BlockReportList,
         replication_handler: Option<MasterReplicationHandler>,
     ) -> FsResult<BlockReportResult> {
         // @todo check cluster.
@@ -4439,7 +4746,7 @@ impl MasterFilesystem {
         let mut delete_blocks = Vec::new();
         let mut missing_blocks = 0usize;
         let mut not_file_blocks = 0usize;
-        for item in list.blocks {
+        for item in &list.blocks {
             match item.status {
                 BlockReportStatus::Finalized | BlockReportStatus::Writing => {
                     let defer_writing_delete =
@@ -4671,7 +4978,7 @@ impl MasterFilesystem {
         reported_blocks: HashSet<i64>,
     ) -> FsResult<Vec<i64>> {
         let existing_blocks = {
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             fs_dir.get_worker_block_ids(worker_id)?
         };
 
@@ -4698,7 +5005,7 @@ impl MasterFilesystem {
                     );
                     return Ok(false);
                 }
-                self.apply_block_report_batch_locked(worker_id, batch, false)?;
+                self.apply_block_report_batch_locked(worker_id, batch.clone(), false)?;
                 Ok(true)
             })?;
             if !applied {
@@ -4728,7 +5035,7 @@ impl MasterFilesystem {
             }
             // Inode state is read from the store; the namespace guard excludes
             // restore, while block/worker locks serialize location changes.
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             let mut accepted = Vec::with_capacity(chunk.len());
             for (add, block_id, location) in chunk {
                 if !add {
@@ -4785,11 +5092,8 @@ impl MasterFilesystem {
                     worker_id
                 )));
             }
-            let added = self
-                .fs_dir
-                .view()
-                .unwrap()
-                .add_replication_location_if_needed(block_id, location)?;
+            let view = self.fs_dir.view()?;
+            let added = view.add_replication_location_if_needed(block_id, location.clone())?;
             // Completion is newer evidence even if the location was already
             // present, so an older full report cannot safely reconcile it.
             self.invalidate_full_block_state(worker_id);
@@ -4828,14 +5132,17 @@ impl MasterFilesystem {
 
     fn delete_locations_unchecked(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
         let block_ids = {
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             fs_dir.block_ids_for_worker(worker_id)?
         };
         let removed_block_ids = self.run_metadata_write(|| {
+            // Shared view + location locks (R4: no cold wait inside object
+            // locks); Busy fails the batch and the lost-worker retry re-issues
+            // it.
             let _location_locks = self
                 .block_location_locks
                 .write_worker_blocks(worker_id, &block_ids);
-            let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+            let fs_dir = self.fs_dir.view()?;
             fs_dir.delete_locations(worker_id)
         })?;
         let mut invalidated = CacheInvalidationResult::default();
@@ -4858,12 +5165,46 @@ impl MasterFilesystem {
                     description: "Before requesting cache invalidation inode write locks",
                     context: {
                         "worker_id" => worker_id,
-                        "data_dir" => self.fs_dir.view().unwrap().get_rocks_store().db.conf().data_dir.clone(),
+                        "data_dir" => self
+                            .fs_dir
+                            .view()
+                            .map(|v| v.get_rocks_store()
+                            .db
+                            .conf()
+                            .data_dir
+                            .clone())
+                            .unwrap_or_default(),
                     },
                 }
+                // R4: plan the candidate files' FULL block sets from a short
+                // view, then drop the view and acquire the complete object
+                // lock set (every block of every candidate file, plus the
+                // inode write locks) before re-opening the view. The cache
+                // check inside invalidate_lost_cache_files reads block
+                // locations, so it must not race a concurrent location write.
+                // R4 order: no view is held while waiting for the inode
+                // locks. The full block set is sampled under the inode locks
+                // (short view, released before the location locks), and the
+                // final verification re-opens the view under both lock sets.
                 let _inode_guard = self.inode_locks.lock_many(&inode_requests);
-                let _location_locks = self.block_location_locks.write_blocks(chunk);
-                let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+                let full_block_ids: Vec<i64> = {
+                    let view = self.fs_dir.view()?;
+                    let inode_ids: Vec<i64> = chunk
+                        .iter()
+                        .map(|block_id| crate::master::meta::InodeId::get_id(*block_id))
+                        .collect();
+                    let mut ids = Vec::new();
+                    for inode_id in inode_ids {
+                        if let Some(inode) = view.store.get_inode(inode_id, None)? {
+                            if let crate::master::meta::inode::InodeView::File(file) = &inode {
+                                ids.extend(file.blocks.iter().map(|b| b.id));
+                            }
+                        }
+                    }
+                    ids
+                };
+                let _location_locks = self.block_location_locks.write_blocks(&full_block_ids);
+                let fs_dir = self.fs_dir.view()?;
                 fs_dir.invalidate_lost_cache_files(chunk)
             });
             match result {
@@ -4896,23 +5237,66 @@ impl MasterFilesystem {
         })
     }
 
-    pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
-        self.run_metadata_write(|| {
-            let path = path.as_ref();
-            if opts.recursive {
-                // Descendant files may have hard links outside this subtree;
-                // locking only the directory path does not protect them.
-                let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-                Self::checked_live_epoch(&fs_dir)?;
-                let inp = Self::resolve_path(&fs_dir, path)?;
-                Self::check_not_reserved_path(path)?;
-                return fs_dir.set_attr(inp, opts);
+    /// Collects every inode id reachable from a live directory node. The
+    /// caller holds the cold handle, so the tree is stable while walking.
+    fn collect_subtree_inode_ids(node: &Arc<DirNode>, out: &mut Vec<i64>) {
+        for child in node.children.read_all() {
+            out.push(child.id());
+            if let Ok(dir) = child.as_dir_ref() {
+                if let Some(handle) = dir.node.as_ref() {
+                    Self::collect_subtree_inode_ids(handle, out);
+                }
             }
-            let resolved = self.resolve_edge_ids(path)?;
-            Self::check_not_pending_path(path)?;
-            Self::check_not_reserved_path(path)?;
-            self.set_attr_single_path_sharded(path, opts, resolved)
-        })
+        }
+    }
+
+    pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
+        self.run_metadata_write_with_fallback(
+            || {
+                let path = path.as_ref();
+                if opts.recursive {
+                    // Recursive propagation touches the whole subtree (files
+                    // may have hard links outside): the global-lock (exclusive
+                    // owner) body owns it — no DFS pre-collection or repeated
+                    // inode locks.
+                    return Ok(ShardedOutcome::Fallback);
+                }
+                let resolved = self.resolve_edge_ids(path)?;
+                Self::check_not_pending_path(path)?;
+                Self::check_not_reserved_path(path)?;
+                self.set_attr_single_path_sharded(path, opts.clone(), resolved)
+            },
+            |fs_dir| {
+                if opts.recursive {
+                    // Exclusive subtree sweep: locks serialize propagation
+                    // against sharded single-inode writers.
+                    let inp = Self::resolve_path(fs_dir, path.as_ref())?;
+                    Self::check_not_reserved_path(path.as_ref())?;
+                    let mut inode_ids = Vec::new();
+                    if let Some(root) = inp.get_last_inode() {
+                        inode_ids.push(root.id());
+                        if let Ok(dir) = root.as_ref().as_dir_ref() {
+                            if let Some(handle) = dir.node.as_ref() {
+                                Self::collect_subtree_inode_ids(handle, &mut inode_ids);
+                            }
+                        }
+                    }
+                    inode_ids.sort_unstable();
+                    inode_ids.dedup();
+                    let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = inode_ids
+                        .iter()
+                        .enumerate()
+                        .map(|(depth, id)| InodeLockRequest::write(depth, *id))
+                        .collect();
+                    let _locks = self.inode_locks.lock_many(&requests);
+                    let inp = Self::resolve_path(fs_dir, path.as_ref())?;
+                    return fs_dir.set_attr(inp, opts.clone());
+                }
+                let inp = Self::resolve_path(fs_dir, path.as_ref())?;
+                Self::check_not_reserved_path(path.as_ref())?;
+                fs_dir.set_attr(inp, opts.clone())
+            },
+        )
     }
 
     pub fn symlink<T: AsRef<str>>(
@@ -4936,41 +5320,60 @@ impl MasterFilesystem {
     ) -> FsResult<()> {
         let target = target.as_ref().to_string();
         let link = link.as_ref().to_string();
-        self.run_metadata_write(|| {
-            let resolved = self.resolve_edge_ids(&link)?;
-            Self::check_not_pending_path(&link)?;
-            Self::check_not_reserved_path(&link)?;
-            let single_parent = !force && !resolved.2 && resolved.0.len() + 1 >= resolved.1;
-            if single_parent {
-                self.symlink_single_parent_sharded(
-                    &target,
-                    &link,
+        self.run_metadata_write_with_fallback(
+            || {
+                let resolved = self.resolve_edge_ids(&link)?;
+                Self::check_not_pending_path(&link)?;
+                Self::check_not_reserved_path(&link)?;
+                let single_parent = !force && !resolved.2 && resolved.0.len() + 1 >= resolved.1;
+                if single_parent {
+                    self.symlink_single_parent_sharded(
+                        &target,
+                        &link,
+                        mode,
+                        owner.clone(),
+                        group.clone(),
+                        resolved,
+                    )?;
+                    return Ok(ShardedOutcome::Done(()));
+                }
+                // Planning point: symlink needs the global lock.
+                Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| {
+                let inp = Self::resolve_path(fs_dir, &link)?;
+                Self::check_not_reserved_path(&link)?;
+                fs_dir.symlink(
+                    target.clone(),
+                    inp,
+                    force,
                     mode,
                     owner.clone(),
                     group.clone(),
-                    resolved,
                 )
-            } else {
-                self.symlink_with_global_lock(&target, &link, force, mode, owner, group)
-            }
-        })
+            },
+        )
     }
 
     pub fn link<T: AsRef<str>>(&self, src_path: T, dst_path: T) -> FsResult<()> {
         let src_path = src_path.as_ref().to_string();
         let dst_path = dst_path.as_ref().to_string();
-        self.run_metadata_write(|| {
-            let src = self.resolve_edge_ids(&src_path)?;
-            let dst = self.resolve_edge_ids(&dst_path)?;
-            Self::check_not_reserved_path(&src_path)?;
-            Self::check_not_reserved_path(&dst_path)?;
-            let single_parent = src.2 && !dst.2 && dst.0.len() + 1 >= dst.1;
-            if single_parent {
-                self.link_single_parent_sharded(&src_path, &dst_path, (src, dst))
-            } else {
-                self.link_with_global_lock(&src_path, &dst_path)
-            }
-        })
+        self.run_metadata_write_with_fallback(
+            || {
+                let src = self.resolve_edge_ids(&src_path)?;
+                let dst = self.resolve_edge_ids(&dst_path)?;
+                Self::check_not_reserved_path(&src_path)?;
+                Self::check_not_reserved_path(&dst_path)?;
+                let single_parent = src.2 && !dst.2 && dst.0.len() + 1 >= dst.1;
+                if single_parent {
+                    self.link_single_parent_sharded(&src_path, &dst_path, (src, dst))?;
+                    return Ok(ShardedOutcome::Done(()));
+                }
+                // Planning point: link needs the global lock.
+                Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| self.link_with_global_lock_body(fs_dir, &src_path, &dst_path),
+        )
     }
 
     pub fn resize<T: AsRef<str>>(&self, path: T, opts: FileAllocOpts) -> FsResult<FileBlocks> {
@@ -4996,35 +5399,41 @@ impl MasterFilesystem {
             self.worker_manager.read().available_bytes()
         };
 
-        let (del_res, inode_id) = self.run_metadata_write(|| {
-            if let Some(result) =
-                self.resize_single_file_sharded(path, inode_id, opts.clone(), available)?
-            {
-                return Ok(result);
-            }
-            self.resize_with_global_lock(path, inode_id, opts, available)
-        })?;
+        let (del_res, inode_id) = self.run_metadata_write_with_fallback(
+            || {
+                if let Some(result) =
+                    self.resize_single_file_sharded(path, inode_id, opts.clone(), available)?
+                {
+                    return Ok(ShardedOutcome::Done(result));
+                }
+                // Planning point: resize needs the global lock.
+                Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| {
+                self.resize_with_global_lock_body(fs_dir, path, inode_id, opts.clone(), available)
+            },
+        )?;
 
         if !del_res.blocks.is_empty() {
             self.worker_manager.write().remove_blocks(&del_res);
         }
 
-        let fs_dir = self.fs_dir.view().unwrap();
+        let fs_dir = self.fs_dir.view()?;
         let inode = Self::resolve_file_inode(&fs_dir, path, Some(inode_id))?;
         let file = inode.as_file_ref()?;
         let locs = self.get_block_locs(path, &fs_dir, file)?;
         Ok(FileBlocks::new(inode.to_file_status(path)?, locs))
     }
 
-    fn resize_with_global_lock(
+    fn resize_with_global_lock_body(
         &self,
+        fs_dir: &mut FsDir,
         path: &str,
         inode_id: Option<i64>,
         opts: FileAllocOpts,
         available: i64,
     ) -> FsResult<(DeleteResult, i64)> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        let mut inode = Self::resolve_file_inode(fs_dir, path, inode_id)?;
         if inode_id.is_some() {
             // A by-id request may carry a stale path, so also check where
             // the inode actually lives.
@@ -5058,7 +5467,7 @@ impl MasterFilesystem {
             }
             let target_id = *ids.last().expect("full path has a target");
             let target = {
-                let fs_dir = self.fs_dir.view().unwrap();
+                let fs_dir = self.fs_dir.view()?;
                 match fs_dir.store.get_inode(target_id, None) {
                     Ok(target) => target,
                     Err(_) if expected_id.is_some() => return Ok(None),
@@ -5090,7 +5499,7 @@ impl MasterFilesystem {
             }
             let _inode_locks = self.lock_sharded_requests(requests, false);
             let _location_locks = self.block_location_locks.write_blocks(&block_ids);
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
                 Ok(epoch) => epoch,
                 Err(_) if expected_id.is_some() => return Ok(None),
@@ -5143,30 +5552,43 @@ impl MasterFilesystem {
         exclude_workers: Vec<u32>,
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
-        self.run_metadata_write(|| {
-            if let Some(located) = self.assign_worker_sharded(
-                path,
-                inode_id,
-                block.clone(),
-                client_addr.clone(),
-                exclude_workers.clone(),
-            )? {
-                return Ok(located);
-            }
-            self.assign_worker_with_global_lock(path, inode_id, block, client_addr, exclude_workers)
-        })
+        self.run_metadata_write_with_fallback(
+            || {
+                if let Some(located) = self.assign_worker_sharded(
+                    path,
+                    inode_id,
+                    block.clone(),
+                    client_addr.clone(),
+                    exclude_workers.clone(),
+                )? {
+                    return Ok(ShardedOutcome::Done(located));
+                }
+                // Planning point: assign needs the global lock.
+                Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| {
+                self.assign_worker_with_global_lock_body(
+                    fs_dir,
+                    path,
+                    inode_id,
+                    block.clone(),
+                    client_addr.clone(),
+                    exclude_workers.clone(),
+                )
+            },
+        )
     }
 
-    fn assign_worker_with_global_lock(
+    fn assign_worker_with_global_lock_body(
         &self,
+        fs_dir: &mut FsDir,
         path: &str,
         inode_id: Option<i64>,
         block: ExtendedBlock,
         client_addr: ClientAddress,
         exclude_workers: Vec<u32>,
     ) -> FsResult<LocatedBlock> {
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        let mut inode = Self::resolve_file_inode(fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
         let block_size = file.block_size as i64;
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
@@ -5239,7 +5661,7 @@ impl MasterFilesystem {
             }
             let _inode_locks = self.lock_sharded_requests(requests, false);
             let _location_lock = self.block_location_locks.write_blocks(&[block.id]);
-            let fs_dir = self.fs_dir.view().unwrap();
+            let fs_dir = self.fs_dir.view()?;
             let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
                 Ok(epoch) => epoch,
                 Err(_) if expected_id.is_some() => return Ok(None),
@@ -5298,99 +5720,117 @@ impl MasterFilesystem {
     pub fn get_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
-        // Retain the namespace guard while resolving the lock target.
-        let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        if !InodeView::is_full_path(path)
-            || (path != PATH_SEPARATOR && path.ends_with(PATH_SEPARATOR))
-        {
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            return fs_dir.get_lock(inp, &lock, self.conf.lock_expire_time_ms());
-        }
-        fs_dir.store.ensure_available()?;
-
-        let root = fs_dir.root_node();
-        let mut inode_id = root.id;
-        let mut children = Some(root.children.clone());
-        let mut full = true;
-        if path != PATH_SEPARATOR {
-            for component in path.split(PATH_SEPARATOR).skip(1) {
-                let Some(child) = children
-                    .as_ref()
-                    .and_then(|children| children.get_child_edge(component))
-                else {
-                    full = false;
-                    break;
-                };
-                match child {
-                    ChildEdge::Dir(node) => {
-                        inode_id = node.id;
-                        children = Some(node.children.clone());
-                    }
-                    ChildEdge::FileId(id) => {
-                        let inode = try_option!(
-                            fs_dir.store.get_inode(id, Some(component))?,
-                            "Failed to load inode {} from store",
-                            id
-                        );
-                        inode_id = inode.id();
-                        children = None;
-                    }
-                }
+        // Shared-view read under the target chain's inode read locks, the same
+        // plan/lock/re-verify protocol as file_status_memory: the lock metadata
+        // lives on the target inode, and the chain locks keep a concurrent
+        // rename from moving the target mid-read.
+        for _ in 0..Self::MEMORY_READ_ATTEMPTS {
+            let fs_dir = self.fs_dir.view()?;
+            let plan_epoch = match Self::checked_live_epoch(&fs_dir) {
+                Ok(epoch) => epoch,
+                Err(_) => return self.get_lock_snapshot(path, &lock),
+            };
+            let plan = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
+            drop(fs_dir);
+            let _locks = self.inode_locks.lock_many(&plan.lock_requests());
+            let fs_dir = self.fs_dir.view()?;
+            let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
+                Ok(epoch) => epoch,
+                Err(_) => return self.get_lock_snapshot(path, &lock),
+            };
+            if locked_epoch != plan_epoch {
+                continue;
             }
+            let verified = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
+            if !plan.matches(&verified) {
+                continue;
+            }
+            if !verified.full {
+                return err_ext!(FsError::file_not_found(path));
+            }
+            let Some(target) = verified.target_edge.as_ref().map(ChildEdge::id) else {
+                return err_ext!(FsError::file_not_found(path));
+            };
+            let mut meta = fs_dir.store.get_locks(target)?;
+            return Ok(meta.check_conflict(&lock, self.conf.lock_expire_time_ms()));
         }
-        Self::check_not_pending_path(path)?;
-        if !full {
-            return err_ext!(FsError::file_not_found(path));
-        }
+        // Bounded attempts exhausted: the snapshot read is the safe reader.
+        self.get_lock_snapshot(path, &lock)
+    }
 
-        let mut meta = fs_dir.store.get_locks(inode_id)?;
-        Ok(meta.check_conflict(&lock, self.conf.lock_expire_time_ms()))
+    /// Pre-S4 lock read: one store snapshot resolves the target and reads its
+    /// lock metadata.
+    fn get_lock_snapshot(&self, path: &str, lock: &FileLock) -> FsResult<Option<FileLock>> {
+        let fs_dir = self.fs_dir.view()?;
+        let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+        let resolved = snapshot.resolve_path(path)?;
+        let inode = resolved
+            .target()
+            .ok_or_else(|| FsError::file_not_found(path))?;
+        let mut meta = fs_dir.store.get_locks(inode.id())?;
+        Ok(meta.check_conflict(lock, self.conf.lock_expire_time_ms()))
     }
 
     pub fn set_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
-        self.run_metadata_write(|| {
-            const MAX_RETRIES: usize = 3;
-            for _ in 0..MAX_RETRIES {
-                let (ids, components_len, full, epoch) = self.resolve_edge_ids(path)?;
-                Self::check_not_pending_path(path)?;
-                if !full {
-                    break;
+        self.run_metadata_write_with_fallback(
+            || {
+                const MAX_RETRIES: usize = 3;
+                for _ in 0..MAX_RETRIES {
+                    let (ids, components_len, full, epoch) = self.resolve_edge_ids(path)?;
+                    Self::check_not_pending_path(path)?;
+                    if !full {
+                        // Side-effect-free planning point: unresolved path.
+                        return Ok(ShardedOutcome::Fallback);
+                    }
+                    let target_depth = ids.len() - 1;
+                    let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
+                        .iter()
+                        .enumerate()
+                        .map(|(depth, id)| {
+                            if depth == target_depth {
+                                InodeLockRequest::write(depth, *id)
+                            } else {
+                                InodeLockRequest::read(depth, *id)
+                            }
+                        })
+                        .collect();
+                    #[cfg(test)]
+                    crate::fault_point! {
+                        sync,
+                        name: "master.metadata.set_lock_planned",
+                        description: "Lock path resolved before inode locks",
+                        context: {"path" => path},
+                    }
+                    #[cfg(test)]
+                    memory_read_gates::park(
+                        "master.metadata.set_lock_planned",
+                        std::time::Duration::from_secs(5),
+                    );
+                    let _locks = self.lock_sharded_requests(requests, target_depth == 0);
+                    let fs_dir = self.fs_dir.view()?;
+                    if epoch != Self::checked_live_epoch(&fs_dir)? {
+                        continue;
+                    }
+                    let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)?
+                    else {
+                        continue;
+                    };
+                    return Ok(ShardedOutcome::Done(fs_dir.set_lock(
+                        inp,
+                        lock.clone(),
+                        self.conf.lock_expire_time_ms(),
+                    )?));
                 }
-                let target_depth = ids.len() - 1;
-                let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
-                    .iter()
-                    .enumerate()
-                    .map(|(depth, id)| {
-                        if depth == target_depth {
-                            InodeLockRequest::write(depth, *id)
-                        } else {
-                            InodeLockRequest::read(depth, *id)
-                        }
-                    })
-                    .collect();
-                #[cfg(test)]
-                crate::fault_point! {
-                    sync,
-                    name: "master.metadata.set_lock_planned",
-                    description: "Lock path resolved before inode locks",
-                    context: {"path" => path},
-                }
-                let _locks = self.lock_sharded_requests(requests, target_depth == 0);
-                let fs_dir = self.fs_dir.view().unwrap();
-                if epoch != Self::checked_live_epoch(&fs_dir)? {
-                    continue;
-                }
-                let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)?
-                else {
-                    continue;
-                };
-                return fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms());
-            }
-            let fs_dir = self.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms())
-        })
+
+                // Retries exhausted with identity churn: side-effect-free fallback.
+                Ok(ShardedOutcome::Fallback)
+            },
+            |fs_dir| {
+                let inp = Self::resolve_path(fs_dir, path)?;
+                fs_dir.set_lock(inp, lock.clone(), self.conf.lock_expire_time_ms())
+            },
+        )
     }
 }
 

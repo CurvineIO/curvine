@@ -37,14 +37,21 @@ fn set_lock_replans_after_parent_replacement() {
         std::thread::yield_now();
     }
     let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    // The worker parks at its pre-lock fault point (set_lock_planned gate),
+    // then waits on the held inode lock. The driver replays the parent
+    // replacement with plain sharded operations (no exclusive window), then
+    // drops the held lock so the worker resumes on the new identity.
     let new_file = if planned {
-        fs.delete("/a", true).unwrap();
+        fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+        fs.mkdir("/a", false).unwrap();
         Some(fs.create("/a/file", true).unwrap())
     } else {
         None
     };
     drop(held);
     let result = worker.join().unwrap();
+    // Cleanup of the moved-away path after the worker finished.
+    fs.delete("/a-moved", true).unwrap();
     runtime.remove(rule_id).unwrap();
     assert!(planned, "set_lock did not reach lock planning");
     assert_ne!(old_file.id, new_file.unwrap().id);
@@ -109,7 +116,7 @@ fn recursive_set_attr_preserves_concurrent_hardlink_update() {
     let result = worker.join().unwrap();
     runtime.remove(rule_id).unwrap();
     assert!(delayed, "recursive set_attr did not reach the commit point");
-    update.unwrap();
+    update.unwrap().unwrap();
     result.unwrap();
     let status = fs.file_status("/alias").unwrap();
     assert_eq!(status.mtime, 1_234_567);

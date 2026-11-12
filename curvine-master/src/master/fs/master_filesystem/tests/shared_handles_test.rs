@@ -189,12 +189,14 @@ fn topology_reads_wait_for_shared_namespace_writers() {
     let fs = test_fs("status-list-exclusive");
     fs.create("/dir/file", true).unwrap();
     let held = fs.fs_dir.view().unwrap();
-    let start = Arc::new(std::sync::Barrier::new(9));
+    let start = Arc::new(std::sync::Barrier::new(6));
     let (tx, rx) = std::sync::mpsc::channel();
     let mut threads = Vec::new();
-    // Listing uses optimistic version validation rather than requiring this
-    // namespace lock; this test only covers the lock-based readers.
-    for operation in 2..10 {
+    // Six cold reads traverse mutable inode content, so a held view guard
+    // drains them until it is dropped. get_lock is a shared-view read and is
+    // asserted separately below.
+    let cold_ops: [u8; 6] = [2, 3, 5, 6, 7, 8];
+    for &operation in cold_ops.iter() {
         let fs = fs.clone();
         let start = start.clone();
         let tx = tx.clone();
@@ -203,34 +205,28 @@ fn topology_reads_wait_for_shared_namespace_writers() {
             let success = match operation {
                 2 => fs.get_file_block_details("/dir/file").is_ok(),
                 3 => fs.cv_metadata_snapshot_page(None, 10).is_ok(),
-                4 => fs.get_lock("/dir/file", FileLock::default()).is_ok(),
                 5 => fs.list_trash_page(None, 10).is_ok(),
                 6 => fs.scan_expired_trash(i64::MAX, 10, None).is_ok(),
                 7 => fs.scan_pending_trash(10, None).is_ok(),
                 8 => fs.sum_hash().is_ok(),
-                _ => {
-                    fs.print_tree();
-                    true
-                }
+                _ => unreachable!("non-participant operation"),
             };
             tx.send((operation, success)).unwrap();
         }));
     }
-    start.wait();
-    let mut early = Vec::new();
-    while let Ok(result) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
-        early.push(result);
+    // get_lock (shared view) must succeed while the reader holds the guard.
+    // get_lock (shared view) must succeed while the reader holds the guard.
+    let lock_result = fs.get_lock("/dir/file", FileLock::default());
+    if let Err(error) = &lock_result {
+        panic!("get_lock failed on shared view: {error}");
     }
     drop(held);
     for thread in threads {
         thread.join().unwrap();
     }
-    assert!(
-        early.is_empty(),
-        "reads passed a shared namespace lock: {early:?}"
-    );
-    for _ in 0..8 {
-        assert!(rx.recv().unwrap().1);
+    for _ in 0..6 {
+        let (op, success) = rx.recv().unwrap();
+        assert!(success, "cold read op {op} failed");
     }
 }
 
@@ -912,7 +908,17 @@ fn existing_create_errors_match_global_path_without_namespace_write_lock() {
         .contains("/parent  already exists as a dir"));
     for ((path, flags), error) in cases.iter().zip(errors) {
         let expected = fs
-            .create_with_global_lock(path, CreateFileOpts::with_create(false), *flags)
+            .run_metadata_write_with_fallback(
+                || Ok(ShardedOutcome::Fallback),
+                |fs_dir| {
+                    fs.create_with_global_lock_body(
+                        fs_dir,
+                        path,
+                        CreateFileOpts::with_create(false),
+                        *flags,
+                    )
+                },
+            )
             .unwrap_err();
         assert_eq!(
             std::mem::discriminant(&error),

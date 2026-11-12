@@ -110,11 +110,7 @@ impl MountManager {
         let mut normalized_options = mnt_opt.clone();
         normalized_options.add_properties = mount.properties;
         self.master_fs.run_metadata_write(|| {
-            let fs_dir = self
-                .master_fs
-                .fs_dir
-                .begin_cold(DEFAULT_COLD_TIMEOUT)
-                .unwrap();
+            let fs_dir = self.master_fs.fs_dir.view()?;
             self.mount_table.add_mount(
                 &fs_dir,
                 assign_id,
@@ -133,11 +129,7 @@ impl MountManager {
             };
             let mut merged = existing.merge_with(mnt_opt.clone());
             Self::normalize_mount_config(&mut merged)?;
-            let fs_dir = self
-                .master_fs
-                .fs_dir
-                .begin_cold(DEFAULT_COLD_TIMEOUT)
-                .unwrap();
+            let fs_dir = self.master_fs.fs_dir.view()?;
             self.mount_table.update_mount(&fs_dir, merged)
         })
     }
@@ -162,11 +154,7 @@ impl MountManager {
 
     pub fn umount(&self, cv_path: &str) -> FsResult<()> {
         self.master_fs.run_metadata_write(|| {
-            let fs_dir = self
-                .master_fs
-                .fs_dir
-                .begin_cold(DEFAULT_COLD_TIMEOUT)
-                .unwrap();
+            let fs_dir = self.master_fs.fs_dir.view()?;
             self.mount_table.umount(&fs_dir, cv_path)
         })
     }

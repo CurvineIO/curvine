@@ -152,18 +152,43 @@ fn mount_publication_waits_for_namespace_lock() {
     let (done_tx, done_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
         started_tx.send(()).unwrap();
-        // The caller acquires the namespace guard before the table
-        // transaction, matching the production ordering.
-        let guard_dir = worker_fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let result = worker_table.add_mount(
-            &guard_dir,
-            42,
-            "/mount",
-            "file:///tmp/mount-publication",
-            &MountOptions::builder().build(),
-        );
-        drop(guard_dir);
-        done_tx.send(result).unwrap();
+        // Mount publication takes the shared view (not a cold window): while
+        // the holder keeps the cold window open, view() reports Busy and the
+        // mount must not publish; once the window closes it succeeds.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match worker_fs.fs_dir.view() {
+                Ok(guard_dir) => {
+                    let result = worker_table.add_mount(
+                        &guard_dir,
+                        42,
+                        "/mount",
+                        "file:///tmp/mount-publication",
+                        &MountOptions::builder().build(),
+                    );
+                    done_tx.send(result).unwrap();
+                    break;
+                }
+                // Temporary cold window: bounded retry. FAILED is terminal.
+                Err(curvine_master::master::meta::NamespaceError::Busy) => {
+                    if std::time::Instant::now() >= deadline {
+                        done_tx
+                            .send(Err(curvine_error::FsError::in_progress_msg(
+                                "mount publication: cold window never reopened",
+                            )))
+                            .unwrap();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    done_tx
+                        .send(Err(curvine_error::FsError::from(e.to_string())))
+                        .unwrap();
+                    break;
+                }
+            }
+        }
     });
     started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let blocked = done_rx.recv_timeout(Duration::from_millis(100));

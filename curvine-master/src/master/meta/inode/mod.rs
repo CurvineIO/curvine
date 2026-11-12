@@ -17,7 +17,7 @@ use curvine_sys::RawPtr;
 mod inode_file;
 pub use self::inode_file::*;
 
-mod inode_dir;
+pub(crate) mod inode_dir;
 pub use self::inode_dir::*;
 
 mod inode_view;

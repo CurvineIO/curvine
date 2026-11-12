@@ -1683,6 +1683,11 @@ impl InodeStore {
         self.fs_stats.counts()
     }
 
+    /// Same stats instance, for view-independent metric accessors.
+    pub(crate) fn fs_stats_handle(&self) -> Arc<FileSystemStats> {
+        self.fs_stats.clone()
+    }
+
     pub fn get_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {
         self.store.get_locations(block_id)
     }

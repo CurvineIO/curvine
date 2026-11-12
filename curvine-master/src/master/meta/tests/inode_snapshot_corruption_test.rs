@@ -37,7 +37,7 @@ fn inode_snapshot_rejects_key_and_payload_id_mismatch() {
     {
         let dir = fs.fs_dir.view().unwrap();
         let store = dir.store_ref();
-        let inode = store.get_inode(second, None).unwrap();
+        let inode = store.get_inode(second, None).unwrap().unwrap();
         let mut batch = store.new_batch();
         batch
             .put_cf_raw(

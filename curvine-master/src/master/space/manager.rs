@@ -462,7 +462,7 @@ impl DirSpaceManager {
         let Ok(normalized) = normalize_tracked_path(path) else {
             return Ok(None);
         };
-        let fs_dir = self.fs.fs_dir.view().unwrap();
+        let fs_dir = self.fs.fs_dir.view()?;
         let snapshot = InodeStoreSnapshot::new(fs_dir.store_ref().checked_read_snapshot()?);
         resolve_dir_id(&snapshot, &normalized)
     }
@@ -611,9 +611,12 @@ impl DirSpaceManager {
         root_id: i64,
         context: &ScanContext,
     ) -> CommonResult<DirSpaceSnapshot> {
-        let lease = {
-            let fs_dir = self.fs.fs_dir.view().unwrap();
-            fs_dir.begin_snapshot_scan()?
+        let lease = match self.fs.fs_dir.view() {
+            Ok(fs_dir) => fs_dir.begin_snapshot_scan()?,
+            Err(e) => {
+                log::warn!("dir-space point scan: namespace unavailable, skipping round: {e}");
+                return Err(e.into());
+            }
         };
         let unpublished = PointScanner::scan(&lease, root_id, context)?;
         drop(lease);
@@ -742,9 +745,12 @@ impl DirSpaceManager {
     fn run_scan(&self, context: &ScanContext) -> CommonResult<DirSpaceSnapshot> {
         // One short store clone; the lease (and its store Arc) is dropped
         // before returning so a pending restore can proceed.
-        let lease = {
-            let fs_dir = self.fs.fs_dir.view().unwrap();
-            fs_dir.begin_snapshot_scan()?
+        let lease = match self.fs.fs_dir.view() {
+            Ok(fs_dir) => fs_dir.begin_snapshot_scan()?,
+            Err(e) => {
+                log::warn!("dir-space scan: namespace unavailable, skipping round: {e}");
+                return Err(e.into());
+            }
         };
         let unpublished = GlobalScanner::scan(&lease, context)?;
         drop(lease);
@@ -874,7 +880,11 @@ impl DirSpaceManager {
             return Ok(None);
         }
 
-        let fs_dir = self.fs.fs_dir.view().unwrap();
+        let fs_dir = self
+            .fs
+            .fs_dir
+            .view()
+            .map_err(|e| DirSpaceQueryError::Storage(format!("namespace unavailable: {e}")))?;
         let namespace =
             InodeStoreSnapshot::new(fs_dir.store_ref().checked_read_snapshot().map_err(|_| {
                 DirSpaceQueryError::SnapshotMiss(
@@ -916,7 +926,11 @@ impl DirSpaceManager {
         let normalized = normalize_dir_path(path)?;
 
         // Resolve the requested path and all point roots from one store view.
-        let fs_dir = self.fs.fs_dir.view().unwrap();
+        let fs_dir = self
+            .fs
+            .fs_dir
+            .view()
+            .map_err(|e| DirSpaceQueryError::Storage(format!("namespace unavailable: {e}")))?;
         let namespace =
             InodeStoreSnapshot::new(fs_dir.store_ref().checked_read_snapshot().map_err(|_| {
                 DirSpaceQueryError::SnapshotMiss(

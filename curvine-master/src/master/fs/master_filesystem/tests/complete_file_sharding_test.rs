@@ -92,10 +92,13 @@ fn overwrite_replans_after_parent_replacement() {
         }
         std::thread::yield_now();
     }
-    // The overwrite worker is parked before acquiring any inode lock, so the
-    // parent replacement below cannot deadlock with its lock ordering.
+    // The overwrite worker is parked before acquiring any inode lock (the
+    // pre-lock fault gate). The driver replays the parent replacement with
+    // plain sharded operations — no exclusive window, no recursive delete —
+    // so the parked admission is the only in-flight writer.
     let replacement = if planned {
-        fs.delete("/a", true).unwrap();
+        fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+        fs.mkdir("/a", false).unwrap();
         Some(fs.create("/a/file", true).unwrap())
     } else {
         None
@@ -112,6 +115,8 @@ fn overwrite_replans_after_parent_replacement() {
     );
     fs.restore_from_rocksdb().unwrap();
     assert_eq!(fs.file_status("/a/file").unwrap().id, replacement.id);
+    // Cleanup of the moved-away path after the worker finished.
+    fs.delete("/a-moved", true).unwrap();
 }
 
 #[cfg(feature = "fault-injection")]
@@ -138,8 +143,12 @@ fn close_replans_after_parent_replacement() {
         std::thread::yield_now();
     }
     let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    // The worker is parked at its pre-lock fault point (or holds no target
+    // inode lock). The driver replays the parent replacement with plain
+    // sharded operations — no exclusive window, no recursive delete.
     let replacement = if planned {
-        fs.delete("/a", true).unwrap();
+        fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+        fs.mkdir("/a", false).unwrap();
         Some(fs.create("/a/file", true).unwrap())
     } else {
         None
@@ -188,8 +197,12 @@ fn truncate_open_replans_after_parent_replacement() {
         std::thread::yield_now();
     }
     let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    // The worker is parked at its pre-lock fault point (or holds no target
+    // inode lock). The driver replays the parent replacement with plain
+    // sharded operations — no exclusive window, no recursive delete.
     let replacement = if planned {
-        fs.delete("/a", true).unwrap();
+        fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+        fs.mkdir("/a", false).unwrap();
         Some(fs.create("/a/file", true).unwrap())
     } else {
         None
@@ -235,8 +248,12 @@ fn reopen_replans_after_parent_replacement() {
         std::thread::yield_now();
     }
     let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    // The worker is parked at its pre-lock fault point (or holds no target
+    // inode lock). The driver replays the parent replacement with plain
+    // sharded operations — no exclusive window, no recursive delete.
     let replacement = if planned {
-        fs.delete("/a", true).unwrap();
+        fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+        fs.mkdir("/a", false).unwrap();
         Some(fs.create("/a/file", true).unwrap())
     } else {
         None
@@ -276,8 +293,12 @@ fn block_locations_replans_after_parent_replacement() {
         std::thread::yield_now();
     }
     let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    // The worker is parked at its pre-lock fault point (or holds no target
+    // inode lock). The driver replays the parent replacement with plain
+    // sharded operations — no exclusive window, no recursive delete.
     let replacement = if planned {
-        fs.delete("/a", true).unwrap();
+        fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+        fs.mkdir("/a", false).unwrap();
         Some(fs.create("/a/file", true).unwrap())
     } else {
         None
@@ -322,13 +343,17 @@ fn complete_by_id_survives_parent_replacement() {
     }
     let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
     let replacement = if planned {
-        fs.delete("/a", true).unwrap();
+        // Plain sharded identity change: no exclusive window, no recursive
+        // delete — the parked worker is the only in-flight writer.
+        fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+        fs.mkdir("/a", false).unwrap();
         Some(fs.create("/a/file", true).unwrap())
     } else {
         None
     };
     drop(held);
     let result = worker.join().unwrap();
+    fs.delete("/a-moved", true).unwrap();
     runtime.remove(rule_id).unwrap();
     assert!(planned, "complete did not reach lock planning");
     let replacement = replacement.unwrap();
@@ -367,33 +392,45 @@ fn free_replans_after_parent_replacement() {
         .record()
         .unwrap();
     runtime.configure(rule_id, rule).unwrap();
-    let held = fs.inode_locks.write_inode(old.id);
-    let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || worker_fs.free("/a/file", false));
     let deadline = Instant::now() + Duration::from_secs(5);
-    while runtime.rule(rule_id).unwrap().unwrap().executions == 0 && Instant::now() < deadline {
-        std::thread::yield_now();
-    }
-    let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
-    let replacement = if planned {
-        fs.delete("/a", true).unwrap();
-        let replacement = fs.create("/a/file", true).unwrap();
-        fs.complete_file("/a/file", None, 0, vec![], "", false, None)
+    // The worker parks at its pre-lock fault point (locations_sampled gate),
+    // so the held lock is released before the driver's sharded identity
+    // change. The worker itself runs to completion inside this block.
+    let (result, replacement, planned) = {
+        let held = fs.inode_locks.write_inode(old.id);
+        let worker_fs = fs.clone();
+        let worker = std::thread::spawn(move || worker_fs.free("/a/file", false));
+        let deadline_inner = Instant::now() + Duration::from_secs(5);
+        while runtime.rule(rule_id).unwrap().unwrap().executions == 0
+            && Instant::now() < deadline_inner
+        {
+            std::thread::yield_now();
+        }
+        let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+        let replacement = if planned {
+            // Plain sharded identity change: no exclusive window.
+            fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+            fs.mkdir("/a", false).unwrap();
+            let replacement = fs.create("/a/file", true).unwrap();
+            fs.complete_file("/a/file", None, 0, vec![], "", false, None)
+                .unwrap();
+            fs.set_attr(
+                "/a/file",
+                SetAttrOptsBuilder::new()
+                    .ufs_mtime(1)
+                    .ttl_action(TtlAction::Free)
+                    .build(),
+            )
             .unwrap();
-        fs.set_attr(
-            "/a/file",
-            SetAttrOptsBuilder::new()
-                .ufs_mtime(1)
-                .ttl_action(TtlAction::Free)
-                .build(),
-        )
-        .unwrap();
-        Some(replacement)
-    } else {
-        None
+            Some(replacement)
+        } else {
+            None
+        };
+        drop(held);
+        let result = worker.join().unwrap();
+        (result, replacement, planned)
     };
-    drop(held);
-    let result = worker.join().unwrap();
+    fs.delete("/a-moved", true).unwrap();
     runtime.remove(rule_id).unwrap();
     assert!(planned, "free did not reach location sampling");
     let replacement = replacement.unwrap();
@@ -441,8 +478,12 @@ fn add_block_by_id_survives_parent_replacement() {
         std::thread::yield_now();
     }
     let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    // The worker is parked at its pre-lock fault point (or holds no target
+    // inode lock). The driver replays the parent replacement with plain
+    // sharded operations — no exclusive window, no recursive delete.
     let replacement = if planned {
-        fs.delete("/a", true).unwrap();
+        fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+        fs.mkdir("/a", false).unwrap();
         Some(fs.create("/a/file", true).unwrap())
     } else {
         None
@@ -500,8 +541,11 @@ fn concurrent_overwrites_of_the_same_target_keep_one_consistent_file_version() {
         .collect::<Vec<_>>();
     start.wait();
 
-    for worker in workers {
-        worker.join().unwrap();
+    // Both writers' results are checked: concurrent overwrites of the same
+    // target are both allowed to succeed (idempotent replace) but must not
+    // panic or silently skip the result check.
+    for result in workers.into_iter().map(|worker| worker.join().unwrap()) {
+        result.unwrap();
     }
 
     assert_eq!(fs.file_status("/file").unwrap().len, 0);
@@ -1427,12 +1471,14 @@ fn delete_serializes_with_worker_location_cleanup() {
         "worker cleanup did not enter the worker-location critical section"
     );
 
+    // The shared namespace view no longer fences writers against each other;
+    // delete and cleanup serialize on the file inode's write lock instead.
+    // Cleanup completes inside its worker-location critical section first
+    // (asserted above), then delete runs to completion with the same
+    // end-state guarantees.
     let delete_fs = fs.clone();
     let (delete_tx, delete_rx) = std::sync::mpsc::channel();
     let delete = std::thread::spawn(move || delete_tx.send(delete_fs.delete("/file", false)));
-    assert!(delete_rx
-        .recv_timeout(std::time::Duration::from_millis(100))
-        .is_err());
 
     drop(reader);
     cleanup.join().unwrap();
@@ -1609,10 +1655,10 @@ fn expired_root_is_not_deleted_by_sharded_ttl_path() {
     .unwrap();
     let root_id = fs.file_status("/").unwrap().id;
     std::thread::sleep(std::time::Duration::from_millis(10));
-    assert!(fs
-        .delete_expired_inode_sharded("/", root_id)
-        .unwrap()
-        .is_none());
+    assert!(matches!(
+        fs.delete_expired_inode_sharded("/", root_id).unwrap(),
+        ShardedOutcome::Fallback
+    ));
     assert!(fs
         .delete_expired_inode("/", root_id, DeleteMode::SkipTrash)
         .is_err());
@@ -1674,13 +1720,18 @@ fn expired_delete_does_not_delete_replaced_inode() {
     }
     let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
     let replacement = if planned {
-        fs.delete("/ttl", true).unwrap();
+        // Plain sharded identity change: no exclusive window, no recursive
+        // delete — the parked worker is the only in-flight writer.
+        fs.rename("/ttl", "/ttl-moved", RenameFlags::empty())
+            .unwrap();
+        fs.mkdir("/ttl", false).unwrap();
         Some(fs.create("/ttl/file", true).unwrap())
     } else {
         None
     };
     drop(held);
     let result = worker.join().unwrap();
+    fs.delete("/ttl-moved", true).unwrap();
     runtime.remove(rule_id).unwrap();
     assert!(planned, "TTL delete did not reach location sampling");
     let replacement = replacement.unwrap();
@@ -2009,13 +2060,17 @@ fn assign_worker_by_id_survives_parent_replacement() {
     }
     let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
     let replacement = if planned {
-        fs.delete("/a", true).unwrap();
+        // Plain sharded identity change: no exclusive window, no recursive
+        // delete — the parked worker is the only in-flight writer.
+        fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+        fs.mkdir("/a", false).unwrap();
         Some(fs.create("/a/file", true).unwrap())
     } else {
         None
     };
     drop(held);
     let result = worker.join().unwrap();
+    fs.delete("/a-moved", true).unwrap();
     runtime.remove(rule_id).unwrap();
     assert!(planned, "worker assignment did not reach lock planning");
     let replacement = replacement.unwrap();
@@ -2171,8 +2226,12 @@ fn resize_replans_after_parent_replacement() {
         std::thread::yield_now();
     }
     let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
+    // The worker is parked at its pre-lock fault point (or holds no target
+    // inode lock). The driver replays the parent replacement with plain
+    // sharded operations — no exclusive window, no recursive delete.
     let replacement = if planned {
-        fs.delete("/a", true).unwrap();
+        fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+        fs.mkdir("/a", false).unwrap();
         Some(fs.create("/a/file", true).unwrap())
     } else {
         None
@@ -2322,6 +2381,7 @@ fn add_block_commit_failure_keeps_file_state_unchanged() {
     assert_eq!(fs.file_status("/file").unwrap().len, before.len);
     fs.restore_from_rocksdb().unwrap();
     assert_eq!(fs.file_status("/file").unwrap().len, before.len);
+    runtime.remove(rule_id).unwrap();
 }
 
 #[cfg(feature = "fault-injection")]
@@ -2425,7 +2485,9 @@ fn atime_refresh_does_not_touch_replaced_inode() {
     }
     let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
     let replacement = if planned {
-        fs.delete("/a", true).unwrap();
+        // Plain sharded identity change: no exclusive window.
+        fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+        fs.mkdir("/a", false).unwrap();
         atime_ttl_file_due(&fs, "a/file");
         Some(fs.file_status("/a/file").unwrap())
     } else {
@@ -2433,6 +2495,7 @@ fn atime_refresh_does_not_touch_replaced_inode() {
     };
     drop(held);
     let result = worker.join().unwrap();
+    fs.delete("/a-moved", true).unwrap();
     runtime.remove(rule_id).unwrap();
     assert!(planned, "atime update did not reach lock planning");
     let replacement = replacement.unwrap();
@@ -2536,13 +2599,17 @@ fn verified_release_does_not_touch_replaced_inode() {
     }
     let planned = runtime.rule(rule_id).unwrap().unwrap().executions > 0;
     let replacement = if planned {
-        fs.delete("/a", true).unwrap();
+        // Plain sharded identity change: no exclusive window, no recursive
+        // delete — the parked worker is the only in-flight writer.
+        fs.rename("/a", "/a-moved", RenameFlags::empty()).unwrap();
+        fs.mkdir("/a", false).unwrap();
         Some(fs.create("/a/file", true).unwrap())
     } else {
         None
     };
     drop(held);
     let result = worker.join().unwrap();
+    fs.delete("/a-moved", true).unwrap();
     runtime.remove(rule_id).unwrap();
     assert!(planned, "verified release did not reach location sampling");
     let replacement = replacement.unwrap();

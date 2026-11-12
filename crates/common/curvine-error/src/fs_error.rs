@@ -478,6 +478,7 @@ impl FsError {
         Self::NoAvailableWorker(ErrorImpl::with_source(msg.into().into()))
     }
 
+
     pub fn is_pipeline_error(&self) -> bool {
         matches!(self, FsError::Pipeline(_))
     }

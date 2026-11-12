@@ -22,7 +22,7 @@ use crate::master::meta::inode::*;
 use crate::master::meta::store::{
     InodeStore, InodeStoreSnapshot, PurgeItem, PurgeTarget, RocksInodeStore,
 };
-use crate::master::meta::{trash, BlockMeta, InodeId};
+use crate::master::meta::{trash, BlockMeta, FileSystemStats, InodeId};
 use crate::master::quota::eviction::evictor::Evictor;
 use curvine_config::ClusterConf;
 use curvine_core_error::CommonError;
@@ -689,7 +689,7 @@ impl FsDir {
     /// idempotent. A directory that still holds children after the paths
     /// already claimed in this batch is skipped as well, so a purge never
     /// removes inodes the batch did not list.
-    pub fn purge_paths(&mut self, paths: &[String], mtime: i64) -> FsResult<DeleteResult> {
+    pub fn purge_paths(&self, paths: &[String], mtime: i64) -> FsResult<DeleteResult> {
         let mut claims: Vec<PurgeClaim> = Vec::new();
         // (parent id, name) pairs already claimed, so a duplicated path is not
         // counted twice.
@@ -825,7 +825,7 @@ impl FsDir {
 
     // Move an entry into /.Trash instead of removing it. Blocks stay on the
     // workers so the entry can be restored until retention expires.
-    pub fn trash(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
+    pub fn trash(&self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
         let op_ms = LocalTime::mills() as i64;
 
         if inp.is_root() {
@@ -882,7 +882,7 @@ impl FsDir {
     /// namespace effect as a soft delete, while the purger reclaims the entry
     /// without waiting for `trash_retention`. It is independent of
     /// `trash_enabled` because `/.Trash` is reserved either way.
-    pub fn trash_pending(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
+    pub fn trash_pending(&self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
         let op_ms = LocalTime::mills() as i64;
 
         if inp.is_root() {
@@ -939,7 +939,7 @@ impl FsDir {
     /// no longer a direct trash child), so a restore either wins before the
     /// claim or fails cleanly. Returns the pending path, or `None` when the
     /// entry is already gone (restored or emptied after the scan).
-    pub fn claim_trash_entry_for_purge(&mut self, trash_path: &str) -> FsResult<Option<String>> {
+    pub fn claim_trash_entry_for_purge(&self, trash_path: &str) -> FsResult<Option<String>> {
         if !trash::is_trash_entry_path(trash_path) {
             return err_ext!(FsError::invalid_argument(format!(
                 "{} is not a trash entry",
@@ -968,15 +968,15 @@ impl FsDir {
         Ok(Some(dst_path))
     }
 
-    fn ensure_trash_root(&mut self) -> FsResult<()> {
+    fn ensure_trash_root(&self) -> FsResult<()> {
         self.ensure_trash_dir(trash::TRASH_ROOT)
     }
 
-    fn ensure_pending_root(&mut self) -> FsResult<()> {
+    fn ensure_pending_root(&self) -> FsResult<()> {
         self.ensure_trash_dir(trash::TRASH_PENDING_ROOT)
     }
 
-    fn ensure_trash_dir(&mut self, path: &str) -> FsResult<()> {
+    fn ensure_trash_dir(&self, path: &str) -> FsResult<()> {
         let inp = InodePath::resolve(self.root_node(), path, &self.store)?;
         match inp.get_last_inode() {
             Some(inode) if inode.is_dir() => Ok(()),
@@ -1375,7 +1375,7 @@ impl FsDir {
     /// subtrees in bounded batches. Entries that disappeared since the snapshot
     /// (restored, purged, or staged by another node) are skipped, which keeps a
     /// retried empty idempotent.
-    pub fn stage_trash_entries(&mut self, names: &[String]) -> FsResult<u64> {
+    pub fn stage_trash_entries(&self, names: &[String]) -> FsResult<u64> {
         if names.is_empty() {
             return Ok(0);
         }
@@ -1413,7 +1413,7 @@ impl FsDir {
         Ok(staged)
     }
 
-    pub fn free(&mut self, inp: &InodePath, recursive: bool) -> FsResult<FreeResult> {
+    pub fn free(&self, inp: &InodePath, recursive: bool) -> FsResult<FreeResult> {
         let op_ms = LocalTime::mills() as i64;
 
         if inp.is_root() {
@@ -1465,7 +1465,7 @@ impl FsDir {
     /// release cannot release an unverified file. Logs a non-recursive `Free`,
     /// so followers release exactly this file. `None` when nothing was released.
     pub fn free_verified(
-        &mut self,
+        &self,
         inode_id: i64,
         expected_path: &str,
         gen: FileGen,
@@ -2358,6 +2358,17 @@ impl FsDir {
 
     pub fn last_inode_id(&self) -> i64 {
         self.inode_id.current()
+    }
+
+    /// Stable inode-id counter reference; callers that must report metrics
+    /// even while the view is closed reuse this same instance.
+    pub(crate) fn inode_id_handle(&self) -> Arc<InodeId> {
+        self.inode_id.clone()
+    }
+
+    /// Same store stats instance the live InodeStore owns (counts gauges).
+    pub(crate) fn fs_stats_handle(&self) -> Arc<FileSystemStats> {
+        self.store.fs_stats_handle()
     }
 
     pub fn update_last_inode_id(&self, new_value: i64) -> CommonResult<()> {

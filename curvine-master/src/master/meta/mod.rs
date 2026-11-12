@@ -39,6 +39,7 @@ pub use fs_dir_handle::{ColdError, ColdFsDirGuard, FsDirHandle, NamespaceError, 
 
 mod fs_stats;
 pub use self::fs_stats::FileSystemStats;
+pub(crate) use self::inode::inode_dir::DirNode;
 
 mod inode_id;
 pub use self::inode_id::InodeId;
