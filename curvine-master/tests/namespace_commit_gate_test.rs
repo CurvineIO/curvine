@@ -106,79 +106,12 @@ fn raft_snapshot_waits_for_inflight_metadata_writers() {
     assert!(result.is_ok(), "snapshot failed: {result:?}");
 }
 
-#[test]
-fn cancelling_snapshot_request_keeps_gate_closed_until_apply_finishes() {
-    use curvine_master::master::journal::JournalSystem;
-    use curvine_master::Master;
-    use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
-    use curvine_runtime::sync::channel::CallChannel;
-
-    Master::init_test_metrics();
-    let mut conf = curvine_config::ClusterConf {
-        testing: true,
-        ..Default::default()
-    };
-    conf.change_test_meta_dir(format!(
-        "snapshot-cancel-gate-{}",
-        curvine_runtime::common::Utils::rand_str(8)
-    ));
-    let journal = JournalSystem::from_conf(&conf).unwrap();
-    let fs = journal.fs();
-    let gate = fs.metadata_commit_gate();
-    let fs_dir = fs.fs_dir.clone();
-    let fs_lock = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-    let loader = journal.journal_loader();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let snapshot_loader = loader.clone();
-    let snapshot = runtime.spawn(async move { snapshot_loader.create_snapshot().await });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while gate.try_enter().is_some() && Instant::now() < deadline {
-        std::thread::yield_now();
-    }
-    let closed_before_cancel = gate.try_enter().is_none();
-    // An acknowledged no-op queued behind the snapshot cannot finish while
-    // the apply worker is blocked by fs_lock. Retry if it overtakes the snapshot.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let marker = loop {
-        let (tx, rx) = CallChannel::channel();
-        runtime
-            .block_on(loader.apply(false, ApplyMsg::new_entry_with_ack(Default::default(), tx)))
-            .unwrap();
-        let mut marker = runtime.spawn(async move { rx.receive().await });
-        if runtime
-            .block_on(async { tokio::time::timeout(Duration::from_millis(100), &mut marker).await })
-            .is_err()
-        {
-            break marker;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "snapshot never blocked the apply queue"
-        );
-    };
-    snapshot.abort();
-    let _ = runtime.block_on(snapshot);
-    let closed_after_cancel = gate.try_enter().is_none();
-    drop(fs_lock);
-    runtime.block_on(marker).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while gate.try_enter().is_none() && Instant::now() < deadline {
-        std::thread::yield_now();
-    }
-    let reopened = gate.try_enter().is_some();
-    drop(fs);
-    journal.shutdown();
-    assert!(closed_before_cancel, "snapshot must close admission");
-    assert!(
-        closed_after_cancel,
-        "cancelled caller must not release the snapshot fence"
-    );
-    assert!(reopened, "snapshot fence must eventually reopen");
-}
+// The cancellation-fence regression moved to
+// src/master/journal/tests/snapshot_cancel_gate_test.rs: it needs a controlled
+// interleaving point inside the apply worker's CreateSnapshot branch, which an
+// integration target cannot reach. The old driver (blocking the worker with a
+// cold namespace guard) no longer represents the protocol: the snapshot body
+// reads the shared view and a closed view fails immediately instead of waiting.
 
 #[test]
 fn multiple_barriers_keep_gate_closed_until_last_drop() {
