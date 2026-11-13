@@ -393,3 +393,239 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     let _ = std::fs::remove_dir_all(&fixture.meta_dir);
     let _ = std::fs::remove_dir_all(&fixture.journal_dir);
 }
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+
+    let mut fixture = ProgressFixture::new("excl-pub-fail");
+    let conf = fixture.conf.clone();
+    let setup_fs = fixture.fs.clone();
+    setup_fs.mkdir("/dir", true).unwrap();
+    setup_fs.create("/dir/file", true).unwrap();
+    setup_fs
+        .journal_writer
+        .with_testing_receiver(|receiver| loop {
+            match receiver.try_recv() {
+                Ok(entry) => drop(entry),
+                Err(_) => break,
+            }
+        });
+
+    let writer = fixture.swap_in_receipts_writer(&conf);
+    fixture.loader.journal_writer = writer.clone();
+    let mfs = fixture.fs.clone();
+    let failure_seq_before = writer.failure_seq();
+
+    // Store-commit failure inside the exclusive body: the batch commit fails
+    // before any publication, so the failure sequence does NOT move and the
+    // holder stays OPEN (pure validation/store error → backfill).
+    let runtime = curvine_fault::FaultRuntime::process();
+    let rule_id = "excl-pub-fail-rule";
+    runtime
+        .configure(
+            rule_id,
+            curvine_fault::FaultRuleBuilder::named("master.metadata.delete.before_commit")
+                .times(1)
+                .unwrap()
+                .return_error("injected exclusive delete store failure")
+                .unwrap(),
+        )
+        .unwrap();
+
+    let delete_fs = mfs.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || done_tx.send(delete_fs.delete("/dir", true)));
+
+    let delete_result = done_rx
+        .recv_timeout(HANDSHAKE_WINDOW)
+        .expect("the delete must finish within the window");
+    runtime.remove(rule_id).unwrap();
+    worker.join().expect("delete worker must not panic");
+
+    // The op error keeps its original variant and message; the failure
+    // sequence did NOT move, so the holder stays OPEN (normal backfill).
+    let delete_err = delete_result.expect_err("the injected store failure must surface");
+    assert!(
+        delete_err
+            .to_string()
+            .contains("injected exclusive delete store failure"),
+        "the original op error must be preserved, got {delete_err}"
+    );
+    assert!(
+        !mfs.fs_dir.is_failed(),
+        "a pre-publication store error must not fail the holder"
+    );
+    assert!(
+        mfs.fs_dir.view().is_ok(),
+        "the view must reopen after a pure store error"
+    );
+    assert_eq!(writer.failure_seq(), failure_seq_before);
+    drop(fixture);
+}
+
+#[test]
+fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsResult<()> {
+    use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
+    use curvine_raft::raft::storage::AppStorage as _;
+    use curvine_raft::raft::RaftResult;
+
+    let mut conf = ClusterConf {
+        testing: true,
+        format_master: true,
+        ..Default::default()
+    };
+    conf.journal.snapshot_entries = 0;
+    conf.journal.writer_channel_size = 8;
+    let meta_dir = std::env::temp_dir().join(format!(
+        "curvine-exclusive-restore-meta-{}",
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    let journal_dir = std::env::temp_dir().join(format!(
+        "curvine-exclusive-restore-journal-{}",
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    conf.master.meta_dir = meta_dir.to_str().unwrap().to_string();
+    conf.journal.journal_dir = journal_dir.to_str().unwrap().to_string();
+    let journal = JournalSystem::from_conf(&conf).unwrap();
+    let fs = journal.fs();
+    let mut loader = journal.journal_loader();
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
+
+    // Setup with the original writer, then drain.
+    fs.mkdir("/dir", true).unwrap();
+    fs.create("/dir/file", true).unwrap();
+    fs.journal_writer.with_testing_receiver(|receiver| loop {
+        match receiver.try_recv() {
+            Ok(entry) => drop(entry),
+            Err(_) => break,
+        }
+    });
+
+    // Real non-empty snapshot before the exclusive operation.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let snapshot = runtime
+        .block_on(loader.create_snapshot())
+        .expect("a real checkpoint must be created");
+    assert!(snapshot.files_data.is_some());
+
+    // Install the receipts writer and align every participant.
+    let writer = {
+        let rt = conf.journal.create_runtime();
+        let client = curvine_raft::raft::RaftClient::from_conf(rt, &conf.journal);
+        let mut writer = JournalWriter::new(
+            true,
+            client,
+            &conf.journal,
+            journal.master_monitor().recovery(),
+        )
+        .unwrap();
+        writer.enable_testing_receipts(journal.master_monitor().recovery());
+        let writer = Arc::new(writer);
+        fs.fs_dir
+            .begin_cold(DEFAULT_COLD_TIMEOUT)
+            .unwrap()
+            .journal_writer = writer.clone();
+        writer
+    };
+    loader.journal_writer = writer.clone();
+
+    // Phase 2: exclusive delete holds the gate and the unique receipt.
+    let delete_fs = fs.clone();
+    let (delete_started_tx, delete_started_rx) = std::sync::mpsc::channel();
+    let (delete_done_tx, delete_done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        delete_started_tx.send(()).unwrap();
+        let result = delete_fs.delete("/dir", true);
+        delete_done_tx.send(result).unwrap();
+    });
+    delete_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("delete worker started");
+    let queued = writer
+        .with_testing_receiver(|receiver| {
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("missing delete journal entry")
+        })
+        .expect("the receipts receiver must exist");
+    let completion = queued.completion.expect("missing commit confirmation");
+
+    eprintln!("restore: entry received, waiting for body");
+    // The body completed (enqueue pushed a scoped waiter) and drop(cold)
+    // ran, but the view may stay Busy while the scoped waiter waits on the
+    // held receipt. The restore intent must be blocked by the gate in this
+    // window — that's the gate-blocking proof. We do NOT wait for view
+    // reopen here; the receipt drop below terminates the holder.
+
+    // Restore intent: apply_snapshot must wait on the same exclusive gate.
+    let restore_loader = loader.clone();
+    let (restore_started_tx, restore_started_rx) = std::sync::mpsc::channel();
+    let (restore_done_tx, restore_done_rx) = std::sync::mpsc::channel::<RaftResult<()>>();
+    let snapshot_clone = snapshot.clone();
+    let restore_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let restore_thread = std::thread::spawn(move || {
+        restore_started_tx.send(()).unwrap();
+        let result = restore_runtime.block_on(restore_loader.apply_snapshot(snapshot_clone));
+        restore_done_tx.send(result).unwrap();
+    });
+    restore_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("restore thread started");
+    let restore_pending = restore_done_rx.recv_timeout(Duration::from_millis(300));
+    assert!(
+        matches!(
+            restore_pending,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "the restore intent must wait on the exclusive gate, got {restore_pending:?}"
+    );
+
+    // Drop the receipt: the delete fails terminal, the gate opens, and the
+    // restore proceeds into apply_snapshot0 — reporting the holder failed.
+    eprintln!("restore: dropping completion");
+    drop(completion);
+    let delete_done = delete_done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the delete must finish once the confirmation fails");
+    worker.join().expect("delete worker must not panic");
+    let delete_err = match delete_done {
+        Ok(_) => panic!("the delete must fail on a dropped confirmation"),
+        Err(err) => err,
+    };
+    assert!(fs.fs_dir.is_failed());
+
+    let restore_result = restore_done_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the restore intent must return once the gate opens");
+    restore_thread
+        .join()
+        .expect("restore thread must not panic");
+
+    let restore_err = match restore_result {
+        Ok(_) => panic!("the restore must not succeed on a FAILED holder"),
+        Err(err) => err,
+    };
+    assert!(
+        restore_err.to_string().contains("unavailable")
+            || restore_err.to_string().contains("failed"),
+        "the restore must report the terminal holder, got {restore_err}"
+    );
+
+    drop(fs);
+    drop(loader);
+    journal.shutdown();
+    let _ = std::fs::remove_dir_all(&meta_dir);
+    let _ = std::fs::remove_dir_all(&journal_dir);
+    if let Some(files) = &snapshot.files_data {
+        let _ = std::fs::remove_dir_all(&files.dir);
+    }
+    Ok(())
+}
