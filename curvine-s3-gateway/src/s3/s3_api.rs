@@ -362,6 +362,33 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
         resp.set_header("last-modified", &v)
     }
 
+    // Standard object headers stored on upload. `response-*` query parameters
+    // override them for this response only; a read never rewrites the object.
+    let stored_or_override = |query: &str, stored: Option<String>| req.get_query(query).or(stored);
+    if let Some(v) = stored_or_override("response-cache-control", head.cache_control.clone()) {
+        resp.set_header("cache-control", &v)
+    }
+    if let Some(v) = stored_or_override(
+        "response-content-disposition",
+        head.content_disposition.clone(),
+    ) {
+        resp.set_header("content-disposition", &v)
+    }
+    if let Some(v) = stored_or_override("response-content-encoding", head.content_encoding.clone())
+    {
+        resp.set_header("content-encoding", &v)
+    }
+    if let Some(v) = stored_or_override("response-content-language", head.content_language.clone())
+    {
+        resp.set_header("content-language", &v)
+    }
+    if let Some(v) = stored_or_override("response-expires", head.expires.clone()) {
+        resp.set_header("expires", &v)
+    }
+    if let Some(v) = req.get_query("response-content-type") {
+        resp.set_header("content-type", &v)
+    }
+
     if let Some(metadata) = head.metadata {
         for (key, value) in metadata {
             let header_name = if key.starts_with("x-amz-meta-") {
@@ -809,7 +836,7 @@ pub async fn handle_put_object<T, F, H>(
         content_md5: req.get_header("content-md5"),
         content_type: req.get_header("content-type"),
         expected_bucket_owner: req.get_header("x-amz-expected-bucket-owner"),
-        expires: req.get_header("expire").and_then(|v| {
+        expires: req.get_header("expires").and_then(|v| {
             chrono::NaiveDateTime::parse_from_str(&v, "%a, %d %b %Y %H:%M:%S GMT")
                 .map_or(None, |v| {
                     Some(chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc))

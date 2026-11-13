@@ -511,17 +511,23 @@ impl S3Router {
                     if let Some(v) = head.content_length {
                         resp.set_header("content-length", v.to_string().as_str())
                     }
-                    if let Some(v) = head.etag {
+                    if let Some(v) = head.etag.clone() {
                         resp.set_header("etag", &v);
                     }
-                    if let Some(v) = head.content_type {
+                    if let Some(v) = head.content_type.clone() {
                         resp.set_header("content-type", &v);
                     }
-                    if let Some(v) = head.last_modified {
+                    if let Some(v) = head.last_modified.clone() {
                         resp.set_header("last-modified", &v);
                     }
 
-                    if let Some(metadata) = head.metadata {
+                    // The standard object headers stored on upload; HEAD and
+                    // GET share this mapping.
+                    for (name, value) in crate::utils::s3_utils::object_response_headers(&head) {
+                        resp.set_header(name, &value);
+                    }
+
+                    if let Some(metadata) = head.metadata.clone() {
                         for (key, value) in metadata {
                             let header_name = if key.starts_with("x-amz-meta-") {
                                 key
