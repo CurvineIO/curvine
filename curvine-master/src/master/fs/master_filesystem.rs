@@ -737,7 +737,7 @@ impl MasterFilesystem {
                     let plan = location_plan
                         .as_ref()
                         .expect("need_locations implies a location plan");
-                    if !plan.covers(&fs_dir)? {
+                    if !plan.covers(&fs_dir, requests)? {
                         return Ok(None);
                     }
                 }
@@ -1999,9 +1999,8 @@ impl MasterFilesystem {
                 if !(recursive && permanent) {
                     return Ok(ShardedOutcome::Fallback);
                 }
-                // The hot closure runs inside the single admission:
-                // metadata_epoch() here returns the outer original epoch (R8).
-                let epoch = self.journal_writer.metadata_epoch()?;
+                // F1: the hot closure receives the outer original epoch
+                // explicitly — no re-sampling (G3).
                 self.run_recursive_metadata_write(
                     epoch,
                     path,
@@ -2625,10 +2624,8 @@ impl MasterFilesystem {
             // the full inode → worker → block order (a free always drops
             // the data blocks). Pre-body fallbacks keep the exclusive
             // bridge below; real body errors propagate verbatim.
-            // The hot closure runs inside run_metadata_write_with_fallback's
-            // single admission: metadata_epoch() here returns the outer
-            // original epoch, passed explicitly to the recursive entry (R8).
-            let epoch = self.journal_writer.metadata_epoch()?;
+            // F1: the hot closure receives the outer original epoch
+            // explicitly — no re-sampling (G3).
             self.run_recursive_metadata_write(
                 epoch,
                 path,

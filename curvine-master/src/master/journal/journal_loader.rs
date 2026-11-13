@@ -1908,21 +1908,34 @@ impl JournalLoader {
             // F3: shared SubtreeLocationPlan::capture replaces the hand-written
             // sampler — one whole-call budget counter (SUBTREE_LOCATION_LIMIT),
             // bounded block iteration and location reads, owned IDs only.
-            let location_plan_opt = {
+            // G2: only capture when need_locations is true — set_attr and
+            // other paths without location requirements never read locations.
+            let location_plan_opt = if need_locations {
                 let fs_dir = self.fs_dir.view().map_err(|e| e.to_string())?;
-                crate::master::meta::subtree_write_plan::SubtreeLocationPlan::capture(
+                let result = crate::master::meta::subtree_write_plan::SubtreeLocationPlan::capture(
                     &fs_dir,
                     plan.inode_requests(),
                 )
-                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+                // G2: static budget overflow — release inode locks and fall
+                // back to the cold bridge (no panic; no body re-run).
+                if result.is_none() {
+                    drop(inode_locks);
+                    let Some(body) = body_slot.take() else {
+                        return Err("replay body already consumed".to_string().into());
+                    };
+                    return self.with_replay_cold(body);
+                }
+                result
+            } else {
+                None
             };
             let location_locks = if need_locations {
                 let location_plan = location_plan_opt
                     .as_ref()
                     .expect("need_locations implies a location plan");
-                let block_ids: Vec<i64> = location_plan.block_ids().to_vec();
-                let worker_ids: Vec<u32> = location_plan.worker_ids().to_vec();
-                {}
+                let block_ids = location_plan.block_ids();
+                let worker_ids = location_plan.worker_ids();
                 // F2: replay location checkpoint — sampling is complete, the
                 // worker/block stripes are not yet acquired. The driver may
                 // add a location here (report/replication) to prove the
@@ -1975,10 +1988,13 @@ impl JournalLoader {
                 // set and checks it is fully covered by the sampled set. New
                 // ids → churn (release view/L/I, retry ≤3, then cold).
                 if need_locations {
-                    let Some(plan) = location_plan_opt.as_ref() else {
+                    let Some(location_plan) = location_plan_opt.as_ref() else {
                         return Err("need_locations without a location plan".to_string().into());
                     };
-                    if !plan.covers(&fs_dir).map_err(|e| e.to_string())? {
+                    if !location_plan
+                        .covers(&fs_dir, plan.inode_requests())
+                        .map_err(|e| e.to_string())?
+                    {
                         return Ok(ReplayStep::Churn);
                     }
                 }

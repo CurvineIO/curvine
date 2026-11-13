@@ -1567,11 +1567,17 @@ impl FsDir {
                     // must be reclaimed once. The FIRST name processes the
                     // inode (free + accounting); every later alias of the
                     // same id sees the seen-marker and stops.
-                    if seen_inodes.as_mut().is_none_or(|seen| !seen.insert(f.id)) {
-                        // Non-recursive frees never enter here; a recursive
-                        // traversal that already saw this inode skips the
-                        // duplicate alias.
+                    // G1: only skip when Some AND already seen — a None
+                    // seen set (non-recursive free) must still process the
+                    // file normally.
+                    if seen_inodes
+                        .as_ref()
+                        .is_some_and(|seen| seen.contains(&f.id))
+                    {
                         continue;
+                    }
+                    if let Some(seen) = seen_inodes.as_mut() {
+                        seen.insert(f.id);
                     }
                     let locs = f.get_locs(&self.store)?;
                     let bytes = f.get_locs_bytes(&locs);

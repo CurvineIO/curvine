@@ -294,19 +294,18 @@ impl SubtreeLocationPlan {
             let Ok(file) = inode.as_file_ref() else {
                 continue;
             };
-            // Iterate the file's own blocks in bounded windows — never
-            // clone the full array before the budget check. The bounded
-            // read walks the existing prefix iterator with the remaining
-            // budget.
-            for block_id in file.block_ids() {
+            // G4: iterate the inode's real blocks directly (no full Vec
+            // clone). The bounded read walks the existing prefix iterator
+            // with the remaining budget.
+            for block in &file.blocks {
                 entries += 1;
                 if entries > SUBTREE_LOCATION_LIMIT {
                     return Ok(None);
                 }
-                block_ids.push(block_id);
+                block_ids.push(block.id);
                 let Some(locations) = fs_dir
                     .store
-                    .get_locations_bounded(block_id, SUBTREE_LOCATION_LIMIT - entries)?
+                    .get_locations_bounded(block.id, SUBTREE_LOCATION_LIMIT - entries)?
                 else {
                     return Ok(None);
                 };
@@ -330,19 +329,50 @@ impl SubtreeLocationPlan {
     /// set (called under the FINAL view, after location locks are held).
     /// Returns `false` when any live block/worker is missing from the
     /// sampled set (release everything and retry ≤3).
-    pub(crate) fn covers(&self, fs_dir: &crate::master::meta::FsDir) -> FsResult<bool> {
-        for &block_id in &self.block_ids {
-            let Some(locations) = fs_dir
-                .store
-                .get_locations_bounded(block_id, SUBTREE_LOCATION_LIMIT)?
-            else {
-                // More live locations than the budget can verify: not
-                // covered (the caller releases and retries).
-                return Ok(false);
+    /// G4: coverage re-validation against the CURRENT full block/worker set
+    /// of every Write inode (not just the sampled set). One whole-call
+    /// counter charges every block entry and every location row against the
+    /// same SUBTREE_LOCATION_LIMIT; bounded reads pass the remaining budget
+    /// and only allow one entry past the limit to prove overflow.
+    pub(crate) fn covers(
+        &self,
+        fs_dir: &crate::master::meta::FsDir,
+        requests: &[InodeLockRequest],
+    ) -> FsResult<bool> {
+        let mut coverage_entries = 0usize;
+        for request in requests {
+            if !matches!(request.mode, InodeLockMode::Write) {
+                continue;
+            }
+            let Some(inode) = fs_dir.store.get_inode(request.inode_id, None)? else {
+                continue;
             };
-            for location in locations {
-                if !self.worker_ids.contains(&location.worker_id) {
+            let Ok(file) = inode.as_file_ref() else {
+                continue;
+            };
+            // G4: iterate the inode's real blocks directly (no full clone).
+            for block in &file.blocks {
+                coverage_entries += 1;
+                if coverage_entries > SUBTREE_LOCATION_LIMIT {
                     return Ok(false);
+                }
+                if !self.block_ids.contains(&block.id) {
+                    return Ok(false);
+                }
+                let Some(locations) = fs_dir
+                    .store
+                    .get_locations_bounded(block.id, SUBTREE_LOCATION_LIMIT - coverage_entries)?
+                else {
+                    return Ok(false);
+                };
+                for location in locations {
+                    coverage_entries += 1;
+                    if coverage_entries > SUBTREE_LOCATION_LIMIT {
+                        return Ok(false);
+                    }
+                    if !self.worker_ids.contains(&location.worker_id) {
+                        return Ok(false);
+                    }
                 }
             }
         }
