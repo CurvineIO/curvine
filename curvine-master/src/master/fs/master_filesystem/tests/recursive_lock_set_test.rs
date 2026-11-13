@@ -528,3 +528,87 @@ fn bounded_journal_queue_falls_back_before_the_body() {
         "the fallback must not have removed anything"
     );
 }
+
+/// R7: the topology changes *after* capture and *before* the lock set is taken.
+/// The lock-set path must then refuse to delete a subtree that moved out; the
+/// post-lock revalidation either re-plans or falls back, but the moved-out
+/// subtree must survive with its inode id.
+#[test]
+fn subtree_moved_out_between_capture_and_locking_survives() {
+    let fs = test_fs("plan-pause-move-out");
+    fs.mkdir("/a/d0", true).unwrap();
+    fs.create("/a/d0/file", false).unwrap();
+    fs.mkdir("/b", false).unwrap();
+    let moved_id = fs.file_status("/a/d0").unwrap().id;
+
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    fs.journal_writer
+        .arm_plan_pause_hook(reached_tx, release_rx);
+
+    let delete_fs = fs.clone();
+    let handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+
+    reached_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the planner must reach the pause point");
+    // The plan is captured; move the subtree out before any lock is taken.
+    fs.rename("/a/d0", "/b/d0", RenameFlags::empty())
+        .expect("move the subtree out");
+    release_tx.send(()).expect("release the planner");
+
+    let result = handle.join().expect("delete thread must not panic");
+    result.expect("the delete must finish, by re-plan or fallback");
+
+    let survivor = fs
+        .file_status("/b/d0")
+        .expect("a subtree moved out between capture and lock must survive");
+    assert_eq!(
+        survivor.id, moved_id,
+        "the moved-out subtree must keep its inode id"
+    );
+    assert!(
+        fs.file_status("/b/d0/file").is_ok(),
+        "its child must survive as well"
+    );
+}
+
+/// R7: a node created inside the subtree in that same window must not become an
+/// orphan: it is either removed with the tree or the operation re-plans.
+#[test]
+fn node_created_between_capture_and_locking_is_not_orphaned() {
+    let fs = test_fs("plan-pause-move-in");
+    fs.mkdir("/a/d0", true).unwrap();
+    fs.create("/a/d0/old", false).unwrap();
+
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    fs.journal_writer
+        .arm_plan_pause_hook(reached_tx, release_rx);
+
+    let delete_fs = fs.clone();
+    let handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+
+    reached_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the planner must reach the pause point");
+    // A new child appears inside the planned subtree after capture.
+    fs.create("/a/d0/new", false)
+        .expect("create inside the subtree");
+    let new_id = fs.file_status("/a/d0/new").unwrap().id;
+    release_tx.send(()).expect("release the planner");
+
+    let result = handle.join().expect("delete thread must not panic");
+    result.expect("the delete must finish, by re-plan or fallback");
+
+    // Either the tree is gone (the new child went with it) or the operation
+    // re-planned; in no case may the child survive as an orphan reachable by id
+    // while its parent path is gone.
+    let parent_gone = fs.file_status("/a").is_err();
+    let child_gone = fs.file_status_by_id("/a/d0/new", Some(new_id)).is_err();
+    assert!(parent_gone, "the planned tree must be deleted in the end");
+    assert!(
+        child_gone,
+        "a node created inside the planned subtree must not be orphaned"
+    );
+}

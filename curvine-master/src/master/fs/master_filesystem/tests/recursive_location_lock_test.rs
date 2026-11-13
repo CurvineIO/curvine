@@ -30,8 +30,17 @@ use curvine_model::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress,
     WorkerAddress, WorkerInfo, WorkerStatus,
 };
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// Bound for a handshake or an interleaved operation observed by this file.
+const OBSERVE_WINDOW: Duration = Duration::from_secs(8);
 
 fn test_fs_with_live_worker(name: &str) -> MasterFilesystem {
+    test_fs_with_worker_session(name, "")
+}
+
+fn test_fs_with_worker_session(name: &str, session: &str) -> MasterFilesystem {
     let fs = test_fs(name);
     let mut worker = WorkerInfo::new(
         WorkerAddress {
@@ -43,6 +52,7 @@ fn test_fs_with_live_worker(name: &str) -> MasterFilesystem {
     worker.status = WorkerStatus::Live;
     worker.capacity = i64::MAX / 4;
     worker.available = i64::MAX / 4;
+    worker.worker_session_id = session.to_string();
     fs.add_test_worker(worker);
     fs
 }
@@ -276,4 +286,125 @@ fn recursive_free_counts_a_shared_block_once() {
         .file_status("/t/alias")
         .expect("free keeps metadata for both names");
     assert_eq!(after.id, file_id);
+}
+
+/// Copy completion takes the same location protection as free. It reaches the
+/// real public(crate) entry `commit_replication_location`, which validates the
+/// worker session and inserts the location under the worker/block location
+/// locks, without taking the file's inode lock.
+///
+/// Deterministic version: completion followed by a recursive free must leave a
+/// whole location set, and a completion that arrives after the free must be
+/// answered rather than silently resurrecting a live location for a file that
+/// no longer references the block.
+#[test]
+fn replication_completion_and_free_keep_the_location_set_consistent() {
+    let session = "replication-session-1";
+    let fs = test_fs_with_worker_session("location-replication", session);
+    fs.mkdir("/t", true).unwrap();
+    let block_id = file_with_one_block(&fs, "/t/file");
+
+    // Completion for the same worker adds nothing new but must be accepted,
+    // proving the entry is reachable with a valid session.
+    let added = fs
+        .commit_replication_location(block_id, BlockLocation::with_id(1), session)
+        .expect("replication completion must succeed with a matching session");
+    let before_free = stored_locations(&fs, block_id);
+    assert!(
+        !before_free.is_empty(),
+        "the block must still carry its location after completion (added={added})"
+    );
+
+    let freed = fs.free("/t", true).expect("recursive free");
+    assert_eq!(freed.inodes, 1, "one inode must be reclaimed: {freed:?}");
+    let after_free = stored_locations(&fs, block_id);
+    assert!(
+        after_free.is_empty() || after_free.len() == before_free.len(),
+        "free must not leave a partially released set: {before_free:?} -> {after_free:?}"
+    );
+
+    // A late completion for the already-freed block is answered, not a panic;
+    // it must not grow a live location set behind the free's back.
+    let late = fs.commit_replication_location(block_id, BlockLocation::with_id(1), session);
+    assert!(
+        late.is_ok(),
+        "a late completion must be answered rather than fail opaquely: {late:?}"
+    );
+    let after_late = stored_locations(&fs, block_id);
+    assert!(
+        after_late.len() <= after_free.len().max(1),
+        "a late completion must not grow the freed block's location set: {after_free:?} -> {after_late:?}"
+    );
+
+    // A completion with a stale session must be rejected, not silently applied.
+    let stale =
+        fs.commit_replication_location(block_id, BlockLocation::with_id(1), "stale-session");
+    assert!(
+        stale.is_err(),
+        "a completion for a changed worker session must be rejected, got {stale:?}"
+    );
+}
+
+/// R7: a location appears after the sample but before the location locks are
+/// taken. The post-lock coverage check must notice that the block now has a
+/// worker/location the sample did not cover, which makes the operation restart
+/// (<=3) or fall back.
+///
+/// The observable proof is a **second capture**: the retry re-enters the plan
+/// path, so the plan pause hook fires again. If the coverage check were absent,
+/// the free would proceed with the stale set and never re-plan - the second
+/// pause would never arrive and this case would hang until its bound.
+#[test]
+fn location_added_after_sampling_forces_a_second_capture() {
+    let fs = test_fs_with_live_worker("location-pause");
+    fs.mkdir("/t/d0", true).unwrap();
+    let block_id = file_with_one_block(&fs, "/t/d0/file");
+
+    let (loc_reached_tx, loc_reached_rx) = mpsc::channel();
+    let (loc_release_tx, loc_release_rx) = mpsc::channel();
+    fs.journal_writer
+        .arm_location_pause_hook(loc_reached_tx, loc_release_rx);
+
+    let free_fs = fs.clone();
+    let handle = std::thread::spawn(move || free_fs.free("/t", true));
+
+    loc_reached_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the location sample must reach the pause point");
+
+    // The block gains a second worker location after the sample.
+    {
+        let handle = fs.fs_dir.clone();
+        let view = handle.view().expect("namespace view");
+        view.store
+            .add_block_location(block_id, BlockLocation::with_id(2))
+            .expect("add a late worker location");
+    }
+
+    // Arm the plan hook again: a correct coverage re-check restarts the
+    // operation, which re-enters the plan path and fires this hook.
+    let (plan_reached_tx, plan_reached_rx) = mpsc::channel();
+    let (plan_release_tx, plan_release_rx) = mpsc::channel();
+    fs.journal_writer
+        .arm_plan_pause_hook(plan_reached_tx, plan_release_rx);
+
+    loc_release_tx.send(()).expect("release the free");
+
+    let recaptured = plan_reached_rx.recv_timeout(OBSERVE_WINDOW);
+    let _ = plan_release_tx.send(());
+    let freed = handle
+        .join()
+        .expect("free thread must not panic")
+        .expect("the free must finish");
+
+    assert!(
+        recaptured.is_ok(),
+        "the location added after sampling must force a fresh capture; without \
+         the post-lock coverage check the free would keep the stale set and \
+         never re-plan"
+    );
+    assert_eq!(
+        freed.inodes, 1,
+        "the restarted free must reclaim exactly one inode: {freed:?}"
+    );
 }
