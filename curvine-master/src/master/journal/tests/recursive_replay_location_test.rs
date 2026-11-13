@@ -136,6 +136,7 @@ fn replay_location_grown_inside_the_sampling_window_forces_a_second_capture() ->
     // The driver: waits for the checkpoint, reports a location from worker 2
     // through the real entry, re-arms, and only then lets the replay continue.
     let driver_fs = target_fs.clone();
+    let (driver_done_tx, driver_done_rx) = std::sync::mpsc::channel();
     let driver = std::thread::spawn(move || {
         first_rx
             .recv_timeout(std::time::Duration::from_secs(30))
@@ -184,11 +185,18 @@ fn replay_location_grown_inside_the_sampling_window_forces_a_second_capture() ->
             .expect("the replay must still be waiting at its checkpoint");
         let recaptured = second_rx.recv_timeout(std::time::Duration::from_secs(30));
         let _ = second_release_tx.send(());
-        (reported, recaptured.is_ok())
+        let outcome = (reported, recaptured.is_ok());
+        // Completion signal: the driver may stall on a later step even after the
+        // replay finished, so the join below is only taken once it is done.
+        let _ = driver_done_tx.send(());
+        outcome
     });
 
     let loader = target.journal_loader();
     let replayed = loader.apply_entry(entry);
+    driver_done_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the driver must finish inside the bounded window");
     let (reported, recaptured) = driver.join().expect("driver thread must not panic");
 
     replayed?;
