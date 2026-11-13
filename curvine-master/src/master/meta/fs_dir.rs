@@ -272,20 +272,6 @@ impl FsDir {
     }
 
     fn publish_metadata_impl<T>(&self, result: CommonResult<T>) -> CommonResult<T> {
-        // R8: real publication-failure injection point — fires AFTER the
-        // store batch committed (durable) and BEFORE the live publication,
-        // so the caller sees a real "durable but unpublished" failure. The
-        // existing publish error path records the true publication source.
-        crate::fault_point! {
-            sync,
-            name: "master.metadata.recursive.publish_after_commit",
-            description: "Inject a publication failure after the store commit",
-            context: {},
-            return_error: |fault| {
-                self.journal_writer.fail_metadata_publication();
-                Err(fault.message.into())
-            },
-        }
         result.map_err(|error| {
             self.journal_writer.fail_metadata_publication();
             error
@@ -668,6 +654,21 @@ impl FsDir {
             }
         };
 
+        // R8: real publication-failure injection at the true boundary —
+        // the store batch has committed (durable above) and NO live
+        // mutation has been applied yet. The fail_metadata_publication
+        // records the real publication source; the caller's guard then
+        // terminalizes the holder while the locks are still held.
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.recursive.publish_after_commit",
+            description: "Inject a publication failure after the durable commit, before live publication",
+            context: { "child_name" => child_name },
+            return_error: |fault| {
+                self.journal_writer.fail_metadata_publication();
+                Err(fault.message.into())
+            },
+        }
         if update_parent_mtime {
             self.publish_metadata(parent.update_mtime(mtime).map_err(CommonError::from))?;
         }
