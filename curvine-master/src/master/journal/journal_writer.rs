@@ -65,6 +65,24 @@ impl JournalCommitScope<'_> {
         };
         let waiters = Self::remove(id);
         let mut result = Ok(());
+        // Test-only instance-isolated unwind injection: this scope has a real
+        // ID and at least one pending waiter, so the driver's release makes
+        // the wait panic after the body published and the cold owner was
+        // dropped — exercising the RAII terminal path on real unwind.
+        #[cfg(test)]
+        if !waiters.is_empty() {
+            if let Some(writer) = self.writer {
+                let release = writer.wait_unwind_hook.lock().unwrap().take();
+                if let Some(release) = release {
+                    if release
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .is_ok()
+                    {
+                        panic!("injected journal commit wait unwind (instance hook)");
+                    }
+                }
+            }
+        }
         for waiter in waiters {
             if let Err(error) = Self::wait_for_commit(waiter) {
                 if result.is_ok() {
@@ -134,6 +152,12 @@ pub struct JournalWriter {
     snapshot_min_interval_ms: u64,
     last_snapshot_ms: AtomicCounter,
     entries_since_snapshot: AtomicCounter,
+
+    /// Test-only instance-isolated wait-unwind hook: when armed, the next
+    /// real `JournalCommitScope::wait` with pending waiters blocks on it and
+    /// panics after release. Consumed once, so it disarms itself.
+    #[cfg(test)]
+    wait_unwind_hook: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl JournalWriter {
@@ -192,6 +216,8 @@ impl JournalWriter {
             snapshot_min_interval_ms: conf.snapshot_min_interval.as_millis(),
             last_snapshot_ms: AtomicCounter::new(0),
             entries_since_snapshot: AtomicCounter::new(0),
+            #[cfg(test)]
+            wait_unwind_hook: std::sync::Mutex::new(None),
         })
     }
 
@@ -266,6 +292,16 @@ impl JournalWriter {
     /// Opens a commit scope so every journal entry enqueued inside it shares
     /// one Raft-commit wait. The caller must invoke `wait` after its metadata
     /// work completes.
+    /// Test-only instance-isolated hook: arms a channel receiver so the
+    /// next `JournalCommitScope::wait` on this writer — entered with at
+    /// least one real pending waiter — blocks until the test driver sends,
+    /// then panics to exercise the real wait unwind path. The receiver is
+    /// consumed once (take), so the hook disarms itself after firing.
+    #[cfg(test)]
+    pub fn arm_wait_unwind_hook(&self, release: std::sync::mpsc::Receiver<()>) {
+        *self.wait_unwind_hook.lock().unwrap() = Some(release);
+    }
+
     pub fn begin_commit_scope(&self) -> JournalCommitScope<'_> {
         let id = if self.enable && self.require_raft_commit {
             let id = NEXT_COMMIT_SCOPE_ID.with(|next| {
@@ -362,7 +398,14 @@ impl JournalWriter {
     /// (its `enter_safe_mode` will overwrite the reason, but the earlier
     /// source-specific call's `last_error` was already stored).
     pub(crate) fn fail_metadata_holder_terminal(&self) {
-        self.fail_metadata("namespace holder terminal after confirmation failure");
+        // Preserve an already-recorded source error (commit/publication
+        // failure, restore failure); only a panic isolation with no prior
+        // source error records the generic terminal reason.
+        let reason = match self.recovery.last_error() {
+            Some(previous) => previous,
+            None => "namespace holder terminal after confirmation failure".to_string(),
+        };
+        self.fail_metadata(&reason);
     }
 
     fn fail_metadata(&self, reason: &str) {

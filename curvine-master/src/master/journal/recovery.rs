@@ -165,6 +165,18 @@ impl RecoveryGate {
         self.inner.pending.load(Ordering::Acquire)
     }
 
+    /// Returns the most recently recorded source error, if any. Used to
+    /// distinguish a holder retirement that already has a recorded source
+    /// error from a panic isolation that has none.
+    pub(crate) fn last_error(&self) -> Option<String> {
+        self.inner
+            .last_error
+            .lock()
+            .ok()
+            .filter(|slot| !slot.is_empty())
+            .map(|slot| slot.clone())
+    }
+
     pub(crate) fn note_error(&self, error: &str) {
         if let Ok(mut slot) = self.inner.last_error.lock() {
             slot.clear();

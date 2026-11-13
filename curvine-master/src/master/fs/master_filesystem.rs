@@ -125,8 +125,6 @@ impl ExclusiveConfirmation<'_> {
     }
 
     fn fail_terminal(&mut self) {
-        #[cfg(test)]
-        eprintln!("confirmation RAII: fail_terminal called");
         if let Some(handle) = self.handle.take() {
             handle.fail_closed(self.writer);
         }

@@ -330,8 +330,7 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
         let rt = conf.journal.create_runtime();
         let client = curvine_raft::raft::RaftClient::from_conf(rt, &conf.journal);
         let recovery = journal.master_monitor().recovery();
-        let mut writer = JournalWriter::new(true, client, &conf.journal, recovery.clone())
-            .unwrap();
+        let mut writer = JournalWriter::new(true, client, &conf.journal, recovery.clone()).unwrap();
         writer.enable_testing_receipts(recovery);
         let writer = Arc::new(writer);
         fs.fs_dir
@@ -407,7 +406,10 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
         "both failures must fail the holder closed"
     );
     assert!(
-        matches!(fs.fs_dir.view().err(), Some(crate::master::meta::NamespaceError::Unavailable)),
+        matches!(
+            fs.fs_dir.view().err(),
+            Some(crate::master::meta::NamespaceError::Unavailable)
+        ),
         "the view must be Unavailable after both failures"
     );
 
@@ -417,4 +419,174 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
         "the original op error must take priority, got {delete_err}"
     );
     journal.shutdown();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn exclusive_real_wait_unwind_fails_holder_via_raii_drop() {
+    // Real pending-wait unwind: the exclusive body completes (view reopens),
+    // the confirmation wait is entered with at least one real pending
+    // waiter, the instance-isolated hook panics on the driver's release, and
+    // the RAII Drop fails the holder closed before the gate opens.
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        format_master: true,
+        ..Default::default()
+    };
+    let tmp_root = std::env::temp_dir().join(format!(
+        "exclusive-wait-unwind-{}",
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    conf.master.meta_dir = tmp_root.join("meta").to_str().unwrap().to_string();
+    conf.journal.journal_dir = tmp_root.join("journal").to_str().unwrap().to_string();
+    conf.journal.snapshot_entries = 0;
+    conf.journal.writer_channel_size = 8;
+    let journal = JournalSystem::from_conf(&conf).unwrap();
+    let mut fs = journal.fs();
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
+    fs.mkdir("/dir", true).unwrap();
+    fs.create("/dir/file", true).unwrap();
+    fs.journal_writer.with_testing_receiver(|receiver| loop {
+        match receiver.try_recv() {
+            Ok(entry) => drop(entry),
+            Err(_) => break,
+        }
+    });
+
+    // Swap in the real receipts writer (require_raft_commit=true) so the
+    // exclusive body's delete produces a real queued receipt.
+    let writer = {
+        let rt = conf.journal.create_runtime();
+        let client = curvine_raft::raft::RaftClient::from_conf(rt, &conf.journal);
+        let recovery = journal.master_monitor().recovery();
+        let mut writer = JournalWriter::new(true, client, &conf.journal, recovery.clone()).unwrap();
+        writer.enable_testing_receipts(recovery);
+        let writer = Arc::new(writer);
+        fs.fs_dir
+            .begin_cold(DEFAULT_COLD_TIMEOUT)
+            .unwrap()
+            .journal_writer = writer.clone();
+        writer
+    };
+    fs.journal_writer = writer.clone();
+    let failure_seq_before = writer.failure_seq();
+
+    // Arm the instance-isolated hook before spawning: the receiver is
+    // consumed exactly once inside JournalCommitScope::wait on this writer.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    writer.arm_wait_unwind_hook(release_rx);
+
+    // Pre-operation opaque cursor probe (handle 77 must answer before).
+    let pre_cursor = fs.fs_dir.view().unwrap().store.cursor_store();
+    let pre_cursor_probe = pre_cursor.get_applied_req(77);
+    assert!(
+        matches!(&pre_cursor_probe, Ok(None)),
+        "the live cursor must answer point lookups, got {pre_cursor_probe:?}"
+    );
+
+    // Driver: run the exclusive path on a worker thread with catch_unwind.
+    let fs_worker = fs.clone();
+    let (view_reopened_tx, view_reopened_rx) = std::sync::mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        let fs = fs_worker;
+        // Real role promotion through the actual role_change path.
+        let epoch = fs.journal_writer.metadata_epoch().unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            fs.run_metadata_write_exclusive(epoch, |fs_dir| {
+                // A real journalled operation: delete the file. The receipt
+                // is enqueued inside the exclusive scope.
+                let inp = InodePath::resolve(fs_dir.root_node(), "/dir/file", &fs_dir.store)?;
+                fs_dir.delete(&inp, false)?;
+                view_reopened_tx.send(()).expect("the driver must be alive");
+                Ok(())
+            })
+        }));
+        (result, epoch)
+    });
+
+    // Driver-side phase 1: the body completed (view reopened) while the
+    // exclusive gate stays closed and the delete still waits for its
+    // confirmation. Poll the view until it reopens — the drop(cold) in the
+    // exclusive path runs right after the body returns.
+    view_reopened_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the exclusive body must complete");
+    let view_reopened = (0..200)
+        .find(|_| fs.fs_dir.view().is_ok())
+        .is_some();
+    assert!(
+        view_reopened,
+        "the view must reopen once the body completes"
+    );
+    assert!(
+        fs.metadata_commit_gate().has_exclusive_writer(),
+        "the exclusive gate must stay closed across the real wait"
+    );
+
+    // Phase 2: release the hook — the wait panics after the view reopened.
+    release_tx.send(()).expect("the hook must still be armed");
+
+    let (worker_result, _epoch) = worker.join().expect("the exclusive worker must finish");
+    let panic_message = match worker_result {
+        Err(payload) => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "<non-string panic>".to_string()),
+        Ok(result) => panic!("the exclusive wait must panic, got {result:?}"),
+    };
+    assert!(
+        panic_message.contains("injected journal commit wait unwind"),
+        "the panic must come from the real wait hook, got {panic_message}"
+    );
+
+    // The RAII Drop ran on unwind: the holder is terminal before the gate
+    // opens, the writer is fenced and the failure_seq advanced.
+    assert!(
+        fs.fs_dir.is_failed(),
+        "the holder must be terminal after the real wait unwind"
+    );
+    assert!(
+        matches!(
+            fs.fs_dir.view().err(),
+            Some(crate::master::meta::NamespaceError::Unavailable)
+        ),
+        "the view must be Unavailable after the terminal failure"
+    );
+    assert_ne!(
+        writer.failure_seq(),
+        failure_seq_before,
+        "the failure_seq must advance on the terminal failure"
+    );
+    let cursor_retired = pre_cursor.get_applied_req(77);
+    let cursor_retired_err =
+        cursor_retired.expect_err("the retired cursor must fail point lookups");
+    assert!(
+        cursor_retired_err
+            .to_string()
+            .contains("cursor store unavailable during metadata restore"),
+        "the retired cursor must report the restore-unavailable error, got {cursor_retired_err}"
+    );
+    // The writer must be fenced: new admissions are rejected.
+    let fence_err = writer
+        .ensure_metadata_current()
+        .expect_err("the fenced writer must reject new admissions");
+    assert!(
+        fence_err.to_string().contains("not accepting writes"),
+        "the writer fence must reject admissions, got {fence_err}"
+    );
+
+    // Cleanup: drain receipts, shutdown journal, remove dirs.
+    writer.with_testing_receiver(|receiver| loop {
+        match receiver.try_recv() {
+            Ok(entry) => drop(entry),
+            Err(_) => break,
+        }
+    });
+    journal.shutdown();
+    let meta_cleanup = std::fs::remove_dir_all(&tmp_root);
+    meta_cleanup.ok();
 }
