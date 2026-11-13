@@ -14,7 +14,7 @@
     "core-js": "^3.51.0",
     "mitt": "^3.0.1",
     "vue": "^3.5.45",
-    "vue-router": "^4.0.3",
+    "vue-router": "^5.4.0",
     "vuex": "^4.0.0"
   },
   "devDependencies": {
