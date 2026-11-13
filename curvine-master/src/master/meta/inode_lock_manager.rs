@@ -113,6 +113,23 @@ impl InodeLockManager {
         }
     }
 
+    /// Test-only non-blocking shared observation (R8): acquires the target
+    /// inode stripe's read lock only if currently free — no waiting, no
+    /// queue registration. `None` proves the stripe is still held by the
+    /// terminal request; `Some` would prove it was already released.
+    #[cfg(test)]
+    pub fn try_read_inode(&self, inode_id: i64) -> Option<InodeLockSet<'_>> {
+        let stripe = self.locks.index(inode_id as u64);
+        let guard = self.locks.try_read(inode_id as u64)?;
+        Some(InodeLockSet {
+            guards: [InodeGuard::Read { _guard: guard }].into_iter().collect(),
+            #[cfg(debug_assertions)]
+            manager: self,
+            #[cfg(debug_assertions)]
+            stripes: [stripe].into_iter().collect(),
+        })
+    }
+
     pub fn lock_many<'a>(&'a self, requests: &[InodeLockRequest]) -> InodeLockSet<'a> {
         let started = std::time::Instant::now();
         let mut stripes: SmallVec<[(usize, InodeLockMode); 8]> = requests
