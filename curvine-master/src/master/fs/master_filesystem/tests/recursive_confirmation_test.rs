@@ -93,28 +93,27 @@ fn failed_view_error(fs: &MasterFilesystem) -> NamespaceError {
     }
 }
 
+/// The expected rejection of a call whose return type differs per probe
+/// (`NamespaceError` for views, `ColdError` for cold access).
+fn rejected<T, E>(result: Result<T, E>, context: &'static str) -> E {
+    result.err().expect(context)
+}
+
 fn assert_holder_terminal(fs: &MasterFilesystem, writer: &Arc<JournalWriter>, seq_before: u64) {
     assert!(fs.fs_dir.is_failed(), "the holder must be terminal");
     assert!(
         matches!(
-            {
-                let e = fs
-                    .fs_dir
-                    .view()
-                    .err()
-                    .expect("the holder must reject new views");
-                e
-            },
+            rejected(fs.fs_dir.view(), "the holder must reject new views"),
             NamespaceError::Unavailable
         ),
         "new views must be rejected after the holder went terminal"
     );
     assert!(
         matches!(
-            fs.fs_dir
-                .begin_cold(DEFAULT_COLD_TIMEOUT)
-                .err()
-                .expect("the terminal holder must reject begin_cold"),
+            rejected(
+                fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT),
+                "the terminal holder must reject begin_cold"
+            ),
             ColdError::Unavailable
         ),
         "cold exclusive access must be rejected after the holder went terminal"
