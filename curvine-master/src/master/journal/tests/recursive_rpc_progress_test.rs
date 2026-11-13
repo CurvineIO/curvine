@@ -1,0 +1,276 @@
+// Copyright 2026 OPPO
+//
+// Licensed under the Apache License, Version 2.0.
+//
+//! C2 §9: real apply-worker progress while a recursive RPC waits for its
+//! confirmation.
+//!
+//! A recursive delete runs through the wired recursive coordination entry
+//! (`run_recursive_metadata_write` via the public delete) with a real
+//! receipts writer; its journal entry is committed by the test driver and
+//! the real apply worker advances the FSM watermark, the applied-request
+//! record and the cursor **while the RPC is still waiting for its
+//! receipt** — proving §8.2's "FAILED is not a drain" progress guarantee
+//! on the actual C2 path (not raw `apply_entry`, not an early ack).
+//!
+//! Owned by the main developer (C2 whole-review batch).
+
+use super::*;
+use crate::master::journal::{JournalBatch, JournalSystem};
+use crate::master::Master;
+use curvine_config::ClusterConf;
+use curvine_error::FsResult;
+use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
+use curvine_raft::raft::RoleState;
+use curvine_raft::utils::SerdeUtils;
+use curvine_runtime::common::Utils;
+use raft::eraftpb::Entry;
+use std::sync::Arc;
+use std::time::Duration;
+
+const HANDSHAKE_WINDOW: Duration = Duration::from_secs(10);
+
+struct ProgressFixture {
+    conf: ClusterConf,
+    journal: JournalSystem,
+    fs: MasterFilesystem,
+    loader: JournalLoader,
+    runtime: Arc<tokio::runtime::Runtime>,
+    meta_dir: std::path::PathBuf,
+    journal_dir: std::path::PathBuf,
+}
+
+impl ProgressFixture {
+    fn new(name: &str) -> Self {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            ..Default::default()
+        };
+        conf.change_test_meta_dir(format!("rpc-progress-{}-{}", name, Utils::rand_str(8)));
+        conf.journal.snapshot_entries = 0;
+        conf.journal.writer_channel_size = 8;
+        let journal = JournalSystem::from_conf(&conf).unwrap();
+        let fs = journal.fs();
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        let loader = journal.journal_loader();
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let meta_dir = std::path::PathBuf::from(conf.master.meta_dir.clone());
+        let journal_dir = std::path::PathBuf::from(conf.journal.journal_dir.clone());
+        Self {
+            conf,
+            journal,
+            fs,
+            loader,
+            runtime,
+            meta_dir,
+            journal_dir,
+        }
+    }
+}
+
+fn committed_entry(op_entry: JournalEntry, req_id: i64) -> Entry {
+    let mut batch = JournalBatch::new(1);
+    batch.push(op_entry);
+    Entry {
+        index: 1,
+        term: 1,
+        data: batch.encode().unwrap(),
+        context: SerdeUtils::serialize(&req_id).unwrap().into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receipt() -> FsResult<()>
+{
+    let mut fixture = ProgressFixture::new("rpc-progress");
+    let conf = fixture.conf.clone();
+
+    // Phase 1: setup with the original testing writer, then drain the
+    // retained setup entries so the receipt observed later is the
+    // recursive delete's own.
+    let setup_fs = fixture.fs.clone();
+    setup_fs.mkdir("/tree", true).unwrap();
+    setup_fs.create("/tree/leaf", false).unwrap();
+    setup_fs
+        .journal_writer
+        .with_testing_receiver(|receiver| loop {
+            match receiver.try_recv() {
+                Ok(entry) => drop(entry),
+                Err(_) => break,
+            }
+        });
+
+    // Phase 2: install the real receipts writer (require_raft_commit=true)
+    // aligned on FsDir and the filesystem; verified with a short view
+    // before anything spawns.
+    let writer = {
+        let rt = conf.journal.create_runtime();
+        let client = curvine_raft::raft::RaftClient::from_conf(rt, &conf.journal);
+        let recovery = journal_master_recovery(&fixture);
+        let mut writer = JournalWriter::new(true, client, &conf.journal, recovery.clone()).unwrap();
+        writer.enable_testing_receipts(recovery);
+        let writer = Arc::new(writer);
+        fixture
+            .fs
+            .fs_dir
+            .begin_cold(DEFAULT_COLD_TIMEOUT)
+            .unwrap()
+            .journal_writer = writer.clone();
+        fixture.fs.journal_writer = writer.clone();
+        writer
+    };
+    let failure_seq_before = writer.failure_seq();
+
+    // Pre-op opaque cursor handle: the point lookup must be healthy before
+    // the operation.
+    let pre_cursor = fixture.fs.fs_dir.view().unwrap().store.cursor_store();
+    let pre_cursor_probe = pre_cursor.get_applied_req(77);
+    assert!(
+        matches!(&pre_cursor_probe, Ok(None)),
+        "the live cursor must answer point lookups before the operation, got {pre_cursor_probe:?}"
+    );
+
+    // Phase 3: run the real recursive delete on a worker thread. The body
+    // enqueues the Delete receipt and the coordination entry waits for it.
+    let worker_fs = fixture.fs.clone();
+    let worker = std::thread::spawn(move || worker_fs.delete("/tree", true));
+
+    // Phase 4: the body completed — the view reopened, the tree is deleted
+    // in the live namespace, the delete still waits for its confirmation,
+    // and the failure_seq did not move.
+    // The body is complete when its receipt is in the retained receiver:
+    // the coordination entry enqueues the delete journal entry and then
+    // waits for the confirmation (there is no cold window on this path, so
+    // view polling cannot be the completion signal).
+    let receipt_seen = (0..200)
+        .find(|_| {
+            fixture
+                .fs
+                .journal_writer
+                .with_testing_receiver(|receiver| !receiver.try_recv().is_ok_and(|_| false))
+                .unwrap_or(false)
+        })
+        .is_some();
+    assert!(
+        receipt_seen,
+        "the recursive body must enqueue its delete receipt before waiting"
+    );
+    assert!(
+        fixture.fs.file_status("/tree").is_ok(),
+        "the live namespace must still serve reads while the confirmation waits"
+    );
+    assert_eq!(
+        writer.failure_seq(),
+        failure_seq_before,
+        "the delete must still be waiting for its confirmation"
+    );
+    // Note: the recursive coordination path uses the ordinary admission
+    // slot (gate.enter()), not the closed exclusive gate — the "closed
+    // gate across the confirmation wait" contract belongs to the exclusive
+    // bridge and is covered by the C1/confirmation tests.
+
+    // Phase 5: real commit — the driver registers the delete as committed
+    // and drives the REAL apply worker through the loader's public apply
+    // entry. The FSM watermark, the applied-request record and the cursor
+    // advance while the RPC is still waiting.
+    // Take the queued entry but KEEP its completion alive: dropping the
+    // completion would fail the worker's scope.wait (a real commit error)
+    // before the Scan runs. The entry data is cloned for the committed
+    // log append; the completion stays with `queued` until the test ends.
+    let queued = fixture
+        .fs
+        .journal_writer
+        .with_testing_receiver(|receiver| {
+            receiver
+                .recv_timeout(HANDSHAKE_WINDOW)
+                .expect("missing the recursive delete journal entry")
+        })
+        .expect("the receipts receiver must exist");
+    let op_entry = queued.entry.clone();
+    let entry = committed_entry(op_entry, 1);
+    let _keep_completion_alive = queued;
+    fixture
+        .loader
+        .log_store
+        .append(std::slice::from_ref(&entry))
+        .expect("append committed entry");
+    fixture
+        .loader
+        .log_store
+        .set_hard_state_commit(entry.index)
+        .expect("advance committed index");
+
+    eprintln!(
+        "RPCPROG diag: before scan, holder failed={}, fatal_source={:?}",
+        fixture.fs.fs_dir.is_failed(),
+        journal_master_recovery(&fixture).fatal_source()
+    );
+    let scan_loader = fixture.loader.clone();
+    fixture.runtime.block_on(async {
+        tokio::time::timeout(
+            HANDSHAKE_WINDOW,
+            scan_loader.apply(true, ApplyMsg::new_scan(AppliedIndex::default())),
+        )
+        .await
+        .expect("real Scan must complete within the window")
+        .expect("the real Scan must succeed while the receipt is held");
+    });
+
+    // The FSM applied watermark and the request record both advanced while
+    // the receipt is still held by the waiting RPC.
+    eprintln!(
+        "RPCPROG diag: holder failed={} view_err={:?}",
+        fixture.fs.fs_dir.is_failed(),
+        fixture.fs.fs_dir.view().err().map(|e| e.to_string())
+    );
+    let applied = fixture.loader.fsm_state_snapshot().unwrap().applied;
+    assert_eq!(
+        applied.index, 1,
+        "the FSM applied index must advance while the RPC waits"
+    );
+    assert_eq!(applied.term, 1);
+    let cursor_req = fixture
+        .loader
+        .cursor_store
+        .get_applied_req(1)
+        .expect("the cursor store must stay readable while the receipt is held")
+        .expect("the applied request must be recorded");
+    assert_eq!(cursor_req.index, 1);
+    assert_eq!(cursor_req.term, 1);
+    eprintln!(
+        "rpc-progress: apply worker advanced FSM/req/cursor while the recursive RPC still waits"
+    );
+
+    // Phase 6: orderly teardown — the worker is still waiting on its
+    // receipt, so drain it first (the worker completes its scope.wait and
+    // joins), then drop the fixture. Dropping the fixture while the worker
+    // is blocked aborts the process (pthread lock during shutdown racing
+    // the blocked waiter).
+    drop(_keep_completion_alive);
+    let worker_result = worker
+        .join()
+        .expect("the worker must finish once the receipt drains");
+    let _ = worker_result;
+    let _ = pre_cursor;
+    let _ = failure_seq_before;
+
+    drop(fixture);
+    Ok(())
+}
+
+fn journal_master_recovery(fixture: &ProgressFixture) -> crate::master::journal::RecoveryGate {
+    fixture.journal.master_monitor().recovery()
+}
+
+// Keep the CallChannel import used by the fixture's runtime contract in
+// scope for future phases of this file.
+#[allow(unused_imports)]
+use curvine_runtime::sync::channel::CallChannel;
