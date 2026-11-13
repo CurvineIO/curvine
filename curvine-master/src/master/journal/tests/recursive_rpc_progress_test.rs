@@ -50,7 +50,7 @@ impl ProgressFixture {
         };
         conf.change_test_meta_dir(format!("rpc-progress-{}-{}", name, Utils::rand_str(8)));
         conf.journal.snapshot_entries = 0;
-        conf.journal.writer_channel_size = 8;
+        conf.journal.writer_channel_size = 0;
         let journal = JournalSystem::from_conf(&conf).unwrap();
         let fs = journal.fs();
         fs.master_monitor.set_role_for_test(RoleState::Leader);
@@ -138,33 +138,44 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
         "the live cursor must answer point lookups before the operation, got {pre_cursor_probe:?}"
     );
 
-    // Phase 3: run the real recursive delete on a worker thread. The body
-    // enqueues the Delete receipt and the coordination entry waits for it.
+    // Phase 3/4: prove the C2 bounded subtree-lock path is taken (not the
+    // C1 cold bridge) and run the real recursive delete. The plan_pause
+    // hook fires after capture and BEFORE lock_many — a cold bridge would
+    // never reach this point. The driver arms the hook before the worker
+    // starts, waits for the reached signal with a bounded timeout, then
+    // releases the pause so the coordination entry continues.
+    let (pause_reached_tx, pause_reached_rx) = std::sync::mpsc::channel();
+    let (pause_release_tx, pause_release_rx) = std::sync::mpsc::channel();
+    fixture
+        .fs
+        .journal_writer
+        .arm_plan_pause_hook(pause_reached_tx, pause_release_rx);
+
     let worker_fs = fixture.fs.clone();
     let worker = std::thread::spawn(move || worker_fs.delete("/tree", true));
 
-    // Phase 4: the body completed — the view reopened, the tree is deleted
-    // in the live namespace, the delete still waits for its confirmation,
-    // and the failure_seq did not move.
-    // The body is complete when its receipt is in the retained receiver:
-    // the coordination entry enqueues the delete journal entry and then
-    // waits for the confirmation (there is no cold window on this path, so
-    // view polling cannot be the completion signal).
-    let receipt_seen = (0..200)
-        .find(|_| {
-            fixture
-                .fs
-                .journal_writer
-                .with_testing_receiver(|receiver| !receiver.try_recv().is_ok_and(|_| false))
-                .unwrap_or(false)
-        })
+    // The plan pause must fire within the window: this proves the C2
+    // bounded subtree-lock path (not the C1 cold bridge) was taken.
+    pause_reached_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the recursive delete must reach the plan pause (C2 path taken)");
+    // Release the pause so the coordination entry continues to lock_many.
+    pause_release_tx
+        .send(())
+        .expect("the plan pause must be releasable");
+
+    // The body has published: the live tree no longer contains /tree
+    // (this is the C2 locked-path completion signal, not a tree-still-
+    // exists assertion).
+    let live_deleted = (0..200)
+        .find(|_| fixture.fs.file_status("/tree").is_err())
         .is_some();
     assert!(
-        receipt_seen,
-        "the recursive body must enqueue its delete receipt before waiting"
+        live_deleted,
+        "the recursive delete must remove /tree in the live namespace"
     );
     assert!(
-        fixture.fs.file_status("/tree").is_ok(),
+        fixture.fs.file_status("/tree").is_err(),
         "the live namespace must still serve reads while the confirmation waits"
     );
     assert_eq!(
@@ -172,10 +183,6 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
         failure_seq_before,
         "the delete must still be waiting for its confirmation"
     );
-    // Note: the recursive coordination path uses the ordinary admission
-    // slot (gate.enter()), not the closed exclusive gate — the "closed
-    // gate across the confirmation wait" contract belongs to the exclusive
-    // bridge and is covered by the C1/confirmation tests.
 
     // Phase 5: real commit — the driver registers the delete as committed
     // and drives the REAL apply worker through the loader's public apply
