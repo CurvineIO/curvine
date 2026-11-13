@@ -282,18 +282,13 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
     Ok(())
 }
 
-// The op Err + commit Err double-failure combination is not naturally
-// reachable through the exclusive protocol: in `fs_dir.delete`, the only
-// `send_and_wait` is the last operation before the body returns, so an op
-// error and a commit error are the same event. A `before_commit` fault
-// blocks the store batch before `send_and_wait` is reached, which produces
-// only an op error (covered by `exclusive_delete_store_error_keeps_holder_
-// open_and_keeps_op_error`). A dropped receipt produces only a commit error
-// (covered by `real_exclusive_delete_confirmation_failure_fails_holder_
-// closed`). The exclusive path's error priority code (op Err over commit
-// Err) is still exercised by the existing match arms in
-// `run_metadata_write_exclusive`, verified by the combination of these two
-// single-failure tests.
+// The (Err(op), Err(commit)) double-failure arm of
+// `run_metadata_write_exclusive` is covered by
+// `exclusive_op_and_commit_error_preserves_original_op_error`
+// (write_planning_test), which calls the production helper directly. This
+// file's two single-failure cases below each cover only one failure kind
+// (op-only via a `before_commit` store fault; commit-only via a dropped
+// receipt) and do NOT together exercise the double-failure match arm.
 
 #[test]
 fn exclusive_delete_validation_error_keeps_holder_open() {
@@ -331,7 +326,14 @@ fn exclusive_delete_validation_error_keeps_holder_open() {
         "the view must reopen after a pure validation error"
     );
     assert_eq!(fs.journal_writer.failure_seq(), failure_seq_before);
+
+    // Teardown: release the filesystem handle first (the holder is OPEN, so
+    // it keeps the metadata store alive through the handle), then shutdown,
+    // then save each independent remove result.
+    drop(fs);
     journal.shutdown();
     let meta_cleanup = std::fs::remove_dir_all(&conf.master.meta_dir);
+    let journal_cleanup = std::fs::remove_dir_all(&conf.journal.journal_dir);
     meta_cleanup.expect("the case meta dir must be removable");
+    journal_cleanup.expect("the case journal dir must be removable");
 }

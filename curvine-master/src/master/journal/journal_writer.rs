@@ -72,8 +72,12 @@ impl JournalCommitScope<'_> {
         #[cfg(test)]
         if !waiters.is_empty() {
             if let Some(writer) = self.writer {
-                let release = writer.wait_unwind_hook.lock().unwrap().take();
-                if let Some(release) = release {
+                let hook = writer.wait_unwind_hook.lock().unwrap().take();
+                if let Some((reached, release)) = hook {
+                    // Signal the driver from inside the real pending wait
+                    // (after the hook mutex is released by take) so the
+                    // driver can observe view/gate before releasing.
+                    let _ = reached.send(());
                     if release
                         .recv_timeout(std::time::Duration::from_secs(30))
                         .is_ok()
@@ -154,10 +158,13 @@ pub struct JournalWriter {
     entries_since_snapshot: AtomicCounter,
 
     /// Test-only instance-isolated wait-unwind hook: when armed, the next
-    /// real `JournalCommitScope::wait` with pending waiters blocks on it and
-    /// panics after release. Consumed once, so it disarms itself.
+    /// real `JournalCommitScope::wait` with pending waiters signals
+    /// `reached` (it is inside the real wait with waiters), then blocks on
+    /// `release` and panics after the release. Consumed once, so it disarms
+    /// itself.
     #[cfg(test)]
-    wait_unwind_hook: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    wait_unwind_hook:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl JournalWriter {
@@ -298,8 +305,12 @@ impl JournalWriter {
     /// then panics to exercise the real wait unwind path. The receiver is
     /// consumed once (take), so the hook disarms itself after firing.
     #[cfg(test)]
-    pub fn arm_wait_unwind_hook(&self, release: std::sync::mpsc::Receiver<()>) {
-        *self.wait_unwind_hook.lock().unwrap() = Some(release);
+    pub fn arm_wait_unwind_hook(
+        &self,
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.wait_unwind_hook.lock().unwrap() = Some((reached, release));
     }
 
     pub fn begin_commit_scope(&self) -> JournalCommitScope<'_> {
@@ -377,6 +388,8 @@ impl JournalWriter {
     }
 
     pub(crate) fn fail_metadata_commit(&self) {
+        self.recovery
+            .record_fatal_source("metadata journal commit failed after mutation");
         self.fail_metadata("metadata journal commit failed after mutation");
     }
 
@@ -385,26 +398,26 @@ impl JournalWriter {
     }
 
     pub(crate) fn fail_metadata_publication(&self) {
+        self.recovery
+            .record_fatal_source("metadata publication failed after durable commit");
         self.fail_metadata("metadata publication failed after durable commit");
     }
 
     pub(crate) fn fail_metadata_restore(&self) {
+        self.recovery
+            .record_fatal_source("metadata restore failed after store replacement began");
         self.fail_metadata("metadata restore failed after store replacement began");
     }
 
-    /// Terminal fencing for the namespace holder. The underlying
-    /// `fail_metadata` call preserves whatever source error was already
-    /// recorded by a preceding `fail_metadata_commit/publication` call
-    /// (its `enter_safe_mode` will overwrite the reason, but the earlier
-    /// source-specific call's `last_error` was already stored).
+    /// Terminal fencing for the namespace holder. The reason reflects the
+    /// recorded fatal source (commit/publication/restore failure) when one
+    /// exists; an unwind with no recorded fatal source gets a neutral
+    /// terminal reason. Ordinary UFS notes are never misattributed here.
     pub(crate) fn fail_metadata_holder_terminal(&self) {
-        // Preserve an already-recorded source error (commit/publication
-        // failure, restore failure); only a panic isolation with no prior
-        // source error records the generic terminal reason.
-        let reason = match self.recovery.last_error() {
-            Some(previous) => previous,
-            None => "namespace holder terminal after confirmation failure".to_string(),
-        };
+        let reason = self
+            .recovery
+            .fatal_source()
+            .unwrap_or_else(|| "namespace holder terminal (unknown source)".to_string());
         self.fail_metadata(&reason);
     }
 
@@ -906,3 +919,7 @@ mod commit_scope_test;
 #[cfg(test)]
 #[path = "tests/exclusive_confirmation_test.rs"]
 mod exclusive_confirmation_test;
+
+#[cfg(test)]
+#[path = "tests/fatal_source_test.rs"]
+mod fatal_source_test;

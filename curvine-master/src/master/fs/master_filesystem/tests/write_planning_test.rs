@@ -291,15 +291,15 @@ fn build_located_blocks_reports_lost_blocks_like_the_live_path() {
     );
 }
 
-#[cfg(feature = "fault-injection")]
 #[test]
 fn exclusive_op_and_commit_error_preserves_original_op_error() {
-    // Direct private helper call: the exclusive body enqueues a real receipt
-    // (via fs_dir.delete → send_and_wait), then returns a distinguishable
-    // typed op error. The test drops the unique receipt to also fail the
-    // commit, exercising the (Err(op), Err(commit)) match arm.
-    use curvine_runtime::sync::channel::CallChannel;
-
+    // Real production-helper contract: the worker thread calls
+    // run_metadata_write_exclusive(epoch, body). The body uses the passed-in
+    // FsDir to perform a real journalled delete (enqueuing a receipt), then
+    // returns a distinguishable typed op error. The driver drops the unique
+    // real completion, so the helper's own result is the (Err(op),
+    // Err(commit)) arm — the test never re-implements the gate/scope/RAII
+    // match.
     Master::init_test_metrics();
     let mut conf = ClusterConf {
         testing: true,
@@ -325,7 +325,8 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
     });
     let failure_seq_before = fs.journal_writer.failure_seq();
 
-    // Install the receipts writer (require_raft_commit=true).
+    // Install the receipts writer (require_raft_commit=true) into both the
+    // FsDir and the filesystem.
     let writer = {
         let rt = conf.journal.create_runtime();
         let client = curvine_raft::raft::RaftClient::from_conf(rt, &conf.journal);
@@ -341,35 +342,23 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
     };
     fs.journal_writer = writer.clone();
 
-    // The exclusive body: first performs a real FsDir operation that enqueues
-    // a receipt (fs_dir.delete), then returns a distinguishable typed op
-    // error. This exercises the (Err(op), Err(commit)) match arm.
-    let op_error_message = "exclusive body: typed op error after enqueue";
-    let op_error = FsError::common(op_error_message);
+    let fs_worker = fs.clone();
+    let worker = std::thread::spawn(move || {
+        let fs = fs_worker;
+        let epoch = fs.journal_writer.metadata_epoch().unwrap();
+        fs.run_metadata_write_exclusive(epoch, |fs_dir: &mut FsDir| {
+            // A real journalled operation through the passed-in owner: the
+            // receipt is enqueued inside the exclusive scope.
+            let inp = InodePath::resolve(fs_dir.root_node(), "/dir/file", &fs_dir.store)?;
+            fs_dir.delete(&inp, false)?;
+            // The send_and_wait inside fs_dir.delete has already enqueued the
+            // receipt. Now return a distinguishable typed op error.
+            err_box!("exclusive body: typed op error after enqueue")
+        })
+    });
 
-    // Acquire the exclusive path directly via the private helper.
-    let epoch = fs.journal_writer.metadata_epoch().unwrap();
-    let commit_gate = fs.metadata_commit_gate();
-    let mut confirmation = ExclusiveConfirmation {
-        handle: Some(&fs.fs_dir),
-        writer: &fs.journal_writer,
-    };
-    let mut gate = commit_gate.close_and_enter_if_open().unwrap();
-    let scope = fs.journal_writer.begin_commit_scope();
-    let mut cold = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-
-    let body_result: FsResult<()> = (|| {
-        let inp = InodePath::resolve(cold.root_node(), "/dir/file", &cold.store)?;
-        cold.delete(&inp, false)?;
-        // The send_and_wait inside fs_dir.delete has already enqueued the
-        // receipt. Now return the typed op error.
-        curvine_core_error::err_box!("{}", op_error_message)
-    })();
-
-    // Drop the cold owner before the confirmation wait.
-    drop(cold);
-
-    // The receipt was enqueued; drop the completion to fail the commit.
+    // Driver: take the unique real completion from the retained receiver and
+    // drop it, failing the commit for real.
     let queued = writer
         .with_testing_receiver(|receiver| {
             receiver
@@ -379,26 +368,16 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
         .expect("the receipts receiver must exist");
     drop(queued.completion.expect("missing commit confirmation"));
 
-    // The confirmation wait now fails for real (the completion was dropped).
-    let commit = scope.wait();
-    // Only a successful commit disarms the RAII guard; a failed commit keeps
-    // the guard armed so its Drop fails the holder closed before the gate
-    // opens.
-    if commit.is_ok() {
-        confirmation.disarm();
-    }
-    drop(confirmation);
-    drop(gate);
-
-    // The op error takes priority over the commit error.
-    let delete_err = match (body_result, commit) {
-        (Err(op_err), _) => op_err,
-        (Ok(_), Err(commit_err)) => commit_err,
-        (Ok(value), Ok(())) => {
-            let _ = value;
-            panic!("the exclusive body must fail");
-        }
-    };
+    // The helper's real result: op error keeps its original variant and
+    // context over the commit error.
+    let result: FsResult<()> = worker.join().expect("the exclusive worker must finish");
+    let delete_err = result.expect_err("the exclusive op must fail with the op error");
+    assert!(
+        delete_err
+            .to_string()
+            .contains("exclusive body: typed op error after enqueue"),
+        "the original op error must take priority, got {delete_err}"
+    );
 
     // The holder must be terminal (body Err + seq moved → fail_closed).
     assert!(
@@ -412,23 +391,30 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
         ),
         "the view must be Unavailable after both failures"
     );
-
-    // The op error keeps its original variant and message.
-    assert!(
-        delete_err.to_string().contains(op_error_message),
-        "the original op error must take priority, got {delete_err}"
+    assert_ne!(
+        fs.journal_writer.failure_seq(),
+        failure_seq_before,
+        "the failure_seq must advance on the terminal failure"
     );
+
+    // Teardown: release handles before shutdown; save each remove result.
+    drop(fs);
+    drop(writer);
     journal.shutdown();
+    let meta_cleanup = std::fs::remove_dir_all(&conf.master.meta_dir);
+    meta_cleanup.expect("the case meta dir must be removable");
 }
 
-#[cfg(feature = "fault-injection")]
 #[test]
 fn exclusive_real_wait_unwind_fails_holder_via_raii_drop() {
-    // Real pending-wait unwind: the exclusive body completes (view reopens),
-    // the confirmation wait is entered with at least one real pending
-    // waiter, the instance-isolated hook panics on the driver's release, and
-    // the RAII Drop fails the holder closed before the gate opens.
+    // Real pending-wait unwind: the worker calls the production exclusive
+    // helper; the instance-isolated hook signals `reached` from inside the
+    // real JournalCommitScope::wait (with pending waiters), the driver then
+    // observes the reopened view and the still-closed gate, releases, and
+    // the wait panics — the RAII Drop fails the holder closed before the
+    // gate opens.
     use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::time::Duration;
 
     Master::init_test_metrics();
     let mut conf = ClusterConf {
@@ -474,10 +460,11 @@ fn exclusive_real_wait_unwind_fails_holder_via_raii_drop() {
     fs.journal_writer = writer.clone();
     let failure_seq_before = writer.failure_seq();
 
-    // Arm the instance-isolated hook before spawning: the receiver is
-    // consumed exactly once inside JournalCommitScope::wait on this writer.
+    // Arm the instance-isolated hook before spawning: the reached signal is
+    // sent from inside the real pending wait; the release is consumed once.
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    writer.arm_wait_unwind_hook(release_rx);
+    writer.arm_wait_unwind_hook(reached_tx, release_rx);
 
     // Pre-operation opaque cursor probe (handle 77 must answer before).
     let pre_cursor = fs.fs_dir.view().unwrap().store.cursor_store();
@@ -487,36 +474,30 @@ fn exclusive_real_wait_unwind_fails_holder_via_raii_drop() {
         "the live cursor must answer point lookups, got {pre_cursor_probe:?}"
     );
 
-    // Driver: run the exclusive path on a worker thread with catch_unwind.
+    // Worker: run the real production helper; catch the injected unwind.
     let fs_worker = fs.clone();
-    let (view_reopened_tx, view_reopened_rx) = std::sync::mpsc::channel::<()>();
     let worker = std::thread::spawn(move || {
         let fs = fs_worker;
-        // Real role promotion through the actual role_change path.
         let epoch = fs.journal_writer.metadata_epoch().unwrap();
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            fs.run_metadata_write_exclusive(epoch, |fs_dir| {
+        catch_unwind(AssertUnwindSafe(|| {
+            fs.run_metadata_write_exclusive(epoch, |fs_dir: &mut FsDir| {
                 // A real journalled operation: delete the file. The receipt
                 // is enqueued inside the exclusive scope.
                 let inp = InodePath::resolve(fs_dir.root_node(), "/dir/file", &fs_dir.store)?;
                 fs_dir.delete(&inp, false)?;
-                view_reopened_tx.send(()).expect("the driver must be alive");
                 Ok(())
             })
-        }));
-        (result, epoch)
+        }))
     });
 
-    // Driver-side phase 1: the body completed (view reopened) while the
-    // exclusive gate stays closed and the delete still waits for its
-    // confirmation. Poll the view until it reopens — the drop(cold) in the
-    // exclusive path runs right after the body returns.
-    view_reopened_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("the exclusive body must complete");
-    let view_reopened = (0..200).find(|_| fs.fs_dir.view().is_ok()).is_some();
+    // Phase 1: the hook reached the real pending wait — the body has
+    // returned, drop(cold) has run, and the driver can now observe the
+    // reopened view and the still-closed exclusive gate without polling.
+    reached_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the exclusive wait must be entered with a real pending waiter");
     assert!(
-        view_reopened,
+        fs.fs_dir.view().is_ok(),
         "the view must reopen once the body completes"
     );
     assert!(
@@ -524,11 +505,29 @@ fn exclusive_real_wait_unwind_fails_holder_via_raii_drop() {
         "the exclusive gate must stay closed across the real wait"
     );
 
-    // Phase 2: release the hook — the wait panics after the view reopened.
+    // Phase 2: release the hook — the wait panics on the real unwind path.
     release_tx.send(()).expect("the hook must still be armed");
 
-    let (worker_result, _epoch) = worker.join().expect("the exclusive worker must finish");
-    let panic_message = match worker_result {
+    // Phase 3: bounded join — the worker must finish on its own.
+    let (worker_result_tx, worker_result_rx) = std::sync::mpsc::channel();
+    let joiner = std::thread::spawn(move || {
+        let joined = worker.join().expect("the exclusive worker must finish");
+        worker_result_tx
+            .send(joined)
+            .expect("the driver must be alive");
+    });
+    let joined = loop {
+        match worker_result_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(joined) => break Some(joined),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the joiner must stay alive until the worker result is sent")
+            }
+        }
+    };
+    let joined = joined.expect("the exclusive worker must finish within the bound");
+    joiner.join().expect("the joiner thread must finish");
+    let panic_message = match joined {
         Err(payload) => payload
             .downcast_ref::<String>()
             .cloned()
@@ -568,7 +567,6 @@ fn exclusive_real_wait_unwind_fails_holder_via_raii_drop() {
             .contains("cursor store unavailable during metadata restore"),
         "the retired cursor must report the restore-unavailable error, got {cursor_retired_err}"
     );
-    // The writer must be fenced: new admissions are rejected.
     let fence_err = writer
         .ensure_metadata_current()
         .expect_err("the fenced writer must reject new admissions");
@@ -577,14 +575,17 @@ fn exclusive_real_wait_unwind_fails_holder_via_raii_drop() {
         "the writer fence must reject admissions, got {fence_err}"
     );
 
-    // Cleanup: drain receipts, shutdown journal, remove dirs.
+    // Teardown: drain receipts, release handles, shutdown, save the real
+    // remove result.
     writer.with_testing_receiver(|receiver| loop {
         match receiver.try_recv() {
             Ok(entry) => drop(entry),
             Err(_) => break,
         }
     });
+    drop(fs);
+    drop(writer);
     journal.shutdown();
-    let meta_cleanup = std::fs::remove_dir_all(&tmp_root);
-    meta_cleanup.ok();
+    let cleanup = std::fs::remove_dir_all(&tmp_root);
+    cleanup.expect("the case temp root must be removable");
 }

@@ -96,6 +96,12 @@ struct RecoveryInner {
     generation: AtomicU64,
     pending: AtomicU64,
     last_error: Mutex<String>,
+    /// Terminal failure source recorded only by real fatal entry points
+    /// (commit/publication/restore failure, holder panic isolation).
+    /// Ordinary UFS diagnostics via `note_error` never touch it, so a
+    /// `No workers available` note cannot be misattributed as the
+    /// namespace fatal cause.
+    fatal_source: Mutex<String>,
     failure_seq: AtomicU64,
 }
 
@@ -109,6 +115,7 @@ impl RecoveryGate {
                 generation: AtomicU64::new(1),
                 pending: AtomicU64::new(0),
                 last_error: Mutex::new(String::new()),
+                fatal_source: Mutex::new(String::new()),
                 failure_seq: AtomicU64::new(0),
             }),
         }
@@ -165,12 +172,21 @@ impl RecoveryGate {
         self.inner.pending.load(Ordering::Acquire)
     }
 
-    /// Returns the most recently recorded source error, if any. Used to
-    /// distinguish a holder retirement that already has a recorded source
-    /// error from a panic isolation that has none.
-    pub(crate) fn last_error(&self) -> Option<String> {
+    /// Records the source of a real terminal failure. Only fatal entry
+    /// points call this; ordinary diagnostics (`note_error`) cannot.
+    pub(crate) fn record_fatal_source(&self, source: &str) {
+        if let Ok(mut slot) = self.inner.fatal_source.lock() {
+            if slot.is_empty() {
+                slot.push_str(source);
+            }
+        }
+    }
+
+    /// Returns the recorded terminal failure source, if any. Ordinary UFS
+    /// notes do not appear here.
+    pub(crate) fn fatal_source(&self) -> Option<String> {
         self.inner
-            .last_error
+            .fatal_source
             .lock()
             .ok()
             .filter(|slot| !slot.is_empty())
