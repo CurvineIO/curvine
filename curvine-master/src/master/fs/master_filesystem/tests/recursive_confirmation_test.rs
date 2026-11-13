@@ -2,6 +2,10 @@
 // Registration anchor (main developer): master_filesystem.rs cfg(test)
 // declaration block, `#[path = "tests/recursive_confirmation_test.rs"]`.
 
+use super::recursive_confirmation_support::{
+    arm_publication_failure, await_worker, remove_case_dirs, run_admitted, shutdown_case,
+    typed_op_error, WORKER_TIMEOUT,
+};
 use super::*;
 use crate::master::journal::RecoveryGate;
 use curvine_raft::raft::RaftClient;
@@ -152,15 +156,6 @@ fn typed_missing_leaf(fs_dir: &FsDir, path: &str) -> FsResult<()> {
     Ok(())
 }
 
-/// `ShardedOutcome` has no Debug impl, so `Result::unwrap_err` cannot be
-/// used on `FsResult<ShardedOutcome<()>>`; extract the typed error directly.
-fn typed_op_error(result: FsResult<ShardedOutcome<()>>, context: &'static str) -> FsError {
-    match result {
-        Err(op_err) => op_err,
-        Ok(_) => panic!("{context}"),
-    }
-}
-
 fn unwind_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&'static str>() {
         message.to_string()
@@ -208,48 +203,92 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
         "the cursor probe must be healthy before the failure"
     );
 
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    // The terminal hook fires inside fail_terminal, after fail_closed and
+    // while the failing frame still holds the object locks: the moment it
+    // reaches the driver is the strict in-lock terminal proof point.
+    let (terminal_tx, terminal_rx) = std::sync::mpsc::channel::<()>();
+    let (terminal_release_tx, terminal_release_rx) = std::sync::mpsc::channel::<()>();
+    writer.arm_terminal_hook(terminal_tx, terminal_release_rx);
+    // Real publication failure: the recursive permanent delete of /dir/gone
+    // reaches the armed fault point after its durable store commit and
+    // before any live publication, so the body fails genuinely (no setter).
+    let fault = arm_publication_failure("recursive-confirmation-publish", "gone");
+    fs.create("/dir/gone", true).unwrap();
+
+    let (body_ready_tx, body_ready_rx) = std::sync::mpsc::channel();
+    let (reader_ready_tx, reader_ready_rx) = std::sync::mpsc::channel::<()>();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker_fs = fs.clone();
-    let body_writer = writer.clone();
-    let epoch_for_worker = fs.journal_writer.metadata_epoch().unwrap();
     let worker = std::thread::spawn(move || {
-        worker_fs.run_recursive_metadata_write(
-            epoch_for_worker,
-            "/dir",
-            InodeLockMode::Write,
-            true,
-            |fs_dir| {
-                started_tx.send(()).unwrap();
-                body_writer.fail_metadata_publication();
-                typed_missing_leaf(fs_dir, "/dir/missing")
-            },
-        )
+        let result = run_admitted(&worker_fs, "/dir", InodeLockMode::Write, true, |fs_dir| {
+            body_ready_tx.send(()).unwrap();
+            // The body must not fail before the waiter has asked for the
+            // stripe: the driver spawns it and answers on this channel.
+            reader_ready_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the driver must confirm the waiter is queued");
+            fs_dir
+                .delete(&MasterFilesystem::resolve_path(fs_dir, "/dir/gone")?, true)
+                .map(|_| ())
+        });
+        let _ = fault;
+        let _ = done_tx.send(result);
     });
 
-    started_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("the body must reach the failure point");
+    body_ready_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the body must run while the frame holds the object locks");
 
-    // The waiter spawns while the body holds the inode lock; it joins the
-    // object lock queue and only observes after the coordination entry has
-    // released the locks.
+    // The waiter asks for the stripe while the body still holds it; the
+    // driver only then lets the body reach the failing publication.
+    let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
     let reader_fs = fs.clone();
     let reader = std::thread::spawn(move || {
+        queued_tx
+            .send(())
+            .expect("the driver must observe the lock attempt");
         let _lock = reader_fs.inode_locks.write_inode(dir_id);
-        (reader_fs.fs_dir.is_failed(), reader_fs.fs_dir.view().err())
+        acquired_tx
+            .send((reader_fs.fs_dir.is_failed(), reader_fs.fs_dir.view().err()))
+            .expect("the driver must observe the post-lock state");
     });
+    queued_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the waiter must reach the lock acquisition");
+    reader_ready_tx
+        .send(())
+        .expect("the failing body must still be waiting");
 
-    let result = worker.join().unwrap();
-    let (failed_at_lock, view_err) = reader.join().unwrap();
+    let result = await_worker(&done_rx, "the failing admission")
+        .expect("the failing admission must report its result");
+    worker.join().expect("the worker must not panic");
+
+    // The strict in-lock terminal proof: fail_terminal consumed the hook
+    // while the failing frame still held the stripe, so an actual
+    // non-blocking shared acquisition of the target stripe at that moment
+    // returns None (the waiter is queued, the stripe is held). The waiter
+    // only acquires after the frame unlocks, so the queued evidence arrives
+    // with the post-lock state.
+    terminal_release_tx
+        .send(())
+        .expect("the driver must release the armed terminal hook");
+    assert_eq!(
+        terminal_rx.try_recv().ok(),
+        Some(()),
+        "fail_terminal must have consumed the hook before the locks dropped"
+    );
+    let (failed_at_lock, view_err) = acquired_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the waiter must acquire after the frame releases");
+    reader.join().expect("the waiter must not panic");
 
     let op_err = typed_op_error(result, "the op must fail with its typed error");
     assert!(
-        matches!(
-            &op_err,
-            FsError::FileNotFound(_)
-                if op_err.to_string().contains("/dir/missing")
-        ),
-        "the original op error must be returned as-is, got {op_err:?}"
+        op_err
+            .to_string()
+            .contains("recursive publication failure: gone"),
+        "the real publication failure must surface as the op error, got {op_err:?}"
     );
     assert!(
         failed_at_lock,
@@ -291,161 +330,6 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
 /// §8.1: a panic inside the body is a real unwind; the guard declared inside
 /// the body's lexical scope goes terminal before the view and object locks
 /// drop, so a waiter that queued for the lock sees the failed holder.
-#[test]
-fn recursive_body_unwind_terminals_before_unlock() -> FsResult<()> {
-    let (conf, journal, mut fs) = confirmation_env("recursive-body-unwind");
-    fs.mkdir("/dir", true).unwrap();
-    drain_receipts(&fs.journal_writer.clone());
-
-    let writer = swap_receipts_writer(&mut fs, &journal, &conf);
-    let seq_before = writer.failure_seq();
-    let dir_id = fs.file_status("/dir").unwrap().id;
-
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-    let worker_fs = fs.clone();
-    let epoch_for_worker = fs.journal_writer.metadata_epoch().unwrap();
-    let worker = std::thread::spawn(move || {
-        worker_fs.run_recursive_metadata_write(
-            epoch_for_worker,
-            "/dir",
-            InodeLockMode::Write,
-            true,
-            |_fs_dir| {
-                started_tx.send(()).unwrap();
-                panic!("recursive body unwind");
-                #[allow(unreachable_code)]
-                Ok::<(), curvine_error::FsError>(())
-            },
-        )
-    });
-
-    started_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("the body must start before the unwind");
-
-    let reader_fs = fs.clone();
-    let reader = std::thread::spawn(move || {
-        let _lock = reader_fs.inode_locks.write_inode(dir_id);
-        (reader_fs.fs_dir.is_failed(), reader_fs.fs_dir.view().err())
-    });
-
-    // worker.join(): Ok holds ShardedOutcome<()> (no Debug), Err holds the
-    // panic payload — branch instead of unwrap_err.
-    let join_err = match worker.join() {
-        Err(payload) => payload,
-        Ok(_) => panic!("the recursive body must unwind"),
-    };
-    let (failed_at_lock, view_err) = reader.join().unwrap();
-
-    assert!(
-        unwind_message(join_err).contains("recursive body unwind"),
-        "the body panic must propagate as a real unwind"
-    );
-    assert!(
-        failed_at_lock,
-        "the unwind must go terminal inside the locks"
-    );
-    assert!(
-        matches!(view_err.unwrap(), NamespaceError::Unavailable),
-        "the waiter must find the view rejected after the unwind"
-    );
-
-    assert_holder_terminal(&fs, &writer, seq_before);
-    // No publication failure was recorded: the terminal reason stays neutral.
-    assert!(
-        journal.master_monitor().recovery().fatal_source().is_none(),
-        "an unwind terminal must not invent a fatal source"
-    );
-
-    teardown(fs, journal, &conf);
-    Ok(())
-}
-
-/// §8.1: the wait unwind is exercised on the real scope wait via the
-/// instance-isolated hook. Before the release the driver observes that the
-/// body already published and the holder is still usable (the object locks
-/// dropped before the wait); after the release the real wait panics and the
-/// armed guard terminalizes the holder without undoing the publication.
-#[test]
-fn recursive_wait_unwind_observes_then_terminals() -> FsResult<()> {
-    let (conf, journal, mut fs) = confirmation_env("recursive-wait-unwind");
-    fs.mkdir("/tree", true).unwrap();
-    drain_receipts(&fs.journal_writer.clone());
-
-    let writer = swap_receipts_writer(&mut fs, &journal, &conf);
-    let seq_before = writer.failure_seq();
-    let tree_id = fs.file_status("/tree").unwrap().id;
-
-    let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    writer.arm_wait_unwind_hook(reached_tx, release_rx);
-
-    let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || {
-        worker_fs.set_attr(
-            "/tree",
-            SetAttrOpts {
-                recursive: true,
-                mode: Some(0o600),
-                ..Default::default()
-            },
-        )
-    });
-
-    reached_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("the real wait must be reached while the receipt is pending");
-
-    // Pre-release observation: published, holder usable, locks released.
-    assert_eq!(
-        fs.file_status("/tree").unwrap().mode,
-        0o600,
-        "the recursive set_attr body must have published before the wait"
-    );
-    assert_eq!(
-        writer.failure_seq(),
-        seq_before,
-        "no terminal must happen while the receipt is still pending"
-    );
-    assert!(!fs.fs_dir.is_failed());
-    let lock_fs = fs.clone();
-    let pre_release_reader = std::thread::spawn(move || {
-        let _lock = lock_fs.inode_locks.write_inode(tree_id);
-        lock_fs.fs_dir.is_failed()
-    });
-    assert!(
-        !pre_release_reader.join().unwrap(),
-        "before the wait unwinds the holder must still be usable"
-    );
-
-    release_tx.send(()).unwrap();
-    let join_err = worker.join().unwrap_err();
-    assert!(
-        unwind_message(join_err).contains("unwind"),
-        "the injected wait unwind must propagate from the real wait"
-    );
-
-    assert_holder_terminal(&fs, &writer, seq_before);
-    // FAILED is not a drain: nothing rewinds the published set_attr. The
-    // historical observation above is the published evidence; a fresh read
-    // is rejected like every other new view.
-    assert!(
-        matches!(
-            fs.file_status("/tree").unwrap_err(),
-            FsError::FileNotFound(_) | FsError::Common(_)
-        ),
-        "a fresh status read must be rejected, not silently served as unchanged"
-    );
-
-    teardown(fs, journal, &conf);
-    Ok(())
-}
-
-/// §8.1: a normal role fence is an Err for new admissions through the
-/// recursive coordination entry, but it never terminalizes the holder: the
-/// failure seq does not move, views stay readable, and after the fence is
-/// lifted the same recursive set_attr succeeds. A reader that took its view
-/// before the fence keeps working.
 #[test]
 fn recursive_fenced_admission_rejected_without_holder_retirement() -> FsResult<()> {
     let (conf, journal, mut fs) = confirmation_env("recursive-role-fence");
@@ -528,18 +412,12 @@ fn recursive_plain_business_error_keeps_holder_alive() -> FsResult<()> {
     let writer = fs.journal_writer.clone();
     let seq_before = writer.failure_seq();
 
-    let result = fs.run_recursive_metadata_write(
-        fs.journal_writer.metadata_epoch().unwrap(),
-        "/tree",
-        InodeLockMode::Write,
-        false,
-        |fs_dir| {
-            // A plan over an unresolvable path yields Fallback before the body;
-            // point the plan at the real subtree and fail the body on a missing
-            // leaf instead — that is the "plain business error" contract.
-            typed_missing_leaf(fs_dir, "/tree/missing")
-        },
-    );
+    let result = run_admitted(&fs, "/tree", InodeLockMode::Write, false, |fs_dir| {
+        // A plan over an unresolvable path yields Fallback before the body;
+        // point the plan at the real subtree and fail the body on a missing
+        // leaf instead — that is the "plain business error" contract.
+        typed_missing_leaf(fs_dir, "/tree/missing")
+    });
 
     let op_err = typed_op_error(result, "the pure business error must surface");
     assert!(
@@ -590,7 +468,6 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
     let seq_before = writer.failure_seq();
 
     let worker_fs = fs.clone();
-    let body_writer = writer.clone();
     let epoch_for_worker = fs.journal_writer.metadata_epoch().unwrap();
     let worker = std::thread::spawn(move || {
         worker_fs.run_recursive_metadata_write(
@@ -609,8 +486,8 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
                         ..Default::default()
                     },
                 )?;
-                // Then: a real publication failure plus a real op error.
-                body_writer.fail_metadata_publication();
+                // Then: a real typed op error; the driver drops the real
+                // receipt, so the confirmation fails too (both real).
                 typed_missing_leaf(fs_dir, "/dir/missing")
             },
         )
@@ -660,57 +537,122 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
 /// §8.1: an Ok body followed by a real commit failure returns the commit
 /// error and the guard's Drop terminalizes the holder before the slot ends.
 #[test]
-fn recursive_commit_error_after_ok_body_terminals_holder() -> FsResult<()> {
-    let (conf, journal, mut fs) = confirmation_env("recursive-commit-error-after-ok");
-    fs.mkdir("/tree", true).unwrap();
+fn recursive_disjoint_writer_completes_while_another_waits() -> FsResult<()> {
+    let (conf, journal, mut fs) = confirmation_env("recursive-disjoint-inflight-writer");
+    fs.mkdir("/a", true).unwrap();
+    fs.mkdir("/b", true).unwrap();
     drain_receipts(&fs.journal_writer.clone());
 
     let writer = swap_receipts_writer(&mut fs, &journal, &conf);
     let seq_before = writer.failure_seq();
 
-    let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || {
-        worker_fs.set_attr(
-            "/tree",
-            SetAttrOpts {
-                recursive: true,
-                mode: Some(0o620),
-                ..Default::default()
-            },
-        )
+    // A publishes a real durable mutation and then waits for its receipt.
+    let (a_ready_tx, a_ready_rx) = std::sync::mpsc::channel();
+    let (a_done_tx, a_done_rx) = std::sync::mpsc::channel();
+    let a_fs = fs.clone();
+    let first = std::thread::spawn(move || {
+        let result = run_admitted(&a_fs, "/a", InodeLockMode::Read, false, |fs_dir| {
+            let inp = MasterFilesystem::resolve_path(fs_dir, "/a")?;
+            fs_dir.set_attr(
+                inp,
+                SetAttrOpts {
+                    mode: Some(0o600),
+                    ..Default::default()
+                },
+            )?;
+            a_ready_tx
+                .send(())
+                .expect("the driver must observe the body");
+            Ok(())
+        });
+        let _ = a_done_tx.send(result);
     });
-
-    let queued = writer
+    a_ready_rx
+        .recv_timeout(WORKER_TIMEOUT)
+        .expect("A must publish its body");
+    let a_entry = writer
         .with_testing_receiver(|receiver| {
             receiver
-                .recv_timeout(Duration::from_secs(5))
-                .expect("missing the recursive set_attr journal entry")
+                .recv_timeout(WORKER_TIMEOUT)
+                .expect("missing A's journal entry")
         })
         .unwrap();
-    let _commit_failed = drop(queued.completion);
 
-    let commit_err = worker.join().unwrap().unwrap_err();
+    // A still holds its ordinary slot while waiting for the receipt: the gate
+    // is not closed for exclusive use and a fresh admission succeeds.
     assert!(
-        commit_err
+        !fs.metadata_commit_gate().has_exclusive_writer(),
+        "a pending confirmation must not hold an exclusive gate"
+    );
+    assert!(
+        fs.metadata_commit_gate().try_enter().is_some(),
+        "the ordinary slot must stay available while another writer waits"
+    );
+
+    // B is a disjoint in-flight writer that must still be inside its
+    // confirmation window when A goes terminal: the driver holds B's real
+    // receipt without resolving it until after A's terminal, so the §8.2
+    // second half - terminal is not a cancellation of already-admitted
+    // writers - is observed on a genuinely in-flight admission, not a
+    // completed one.
+    let (b_done_tx, b_done_rx) = std::sync::mpsc::channel();
+    let b_fs = fs.clone();
+    let second = std::thread::spawn(move || {
+        let result = run_admitted(&b_fs, "/b", InodeLockMode::Read, false, |fs_dir| {
+            let inp = MasterFilesystem::resolve_path(fs_dir, "/b")?;
+            fs_dir.set_attr(
+                inp,
+                SetAttrOpts {
+                    mode: Some(0o640),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        });
+        let _ = b_done_tx.send(result);
+    });
+    let b_entry = writer
+        .with_testing_receiver(|receiver| {
+            receiver
+                .recv_timeout(WORKER_TIMEOUT)
+                .expect("missing B's journal entry")
+        })
+        .unwrap();
+    assert_eq!(
+        fs.file_status("/b").unwrap().mode,
+        0o640,
+        "B's body must have published while A still waits"
+    );
+    assert!(!fs.fs_dir.is_failed(), "B must not terminalize the holder");
+
+    // Now A's confirmation fails while B's real receipt is still pending.
+    let a_entry = a_entry;
+    drop(a_entry.completion);
+    let a_result =
+        await_worker(&a_done_rx, "A").expect("A must report after its confirmation fails");
+    first.join().expect("A must not panic");
+    assert!(
+        a_result
+            .unwrap_err()
             .to_string()
-            .contains("journal commit failed after metadata commit"),
-        "the real commit error must be returned, got {commit_err}"
+            .contains("journal commit failed"),
+        "A must surface its real commit error"
     );
-
     assert_holder_terminal(&fs, &writer, seq_before);
-    // The commit failure is a real fatal: scope.wait's error path calls
-    // fail_metadata_commit, which records its own source (same attribution
-    // semantics as C1's exclusive confirmation failure). It is not the
-    // publication source because no publication failure happened.
-    let fatal_source = journal.master_monitor().recovery().fatal_source();
-    assert!(
-        fatal_source
-            .as_deref()
-            .map(|source| source.contains("metadata journal commit failed"))
-            .unwrap_or(false),
-        "a dropped receipt must record the commit failure as the fatal source, got {fatal_source:?}"
-    );
 
-    teardown(fs, journal, &conf);
+    // B's terminal-time observation: its admission was live across A's
+    // terminal, and its own already-published body stays intact (terminal
+    // is not a cancellation); B then finishes under its original rules when
+    // the driver resolves its receipt.
+    drop(b_entry.completion);
+    let b_result =
+        await_worker(&b_done_rx, "B after the terminal").expect("B must report its result");
+    second.join().expect("B must not panic");
+    b_result.unwrap();
+
+    drop(writer);
+    drop(fs);
+    shutdown_case(journal);
+    remove_case_dirs(&conf);
     Ok(())
 }

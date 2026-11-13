@@ -185,10 +185,7 @@ pub(super) fn typed_missing_leaf(fs_dir: &FsDir, path: &str) -> FsResult<()> {
 
 /// `ShardedOutcome` has no Debug impl, so `Result::unwrap_err` cannot be
 /// used on `FsResult<ShardedOutcome<()>>`; extract the typed error directly.
-pub(super) fn typed_op_error(
-    result: FsResult<ShardedOutcome<()>>,
-    context: &'static str,
-) -> FsError {
+pub(super) fn typed_op_error<R>(result: FsResult<R>, context: &'static str) -> FsError {
     match result {
         Err(op_err) => op_err,
         Ok(_) => panic!("{context}"),
@@ -240,6 +237,12 @@ pub(super) fn spawn_lock_waiter(
 }
 
 /// Arming the real publication-failure boundary: the
+/// `master.metadata.recursive.publish_after_commit` fault point fires inside
+/// `publish_metadata_impl` after the durable store commit and before the live
+/// publication, so the body observes a genuine durable-but-unpublished error
+/// through the real fatal entry (no setter). The point declares no matcher
+/// keys, so the rule is one-shot (`times(1)`) and must only be armed by the
+/// case that is about to publish its own recursive mutation.
 /// Arming the real publication-failure boundary: the
 /// `master.metadata.recursive.publish_after_commit` fault point fires inside
 /// `unprotected_delete` after the store batch committed (durable) and before
@@ -249,7 +252,7 @@ pub(super) fn spawn_lock_waiter(
 pub(super) fn arm_publication_failure(
     rule_id: &str,
     child_name: &str,
-) -> curvine_fault::FaultRuntime {
+) -> &'static curvine_fault::FaultRuntime {
     use curvine_fault::{FaultRuleBuilder, FaultRuntime};
     let runtime = FaultRuntime::process();
     let rule = FaultRuleBuilder::named("master.metadata.recursive.publish_after_commit")

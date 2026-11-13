@@ -7351,6 +7351,10 @@ mod tests {
     mod get_block_locations_batch_test;
     #[path = "lost_worker_gate_test.rs"]
     mod lost_worker_gate_test;
+    #[path = "recursive_confirmation_lifecycle_test.rs"]
+    mod recursive_confirmation_lifecycle_test;
+    #[path = "recursive_confirmation_support.rs"]
+    mod recursive_confirmation_support;
     #[path = "recursive_confirmation_test.rs"]
     mod recursive_confirmation_test;
     #[path = "recursive_location_lock_test.rs"]

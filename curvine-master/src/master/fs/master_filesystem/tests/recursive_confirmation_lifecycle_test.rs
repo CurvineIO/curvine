@@ -1,4 +1,5 @@
 use super::recursive_confirmation_support::*;
+use super::recursive_confirmation_support::{await_worker, WORKER_TIMEOUT};
 use super::*;
 use crate::master::meta::NamespaceError;
 use std::sync::mpsc::RecvTimeoutError;
@@ -25,16 +26,17 @@ fn recursive_body_unwind_terminals_before_unlock() -> FsResult<()> {
     let (terminal_release_tx, terminal_release_rx) = std::sync::mpsc::channel::<()>();
     writer.arm_terminal_hook(terminal_tx, terminal_release_rx);
     let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || {
-        let _stay = done_tx;
-        run_admitted(&worker_fs, "/dir", InodeLockMode::Write, true, |_fs_dir| {
-            body_ready_tx.send(()).unwrap();
-            reader_ready_rx
-                .recv_timeout(WORKER_TIMEOUT)
-                .expect("the driver must confirm the waiter is queued");
-            panic!("recursive body unwind")
-        })
-    });
+    let worker: std::thread::JoinHandle<Result<(), curvine_error::FsError>> =
+        std::thread::spawn(move || {
+            let _stay = done_tx;
+            run_admitted::<()>(&worker_fs, "/dir", InodeLockMode::Write, true, |_fs_dir| {
+                body_ready_tx.send(()).unwrap();
+                reader_ready_rx
+                    .recv_timeout(WORKER_TIMEOUT)
+                    .expect("the driver must confirm the waiter is queued");
+                panic!("recursive body unwind")
+            })
+        });
 
     body_ready_rx
         .recv_timeout(WORKER_TIMEOUT)
@@ -74,6 +76,7 @@ fn recursive_body_unwind_terminals_before_unlock() -> FsResult<()> {
     match await_worker(&done_rx, "the unwinding body") {
         Err(RecvTimeoutError::Disconnected) => {}
         Ok(()) => panic!("the body unwind must abort the worker"),
+        Err(RecvTimeoutError::Timeout) => unreachable!("await_worker panics on Timeout"),
     }
     let join_err = worker
         .join()
@@ -184,6 +187,7 @@ fn recursive_wait_unwind_observes_then_terminals() -> FsResult<()> {
     match await_worker(&done_rx, "the wait unwind") {
         Err(RecvTimeoutError::Disconnected) => {}
         Ok(()) => panic!("the injected wait unwind must abort the worker"),
+        Err(RecvTimeoutError::Timeout) => unreachable!("await_worker panics on Timeout"),
     }
     let join_err = worker
         .join()
@@ -217,16 +221,18 @@ fn recursive_commit_error_after_ok_body_terminals_holder() -> FsResult<()> {
     let writer = swap_receipts_writer(&mut fs, &journal, &conf);
     let seq_before = writer.failure_seq();
 
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker_fs = fs.clone();
     let worker = std::thread::spawn(move || {
-        worker_fs.set_attr(
+        let result = worker_fs.set_attr(
             "/tree",
             SetAttrOpts {
                 recursive: true,
                 mode: Some(0o620),
                 ..Default::default()
             },
-        )
+        );
+        let _ = done_tx.send(result);
     });
 
     let queued = writer
