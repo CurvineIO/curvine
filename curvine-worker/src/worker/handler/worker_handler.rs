@@ -118,6 +118,10 @@ impl MessageHandler for WorkerHandler {
                 let h = self.get_handler(msg, &mut handler)?;
                 let res = h.handle(msg);
 
+                // Retire the handler only on a successful Cancel/Complete. An
+                // error reply keeps it so a retried Complete reaches the same
+                // WriteHandler and its `aborted` latch (see the retention
+                // tests below).
                 if res
                     .as_ref()
                     .is_ok_and(|msg| msg.response_status() == ResponseStatus::Success)
@@ -913,5 +917,126 @@ mod tests {
         assert!(!peer.declares_capability("short-circuit"));
         assert!(!ConnectionPeer::Legacy.declares_capability("batch-write"));
         assert!(!ConnectionPeer::Unknown.declares_capability("batch-write"));
+    }
+
+    // `WriteHandler::aborted` only refuses a retried Complete if `handle()` keeps the
+    // handler after an error reply; these tests pin that retention rule on the wire path.
+
+    use crate::worker::{Worker, WorkerService};
+    use curvine_config::{ClusterConf, WorkerConf};
+    use curvine_error::{FsError, FsResult};
+    use curvine_io::DataSlice;
+    use curvine_model::{ExtendedBlock, FileType, ProtoUtils, StorageType};
+    use curvine_rpc::handler::{HandlerService, MessageHandler};
+    use curvine_rpc::message::Message;
+    use curvine_runtime::runtime::AsyncRuntime;
+    use std::sync::Arc;
+
+    fn worker_handler(name: &str) -> FsResult<WorkerHandler> {
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                dir_reserved: "0".to_string(),
+                data_dir: vec![format!("[MEM:1KB]../testing/worker-handler-{name}")],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        // Initialize metrics/config explicitly; must not depend on test order.
+        let _worker = Worker::with_conf(conf.clone())?;
+        let rt = Arc::new(AsyncRuntime::new("worker-handler-test", 1, 1));
+        let service = WorkerService::with_conf(&conf, rt, "test-session".to_string())
+            .map_err(FsError::from)?;
+        Ok(service.get_message_handler(None))
+    }
+
+    fn write_frame(block: &ExtendedBlock, status: RequestStatus, seq_id: i32) -> Message {
+        Builder::new()
+            .code(RpcCode::WriteBlock)
+            .request(status)
+            .req_id(1)
+            .seq_id(seq_id)
+            .proto_header(BlockWriteRequest {
+                block: ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size: 1024,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build()
+    }
+
+    fn has_handler(worker: &WorkerHandler) -> bool {
+        worker.handler.lock().is_some()
+    }
+
+    /// Send one frame and decode the reply the way the client does: a
+    /// `BlockHandler` error is carried as an `Error`-status reply, not an `Err`.
+    fn send(worker: &WorkerHandler, frame: &Message) -> FsResult<()> {
+        worker.handle(frame)?.check_error_ext::<FsError>()
+    }
+
+    /// Complete -> Err -> Complete on one connection: the retry must land on
+    /// the handler that latched `aborted`, and be refused for that reason.
+    #[test]
+    fn retried_complete_after_error_reaches_the_same_handler_and_is_refused() -> FsResult<()> {
+        let worker = worker_handler("complete-retry-same-handler")?;
+        // len 1024 with nothing written: finalize sees a length mismatch on a
+        // fresh block, aborts (removes) it and latches `aborted` on the handler.
+        let block = ExtendedBlock::new(71, 1024, StorageType::Disk, FileType::File);
+
+        send(&worker, &write_frame(&block, RequestStatus::Open, 1))?;
+        assert!(has_handler(&worker));
+
+        let first = send(&worker, &write_frame(&block, RequestStatus::Complete, 2)).unwrap_err();
+        assert!(
+            first.to_string().contains("length mismatch"),
+            "the first Complete must fail on the mismatch itself, got: {first}"
+        );
+        assert!(
+            has_handler(&worker),
+            "an error reply must keep the handler so the retry reaches the aborted latch"
+        );
+
+        // Same handler: refused by intent. A fresh handler would fail on the missing open.
+        let retry = send(&worker, &write_frame(&block, RequestStatus::Complete, 3)).unwrap_err();
+        assert!(
+            retry
+                .to_string()
+                .contains("aborted and cannot be committed"),
+            "the retried Complete must hit the aborted handler, got: {retry}"
+        );
+        assert!(has_handler(&worker));
+
+        // Cancel on the closed handler is Ok and retires it.
+        send(&worker, &write_frame(&block, RequestStatus::Cancel, 4))?;
+        assert!(
+            !has_handler(&worker),
+            "a successful Cancel must retire the handler"
+        );
+        Ok(())
+    }
+
+    /// The other half of the rule: a successful Complete retires the handler,
+    /// so the next frame on the connection starts from a fresh one.
+    #[test]
+    fn successful_complete_retires_the_handler() -> FsResult<()> {
+        let worker = worker_handler("complete-success-retires")?;
+        // len 0 with nothing written: finalize length check passes.
+        let block = ExtendedBlock::new(72, 0, StorageType::Disk, FileType::File);
+
+        send(&worker, &write_frame(&block, RequestStatus::Open, 1))?;
+        assert!(has_handler(&worker));
+
+        send(&worker, &write_frame(&block, RequestStatus::Complete, 2))?;
+        assert!(
+            !has_handler(&worker),
+            "a successful Complete must retire the handler"
+        );
+        Ok(())
     }
 }
