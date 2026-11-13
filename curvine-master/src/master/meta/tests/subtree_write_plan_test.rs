@@ -133,8 +133,7 @@ fn every_file_name_in_the_subtree_gets_a_write_lock() -> curvine_error::FsResult
 }
 
 #[test]
-fn root_is_written_when_it_is_the_target_and_filtered_as_ancestor() -> curvine_error::FsResult<()>
-{
+fn root_is_written_when_it_is_the_target_and_filtered_as_ancestor() -> curvine_error::FsResult<()> {
     let fs = test_fs("root-filter");
     fs.mkdir("/x", false)?;
     let root_id = {
@@ -191,7 +190,9 @@ fn stale_restore_epoch_invalidates_the_plan() -> curvine_error::FsResult<()> {
             .store
             .begin_restore(Duration::from_secs(1))
             .expect("restore guard");
-        let revalidated = plan.revalidate(&view, "/e").expect("revalidate must not error");
+        let revalidated = plan
+            .revalidate(&view, "/e")
+            .expect("revalidate must not error");
         assert!(
             revalidated.is_none(),
             "a plan captured before a restore generation change must not revalidate"
@@ -220,7 +221,9 @@ fn deep_version_change_invalidates_the_plan() -> curvine_error::FsResult<()> {
     fs.create("/v/d0/news", false)?;
 
     let view = handle.view().expect("namespace view");
-    let revalidated = plan.revalidate(&view, "/v").expect("revalidate must not error");
+    let revalidated = plan
+        .revalidate(&view, "/v")
+        .expect("revalidate must not error");
     assert!(
         revalidated.is_none(),
         "a version change at depth 1 ({d0}) must invalidate the plan"
@@ -246,7 +249,9 @@ fn empty_directory_still_records_a_version_token() -> curvine_error::FsResult<()
     fs.create("/t/empty/first", false)?;
 
     let view = handle.view().expect("namespace view");
-    let revalidated = plan.revalidate(&view, "/t").expect("revalidate must not error");
+    let revalidated = plan
+        .revalidate(&view, "/t")
+        .expect("revalidate must not error");
     assert!(
         revalidated.is_none(),
         "an empty directory's version token must be captured and checked"
@@ -265,16 +270,13 @@ fn duplicate_hardlink_names_are_counted_separately() -> curvine_error::FsResult<
     // the budget counts names/edges, not distinct inode ids.
     let extra = SUBTREE_PLAN_LIMIT + 4;
     for index in 0..extra {
-        fs.link(
-            "/h/file".to_string(),
-            format!("/h/alias{index}"),
-        )?;
+        fs.link("/h/file".to_string(), format!("/h/alias{index}"))?;
     }
 
     let handle = fs.fs_dir();
     let view = handle.view().expect("namespace view");
-    let plan = SubtreeWritePlan::capture(&view, "/h", InodeLockMode::Write)
-        .expect("capture must succeed");
+    let plan =
+        SubtreeWritePlan::capture(&view, "/h", InodeLockMode::Write).expect("capture must succeed");
 
     assert!(
         plan.is_none(),

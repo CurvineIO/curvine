@@ -274,11 +274,13 @@ fn bounded_enumeration_skips_uninitialized_shards_without_creating_them() {
         let sequence = children.sequence.version();
         // No listing ran first, so every shard slot is still uninitialized.
         for max_edges in [0, 1, usize::MAX] {
-            assert_eq!(
-                children
-                    .child_edges_bounded(max_edges)
-                    .map(|_| Vec::<ChildEdge>::new()),
-                Some(Vec::new())
+            let edges = children
+                .child_edges_bounded(max_edges)
+                .expect("an empty directory always fits the budget");
+            assert!(
+                edges.is_empty(),
+                "an empty directory must enumerate no edges, got {}",
+                edges.len()
             );
         }
         let shards = children.sharded().expect("directory was not promoted");

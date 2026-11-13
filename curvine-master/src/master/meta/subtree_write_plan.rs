@@ -81,13 +81,14 @@ impl SubtreeWritePlan {
             }
         };
 
-        // Walk the chain root..=target. At every directory level: capture
-        // the children token first, then enumerate at most
-        // `remaining + 1` edges to find the next component.
+        // Walk the chain root..=target. `components[0]` is the empty root
+        // segment (resolve_edge_ids_on convention): the first edge IS the
+        // root, and each later component names the next edge. At every
+        // directory level the children token is captured before descending.
         let mut chain: Vec<i64> = Vec::with_capacity(components.len());
         let mut tokens: Vec<DirectoryChildrenSharedVersion> = Vec::new();
         let mut walk: Option<ChildEdge> = Some(ChildEdge::Dir(fs_dir.root_node()));
-        for component in &components {
+        for (index, _) in components.iter().enumerate() {
             let Some(edge) = walk.take() else {
                 // The chain ended before the path did.
                 return Ok(None);
@@ -100,12 +101,12 @@ impl SubtreeWritePlan {
                 // A file component: the path cannot descend past it.
                 return Ok(None);
             };
-            if chain.len() == components.len() {
+            if index + 1 == components.len() {
                 break;
             }
             tokens.push(node.children.shared_version());
             // Point lookup by name: no enumeration, no edge budget.
-            walk = node.children.get_child_edge(component);
+            walk = node.children.get_child_edge(&components[index + 1]);
         }
         if chain.len() != components.len() {
             return Ok(None);
@@ -114,18 +115,23 @@ impl SubtreeWritePlan {
 
         // Collect the target subtree with an explicit Vec stack: every
         // directory and every file id enters the Write set. Each visited
-        // directory records a token before enumerating its edges.
+        // directory records a token before enumerating its edges. The
+        // target edge is re-fetched by the same convention: walk from the
+        // root through components[1..].
         let target_edge = {
-            let node = fs_dir.root_node();
-            let mut level: Option<ChildEdge> = Some(ChildEdge::Dir(node));
-            for component in &components {
+            let mut level: Option<ChildEdge> = Some(ChildEdge::Dir(fs_dir.root_node()));
+            for (index, _) in components.iter().enumerate() {
                 let Some(edge) = level.take() else {
                     return Ok(None);
                 };
-                level = match edge {
-                    ChildEdge::Dir(dir) => dir.children.get_child_edge(component),
-                    ChildEdge::FileId(_) => None,
+                if index + 1 == components.len() {
+                    level = Some(edge);
+                    break;
+                }
+                let ChildEdge::Dir(dir) = edge else {
+                    return Ok(None);
                 };
+                level = dir.children.get_child_edge(&components[index + 1]);
             }
             level
         };
@@ -162,23 +168,25 @@ impl SubtreeWritePlan {
             }
         }
 
-        // Assemble the request set. Ancestors above the parent are Read
-        // (root only when it is the target or the parent); the parent takes
-        // `parent_mode`; the target and the whole subtree are Write.
+        // Assemble the request set. The target and its whole subtree come
+        // from the DFS as Write; the chain contributes the ancestors: the
+        // parent in `parent_mode`, everything above it Read, with the root
+        // kept only when it is the mutated parent.
         let parent_depth = target_depth.saturating_sub(1);
         let mut requests: Vec<InodeLockRequest> = Vec::with_capacity(chain.len() + subtree.len());
         for (depth, id) in chain.iter().enumerate() {
-            let mode = if depth == target_depth {
-                InodeLockMode::Write
-            } else if depth == parent_depth {
+            if depth == target_depth {
+                // The subtree section already carries the target as Write.
+                continue;
+            }
+            let mode = if depth == parent_depth {
                 parent_mode
             } else {
                 InodeLockMode::Read
             };
             // Root as a pure ancestor stays lock-free (established filter);
-            // a root that is the target or the mutated parent keeps its mode.
+            // a root that is the mutated parent keeps its mode.
             if *id == ROOT_INODE_ID
-                && depth != target_depth
                 && !(depth == parent_depth && matches!(mode, InodeLockMode::Write))
             {
                 continue;
