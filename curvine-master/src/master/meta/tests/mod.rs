@@ -4,4 +4,5 @@ mod directory_attribute_state_test;
 mod fs_dir_handle_test;
 mod inode_lock_pool_test;
 mod inode_snapshot_corruption_test;
+mod subtree_location_plan_test;
 mod subtree_write_plan_test;
