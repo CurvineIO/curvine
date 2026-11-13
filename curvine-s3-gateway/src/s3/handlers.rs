@@ -196,6 +196,30 @@ pub const NO_SUCH_BUCKET: &str = "NoSuchBucket: the specified bucket does not ex
 /// Error text the S3 API layer maps to `BucketNotEmpty` (409).
 pub const BUCKET_NOT_EMPTY: &str = "BucketNotEmpty: the bucket you tried to delete is not empty";
 
+/// Directory markers below `dir`, deepest first.
+///
+/// Iterative on purpose: an async recursion over a deep tree would have to box
+/// every level. Any file below `dir` means the bucket is not empty, which is
+/// reported as `BucketNotEmpty`.
+async fn empty_directory_markers(fs: &UnifiedFileSystem, dir: &Path) -> Result<Vec<Path>, String> {
+    let mut markers = Vec::new();
+    let mut pending = vec![dir.clone()];
+    while let Some(current) = pending.pop() {
+        let children = fs.list_status(&current).await.map_err(|e| e.to_string())?;
+        for child in children {
+            if !child.is_dir {
+                return Err(BUCKET_NOT_EMPTY.to_string());
+            }
+            let child_path = Path::from_str(&child.path).map_err(|e| e.to_string())?;
+            pending.push(child_path.clone());
+            markers.push(child_path);
+        }
+    }
+    // Deepest first: a parent can only be removed once its children are gone.
+    markers.sort_by_key(|marker| std::cmp::Reverse(marker.full_path().len()));
+    Ok(markers)
+}
+
 #[derive(Clone)]
 pub struct S3Handlers {
     pub fs: UnifiedFileSystem,
@@ -408,6 +432,17 @@ impl HeadHandler for S3Handlers {
 
                     Ok(Some(head))
                 }
+                // A directory is a directory marker object (`key/`) as far as
+                // S3 is concerned: HEAD answers 200 with an empty body, which
+                // is what `stat` on a directory expects.
+                Ok(st) if st.is_dir => Ok(Some(HeadObjectResult {
+                    content_length: Some(0),
+                    last_modified: crate::utils::s3_utils::format_http_timestamp(st.mtime),
+                    accept_ranges: Some("bytes".to_string()),
+                    etag: Some(format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5)),
+                    content_type: Some("application/x-directory".to_string()),
+                    ..Default::default()
+                })),
                 Ok(st) => {
                     tracing::debug!("Path exists but is not a file: {:?}", st.file_type);
                     Ok(None)
@@ -587,10 +622,40 @@ impl PutObjectHandler for S3Handlers {
             self.cv_object_path(&bucket, &object),
         );
 
+        let this = self.clone();
+
         async move {
             // The staging prefix is reserved; a PUT cannot create an object
             // that listings would have to hide.
             reject_reserved_key(&object)?;
+
+            // S3 requires the bucket to exist. The staging write creates its
+            // parents, so without this check a typo'd bucket name succeeded and
+            // the bucket then showed up in ListBuckets.
+            let bucket_path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
+            match fs.get_status(&bucket_path).await {
+                Ok(st) if st.is_dir => {}
+                _ => return Err(NO_SUCH_BUCKET.to_string()),
+            }
+
+            // A key ending in '/' is a directory marker: OpenDAL `create_dir`,
+            // the AWS console and Hadoop S3A all write one. Storing it as a
+            // file named without the slash made every later PUT under that
+            // prefix fail with "Parent path is not a directory".
+            if object.ends_with('/') {
+                // A directory marker carries no body; storing one would put
+                // bytes under a key that stands for a directory.
+                if opt.content_length.unwrap_or(0) > 0 {
+                    return Err(
+                        "UnexpectedContent: a directory marker must not carry a body".to_string(),
+                    );
+                }
+                let dir = this
+                    .cv_object_path(&bucket, &object)
+                    .map_err(|e| e.to_string())?;
+                fs.mkdir(&dir, true).await.map_err(|e| e.to_string())?;
+                return Ok(format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5));
+            }
 
             // S3 applies `If-Match` / `If-None-Match` to the DESTINATION on
             // PutObject. Without this an `If-Match: <old>` overwrite silently
@@ -655,6 +720,37 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
 
         async move {
             let path = Path::from_str(format!("/{object}")).map_err(|e| e.to_string())?;
+            // Deleting a directory marker (`key/`) removes the empty directory
+            // the marker stands for. A plain delete refused a directory and
+            // left `rmdir` unusable from every S3 client.
+            // A directory marker (`key/`) is an empty object: deleting it
+            // removes an EMPTY directory and never the objects below it. A
+            // recursive delete here would silently drop every `key/...` object.
+            let is_dir = fs
+                .get_status(&path)
+                .await
+                .map(|st| st.is_dir)
+                .unwrap_or(false);
+            if is_dir {
+                let empty = fs
+                    .list_status(&path)
+                    .await
+                    .map(|children| children.is_empty())
+                    .unwrap_or(false);
+                // A non-empty marker stays. S3 keeps the child objects too, so
+                // the difference is only the marker itself: this gateway cannot
+                // represent `key/` apart from the directory that holds them, so
+                // deleting a non-empty marker is a no-op by design. Answering
+                // 409 here would fail the cleanup scripts that expect S3's 204.
+                if !empty {
+                    return Ok(());
+                }
+                return fs
+                    .delete(&path, false)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+            }
             match fs.delete(&path, false).await {
                 Ok(_) => Ok(()),
                 Err(e) => {
@@ -717,10 +813,22 @@ impl crate::s3::s3_api::DeleteBucketHandler for S3Handlers {
             if !status.is_dir {
                 return Err(NO_SUCH_BUCKET.to_string());
             }
-            if status.children_num > 0 {
-                return Err(BUCKET_NOT_EMPTY.to_string());
+            // Objects nest arbitrarily deep, so the bucket is empty only when
+            // no file remains anywhere below it. `children_num` only counts the
+            // first level and kept a bucket undeletable once its objects were
+            // removed but their parent directories were not.
+            //
+            // The markers are then removed deepest-first WITHOUT `recursive`:
+            // a non-recursive delete of a directory only succeeds while it is
+            // empty, so an object that lands after the walk fails the delete
+            // and is reported as BucketNotEmpty instead of being removed by a
+            // recursive delete the client never asked for.
+            let markers = empty_directory_markers(&fs, &path).await?;
+            for marker in markers {
+                if fs.delete(&marker, false).await.is_err() {
+                    return Err(BUCKET_NOT_EMPTY.to_string());
+                }
             }
-
             fs.delete(&path, false)
                 .await
                 .map(|_| ())
