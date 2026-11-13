@@ -185,6 +185,14 @@ pub struct JournalWriter {
     #[cfg(test)]
     plan_pause_hook:
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Test-only instance-isolated pre-hot checkpoint (G3): armed by
+    /// `arm_pre_hot_hook`, consumed inside `run_metadata_write_with_fallback`
+    /// after the outer original epoch is captured, the gate/scope/ensure are
+    /// done, and just before `hot(epoch)` is called — the driver's window to
+    /// fence/unfence and prove the original epoch data flow.
+    #[cfg(test)]
+    pre_hot_hook:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     /// Test-only instance-isolated location checkpoint (R7): armed by
     /// `arm_location_pause_hook`, consumed after location sampling and
     /// before the worker/block stripes are acquired — the driver's window
@@ -257,6 +265,8 @@ impl JournalWriter {
             terminal_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             plan_pause_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            pre_hot_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             location_pause_hook: std::sync::Mutex::new(None),
         })

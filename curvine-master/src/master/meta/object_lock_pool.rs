@@ -59,10 +59,7 @@ impl ObjectLockPool {
 
     /// Test-only non-blocking shared acquisition by pre-computed stripe index.
     #[cfg(test)]
-    pub(crate) fn try_read_by_stripe(
-        &self,
-        stripe: usize,
-    ) -> Option<RwLockReadGuard<'_, ()>> {
+    pub(crate) fn try_read_by_stripe(&self, stripe: usize) -> Option<RwLockReadGuard<'_, ()>> {
         self.stripes.get(stripe)?.try_read()
     }
 

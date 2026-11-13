@@ -541,6 +541,15 @@ impl MasterFilesystem {
         self.journal_writer.ensure_metadata_epoch(epoch)?;
         let outcome = {
             let scope = self.journal_writer.begin_commit_scope();
+            // G3: pre-hot observation checkpoint — the outer original epoch
+            // has been captured and ensured; the driver may fence/unfence
+            // here to prove the original-epoch data flow into hot(epoch).
+            // take-once, disarms itself.
+            #[cfg(test)]
+            if let Some((reached, release)) = self.journal_writer.consume_pre_hot_hook() {
+                let _ = reached.send(());
+                let _ = release.recv_timeout(std::time::Duration::from_secs(60));
+            }
             let outcome = hot(epoch);
             scope.wait()?;
             outcome?

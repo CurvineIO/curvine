@@ -277,6 +277,178 @@ fn recursive_fenced_admission_rejected_without_holder_retirement() -> FsResult<(
     Ok(())
 }
 
+/// G3: fence inside a REAL public recursive RPC admission. The helper drives
+/// each public entry through its real outer admission while the plan-pause
+/// observation holds the call between the outer capture and the body; the
+/// fence+unfence in that window must reject the same admission with the
+/// original typed epoch error - no body side effect, holder alive, failure
+/// seq unmoved, no fatal source. The three real hot routes are exercised
+/// directly (delete/free/set_attr), so a re-sampled epoch inside a hot
+/// closure cannot mask the original-epoch flow.
+fn assert_fenced_real_rpc_rejects<R: Send>(
+    fs: &MasterFilesystem,
+    journal: &JournalSystem,
+    writer: &Arc<JournalWriter>,
+    conf: &ClusterConf,
+    body: impl FnOnce(&MasterFilesystem) -> FsResult<R> + Send,
+    verify_unchanged: impl Fn(&MasterFilesystem) + Send,
+    case: &str,
+) {
+    let seq_before = writer.failure_seq();
+    let (plan_reached_tx, plan_reached_rx) = std::sync::mpsc::channel::<()>();
+    let (plan_release_tx, plan_release_rx) = std::sync::mpsc::channel::<()>();
+    writer.arm_plan_pause_hook(plan_reached_tx, plan_release_rx);
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        let _ = done_tx.send(body(&worker_fs));
+    });
+
+    plan_reached_rx
+        .recv_timeout(WORKER_TIMEOUT)
+        .expect("the real public admission must reach the plan pause");
+    writer.fence_metadata();
+    writer.unfence_metadata();
+    plan_release_tx
+        .send(())
+        .expect("the driver must release the plan pause");
+
+    let result =
+        await_worker(&done_rx, case).expect("the fenced-window admission must report its result");
+    worker.join().expect("the worker must not panic");
+    assert!(
+        result.is_err(),
+        "{case}: the fenced-window admission must be rejected"
+    );
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("{case}: the fenced-window admission must be rejected"),
+    };
+    assert!(
+        err.to_string().contains("fenced")
+            || err.to_string().contains("role changed")
+            || err.to_string().contains("epoch"),
+        "{case}: the rejection must be the original epoch error, got {err:?}"
+    );
+    verify_unchanged(fs);
+    assert!(
+        !fs.fs_dir.is_failed(),
+        "{case}: the fence must not terminalize the holder"
+    );
+    assert_eq!(
+        writer.failure_seq(),
+        seq_before,
+        "{case}: a role fence must not move the failure seq"
+    );
+    assert!(
+        journal.master_monitor().recovery().fatal_source().is_none(),
+        "{case}: a role fence must not be recorded as a fatal source"
+    );
+}
+
+#[test]
+fn recursive_delete_fenced_inside_real_rpc_rejects_by_original_epoch() -> FsResult<()> {
+    let (conf, journal, fs) = confirmation_env("recursive-delete-fenced-window");
+    fs.mkdir("/dir", true).unwrap();
+    fs.create("/dir/victim", true).unwrap();
+    drain_receipts(&fs.journal_writer.clone());
+    let writer = fs.journal_writer.clone();
+
+    let _ = assert_fenced_real_rpc_rejects(
+        &fs,
+        &journal,
+        &writer,
+        &conf,
+        |fs| fs.delete_with_mode("/dir/victim", true, DeleteMode::SkipTrash),
+        |fs| {
+            assert!(
+                fs.file_status("/dir/victim").is_ok(),
+                "no body side effect: the victim must survive"
+            );
+        },
+        "recursive delete",
+    );
+
+    drop(writer);
+    drop(fs);
+    shutdown_case(journal);
+    remove_case_dirs(&conf);
+    Ok(())
+}
+
+#[test]
+fn recursive_free_fenced_inside_real_rpc_rejects_by_original_epoch() -> FsResult<()> {
+    let (conf, journal, fs) = confirmation_env("recursive-free-fenced-window");
+    fs.mkdir("/dir", true).unwrap();
+    fs.create("/dir/blob", true).unwrap();
+    drain_receipts(&fs.journal_writer.clone());
+    let writer = fs.journal_writer.clone();
+    let mode_before = fs.file_status("/dir/blob").unwrap().mode;
+
+    let _ = assert_fenced_real_rpc_rejects(
+        &fs,
+        &journal,
+        &writer,
+        &conf,
+        |fs| fs.free_or_defer("/dir/blob", false),
+        |fs| {
+            assert_eq!(
+                fs.file_status("/dir/blob").unwrap().mode,
+                mode_before,
+                "no body side effect: the mode must be unchanged"
+            );
+        },
+        "recursive free",
+    );
+
+    drop(writer);
+    drop(fs);
+    shutdown_case(journal);
+    remove_case_dirs(&conf);
+    Ok(())
+}
+
+#[test]
+fn recursive_set_attr_fenced_inside_real_rpc_rejects_by_original_epoch() -> FsResult<()> {
+    let (conf, journal, fs) = confirmation_env("recursive-set-attr-fenced-window");
+    fs.mkdir("/tree", true).unwrap();
+    fs.create("/tree/file", true).unwrap();
+    drain_receipts(&fs.journal_writer.clone());
+    let writer = fs.journal_writer.clone();
+
+    let _ = assert_fenced_real_rpc_rejects(
+        &fs,
+        &journal,
+        &writer,
+        &conf,
+        |fs| {
+            fs.set_attr(
+                "/tree",
+                SetAttrOpts {
+                    recursive: true,
+                    mode: Some(0o600),
+                    ..Default::default()
+                },
+            )
+        },
+        |fs| {
+            assert_ne!(
+                fs.file_status("/tree").unwrap().mode,
+                0o600,
+                "no body side effect: the mode must be unchanged"
+            );
+        },
+        "recursive set_attr",
+    );
+
+    drop(writer);
+    drop(fs);
+    shutdown_case(journal);
+    remove_case_dirs(&conf);
+    Ok(())
+}
+
 /// §8.1: a pure business error with an unmoved failure seq and an Ok
 /// confirmation keeps the holder usable — no retirement, no safe mode, and
 /// later ordinary writes succeed.
@@ -412,6 +584,7 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
         "the first recorded fatal must be the commit failure, got {fatal_source:?}"
     );
 
+    drop(writer);
     drop(fs);
     shutdown_case(journal);
     remove_case_dirs(&conf);
