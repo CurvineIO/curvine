@@ -567,6 +567,9 @@ impl MasterFilesystem {
 
     pub(crate) fn release_deleted_blocks(&self, delete_res: &mut DeleteResult) {
         let blocks = std::mem::take(&mut delete_res.blocks);
+        // The namespace deletion is final. Drop stale creator release rights,
+        // but retain reservation credit until each worker confirms deletion.
+        self.forget_pre_alloc(blocks.keys().copied());
         let mut worker_manager = self.worker_manager.write();
         worker_manager.remove_blocks(&DeleteResult {
             inodes: 0,
@@ -4760,6 +4763,41 @@ mod tests {
             release_block_id,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn deleted_block_report_releases_canceled_file_reservation() {
+        let fs = first_block_fs("deleted-block-reservation");
+        let status = fs.create("/canceled.tmp", true).unwrap();
+        let block = fs
+            .alloc_first_block("/canceled.tmp", status.id, ClientAddress::default())
+            .unwrap();
+        let other = fs.create("/active.tmp", true).unwrap();
+        fs.alloc_first_block("/active.tmp", other.id, ClientAddress::default())
+            .unwrap();
+        let report = || BlockReportList {
+            report_id: 0,
+            cluster_id: "curvine".into(),
+            worker_id: 1,
+            full_report: false,
+            total_len: 0,
+            // Writer abort may have removed the block before DeleteBlock arrives.
+            blocks: vec![BlockReportInfo::with_deleted(block.block.id, 0)],
+        };
+
+        fs.delete("/canceled.tmp", false).unwrap();
+        assert!(!fs.has_pre_alloc(block.block.id));
+        assert_eq!(scheduled_bytes(&fs), 2 * status.block_size);
+        let before = fs.worker_manager.read().available_bytes();
+        fs.block_report(report(), None).unwrap();
+        assert_eq!(scheduled_bytes(&fs), status.block_size);
+        assert_eq!(
+            fs.worker_manager.read().available_bytes(),
+            before + status.block_size
+        );
+        fs.block_report(report(), None).unwrap();
+        assert_eq!(scheduled_bytes(&fs), status.block_size);
+        assert!(fs.get_block_locations("/active.tmp").is_ok());
     }
 
     #[test]

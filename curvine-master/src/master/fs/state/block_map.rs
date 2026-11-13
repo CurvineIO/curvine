@@ -70,10 +70,28 @@ impl BlockMap {
         cmds
     }
 
-    pub fn deleted_block(&mut self, worker_id: u32, block_id: i64) {
+    /// Acknowledges only a deletion requested for this replica. Unsolicited
+    /// and repeated reports must not settle a different reservation.
+    pub fn deleted_block(&mut self, worker_id: u32, block_id: i64) -> bool {
         self.remove_blocks
-            .entry(worker_id)
-            .or_default()
-            .remove(&block_id);
+            .get_mut(&worker_id)
+            .is_some_and(|blocks| blocks.remove(&block_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deleted_block_matches_pending_replica_once() {
+        let mut map = BlockMap::new();
+        map.remove_block(1, 10);
+        map.remove_block(2, 10);
+        assert!(!map.deleted_block(3, 10));
+        assert!(!map.deleted_block(1, 11));
+        assert!(map.deleted_block(1, 10));
+        assert!(!map.deleted_block(1, 10));
+        assert!(map.deleted_block(2, 10));
     }
 }

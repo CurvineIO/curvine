@@ -325,7 +325,14 @@ impl WorkerManager {
     }
 
     pub fn deleted_block(&mut self, worker_id: u32, block_id: i64) {
-        self.block_map.deleted_block(worker_id, block_id)
+        // Scheduling deletion is not proof that the worker has stopped using
+        // space. Settle only after its Deleted report matches a pending request,
+        // including the case where writer cancellation already removed the block.
+        if self.block_map.deleted_block(worker_id, block_id) {
+            if let Some(worker) = self.worker_map.workers.get_mut(&worker_id) {
+                worker.settle_scheduled_block(block_id, 0);
+            }
+        }
     }
 
     pub fn get_worker(&self, id: u32) -> Option<&WorkerInfo> {
@@ -624,6 +631,129 @@ mod tests {
             manager.get_worker(1).unwrap().scheduled_bytes,
             8 * block_size
         );
+    }
+
+    #[test]
+    fn deleted_block_settles_only_the_confirmed_replica() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        for id in [1, 2] {
+            manager.add_test_worker(worker_with_available(id, 1 << 30));
+        }
+        for block_id in [10, 20] {
+            let workers = manager
+                .choose_worker(ChooseContext::with_num(2, block_size, vec![]))
+                .unwrap();
+            manager.bind_scheduled_blocks(&workers, block_id, block_size);
+        }
+        manager.remove_blocks(&DeleteResult {
+            blocks: [(
+                10,
+                vec![BlockLocation::with_id(1), BlockLocation::with_id(2)],
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        // Queuing deletion and sending commands must not release capacity.
+        for id in [1, 2] {
+            assert!(!manager.block_map.handle_heartbeat(id).is_empty());
+            assert_eq!(
+                manager.get_worker(id).unwrap().scheduled_bytes,
+                2 * block_size
+            );
+        }
+        manager.deleted_block(1, 10);
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+        assert_eq!(
+            manager.get_worker(2).unwrap().scheduled_bytes,
+            2 * block_size
+        );
+        manager.deleted_block(1, 10);
+        manager.deleted_block(99, 10);
+        manager.deleted_block(1, 20); // Not requested: preserve this live block.
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+        manager.deleted_block(2, 10);
+        assert_eq!(manager.get_worker(2).unwrap().scheduled_bytes, block_size);
+
+        // Even if the same id acquires fresh credit, a duplicate old report
+        // without a pending delete cannot consume it.
+        let workers = manager
+            .choose_worker(ChooseContext::with_num(2, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&workers, 10, block_size);
+        manager.deleted_block(1, 10);
+        assert_eq!(
+            manager.get_worker(1).unwrap().scheduled_bytes,
+            2 * block_size
+        );
+    }
+
+    #[test]
+    fn deleted_block_settles_remaining_credit_after_heartbeat() {
+        let block_size = 128 << 20;
+        for consumed in [0, block_size / 2, block_size] {
+            let mut manager = robin_manager();
+            let available = 1 << 30;
+            manager.add_test_worker(worker_with_available(1, available));
+            for block_id in [10, 20] {
+                let workers = manager
+                    .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+                    .unwrap();
+                manager.bind_scheduled_blocks(&workers, block_id, block_size);
+            }
+            let worker = manager.worker_map.workers.get_mut(&1).unwrap();
+            worker.available -= consumed;
+            worker.reclaim_scheduled_from_heartbeat(available);
+            assert_eq!(worker.scheduled_bytes, 2 * block_size - consumed);
+
+            manager.remove_block(1, 10);
+            manager.deleted_block(1, 10);
+            let worker = manager.get_worker(1).unwrap();
+            assert_eq!(worker.scheduled_bytes, block_size);
+            assert!(!worker.scheduled_blocks.contains_key(&10));
+            assert_eq!(worker.scheduled_blocks.get(&20).unwrap().1, block_size);
+        }
+    }
+
+    #[test]
+    fn deleted_block_restores_allocation_without_waiting_for_expiry() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        manager.add_test_worker(worker_with_available(1, block_size));
+        let workers = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&workers, 10, block_size);
+        manager.remove_block(1, 10);
+        assert!(manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .is_err());
+
+        manager.deleted_block(1, 10);
+        assert_eq!(manager.available_bytes(), block_size);
+        assert!(manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .is_ok());
+    }
+
+    #[test]
+    fn deleted_block_without_credit_or_worker_preserves_other_budget() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        manager.add_test_worker(worker_with_available(1, 1 << 30));
+        let workers = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&workers, 20, block_size);
+
+        manager.remove_block(1, 10); // Its reservation is already gone.
+        manager.remove_block(99, 10); // Its worker is no longer known.
+        manager.deleted_block(1, 10);
+        manager.deleted_block(99, 10);
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+        assert!(!manager.block_map.deleted_block(99, 10));
     }
 
     #[test]
