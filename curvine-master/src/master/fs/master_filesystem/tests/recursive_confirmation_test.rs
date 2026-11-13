@@ -3,33 +3,14 @@
 // declaration block, `#[path = "tests/recursive_confirmation_test.rs"]`.
 
 use super::recursive_confirmation_support::{
-    arm_publication_failure, await_worker, remove_case_dirs, run_admitted, shutdown_case,
-    typed_op_error, WORKER_TIMEOUT,
+    arm_publication_failure, assert_holder_terminal, await_worker, confirmation_env,
+    drain_receipts, remove_case_dirs, run_admitted, shutdown_case, swap_receipts_writer,
+    typed_missing_leaf, typed_op_error, WORKER_TIMEOUT,
 };
 use super::*;
 use crate::master::journal::RecoveryGate;
 use curvine_raft::raft::RaftClient;
 
-fn test_conf(name: &str) -> ClusterConf {
-    let mut conf = ClusterConf {
-        testing: true,
-        format_master: true,
-        ..Default::default()
-    };
-    conf.change_test_meta_dir(format!(
-        "{}-{}",
-        name,
-        curvine_runtime::common::Utils::rand_str(8)
-    ));
-    conf
-}
-
-fn build_writer(conf: &ClusterConf) -> FsResult<JournalWriter> {
-    Master::init_test_metrics();
-    let rt = conf.journal.create_runtime();
-    let client = RaftClient::from_conf(rt, &conf.journal);
-    JournalWriter::new(true, client, &conf.journal, RecoveryGate::new())
-}
 use crate::master::meta::fs_dir_handle::NamespaceGuard;
 use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use crate::master::meta::{ColdError, NamespaceError};
@@ -40,47 +21,6 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-
-/// Enabled journal with a truly unbounded testing queue: §8.3 admits the
-/// recursive coordination entry, so every test below exercises the real
-/// sharded path instead of the exclusive fallback.
-fn confirmation_env(name: &str) -> (ClusterConf, JournalSystem, MasterFilesystem) {
-    let mut conf = test_conf(name);
-    conf.journal.writer_channel_size = 0;
-    conf.journal.snapshot_entries = 0;
-    let journal = JournalSystem::from_conf(&conf).unwrap();
-    let fs = journal.fs();
-    fs.master_monitor.set_role_for_test(RoleState::Leader);
-    (conf, journal, fs)
-}
-
-/// Real receipts writer shared by the body's FsDir and the final fs clone.
-/// Clones must be taken after this swap (MasterFilesystem clones carry their
-/// own journal_writer Arc).
-fn swap_receipts_writer(
-    fs: &mut MasterFilesystem,
-    journal: &JournalSystem,
-    conf: &ClusterConf,
-) -> Arc<JournalWriter> {
-    let mut writer = build_writer(conf).unwrap();
-    writer.enable_testing_receipts(journal.master_monitor().recovery());
-    let writer = Arc::new(writer);
-    fs.fs_dir
-        .begin_cold(DEFAULT_COLD_TIMEOUT)
-        .unwrap()
-        .journal_writer = writer.clone();
-    fs.journal_writer = writer.clone();
-    writer
-}
-
-fn drain_receipts(writer: &Arc<JournalWriter>) {
-    writer.with_testing_receiver(|receiver| loop {
-        match receiver.try_recv() {
-            Ok(entry) => drop(entry),
-            Err(_) => break,
-        }
-    });
-}
 
 /// Stable observation of the rejected view after the holder went terminal.
 fn failed_view_error(fs: &MasterFilesystem) -> NamespaceError {
@@ -97,42 +37,6 @@ fn failed_view_error(fs: &MasterFilesystem) -> NamespaceError {
     }
 }
 
-/// The expected rejection of a call whose return type differs per probe
-/// (`NamespaceError` for views, `ColdError` for cold access).
-fn rejected<T, E>(result: Result<T, E>, context: &'static str) -> E {
-    result.err().expect(context)
-}
-
-fn assert_holder_terminal(fs: &MasterFilesystem, writer: &Arc<JournalWriter>, seq_before: u64) {
-    assert!(fs.fs_dir.is_failed(), "the holder must be terminal");
-    assert!(
-        matches!(
-            rejected(fs.fs_dir.view(), "the holder must reject new views"),
-            NamespaceError::Unavailable
-        ),
-        "new views must be rejected after the holder went terminal"
-    );
-    assert!(
-        matches!(
-            rejected(
-                fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT),
-                "the terminal holder must reject begin_cold"
-            ),
-            ColdError::Unavailable
-        ),
-        "cold exclusive access must be rejected after the holder went terminal"
-    );
-    assert!(
-        writer.ensure_metadata_current().is_err(),
-        "journal writes must be fenced after the holder went terminal"
-    );
-    assert_ne!(
-        writer.failure_seq(),
-        seq_before,
-        "a terminal confirmation must move the failure seq"
-    );
-}
-
 fn terminal_holder_alive_probe(fs: &MasterFilesystem, pre_view: &NamespaceGuard<'_>) {
     // FAILED is not a drain: the pre-failure view reference survives and can
     // be dropped safely, but reads through the terminal store are rejected
@@ -143,27 +47,6 @@ fn terminal_holder_alive_probe(fs: &MasterFilesystem, pre_view: &NamespaceGuard<
         rejected.is_err(),
         "reads through the terminal store must be rejected, not silently served"
     );
-}
-
-/// Fail the body with the original typed error when the leaf is missing:
-/// `InodePath::resolve` returns a partial-chain Ok for missing leaves, so
-/// the missing case is detected explicitly (§9: uncommitted store errors).
-fn typed_missing_leaf(fs_dir: &FsDir, path: &str) -> FsResult<()> {
-    let inp = MasterFilesystem::resolve_path(fs_dir, path)?;
-    if inp.get_last_inode().is_none() {
-        return Err(FsError::file_not_found(path));
-    }
-    Ok(())
-}
-
-fn unwind_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&'static str>() {
-        message.to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_string()
-    }
 }
 
 fn teardown(fs: MasterFilesystem, journal: JournalSystem, conf: &ClusterConf) {
