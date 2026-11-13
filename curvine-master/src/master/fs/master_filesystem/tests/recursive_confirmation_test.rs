@@ -520,14 +520,19 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
     );
 
     assert_holder_terminal(&fs, &writer, seq_before);
+    // T6 has no publication fatal: the body's typed op error (FileNotFound,
+    // no seq move) is followed by the dropped receipt's real commit failure,
+    // which is the FIRST fatal recorded — record_fatal_source is
+    // first-wins (RecoveryGate), so the source names the commit failure,
+    // not a publication failure that never happened in this case.
     assert!(
         journal
             .master_monitor()
             .recovery()
             .fatal_source()
             .unwrap()
-            .contains("metadata publication failed after durable commit"),
-        "the fatal source must still name the real publication failure"
+            .contains("metadata journal commit failed"),
+        "the commit failure must be the first (and only) fatal source"
     );
 
     teardown(fs, journal, &conf);
@@ -643,8 +648,13 @@ fn recursive_disjoint_writer_completes_while_another_waits() -> FsResult<()> {
     // B's terminal-time observation: its admission was live across A's
     // terminal, and its own already-published body stays intact (terminal
     // is not a cancellation); B then finishes under its original rules when
-    // the driver resolves its receipt.
-    drop(b_entry.completion);
+    // the driver resolves its receipt — a real successful ack (send(())),
+    // because B must complete Ok to prove the in-flight writer survives.
+    b_entry
+        .completion
+        .expect("B's receipt must carry a completion")
+        .send(())
+        .expect("B's confirmation ack must be delivered");
     let b_result =
         await_worker(&b_done_rx, "B after the terminal").expect("B must report its result");
     second.join().expect("B must not panic");
