@@ -463,8 +463,12 @@ mod fenced_window_matrix {
             pre_hot_rx
                 .recv_timeout(WORKER_TIMEOUT)
                 .expect("the real public admission must reach the pre-hot checkpoint");
+            // G3: fence AFTER the outer epoch is captured+ensured and BEFORE
+            // the body runs. The epoch advances (+1) and stays advanced —
+            // the locked ensure(e0) in the recursive entry must reject with
+            // NotLeader. If we unfence here, the epoch returns and ensure
+            // passes — that would NOT detect a re-sampling bug.
             writer.fence_metadata();
-            writer.unfence_metadata();
             pre_hot_release_tx
                 .send(())
                 .expect("the driver must release the pre-hot pause");
@@ -496,6 +500,9 @@ mod fenced_window_matrix {
             // The take-once hook must not fire again for the next op.
             assert!(writer.consume_pre_hot_hook().is_none());
         }
+        // Restore the writer for subsequent tests (fence was NOT unfenced
+        // during the matrix — unfence now so the epoch returns to normal).
+        writer.unfence_metadata();
 
         drop(writer);
         drop(fs);

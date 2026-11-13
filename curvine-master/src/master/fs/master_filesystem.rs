@@ -759,8 +759,11 @@ impl MasterFilesystem {
                 // a role fence between admission and this point rejects with
                 // the caller's own epoch, with no body and no holder
                 // retirement.
+                #[cfg(test)]
+                eprintln!("F1DIAG: ensure_metadata_epoch(epoch={epoch}) about to run");
                 self.journal_writer.ensure_metadata_epoch(epoch)?;
-
+                #[cfg(test)]
+                eprintln!("F1DIAG: ensure_metadata_epoch(epoch={epoch}) passed");
                 // §8.1 step 3: the guard lives in the body's lexical scope.
                 let mut confirmation = MetadataConfirmation {
                     handle: Some(&self.fs_dir),
