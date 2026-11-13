@@ -184,6 +184,22 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
         "the delete must still be waiting for its confirmation"
     );
 
+    // G6: arm the instance-isolated wait hook — its reached signal proves
+    // the recursive delete has entered the real non-empty
+    // JournalCommitScope::wait with a pending receipt waiter.
+    let (wait_reached_tx, wait_reached_rx) = std::sync::mpsc::channel();
+    let (wait_release_tx, wait_release_rx) = std::sync::mpsc::channel();
+    fixture
+        .fs
+        .journal_writer
+        .arm_wait_unwind_hook(wait_reached_tx, wait_release_rx);
+
+    // G6: the wait hook must reach (the recursive entry has entered the
+    // real scope.wait with a pending receipt waiter).
+    wait_reached_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the recursive delete must enter the real scope.wait");
+
     // Phase 5: real commit — the driver registers the delete as committed
     // and drives the REAL apply worker through the loader's public apply
     // entry. The FSM watermark, the applied-request record and the cursor
@@ -256,19 +272,44 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
         "rpc-progress: apply worker advanced FSM/req/cursor while the recursive RPC still waits"
     );
 
-    // Phase 6: orderly teardown — the worker is still waiting on its
-    // receipt, so drain it first (the worker completes its scope.wait and
-    // joins), then drop the fixture. Dropping the fixture while the worker
-    // is blocked aborts the process (pthread lock during shutdown racing
-    // the blocked waiter).
-    drop(_keep_completion_alive);
+    // G6: real successful confirmation — send the ack (not drop).
+    // The RPC worker's scope.wait resolves Ok, the coordination entry
+    // returns Ok, and the holder stays usable.
+    _keep_completion_alive
+        .completion
+        .as_ref()
+        .expect("the receipt must carry a completion sender")
+        .send(())
+        .expect("the successful ack must be delivered");
     let worker_result = worker
         .join()
-        .expect("the worker must finish once the receipt drains");
-    let _ = worker_result;
+        .expect("the RPC worker must finish after the real ack");
+    assert!(
+        worker_result.is_ok(),
+        "the recursive delete must succeed with the real confirmation: {:?}",
+        worker_result.as_ref().err().map(|e| e.to_string())
+    );
+    // The holder must stay usable (no seq move, no retirement).
+    assert_eq!(
+        fixture.fs.journal_writer.failure_seq(),
+        failure_seq_before,
+        "the failure_seq must not move after the real ack"
+    );
+    assert!(
+        !fixture.fs.fs_dir.is_failed(),
+        "the holder must stay usable after the real ack"
+    );
+    assert!(
+        fixture.fs.file_status("/tree").is_err(),
+        "the tree must still be deleted after the successful confirmation"
+    );
     let _ = pre_cursor;
     let _ = failure_seq_before;
 
+    // Release the wait hook (the scope.wait has already resolved Ok).
+    wait_release_tx
+        .send(())
+        .expect("the wait hook must be releasable");
     drop(fixture);
     Ok(())
 }

@@ -514,10 +514,9 @@ impl JournalWriter {
 
     /// Test-only: consumes the armed pre-hot checkpoint, if any.
     #[cfg(test)]
-    pub(crate) fn consume_pre_hot_hook(&self) -> Option<(
-        std::sync::mpsc::Sender<()>,
-        std::sync::mpsc::Receiver<()>,
-    )> {
+    pub(crate) fn consume_pre_hot_hook(
+        &self,
+    ) -> Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)> {
         self.pre_hot_hook.lock().unwrap().take()
     }
 
