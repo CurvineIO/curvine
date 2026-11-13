@@ -193,8 +193,14 @@ fn teardown(fs: MasterFilesystem, journal: JournalSystem, conf: &ClusterConf) {
 #[test]
 fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
     let (conf, journal, mut fs) = confirmation_env("recursive-publication-inside-locks");
+    // All setup writes run on the ORIGINAL testing writer: the receipts
+    // writer has require_raft_commit=true and no sender/driver, so a setup
+    // write after the swap would block forever on its own scope.wait (the
+    // first unreached stage the tracer showed: fs.create hung before the
+    // worker existed). Setup, drain, then swap - the C1 fixture order.
     fs.mkdir("/dir", true).unwrap();
     fs.create("/dir/file", true).unwrap();
+    fs.create("/dir/gone", true).unwrap();
     fs.journal_writer.with_testing_receiver(|receiver| loop {
         match receiver.try_recv() {
             Ok(entry) => drop(entry),
@@ -225,12 +231,11 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
     stage("after: arm_terminal_hook");
     writer.arm_terminal_hook(terminal_tx, terminal_release_rx);
     // Real publication failure: the recursive permanent delete of /dir/gone
-    // reaches the armed fault point after its durable store commit and
-    // before any live publication, so the body fails genuinely (no setter).
+    // (created above, before the swap) reaches the armed fault point after
+    // its durable store commit and before any live publication, so the
+    // body fails genuinely (no setter).
     stage("after: arm_publication_failure");
     let fault = arm_publication_failure("recursive-confirmation-publish", "gone");
-    stage("before: create gone");
-    fs.create("/dir/gone", true).unwrap();
 
     stage("before: spawn worker");
     let (body_ready_tx, body_ready_rx) = std::sync::mpsc::channel();
