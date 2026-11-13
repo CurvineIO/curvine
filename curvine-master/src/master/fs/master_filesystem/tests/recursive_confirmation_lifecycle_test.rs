@@ -396,3 +396,80 @@ fn recursive_disjoint_writer_completes_while_another_waits() -> FsResult<()> {
     remove_case_dirs(&conf);
     Ok(())
 }
+
+/// F1 admission-window coverage: the outer admission captures the original
+/// epoch before the plan pause; fencing and unfencing inside that window
+/// must not let the same admission through - after the pause it still fails
+/// on the original epoch, with no body side effect and a live holder.
+#[test]
+fn recursive_fenced_inside_plan_window_rejected_by_original_epoch() -> FsResult<()> {
+    let (conf, journal, mut fs) = confirmation_env("recursive-fenced-plan-window");
+    fs.mkdir("/tree", true).unwrap();
+    drain_receipts(&fs.journal_writer.clone());
+    let writer = fs.journal_writer.clone();
+    let seq_before = writer.failure_seq();
+
+    let (plan_reached_tx, plan_reached_rx) = std::sync::mpsc::channel::<()>();
+    let (plan_release_tx, plan_release_rx) = std::sync::mpsc::channel::<()>();
+    writer.arm_plan_pause_hook(plan_reached_tx, plan_release_rx);
+
+    // The body never runs for a rejected admission; the flag proves it.
+    let body_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker_fs = fs.clone();
+    let body_flag = body_ran.clone();
+    let worker = std::thread::spawn(move || {
+        let result = run_admitted(&worker_fs, "/tree", InodeLockMode::Read, false, |fs_dir| {
+            body_flag.store(true, std::sync::atomic::Ordering::Release);
+            let inp = MasterFilesystem::resolve_path(fs_dir, "/tree")?;
+            fs_dir.set_attr(
+                inp,
+                SetAttrOpts {
+                    mode: Some(0o600),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        });
+        let _ = done_tx.send(result);
+    });
+
+    plan_reached_rx
+        .recv_timeout(WORKER_TIMEOUT)
+        .expect("the real plan pause must be reached");
+    fs.journal_writer.fence_metadata();
+    fs.journal_writer.unfence_metadata();
+    plan_release_tx
+        .send(())
+        .expect("the driver must release the plan pause");
+
+    let result = await_worker(&done_rx, "the fenced-window admission")
+        .expect("the fenced-window admission must report its result");
+    worker.join().expect("the worker must not panic");
+    // The same admission fails after the unfence: the original epoch no
+    // longer matches the current role epoch.
+    assert!(
+        result.is_err(),
+        "the fenced-window admission must be rejected by the original epoch"
+    );
+    assert!(
+        !body_ran.load(std::sync::atomic::Ordering::Acquire),
+        "the body must not run for a rejected admission"
+    );
+    assert!(!fs.fs_dir.is_failed(), "the holder must stay alive");
+    assert_eq!(
+        writer.failure_seq(),
+        seq_before,
+        "an epoch rejection must not move the failure seq"
+    );
+    assert!(
+        journal.master_monitor().recovery().fatal_source().is_none(),
+        "an epoch rejection must not be recorded as a fatal source"
+    );
+
+    drop(writer);
+    drop(fs);
+    shutdown_case(journal);
+    remove_case_dirs(&conf);
+    Ok(())
+}
