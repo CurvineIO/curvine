@@ -313,7 +313,7 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
     conf.journal.snapshot_entries = 0;
     conf.journal.writer_channel_size = 8;
     let journal = JournalSystem::from_conf(&conf).unwrap();
-    let fs = journal.fs();
+    let mut fs = journal.fs();
     fs.master_monitor.set_role_for_test(RoleState::Leader);
     fs.mkdir("/dir", true).unwrap();
     fs.create("/dir/file", true).unwrap();
@@ -329,14 +329,10 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
     let writer = {
         let rt = conf.journal.create_runtime();
         let client = curvine_raft::raft::RaftClient::from_conf(rt, &conf.journal);
-        let mut writer = JournalWriter::new(
-            true,
-            client,
-            &conf.journal,
-            fs.journal_writer.recovery.clone(),
-        )
-        .unwrap();
-        writer.enable_testing_receipts(fs.journal_writer.recovery.clone());
+        let recovery = journal.master_monitor().recovery();
+        let mut writer = JournalWriter::new(true, client, &conf.journal, recovery.clone())
+            .unwrap();
+        writer.enable_testing_receipts(recovery);
         let writer = Arc::new(writer);
         fs.fs_dir
             .begin_cold(DEFAULT_COLD_TIMEOUT)
@@ -386,7 +382,12 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
 
     // The confirmation wait now fails for real (the completion was dropped).
     let commit = scope.wait();
-    confirmation.disarm();
+    // Only a successful commit disarms the RAII guard; a failed commit keeps
+    // the guard armed so its Drop fails the holder closed before the gate
+    // opens.
+    if commit.is_ok() {
+        confirmation.disarm();
+    }
     drop(confirmation);
     drop(gate);
 
