@@ -24,7 +24,9 @@ use crate::master::meta::inode::{
     ROOT_INODE_ID, ROOT_INODE_NAME,
 };
 use crate::master::meta::store::InodeStoreSnapshot;
-use crate::master::meta::subtree_write_plan::{SubtreeWritePlan, SUBTREE_PLAN_LIMIT};
+use crate::master::meta::subtree_write_plan::{
+    SubtreeWritePlan, SUBTREE_LOCATION_LIMIT, SUBTREE_PLAN_LIMIT,
+};
 use crate::master::meta::{
     trash, BlockLocationLockManager, CacheInvalidationResult, ColdError, ColdFsDirGuard,
     CommitGate, FileSystemStats, FsDir, FsDirHandle, InodeId, InodeLockManager, InodeLockMode,
@@ -136,6 +138,17 @@ impl<'a> MetadataConfirmation<'a> {
     pub(crate) fn fail_terminal(&mut self) {
         if let Some(handle) = self.handle.take() {
             handle.fail_closed(self.writer);
+        }
+        // R8 observation checkpoint: consume the writer's instance-isolated
+        // terminal hook AFTER the terminal transition and BEFORE the
+        // caller's frame releases the locks. take() empties the slot so the
+        // guard's Drop cannot re-fire; the wait is bounded by the test's
+        // own release (this runs inside fail_terminal, whose decision is
+        // already complete).
+        #[cfg(test)]
+        if let Some((reached, release)) = self.writer.consume_terminal_hook() {
+            let _ = reached.send(());
+            let _ = release.recv_timeout(std::time::Duration::from_secs(60));
         }
     }
 }
@@ -562,13 +575,37 @@ impl MasterFilesystem {
     /// inode → worker → block lock order (§6).
     fn run_recursive_metadata_write<R>(
         &self,
+        epoch: u64,
         path: &str,
         parent_mode: InodeLockMode,
         need_locations: bool,
         body: impl FnOnce(&FsDir) -> FsResult<R>,
     ) -> FsResult<ShardedOutcome<R>> {
-        // One ordinary admission: capture the original epoch once.
-        let epoch = self.journal_writer.metadata_epoch()?;
+        // R5: pre-body churn retries (≤3) must re-run the PLANNING, not the
+        // body — the body slot keeps the FnOnce available until an actual
+        // execution consumes it.
+        self.run_recursive_metadata_write_impl(
+            epoch,
+            path,
+            parent_mode,
+            need_locations,
+            &mut Some(body),
+        )
+    }
+
+    fn run_recursive_metadata_write_impl<R>(
+        &self,
+        epoch: u64,
+        path: &str,
+        parent_mode: InodeLockMode,
+        need_locations: bool,
+        body_slot: &mut Option<impl FnOnce(&FsDir) -> FsResult<R>>,
+    ) -> FsResult<ShardedOutcome<R>> {
+        // R8 epoch boundary: the ORIGINAL epoch comes from the single
+        // admission in `run_metadata_write_with_fallback` and is passed
+        // explicitly — never re-sampled here. The recursive coordination
+        // re-verifies THIS epoch under the locks, so a role fence between
+        // admission and the body rejects with the caller's own epoch.
         // §8.3: with the journal enabled and a bounded queue, holding
         // subtree locks across enqueue can self-deadlock against the
         // SenderTask (R→queue→SenderTask→A apply→R). Only a disabled
@@ -598,6 +635,16 @@ impl MasterFilesystem {
             };
             let requests = plan.inode_requests();
 
+            // R7 observation checkpoint: capture is complete and the locks are
+            // not yet acquired — the driver may mutate the live tree here
+            // (move/create/EXCHANGE) to exercise the post-capture revalidation.
+            // take() disarms the hook after one pause.
+            #[cfg(test)]
+            if let Some((reached, release)) = self.journal_writer.consume_plan_pause_hook() {
+                let _ = reached.send(());
+                let _ = release.recv_timeout(std::time::Duration::from_secs(60));
+            }
+
             // Inode locks: one stripe-sorted batch (§4).
             let inode_locks = self.inode_locks.lock_many(requests);
 
@@ -606,9 +653,14 @@ impl MasterFilesystem {
             // locks (§6: no NamespaceGuard is held while waiting for any
             // object lock). The location budget mirrors the plan budget;
             // exceeding it is a pre-body typed fallback.
+            // R5: the location budget is independent of the plan budget
+            // and charges every actual entry (block + worker-location)
+            // against SUBTREE_LOCATION_LIMIT (design §6).
             let location_locks = if need_locations {
                 let mut block_ids: Vec<i64> = Vec::new();
                 let mut worker_ids: Vec<u32> = Vec::new();
+                let mut location_entries = 0usize;
+                let mut over_budget = false;
                 {
                     let fs_dir = self.fs_dir.view()?;
                     if Self::checked_live_epoch(&fs_dir)? != planned_epoch {
@@ -626,30 +678,49 @@ impl MasterFilesystem {
                             continue;
                         };
                         for block_id in file.block_ids() {
-                            block_ids.push(block_id);
-                            if block_ids.len() > SUBTREE_PLAN_LIMIT {
-                                drop(inode_locks);
-                                return Ok(ShardedOutcome::Fallback);
+                            location_entries += 1;
+                            if location_entries > SUBTREE_LOCATION_LIMIT {
+                                over_budget = true;
+                                break;
                             }
+                            block_ids.push(block_id);
                             for location in fs_dir.get_block_locations(block_id)? {
+                                location_entries += 1;
                                 worker_ids.push(location.worker_id);
-                                if worker_ids.len() > SUBTREE_PLAN_LIMIT {
-                                    drop(inode_locks);
-                                    return Ok(ShardedOutcome::Fallback);
+                                if location_entries > SUBTREE_LOCATION_LIMIT {
+                                    over_budget = true;
+                                    break;
                                 }
                             }
+                            if over_budget {
+                                break;
+                            }
+                        }
+                        if over_budget {
+                            break;
                         }
                     }
+                }
+                if over_budget {
+                    drop(inode_locks);
+                    return Ok(ShardedOutcome::Fallback);
                 }
                 // A missing location key or an empty set keeps the original
                 // business semantics: the locks cover whatever the live
                 // sampler saw, and the final revalidation re-checks the set.
-                Some(
+                Some((
                     self.block_location_locks
                         .write_workers_blocks(&worker_ids, &block_ids),
-                )
+                    (block_ids, worker_ids),
+                ))
             } else {
                 None
+            };
+            // Location coverage identity for the final-view revalidation
+            // (R3): the sampled ids the acquired locks are known to cover.
+            let (location_locks, location_sample) = match location_locks {
+                Some((locks, ids)) => (Some(locks), Some(ids)),
+                None => (None, None),
             };
 
             // The commit scope opens before the body so every journal
@@ -672,6 +743,42 @@ impl MasterFilesystem {
                     return Ok(None);
                 }
 
+                // R3: location coverage revalidation under the FINAL view.
+                // A report/replication writer holds only worker/block
+                // stripes (no inode locks), so it can add a location between
+                // sampling and lock acquisition. Re-read the current
+                // block/worker set of every Write inode: any id not in the
+                // sampled set means the acquired location locks do not cover
+                // the live state — return None (release view/L/I, retry ≤3,
+                // then fallback) rather than running the body against
+                // unprotected locations.
+                if need_locations {
+                    let (sampled_blocks, sampled_workers) = location_sample
+                        .as_ref()
+                        .expect("need_locations implies a sampled location set");
+                    for request in requests {
+                        if !matches!(request.mode, InodeLockMode::Write) {
+                            continue;
+                        }
+                        let Some(inode) = fs_dir.store.get_inode(request.inode_id, None)? else {
+                            continue;
+                        };
+                        let Ok(file) = inode.as_file_ref() else {
+                            continue;
+                        };
+                        for block_id in file.block_ids() {
+                            if !sampled_blocks.contains(&block_id) {
+                                return Ok(None);
+                            }
+                            for location in fs_dir.get_block_locations(block_id)? {
+                                if !sampled_workers.contains(&location.worker_id) {
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // §8.1 step 3: the guard lives in the body's lexical scope.
                 let mut confirmation = MetadataConfirmation {
                     handle: Some(&self.fs_dir),
@@ -682,7 +789,12 @@ impl MasterFilesystem {
                 // §8.1 step 4: capture the whole Result; never `?` out of
                 // the protected scope. A real op error with a moved failure
                 // seq goes terminal while the locks are still held, and the
-                // guard leaves the scope together with the result.
+                // guard leaves the scope together with the result. The body
+                // slot is consumed exactly here — a pre-body churn never
+                // touched it, so the retry loop can plan again.
+                let Some(body) = body_slot.take() else {
+                    return err_box!("recursive body already consumed");
+                };
                 let op = body(&fs_dir);
                 if op.is_err() && self.journal_writer.failure_seq() != failure_seq_before {
                     confirmation.fail_terminal();
@@ -691,16 +803,17 @@ impl MasterFilesystem {
             })();
 
             // Distinguish "pre-body coverage churn" (inner Ok(None)) from a
-            // completed body: churn unwinds to a typed fallback with the
-            // guard never created (the scope is empty — no entry/receipt —
-            // so ending it is a no-op; §8.1 step 2).
+            // completed body: churn releases everything and RETRIES (≤3, R5)
+            // — only planning-budget overflow exits to the exclusive bridge
+            // immediately. The scope is empty (no entry/receipt), so ending
+            // it is a no-op (§8.1 step 2).
             let (op, mut confirmation) = match op {
                 Ok(Some((op, confirmation))) => (op, confirmation),
                 Ok(None) => {
                     drop(location_locks);
                     drop(inode_locks);
                     drop(scope);
-                    return Ok(ShardedOutcome::Fallback);
+                    continue;
                 }
                 Err(e) => {
                     drop(location_locks);
@@ -1902,19 +2015,28 @@ impl MasterFilesystem {
                         restore_epoch,
                     );
                 }
-                // C2: recursive deletes run the bounded subtree-lock path
-                // (design §8.1/§8.4). A permanent delete may drop the last
-                // link, so it takes the full inode → worker → block order;
-                // a trash soft-delete is an internal rename and touches no
-                // blocks. Everything else (queue bounded, planning cap,
-                // coverage churn) is a pre-body typed Fallback into the
-                // exclusive bridge below.
+                // R4: only a recursive PERMANENT delete takes the subtree
+                // coordination path (§8.4). A trash soft-delete (Default
+                // with trash enabled, or AsyncPurge outside the trash) is
+                // an internal rename into /.Trash/.pending — the
+                // destination directory locks are not in the plan, so it
+                // stays on the original cold body. A permanent delete may
+                // drop the last link, so it takes the full inode → worker →
+                // block order.
                 let permanent = matches!(mode, DeleteMode::SkipTrash)
-                    || (recursive && trash::is_trash_path(path));
+                    || trash::is_trash_path(path)
+                    || (matches!(mode, DeleteMode::Default) && !self.conf.trash_enabled);
+                if !(recursive && permanent) {
+                    return Ok(ShardedOutcome::Fallback);
+                }
+                // The hot closure runs inside the single admission:
+                // metadata_epoch() here returns the outer original epoch (R8).
+                let epoch = self.journal_writer.metadata_epoch()?;
                 self.run_recursive_metadata_write(
+                    epoch,
                     path,
                     InodeLockMode::Write,
-                    recursive && permanent,
+                    true,
                     |locked| self.delete_locked(locked, path, recursive, mode),
                 )
             },
@@ -2524,9 +2646,16 @@ impl MasterFilesystem {
             // the full inode → worker → block order (a free always drops
             // the data blocks). Pre-body fallbacks keep the exclusive
             // bridge below; real body errors propagate verbatim.
+            // The hot closure runs inside run_metadata_write_with_fallback's
+            // single admission: metadata_epoch() here returns the outer
+            // original epoch, passed explicitly to the recursive entry (R8).
+            let epoch = self.journal_writer.metadata_epoch()?;
             self.run_recursive_metadata_write(
+                epoch,
                 path,
-                InodeLockMode::Write,
+                // R4: a free does not mutate the parent edge, so the parent
+                // takes Read (§4) — only the target subtree is Write.
+                InodeLockMode::Read,
                 recursive,
                 |locked| {
                     let inp = Self::resolve_path(locked, path)?;
@@ -2534,6 +2663,20 @@ impl MasterFilesystem {
                     let Some(inode) = Self::free_target(&inp, expected_id)? else {
                         return Ok(None);
                     };
+                    // R4: re-check the fs_mode mount refusal under the
+                    // locks — the pre-lock classification is not proof the
+                    // condition still holds (a mount could have been added
+                    // between planning and locking).
+                    if recursive {
+                        if let Some(releaser) = self.fs_mode_releaser() {
+                            if releaser.contains_fs_mode_mount(path) {
+                                return err_box!(
+                                    "free {} would release fs_mode files without UFS verification; free each fs_mode mount separately",
+                                    path
+                                );
+                            }
+                        }
+                    }
                     let free_res = locked.free(&inp, recursive)?;
                     Ok(Some((FreeOutcome::Freed(free_res), inode)))
                 },
@@ -5556,8 +5699,12 @@ impl MasterFilesystem {
                     // lock path. It mutates subtree inodes but not parent
                     // edges, so the parent takes Read and no location locks
                     // are needed (§6). Pre-body fallbacks keep the original
-                    // exclusive body below.
+                    // exclusive body below. The hot closure runs inside the
+                    // single admission: metadata_epoch() here returns the
+                    // outer original epoch, passed explicitly (R8).
+                    let epoch = self.journal_writer.metadata_epoch()?;
                     return self.run_recursive_metadata_write(
+                        epoch,
                         path,
                         InodeLockMode::Read,
                         false,

@@ -171,6 +171,27 @@ pub struct JournalWriter {
     #[cfg(test)]
     wait_unwind_hook:
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Test-only instance-isolated terminal checkpoint (R8): armed by
+    /// `arm_terminal_hook`, consumed by the next real terminal failure on
+    /// this writer (after the holder's terminal transition, before the
+    /// caller's frame releases the locks).
+    #[cfg(test)]
+    terminal_hook:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Test-only instance-isolated plan checkpoint (R7): armed by
+    /// `arm_plan_pause_hook`, consumed after `capture` returned Some and
+    /// before `lock_many` — the caller's window to mutate the live tree
+    /// (move/create/EXCHANGE) before the locks are acquired.
+    #[cfg(test)]
+    plan_pause_hook:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Test-only instance-isolated location checkpoint (R7): armed by
+    /// `arm_location_pause_hook`, consumed after location sampling and
+    /// before the worker/block stripes are acquired — the driver's window
+    /// to add a location (report/replication) that the sample missed.
+    #[cfg(test)]
+    location_pause_hook:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl JournalWriter {
@@ -232,6 +253,12 @@ impl JournalWriter {
             entries_since_snapshot: AtomicCounter::new(0),
             #[cfg(test)]
             wait_unwind_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            terminal_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            plan_pause_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            location_pause_hook: std::sync::Mutex::new(None),
         })
     }
 
@@ -442,6 +469,71 @@ impl JournalWriter {
     /// forked conf or a test identity.
     pub(crate) fn queue_never_blocks(&self) -> bool {
         !self.enable || self.journal_unbounded
+    }
+
+    /// Test-only instance-isolated terminal checkpoint (R8): arms the
+    /// hook so the next real terminal failure on this writer — via the
+    /// actual fail_terminal path — signals `reached` after the terminal
+    /// transition and before the caller's frame releases the locks, then
+    /// waits for the driver's release. Consumed once (take), so it disarms
+    /// itself; the guard's Drop cannot re-fire.
+    /// Test-only instance-isolated plan checkpoint (R7): arms the hook so
+    /// the next recursive coordination on this writer pauses after capture
+    /// and before lock_many. Consumed once (take), so it disarms itself.
+    #[cfg(test)]
+    pub fn arm_plan_pause_hook(
+        &self,
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.plan_pause_hook.lock().unwrap() = Some((reached, release));
+    }
+
+    /// Test-only: consumes the armed plan checkpoint, if any.
+    #[cfg(test)]
+    pub(crate) fn consume_plan_pause_hook(
+        &self,
+    ) -> Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)> {
+        self.plan_pause_hook.lock().unwrap().take()
+    }
+
+    /// Test-only instance-isolated location checkpoint (R7): arms the hook
+    /// so the next recursive coordination on this writer pauses after
+    /// location sampling and before the location locks. Consumed once.
+    #[cfg(test)]
+    pub fn arm_location_pause_hook(
+        &self,
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.location_pause_hook.lock().unwrap() = Some((reached, release));
+    }
+
+    /// Test-only: consumes the armed location checkpoint, if any.
+    #[cfg(test)]
+    pub(crate) fn consume_location_pause_hook(
+        &self,
+    ) -> Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)> {
+        self.location_pause_hook.lock().unwrap().take()
+    }
+
+    #[cfg(test)]
+    pub fn arm_terminal_hook(
+        &self,
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.terminal_hook.lock().unwrap() = Some((reached, release));
+    }
+
+    /// Test-only: consumes the armed terminal checkpoint, if any. Called
+    /// by `MetadataConfirmation::fail_terminal` after the holder's terminal
+    /// transition and before the caller's frame releases the locks.
+    #[cfg(test)]
+    pub(crate) fn consume_terminal_hook(
+        &self,
+    ) -> Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)> {
+        self.terminal_hook.lock().unwrap().take()
     }
 
     pub fn ensure_metadata_current(&self) -> FsResult<()> {

@@ -272,6 +272,20 @@ impl FsDir {
     }
 
     fn publish_metadata_impl<T>(&self, result: CommonResult<T>) -> CommonResult<T> {
+        // R8: real publication-failure injection point — fires AFTER the
+        // store batch committed (durable) and BEFORE the live publication,
+        // so the caller sees a real "durable but unpublished" failure. The
+        // existing publish error path records the true publication source.
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.recursive.publish_after_commit",
+            description: "Inject a publication failure after the store commit",
+            context: {},
+            return_error: |fault| {
+                self.journal_writer.fail_metadata_publication();
+                Err(fault.message.into())
+            },
+        }
         result.map_err(|error| {
             self.journal_writer.fail_metadata_publication();
             error
@@ -1511,12 +1525,26 @@ impl FsDir {
     ) -> FsResult<FreeResult> {
         let mut free_res = FreeResult::default();
         let mut change_inodes = vec![];
+        // R6: hard-link aliases inside the same subtree resolve to the same
+        // inode. Each alias pushed its own store snapshot, and every
+        // snapshot was still in the "not freed" state, so the physical
+        // blocks/bytes were counted (and the inode processed) once per
+        // name. A free is a physical reclaim: process each unique inode
+        // exactly once (delete keeps its per-edge nlink multiplicity —
+        // that contract is unchanged).
+        let mut seen_inodes: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
         let mut stack = LinkedList::new();
         stack.push_back(inode);
         while let Some(inode) = stack.pop_front() {
             match inode.as_ref() {
                 FileEntry(e) => {
+                    // An alias whose inode was already reclaimed (another
+                    // name processed it first) is already accounted for;
+                    // otherwise its store row carries the real inode.
+                    if seen_inodes.contains(&e.id) {
+                        continue;
+                    }
                     if let Some(store_inode) = self.store.get_inode(e.id, Some(&e.name))? {
                         stack.push_back(InodePtr::from_owned(store_inode));
                     }
@@ -1531,6 +1559,13 @@ impl FsDir {
                 }
 
                 File(f) => {
+                    // R6: two names of one inode inside the same subtree
+                    // must be reclaimed once. The FIRST name processes the
+                    // inode (free + accounting); every later alias of the
+                    // same id sees the seen-marker and stops.
+                    if !seen_inodes.insert(f.id) {
+                        continue;
+                    }
                     let locs = f.get_locs(&self.store)?;
                     let bytes = f.get_locs_bytes(&locs);
                     if inode.as_mut().as_file_mut()?.free(mtime) {

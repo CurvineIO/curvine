@@ -51,7 +51,15 @@ fn test_fs_with_live_worker(name: &str) -> MasterFilesystem {
 /// free/delete paths must release. `add_block` only allocates the block id; the
 /// store location row is written explicitly, as the worker report would.
 fn file_with_one_block(fs: &MasterFilesystem, path: &str) -> i64 {
-    fs.create(path, true).expect("create file");
+    // `StoragePolicy::free` only clears blocks for a policy that may drop the
+    // Curvine copy (TtlAction::Delete/Free); the default None would make every
+    // free a no-op, so the fixture states the policy it exercises.
+    let opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    fs.create_with_opts(path, opts, OpenFlags::new_create().set_overwrite(true))
+        .expect("create file");
     let block = fs
         .add_block(
             path,
@@ -70,6 +78,23 @@ fn file_with_one_block(fs: &MasterFilesystem, path: &str) -> i64 {
             .add_block_location(block.id, BlockLocation::with_id(1))
             .expect("record the block location");
     }
+    // Commit a real length so the block counts as allocated data; a bare
+    // add_block leaves len 0 and nothing to reclaim.
+    let commit = curvine_model::CommitBlock {
+        block_id: block.id,
+        block_len: 4096,
+        locations: vec![BlockLocation::with_id(1)],
+    };
+    fs.complete_file(
+        path.to_string(),
+        None,
+        4096,
+        vec![commit],
+        "location-fixture".to_string(),
+        false,
+        None,
+    )
+    .expect("complete the block");
     block.id
 }
 
@@ -134,7 +159,7 @@ fn last_link_delete_keeps_locations_atomic() {
     let file_id = fs.file_status("/d/file").unwrap().id;
 
     // One of two names: nothing about locations may change.
-    fs.delete("/d/file", false).unwrap();
+    fs.delete("/d/file", true).unwrap();
     assert_eq!(
         stored_locations(&fs, block_id).len(),
         2,
@@ -143,7 +168,7 @@ fn last_link_delete_keeps_locations_atomic() {
 
     // The last name is removed: the inode is gone, and the location set must
     // not be left partially released.
-    fs.delete("/d/alias", false).unwrap();
+    fs.delete("/d/alias", true).unwrap();
     assert!(
         fs.file_status_by_id("/d/alias", Some(file_id)).is_err(),
         "the last link removal must drop the inode"
@@ -200,4 +225,55 @@ fn concurrent_block_report_keeps_only_the_reporting_workers_location() {
         remaining.len() <= 1,
         "at most the reporting worker's location remains: {remaining:?}"
     );
+}
+
+/// R6: two names of one inode inside the freed subtree share one physical
+/// block. Design §4 fixes the accounting: delete counts edge removals, free
+/// counts unique inode/block physical reclamation. Two names must therefore be
+/// one freed inode and one block, not two of each.
+#[test]
+fn recursive_free_counts_a_shared_block_once() {
+    let fs = test_fs_with_live_worker("location-free-aliases");
+    fs.mkdir("/t", true).unwrap();
+    let block_id = file_with_one_block(&fs, "/t/file");
+    add_two_locations(&fs, block_id);
+    // The second name of the same inode lives inside the same subtree.
+    fs.link("/t/file".to_string(), "/t/alias".to_string())
+        .unwrap();
+    let file_id = fs.file_status("/t/file").unwrap().id;
+
+    // Fixture self-check: the block must carry a committed length, otherwise
+    // `InodeFile::free` reports nothing reclaimed and the assertion below would
+    // be testing an empty fixture.
+    let blocks = fs
+        .get_block_locations("/t/file")
+        .expect("read block locations");
+    assert!(
+        blocks.block_locs.iter().any(|loc| loc.block.len > 0),
+        "fixture: the block must have a committed length, got {:?}",
+        blocks.block_locs
+    );
+
+    let freed = fs.free("/t", true).expect("recursive free");
+
+    // Both names point at one inode: the physical reclamation is one inode,
+    // regardless of how many names the subtree holds (§4).
+    assert_eq!(
+        freed.inodes, 1,
+        "two names of one inode must be reclaimed once (§4: free counts unique \
+         inodes, got {freed:?})"
+    );
+    // Bytes are the real physical copies, not a logical size: one 4096 block
+    // with two locations is 8192 (`get_locs_bytes` sums locs.len() * block.len).
+    // Two names must not multiply that again.
+    assert_eq!(
+        freed.bytes, 8192,
+        "one block with two physical locations is 8192 bytes, counted once per \
+         unique inode (got {freed:?})"
+    );
+    // The inode itself keeps its metadata; only its space is released.
+    let after = fs
+        .file_status("/t/alias")
+        .expect("free keeps metadata for both names");
+    assert_eq!(after.id, file_id);
 }

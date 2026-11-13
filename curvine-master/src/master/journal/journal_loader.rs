@@ -1846,115 +1846,198 @@ impl JournalLoader {
         need_locations: bool,
         body: impl FnOnce(&FsDir) -> FsResult<T>,
     ) -> CommonResult<T> {
-        use crate::master::fs::master_filesystem::MetadataConfirmation;
-        use crate::master::meta::subtree_write_plan::SubtreeWritePlan;
+        // R1/R2: the body must be available BOTH inside the locked window
+        // (with the guard) and in the caller's cold fallback after churn.
+        // `Option::take` hands it over exactly once per branch.
+        self.with_replay_locks_impl(path, parent_mode, need_locations, &mut Some(body))
+    }
 
-        let plan = {
-            let fs_dir = self.fs_dir.view().map_err(|e| e.to_string())?;
-            match SubtreeWritePlan::capture(&fs_dir, path, parent_mode) {
-                Ok(Some(plan)) => plan,
-                // Budget overflow / unresolvable: the cold bridge keeps the
-                // original behavior (§7).
-                Ok(None) => return self.with_replay_cold(body),
-                Err(e) => return Err(e.to_string().into()),
+    fn with_replay_locks_impl<T>(
+        &self,
+        path: &str,
+        parent_mode: crate::master::meta::InodeLockMode,
+        need_locations: bool,
+        body_slot: &mut Option<impl FnOnce(&FsDir) -> FsResult<T>>,
+    ) -> CommonResult<T> {
+        // R5: side-effect-free churn (epoch/identity/token mismatch or
+        // location coverage shortfall) retries the whole capture/sample/
+        // lock/revalidate sequence up to 3 times; only then does the cold
+        // bridge own it. A real body error is never retried.
+        const MAX_RETRIES: usize = 3;
+        for attempt in 0..MAX_RETRIES {
+            let _ = attempt;
+            use crate::master::fs::master_filesystem::MetadataConfirmation;
+            use crate::master::meta::subtree_write_plan::SubtreeWritePlan;
+
+            // R1: the fallback decision is made while the planning view is
+            // alive, but `with_replay_cold` must only run AFTER this thread has
+            // released its own view (begin_cold waits for every view strong
+            // reference — calling it inside the view scope would self-wait until
+            // the DrainTimeout).
+            enum PlanOutcome<T> {
+                Planned(T),
+                ColdFallback,
             }
-        };
-        let inode_locks = self.inode_locks.lock_many(plan.inode_requests());
-
-        // Location locks for a recursive free replay (the same protection
-        // as the RPC path, minus admission): sample with a short view,
-        // drop the view, then take worker → block stripes.
-        let location_locks = if need_locations {
-            let mut block_ids: Vec<i64> = Vec::new();
-            let mut worker_ids: Vec<u32> = Vec::new();
-            {
+            let plan = {
                 let fs_dir = self.fs_dir.view().map_err(|e| e.to_string())?;
-                for request in plan.inode_requests() {
-                    if !matches!(request.mode, crate::master::meta::InodeLockMode::Write) {
-                        continue;
-                    }
-                    let Some(inode) = fs_dir
-                        .store
-                        .get_inode(request.inode_id, None)
-                        .map_err(|e| e.to_string())?
-                    else {
-                        continue;
+                match SubtreeWritePlan::capture(&fs_dir, path, parent_mode) {
+                    Ok(Some(plan)) => PlanOutcome::Planned(plan),
+                    // Budget overflow / unresolvable: the cold bridge keeps the
+                    // original behavior (§7) — entered after the view drops.
+                    Ok(None) => PlanOutcome::ColdFallback,
+                    Err(e) => return Err(e.to_string().into()),
+                }
+            };
+            let plan = match plan {
+                PlanOutcome::Planned(plan) => plan,
+                PlanOutcome::ColdFallback => {
+                    let Some(body) = body_slot.take() else {
+                        return Err("replay body already consumed".to_string().into());
                     };
-                    let Ok(file) = inode.as_file_ref() else {
-                        continue;
-                    };
-                    for block_id in file.block_ids() {
-                        block_ids.push(block_id);
-                        if block_ids.len()
-                            > crate::master::meta::subtree_write_plan::SUBTREE_PLAN_LIMIT
-                        {
-                            drop(inode_locks);
-                            return self.with_replay_cold(body);
+                    return self.with_replay_cold(body);
+                }
+            };
+            let inode_locks = self.inode_locks.lock_many(plan.inode_requests());
+
+            // Location locks for a recursive free replay (the same protection
+            // as the RPC path, minus admission): sample with a short view,
+            // drop the view, then take worker → block stripes. R1: the
+            // over-budget decision is recorded inside the view scope; the cold
+            // bridge runs only after both the view and the inode locks are
+            // released (begin_cold self-waits otherwise).
+            let location_locks = if need_locations {
+                let mut block_ids: Vec<i64> = Vec::new();
+                let mut worker_ids: Vec<u32> = Vec::new();
+                let mut over_budget = false;
+                {
+                    let fs_dir = self.fs_dir.view().map_err(|e| e.to_string())?;
+                    for request in plan.inode_requests() {
+                        if !matches!(request.mode, crate::master::meta::InodeLockMode::Write) {
+                            continue;
                         }
-                        for location in fs_dir
-                            .get_block_locations(block_id)
+                        let Some(inode) = fs_dir
+                            .store
+                            .get_inode(request.inode_id, None)
                             .map_err(|e| e.to_string())?
-                        {
-                            worker_ids.push(location.worker_id);
-                            if worker_ids.len()
-                                > crate::master::meta::subtree_write_plan::SUBTREE_PLAN_LIMIT
+                        else {
+                            continue;
+                        };
+                        let Ok(file) = inode.as_file_ref() else {
+                            continue;
+                        };
+                        // R5: independent location budget — every block entry
+                        // and worker-location entry is charged against
+                        // SUBTREE_LOCATION_LIMIT (design §6); the plan budget
+                        // does not cover locations.
+                        let mut location_entries = 0usize;
+                        for block_id in file.block_ids() {
+                            location_entries += 1;
+                            block_ids.push(block_id);
+                            if location_entries
+                                > crate::master::meta::subtree_write_plan::SUBTREE_LOCATION_LIMIT
                             {
-                                drop(inode_locks);
-                                return self.with_replay_cold(body);
+                                over_budget = true;
+                                break;
                             }
+                            for location in fs_dir
+                                .get_block_locations(block_id)
+                                .map_err(|e| e.to_string())?
+                            {
+                                location_entries += 1;
+                                worker_ids.push(location.worker_id);
+                                if location_entries
+                                > crate::master::meta::subtree_write_plan::SUBTREE_LOCATION_LIMIT
+                            {
+                                over_budget = true;
+                                break;
+                            }
+                            }
+                            if over_budget {
+                                break;
+                            }
+                        }
+                        if over_budget {
+                            break;
                         }
                     }
                 }
-            }
-            Some(
-                self.block_location_locks
-                    .write_workers_blocks(&worker_ids, &block_ids),
-            )
-        } else {
-            None
-        };
+                if over_budget {
+                    drop(inode_locks);
+                    let Some(body) = body_slot.take() else {
+                        return Err("replay body already consumed".to_string().into());
+                    };
+                    return self.with_replay_cold(body);
+                }
+                Some(
+                    self.block_location_locks
+                        .write_workers_blocks(&worker_ids, &block_ids),
+                )
+            } else {
+                None
+            };
 
-        // Pre-body revalidation: churn here (before the guard exists) falls
-        // back to the cold bridge with the locks dropped.
-        let churn = {
-            let fs_dir = self.fs_dir.view().map_err(|e| e.to_string())?;
-            plan.revalidate(&fs_dir, path)
-                .map_err(|e| e.to_string())?
-                .is_none()
-        };
-        if churn {
+            // R2: the final revalidation and the body share ONE view window.
+            // A cold/restore lifecycle could otherwise take the unique owner
+            // between two separate views, replacing root/store while the plan's
+            // locks are still held. Churn (side-effect-free mismatch) is
+            // reported as a flag; the caller releases the locks and falls back
+            // to the cold bridge. The guard is declared after the view binding
+            // (§8.2) and lives only inside this view window.
+            enum ReplayStep<T> {
+                Body(T),
+                Churn,
+            }
+            let result = (|| -> CommonResult<ReplayStep<T>> {
+                let fs_dir = self.fs_dir.view().map_err(|e| e.to_string())?;
+                if plan
+                    .revalidate(&fs_dir, path)
+                    .map_err(|e| e.to_string())?
+                    .is_none()
+                {
+                    // Side-effect-free churn: the caller releases view/locks
+                    // and takes the cold bridge. The body was never moved here
+                    // — it stays available for the caller's cold fallback.
+                    return Ok(ReplayStep::Churn);
+                }
+                let guard = MetadataConfirmation::arm(&self.fs_dir, &self.journal_writer);
+                let mut guard = guard;
+                let failure_seq_before = self.journal_writer.failure_seq();
+                let Some(body) = body_slot.take() else {
+                    return Err("replay body already consumed".to_string().into());
+                };
+                let result = body(&fs_dir);
+                let seq_moved = self.journal_writer.failure_seq() != failure_seq_before;
+                if result.is_err() && seq_moved {
+                    // A real in-lock fatal: terminalize while the locks are
+                    // still held (handle.take() empties the guard).
+                    guard.fail_terminal();
+                } else {
+                    // Ok, or a plain business error that did not move the seq:
+                    // the holder stays usable — the replay error goes to the
+                    // original apply error/retry rules without retiring the
+                    // namespace (design §8.2).
+                    guard.disarm();
+                }
+                drop(fs_dir);
+                drop(guard);
+                let step = result.map(ReplayStep::Body).map_err(|e| e.to_string())?;
+                Ok(step)
+            })();
+
             drop(location_locks);
             drop(inode_locks);
-            return self.with_replay_cold(body);
-        }
-
-        // Guard declared after the inode/view bindings (§8.2); the final
-        // view and the body run inside the protected scope.
-        let result = (|| -> CommonResult<T> {
-            let fs_dir = self.fs_dir.view().map_err(|e| e.to_string())?;
-            let mut guard = MetadataConfirmation::arm(&self.fs_dir, &self.journal_writer);
-            let failure_seq_before = self.journal_writer.failure_seq();
-            let result = body(&fs_dir);
-            let seq_moved = self.journal_writer.failure_seq() != failure_seq_before;
-            if result.is_err() && seq_moved {
-                // A real in-lock fatal: terminalize while the locks are
-                // still held (handle.take() empties the guard).
-                guard.fail_terminal();
-            } else {
-                // Ok, or a plain business error that did not move the seq:
-                // the holder stays usable — the replay error goes to the
-                // original apply error/retry rules without retiring the
-                // namespace (design §8.2).
-                guard.disarm();
+            match result? {
+                ReplayStep::Body(value) => return Ok(value),
+                ReplayStep::Churn => continue,
             }
-            drop(fs_dir);
-            drop(guard);
-            result.map_err(|e| e.into())
-        })();
-
-        drop(location_locks);
-        drop(inode_locks);
-        result
+        }
+        // Retries exhausted on side-effect-free churn: the cold bridge owns
+        // the replay (design §8.2). The body was never consumed by a churn
+        // pass.
+        let Some(body) = body_slot.take() else {
+            return Err("replay body already consumed".to_string().into());
+        };
+        self.with_replay_cold(body)
     }
 
     fn with_replay_cold<T>(&self, body: impl FnOnce(&FsDir) -> FsResult<T>) -> CommonResult<T> {
@@ -2306,7 +2389,11 @@ impl JournalLoader {
             // C2: a recursive directory delete replays under the bounded
             // subtree-lock path (parent Write; no location locks — the
             // Delete entry carries no block list).
-            return self.with_replay_locks(&entry_path, InodeLockMode::Write, false, |fs_dir| {
+            // R3: a recursive permanent delete reads stage_decrement_nlink
+            // location rows inside the body — the full inode → worker →
+            // block order protects it against concurrent report/replication
+            // writes, regardless of what the journal entry format carries.
+            return self.with_replay_locks(&entry_path, InodeLockMode::Write, true, |fs_dir| {
                 let inp = InodePath::resolve(fs_dir.root_node(), &entry_path, &fs_dir.store)?;
                 if inp.get_last_inode().is_none() {
                     warn!("Delete: path not found: {}", entry_path);

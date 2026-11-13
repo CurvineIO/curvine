@@ -211,12 +211,19 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let worker_fs = fs.clone();
     let body_writer = writer.clone();
+    let epoch_for_worker = fs.journal_writer.metadata_epoch().unwrap();
     let worker = std::thread::spawn(move || {
-        worker_fs.run_recursive_metadata_write("/dir", InodeLockMode::Write, true, |fs_dir| {
-            started_tx.send(()).unwrap();
-            body_writer.fail_metadata_publication();
-            typed_missing_leaf(fs_dir, "/dir/missing")
-        })
+        worker_fs.run_recursive_metadata_write(
+            epoch_for_worker,
+            "/dir",
+            InodeLockMode::Write,
+            true,
+            |fs_dir| {
+                started_tx.send(()).unwrap();
+                body_writer.fail_metadata_publication();
+                typed_missing_leaf(fs_dir, "/dir/missing")
+            },
+        )
     });
 
     started_rx
@@ -296,13 +303,20 @@ fn recursive_body_unwind_terminals_before_unlock() -> FsResult<()> {
 
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let worker_fs = fs.clone();
+    let epoch_for_worker = fs.journal_writer.metadata_epoch().unwrap();
     let worker = std::thread::spawn(move || {
-        worker_fs.run_recursive_metadata_write("/dir", InodeLockMode::Write, true, |_fs_dir| {
-            started_tx.send(()).unwrap();
-            panic!("recursive body unwind");
-            #[allow(unreachable_code)]
-            Ok::<(), curvine_error::FsError>(())
-        })
+        worker_fs.run_recursive_metadata_write(
+            epoch_for_worker,
+            "/dir",
+            InodeLockMode::Write,
+            true,
+            |_fs_dir| {
+                started_tx.send(()).unwrap();
+                panic!("recursive body unwind");
+                #[allow(unreachable_code)]
+                Ok::<(), curvine_error::FsError>(())
+            },
+        )
     });
 
     started_rx
@@ -514,12 +528,18 @@ fn recursive_plain_business_error_keeps_holder_alive() -> FsResult<()> {
     let writer = fs.journal_writer.clone();
     let seq_before = writer.failure_seq();
 
-    let result = fs.run_recursive_metadata_write("/tree", InodeLockMode::Write, false, |fs_dir| {
-        // A plan over an unresolvable path yields Fallback before the body;
-        // point the plan at the real subtree and fail the body on a missing
-        // leaf instead — that is the "plain business error" contract.
-        typed_missing_leaf(fs_dir, "/tree/missing")
-    });
+    let result = fs.run_recursive_metadata_write(
+        fs.journal_writer.metadata_epoch().unwrap(),
+        "/tree",
+        InodeLockMode::Write,
+        false,
+        |fs_dir| {
+            // A plan over an unresolvable path yields Fallback before the body;
+            // point the plan at the real subtree and fail the body on a missing
+            // leaf instead — that is the "plain business error" contract.
+            typed_missing_leaf(fs_dir, "/tree/missing")
+        },
+    );
 
     let op_err = typed_op_error(result, "the pure business error must surface");
     assert!(
@@ -571,22 +591,29 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
 
     let worker_fs = fs.clone();
     let body_writer = writer.clone();
+    let epoch_for_worker = fs.journal_writer.metadata_epoch().unwrap();
     let worker = std::thread::spawn(move || {
-        worker_fs.run_recursive_metadata_write("/dir", InodeLockMode::Write, true, |fs_dir| {
-            // First step: a real successful mutation that enqueues a journal
-            // entry and registers the waiter on this admission's scope.
-            let inp = MasterFilesystem::resolve_path(fs_dir, "/dir/file")?;
-            fs_dir.set_attr(
-                inp,
-                SetAttrOpts {
-                    mode: Some(0o640),
-                    ..Default::default()
-                },
-            )?;
-            // Then: a real publication failure plus a real op error.
-            body_writer.fail_metadata_publication();
-            typed_missing_leaf(fs_dir, "/dir/missing")
-        })
+        worker_fs.run_recursive_metadata_write(
+            epoch_for_worker,
+            "/dir",
+            InodeLockMode::Write,
+            true,
+            |fs_dir| {
+                // First step: a real successful mutation that enqueues a journal
+                // entry and registers the waiter on this admission's scope.
+                let inp = MasterFilesystem::resolve_path(fs_dir, "/dir/file")?;
+                fs_dir.set_attr(
+                    inp,
+                    SetAttrOpts {
+                        mode: Some(0o640),
+                        ..Default::default()
+                    },
+                )?;
+                // Then: a real publication failure plus a real op error.
+                body_writer.fail_metadata_publication();
+                typed_missing_leaf(fs_dir, "/dir/missing")
+            },
+        )
     });
 
     // Driver: drop the unique real receipt so the confirmation fails too.

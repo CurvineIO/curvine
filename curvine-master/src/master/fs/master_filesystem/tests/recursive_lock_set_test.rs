@@ -500,10 +500,16 @@ fn bounded_journal_queue_falls_back_before_the_body() {
     // answer Fallback first. A body that ran here would be a side effect taken
     // before the fallback decision.
     let mut body_ran = false;
-    let outcome = fs.run_recursive_metadata_write("/bounded", InodeLockMode::Write, true, |_| {
-        body_ran = true;
-        Ok(())
-    });
+    let outcome = fs.run_recursive_metadata_write(
+        fs.journal_writer.metadata_epoch().unwrap(),
+        "/bounded",
+        InodeLockMode::Write,
+        true,
+        |_| {
+            body_ran = true;
+            Ok(())
+        },
+    );
 
     match outcome {
         Ok(ShardedOutcome::Fallback) => {}

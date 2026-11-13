@@ -26,6 +26,13 @@ use curvine_error::FsResult;
 /// exceeded — never a full enumeration followed by a length check.
 pub(crate) const SUBTREE_PLAN_LIMIT: usize = 1024;
 
+/// Independent budget for the location sample (design §6): every block
+/// entry and every worker-location entry is charged against this limit —
+/// the plan budget does not cover locations, and a total above 1024 must
+/// be rejected before any body side effect. One extra item per check is
+/// allowed only to prove the overflow; no unbounded block-array copy.
+pub(crate) const SUBTREE_LOCATION_LIMIT: usize = 1024;
+
 /// One bounded subtree plan. Keeps only the restore epoch, the path id
 /// chain, the target depth, the full inode lock requests, and one
 /// shared-version token per visited directory (stable children handles).
