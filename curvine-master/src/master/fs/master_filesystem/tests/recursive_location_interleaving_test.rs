@@ -343,6 +343,3 @@ fn block_report_racing_a_last_link_delete_forces_coverage() {
         "the recursive delete must still complete"
     );
 }
-
-#[path = "recursive_location_id_only_test.rs"]
-mod recursive_location_id_only_test;
