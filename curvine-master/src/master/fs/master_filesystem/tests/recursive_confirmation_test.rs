@@ -285,13 +285,13 @@ fn recursive_fenced_admission_rejected_without_holder_retirement() -> FsResult<(
 /// seq unmoved, no fatal source. The three real hot routes are exercised
 /// directly (delete/free/set_attr), so a re-sampled epoch inside a hot
 /// closure cannot mask the original-epoch flow.
-fn assert_fenced_real_rpc_rejects<R: Send>(
+fn assert_fenced_real_rpc_rejects<R: Send + 'static>(
     fs: &MasterFilesystem,
     journal: &JournalSystem,
     writer: &Arc<JournalWriter>,
     conf: &ClusterConf,
-    body: impl FnOnce(&MasterFilesystem) -> FsResult<R> + Send,
-    verify_unchanged: impl Fn(&MasterFilesystem) + Send,
+    body: impl FnOnce(&MasterFilesystem) -> FsResult<R> + Send + 'static,
+    verify_unchanged: impl Fn(&MasterFilesystem) + Send + 'static,
     case: &str,
 ) {
     let seq_before = writer.failure_seq();
