@@ -21,7 +21,6 @@
 
 use crate::s3::s3_api::{HeadObjectResult, ListObjectContent, Owner};
 use curvine_model::{FileStatus, StorageType, TtlAction};
-use std::collections::HashMap;
 
 pub fn format_s3_timestamp(timestamp_ms: i64) -> Option<String> {
     chrono::DateTime::from_timestamp(timestamp_ms / 1000, 0)
@@ -128,65 +127,6 @@ pub fn create_owner_info(file_status: &FileStatus) -> Owner {
     }
 }
 
-/// Create metadata map from file status
-pub fn create_metadata_map(file_status: &FileStatus) -> HashMap<String, String> {
-    let mut metadata = HashMap::new();
-    metadata.insert("curvine-file-id".to_string(), file_status.id.to_string());
-    metadata.insert(
-        "curvine-replicas".to_string(),
-        file_status.replicas.to_string(),
-    );
-    metadata.insert(
-        "curvine-block-size".to_string(),
-        file_status.block_size.to_string(),
-    );
-    metadata.insert("curvine-owner".to_string(), file_status.owner.clone());
-    metadata.insert("curvine-group".to_string(), file_status.group.clone());
-    metadata.insert(
-        "curvine-mode".to_string(),
-        format!("{:o}", file_status.mode),
-    );
-    metadata.insert(
-        "curvine-complete".to_string(),
-        file_status.is_complete.to_string(),
-    );
-
-    // Add atime if different from mtime
-    if file_status.atime != file_status.mtime {
-        if let Some(atime_str) =
-            chrono::DateTime::from_timestamp(file_status.atime / 1000, 0).map(|dt| dt.to_rfc3339())
-        {
-            metadata.insert("curvine-atime".to_string(), atime_str);
-        }
-    }
-
-    // Add UFS mtime if available and different
-    if file_status.storage_policy.ufs_mtime > 0
-        && file_status.storage_policy.ufs_mtime != file_status.mtime
-    {
-        if let Some(ufs_mtime_str) =
-            chrono::DateTime::from_timestamp(file_status.storage_policy.ufs_mtime / 1000, 0)
-                .map(|dt| dt.to_rfc3339())
-        {
-            metadata.insert("curvine-ufs-mtime".to_string(), ufs_mtime_str);
-        }
-    }
-
-    // Internal attributes the gateway writes for its own bookkeeping must not
-    // leak into the response: they are not user metadata, and emitting them
-    // duplicated every `s3.meta.*` entry under two different names.
-    for (key, value) in &file_status.x_attr {
-        if key.starts_with("s3.") || key.starts_with('\0') {
-            continue;
-        }
-        if let Ok(value_str) = String::from_utf8(value.clone()) {
-            metadata.insert(key.to_lowercase(), value_str);
-        }
-    }
-
-    metadata
-}
-
 /// Fill TTL/Expiration information for HeadObjectResult
 pub fn fill_ttl_info(head: &mut HeadObjectResult, file_status: &FileStatus) {
     if file_status.storage_policy.ttl_ms > 0 {
@@ -226,13 +166,9 @@ pub fn file_status_to_head_object_result(
     // TTL/Expiration information
     fill_ttl_info(&mut head, file_status);
 
-    // Metadata from file attributes and properties
-    // User metadata must stay visible alongside the internal Curvine keys.
-    let mut metadata = create_metadata_map(file_status);
-    for (name, value) in user_metadata(file_status) {
-        metadata.insert(name, value);
-    }
-    head.metadata = Some(metadata);
+    // Only metadata the client uploaded; internal attributes (file id, owner,
+    // mode, replicas, other xattrs) are not S3 user metadata.
+    head.metadata = Some(user_metadata(file_status).into_iter().collect());
 
     head
 }
@@ -398,26 +334,21 @@ mod etag_tests {
 mod metadata_visibility_tests {
     use super::*;
 
-    /// Internal bookkeeping attributes must not surface as user metadata, and
-    /// must not be duplicated under their raw key.
+    /// HEAD/GET return exactly the uploaded user metadata, nothing internal.
     #[test]
-    fn internal_attributes_are_not_exposed_as_metadata() {
-        let mut status = FileStatus::default();
-        status
-            .x_attr
-            .insert("s3.etag".to_string(), b"deadbeef".to_vec());
-        status
-            .x_attr
-            .insert("s3.meta.foo".to_string(), b"bar".to_vec());
-        status
-            .x_attr
-            .insert("legacy-key".to_string(), b"kept".to_vec());
-
-        let meta = create_metadata_map(&status);
-        assert!(!meta.contains_key("s3.etag"), "{meta:?}");
-        assert!(!meta.contains_key("s3.meta.foo"), "{meta:?}");
-        assert!(!meta.keys().any(|k| k.starts_with("s3.")), "{meta:?}");
-        assert_eq!(meta.get("legacy-key").map(String::as_str), Some("kept"));
+    fn only_user_metadata_is_exposed() {
+        let mut status = FileStatus {
+            id: 42,
+            owner: "root".into(),
+            ..Default::default()
+        };
+        let meta = |s: &FileStatus| file_status_to_head_object_result(s, "k").metadata;
+        assert_eq!(meta(&status), Some(Default::default()));
+        for (k, v) in [("s3.etag", "a"), ("s3.meta.owner", "me"), ("raw", "x")] {
+            status.x_attr.insert(k.into(), v.into());
+        }
+        let expected = [("owner".to_string(), "me".to_string())];
+        assert_eq!(meta(&status), Some(expected.into()));
     }
 }
 
