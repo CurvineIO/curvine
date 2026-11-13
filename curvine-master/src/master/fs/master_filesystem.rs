@@ -705,6 +705,16 @@ impl MasterFilesystem {
                     drop(inode_locks);
                     return Ok(ShardedOutcome::Fallback);
                 }
+                // R7 location checkpoint: sampling is complete, the worker/
+                // block stripes are not yet acquired — the driver may add a
+                // location here to prove the post-lock coverage check
+                // re-plans rather than accepting the stale sample.
+                #[cfg(test)]
+                if let Some((reached, release)) = self.journal_writer.consume_location_pause_hook()
+                {
+                    let _ = reached.send(());
+                    let _ = release.recv_timeout(std::time::Duration::from_secs(60));
+                }
                 // A missing location key or an empty set keeps the original
                 // business semantics: the locks cover whatever the live
                 // sampler saw, and the final revalidation re-checks the set.
