@@ -235,6 +235,18 @@ fn recursive_set_attr_waits_for_shared_namespace_readers() {
             .unwrap()
             .unwrap(),
     };
+    // R8: the success branch must also join its task (no unbounded leak).
+    task.join().unwrap();
+    assert_eq!(wide.file_status("/wide/dir/file").unwrap().mode, 0o700);
+    assert_eq!(wide.file_status("/wide/dir").unwrap().mode, 0o700);
+
+    // R8: restore the persistence regression the C1 contract carried — the
+    // recursive write must survive a restore-from-store on BOTH paths.
+    fs.restore_from_rocksdb().unwrap();
+    assert_eq!(fs.file_status("/tree/dir").unwrap().mode, 0o700);
+    assert_eq!(fs.file_status("/tree/dir/file").unwrap().mode, 0o700);
+    wide.restore_from_rocksdb().unwrap();
+    assert_eq!(wide.file_status("/wide/dir").unwrap().mode, 0o700);
     assert_eq!(wide.file_status("/wide/dir/file").unwrap().mode, 0o700);
 }
 
