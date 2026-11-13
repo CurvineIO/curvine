@@ -146,6 +146,12 @@ pub struct JournalWriter {
     /// Read barrier over Raft metadata catch-up; defaults to current so
     /// single-node and testing writers are never fenced off.
     read_barrier: Arc<JournalReadBarrier>,
+    /// Whether the real journal queue is unbounded (cap == 0), captured at
+    /// construction from the actual channel mode (design §8.3). Read-only
+    /// fact; the C2 recursive fast path requires it (or a disabled journal)
+    /// so no admission can block on a full bounded queue while holding
+    /// subtree locks.
+    journal_unbounded: bool,
     metrics: &'static MasterMetrics,
     receiver: Option<Mutex<BlockingReceiver<QueuedJournalEntry>>>,
 
@@ -222,6 +228,7 @@ impl JournalWriter {
             snapshot_entries: conf.snapshot_entries,
             snapshot_min_interval_ms: conf.snapshot_min_interval.as_millis(),
             last_snapshot_ms: AtomicCounter::new(0),
+            journal_unbounded: conf.writer_channel_size == 0,
             entries_since_snapshot: AtomicCounter::new(0),
             #[cfg(test)]
             wait_unwind_hook: std::sync::Mutex::new(None),
@@ -426,6 +433,15 @@ impl JournalWriter {
         self.recovery.enter_safe_mode(reason);
         self.recovery.mark_writer_failed();
         self.recovery.record_failure();
+    }
+
+    /// Whether the real journal queue is unbounded (cap == 0) or the writer
+    /// has the journal disabled: the C2 recursive path may hold subtree
+    /// locks across enqueue only in these cases (design §8.3). The fact is
+    /// captured at construction from the actual channel mode, never from a
+    /// forked conf or a test identity.
+    pub(crate) fn queue_never_blocks(&self) -> bool {
+        !self.enable || self.journal_unbounded
     }
 
     pub fn ensure_metadata_current(&self) -> FsResult<()> {

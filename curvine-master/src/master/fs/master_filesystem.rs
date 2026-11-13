@@ -103,17 +103,21 @@ enum ShardedOutcome<R> {
 #[path = "master_filesystem/tests/memory_read_gates.rs"]
 pub(crate) mod memory_read_gates;
 
-/// Confirmation-window guard for the exclusive path: armed while the cold
-/// owner is still dropping (before the confirmation wait), disarmed only
-/// when `scope.wait` reports the real apply/cursor ack. On a confirmation error — or if the wait panics while
-/// armed — the namespace holder goes terminal before the exclusive gate
-/// guard is released. Single-purpose for this one call site.
-struct ExclusiveConfirmation<'a> {
+/// Confirmation-window guard shared by the exclusive path and the C2
+/// recursive coordination entry (design §8.1). Armed in the body's lexical
+/// scope after the view/lock declarations, disarmed only when the real
+/// confirmation reports the apply/cursor ack. On a confirmation error — or
+/// if the wait panics while armed — the namespace holder goes terminal
+/// before the surrounding resources are released. Borrows only the holder
+/// and the writer: no namespace view, object locks, DB Arc, admission slot
+/// or exclusive gate. `handle.take` keeps the single terminal/disarm
+/// mechanism; there is no second legacy implementation.
+struct MetadataConfirmation<'a> {
     handle: Option<&'a FsDirHandle>,
     writer: &'a JournalWriter,
 }
 
-impl ExclusiveConfirmation<'_> {
+impl MetadataConfirmation<'_> {
     fn disarm(&mut self) {
         self.handle = None;
     }
@@ -125,7 +129,7 @@ impl ExclusiveConfirmation<'_> {
     }
 }
 
-impl Drop for ExclusiveConfirmation<'_> {
+impl Drop for MetadataConfirmation<'_> {
     fn drop(&mut self) {
         self.fail_terminal();
     }
@@ -557,7 +561,7 @@ impl MasterFilesystem {
                 // The confirmation guard is armed while the cold owner still
                 // holds the unique view: a confirmation error — or a panic in
                 // the wait — goes terminal before the gate guard is released.
-                let mut confirmation = ExclusiveConfirmation {
+                let mut confirmation = MetadataConfirmation {
                     handle: Some(&self.fs_dir),
                     writer: &self.journal_writer,
                 };
