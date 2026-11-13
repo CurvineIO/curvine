@@ -118,16 +118,9 @@ impl InodeLockManager {
     /// queue registration. `None` proves the stripe is still held by the
     /// terminal request; `Some` would prove it was already released.
     #[cfg(test)]
-    pub fn try_read_inode(&self, inode_id: i64) -> Option<InodeLockSet<'_>> {
+    pub fn try_read_inode(&self, inode_id: i64) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
         let stripe = self.locks.index(inode_id as u64);
-        let guard = self.locks.try_read(inode_id as u64)?;
-        Some(InodeLockSet {
-            guards: [InodeGuard::Read { _guard: guard }].into_iter().collect(),
-            #[cfg(debug_assertions)]
-            manager: self,
-            #[cfg(debug_assertions)]
-            stripes: [stripe].into_iter().collect(),
-        })
+        self.locks.try_read_by_stripe(stripe)
     }
 
     pub fn lock_many<'a>(&'a self, requests: &[InodeLockRequest]) -> InodeLockSet<'a> {

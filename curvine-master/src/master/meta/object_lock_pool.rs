@@ -57,6 +57,15 @@ impl ObjectLockPool {
         self.stripes[self.index(key)].try_read()
     }
 
+    /// Test-only non-blocking shared acquisition by pre-computed stripe index.
+    #[cfg(test)]
+    pub(crate) fn try_read_by_stripe(
+        &self,
+        stripe: usize,
+    ) -> Option<RwLockReadGuard<'_, ()>> {
+        self.stripes.get(stripe)?.try_read()
+    }
+
     /// Acquire an already-computed stripe index. Callers that group keys by
     /// stripe first (`acquire_stripes`) avoid hashing twice per key.
     #[inline]

@@ -46,8 +46,6 @@ pub(crate) struct SubtreeWritePlan {
     chain: Vec<i64>,
     /// The planned path components, for the locked re-walk.
     components: Vec<String>,
-    /// Depth of the target in `chain` (`chain.len() - 1`).
-    target_depth: usize,
     /// The full inode lock request set (ancestors, parent, subtree).
     requests: Vec<InodeLockRequest>,
     /// One token per directory visited during the walk, captured BEFORE its
@@ -210,7 +208,6 @@ impl SubtreeWritePlan {
             restore_epoch,
             chain,
             components,
-            target_depth,
             requests,
             tokens,
         }))

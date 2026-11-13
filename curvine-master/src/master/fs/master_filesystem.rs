@@ -663,7 +663,11 @@ impl MasterFilesystem {
             // LIMIT), bounded block iteration and location reads, owned IDs
             // only.
             let location_plan_and_locks = if need_locations {
-                {
+                // G5: the short view block ONLY returns the owned location
+                // plan — the hook consumption and L acquisition happen AFTER
+                // the view is dropped, so a cold drain never waits on a
+                // NamespaceGuard held by this same frame.
+                let location_plan = {
                     let fs_dir = self.fs_dir.view()?;
                     if Self::checked_live_epoch(&fs_dir)? != planned_epoch {
                         drop(inode_locks);
@@ -675,22 +679,21 @@ impl MasterFilesystem {
                         drop(inode_locks);
                         return Ok(ShardedOutcome::Fallback);
                     };
-                    // R7 location checkpoint: sampling is complete, the
-                    // worker/block stripes are not yet acquired — the driver
-                    // may add a location here to prove the post-lock coverage
-                    // check re-plans rather than accepting the stale sample.
-                    #[cfg(test)]
-                    if let Some((reached, release)) =
-                        self.journal_writer.consume_location_pause_hook()
-                    {
-                        let _ = reached.send(());
-                        let _ = release.recv_timeout(std::time::Duration::from_secs(60));
-                    }
-                    let locks = self
-                        .block_location_locks
-                        .write_workers_blocks(plan.worker_ids(), plan.block_ids());
-                    Some((plan, locks))
+                    plan
+                };
+                // G5: the view is now dropped. Consume the location hook
+                // and acquire L in a separate block (no NamespaceGuard held
+                // while waiting for location locks).
+                #[cfg(test)]
+                if let Some((reached, release)) = self.journal_writer.consume_location_pause_hook()
+                {
+                    let _ = reached.send(());
+                    let _ = release.recv_timeout(std::time::Duration::from_secs(60));
                 }
+                let locks = self
+                    .block_location_locks
+                    .write_workers_blocks(location_plan.worker_ids(), location_plan.block_ids());
+                Some((location_plan, locks))
             } else {
                 None
             };
