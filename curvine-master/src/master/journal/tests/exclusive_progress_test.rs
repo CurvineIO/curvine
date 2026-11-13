@@ -302,15 +302,23 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
         .expect("advance committed index");
 
     let scan_loader = fixture.loader.clone();
-    let scan_result = fixture.runtime.block_on(async {
+    let scan_outcome = fixture.runtime.block_on(async {
         tokio::time::timeout(
             HANDSHAKE_WINDOW,
             scan_loader.apply(true, ApplyMsg::new_scan(AppliedIndex::default())),
         )
         .await
-        .expect("real Scan must complete within the window")
-        .expect("the real Scan must succeed while the receipt is held");
     });
+    // One request, one result: a second scan would be a new request, not the
+    // same receiver, so a timeout is reported instead of retried.
+    let scan_result = match scan_outcome {
+        Ok(result) => result,
+        Err(_) => panic!("the real Scan must return within the bound"),
+    };
+    assert!(
+        scan_result.is_ok(),
+        "the real Scan must succeed while the receipt is held, got {scan_result:?}"
+    );
 
     // The FSM applied watermark and the cursor store must both reflect the
     // committed entry — real confirmation, not a mocked ack.
@@ -373,9 +381,8 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     assert!(
         rpc_err
             .to_string()
-            .contains("journal writer is not accepting writes")
-            || rpc_err.to_string().contains("JournalUnavailable"),
-        "the resumed RPC must be fenced, got {rpc_err}"
+            .contains("journal writer is not accepting writes"),
+        "the resumed RPC must be fenced by the writer, got {rpc_err}"
     );
 
     // Teardown: stop the real apply worker with a bounded shutdown, drain the
@@ -405,6 +412,15 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
             Err(_) => break,
         }
     });
+    // A shutdown ack is not worker exit: join the real apply worker and the
+    // blocked RPC thread before tearing the directories down.
+    fixture.runtime.block_on(async {
+        tokio::time::timeout(HANDSHAKE_WINDOW, apply_worker)
+            .await
+            .expect("the apply worker must exit after shutdown")
+            .expect("the apply worker must not panic");
+    });
+    rpc.join().expect("the blocked RPC thread must not panic");
     drop(mfs);
     fixture.journal.shutdown();
     let meta_cleanup = std::fs::remove_dir_all(&fixture.meta_dir);
@@ -420,9 +436,13 @@ fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
 
     let mut fixture = ProgressFixture::new("excl-pub-fail");
     let conf = fixture.conf.clone();
+    // A per-instance unique directory: the fault matcher below is keyed on
+    // this exact name, so another case deleting "/dir" cannot consume it.
+    let dir_name = format!("dir-{}", Utils::rand_str(8));
+    let dir_path = format!("/{dir_name}");
     let setup_fs = fixture.fs.clone();
-    setup_fs.mkdir("/dir", true).unwrap();
-    setup_fs.create("/dir/file", true).unwrap();
+    setup_fs.mkdir(&dir_path, true).unwrap();
+    setup_fs.create(format!("{dir_path}/file"), true).unwrap();
     setup_fs
         .journal_writer
         .with_testing_receiver(|receiver| loop {
@@ -446,7 +466,7 @@ fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
         .configure(
             rule_id,
             curvine_fault::FaultRuleBuilder::named("master.metadata.delete.before_commit")
-                .matches("child_name", "dir")
+                .matches("child_name", dir_name.as_str())
                 .unwrap()
                 .times(1)
                 .unwrap()
@@ -457,7 +477,8 @@ fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
 
     let delete_fs = mfs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || done_tx.send(delete_fs.delete("/dir", true)));
+    let delete_path = dir_path.clone();
+    let worker = std::thread::spawn(move || done_tx.send(delete_fs.delete(&delete_path, true)));
 
     let delete_result = done_rx.recv_timeout(HANDSHAKE_WINDOW);
     runtime.remove(rule_id).unwrap();
@@ -482,7 +503,30 @@ fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
         "the view must reopen after a pure store error"
     );
     assert_eq!(writer.failure_seq(), failure_seq_before);
-    drop(fixture);
+
+    // Same closedown discipline as the other cases: release the borrowed
+    // handles, shut the journal system down, then remove both trees with
+    // their results kept.
+    drop(mfs);
+    let ProgressFixture {
+        journal: fixture_journal,
+        fs: fixture_fs,
+        loader: fixture_loader,
+        receiver: fixture_receiver,
+        runtime: fixture_runtime,
+        meta_dir,
+        journal_dir,
+        ..
+    } = fixture;
+    drop(fixture_fs);
+    drop(fixture_loader);
+    drop(fixture_receiver);
+    drop(fixture_runtime);
+    fixture_journal.shutdown();
+    let meta_cleanup = std::fs::remove_dir_all(&meta_dir);
+    let journal_cleanup = std::fs::remove_dir_all(&journal_dir);
+    meta_cleanup.expect("the store-error meta tree must be removed");
+    journal_cleanup.expect("the store-error journal tree must be removed");
 }
 
 #[test]
@@ -588,12 +632,43 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
         .expect("the receipts receiver must exist");
     let completion = queued.completion.expect("missing commit confirmation");
 
-    eprintln!("restore: entry received, waiting for body");
-    // The body completed (enqueue pushed a scoped waiter) and drop(cold)
-    // ran, but the view may stay Busy while the scoped waiter waits on the
-    // held receipt. The restore intent must be blocked by the gate in this
-    // window — that's the gate-blocking proof. We do NOT wait for view
-    // reopen here; the receipt drop below terminates the holder.
+    // Observe the completed body before starting the restore intent. Entry
+    // arrival only proves an enqueue; the body must have published and
+    // reopened the view, the delete must already be applied, the failure
+    // sequence must not have moved, and the delete must still wait for this
+    // receipt.
+    let failure_seq_before_restore = writer.failure_seq();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut view_reopened = false;
+    while std::time::Instant::now() < deadline {
+        if fs.fs_dir.view().is_ok() {
+            view_reopened = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let live_status = fs.file_status("/dir");
+    let delete_probe = delete_done_rx.recv_timeout(Duration::from_millis(100));
+    assert!(
+        view_reopened,
+        "the body must complete and reopen the view before the restore intent starts"
+    );
+    assert!(
+        matches!(&live_status, Err(error) if matches!(error, curvine_error::FsError::FileNotFound(_))),
+        "the deleted directory must already be gone from the live tree, got {live_status:?}"
+    );
+    assert_eq!(
+        writer.failure_seq(),
+        failure_seq_before_restore,
+        "a completed body must not bump the publication failure sequence"
+    );
+    assert!(
+        matches!(
+            delete_probe,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "the delete must still wait for its confirmation, got {delete_probe:?}"
+    );
 
     // Restore intent: apply_snapshot must wait on the same exclusive gate.
     let restore_loader = loader.clone();
@@ -634,6 +709,12 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
         Err(err) => err,
     };
     assert!(fs.fs_dir.is_failed());
+    assert!(
+        delete_err
+            .to_string()
+            .contains("journal commit failed after metadata commit"),
+        "the delete must surface the real commit error, got {delete_err}"
+    );
 
     let restore_result = restore_done_rx
         .recv_timeout(Duration::from_secs(30))
@@ -647,18 +728,31 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
         Err(err) => err,
     };
     assert!(
-        restore_err.to_string().contains("unavailable")
-            || restore_err.to_string().contains("failed"),
-        "the restore must report the terminal holder, got {restore_err}"
+        restore_err
+            .to_string()
+            .contains("namespace permanently unavailable after failure"),
+        "the restore must report the terminal namespace state, got {restore_err}"
     );
 
     drop(fs);
     drop(loader);
     journal.shutdown();
-    let _ = std::fs::remove_dir_all(&meta_dir);
-    let _ = std::fs::remove_dir_all(&journal_dir);
-    if let Some(files) = &snapshot.files_data {
-        let _ = std::fs::remove_dir_all(&files.dir);
+    let meta_cleanup = std::fs::remove_dir_all(&meta_dir);
+    let journal_cleanup = std::fs::remove_dir_all(&journal_dir);
+    let files_cleanup = snapshot
+        .files_data
+        .as_ref()
+        .map(|files| std::fs::remove_dir_all(&files.dir));
+    meta_cleanup.expect("the restore meta tree must be removed");
+    journal_cleanup.expect("the restore journal tree must be removed");
+    if let Some(result) = files_cleanup {
+        // The restore failed before publishing files, so an absent tree is a
+        // legitimate outcome; anything else must be reported.
+        match result {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("the restored files tree must be removable: {error}"),
+        }
     }
     Ok(())
 }

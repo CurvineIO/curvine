@@ -664,10 +664,18 @@ fn purge_child_publication_failure_fences_writes() {
     runtime.configure(&rule_id, rule).unwrap();
     let result = fs.purge_trash_batch("/parent", std::slice::from_ref(&path));
     runtime.remove(&rule_id).unwrap();
-    let purge_err = result.unwrap_err().to_string();
+    // Keep the original FsError: the injected fault produces a Common error,
+    // and its variant must survive the exclusive publication failure path.
+    let purge_error = result.expect_err("the injected publication failure must surface");
     assert!(
-        purge_err.contains("injected purge publication failure"),
-        "the publication error must keep its original message, got {purge_err}"
+        matches!(&purge_error, curvine_error::FsError::Common(_)),
+        "the publication error must keep its original Common variant, got {purge_error:?}"
+    );
+    assert!(
+        purge_error
+            .to_string()
+            .contains("injected purge publication failure"),
+        "the publication error must keep its original message, got {purge_error}"
     );
     // The exclusive confirmation failure (seq moved) went terminal: the
     // holder is FAILED and all subsequent access reports Unavailable.
@@ -691,6 +699,16 @@ fn purge_child_publication_failure_fences_writes() {
     );
     assert!(fs.journal_writer.ensure_metadata_current().is_err());
     assert!(fs.mkdir("/another", false).is_err());
+    // Independent of the namespace state: a failed purge must not have queued
+    // any worker block deletion for this worker.
+    assert!(
+        fs.worker_manager
+            .write()
+            .block_map
+            .handle_heartbeat(100)
+            .is_empty(),
+        "a failed purge publication must not queue worker block deletions"
+    );
 }
 
 #[test]
