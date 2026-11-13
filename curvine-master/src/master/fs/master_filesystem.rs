@@ -138,17 +138,16 @@ impl<'a> MetadataConfirmation<'a> {
     pub(crate) fn fail_terminal(&mut self) {
         if let Some(handle) = self.handle.take() {
             handle.fail_closed(self.writer);
-        }
-        // R8 observation checkpoint: consume the writer's instance-isolated
-        // terminal hook AFTER the terminal transition and BEFORE the
-        // caller's frame releases the locks. take() empties the slot so the
-        // guard's Drop cannot re-fire; the wait is bounded by the test's
-        // own release (this runs inside fail_terminal, whose decision is
-        // already complete).
-        #[cfg(test)]
-        if let Some((reached, release)) = self.writer.consume_terminal_hook() {
-            let _ = reached.send(());
-            let _ = release.recv_timeout(std::time::Duration::from_secs(60));
+            // F6.5: the observation checkpoint fires ONLY when an actual
+            // terminal transition happened (handle was Some and was taken).
+            // A successful disarm sets handle=None first, so the guard's
+            // Drop calls fail_terminal but never reaches this branch — no
+            // fabricated "terminal happened" event from a successful Drop.
+            #[cfg(test)]
+            if let Some((reached, release)) = self.writer.consume_terminal_hook() {
+                let _ = reached.send(());
+                let _ = release.recv_timeout(std::time::Duration::from_secs(60));
+            }
         }
     }
 }
