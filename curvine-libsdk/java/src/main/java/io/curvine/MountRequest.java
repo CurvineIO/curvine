@@ -87,11 +87,11 @@ public final class MountRequest {
         }
 
         /**
-         * Select replacement-style update semantics for an existing mount.
+         * Select update semantics for an existing mount.
          *
-         * <p>All options in this request, including defaults for options not explicitly set,
-         * are sent to the master and can replace existing mount settings. Include each setting's
-         * current value in the request when it must be preserved.
+         * <p>Only the options explicitly set on this builder are sent to the master;
+         * omitted options keep the values already stored on the mount. Include a
+         * setting explicitly when it must change.
          */
         public Builder update(boolean update) {
             this.update = update;
@@ -169,14 +169,37 @@ public final class MountRequest {
             MountOptionsProto.Builder options = MountOptionsProto.newBuilder()
                     .setUpdate(update)
                     .putAllAddProperties(addProperties)
-                    .setTtlMs(ttlMs == null ? DEFAULT_TTL_MS : ttlMs)
-                    .setTtlAction(ttlAction == null ? defaultTtlAction(writeType) : ttlAction)
                     .setReadVerifyUfs(readVerifyUfs)
                     .addAllRemoveProperties(removeProperties)
-                    .setWriteType(writeType)
-                    .setAutoCache(autoCache == null || autoCache)
-                    .setAccessMode(accessMode == null
-                            ? AccessModeProto.ACCESS_MODE_PROTO_READ_ONLY : accessMode);
+                    .setWriteType(writeType);
+            if (update) {
+                // An update sends only the fields the caller set explicitly, so
+                // omitted options keep the values stored on the master (#2105).
+                // `read_verify_ufs` cannot be omitted yet: the proto field is
+                // still required, so it is always sent until the field becomes
+                // optional (see the CLI-side fix in PR for issue #2104).
+                if (ttlMs != null) {
+                    options.setTtlMs(ttlMs);
+                }
+                if (ttlAction != null) {
+                    options.setTtlAction(ttlAction);
+                }
+                if (autoCache != null) {
+                    options.setAutoCache(autoCache);
+                }
+                if (accessMode != null) {
+                    options.setAccessMode(accessMode);
+                }
+            } else {
+                // A new mount fills the documented defaults, mirroring the CLI:
+                // 7d TTL, action derived from the write type, auto_cache on and
+                // read-only access.
+                options.setTtlMs(ttlMs == null ? DEFAULT_TTL_MS : ttlMs)
+                        .setTtlAction(ttlAction == null ? defaultTtlAction(writeType) : ttlAction)
+                        .setAutoCache(autoCache == null || autoCache)
+                        .setAccessMode(accessMode == null
+                                ? AccessModeProto.ACCESS_MODE_PROTO_READ_ONLY : accessMode);
+            }
             if (writeCache != null) {
                 options.setWriteCache(writeCache);
             }

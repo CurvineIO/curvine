@@ -58,6 +58,7 @@ public class MountRequestTest {
                 .cvPath("/data")
                 .update(true)
                 .ttlMs(60_000L)
+                .ttlAction(TtlActionProto.TTL_ACTION_PROTO_FREE)
                 .readVerifyUfs(true)
                 .storageType(StorageTypeProto.STORAGE_TYPE_PROTO_SSD)
                 .blockSize(16L * 1024L * 1024L)
@@ -88,6 +89,44 @@ public class MountRequestTest {
         Assert.assertEquals(
                 AccessModeProto.ACCESS_MODE_PROTO_READ_WRITE, request.getOptions().getAccessMode());
         Assert.assertTrue(request.getOptions().getWriteCache());
+    }
+
+    @Test
+    public void updateSendsOnlyExplicitOptions() {
+        MountRequest request = MountRequest.builder()
+                .ufsPath("oss://bucket/data")
+                .cvPath("/data")
+                .update(true)
+                .autoCache(false)
+                .build();
+
+        Assert.assertTrue(request.getOptions().getUpdate());
+        // Explicitly set options are sent.
+        Assert.assertFalse(request.getOptions().getAutoCache());
+        // Omitted update-optional fields stay unset so the master keeps the
+        // stored mount settings instead of resetting them to builder defaults.
+        Assert.assertFalse(request.getOptions().hasTtlMs());
+        Assert.assertFalse(request.getOptions().hasTtlAction());
+        Assert.assertFalse(request.getOptions().hasAccessMode());
+        Assert.assertFalse(request.getOptions().hasWriteCache());
+    }
+
+    @Test
+    public void updateSendsExplicitTtlAndAccessMode() {
+        MountRequest request = MountRequest.builder()
+                .ufsPath("oss://bucket/data")
+                .cvPath("/data")
+                .update(true)
+                .ttlMs(60_000L)
+                .ttlAction(TtlActionProto.TTL_ACTION_PROTO_FREE)
+                .accessMode(AccessModeProto.ACCESS_MODE_PROTO_READ_WRITE)
+                .build();
+
+        Assert.assertEquals(60_000L, request.getOptions().getTtlMs());
+        Assert.assertEquals(
+                TtlActionProto.TTL_ACTION_PROTO_FREE, request.getOptions().getTtlAction());
+        Assert.assertEquals(
+                AccessModeProto.ACCESS_MODE_PROTO_READ_WRITE, request.getOptions().getAccessMode());
     }
 
     @Test
