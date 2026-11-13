@@ -298,14 +298,26 @@ fn exchange_in_the_same_window_is_serialized_not_concurrent() {
         .recv_timeout(OBSERVE_WINDOW)
         .expect("the planner must reach the pause point");
 
-    // The exchange runs on its own thread: it must never be required to finish
-    // while the planner is paused.
+    // Reaching the pause point already proves the delete passed admission and
+    // holds the inode write locks. The exchange requires exclusive mode, so it
+    // must wait for that admission slot instead of running concurrently.
+    let (exchange_done_tx, exchange_done_rx) = mpsc::channel();
     let exchange_fs = fs.clone();
     let exchange_handle = std::thread::spawn(move || {
-        exchange_fs.rename("/a/d0/left", "/a/d0/right", RenameFlags::EXCHANGE)
+        let result = exchange_fs.rename("/a/d0/left", "/a/d0/right", RenameFlags::EXCHANGE);
+        let _ = exchange_done_tx.send(());
+        result
     });
-    // Give the exchange a chance to queue behind the gate before we release.
-    std::thread::sleep(Duration::from_millis(100));
+    // Positive evidence that it is queued: a bounded window in which it must
+    // NOT finish. This is an assertion about the other thread's progress, not
+    // a sleep hoping the queue order is what we guessed.
+    assert!(
+        exchange_done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .is_err(),
+        "the exchange must not complete while the delete owns the admission \
+         slot and the inode write locks"
+    );
     release_tx.send(()).expect("release the planner");
 
     let deleted = delete_handle.join().expect("delete thread must not panic");

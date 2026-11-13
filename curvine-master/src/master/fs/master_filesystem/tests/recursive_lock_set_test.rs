@@ -51,9 +51,9 @@ fn run_with_live_view_guard<T: Send + 'static>(
         let _ = tx.send(op(worker_fs));
     });
     let observed = rx.recv_timeout(OBSERVE_WINDOW);
-    // Release the guard, then let the worker finish so nothing leaks.
+    // Releasing the guard wakes the worker; joining it is what proves the
+    // wake-up actually happened, so no grace-period sleep is needed here.
     drop(held);
-    let _ = std::thread::sleep(Duration::from_millis(20));
     worker.join().expect("mutation worker must not panic");
     observed.map_err(|_| ())
 }
@@ -194,29 +194,83 @@ fn recursive_delete_completes_alongside_an_unrelated_writer() {
     build_tree(&fs, "/target", 5, 4);
     fs.mkdir("/other", false).unwrap();
 
+    // The writer must prove real business progress, not just that it looped:
+    // a run where every create/delete failed would otherwise still report
+    // rounds > 0 and make the test pass without any interleaving at all.
+    struct Progress {
+        created: u64,
+        deleted: u64,
+        first_error: Option<String>,
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
     let writer_stop = Arc::clone(&stop);
     let writer_fs = fs.clone();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
-        let mut rounds = 0u64;
+        let mut announced = false;
+        let mut progress = Progress {
+            created: 0,
+            deleted: 0,
+            first_error: None,
+        };
         while !writer_stop.load(Ordering::Relaxed) {
-            let path = format!("/other/f{}", rounds % 128);
-            let _ = writer_fs.create(&path, false);
-            let _ = writer_fs.delete(&path, false);
-            rounds += 1;
+            let path = format!("/other/f{}", (progress.created + progress.deleted) % 128);
+            match writer_fs.create(&path, false) {
+                Ok(_) => {
+                    progress.created += 1;
+                    if let Err(e) = writer_fs.delete(&path, false) {
+                        progress
+                            .first_error
+                            .get_or_insert_with(|| format!("delete {path}: {e}"));
+                        break;
+                    }
+                    progress.deleted += 1;
+                    if !announced {
+                        let _ = started_tx.send(());
+                        announced = true;
+                    }
+                }
+
+                Err(e) => {
+                    progress
+                        .first_error
+                        .get_or_insert_with(|| format!("create {path}: {e}"));
+                    break;
+                }
+            }
         }
-        rounds
+        let _ = progress_tx.send(progress);
     });
 
-    // Make sure the writer is really running before the delete starts.
-    std::thread::sleep(Duration::from_millis(50));
+    // Handshake instead of a sleep: the writer announces its first completed
+    // create/delete round, so the delete starts against a writer that is
+    // demonstrably running.
+    started_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the unrelated writer must complete a first round");
     let outcome = run_bounded(&fs, |fs| fs.delete("/target", true));
     stop.store(true, Ordering::Relaxed);
-    let rounds = writer.join().expect("writer thread must stop");
+
+    // Bounded join: a stuck writer must fail the test with a clear reason
+    // instead of hanging the whole suite.
+    let progress = progress_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the unrelated writer must stop within 30s after the delete returns");
+    writer.join().expect("writer thread must stop");
 
     assert!(
-        rounds > 0,
-        "fixture: the background writer must have made progress"
+        progress.created > 0 && progress.deleted > 0,
+        "fixture: the unrelated writer must have created and deleted real files \
+         (created={}, deleted={})",
+        progress.created,
+        progress.deleted
+    );
+    assert!(
+        progress.first_error.is_none(),
+        "the unrelated writer must not be disturbed by the delete: {:?}",
+        progress.first_error
     );
     assert!(
         outcome.is_ok(),

@@ -225,6 +225,14 @@ fn id_only_invalidation_excludes_with_the_delete_on_the_same_file_inode() {
         .recv_timeout(OBSERVE_WINDOW)
         .expect("the delete must reach its location sample");
 
+    // Direct evidence (no scheduler luck): the paused delete already holds this
+    // file's inode write lock, so a non-blocking read on the same stripe must
+    // fail. This is what makes the exclusion claim about the real holder.
+    assert!(
+        fs.inode_locks.try_read_inode(file_id).is_none(),
+        "the paused delete must hold the file inode write lock"
+    );
+
     // The cleanup runs on its own thread: it needs the file inode write lock,
     // which the paused delete already holds.
     let idl_fs = fs.clone();

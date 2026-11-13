@@ -264,6 +264,3 @@ fn recursive_free_counts_a_shared_block_once() {
 
 #[path = "recursive_location_interleaving_test.rs"]
 mod recursive_location_interleaving_test;
-
-#[path = "recursive_location_id_only_test.rs"]
-mod recursive_location_id_only_test;

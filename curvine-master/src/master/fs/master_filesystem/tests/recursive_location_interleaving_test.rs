@@ -23,14 +23,32 @@ use super::*;
 /// worker's released location stays released, and nothing else appears.
 #[test]
 fn concurrent_block_report_keeps_only_the_reporting_workers_location() {
-    let fs = test_fs_with_live_worker("location-report");
+    // Two workers: the fixture block lives on worker 1, so only worker 2 can
+    // widen the sampled location set (reporting worker 1 again is an
+    // idempotent no-op and would prove nothing).
+    let fs = test_fs_with_two_workers("location-report", "session-1", "session-2");
     fs.mkdir("/f/d0", true).unwrap();
     let block_id = file_with_one_block(&fs, "/f/d0/file");
 
-    // Worker 1 reports the block as present while the tree is being freed.
+    // Order the race instead of betting on the scheduler: the report lands
+    // inside the sampling window, i.e. after the location sample and before
+    // the stripes are acquired.
+    let (loc_reached_tx, loc_reached_rx) = mpsc::channel();
+    let (loc_release_tx, loc_release_rx) = mpsc::channel();
+    fs.journal_writer
+        .arm_location_pause_hook(loc_reached_tx, loc_release_rx);
+
+    let free_fs = fs.clone();
+    let free = std::thread::spawn(move || free_fs.free("/f", true));
+    loc_reached_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the free's location sample must reach the pause point");
+
+    // Worker 2, which the master did not know about, reports the block through
+    // the real entry: this grows the live set past the sample.
     let report = BlockReportList {
         cluster_id: String::new(),
-        worker_id: 1,
+        worker_id: 2,
         full_report: false,
         total_len: 0,
         report_id: 0,
@@ -41,27 +59,44 @@ fn concurrent_block_report_keeps_only_the_reporting_workers_location() {
             4096,
         )],
     };
+    let reported = fs
+        .block_report(report, None)
+        .expect("the real block report entry must succeed");
 
-    // Start the free on its own thread so the report can race it.
-    let free_fs = fs.clone();
-    let free = std::thread::spawn(move || free_fs.free("/f", true));
-    let _ = fs.block_report(report, None);
+    // Watch for the re-plan that the post-lock coverage check must trigger,
+    // then release the free.
+    let (plan2_tx, plan2_rx) = mpsc::channel();
+    let (plan2_release_tx, plan2_release_rx) = mpsc::channel();
+    fs.journal_writer
+        .arm_plan_pause_hook(plan2_tx, plan2_release_rx);
+    loc_release_tx.send(()).expect("release the free");
+
+    let recaptured = plan2_rx.recv_timeout(OBSERVE_WINDOW);
+    let _ = plan2_release_tx.send(());
     let freed = free.join().expect("free thread must not panic");
 
     assert!(freed.is_ok(), "recursive free must succeed: {freed:?}");
+    assert!(
+        recaptured.is_ok(),
+        "the location reported after sampling must force a fresh capture \
+         (delete_blocks {:?})",
+        reported.delete_blocks
+    );
     assert!(fs.file_status("/f/d0/file").is_ok(), "free keeps metadata");
-    // Block reports are per-worker: worker 1 reports that it still holds the
-    // block, so its location survives; worker 2 did not report, so the free's
-    // release of its location stands. Both-dropped or an extra worker would
-    // mean the report and the free disagreed.
+    // `free` on a non-cache file is a metadata operation: it must not reclaim
+    // the block at all, and in particular it must not drop the location it
+    // only learned about inside its own sampling window. The old shape of this
+    // test asserted "at most one location remains", which the no-op free
+    // satisfied without ever exercising the race.
     let remaining = stored_locations(&fs, block_id);
     assert!(
-        remaining.iter().all(|loc| loc.worker_id == 1),
-        "only the reporting worker may keep a location after the race: {remaining:?}"
+        remaining.iter().any(|loc| loc.worker_id == 1),
+        "worker 1's original location must survive a free: {remaining:?}"
     );
     assert!(
-        remaining.len() <= 1,
-        "at most the reporting worker's location remains: {remaining:?}"
+        remaining.iter().any(|loc| loc.worker_id == 2),
+        "worker 2's location was reported inside the window, so the re-planned \
+         free must own it and leave it in place: {remaining:?}"
     );
 }
 

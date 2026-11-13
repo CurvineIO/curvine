@@ -1968,6 +1968,17 @@ impl JournalLoader {
                     };
                     return self.with_replay_cold(body);
                 }
+                // F2: replay location checkpoint — sampling is complete, the
+                // worker/block stripes are not yet acquired. The driver may
+                // add a location here (report/replication) to prove the
+                // post-lock coverage check re-plans. Consumed once via the
+                // same writer instance the replay uses.
+                #[cfg(test)]
+                if let Some((reached, release)) = self.journal_writer.consume_location_pause_hook()
+                {
+                    let _ = reached.send(());
+                    let _ = release.recv_timeout(std::time::Duration::from_secs(60));
+                }
                 Some((
                     self.block_location_locks
                         .write_workers_blocks(&worker_ids, &block_ids),
