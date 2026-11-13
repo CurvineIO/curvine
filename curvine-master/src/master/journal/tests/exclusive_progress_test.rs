@@ -270,12 +270,11 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     let seq_while_held = writer.failure_seq();
     assert_eq!(seq_while_held, failure_seq_before);
     let worker_probe = delete_done_rx.recv_timeout(Duration::from_millis(100));
-    assert!(
-        matches!(
-            worker_probe,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ),
-        "the delete must still be waiting for its confirmation, got {worker_probe:?}"
+    // Saved and reused: if the delete already reported here, the late wait
+    // below must consume this result instead of waiting again.
+    let worker_pending_at_body = matches!(
+        worker_probe,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
     );
 
     // The same exclusive gate must still be held by the waiting delete.
@@ -365,10 +364,19 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     // terminal before the exclusive gate opens.
     drop(completion);
 
-    let delete_outcome = wait_same_result(&delete_done_rx, HANDSHAKE_WINDOW, HANDSHAKE_WINDOW);
+    // Only a timed-out probe starts another wait on the same receiver.
+    let delete_outcome = match worker_probe {
+        Ok(value) => Waited::Delivered(value),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Waited::Disconnected,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            wait_same_result(&delete_done_rx, HANDSHAKE_WINDOW, HANDSHAKE_WINDOW)
+        }
+    };
     let delete_done = match delete_outcome {
         Waited::Delivered(result) => result,
         Waited::Disconnected => {
+            // The producer already ended, so this join cannot block.
+            worker.join().expect("the delete worker must not panic");
             panic!("the delete worker exited without reporting a result")
         }
         Waited::Timeout => panic!(
@@ -408,6 +416,8 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     let rpc_result = match rpc_outcome {
         Waited::Delivered(result) => result,
         Waited::Disconnected => {
+            // The thread already ended, so this join cannot block.
+            rpc.join().expect("the blocked RPC thread must not panic");
             panic!("the blocked RPC thread exited without reporting a result")
         }
         Waited::Timeout => panic!("the blocked RPC did not resume; skipping its join"),
@@ -438,8 +448,12 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     let shutdown_ack = fixture
         .runtime
         .block_on(async { tokio::time::timeout(HANDSHAKE_WINDOW, shutdown_rx.receive()).await });
-    if shutdown_ack.is_err() {
-        panic!("the shutdown was not acknowledged; skipping teardown that could block");
+    match shutdown_ack {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("the shutdown channel dropped without acknowledging: {error}"),
+        Err(_) => {
+            panic!("the shutdown was not acknowledged; skipping teardown that could block")
+        }
     }
     writer.with_testing_receiver(|receiver| loop {
         match receiver.try_recv() {
@@ -478,6 +492,10 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
         "the live cursor must answer point lookups, got {pre_cursor_probe:?}"
     );
     rpc_started.expect("the blocked RPC thread must have started");
+    assert!(
+        worker_pending_at_body,
+        "the delete must still be waiting when the body completes"
+    );
 }
 
 #[cfg(feature = "fault-injection")]
@@ -540,7 +558,11 @@ fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
     runtime.remove(rule_id).unwrap();
     let delete_result = match delete_outcome {
         Waited::Delivered(result) => result,
-        Waited::Disconnected => panic!("the delete worker exited without reporting a result"),
+        Waited::Disconnected => {
+            // The producer already ended, so this join cannot block.
+            worker.join().expect("delete worker must not panic");
+            panic!("the delete worker exited without reporting a result")
+        }
         Waited::Timeout => {
             panic!("the delete did not report a result; skipping its join and blocking teardown")
         }
@@ -722,6 +744,11 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
     }
     let live_status = fs.file_status("/dir");
     let delete_probe = delete_done_rx.recv_timeout(Duration::from_millis(100));
+    // Saved and reused below; only a timed-out probe starts another wait.
+    let delete_pending_at_body = matches!(
+        delete_probe,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
     assert!(
         view_reopened,
         "the body must complete and reopen the view before the restore intent starts"
@@ -761,26 +788,33 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
         .recv_timeout(Duration::from_secs(5))
         .expect("restore thread started");
     let restore_pending = restore_done_rx.recv_timeout(Duration::from_millis(300));
-    assert!(
-        matches!(
-            restore_pending,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ),
-        "the restore intent must wait on the exclusive gate, got {restore_pending:?}"
+    // Saved and reused below; the "still waiting" check moves to the end.
+    let restore_pending_at_body = matches!(
+        restore_pending,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
     );
 
     // Drop the receipt: the delete fails terminal, the gate opens, and the
     // restore proceeds into apply_snapshot0 — reporting the holder failed.
     eprintln!("restore: dropping completion");
     drop(completion);
-    let delete_outcome = wait_same_result(
-        &delete_done_rx,
-        Duration::from_secs(10),
-        Duration::from_secs(10),
-    );
+    // Only a timed-out probe starts another wait on the same receiver.
+    let delete_outcome = match delete_probe {
+        Ok(value) => Waited::Delivered(value),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Waited::Disconnected,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => wait_same_result(
+            &delete_done_rx,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        ),
+    };
     let delete_done = match delete_outcome {
         Waited::Delivered(result) => result,
-        Waited::Disconnected => panic!("the delete worker exited without reporting a result"),
+        Waited::Disconnected => {
+            // The producer already ended, so this join cannot block.
+            worker.join().expect("delete worker must not panic");
+            panic!("the delete worker exited without reporting a result")
+        }
         Waited::Timeout => {
             panic!("the delete did not report a result; skipping its join and blocking teardown")
         }
@@ -798,14 +832,24 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
         "the delete must surface the real commit error, got {delete_err}"
     );
 
-    let restore_outcome = wait_same_result(
-        &restore_done_rx,
-        Duration::from_secs(30),
-        Duration::from_secs(30),
-    );
+    let restore_outcome = match restore_pending {
+        Ok(value) => Waited::Delivered(value),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Waited::Disconnected,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => wait_same_result(
+            &restore_done_rx,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        ),
+    };
     let restore_result = match restore_outcome {
         Waited::Delivered(result) => result,
-        Waited::Disconnected => panic!("the restore thread exited without reporting a result"),
+        Waited::Disconnected => {
+            // The producer already ended, so this join cannot block.
+            restore_thread
+                .join()
+                .expect("restore thread must not panic");
+            panic!("the restore thread exited without reporting a result")
+        }
         Waited::Timeout => {
             panic!("the restore intent did not return; skipping its join and the blocking teardown")
         }
@@ -839,5 +883,14 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
     let journal_cleanup = std::fs::remove_dir_all(&journal_dir);
     meta_cleanup.expect("the restore meta tree must be removed");
     journal_cleanup.expect("the restore journal tree must be removed");
+    // The early probes must have observed real waiting, not an early result.
+    assert!(
+        delete_pending_at_body,
+        "the delete must still be waiting when the body completes"
+    );
+    assert!(
+        restore_pending_at_body,
+        "the restore intent must wait on the exclusive gate"
+    );
     Ok(())
 }
