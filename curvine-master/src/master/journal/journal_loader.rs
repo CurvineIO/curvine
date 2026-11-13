@@ -1935,15 +1935,19 @@ impl JournalLoader {
             let mut guard = MetadataConfirmation::arm(&self.fs_dir, &self.journal_writer);
             let failure_seq_before = self.journal_writer.failure_seq();
             let result = body(&fs_dir);
-            if result.is_err() && self.journal_writer.failure_seq() != failure_seq_before {
+            let seq_moved = self.journal_writer.failure_seq() != failure_seq_before;
+            if result.is_err() && seq_moved {
+                // A real in-lock fatal: terminalize while the locks are
+                // still held (handle.take() empties the guard).
                 guard.fail_terminal();
-            }
-            drop(fs_dir);
-            if result.is_ok() {
-                // No fatal: disarm so the holder stays usable after the
-                // locks drop (replay has no confirmation wait to disarm it).
+            } else {
+                // Ok, or a plain business error that did not move the seq:
+                // the holder stays usable — the replay error goes to the
+                // original apply error/retry rules without retiring the
+                // namespace (design §8.2).
                 guard.disarm();
             }
+            drop(fs_dir);
             drop(guard);
             result.map_err(|e| e.into())
         })();
