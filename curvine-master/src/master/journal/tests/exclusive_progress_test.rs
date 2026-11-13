@@ -177,11 +177,9 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
 
     // Pre-operation opaque cursor handle: saved before the operation spawns.
     let pre_cursor = mfs.fs_dir.view().unwrap().store.cursor_store();
+    // Saved, not asserted here: an unexpected early result must not skip the
+    // teardown. It is checked after cleanup.
     let pre_cursor_probe = pre_cursor.get_applied_req(77);
-    assert!(
-        matches!(&pre_cursor_probe, Ok(None)),
-        "the live cursor must answer point lookups, got {pre_cursor_probe:?}"
-    );
 
     // Real role promotion through the actual role_change path.
     eprintln!("progress: promoting to leader");
@@ -268,9 +266,10 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
         "the loader and the filesystem must share one gate"
     );
 
-    // A second write RPC must stay blocked by the gate: create on a fresh
-    // path fails nothing, it just cannot proceed. Started ack + bounded
-    // pending is the evidence.
+    // A second write RPC must stay blocked by the gate. `/validation` already
+    // exists from setup, so this create targets a prepared path and simply
+    // cannot proceed while the gate is closed. Started ack + bounded pending
+    // is the evidence.
     let rpc_fs = mfs.clone();
     let (rpc_started_tx, rpc_started_rx) = std::sync::mpsc::channel::<()>();
     let (rpc_tx, rpc_rx) = std::sync::mpsc::channel();
@@ -421,12 +420,25 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
             .expect("the apply worker must not panic");
     });
     rpc.join().expect("the blocked RPC thread must not panic");
+    // Release every independent handle this case still owns before the
+    // journal system is shut down.
+    drop(scan_loader);
     drop(mfs);
+    drop(fixture.fs);
+    drop(fixture.loader);
+    drop(fixture.receiver);
+    drop(fixture.runtime);
     fixture.journal.shutdown();
     let meta_cleanup = std::fs::remove_dir_all(&fixture.meta_dir);
     let journal_cleanup = std::fs::remove_dir_all(&fixture.journal_dir);
     meta_cleanup.expect("the meta dir must be removable");
     journal_cleanup.expect("the journal dir must be removable");
+    // Observations saved before teardown are asserted only now.
+    assert!(
+        matches!(&pre_cursor_probe, Ok(None)),
+        "the live cursor must answer point lookups, got {pre_cursor_probe:?}"
+    );
+    rpc_started.expect("the blocked RPC thread must have started");
 }
 
 #[cfg(feature = "fault-injection")]
@@ -452,6 +464,9 @@ fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
             }
         });
 
+    // The setup clone is no longer needed: keeping it alive would hold the
+    // store of an OPEN holder.
+    drop(setup_fs);
     let writer = fixture.swap_in_receipts_writer(&conf);
     fixture.loader.journal_writer = writer.clone();
     let mfs = fixture.fs.clone();
@@ -488,6 +503,10 @@ fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
     // The op error keeps its original variant and message; the failure
     // sequence did NOT move, so the holder stays OPEN (normal backfill).
     let delete_err = delete_result.expect_err("the injected store failure must surface");
+    assert!(
+        matches!(&delete_err, curvine_error::FsError::Common(_)),
+        "the injected store failure must keep its original Common variant, got {delete_err:?}"
+    );
     assert!(
         delete_err
             .to_string()
@@ -630,6 +649,13 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
                 .expect("missing delete journal entry")
         })
         .expect("the receipts receiver must exist");
+    // The queued receipt must be the typed recursive Delete for /dir, not any
+    // other entry that happens to arrive first.
+    assert!(
+        matches!(&queued.entry, JournalEntry::Delete(entry) if entry.path == "/dir"),
+        "the queued entry must be the /dir delete, got {:?}",
+        queued.entry
+    );
     let completion = queued.completion.expect("missing commit confirmation");
 
     // Observe the completed body before starting the restore intent. Entry
@@ -737,22 +763,13 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
     drop(fs);
     drop(loader);
     journal.shutdown();
+    // Only the two independent roots this case created are removed. The
+    // snapshot's files directory lives under meta_dir/checkpoint, so removing
+    // meta_dir already covers it; deleting it separately would report a
+    // NotFound caused by the parent removal, not by the restore.
     let meta_cleanup = std::fs::remove_dir_all(&meta_dir);
     let journal_cleanup = std::fs::remove_dir_all(&journal_dir);
-    let files_cleanup = snapshot
-        .files_data
-        .as_ref()
-        .map(|files| std::fs::remove_dir_all(&files.dir));
     meta_cleanup.expect("the restore meta tree must be removed");
     journal_cleanup.expect("the restore journal tree must be removed");
-    if let Some(result) = files_cleanup {
-        // The restore failed before publishing files, so an absent tree is a
-        // legitimate outcome; anything else must be reported.
-        match result {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => panic!("the restored files tree must be removable: {error}"),
-        }
-    }
     Ok(())
 }
