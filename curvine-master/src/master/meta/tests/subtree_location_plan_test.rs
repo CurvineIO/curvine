@@ -202,7 +202,7 @@ fn one_block_with_many_location_rows_is_charged_per_row() {
     let handle = fs.fs_dir();
     let view = handle.view().expect("namespace view");
     assert!(
-        SubtreeLocationPlan::covers(&plan, &view, &[request]).expect("covers"),
+        SubtreeLocationPlan::covers(&plan, &view).expect("covers"),
         "the unchanged set must be covered"
     );
 }
@@ -231,12 +231,12 @@ fn exactly_at_the_budget_still_produces_a_plan() {
     let handle = fs.fs_dir();
     let view = handle.view().expect("namespace view");
     assert!(
-        SubtreeLocationPlan::covers(&plan, &view, &requests).expect("covers"),
+        SubtreeLocationPlan::covers(&plan, &view).expect("covers"),
         "the unchanged set must be covered at the boundary"
     );
     seed_locations(&fs, plan.block_ids()[0], &[9]);
     assert!(
-        !SubtreeLocationPlan::covers(&plan, &view, &requests).expect("covers"),
+        !SubtreeLocationPlan::covers(&plan, &view).expect("covers"),
         "a worker row added after the sample must break coverage"
     );
 }
@@ -270,7 +270,7 @@ fn empty_and_zero_location_blocks_stay_planable() {
     let handle = fs.fs_dir();
     let view = handle.view().expect("namespace view");
     assert!(
-        SubtreeLocationPlan::covers(&plan, &view, &requests).expect("covers"),
+        SubtreeLocationPlan::covers(&plan, &view).expect("covers"),
         "the empty set must be covered"
     );
     // Ids stay addressable: this is a plan over existing files only.

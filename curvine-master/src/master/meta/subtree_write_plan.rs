@@ -333,34 +333,19 @@ impl SubtreeLocationPlan {
     pub(crate) fn covers(
         &self,
         fs_dir: &crate::master::meta::FsDir,
-        requests: &[InodeLockRequest],
     ) -> FsResult<bool> {
-        for request in requests {
-            if !matches!(request.mode, InodeLockMode::Write) {
-                continue;
-            }
-            let Some(inode) = fs_dir.store.get_inode(request.inode_id, None)? else {
-                continue;
+        for &block_id in &self.block_ids {
+            let Some(locations) = fs_dir
+                .store
+                .get_locations_bounded(block_id, SUBTREE_LOCATION_LIMIT)?
+            else {
+                // More live locations than the budget can verify: not
+                // covered (the caller releases and retries).
+                return Ok(false);
             };
-            let Ok(file) = inode.as_file_ref() else {
-                continue;
-            };
-            for block_id in file.block_ids() {
-                if !self.block_ids.contains(&block_id) {
+            for location in locations {
+                if !self.worker_ids.contains(&location.worker_id) {
                     return Ok(false);
-                }
-                let Some(locations) = fs_dir
-                    .store
-                    .get_locations_bounded(block_id, SUBTREE_LOCATION_LIMIT)?
-                else {
-                    // More live locations than the budget can verify: not
-                    // covered (the caller releases and retries).
-                    return Ok(false);
-                };
-                for location in locations {
-                    if !self.worker_ids.contains(&location.worker_id) {
-                        return Ok(false);
-                    }
                 }
             }
         }

@@ -737,7 +737,7 @@ impl MasterFilesystem {
                     let plan = location_plan
                         .as_ref()
                         .expect("need_locations implies a location plan");
-                    if !plan.covers(&fs_dir, requests)? {
+                    if !plan.covers(&fs_dir)? {
                         return Ok(None);
                     }
                 }

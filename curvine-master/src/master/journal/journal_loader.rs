@@ -1905,69 +1905,24 @@ impl JournalLoader {
             // over-budget decision is recorded inside the view scope; the cold
             // bridge runs only after both the view and the inode locks are
             // released (begin_cold self-waits otherwise).
+            // F3: shared SubtreeLocationPlan::capture replaces the hand-written
+            // sampler — one whole-call budget counter (SUBTREE_LOCATION_LIMIT),
+            // bounded block iteration and location reads, owned IDs only.
+            let location_plan_opt = {
+                let fs_dir = self.fs_dir.view().map_err(|e| e.to_string())?;
+                crate::master::meta::subtree_write_plan::SubtreeLocationPlan::capture(
+                    &fs_dir,
+                    plan.inode_requests(),
+                )
+                .map_err(|e| e.to_string())?
+            };
             let location_locks = if need_locations {
-                let mut block_ids: Vec<i64> = Vec::new();
-                let mut worker_ids: Vec<u32> = Vec::new();
-                let mut over_budget = false;
-                {
-                    let fs_dir = self.fs_dir.view().map_err(|e| e.to_string())?;
-                    for request in plan.inode_requests() {
-                        if !matches!(request.mode, crate::master::meta::InodeLockMode::Write) {
-                            continue;
-                        }
-                        let Some(inode) = fs_dir
-                            .store
-                            .get_inode(request.inode_id, None)
-                            .map_err(|e| e.to_string())?
-                        else {
-                            continue;
-                        };
-                        let Ok(file) = inode.as_file_ref() else {
-                            continue;
-                        };
-                        // R5: independent location budget — every block entry
-                        // and worker-location entry is charged against
-                        // SUBTREE_LOCATION_LIMIT (design §6); the plan budget
-                        // does not cover locations.
-                        let mut location_entries = 0usize;
-                        for block_id in file.block_ids() {
-                            location_entries += 1;
-                            block_ids.push(block_id);
-                            if location_entries
-                                > crate::master::meta::subtree_write_plan::SUBTREE_LOCATION_LIMIT
-                            {
-                                over_budget = true;
-                                break;
-                            }
-                            for location in fs_dir
-                                .get_block_locations(block_id)
-                                .map_err(|e| e.to_string())?
-                            {
-                                location_entries += 1;
-                                worker_ids.push(location.worker_id);
-                                if location_entries
-                                > crate::master::meta::subtree_write_plan::SUBTREE_LOCATION_LIMIT
-                            {
-                                over_budget = true;
-                                break;
-                            }
-                            }
-                            if over_budget {
-                                break;
-                            }
-                        }
-                        if over_budget {
-                            break;
-                        }
-                    }
-                }
-                if over_budget {
-                    drop(inode_locks);
-                    let Some(body) = body_slot.take() else {
-                        return Err("replay body already consumed".to_string().into());
-                    };
-                    return self.with_replay_cold(body);
-                }
+                let location_plan = location_plan_opt
+                    .as_ref()
+                    .expect("need_locations implies a location plan");
+                let block_ids: Vec<i64> = location_plan.block_ids().to_vec();
+                let worker_ids: Vec<u32> = location_plan.worker_ids().to_vec();
+                {}
                 // F2: replay location checkpoint — sampling is complete, the
                 // worker/block stripes are not yet acquired. The driver may
                 // add a location here (report/replication) to prove the
@@ -1987,10 +1942,10 @@ impl JournalLoader {
             } else {
                 None
             };
-            let (location_locks, location_sample) = match location_locks {
-                Some((locks, ids)) => (Some(locks), Some(ids)),
-                None => (None, None),
-            };
+            // R3/F3: location coverage revalidation under the FINAL view —
+            // SubtreeLocationPlan::covers re-reads the current block/worker
+            // set and checks it is fully covered by the sampled set. New ids
+            // → churn (release view/L/I, retry ≤3, then cold).
 
             // R2: the final revalidation and the body share ONE view window.
             // A cold/restore lifecycle could otherwise take the unique owner
@@ -2015,44 +1970,16 @@ impl JournalLoader {
                     // — it stays available for the caller's cold fallback.
                     return Ok(ReplayStep::Churn);
                 }
-                // F2: location coverage revalidation under the FINAL view —
-                // a report/replication writer holds only worker/block stripes
-                // (no inode locks) and can add a location between sampling
-                // and lock acquisition. Re-read the current block/worker set
-                // of every Write inode; any id not in the sampled set means
-                // the acquired location locks do not cover the live state —
-                // churn (release view/L/I, retry ≤3, then cold).
+                // F2/F3: location coverage revalidation under the FINAL view —
+                // SubtreeLocationPlan::covers re-reads the current block/worker
+                // set and checks it is fully covered by the sampled set. New
+                // ids → churn (release view/L/I, retry ≤3, then cold).
                 if need_locations {
-                    let (sampled_blocks, sampled_workers) = location_sample
-                        .as_ref()
-                        .expect("need_locations implies a sampled location set");
-                    for request in plan.inode_requests() {
-                        if !matches!(request.mode, crate::master::meta::InodeLockMode::Write) {
-                            continue;
-                        }
-                        let Some(inode) = fs_dir
-                            .store
-                            .get_inode(request.inode_id, None)
-                            .map_err(|e| e.to_string())?
-                        else {
-                            continue;
-                        };
-                        let Ok(file) = inode.as_file_ref() else {
-                            continue;
-                        };
-                        for block_id in file.block_ids() {
-                            if !sampled_blocks.contains(&block_id) {
-                                return Ok(ReplayStep::Churn);
-                            }
-                            for location in fs_dir
-                                .get_block_locations(block_id)
-                                .map_err(|e| e.to_string())?
-                            {
-                                if !sampled_workers.contains(&location.worker_id) {
-                                    return Ok(ReplayStep::Churn);
-                                }
-                            }
-                        }
+                    let Some(plan) = location_plan_opt.as_ref() else {
+                        return Err("need_locations without a location plan".to_string().into());
+                    };
+                    if !plan.covers(&fs_dir).map_err(|e| e.to_string())? {
+                        return Ok(ReplayStep::Churn);
                     }
                 }
                 let guard = MetadataConfirmation::arm(&self.fs_dir, &self.journal_writer);
