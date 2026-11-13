@@ -30,7 +30,9 @@ message MountOptionsProto {
     map<string, string> add_properties = 2;
     optional int64 ttl_ms = 3;
     optional TtlActionProto ttl_action = 4;
-    required bool read_verify_ufs = 5;
+    // Optional so an update can leave the stored value untouched: absent means
+    // "keep the mount's current setting". A new mount always sets it.
+    optional bool read_verify_ufs = 5;
     optional StorageTypeProto storage_type = 6;
     optional int64 block_size = 7;
     optional int32 replicas = 8;
