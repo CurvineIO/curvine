@@ -326,12 +326,17 @@ fn recursive_delete_body_error_is_returned_verbatim_without_replay() {
         "c2-body-error-{}",
         curvine_runtime::common::Utils::rand_str(8)
     );
+    // The fault point's context carries the TOP-LEVEL entry name of the
+    // apply_delete call (`child_name` = the name passed to
+    // unprotected_delete), not each descendant. This case owns the /err
+    // subtree exclusively, so matching on "err" scopes the rule to this
+    // case's delete while still firing exactly once inside its body.
     faults
         .configure(
             &rule_id,
-            // No matcher: any delete reaching the store commit is fine, the
-            // rule fires once. The point is the real body commit boundary.
             curvine_fault::FaultRuleBuilder::named("master.metadata.delete.before_commit")
+                .matches("child_name", "err")
+                .expect("child_name matcher")
                 .times(1)
                 .unwrap()
                 .return_error("injected c2 body failure")

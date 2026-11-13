@@ -311,3 +311,66 @@ fn replay_body_error_propagates_and_keeps_the_holder_open() -> FsResult<()> {
     );
     Ok(())
 }
+
+/// Real admission boundary, not a direct `apply_entry`: an entry applied
+/// through the public AppStorage entry point must advance the FSM watermark and
+/// persist its per-request record. The earlier cases in this file only prove
+/// that a direct apply leaves the watermark alone, which is a different claim.
+#[test]
+fn app_storage_apply_advances_the_real_fsm_and_request_record() -> FsResult<()> {
+    use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
+    use curvine_raft::utils::SerdeUtils;
+    use raft::eraftpb::Entry;
+
+    let js = JournalSystem::from_conf(&test_conf("app-storage"))?;
+    let fs = js.fs();
+    let loader = js.journal_loader();
+    build_tree(&fs, "/g");
+    echo_entries(&fs);
+    let op = capture_one(&fs, || {
+        fs.create("/g/after", false).unwrap();
+    });
+
+    let req_id: i64 = 9_001;
+    let mut batch = JournalBatch::new(1);
+    batch.push(op);
+    let entry = Entry {
+        index: 1,
+        term: 1,
+        data: batch
+            .encode()
+            .map_err(|e| curvine_error::FsError::from(e.to_string()))?,
+        context: SerdeUtils::serialize(&req_id)
+            .map_err(|e| curvine_error::FsError::from(e.to_string()))?
+            .into(),
+        ..Default::default()
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(async { loader.apply(true, ApplyMsg::new_entry(entry)).await })
+        .expect("AppStorage apply must succeed");
+
+    let applied = loader.fsm_state_snapshot()?.applied;
+    assert_eq!(
+        (applied.index, applied.term),
+        (1, 1),
+        "an entry applied through AppStorage must advance the real FSM watermark"
+    );
+    let record = {
+        let handle = fs.fs_dir.clone();
+        let view = handle.view().expect("namespace view");
+        view.get_rocks_store()
+            .get_applied_req(req_id)
+            .expect("read applied-request record")
+    };
+    assert_eq!(
+        record.map(|row| (row.index, row.term)),
+        Some((1, 1)),
+        "the applied-request record must be persisted for the admission path"
+    );
+    Ok(())
+}
