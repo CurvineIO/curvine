@@ -64,6 +64,16 @@ fn staging_path_for(object: &Path, staging_id: &str) -> Result<Path, String> {
         .map_err(|e| format!("Invalid staging path: {e}"))
 }
 
+/// What the client declared about the body, verified before publishing.
+///
+/// Kept as one value so the staging path takes a single "expectations"
+/// argument instead of growing one parameter per check.
+#[derive(Clone, Copy, Default)]
+pub struct BodyExpect<'a> {
+    pub length: Option<usize>,
+    pub content_md5: Option<&'a str>,
+}
+
 pub struct PutContext {
     pub fs: UnifiedFileSystem,
     pub rt: Arc<AsyncRuntime>,
@@ -235,7 +245,7 @@ impl PutOperation {
         context: PutContext,
         body: &mut crate::utils::io::PollReaderEnum,
         metadata: crate::utils::s3_utils::S3Metadata,
-        expect_length: Option<usize>,
+        expect: BodyExpect<'_>,
     ) -> Result<String, String> {
         context.log_start();
 
@@ -245,13 +255,7 @@ impl PutOperation {
 
         let mut stats = UploadStats::new();
         let result = Self::stage_and_publish(
-            &context,
-            body,
-            &staging,
-            &object,
-            &mut stats,
-            &metadata,
-            expect_length,
+            &context, body, &staging, &object, &mut stats, &metadata, expect,
         )
         .await;
 
@@ -278,7 +282,7 @@ impl PutOperation {
         object: &Path,
         stats: &mut UploadStats,
         metadata: &crate::utils::s3_utils::S3Metadata,
-        expect_length: Option<usize>,
+        expect: BodyExpect<'_>,
     ) -> Result<(), String> {
         let mut writer = context.create_writer_at(staging).await?;
 
@@ -312,7 +316,7 @@ impl PutOperation {
         // A body shorter than the declared `Content-Length` means the client
         // disconnected early. The body stream simply ends, so without this
         // check the truncated body would be published as a successful object.
-        if let Some(expected) = expect_length {
+        if let Some(expected) = expect.length {
             if stats.total_written as usize != expected {
                 let _ = writer.cancel().await;
                 let _ = context.fs.delete_with_opts(staging, false, true).await;
@@ -325,6 +329,14 @@ impl PutOperation {
 
         stats.md5 = Some(format!("{:x}", md5.compute()));
         let digest = stats.md5.clone().unwrap_or_default();
+
+        // The client's own integrity check must decide before the object is
+        // published. Reporting BadDigest after the rename answered 400 for a
+        // write that had already replaced the previous object.
+        if let Err(e) = crate::s3::s3_api::verify_content_md5(expect.content_md5, &digest) {
+            let _ = context.fs.delete_with_opts(staging, false, true).await;
+            return Err(e);
+        }
 
         // Attach the S3 metadata while the object is still staging, so the
         // rename below publishes body and metadata together.
