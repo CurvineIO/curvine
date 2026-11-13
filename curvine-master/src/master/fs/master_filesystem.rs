@@ -530,16 +530,19 @@ impl MasterFilesystem {
     /// failure_seq honored, snapshot after gate release).
     pub(crate) fn run_metadata_write_with_fallback<R>(
         &self,
-        hot: impl FnOnce() -> FsResult<ShardedOutcome<R>>,
+        hot: impl FnOnce(u64) -> FsResult<ShardedOutcome<R>>,
         cold_body: impl FnOnce(&mut FsDir) -> FsResult<R>,
     ) -> FsResult<R> {
         let epoch = self.journal_writer.metadata_epoch()?;
         // Normal admission: hot runs once; a genuine error is a genuine error.
+        // F1: the outer original epoch is passed explicitly to the hot
+        // coordination closure — recursive entries must use THIS value, not
+        // re-sample metadata_epoch() inside the hot body.
         let commit_guard = self.metadata_commit_gate.enter();
         self.journal_writer.ensure_metadata_epoch(epoch)?;
         let outcome = {
             let scope = self.journal_writer.begin_commit_scope();
-            let outcome = hot();
+            let outcome = hot(epoch);
             scope.wait()?;
             outcome?
         };
@@ -788,6 +791,13 @@ impl MasterFilesystem {
                         }
                     }
                 }
+
+                // F1: the ORIGINAL journal epoch is re-verified under the
+                // final view after all revalidation and before the body —
+                // a role fence between admission and this point rejects with
+                // the caller's own epoch, with no body and no holder
+                // retirement.
+                self.journal_writer.ensure_metadata_epoch(epoch)?;
 
                 // §8.1 step 3: the guard lives in the body's lexical scope.
                 let mut confirmation = MetadataConfirmation {
@@ -2009,7 +2019,7 @@ impl MasterFilesystem {
         mode: DeleteMode,
     ) -> FsResult<DeleteResult> {
         let mut delete_res = self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 let path = path.as_ref();
                 let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
                 let sharded = matches!(mode, DeleteMode::SkipTrash)
@@ -2064,7 +2074,7 @@ impl MasterFilesystem {
         mode: DeleteMode,
     ) -> FsResult<Option<(DeleteResult, InodeView)>> {
         let result = self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 if matches!(mode, DeleteMode::SkipTrash) {
                     if let ShardedOutcome::Done(result) =
                         self.delete_expired_inode_sharded(path, inode_id)?
@@ -2249,7 +2259,7 @@ impl MasterFilesystem {
             return Ok(None);
         }
         let result = self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 if !self.master_monitor.is_active() {
                     return Ok(ShardedOutcome::Done(None));
                 }
@@ -2338,7 +2348,7 @@ impl MasterFilesystem {
             return Ok(None);
         }
         let result = self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 if !self.master_monitor.is_active() {
                     return Ok(ShardedOutcome::Done(None));
                 }
@@ -2416,7 +2426,7 @@ impl MasterFilesystem {
         // A journalled rename (trash -> pending staging): route through the
         // trash cold bridge instead of a bare shared view.
         self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 if !self.master_monitor.is_active() {
                     return Ok(ShardedOutcome::Done(None));
                 }
@@ -2450,7 +2460,7 @@ impl MasterFilesystem {
         overwrite: bool,
     ) -> FsResult<RestoredTrashEntry> {
         let restored = self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 // Planning point: restore needs the global lock.
                 Ok(ShardedOutcome::Fallback)
             },
@@ -2483,7 +2493,7 @@ impl MasterFilesystem {
         let mut staged = 0;
         for batch in names.chunks(BATCH_SIZE) {
             staged += self.run_metadata_write_with_fallback(
-                || {
+                |epoch| {
                     // Planning point: staging renames need the global lock.
                     Ok(ShardedOutcome::Fallback)
                 },
@@ -2613,7 +2623,7 @@ impl MasterFilesystem {
         expected_id: Option<i64>,
     ) -> FsResult<Option<(FreeOutcome, InodeView)>> {
         let mut outcome = self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
             if let Some(releaser) = self.fs_mode_releaser() {
                 if releaser.is_fs_mode(path) {
                     let Some((pending, cleanup, inode)) =
@@ -2882,7 +2892,7 @@ impl MasterFilesystem {
         ufs_mtime: i64,
     ) -> FsResult<bool> {
         let result = self.run_metadata_write_with_fallback(
-            || self.release_verified_sharded(inode_id, path, gen, ufs_mtime),
+            |_epoch| self.release_verified_sharded(inode_id, path, gen, ufs_mtime),
             |fs_dir| fs_dir.free_verified(inode_id, path, gen, ufs_mtime),
         )?;
         let Some(mut free_res) = result else {
@@ -3082,7 +3092,7 @@ impl MasterFilesystem {
         }
 
         let (renamed, deleted) = self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 // Live-tree pre-check. The store-snapshot read this replaces cost
                 // two RocksDB walk rounds per rename and only fed the sharded
                 // routing decision, which the sharded loop re-resolves live
@@ -3218,7 +3228,7 @@ impl MasterFilesystem {
         }
 
         let (status, deleted) = self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 // Plan first: a missing parent needs the global lock — an
                 // explicit side-effect-free Fallback, not a cold re-entry.
                 let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
@@ -3258,7 +3268,7 @@ impl MasterFilesystem {
         }
 
         let opened = self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 let (ids, components_len, full, epoch) = self.resolve_edge_ids(path)?;
                 Self::check_not_reserved_path(path)?;
                 if flags.truncate() {
@@ -3449,7 +3459,7 @@ impl MasterFilesystem {
     pub fn close_file<T: AsRef<str>>(&self, path: T, client_name: &str) -> FsResult<()> {
         let path = path.as_ref();
         self.run_metadata_write_with_fallback(
-            || self.close_file_sharded(path, client_name),
+            |_epoch| self.close_file_sharded(path, client_name),
             |fs_dir| self.close_file_with_global_lock_body(fs_dir, path, client_name),
         )
     }
@@ -4071,7 +4081,7 @@ impl MasterFilesystem {
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
         self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 self.add_block_sharded(
                     path,
                     inode_id,
@@ -4368,7 +4378,7 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let client_name = client_name.as_ref().to_string();
         self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 self.complete_file_sharded(
                     path,
                     inode_id,
@@ -5702,7 +5712,7 @@ impl MasterFilesystem {
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
         self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 let path = path.as_ref();
                 if opts.recursive {
                     // C2: recursive propagation runs the bounded subtree-
@@ -5763,7 +5773,7 @@ impl MasterFilesystem {
         let target = target.as_ref().to_string();
         let link = link.as_ref().to_string();
         self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 let resolved = self.resolve_edge_ids(&link)?;
                 Self::check_not_pending_path(&link)?;
                 Self::check_not_reserved_path(&link)?;
@@ -5802,7 +5812,7 @@ impl MasterFilesystem {
         let src_path = src_path.as_ref().to_string();
         let dst_path = dst_path.as_ref().to_string();
         self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 let src = self.resolve_edge_ids(&src_path)?;
                 let dst = self.resolve_edge_ids(&dst_path)?;
                 Self::check_not_reserved_path(&src_path)?;
@@ -5843,7 +5853,7 @@ impl MasterFilesystem {
         };
 
         let (del_res, inode_id) = self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 if let Some(result) =
                     self.resize_single_file_sharded(path, inode_id, opts.clone(), available)?
                 {
@@ -5996,7 +6006,7 @@ impl MasterFilesystem {
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
         self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 if let Some(located) = self.assign_worker_sharded(
                     path,
                     inode_id,
@@ -6223,7 +6233,7 @@ impl MasterFilesystem {
     pub fn set_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
         self.run_metadata_write_with_fallback(
-            || {
+            |epoch| {
                 const MAX_RETRIES: usize = 3;
                 for _ in 0..MAX_RETRIES {
                     let (ids, components_len, full, epoch) = self.resolve_edge_ids(path)?;

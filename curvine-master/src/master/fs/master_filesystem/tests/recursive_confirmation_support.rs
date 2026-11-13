@@ -99,10 +99,9 @@ pub(super) fn run_admitted<R>(
     body: impl FnOnce(&FsDir) -> FsResult<R>,
 ) -> FsResult<R> {
     fs.run_metadata_write_with_fallback(
-        || {
-            // One original epoch for the whole admission, captured before the
-            // recursive entry takes any locks (R8 epoch contract).
-            let epoch = fs.journal_writer.metadata_epoch()?;
+        |epoch| {
+            // F1: the outer original epoch is passed explicitly by the
+            // admission; the recursive entry re-verifies THIS value.
             fs.run_recursive_metadata_write(epoch, path, mode, need_locations, body)
         },
         |_cold| panic!("the confirmation contract tests must stay on the sharded path"),
