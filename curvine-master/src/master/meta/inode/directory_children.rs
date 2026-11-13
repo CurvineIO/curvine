@@ -637,7 +637,7 @@ impl DirectoryChildren {
                 };
                 let taken: Vec<(String, ChildEdge)> = children
                     .list_options(&ListOptions {
-                        limit: Some(remaining + 1),
+                        limit: Some(remaining.saturating_add(1)),
                         start_after: None,
                     })
                     .into_iter()
@@ -661,7 +661,7 @@ impl DirectoryChildren {
                 return self.child_edges_bounded(max_edges);
             }
             let taken: Vec<ChildItem<'_>> = children.list_options(&ListOptions {
-                limit: Some(remaining + 1),
+                limit: Some(remaining.saturating_add(1)),
                 start_after: None,
             });
             over = taken.len() > remaining;
