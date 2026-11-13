@@ -24,6 +24,7 @@
 //! protocol.
 
 use super::*;
+use crate::master::meta::InodeLockMode;
 use curvine_config::ClusterConf;
 use curvine_model::SetAttrOptsBuilder;
 use curvine_runtime::common::Utils;
@@ -261,5 +262,52 @@ fn oversized_replay_completes_and_leaves_the_gate_open() -> FsResult<()> {
     target_fs
         .mkdir("/after", false)
         .expect("the apply gate must not be left closed");
+    Ok(())
+}
+
+/// Regression contract for the `with_replay_locks` fix (1304cb662): a body that
+/// returns a real error without moving the publication sequence must propagate
+/// the error verbatim and leave the holder OPEN. Retiring the holder on a pure
+/// business error would make every later replay fail.
+#[test]
+fn replay_body_error_propagates_and_keeps_the_holder_open() -> FsResult<()> {
+    let js = JournalSystem::from_conf(&test_conf("replay-body-error"))?;
+    let fs = js.fs();
+    let loader = js.journal_loader();
+    build_tree(&fs, "/e");
+
+    let seq_before = fs.journal_writer.failure_seq();
+    let outcome = loader.with_replay_locks("/e/d0", InodeLockMode::Write, false, |_view| {
+        Err::<(), _>(curvine_error::FsError::file_not_found("/e/d0"))
+    });
+
+    let error = outcome.expect_err("the body error must propagate");
+    assert!(
+        error.to_string().contains("/e/d0"),
+        "the original body error must surface, got {error}"
+    );
+    assert_eq!(
+        fs.journal_writer.failure_seq(),
+        seq_before,
+        "a pure body error must not count as a publication failure"
+    );
+    assert!(
+        !fs.fs_dir.is_failed(),
+        "a pure business error must not retire the holder"
+    );
+    assert!(
+        fs.fs_dir.view().is_ok(),
+        "the namespace view must stay accessible after a body error"
+    );
+
+    // A later replay still executes on the same loader.
+    let entry = capture_one(&fs, || {
+        fs.create("/e/after", false).unwrap();
+    });
+    loader.apply_entry(entry)?;
+    assert!(
+        fs.file_status("/e/after").is_ok(),
+        "a later replay must still apply after a pure body error"
+    );
     Ok(())
 }

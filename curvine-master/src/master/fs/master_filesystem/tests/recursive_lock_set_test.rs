@@ -340,6 +340,7 @@ fn recursive_delete_body_error_is_returned_verbatim_without_replay() {
         .unwrap();
 
     let result = fs.delete("/err", true);
+
     let executions = faults
         .rule(&rule_id)
         .expect("fault rule lookup")
@@ -442,5 +443,77 @@ fn testing_writer_reports_its_real_queue_mode() {
     assert!(
         fs.journal_writer.queue_never_blocks(),
         "the testing writer's channel is unbounded and must report so"
+    );
+}
+
+/// §8.3: the optimization only applies while the writer's queue can never
+/// block. With a bounded channel (cap > 0) the recursive entry point must
+/// return the typed fallback before the body runs, so no side effect can have
+/// happened when the caller retries through the exclusive path.
+#[test]
+fn bounded_journal_queue_falls_back_before_the_body() {
+    use curvine_config::ClusterConf;
+    use curvine_raft::raft::RoleState;
+
+    Master::init_test_metrics();
+    let mut conf = ClusterConf::format();
+    conf.testing = true;
+    conf.format_master = true;
+    conf.change_test_meta_dir(format!(
+        "recursive-bounded-queue-{}",
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    conf.journal.snapshot_entries = 0;
+    conf.journal.writer_channel_size = 8;
+    let journal = JournalSystem::from_conf(&conf).expect("journal system");
+    let fs = journal.fs();
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
+    assert!(
+        !fs.journal_writer.queue_never_blocks(),
+        "a bounded channel must not report an unbounded queue"
+    );
+    // Keep the fixture under the bounded channel's capacity: this writer has
+    // no consumer thread in testing mode, so more than `writer_channel_size`
+    // journal writes would block in enqueue before the case under test runs.
+    fs.mkdir("/bounded", true).expect("dir");
+    fs.create("/bounded/f", false).expect("file");
+    assert!(
+        fs.journal_writer
+            .with_testing_receiver(|receiver| {
+                let mut drained = 0usize;
+                while receiver.try_recv().is_ok() {
+                    drained += 1;
+                }
+                drained
+            })
+            .unwrap_or(0)
+            >= 2,
+        "the fixture writes must be drained so the tested call starts from an empty queue"
+    );
+
+    // The body must never run when the queue can block: the entry point has to
+    // answer Fallback first. A body that ran here would be a side effect taken
+    // before the fallback decision.
+    let mut body_ran = false;
+    let outcome = fs.run_recursive_metadata_write("/bounded", InodeLockMode::Write, true, |_| {
+        body_ran = true;
+        Ok(())
+    });
+
+    match outcome {
+        Ok(ShardedOutcome::Fallback) => {}
+        Ok(ShardedOutcome::Done(_)) => {
+            panic!("a bounded journal queue must fall back before the body, not complete")
+        }
+        Err(error) => panic!("a bounded journal queue must fall back, not fail: {error}"),
+    }
+    assert!(
+        !body_ran,
+        "the body must not run when the plan falls back before it"
+    );
+    // The tree is untouched by the fallback decision.
+    assert!(
+        fs.file_status("/bounded").is_ok(),
+        "the fallback must not have removed anything"
     );
 }
