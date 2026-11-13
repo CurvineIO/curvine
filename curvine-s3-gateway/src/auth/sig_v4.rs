@@ -147,8 +147,16 @@ pub const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
 /// [`MAX_CLOCK_SKEW_SECS`], so a captured request cannot be replayed
 /// indefinitely and no caller slices a too-short string.
 fn validate_xamz_date(xamz_date: &str) -> GenericResult<()> {
+    let skew = chrono::Utc::now().timestamp() - signed_at(xamz_date)?;
+    if skew.abs() > MAX_CLOCK_SKEW_SECS {
+        return Err(format!("x-amz-date outside the accepted skew: {skew}s"));
+    }
+    Ok(())
+}
+
+/// Seconds since the epoch of an `x-amz-date` value (`YYYYMMDD'T'HHMMSS'Z'`).
+fn signed_at(xamz_date: &str) -> GenericResult<i64> {
     let bytes = xamz_date.as_bytes();
-    // `20250101T000000Z`
     if bytes.len() != 16 || bytes[8] != b'T' || bytes[15] != b'Z' {
         return Err(format!("invalid x-amz-date format: {xamz_date}"));
     }
@@ -156,12 +164,144 @@ fn validate_xamz_date(xamz_date: &str) -> GenericResult<()> {
         .map_err(|e| format!("invalid x-amz-date: {e}"))?;
     let time = chrono::NaiveTime::parse_from_str(&xamz_date[9..15], "%H%M%S")
         .map_err(|e| format!("invalid x-amz-date: {e}"))?;
-    let signed_at = date.and_time(time).and_utc().timestamp();
-    let skew = chrono::Utc::now().timestamp() - signed_at;
-    if skew.abs() > MAX_CLOCK_SKEW_SECS {
-        return Err(format!("x-amz-date outside the accepted skew: {skew}s"));
+    Ok(date.and_time(time).and_utc().timestamp())
+}
+
+/// Longest lifetime SigV4 allows for a presigned URL (7 days).
+const MAX_PRESIGN_SECS: i64 = 7 * 24 * 3600;
+
+/// Query-string (presigned URL) SigV4 authentication.
+pub struct Presigned {
+    pub access_key: String,
+    pub region: String,
+    pub signature: String,
+    date: String,
+    expires: i64,
+    signed_headers: Vec<String>,
+}
+
+fn query_pairs(query: &str) -> impl Iterator<Item = (String, String)> + '_ {
+    let decode =
+        |s: &str| urlencoding::decode(s).map_or_else(|_| s.to_string(), |c| c.into_owned());
+    query.split('&').filter(|kv| !kv.is_empty()).map(move |kv| {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        (decode(k), decode(v))
+    })
+}
+
+/// URI encoding as SigV4 signs it: unreserved bytes kept, uppercase hex.
+fn aws_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Parse presigned-URL authentication; `None` when the query carries none.
+pub fn extract_presigned(query: &str) -> Option<Result<Presigned, AuthError>> {
+    let mut auth = std::collections::HashMap::new();
+    for (k, v) in query_pairs(query).filter(|(k, _)| k.starts_with("X-Amz-")) {
+        // A repeated authentication parameter is ambiguous: reject it.
+        if auth.insert(k, v).is_some() {
+            return Some(Err(AuthError::InvalidFormat(
+                "duplicate X-Amz parameter".into(),
+            )));
+        }
     }
-    Ok(())
+    auth.get("X-Amz-Signature")?;
+    let bad = |m: &str| Some(Err(AuthError::InvalidFormat(m.to_string())));
+    let get = |k: &str| auth.get(k).map(String::as_str).unwrap_or_default();
+    if auth.contains_key("X-Amz-Security-Token") {
+        return bad("session tokens are not supported");
+    }
+    let credential: Vec<&str> = get("X-Amz-Credential").split('/').collect();
+    let date = get("X-Amz-Date");
+    let expires = get("X-Amz-Expires").parse::<i64>().unwrap_or(0);
+    let signed_headers: Vec<String> = get("X-Amz-SignedHeaders")
+        .split(';')
+        .map(str::to_string)
+        .collect();
+    if get("X-Amz-Algorithm") != "AWS4-HMAC-SHA256"
+        || credential.len() != 5
+        || credential[3] != "s3"
+        || credential[4] != "aws4_request"
+        || date.get(..8) != Some(credential[1])
+        || !(1..=MAX_PRESIGN_SECS).contains(&expires)
+        || !signed_headers.iter().any(|h| h == "host")
+    {
+        return bad("invalid presigned URL parameters");
+    }
+    Some(Ok(Presigned {
+        access_key: credential[0].to_string(),
+        region: credential[2].to_string(),
+        signature: get("X-Amz-Signature").to_string(),
+        date: date.to_string(),
+        expires,
+        signed_headers,
+    }))
+}
+
+/// SigV4 canonical header value: trimmed, with internal whitespace runs
+/// collapsed to one space, as SDKs sign it.
+fn canonical_value(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Verify a presigned GET/HEAD at `now`. Unlike header signatures it is valid
+/// for its whole `X-Amz-Expires` lifetime, with clock-skew tolerance only for
+/// a signing time in the future.
+pub fn verify_presigned(
+    p: &Presigned,
+    method: &str,
+    encoded_path: &str,
+    query: &str,
+    secret: &str,
+    header: impl Fn(&str) -> Option<String>,
+    now: i64,
+) -> GenericResult<HmacSha256CircleHasher> {
+    if method != "GET" && method != "HEAD" {
+        return Err("presigned URLs are only accepted for GET and HEAD".into());
+    }
+    let start = signed_at(&p.date)?;
+    if now + MAX_CLOCK_SKEW_SECS < start || now > start + p.expires {
+        return Err("presigned URL is not valid at this time".into());
+    }
+    let mut pairs: Vec<(String, String)> = query_pairs(query)
+        .filter(|(k, _)| k != "X-Amz-Signature")
+        .map(|(k, v)| (aws_encode(&k), aws_encode(&v)))
+        .collect();
+    pairs.sort();
+    let canonical_query: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut canonical_headers = String::new();
+    for name in &p.signed_headers {
+        let value = header(name).ok_or("a signed header is missing")?;
+        canonical_headers.push_str(&format!("{name}:{}\n", canonical_value(&value)));
+    }
+    let canonical_request = format!(
+        "{method}\n{encoded_path}\n{}\n{canonical_headers}\n{}\nUNSIGNED-PAYLOAD",
+        canonical_query.join("&"),
+        p.signed_headers.join(";")
+    );
+    let scope = format!("{}/{}/s3/aws4_request", &p.date[..8], p.region);
+    let digest = hex::encode(sha2::Sha256::digest(canonical_request.as_bytes()));
+    let string_to_sign = format!("AWS4-HMAC-SHA256\n{}\n{scope}\n{digest}", p.date);
+    let ksign = get_v4_ksigning(secret, &p.region, &p.date)?;
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&ksign).map_err(|e| e.to_string())?;
+    mac.update(string_to_sign.as_bytes());
+    let signature = hex::encode(mac.finalize().into_bytes());
+    if !crate::auth::sig_v2::constant_time_eq(signature.as_bytes(), p.signature.as_bytes()) {
+        return Err("presigned URL signature does not match".into());
+    }
+    Ok(HmacSha256CircleHasher::new(
+        ksign,
+        signature,
+        p.date.clone(),
+        p.region.clone(),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -430,6 +570,27 @@ mod tests {
                 "expected {bad:?} to be rejected"
             );
         }
+    }
+
+    /// AWS "query parameters" example: GET examplebucket/test.txt, 24h URL.
+    #[test]
+    fn verifies_presigned_urls_against_the_aws_example() {
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404";
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let host = |k: &str| (k == "host").then(|| "examplebucket.s3.amazonaws.com".to_string());
+        let p = extract_presigned(query).unwrap().unwrap();
+        let at = signed_at("20130524T010000Z").unwrap();
+        assert!(verify_presigned(&p, "GET", "/test.txt", query, secret, host, at).is_ok());
+        assert!(verify_presigned(&p, "GET", "/other.txt", query, secret, host, at).is_err());
+        assert!(verify_presigned(&p, "PUT", "/test.txt", query, secret, host, at).is_err());
+        // A GET URL replayed as HEAD signs a different canonical method.
+        assert!(verify_presigned(&p, "HEAD", "/test.txt", query, secret, host, at).is_err());
+        assert_eq!(canonical_value(" \"a\",\t  \"b\" "), "\"a\", \"b\"");
+        let expired = at + 86400;
+        assert!(verify_presigned(&p, "GET", "/test.txt", query, secret, host, expired).is_err());
+        let longer = query.replace("Expires=86400", "Expires=604801");
+        assert!(extract_presigned(&longer).unwrap().is_err());
+        assert!(extract_presigned("list-type=2").is_none());
     }
 
     #[test]

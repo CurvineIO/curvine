@@ -529,6 +529,42 @@ pub async fn handle_authorization_middleware(
     let original_extensions = req.extensions().clone();
     let req = Request::from(req);
 
+    // Presigned URL: SigV4 carried in the query instead of an Authorization header.
+    let raw_query = req.request.uri().query().unwrap_or_default().to_string();
+    let presigned = match sig_v4::VHeader::get_header(&req, "authorization") {
+        None => sig_v4::extract_presigned(&raw_query),
+        Some(_) => None,
+    };
+    if let Some(presigned) = presigned {
+        let forbidden = || (axum::http::StatusCode::FORBIDDEN, b"").into_response();
+        let Ok(p) = presigned else {
+            return forbidden();
+        };
+        let secret = match ak_store.get(&p.access_key).await {
+            Ok(Some(secret)) => secret,
+            Ok(None) => return forbidden(),
+            Err(_) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, b"").into_response(),
+        };
+        let now = chrono::Utc::now().timestamp();
+        let path = req.encoded_path();
+        let header = |name: &str| sig_v4::VHeader::get_header(&req, name);
+        let method = req.method().to_string();
+        let hasher =
+            match sig_v4::verify_presigned(&p, &method, path, &raw_query, &secret, header, now) {
+                Ok(hasher) => hasher,
+                Err(e) => {
+                    // Never log the URL: its query is a bearer credential.
+                    tracing::warn!("presigned request rejected: {e}");
+                    return forbidden();
+                }
+            };
+        let v4head = sig_v4::V4Head::new(p.signature, p.region, p.access_key, hasher);
+        let mut axum_req: axum::http::Request<axum::body::Body> = req.into();
+        *axum_req.extensions_mut() = original_extensions;
+        axum_req.extensions_mut().insert(v4head);
+        return next.run(axum_req).await;
+    }
+
     let auth_result = crate::auth::sig_v4::extract_args(&req);
 
     if auth_result.is_err() {

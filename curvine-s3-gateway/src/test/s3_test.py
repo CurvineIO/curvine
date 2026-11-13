@@ -57,7 +57,7 @@ class S3TestClient:
             aws_access_key_id=config.access_key,
             aws_secret_access_key=config.secret_key,
             region_name=config.region,
-            config=Config(retries={'max_attempts': 1})
+            config=Config(signature_version='s3v4', retries={'max_attempts': 1})
         )
     
     def create_bucket(self) -> bool:
@@ -245,6 +245,34 @@ class S3BasicOperationsTest:
             self._record_test(f"Head Object ({key})", False)
             return False
     
+    def test_presigned_get(self) -> bool:
+        """#2093: presigned GET/HEAD work; tampered or method-swapped URLs fail."""
+        import urllib.error
+        import urllib.request
+        s3, bucket, key = self.client.client, self.client.config.test_bucket, 'presigned.txt'
+        s3.put_object(Bucket=bucket, Key=key, Body=b'presigned body')
+        params = {'Bucket': bucket, 'Key': key}
+        get = s3.generate_presigned_url('get_object', Params=params, ExpiresIn=60)
+        head = s3.generate_presigned_url('head_object', Params=params, ExpiresIn=60)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def fetch(url, method='GET'):
+            try:
+                with opener.open(urllib.request.Request(url, method=method), timeout=5) as r:
+                    return r.status, r.headers.get('Content-Length'), r.read()
+            except urllib.error.HTTPError as error:
+                return error.code, None, b''
+
+        # The URLs are bearer credentials: never print them.
+        success = (fetch(get) == (200, '14', b'presigned body')
+                   and fetch(head, 'HEAD') == (200, '14', b'')
+                   and fetch(get.replace(key, 'other.txt'))[0] == 403
+                   and fetch(get, 'HEAD')[0] == 403
+                   and fetch(head)[0] == 403)
+        s3.delete_object(Bucket=bucket, Key=key)
+        self._record_test("Presigned GET/HEAD (valid works, tampered or swapped rejected)", success)
+        return success
+
     def test_delete_object(self, key: str) -> bool:
         """Test deleting an object"""
         try:
@@ -713,6 +741,10 @@ class ComprehensiveS3TestSuite:
         for key in test_data.keys():
             if not basic_test.test_head_object(key):
                 return False
+
+        # Query-string SigV4 (#2093)
+        if not basic_test.test_presigned_get():
+            return False
         
         # Test download and verify
         for key, original_data in test_data.items():
