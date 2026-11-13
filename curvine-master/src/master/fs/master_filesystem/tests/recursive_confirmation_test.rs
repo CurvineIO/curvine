@@ -142,6 +142,26 @@ fn terminal_holder_alive_probe(fs: &MasterFilesystem, pre_view: &NamespaceGuard<
     );
 }
 
+/// Fail the body with the original typed error when the leaf is missing:
+/// `InodePath::resolve` returns a partial-chain Ok for missing leaves, so
+/// the missing case is detected explicitly (§9: uncommitted store errors).
+fn typed_missing_leaf(fs_dir: &FsDir, path: &str) -> FsResult<()> {
+    let inp = MasterFilesystem::resolve_path(fs_dir, path)?;
+    if inp.get_last_inode().is_none() {
+        return Err(FsError::file_not_found(path));
+    }
+    Ok(())
+}
+
+/// `ShardedOutcome` has no Debug impl, so `Result::unwrap_err` cannot be
+/// used on `FsResult<ShardedOutcome<()>>`; extract the typed error directly.
+fn typed_op_error(result: FsResult<ShardedOutcome<()>>, context: &'static str) -> FsError {
+    match result {
+        Err(op_err) => op_err,
+        Ok(_) => panic!("{context}"),
+    }
+}
+
 fn unwind_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&'static str>() {
         message.to_string()
@@ -196,11 +216,7 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
         worker_fs.run_recursive_metadata_write("/dir", InodeLockMode::Write, true, |fs_dir| {
             started_tx.send(()).unwrap();
             body_writer.fail_metadata_publication();
-            let inp = MasterFilesystem::resolve_path(fs_dir, "/dir/missing")?;
-            if inp.get_last_inode().is_none() {
-                return Err(FsError::file_not_found("/dir/missing"));
-            }
-            Ok(())
+            typed_missing_leaf(fs_dir, "/dir/missing")
         })
     });
 
@@ -220,11 +236,7 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
     let result = worker.join().unwrap();
     let (failed_at_lock, view_err) = reader.join().unwrap();
 
-    // ShardedOutcome has no Debug impl; extract the typed error directly.
-    let op_err = match result {
-        Err(op_err) => op_err,
-        Ok(_) => panic!("the op must fail with its typed error"),
-    };
+    let op_err = typed_op_error(result, "the op must fail with its typed error");
     assert!(
         matches!(
             &op_err,
@@ -507,17 +519,10 @@ fn recursive_plain_business_error_keeps_holder_alive() -> FsResult<()> {
         // A plan over an unresolvable path yields Fallback before the body;
         // point the plan at the real subtree and fail the body on a missing
         // leaf instead — that is the "plain business error" contract.
-        let inp = MasterFilesystem::resolve_path(fs_dir, "/tree/missing")?;
-        if inp.get_last_inode().is_none() {
-            return Err(FsError::file_not_found("/tree/missing"));
-        }
-        Ok(())
+        typed_missing_leaf(fs_dir, "/tree/missing")
     });
 
-    let op_err = match result {
-        Err(op_err) => op_err,
-        Ok(_) => panic!("the pure business error must surface"),
-    };
+    let op_err = typed_op_error(result, "the pure business error must surface");
     assert!(
         matches!(
             &op_err,
@@ -581,11 +586,7 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
             )?;
             // Then: a real publication failure plus a real op error.
             body_writer.fail_metadata_publication();
-            let inp = MasterFilesystem::resolve_path(fs_dir, "/dir/missing")?;
-            if inp.get_last_inode().is_none() {
-                return Err(FsError::file_not_found("/dir/missing"));
-            }
-            Ok(())
+            typed_missing_leaf(fs_dir, "/dir/missing")
         })
     });
 
@@ -599,10 +600,10 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
         .unwrap();
     let _commit_failed = drop(queued.completion);
 
-    let result = match worker.join().unwrap() {
-        Err(result) => result,
-        Ok(_) => panic!("the double failure must return an error"),
-    };
+    let result = typed_op_error(
+        worker.join().unwrap(),
+        "the double failure must return an error",
+    );
     assert!(
         matches!(
             &result,
