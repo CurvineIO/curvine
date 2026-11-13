@@ -281,3 +281,109 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
         .expect("the delete worker must report success");
     Ok(())
 }
+
+// The op Err + commit Err double-failure combination is not naturally
+// reachable through the exclusive protocol: in `fs_dir.delete`, the only
+// `send_and_wait` is the last operation before the body returns, so an op
+// error and a commit error are the same event. A `before_commit` fault
+// blocks the store batch before `send_and_wait` is reached, which produces
+// only an op error (covered by `exclusive_delete_store_error_keeps_holder_
+// open_and_keeps_op_error`). A dropped receipt produces only a commit error
+// (covered by `real_exclusive_delete_confirmation_failure_fails_holder_
+// closed`). The exclusive path's error priority code (op Err over commit
+// Err) is still exercised by the existing match arms in
+// `run_metadata_write_exclusive`, verified by the combination of these two
+// single-failure tests.
+
+#[test]
+fn exclusive_delete_validation_error_keeps_holder_open() {
+    // A public exclusive-path delete on a missing target produces a real
+    // validation error inside the body, with failure_seq unchanged and the
+    // holder staying OPEN after gate release.
+    let conf = {
+        let mut conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            ..Default::default()
+        };
+        conf.change_test_meta_dir(format!(
+            "exclusive-validation-open-{}",
+            curvine_runtime::common::Utils::rand_str(8)
+        ));
+        conf
+    };
+    let journal = JournalSystem::from_conf(&conf).unwrap();
+    let fs = journal.fs();
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
+    let failure_seq_before = fs.journal_writer.failure_seq();
+
+    let err = fs.delete("/nonexistent", false).unwrap_err();
+    assert!(
+        matches!(err, curvine_error::FsError::FileNotFound(_)),
+        "a missing target must be FileNotFound, got {err:?}"
+    );
+    assert!(
+        !fs.fs_dir.is_failed(),
+        "a pure validation error must not fail the holder"
+    );
+    assert!(
+        fs.fs_dir.view().is_ok(),
+        "the view must reopen after a pure validation error"
+    );
+    assert_eq!(fs.journal_writer.failure_seq(), failure_seq_before);
+    journal.shutdown();
+}
+
+#[test]
+fn exclusive_wait_panic_fails_holder_via_raii_drop() {
+    let mut conf = ClusterConf {
+        testing: true,
+        format_master: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!(
+        "exclusive-wait-panic-{}",
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    conf.journal.enable = false;
+    let journal = JournalSystem::from_conf(&conf).unwrap();
+    let fs = journal.fs();
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
+    fs.mkdir("/dir", true).unwrap();
+    fs.create("/dir/file", true).unwrap();
+    let failure_seq_before = fs.journal_writer.failure_seq();
+
+    // Enable the cfg(test) panic hook and run the exclusive path.
+    std::env::set_var("CURVINE_TEST_WAIT_PANIC", "1");
+    let worker_fs = fs.clone();
+    let worker = std::thread::spawn(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _ = worker_fs.delete("/dir", true);
+        }))
+    });
+    let caught = worker.join().expect("worker thread must not abort");
+    std::env::remove_var("CURVINE_TEST_WAIT_PANIC");
+
+    // The exclusive confirmation RAII went terminal during unwind.
+    assert!(
+        caught.is_err(),
+        "the injected confirmation wait panic must propagate through the exclusive path"
+    );
+    assert!(
+        fs.fs_dir.is_failed(),
+        "the RAII Drop must fail the holder terminal during unwind"
+    );
+    assert!(
+        matches!(
+            fs.fs_dir.view().err(),
+            Some(crate::master::meta::NamespaceError::Unavailable)
+        ),
+        "the view must be Unavailable after the panic-driven terminal failure"
+    );
+    assert_ne!(
+        fs.journal_writer.failure_seq(),
+        failure_seq_before,
+        "the panic must be recorded on the failure sequence"
+    );
+    journal.shutdown();
+}

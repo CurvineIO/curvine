@@ -664,23 +664,31 @@ fn purge_child_publication_failure_fences_writes() {
     runtime.configure(&rule_id, rule).unwrap();
     let result = fs.purge_trash_batch("/parent", std::slice::from_ref(&path));
     runtime.remove(&rule_id).unwrap();
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("injected purge publication failure"));
-    // The durable inode is gone but publication failed, so the live edge is
-    // dangling. Reads must report corruption rather than claim it is absent.
-    assert!(fs
-        .exists(&path)
-        .unwrap_err()
-        .to_string()
-        .contains("missing inode"));
-    assert!(fs
-        .worker_manager
-        .write()
-        .block_map
-        .handle_heartbeat(100)
-        .is_empty());
+    let purge_err = result.unwrap_err().to_string();
+    assert!(
+        purge_err.contains("injected purge publication failure"),
+        "the publication error must keep its original message, got {purge_err}"
+    );
+    // The exclusive confirmation failure (seq moved) went terminal: the
+    // holder is FAILED and all subsequent access reports Unavailable.
+    assert!(
+        fs.fs_dir.is_failed(),
+        "a publication failure in the exclusive path must fail the holder"
+    );
+    assert!(
+        matches!(
+            fs.fs_dir.view().err(),
+            Some(crate::master::meta::NamespaceError::Unavailable)
+        ),
+        "the view must be Unavailable after the terminal failure"
+    );
+    assert!(
+        matches!(
+            fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).err(),
+            Some(ColdError::Unavailable)
+        ),
+        "begin_cold must be Unavailable after the terminal failure"
+    );
     assert!(fs.journal_writer.ensure_metadata_current().is_err());
     assert!(fs.mkdir("/another", false).is_err());
 }

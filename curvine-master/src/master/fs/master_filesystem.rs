@@ -119,6 +119,8 @@ impl ExclusiveConfirmation<'_> {
     }
 
     fn fail_terminal(&mut self) {
+        #[cfg(test)]
+        eprintln!("confirmation RAII: fail_terminal called");
         if let Some(handle) = self.handle.take() {
             handle.fail_closed(self.writer);
         }
@@ -589,6 +591,13 @@ impl MasterFilesystem {
                 // RPC writes, snapshots and restores cannot cross it; the
                 // applier can take the view to advance the real ack.
                 drop(cold);
+                // Test-only panic injection: exercises the exclusive
+                // confirmation RAII's Drop path (terminal before gate
+                // release) on unwind.
+                #[cfg(test)]
+                if std::env::var("CURVINE_TEST_WAIT_PANIC").is_ok() {
+                    panic!("injected confirmation wait panic for RAII test");
+                }
                 let commit = scope.wait();
                 // Only a confirmed wait disarms the guard; a confirmation
                 // error stays armed so the Drop below goes terminal before

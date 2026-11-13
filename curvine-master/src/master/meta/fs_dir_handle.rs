@@ -236,7 +236,7 @@ impl FsDirHandle {
     /// `begin_cold` is rejected.
     pub(crate) fn fail_closed(&self, writer: &JournalWriter) {
         self.state.store(STATE_FAILED, Ordering::Release);
-        writer.fail_metadata_restore();
+        writer.fail_metadata_holder_terminal();
         if let Some(fs_dir) = self.current.swap(None) {
             fs_dir.store.invalidate_cursor_store();
         }
@@ -395,7 +395,7 @@ impl ColdFsDirGuard<'_> {
         self.handle.state.store(STATE_FAILED, Ordering::Release);
         if let Some(fs_dir) = self.taken.take() {
             fs_dir.store.invalidate_cursor_store();
-            fs_dir.journal_writer.fail_metadata_restore();
+            fs_dir.journal_writer.fail_metadata_holder_terminal();
         }
         self.handle.current.store(None);
     }

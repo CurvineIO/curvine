@@ -536,7 +536,7 @@ impl InodeStore {
             sync,
             name: "master.metadata.delete.before_commit",
             description: "Before committing delete metadata",
-            context: {},
+            context: { "child_name" => del_name },
             return_error: |fault| Err(fault.message.into()),
         }
         batch.commit()?;

@@ -427,6 +427,8 @@ fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
         .configure(
             rule_id,
             curvine_fault::FaultRuleBuilder::named("master.metadata.delete.before_commit")
+                .matches("child_name", "dir")
+                .unwrap()
                 .times(1)
                 .unwrap()
                 .return_error("injected exclusive delete store failure")
@@ -438,10 +440,9 @@ fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || done_tx.send(delete_fs.delete("/dir", true)));
 
-    let delete_result = done_rx
-        .recv_timeout(HANDSHAKE_WINDOW)
-        .expect("the delete must finish within the window");
+    let delete_result = done_rx.recv_timeout(HANDSHAKE_WINDOW);
     runtime.remove(rule_id).unwrap();
+    let delete_result = delete_result.expect("the delete must finish within the window");
     worker.join().expect("delete worker must not panic");
 
     // The op error keeps its original variant and message; the failure
@@ -489,7 +490,7 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
     conf.master.meta_dir = meta_dir.to_str().unwrap().to_string();
     conf.journal.journal_dir = journal_dir.to_str().unwrap().to_string();
     let journal = JournalSystem::from_conf(&conf).unwrap();
-    let fs = journal.fs();
+    let mut fs = journal.fs();
     let mut loader = journal.journal_loader();
     fs.master_monitor.set_role_for_test(RoleState::Leader);
 
@@ -513,7 +514,9 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
         .expect("a real checkpoint must be created");
     assert!(snapshot.files_data.is_some());
 
-    // Install the receipts writer and align every participant.
+    // Install the receipts writer and align every participant: FsDir body,
+    // local fs, and loader all share one Arc — verified with a short view +
+    // Arc::ptr_eq before spawning the delete.
     let writer = {
         let rt = conf.journal.create_runtime();
         let client = curvine_raft::raft::RaftClient::from_conf(rt, &conf.journal);
@@ -532,7 +535,18 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
             .journal_writer = writer.clone();
         writer
     };
+    fs.journal_writer = writer.clone();
     loader.journal_writer = writer.clone();
+    {
+        // Short view: verify all three writer Arcs are aligned.
+        let view = fs.fs_dir.view().unwrap();
+        assert!(
+            Arc::ptr_eq(&view.journal_writer, &writer),
+            "FsDir must use the receipts writer"
+        );
+    }
+    assert!(Arc::ptr_eq(&fs.journal_writer, &writer));
+    assert!(Arc::ptr_eq(&loader.journal_writer, &writer));
 
     // Phase 2: exclusive delete holds the gate and the unique receipt.
     let delete_fs = fs.clone();
