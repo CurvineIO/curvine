@@ -1968,12 +1968,17 @@ impl JournalLoader {
                     };
                     return self.with_replay_cold(body);
                 }
-                Some(
+                Some((
                     self.block_location_locks
                         .write_workers_blocks(&worker_ids, &block_ids),
-                )
+                    (block_ids, worker_ids),
+                ))
             } else {
                 None
+            };
+            let (location_locks, location_sample) = match location_locks {
+                Some((locks, ids)) => (Some(locks), Some(ids)),
+                None => (None, None),
             };
 
             // R2: the final revalidation and the body share ONE view window.
@@ -1998,6 +2003,49 @@ impl JournalLoader {
                     // and takes the cold bridge. The body was never moved here
                     // — it stays available for the caller's cold fallback.
                     return Ok(ReplayStep::Churn);
+                }
+                // F2: location coverage revalidation under the FINAL view —
+                // a report/replication writer holds only worker/block stripes
+                // (no inode locks) and can add a location between sampling
+                // and lock acquisition. Re-read the current block/worker set
+                // of every Write inode; any id not in the sampled set means
+                // the acquired location locks do not cover the live state —
+                // churn (release view/L/I, retry ≤3, then cold).
+                if need_locations {
+                    let (sampled_blocks, sampled_workers) = location_sample
+                        .as_ref()
+                        .expect("need_locations implies a sampled location set");
+                    for request in plan.inode_requests() {
+                        if !matches!(
+                            request.mode,
+                            crate::master::meta::InodeLockMode::Write
+                        ) {
+                            continue;
+                        }
+                        let Some(inode) = fs_dir
+                            .store
+                            .get_inode(request.inode_id, None)
+                            .map_err(|e| e.to_string())?
+                        else {
+                            continue;
+                        };
+                        let Ok(file) = inode.as_file_ref() else {
+                            continue;
+                        };
+                        for block_id in file.block_ids() {
+                            if !sampled_blocks.contains(&block_id) {
+                                return Ok(ReplayStep::Churn);
+                            }
+                            for location in fs_dir
+                                .get_block_locations(block_id)
+                                .map_err(|e| e.to_string())?
+                            {
+                                if !sampled_workers.contains(&location.worker_id) {
+                                    return Ok(ReplayStep::Churn);
+                                }
+                            }
+                        }
+                    }
                 }
                 let guard = MetadataConfirmation::arm(&self.fs_dir, &self.journal_writer);
                 let mut guard = guard;
