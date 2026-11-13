@@ -16,11 +16,7 @@
 //! cases here isolate the three ways coverage may break - block membership,
 //! worker-on-a-new-block, and the whole-call budget with both sets unchanged.
 
-use crate::master::meta::tests::subtree_location_plan_test::{
-    file_request, one_block, plan_of, seed_locations, test_fs,
-};
 use super::*;
-use crate::master::meta::BlockMeta;
 
 /// G4c: the current block set grows after the sample. `covers` iterates the
 /// inode's real blocks now, so a block that appeared after capture must make it

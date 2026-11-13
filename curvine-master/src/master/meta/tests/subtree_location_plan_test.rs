@@ -33,7 +33,7 @@ use curvine_config::ClusterConf;
 use curvine_model::BlockLocation;
 use curvine_runtime::common::Utils;
 
-pub(super) fn test_fs(name: &str) -> MasterFilesystem {
+fn test_fs(name: &str) -> MasterFilesystem {
     Master::init_test_metrics();
     let mut conf = ClusterConf::format();
     conf.testing = true;
@@ -56,14 +56,14 @@ pub(super) fn test_fs(name: &str) -> MasterFilesystem {
 }
 
 /// Creates one file and returns (file_id, request) for it.
-pub(super) fn file_request(fs: &MasterFilesystem, path: &str) -> (i64, InodeLockRequest) {
+fn file_request(fs: &MasterFilesystem, path: &str) -> (i64, InodeLockRequest) {
     fs.create(path, true).expect("create file");
     let id = fs.file_status(path).expect("status").id;
     (id, InodeLockRequest::write(0, id))
 }
 
 /// Writes `workers.len()` location rows for one block through the store.
-pub(super) fn seed_locations(fs: &MasterFilesystem, block_id: i64, workers: &[u32]) {
+fn seed_locations(fs: &MasterFilesystem, block_id: i64, workers: &[u32]) {
     let handle = fs.fs_dir();
     let view = handle.view().expect("namespace view");
     for worker in workers {
@@ -75,7 +75,7 @@ pub(super) fn seed_locations(fs: &MasterFilesystem, block_id: i64, workers: &[u3
 
 /// Allocates one block on `path` without completing it (zero-length is fine for
 /// the plan, which only walks block ids).
-pub(super) fn one_block(fs: &MasterFilesystem, path: &str) -> (i64, InodeLockRequest) {
+fn one_block(fs: &MasterFilesystem, path: &str) -> (i64, InodeLockRequest) {
     let (id, request) = file_request(fs, path);
     let block = fs
         .add_block(
@@ -92,10 +92,7 @@ pub(super) fn one_block(fs: &MasterFilesystem, path: &str) -> (i64, InodeLockReq
     (id, request)
 }
 
-pub(super) fn plan_of(
-    fs: &MasterFilesystem,
-    requests: &[InodeLockRequest],
-) -> Option<SubtreeLocationPlan> {
+fn plan_of(fs: &MasterFilesystem, requests: &[InodeLockRequest]) -> Option<SubtreeLocationPlan> {
     let handle = fs.fs_dir();
     let view = handle.view().expect("namespace view");
     SubtreeLocationPlan::capture(&view, requests).expect("capture must not error")
