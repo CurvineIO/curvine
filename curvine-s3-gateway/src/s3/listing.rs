@@ -83,6 +83,9 @@ pub struct ListObjectPage {
     pub common_prefixes: Vec<CommonPrefix>,
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
+    /// Last entry of this page, in raw key form. ListObjects V1 answers with a
+    /// `NextMarker` instead of the opaque token V2 hands back.
+    pub next_marker: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -226,7 +229,8 @@ pub(super) async fn list_objects<S: DirSource>(
         }
         if page.contents.len() + page.common_prefixes.len() == max_keys {
             page.is_truncated = true;
-            page.next_continuation_token = last_entry.map(|last| token(opt, last));
+            page.next_continuation_token = last_entry.clone().map(|last| token(opt, last));
+            page.next_marker = last_entry;
             break;
         }
         last_entry = Some(entry.to_string());
