@@ -33,7 +33,7 @@ use curvine_config::ClusterConf;
 use curvine_model::BlockLocation;
 use curvine_runtime::common::Utils;
 
-fn test_fs(name: &str) -> MasterFilesystem {
+pub(super) fn test_fs(name: &str) -> MasterFilesystem {
     Master::init_test_metrics();
     let mut conf = ClusterConf::format();
     conf.testing = true;
@@ -56,14 +56,14 @@ fn test_fs(name: &str) -> MasterFilesystem {
 }
 
 /// Creates one file and returns (file_id, request) for it.
-fn file_request(fs: &MasterFilesystem, path: &str) -> (i64, InodeLockRequest) {
+pub(super) fn file_request(fs: &MasterFilesystem, path: &str) -> (i64, InodeLockRequest) {
     fs.create(path, true).expect("create file");
     let id = fs.file_status(path).expect("status").id;
     (id, InodeLockRequest::write(0, id))
 }
 
 /// Writes `workers.len()` location rows for one block through the store.
-fn seed_locations(fs: &MasterFilesystem, block_id: i64, workers: &[u32]) {
+pub(super) fn seed_locations(fs: &MasterFilesystem, block_id: i64, workers: &[u32]) {
     let handle = fs.fs_dir();
     let view = handle.view().expect("namespace view");
     for worker in workers {
@@ -75,7 +75,7 @@ fn seed_locations(fs: &MasterFilesystem, block_id: i64, workers: &[u32]) {
 
 /// Allocates one block on `path` without completing it (zero-length is fine for
 /// the plan, which only walks block ids).
-fn one_block(fs: &MasterFilesystem, path: &str) -> (i64, InodeLockRequest) {
+pub(super) fn one_block(fs: &MasterFilesystem, path: &str) -> (i64, InodeLockRequest) {
     let (id, request) = file_request(fs, path);
     let block = fs
         .add_block(
@@ -92,7 +92,10 @@ fn one_block(fs: &MasterFilesystem, path: &str) -> (i64, InodeLockRequest) {
     (id, request)
 }
 
-fn plan_of(fs: &MasterFilesystem, requests: &[InodeLockRequest]) -> Option<SubtreeLocationPlan> {
+pub(super) fn plan_of(
+    fs: &MasterFilesystem,
+    requests: &[InodeLockRequest],
+) -> Option<SubtreeLocationPlan> {
     let handle = fs.fs_dir();
     let view = handle.view().expect("namespace view");
     SubtreeLocationPlan::capture(&view, requests).expect("capture must not error")
@@ -363,103 +366,5 @@ fn bounded_location_read_with_a_zero_budget_distinguishes_empty_from_over_limit(
     );
 }
 
-/// G4c: the current block set grows after the sample. `covers` iterates the
-/// inode's real blocks now, so a block that appeared after capture must make it
-/// return false instead of silently passing.
-#[test]
-fn covers_rejects_a_block_added_after_the_sample() {
-    let fs = test_fs("covers-block-grew");
-    let (id, request) = one_block(&fs, "/grew");
-    let plan = plan_of(&fs, &[request]).expect("one block is inside the budget");
-
-    // Add a second block to the same inode after the sample.
-    let block_id = {
-        let handle = fs.fs_dir();
-        let view = handle.view().expect("namespace view");
-        let mut inode = view.store.get_inode(id, None).expect("inode").expect("row");
-        let file = inode.as_file_mut().expect("file");
-        let block_id = crate::master::meta::InodeId::create_block_id(id, 2).expect("block id");
-        file.blocks.push(BlockMeta::new(block_id, 4096));
-        let mut batch = view.store_ref().new_batch();
-        batch.write_inode(&inode).expect("write the widened inode");
-        batch.commit().expect("commit");
-        view.store
-            .add_block_location(block_id, BlockLocation::with_id(1))
-            .expect("seed the new block's location");
-        block_id
-    };
-    assert!(block_id > 0);
-
-    let handle = fs.fs_dir();
-    let view = handle.view().expect("namespace view");
-    assert!(
-        !SubtreeLocationPlan::covers(&plan, &view, &[request]).expect("covers"),
-        "a block that appeared after the sample must break coverage"
-    );
-}
-
-/// G4d: a worker that WAS sampled adds a location on a block the plan never saw.
-/// The whole-call counter and the block membership check must both refuse it -
-/// silently accepting would replay against a partially sampled set.
-#[test]
-fn covers_rejects_a_known_worker_expanding_onto_a_new_block() {
-    let fs = test_fs("covers-cross-block");
-    // Exactly at the budget: 512 blocks x (1 block entry + 1 location) = 1024.
-    let files_blocks = SUBTREE_LOCATION_LIMIT / 2;
-    let (id, request) = file_request(&fs, "/cross");
-    {
-        let handle = fs.fs_dir();
-        let view = handle.view().expect("namespace view");
-        let mut inode = view.store.get_inode(id, None).expect("inode").expect("row");
-        let mut blocks = Vec::with_capacity(files_blocks);
-        for seq in 1..=files_blocks as i64 {
-            let block_id =
-                crate::master::meta::InodeId::create_block_id(id, seq).expect("block id");
-            blocks.push(BlockMeta::new(block_id, 4096));
-        }
-        inode.as_file_mut().expect("file").blocks = blocks;
-        let mut batch = view.store_ref().new_batch();
-        batch.write_inode(&inode).expect("write");
-        batch.commit().expect("commit");
-        for seq in 1..=files_blocks as i64 {
-            let block_id =
-                crate::master::meta::InodeId::create_block_id(id, seq).expect("block id");
-            view.store
-                .add_block_location(block_id, BlockLocation::with_id(1))
-                .expect("seed location");
-        }
-    }
-    let plan = plan_of(&fs, &[request]).expect("exactly at the budget still plans");
-    assert_eq!(plan.block_ids().len(), files_blocks);
-
-    // Worker 1 is already known to the plan; put it on one more block that the
-    // plan never saw, so the set grows without introducing a new worker.
-    let extra = {
-        let handle = fs.fs_dir();
-        let view = handle.view().expect("namespace view");
-        let mut inode = view.store.get_inode(id, None).expect("inode").expect("row");
-        let extra = crate::master::meta::InodeId::create_block_id(id, files_blocks as i64 + 1)
-            .expect("block id");
-        inode
-            .as_file_mut()
-            .expect("file")
-            .blocks
-            .push(BlockMeta::new(extra, 4096));
-        let mut batch = view.store_ref().new_batch();
-        batch.write_inode(&inode).expect("write");
-        batch.commit().expect("commit");
-        view.store
-            .add_block_location(extra, BlockLocation::with_id(1))
-            .expect("seed the extra block's location");
-        extra
-    };
-    assert!(extra > 0);
-
-    let handle = fs.fs_dir();
-    let view = handle.view().expect("namespace view");
-    assert!(
-        !SubtreeLocationPlan::covers(&plan, &view, &[request]).expect("covers"),
-        "a known worker on a block outside the sample must break coverage, not \
-         pass because the worker id happens to be in the sampled set"
-    );
-}
+#[path = "subtree_location_cover_test.rs"]
+mod subtree_location_cover_test;

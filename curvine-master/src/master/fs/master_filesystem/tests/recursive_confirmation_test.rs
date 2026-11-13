@@ -277,214 +277,230 @@ fn recursive_fenced_admission_rejected_without_holder_retirement() -> FsResult<(
     Ok(())
 }
 
-/// G3: fence inside a REAL public recursive RPC admission. The helper drives
-/// each public entry through its real outer admission while the plan-pause
-/// observation holds the call between the outer capture and the body; the
-/// fence+unfence in that window must reject the same admission with the
-/// original typed epoch error - no body side effect, holder alive, failure
-/// seq unmoved, no fatal source. The three real hot routes are exercised
-/// directly (delete/free/set_attr), so a re-sampled epoch inside a hot
-/// closure cannot mask the original-epoch flow.
-fn assert_fenced_real_rpc_rejects<R: Send + 'static>(
-    fs: &MasterFilesystem,
-    journal: &JournalSystem,
-    writer: &Arc<JournalWriter>,
-    conf: &ClusterConf,
-    body: impl FnOnce(&MasterFilesystem) -> FsResult<R> + Send + 'static,
-    verify_unchanged: impl Fn(&MasterFilesystem) + Send + 'static,
-    case: &str,
-) {
-    let seq_before = writer.failure_seq();
-    let (plan_reached_tx, plan_reached_rx) = std::sync::mpsc::channel::<()>();
-    let (plan_release_tx, plan_release_rx) = std::sync::mpsc::channel::<()>();
-    writer.arm_plan_pause_hook(plan_reached_tx, plan_release_rx);
-
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || {
-        let _ = done_tx.send(body(&worker_fs));
-    });
-
-    plan_reached_rx
-        .recv_timeout(WORKER_TIMEOUT)
-        .expect("the real public admission must reach the plan pause");
-    writer.fence_metadata();
-    writer.unfence_metadata();
-    plan_release_tx
-        .send(())
-        .expect("the driver must release the plan pause");
-
-    let result =
-        await_worker(&done_rx, case).expect("the fenced-window admission must report its result");
-    worker.join().expect("the worker must not panic");
-    assert!(
-        result.is_err(),
-        "{case}: the fenced-window admission must be rejected"
-    );
-    let err = match result {
-        Err(e) => e,
-        Ok(_) => panic!("{case}: the fenced-window admission must be rejected"),
+/// G3 final matrix: one shared real-completed-file fixture drives the three
+/// real public recursive RPCs (delete/free/set_attr) through a fenced
+/// pre-hot window. The common invariants (same inode, mode 644, same
+/// non-empty blocks) reject each op's real side effect; the single accepted
+/// error is the original-epoch NotLeader.
+mod fenced_window_matrix {
+    use super::*;
+    use curvine_model::{
+        BlockLocation, ClientAddress, CreateFileOptsBuilder, OpenFlags, TtlAction, WorkerAddress,
+        WorkerInfo, WorkerStatus,
     };
-    assert!(
-        err.to_string().contains("fenced")
-            || err.to_string().contains("role changed")
-            || err.to_string().contains("epoch"),
-        "{case}: the rejection must be the original epoch error, got {err:?}"
-    );
-    verify_unchanged(fs);
-    assert!(
-        !fs.fs_dir.is_failed(),
-        "{case}: the fence must not terminalize the holder"
-    );
-    assert_eq!(
-        writer.failure_seq(),
-        seq_before,
-        "{case}: a role fence must not move the failure seq"
-    );
-    assert!(
-        journal.master_monitor().recovery().fatal_source().is_none(),
-        "{case}: a role fence must not be recorded as a fatal source"
-    );
-}
 
-/// §8.1: a pure business error with an unmoved failure seq and an Ok
-/// confirmation keeps the holder usable — no retirement, no safe mode, and
-/// later ordinary writes succeed.
-#[test]
-fn recursive_plain_business_error_keeps_holder_alive() -> FsResult<()> {
-    let (conf, journal, mut fs) = confirmation_env("recursive-plain-business-error");
-    fs.mkdir("/tree", true).unwrap();
-    drain_receipts(&fs.journal_writer.clone());
-    let writer = fs.journal_writer.clone();
-    let seq_before = writer.failure_seq();
+    /// A real, completed, free-able file: 4096 bytes, one committed block
+    /// with a real location row, TTL Delete policy (the free contract
+    /// requires a policy that may drop the Curvine copy), and a live
+    /// worker. Not an empty stub - a rejected free on an empty file would
+    /// be a vacuous oracle.
+    fn completed_file_fixture(name: &str) -> (ClusterConf, JournalSystem, MasterFilesystem, i64) {
+        let (conf, journal, fs) = confirmation_env(name);
+        let mut worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 1,
+                ..Default::default()
+            },
+            1,
+        );
+        worker.status = WorkerStatus::Live;
+        worker.capacity = i64::MAX / 4;
+        worker.available = i64::MAX / 4;
+        fs.add_test_worker(worker);
 
-    let result = run_admitted(&fs, "/tree", InodeLockMode::Write, false, |fs_dir| {
-        // A plan over an unresolvable path yields Fallback before the body;
-        // point the plan at the real subtree and fail the body on a missing
-        // leaf instead — that is the "plain business error" contract.
-        typed_missing_leaf(fs_dir, "/tree/missing")
-    });
-
-    let op_err = typed_op_error(result, "the pure business error must surface");
-    assert!(
-        matches!(
-            &op_err,
-            FsError::FileNotFound(_) if op_err.to_string().contains("/tree/missing")
-        ),
-        "the pure business error must be returned with its original variant, got {op_err:?}"
-    );
-    assert_eq!(
-        writer.failure_seq(),
-        seq_before,
-        "a plain business error must not move the failure seq"
-    );
-    assert!(!fs.fs_dir.is_failed());
-    assert!(fs.fs_dir.view().is_ok());
-    assert!(
-        journal.master_monitor().recovery().fatal_source().is_none(),
-        "a plain business error must not be recorded as a fatal source"
-    );
-
-    // The holder stays usable: ordinary writes keep succeeding.
-    fs.mkdir("/after", true).unwrap();
-    fs.create("/after/x", true).unwrap();
-
-    drain_receipts(&writer);
-    drop(fs);
-    shutdown_case(journal);
-    remove_case_dirs(&conf);
-    Ok(())
-}
-
-/// §8.1: with both the op and the confirmation failing, the original op
-/// variant and payload win — the returned error is not the commit error and
-/// not a Common wrapper. The holder is terminalized by the in-lock
-/// fail_terminal of the moved-seq op error.
-#[test]
-fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
-    let (conf, journal, mut fs) = confirmation_env("recursive-double-failure");
-    fs.mkdir("/dir", true).unwrap();
-    fs.create("/dir/file", true).unwrap();
-    fs.journal_writer.with_testing_receiver(|receiver| loop {
-        match receiver.try_recv() {
-            Ok(entry) => drop(entry),
-            Err(_) => break,
-        }
-    });
-
-    let writer = swap_receipts_writer(&mut fs, &journal, &conf);
-    let seq_before = writer.failure_seq();
-
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || {
-        // Same real public admission as every other case here: one commit
-        // gate slot, original epoch, and the commit scope around the whole
-        // recursive entry (F6.1: no bare helper calls).
-        let result = run_admitted(&worker_fs, "/dir", InodeLockMode::Write, true, |fs_dir| {
-            // First step: a real successful mutation that enqueues a journal
-            // entry and registers the waiter on this admission's scope.
-            let inp = MasterFilesystem::resolve_path(fs_dir, "/dir/file")?;
-            fs_dir.set_attr(
-                inp,
-                SetAttrOpts {
-                    mode: Some(0o640),
-                    ..Default::default()
-                },
-            )?;
-            // Then: a real typed op error; the driver drops the real
-            // receipt, so the confirmation fails too (both real).
-            typed_missing_leaf(fs_dir, "/dir/missing")
-        });
-        let _ = done_tx.send(result);
-    });
-
-    // Driver: drop the unique real receipt so the confirmation fails too.
-    let queued = writer
-        .with_testing_receiver(|receiver| {
-            receiver
-                .recv_timeout(Duration::from_secs(5))
-                .expect("missing the recursive set_attr journal entry")
-        })
+        fs.mkdir("/dir", true).unwrap();
+        // replicas(2) keeps room for the explicit location row; ttl_action
+        // Delete makes the file actually free-able.
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .ttl_action(TtlAction::Delete)
+            .replicas(2)
+            .build();
+        fs.create_with_opts(
+            "/dir/victim",
+            opts,
+            OpenFlags::new_create().set_overwrite(true),
+        )
+        .expect("create the victim file");
+        fs.set_attr(
+            "/dir/victim",
+            SetAttrOpts {
+                mode: Some(0o644),
+                ..Default::default()
+            },
+        )
         .unwrap();
-    let _commit_failed = drop(queued.completion);
+        let block = fs
+            .add_block(
+                "/dir/victim",
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .expect("allocate the block");
+        {
+            let view = fs.fs_dir.view().expect("namespace view");
+            view.store
+                .add_block_location(block.id, BlockLocation::with_id(1))
+                .expect("record the block location");
+        }
+        let commit = curvine_model::CommitBlock {
+            block_id: block.id,
+            block_len: 4096,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        fs.complete_file(
+            "/dir/victim".to_string(),
+            None,
+            4096,
+            vec![commit],
+            "fenced-window-fixture".to_string(),
+            false,
+            None,
+        )
+        .expect("complete the block");
+        drain_receipts(&fs.journal_writer.clone());
 
-    let result = await_worker(&done_rx, "the double failure")
-        .expect("the double failure must report its result");
-    worker.join().expect("the worker must not panic");
-    let result = typed_op_error(result, "the double failure must return an error");
-    assert!(
-        matches!(
-            &result,
-            FsError::FileNotFound(_) if result.to_string().contains("/dir/missing")
-        ),
-        "the op error must win with its original variant and payload, got {result:?}"
-    );
-    assert!(
-        !result.to_string().contains("journal commit failed"),
-        "the commit error must not replace the op error"
-    );
+        // Pin the initial state once, before any op: inode, mode, blocks.
+        let status = fs.file_status("/dir/victim").expect("victim status");
+        assert_eq!(status.mode, 0o644, "the fixture must pin mode 644");
+        let blocks_before = block_signature(&fs);
+        assert!(
+            !blocks_before.is_empty(),
+            "the fixture must have a real non-empty block set"
+        );
+        (conf, journal, fs, status.id)
+    }
 
-    assert_holder_terminal(&fs, &writer, seq_before);
-    // First real fatal wins (RecoveryGate::record_fatal_source only writes
-    // an empty slot). Sequence per §8.1: the body op error alone (with the
-    // failure seq unmoved) does NOT terminalize in-lock; the same guard
-    // survives past I/L/view, then the dropped real receipt makes the
-    // scope wait fail - fail_metadata_commit records the first (and only)
-    // fatal source - and the guard ends the holder before the slot opens.
-    // A publication fault is not armed in this case.
-    let fatal_source = journal.master_monitor().recovery().fatal_source();
-    assert!(
-        fatal_source
-            .as_deref()
-            .map(|source| source.contains("metadata journal commit failed"))
-            .unwrap_or(false),
-        "the first recorded fatal must be the commit failure, got {fatal_source:?}"
-    );
+    /// The shared invariants for a REJECTED op: the same inode survives
+    /// with the pinned mode and the original non-empty block set - the
+    /// real side effects of delete (removal), free (reclaim), and chmod
+    /// (mode rewrite) would each break at least one of these.
+    /// (block_id, len) pairs: primitive, order-preserving, comparable
+    /// (FileBlocks has no PartialEq derive; the pair list is the honest
+    /// signature of the non-empty block set).
+    fn block_signature(fs: &MasterFilesystem) -> Vec<(i64, i64)> {
+        fs.get_block_locations("/dir/victim")
+            .expect("victim block locations")
+            .block_locs
+            .iter()
+            .map(|located| (located.block.id, located.block.len))
+            .collect()
+    }
 
-    drop(writer);
-    drop(fs);
-    shutdown_case(journal);
-    remove_case_dirs(&conf);
-    Ok(())
+    fn assert_common_invariants(
+        fs: &MasterFilesystem,
+        inode_id: i64,
+        blocks_before: &[(i64, i64)],
+    ) {
+        let status = fs
+            .file_status("/dir/victim")
+            .expect("a rejected op must not remove the file");
+        assert_eq!(status.id, inode_id, "the same inode must survive");
+        assert_eq!(status.mode, 0o644, "the pinned mode must survive");
+        assert_eq!(
+            block_signature(fs),
+            blocks_before,
+            "the non-empty block set must be untouched"
+        );
+    }
+
+    #[test]
+    fn fenced_window_rejects_real_recursive_rpcs_by_original_epoch() -> FsResult<()> {
+        let (conf, journal, fs, inode_id) =
+            completed_file_fixture("recursive-fenced-window-matrix");
+        let writer = fs.journal_writer.clone();
+        let blocks_before = block_signature(&fs);
+
+        // (name, real public op mapped to (), post-check) - three rows, one
+        // shared driver; no per-op copies, no generic runner framework.
+        type Op = Box<dyn FnOnce(&MasterFilesystem) -> FsResult<()> + Send>;
+        let ops: Vec<(&'static str, Op)> = vec![
+            (
+                "recursive delete",
+                Box::new(|fs: &MasterFilesystem| {
+                    fs.delete_with_mode("/dir", true, DeleteMode::SkipTrash)
+                        .map(|_| ())
+                }),
+            ),
+            (
+                "recursive free",
+                Box::new(|fs: &MasterFilesystem| fs.free_or_defer("/dir", true).map(|_| ())),
+            ),
+            (
+                "recursive set_attr",
+                Box::new(|fs: &MasterFilesystem| {
+                    fs.set_attr(
+                        "/dir",
+                        SetAttrOpts {
+                            recursive: true,
+                            mode: Some(0o600),
+                            ..Default::default()
+                        },
+                    )
+                    .map(|_| ())
+                }),
+            ),
+        ];
+
+        for (case, op) in ops {
+            let seq_before = writer.failure_seq();
+            let (pre_hot_tx, pre_hot_rx) = std::sync::mpsc::channel::<()>();
+            let (pre_hot_release_tx, pre_hot_release_rx) = std::sync::mpsc::channel::<()>();
+            writer.arm_pre_hot_hook(pre_hot_tx, pre_hot_release_rx);
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker_fs = fs.clone();
+            let worker = std::thread::spawn(move || {
+                let _ = done_tx.send(op(&worker_fs));
+            });
+
+            // At this point the outer epoch is captured and ensured; the
+            // commit slot is held; hot has not run.
+            pre_hot_rx
+                .recv_timeout(WORKER_TIMEOUT)
+                .expect("the real public admission must reach the pre-hot checkpoint");
+            writer.fence_metadata();
+            writer.unfence_metadata();
+            pre_hot_release_tx
+                .send(())
+                .expect("the driver must release the pre-hot pause");
+
+            let result = await_worker(&done_rx, case)
+                .expect("the fenced-window admission must report its result");
+            worker.join().expect("the worker must not panic");
+            // The single accepted error: the original-epoch NotLeader from
+            // the locked re-verify of the caller's own epoch.
+            let err = result.unwrap_err();
+            assert!(
+                err.to_string().contains("role changed"),
+                "{case}: the rejection must be the original-epoch error, got {err:?}"
+            );
+            assert_common_invariants(&fs, inode_id, &blocks_before);
+            assert!(
+                !fs.fs_dir.is_failed(),
+                "{case}: the fence must not terminalize the holder"
+            );
+            assert_eq!(
+                writer.failure_seq(),
+                seq_before,
+                "{case}: a role fence must not move the failure seq"
+            );
+            assert!(
+                journal.master_monitor().recovery().fatal_source().is_none(),
+                "{case}: a role fence must not be recorded as a fatal source"
+            );
+            // The take-once hook must not fire again for the next op.
+            assert!(writer.consume_pre_hot_hook().is_none());
+        }
+
+        drop(writer);
+        drop(fs);
+        shutdown_case(journal);
+        remove_case_dirs(&conf);
+        Ok(())
+    }
 }

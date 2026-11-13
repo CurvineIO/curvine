@@ -1917,19 +1917,24 @@ impl JournalLoader {
                     plan.inode_requests(),
                 )
                 .map_err(|e| e.to_string())?;
-                // G2: static budget overflow — release inode locks and fall
-                // back to the cold bridge (no panic; no body re-run).
-                if result.is_none() {
-                    drop(inode_locks);
-                    let Some(body) = body_slot.take() else {
-                        return Err("replay body already consumed".to_string().into());
-                    };
-                    return self.with_replay_cold(body);
-                }
+                // G2: the view must be dropped before any cold bridge call —
+                // otherwise begin_cold self-waits on this thread's own view.
+                // The budget decision is made here; the actual fallback runs
+                // after the view is released.
+                drop(fs_dir);
                 result
             } else {
                 None
             };
+            // G2: static budget overflow — release I, then cold (view already
+            // dropped above, no self-wait).
+            if location_plan_opt.is_none() {
+                drop(inode_locks);
+                let Some(body) = body_slot.take() else {
+                    return Err("replay body already consumed".to_string().into());
+                };
+                return self.with_replay_cold(body);
+            }
             let location_locks = if need_locations {
                 let location_plan = location_plan_opt
                     .as_ref()
