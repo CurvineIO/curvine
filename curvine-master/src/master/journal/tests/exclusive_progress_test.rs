@@ -827,6 +827,9 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
 
     drop(fs);
     drop(loader);
+    // The case-owned runtime is an independent handle too: release it before
+    // the journal system is shut down.
+    drop(runtime);
     journal.shutdown();
     // Only the two independent roots this case created are removed. The
     // snapshot's files directory lives under meta_dir/checkpoint, so removing
