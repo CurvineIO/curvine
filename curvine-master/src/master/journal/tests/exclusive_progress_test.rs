@@ -78,12 +78,6 @@ impl ProgressFixture {
             .enable_all()
             .build()
             .unwrap();
-        // Start the real apply worker on the test-owned channel: role_change
-        // and the Scan both need a live consumer for their queue messages.
-        let loader_for_worker = loader.clone();
-        let _apply_worker = runtime.spawn(async move {
-            loader_for_worker.run_apply(receiver).await;
-        });
         Self {
             conf,
             journal,
@@ -132,20 +126,28 @@ fn committed_entry(op_entry: JournalEntry, req_id: i64) -> Entry {
 #[test]
 fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     let mut fixture = ProgressFixture::new("scan-progress");
+    let conf = fixture.conf.clone();
+
+    // Setup files first (original testing writer; entries drained in the
+    // fixture constructor).
     let fs = fixture.fs.clone();
     let gate = fs.metadata_commit_gate();
-
-    // Setup files: the delete target and a validation probe that must be
-    // blocked by the exclusive gate (create has no extra journal entry on
-    // failure, unlike mkdir/create flows that journal first).
     fs.mkdir("/dir", true).unwrap();
     fs.create("/dir/file", true).unwrap();
     fs.create("/validation", false).unwrap();
 
-    // Real receipts writer for the public exclusive delete.
-    let conf = fixture.conf.clone();
+    // Install the receipts writer BEFORE any fs/loader clone, so the
+    // exclusive scope, the FsDir body and the loader all share one Arc.
     let writer = fixture.swap_in_receipts_writer(&conf);
+    fixture.loader.journal_writer = writer.clone();
     let failure_seq_before = writer.failure_seq();
+
+    // Start the real apply worker AFTER the writer identity is aligned, so
+    // the loader's apply path uses the same receipts writer.
+    let loader_for_worker = fixture.loader.clone();
+    let apply_worker = fixture.runtime.spawn(async move {
+        loader_for_worker.run_apply(receiver).await;
+    });
 
     // Real role promotion through the actual role_change path.
     eprintln!("progress: promoting to leader");
