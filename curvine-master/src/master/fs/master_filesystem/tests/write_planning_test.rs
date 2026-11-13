@@ -514,9 +514,7 @@ fn exclusive_real_wait_unwind_fails_holder_via_raii_drop() {
     view_reopened_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the exclusive body must complete");
-    let view_reopened = (0..200)
-        .find(|_| fs.fs_dir.view().is_ok())
-        .is_some();
+    let view_reopened = (0..200).find(|_| fs.fs_dir.view().is_ok()).is_some();
     assert!(
         view_reopened,
         "the view must reopen once the body completes"

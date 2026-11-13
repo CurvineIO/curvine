@@ -1670,7 +1670,7 @@ impl MasterFilesystem {
     }
 
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
-        self.run_metadata_write(|| self.mkdir_single_parent_sharded(path.as_ref(), opts.clone()))
+        self.run_metadata_write(|| self.mkdir_single_parent_sharded(path.as_ref(), opts))
     }
 
     pub fn mkdir<T: AsRef<str>>(&self, path: T, create_parent: bool) -> FsResult<FileStatus> {
