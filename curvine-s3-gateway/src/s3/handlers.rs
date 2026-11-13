@@ -626,7 +626,16 @@ impl PutObjectHandler for S3Handlers {
                 .content_length
                 .and_then(|v| usize::try_from(v).ok())
                 .filter(|v| *v > 0);
-            let md5 = PutOperation::execute(context, &mut body, metadata, expect_length).await?;
+            let md5 = PutOperation::execute(
+                context,
+                &mut body,
+                metadata,
+                crate::s3::types::BodyExpect {
+                    length: expect_length,
+                    content_md5: opt.content_md5.as_deref(),
+                },
+            )
+            .await?;
             let _ = path;
 
             // Report what HEAD/GET will report for the same object.

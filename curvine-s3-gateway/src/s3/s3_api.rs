@@ -1905,7 +1905,14 @@ pub async fn handle_create_bucket<
             .and_then(|v| v.parse().ok()),
     };
     let url_path = req.url_path();
-    if let Err(e) = handler.handle(&opt, url_path.trim_matches('/')).await {
+    let bucket = url_path.trim_matches('/');
+    if let Err(e) = validate_bucket_name(bucket) {
+        log::info!("create bucket rejected: {e}");
+        resp.set_status(400);
+        resp.send_header();
+        return;
+    }
+    if let Err(e) = handler.handle(&opt, bucket).await {
         if e.contains("BucketAlreadyExists") {
             crate::utils::s3_utils::set_error_response(resp, 409); // Conflict
         } else {
@@ -1984,6 +1991,56 @@ pub async fn handle_delete_bucket<
     }
 }
 
+/// Whether `bucket` is a name S3 accepts.
+///
+/// Without this a one-character bucket was created and answered 200, while the
+/// protocol requires `InvalidBucketName` for anything outside 3-63 characters
+/// of lower-case letters, digits, dots and hyphens.
+fn validate_bucket_name(bucket: &str) -> Result<(), String> {
+    let bytes = bucket.as_bytes();
+    if !(3..=63).contains(&bytes.len()) {
+        return Err("InvalidBucketName: bucket names must be 3-63 characters".to_string());
+    }
+    let edge = |byte: u8| byte == b'.' || byte == b'-';
+    let valid_chars = bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || edge(*byte));
+    if !valid_chars
+        || edge(bytes[0])
+        || edge(bytes[bytes.len() - 1])
+        || bucket.contains("..")
+        || bucket.starts_with("xn--")
+        || bucket.parse::<std::net::IpAddr>().is_ok()
+    {
+        return Err("InvalidBucketName: the specified bucket is not valid".to_string());
+    }
+    Ok(())
+}
+
+/// Check a declared `Content-MD5` against the digest computed while streaming.
+///
+/// The header is the client's own integrity check: a malformed digest is
+/// `InvalidDigest` and a mismatch `BadDigest`. Ignoring it stored a body the
+/// client had already rejected.
+pub(crate) fn verify_content_md5(declared: Option<&str>, computed_hex: &str) -> Result<(), String> {
+    let Some(declared) = declared else {
+        return Ok(());
+    };
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(declared.trim())
+        .map_err(|_| "InvalidDigest: Content-MD5 must be base64 of the MD5 digest".to_string())?;
+    if decoded.len() != 16 {
+        return Err("InvalidDigest: Content-MD5 must decode to 16 bytes".to_string());
+    }
+    if hex::encode(decoded) != computed_hex {
+        return Err(
+            "BadDigest: the Content-MD5 you specified did not match what we received".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Map a handler error to the HTTP status the S3 protocol requires.
 ///
 /// Handlers report protocol conditions as text; without this the caller could
@@ -1998,7 +2055,12 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         404
     } else if err.starts_with("PreconditionFailed") {
         412
-    } else if err.starts_with("HashMismatch") || err.starts_with("ContentLengthMismatch") {
+    } else if err.starts_with("HashMismatch")
+        || err.starts_with("ContentLengthMismatch")
+        || err.starts_with("InvalidDigest")
+        || err.starts_with("BadDigest")
+        || err.starts_with("InvalidBucketName")
+    {
         400
     } else if err.starts_with("InvalidPart")
         || err.starts_with("EntityTooSmall")
@@ -2259,6 +2321,59 @@ mod tests {
         );
         // A genuine backend failure stays a server error.
         assert_eq!(status_for_error("Failed to write to destination: io"), 500);
+    }
+
+    /// A one-character bucket was created and answered 200; S3 requires
+    /// InvalidBucketName for anything outside its naming rules.
+    #[test]
+    fn bucket_names_outside_the_rules_are_rejected() {
+        for bad in [
+            "a",
+            "aa",
+            "-abc",
+            "abc-",
+            ".abc",
+            "abc.",
+            "a..b",
+            "Abc",
+            "192.168.1.1",
+            "xn--bucket",
+        ] {
+            assert!(validate_bucket_name(bad).is_err(), "{bad} must be rejected");
+        }
+        for good in ["abc", "a-b.c", "my-bucket-01", "a1b2c3"] {
+            assert!(
+                validate_bucket_name(good).is_ok(),
+                "{good} must be accepted"
+            );
+        }
+    }
+
+    /// The client's own integrity check must be enforced, not ignored.
+    #[test]
+    fn content_md5_is_verified() {
+        use base64::Engine;
+        let digest = [0x11u8; 16];
+        let declared = base64::engine::general_purpose::STANDARD.encode(digest);
+        let computed = hex::encode(digest);
+
+        assert!(verify_content_md5(None, &computed).is_ok());
+        assert!(verify_content_md5(Some(&declared), &computed).is_ok());
+
+        assert!(
+            verify_content_md5(Some(&declared), &hex::encode([0x22u8; 16]))
+                .expect_err("mismatch")
+                .starts_with("BadDigest")
+        );
+        assert!(verify_content_md5(Some("not base64!"), &computed)
+            .expect_err("malformed")
+            .starts_with("InvalidDigest"));
+        assert!(verify_content_md5(
+            Some(&base64::engine::general_purpose::STANDARD.encode([0u8; 8])),
+            &computed
+        )
+        .expect_err("short digest")
+        .starts_with("InvalidDigest"));
     }
 
     #[test]
