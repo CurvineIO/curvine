@@ -223,10 +223,7 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
     // ShardedOutcome has no Debug impl; extract the typed error directly.
     let op_err = match result {
         Err(op_err) => op_err,
-        Ok(_) => {
-            eprintln!("publication debug: wrapper returned Ok");
-            panic!("the op must fail with its typed error");
-        }
+        Ok(_) => panic!("the op must fail with its typed error"),
     };
     assert!(
         matches!(
