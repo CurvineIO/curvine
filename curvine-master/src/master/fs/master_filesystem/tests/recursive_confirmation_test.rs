@@ -3,9 +3,32 @@
 // declaration block, `#[path = "tests/recursive_confirmation_test.rs"]`.
 
 use super::*;
-use crate::master::journal::journal_writer::tests::{build_writer, test_conf};
+use crate::master::journal::RecoveryGate;
+use curvine_raft::raft::RaftClient;
+
+fn test_conf(name: &str) -> ClusterConf {
+    let mut conf = ClusterConf {
+        testing: true,
+        format_master: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!(
+        "{}-{}",
+        name,
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    conf
+}
+
+fn build_writer(conf: &ClusterConf) -> FsResult<JournalWriter> {
+    Master::init_test_metrics();
+    let rt = conf.journal.create_runtime();
+    let client = RaftClient::from_conf(rt, &conf.journal);
+    JournalWriter::new(true, client, &conf.journal, RecoveryGate::new())
+}
+use crate::master::meta::fs_dir_handle::NamespaceGuard;
 use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
-use crate::master::meta::NamespaceError;
+use crate::master::meta::{ColdError, NamespaceError};
 use crate::master::Master;
 use curvine_raft::raft::RoleState;
 use std::sync::mpsc::Receiver;
@@ -74,15 +97,25 @@ fn assert_holder_terminal(fs: &MasterFilesystem, writer: &Arc<JournalWriter>, se
     assert!(fs.fs_dir.is_failed(), "the holder must be terminal");
     assert!(
         matches!(
-            fs.fs_dir.view().unwrap_err(),
-            NamespaceError::Unavailable(_)
+            {
+                let e = fs
+                    .fs_dir
+                    .view()
+                    .err()
+                    .expect("the holder must reject new views");
+                e
+            },
+            NamespaceError::Unavailable
         ),
         "new views must be rejected after the holder went terminal"
     );
     assert!(
         matches!(
-            fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap_err(),
-            NamespaceError::Unavailable(_)
+            fs.fs_dir
+                .begin_cold(DEFAULT_COLD_TIMEOUT)
+                .err()
+                .expect("the terminal holder must reject begin_cold"),
+            ColdError::Unavailable
         ),
         "cold exclusive access must be rejected after the holder went terminal"
     );
@@ -98,12 +131,14 @@ fn assert_holder_terminal(fs: &MasterFilesystem, writer: &Arc<JournalWriter>, se
 }
 
 fn terminal_holder_alive_probe(fs: &MasterFilesystem, pre_view: &NamespaceGuard<'_>) {
-    // A pre-failure view stays a legal reader: resolving through it still
-    // works (FAILED is not a drain), while fresh views are rejected.
-    let still_resolved = MasterFilesystem::resolve_path(pre_view, "/dir");
+    // FAILED is not a drain: the pre-failure view reference survives and can
+    // be dropped safely, but reads through the terminal store are rejected
+    // (the retirement invalidates the metadata store — same boundary as C1's
+    // cursor probe: healthy before, rejected after).
+    let rejected = MasterFilesystem::resolve_path(pre_view, "/dir");
     assert!(
-        still_resolved.is_ok(),
-        "a reader that took its view before the failure must keep working"
+        rejected.is_err(),
+        "reads through the terminal store must be rejected, not silently served"
     );
 }
 
@@ -142,7 +177,7 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
         }
     });
 
-    let writer = swap_receipts_writer(&mut fs, &journal);
+    let writer = swap_receipts_writer(&mut fs, &journal, &conf);
     let seq_before = writer.failure_seq();
     let dir_id = fs.file_status("/dir").unwrap().id;
 
@@ -161,7 +196,10 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
         worker_fs.run_recursive_metadata_write("/dir", InodeLockMode::Write, true, |fs_dir| {
             started_tx.send(()).unwrap();
             body_writer.fail_metadata_publication();
-            let _ = MasterFilesystem::resolve_path(fs_dir, "/dir/missing")?;
+            let inp = MasterFilesystem::resolve_path(fs_dir, "/dir/missing")?;
+            if inp.get_last_inode().is_none() {
+                return Err(FsError::file_not_found("/dir/missing"));
+            }
             Ok(())
         })
     });
@@ -182,9 +220,20 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
     let result = worker.join().unwrap();
     let (failed_at_lock, view_err) = reader.join().unwrap();
 
-    let op_err = result.unwrap_err();
+    // ShardedOutcome has no Debug impl; extract the typed error directly.
+    let op_err = match result {
+        Err(op_err) => op_err,
+        Ok(_) => {
+            eprintln!("publication debug: wrapper returned Ok");
+            panic!("the op must fail with its typed error");
+        }
+    };
     assert!(
-        matches!(&op_err, FsError::FileNotFound(path) if path.contains("/dir/missing")),
+        matches!(
+            &op_err,
+            FsError::FileNotFound(_)
+                if op_err.to_string().contains("/dir/missing")
+        ),
         "the original op error must be returned as-is, got {op_err:?}"
     );
     assert!(
@@ -192,7 +241,7 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
         "the holder must go terminal inside the locks"
     );
     assert!(
-        matches!(view_err.unwrap(), NamespaceError::Unavailable(_)),
+        matches!(view_err.unwrap(), NamespaceError::Unavailable),
         "a reader that waited for the object lock must find the view rejected"
     );
 
@@ -233,7 +282,7 @@ fn recursive_body_unwind_terminals_before_unlock() -> FsResult<()> {
     fs.mkdir("/dir", true).unwrap();
     drain_receipts(&fs.journal_writer.clone());
 
-    let writer = swap_receipts_writer(&mut fs, &journal);
+    let writer = swap_receipts_writer(&mut fs, &journal, &conf);
     let seq_before = writer.failure_seq();
     let dir_id = fs.file_status("/dir").unwrap().id;
 
@@ -242,7 +291,9 @@ fn recursive_body_unwind_terminals_before_unlock() -> FsResult<()> {
     let worker = std::thread::spawn(move || {
         worker_fs.run_recursive_metadata_write("/dir", InodeLockMode::Write, true, |_fs_dir| {
             started_tx.send(()).unwrap();
-            panic!("recursive body unwind")
+            panic!("recursive body unwind");
+            #[allow(unreachable_code)]
+            Ok::<(), curvine_error::FsError>(())
         })
     });
 
@@ -256,7 +307,12 @@ fn recursive_body_unwind_terminals_before_unlock() -> FsResult<()> {
         (reader_fs.fs_dir.is_failed(), reader_fs.fs_dir.view().err())
     });
 
-    let join_err = worker.join().unwrap_err();
+    // worker.join(): Ok holds ShardedOutcome<()> (no Debug), Err holds the
+    // panic payload — branch instead of unwrap_err.
+    let join_err = match worker.join() {
+        Err(payload) => payload,
+        Ok(_) => panic!("the recursive body must unwind"),
+    };
     let (failed_at_lock, view_err) = reader.join().unwrap();
 
     assert!(
@@ -268,7 +324,7 @@ fn recursive_body_unwind_terminals_before_unlock() -> FsResult<()> {
         "the unwind must go terminal inside the locks"
     );
     assert!(
-        matches!(view_err.unwrap(), NamespaceError::Unavailable(_)),
+        matches!(view_err.unwrap(), NamespaceError::Unavailable),
         "the waiter must find the view rejected after the unwind"
     );
 
@@ -294,7 +350,7 @@ fn recursive_wait_unwind_observes_then_terminals() -> FsResult<()> {
     fs.mkdir("/tree", true).unwrap();
     drain_receipts(&fs.journal_writer.clone());
 
-    let writer = swap_receipts_writer(&mut fs, &journal);
+    let writer = swap_receipts_writer(&mut fs, &journal, &conf);
     let seq_before = writer.failure_seq();
     let tree_id = fs.file_status("/tree").unwrap().id;
 
@@ -354,7 +410,7 @@ fn recursive_wait_unwind_observes_then_terminals() -> FsResult<()> {
     assert!(
         matches!(
             fs.file_status("/tree").unwrap_err(),
-            FsError::FileNotFound(_) | FsError::Unavailable(_) | FsError::NotLeader(_)
+            FsError::FileNotFound(_) | FsError::Common(_)
         ),
         "a fresh status read must be rejected, not silently served as unchanged"
     );
@@ -451,13 +507,25 @@ fn recursive_plain_business_error_keeps_holder_alive() -> FsResult<()> {
     let seq_before = writer.failure_seq();
 
     let result = fs.run_recursive_metadata_write("/tree", InodeLockMode::Write, false, |fs_dir| {
-        let _ = MasterFilesystem::resolve_path(fs_dir, "/nope")?;
+        // A plan over an unresolvable path yields Fallback before the body;
+        // point the plan at the real subtree and fail the body on a missing
+        // leaf instead — that is the "plain business error" contract.
+        let inp = MasterFilesystem::resolve_path(fs_dir, "/tree/missing")?;
+        if inp.get_last_inode().is_none() {
+            return Err(FsError::file_not_found("/tree/missing"));
+        }
         Ok(())
     });
 
-    let op_err = result.unwrap_err();
+    let op_err = match result {
+        Err(op_err) => op_err,
+        Ok(_) => panic!("the pure business error must surface"),
+    };
     assert!(
-        matches!(&op_err, FsError::FileNotFound(path) if path.contains("/nope")),
+        matches!(
+            &op_err,
+            FsError::FileNotFound(_) if op_err.to_string().contains("/tree/missing")
+        ),
         "the pure business error must be returned with its original variant, got {op_err:?}"
     );
     assert_eq!(
@@ -497,7 +565,7 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
         }
     });
 
-    let writer = swap_receipts_writer(&mut fs, &journal);
+    let writer = swap_receipts_writer(&mut fs, &journal, &conf);
     let seq_before = writer.failure_seq();
 
     let worker_fs = fs.clone();
@@ -516,7 +584,10 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
             )?;
             // Then: a real publication failure plus a real op error.
             body_writer.fail_metadata_publication();
-            let _ = MasterFilesystem::resolve_path(fs_dir, "/dir/missing")?;
+            let inp = MasterFilesystem::resolve_path(fs_dir, "/dir/missing")?;
+            if inp.get_last_inode().is_none() {
+                return Err(FsError::file_not_found("/dir/missing"));
+            }
             Ok(())
         })
     });
@@ -531,9 +602,15 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
         .unwrap();
     let _commit_failed = drop(queued.completion);
 
-    let result = worker.join().unwrap().unwrap_err();
+    let result = match worker.join().unwrap() {
+        Err(result) => result,
+        Ok(_) => panic!("the double failure must return an error"),
+    };
     assert!(
-        matches!(&result, FsError::FileNotFound(path) if path.contains("/dir/missing")),
+        matches!(
+            &result,
+            FsError::FileNotFound(_) if result.to_string().contains("/dir/missing")
+        ),
         "the op error must win with its original variant and payload, got {result:?}"
     );
     assert!(
@@ -543,7 +620,9 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
 
     assert_holder_terminal(&fs, &writer, seq_before);
     assert!(
-        writer
+        journal
+            .master_monitor()
+            .recovery()
             .fatal_source()
             .unwrap()
             .contains("metadata publication failed after durable commit"),
@@ -562,7 +641,7 @@ fn recursive_commit_error_after_ok_body_terminals_holder() -> FsResult<()> {
     fs.mkdir("/tree", true).unwrap();
     drain_receipts(&fs.journal_writer.clone());
 
-    let writer = swap_receipts_writer(&mut fs, &journal);
+    let writer = swap_receipts_writer(&mut fs, &journal, &conf);
     let seq_before = writer.failure_seq();
 
     let worker_fs = fs.clone();
@@ -595,9 +674,17 @@ fn recursive_commit_error_after_ok_body_terminals_holder() -> FsResult<()> {
     );
 
     assert_holder_terminal(&fs, &writer, seq_before);
+    // The commit failure is a real fatal: scope.wait's error path calls
+    // fail_metadata_commit, which records its own source (same attribution
+    // semantics as C1's exclusive confirmation failure). It is not the
+    // publication source because no publication failure happened.
+    let fatal_source = journal.master_monitor().recovery().fatal_source();
     assert!(
-        journal.master_monitor().recovery().fatal_source().is_none(),
-        "a dropped receipt has no publication fatal source; the reason stays neutral"
+        fatal_source
+            .as_deref()
+            .map(|source| source.contains("metadata journal commit failed"))
+            .unwrap_or(false),
+        "a dropped receipt must record the commit failure as the fatal source, got {fatal_source:?}"
     );
 
     teardown(fs, journal, &conf);

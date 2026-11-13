@@ -7194,6 +7194,8 @@ mod tests {
     mod get_block_locations_batch_test;
     #[path = "lost_worker_gate_test.rs"]
     mod lost_worker_gate_test;
+    #[path = "recursive_confirmation_test.rs"]
+    mod recursive_confirmation_test;
     #[path = "recursive_lock_set_test.rs"]
     mod recursive_lock_set_test;
     #[path = "rename_failure_test.rs"]
