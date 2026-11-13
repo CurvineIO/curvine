@@ -304,11 +304,12 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     });
     let rpc_started = rpc_started_rx.recv_timeout(HANDSHAKE_WINDOW);
     let rpc_pending = rpc_rx.recv_timeout(Duration::from_millis(200));
-    let rpc_still_blocked = matches!(rpc_pending, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
-    assert!(
-        rpc_still_blocked,
-        "a second write RPC must stay blocked by the exclusive gate, got {rpc_pending:?}"
-    );
+    // Saved and reused below, like the other probes: only a timed-out probe
+    // starts another wait on this receiver. The "blocked by the gate" check
+    // moves to the closing assertions so an early result cannot panic past
+    // teardown.
+    let rpc_blocked_at_body =
+        matches!(rpc_pending, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
 
     // Real Scan through the loader: register the delete as committed, run the
     // actual apply worker against it, and observe the cursor advance. The
@@ -412,7 +413,14 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
 
     // The blocked RPC resumes only to be fenced: the writer refuses new
     // admissions after the terminal failure.
-    let rpc_outcome = wait_same_result(&rpc_rx, HANDSHAKE_WINDOW, HANDSHAKE_WINDOW);
+    // Only a timed-out probe starts another wait on the same receiver.
+    let rpc_outcome = match rpc_pending {
+        Ok(value) => Waited::Delivered(value),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Waited::Disconnected,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            wait_same_result(&rpc_rx, HANDSHAKE_WINDOW, HANDSHAKE_WINDOW)
+        }
+    };
     let rpc_result = match rpc_outcome {
         Waited::Delivered(result) => result,
         Waited::Disconnected => {
@@ -495,6 +503,10 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     assert!(
         worker_pending_at_body,
         "the delete must still be waiting when the body completes"
+    );
+    assert!(
+        rpc_blocked_at_body,
+        "a second write RPC must stay blocked by the exclusive gate"
     );
 }
 
