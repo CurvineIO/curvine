@@ -2745,6 +2745,10 @@ mod journal_watermark_test;
 mod recursive_replay_lock_test;
 
 #[cfg(test)]
+#[path = "tests/recursive_rpc_progress_test.rs"]
+mod recursive_rpc_progress_test;
+
+#[cfg(test)]
 #[path = "tests/replay_lock_test.rs"]
 mod replay_lock_test;
 
