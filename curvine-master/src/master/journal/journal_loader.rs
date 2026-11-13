@@ -74,6 +74,10 @@ pub(crate) mod snapshot_apply_gate;
 #[path = "tests/snapshot_cancel_gate_test.rs"]
 mod snapshot_cancel_gate_test;
 
+#[cfg(test)]
+#[path = "tests/exclusive_progress_test.rs"]
+mod exclusive_progress_test;
+
 enum UfsDrive {
     CaughtUp,
     Advanced,

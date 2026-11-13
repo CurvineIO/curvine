@@ -42,6 +42,7 @@ struct ProgressFixture {
     journal: JournalSystem,
     fs: crate::master::fs::MasterFilesystem,
     loader: JournalLoader,
+    receiver: Option<AsyncReceiver<ApplyMsg>>,
     runtime: tokio::runtime::Runtime,
     meta_dir: String,
     journal_dir: String,
@@ -83,6 +84,7 @@ impl ProgressFixture {
             journal,
             fs,
             loader,
+            receiver: Some(receiver),
             runtime,
             meta_dir,
             journal_dir,
@@ -128,23 +130,47 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     let mut fixture = ProgressFixture::new("scan-progress");
     let conf = fixture.conf.clone();
 
-    // Setup files first (original testing writer; entries drained in the
-    // fixture constructor).
-    let fs = fixture.fs.clone();
-    let gate = fs.metadata_commit_gate();
-    fs.mkdir("/dir", true).unwrap();
-    fs.create("/dir/file", true).unwrap();
-    fs.create("/validation", false).unwrap();
+    // Phase 1: setup with the original testing writer, then drain its
+    // retained entries.
+    let setup_fs = fixture.fs.clone();
+    setup_fs.mkdir("/dir", true).unwrap();
+    setup_fs.create("/dir/file", true).unwrap();
+    setup_fs.create("/validation", false).unwrap();
+    setup_fs
+        .journal_writer
+        .with_testing_receiver(|receiver| loop {
+            match receiver.try_recv() {
+                Ok(entry) => drop(entry),
+                Err(_) => break,
+            }
+        });
 
-    // Install the receipts writer BEFORE any fs/loader clone, so the
-    // exclusive scope, the FsDir body and the loader all share one Arc.
+    // Phase 2: install the receipts writer and align every participant
+    // (FsDir body / final fs clone / loader) on the same Arc — verified with
+    // a short view + Arc::ptr_eq, released immediately.
     let writer = fixture.swap_in_receipts_writer(&conf);
     fixture.loader.journal_writer = writer.clone();
+    // Clone AFTER the swap: MasterFilesystem clones hold their own
+    // journal_writer Arc, so a pre-swap clone would keep the old writer.
+    let mfs = fixture.fs.clone();
+    let gate = mfs.metadata_commit_gate();
+    {
+        let view = mfs.fs_dir.view().unwrap();
+        assert!(
+            Arc::ptr_eq(&view.journal_writer, &writer),
+            "the FsDir must use the receipts writer"
+        );
+    }
+    assert!(Arc::ptr_eq(&fixture.loader.journal_writer, &writer));
+    assert!(Arc::ptr_eq(&mfs.journal_writer, &writer));
     let failure_seq_before = writer.failure_seq();
 
-    // Start the real apply worker AFTER the writer identity is aligned, so
-    // the loader's apply path uses the same receipts writer.
+    // Phase 3: start the real apply worker on the aligned loader.
     let loader_for_worker = fixture.loader.clone();
+    let receiver = match fixture.receiver.take() {
+        Some(receiver) => receiver,
+        None => panic!("the apply receiver must exist exactly once"),
+    };
     let apply_worker = fixture.runtime.spawn(async move {
         loader_for_worker.run_apply(receiver).await;
     });
@@ -158,7 +184,7 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     eprintln!("progress: leader promoted");
 
     // Public recursive delete on its own OS thread.
-    let delete_fs = fs.clone();
+    let delete_fs = mfs.clone();
     let (delete_started_tx, delete_started_rx) = std::sync::mpsc::channel();
     let (delete_done_tx, delete_done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -193,19 +219,12 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     // pending.
     let deadline = std::time::Instant::now() + HANDSHAKE_WINDOW;
     let view_while_held = loop {
-        match fs.fs_dir.view() {
-            Ok(_) => {
-                eprintln!("progress: view reopened");
-                break None;
-            }
+        match mfs.fs_dir.view() {
+            Ok(_) => break None,
             Err(NamespaceError::Busy) if std::time::Instant::now() < deadline => {
-                eprintln!("progress: view busy, cold still dropping");
                 std::thread::yield_now();
             }
-            Err(e) => {
-                eprintln!("progress: view terminal: {e}");
-                break Some(e);
-            }
+            Err(e) => break Some(e),
         }
     };
     assert!(
@@ -213,7 +232,7 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
         "the view must reopen once the body completes, got {view_while_held:?}"
     );
     assert!(
-        matches!(fs.file_status("/dir"), Err(e) if matches!(e, curvine_error::FsError::FileNotFound(_))),
+        matches!(mfs.file_status("/dir"), Err(e) if matches!(e, curvine_error::FsError::FileNotFound(_))),
         "the directory must be deleted in the live tree"
     );
     let seq_while_held = writer.failure_seq();
@@ -236,7 +255,7 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     assert!(
         Arc::ptr_eq(
             &fixture.loader.metadata_commit_gate,
-            &fs.metadata_commit_gate()
+            &mfs.metadata_commit_gate()
         ),
         "the loader and the filesystem must share one gate"
     );
@@ -244,7 +263,7 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     // A second write RPC must stay blocked by the gate: create on a fresh
     // path fails nothing, it just cannot proceed. Started ack + bounded
     // pending is the evidence.
-    let rpc_fs = fs.clone();
+    let rpc_fs = mfs.clone();
     let (rpc_started_tx, rpc_started_rx) = std::sync::mpsc::channel::<()>();
     let (rpc_tx, rpc_rx) = std::sync::mpsc::channel();
     let rpc = std::thread::spawn(move || {
@@ -313,9 +332,9 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
         Err(err) => err,
     };
     worker.join().expect("delete worker must not panic");
-    assert!(fs.fs_dir.is_failed());
+    assert!(mfs.fs_dir.is_failed());
     assert!(
-        matches!(fs.fs_dir.view().err(), Some(NamespaceError::Unavailable)),
+        matches!(mfs.fs_dir.view().err(), Some(NamespaceError::Unavailable)),
         "the view must be Unavailable after the terminal failure"
     );
     assert_ne!(writer.failure_seq(), failure_seq_before);
@@ -369,7 +388,7 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
             Err(_) => break,
         }
     });
-    drop(fs);
+    drop(mfs);
     fixture.journal.shutdown();
     let _ = std::fs::remove_dir_all(&fixture.meta_dir);
     let _ = std::fs::remove_dir_all(&fixture.journal_dir);

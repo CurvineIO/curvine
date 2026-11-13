@@ -137,6 +137,27 @@ pub struct JournalWriter {
 }
 
 impl JournalWriter {
+    /// Test-only: switches the writer into real-commit-receipt mode and
+    /// binds it to the live recovery gate.
+    #[cfg(test)]
+    pub(crate) fn enable_testing_receipts(&mut self, recovery: RecoveryGate) {
+        self.require_raft_commit = true;
+        self.recovery = recovery;
+    }
+
+    /// Test-only: runs `f` with the retained receiver when the writer runs
+    /// without the sender task (testing builds), so cross-module regression
+    /// tests can observe real queued receipts.
+    #[cfg(test)]
+    pub(crate) fn with_testing_receiver<R>(
+        &self,
+        f: impl FnOnce(&BlockingReceiver<QueuedJournalEntry>) -> R,
+    ) -> Option<R> {
+        self.receiver
+            .as_ref()
+            .map(|receiver| f(&receiver.lock().unwrap()))
+    }
+
     pub fn new(
         testing: bool,
         client: RaftClient,
