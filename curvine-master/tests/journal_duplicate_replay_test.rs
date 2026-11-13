@@ -17,50 +17,19 @@ use curvine_master::master::journal::JournalSystem;
 use curvine_master::master::Master;
 use curvine_runtime::common::Utils;
 
-// A timed-out proposal can be committed before the RPC is retried. This test
-// isolates reordered follower replay; it does not simulate the RPC timeout.
-#[test]
-#[ignore = "duplicate proposal replay lacks a durable idempotency boundary"]
-fn delayed_duplicate_delete_does_not_remove_recreated_path() {
-    Master::init_test_metrics();
-    let mut source_conf = ClusterConf {
-        testing: true,
-        ..Default::default()
-    };
-    source_conf.change_test_meta_dir(format!("duplicate-source-{}", Utils::rand_str(8)));
-    let mut target_conf = ClusterConf {
-        testing: true,
-        ..Default::default()
-    };
-    target_conf.change_test_meta_dir(format!("duplicate-target-{}", Utils::rand_str(8)));
-    let source = JournalSystem::from_conf(&source_conf).unwrap();
-    let target = JournalSystem::from_conf(&target_conf).unwrap();
-    let fs = source.fs();
-    fs.mkdir("/duplicate", false).unwrap();
-    let mkdir = fs.fs_dir.view().unwrap().take_entries();
-    fs.delete("/duplicate", false).unwrap();
-    let delete = fs.fs_dir.view().unwrap().take_entries();
-    fs.mkdir("/duplicate", false).unwrap();
-    let recreate = fs.fs_dir.view().unwrap().take_entries();
-    assert_eq!((mkdir.len(), delete.len(), recreate.len()), (1, 1, 1));
-    let loader = target.journal_loader();
-    loader.apply_entry(mkdir[0].clone()).unwrap();
-    loader.apply_entry(delete[0].clone()).unwrap();
-    loader.apply_entry(recreate[0].clone()).unwrap();
-    loader.apply_entry(delete[0].clone()).unwrap();
-    assert!(target.fs().exists("/duplicate").unwrap());
-    source.shutdown();
-    target.shutdown();
-}
-
 // ---------------------------------------------------------------------------
-// Real Raft batch boundary.
+// Request-level duplicate Delete replay.
 //
-// The ignored case above calls `apply_entry` directly, which bypasses the
-// Raft Entry context, `JournalBatch` decode, and the durable applied-request
-// check in `apply0`. This case drives the same public `AppStorage::apply`
-// entry the applier uses, with real encoded batches and distinct request ids,
-// so the persisted dedup boundary actually runs.
+// Duplicate-proposal dedup belongs to the Raft Entry boundary: the request id
+// travels in `Entry.context`, the batch is decoded by `apply0`, and the
+// persisted applied-request record decides whether the batch replays. A raw
+// `apply_entry(JournalEntry)` does not carry any of that and therefore does
+// not promise this semantics; replaying a Delete primitive directly will just
+// delete whatever the path resolves to now.
+//
+// This case drives the same public `AppStorage::apply` entry the applier uses,
+// with real encoded batches and distinct request ids, so the durable boundary
+// actually runs.
 // ---------------------------------------------------------------------------
 
 use curvine_master::master::journal::{JournalBatch, JournalEntry};
@@ -158,14 +127,19 @@ fn raft_request_duplicate_delete_preserves_recreated_inode() {
                 })
                 .expect("applying a committed entry must finish within the bound")
         };
-        // Short view borrow: only the owned record leaves the block.
-        let applied_req = |req_id: i64| {
+        // Short view borrows: only owned values or errors leave these blocks.
+        let applied_req = |req_id: i64| -> Result<Option<(u64, u64)>, String> {
             let handle = target_fs.fs_dir();
-            let view = handle.view().expect("namespace view");
+            let view = handle.view().map_err(|error| error.to_string())?;
             view.get_rocks_store()
                 .get_applied_req(req_id)
-                .expect("read the applied-request record")
-                .map(|record| (record.index, record.term))
+                .map(|record| record.map(|row| (row.index, row.term)))
+                .map_err(|error| error.to_string())
+        };
+        let read_echo = || -> Result<Vec<JournalEntry>, String> {
+            let handle = target_fs.fs_dir();
+            let view = handle.view().map_err(|error| error.to_string())?;
+            Ok(view.take_entries())
         };
 
         let first_result = apply(first);
@@ -190,7 +164,7 @@ fn raft_request_duplicate_delete_preserves_recreated_inode() {
         let original_lookup = target_fs.file_status_by_id("/duplicate", Some(original_id));
         let fsm_after_duplicate = loader.get_fsm_state().applied;
         let cursors_after = (applied_req(101), applied_req(102), applied_req(103));
-        let echo = target_fs.fs_dir().view().unwrap().take_entries();
+        let echo = read_echo();
         (
             first_result,
             second_result,
@@ -208,19 +182,12 @@ fn raft_request_duplicate_delete_preserves_recreated_inode() {
     };
 
     // The source filesystem and both systems are released before the
-    // assertions; directory removal results are saved, not swallowed.
+    // assertions; each tree removal keeps its own result.
     drop(source_fs);
     source.shutdown();
     target.shutdown();
-    let cleanup = (|| {
-        let mut first_error = None;
-        for root in [&source_root, &target_root] {
-            if let Err(error) = std::fs::remove_dir_all(root) {
-                first_error.get_or_insert(error);
-            }
-        }
-        first_error
-    })();
+    let source_cleanup = std::fs::remove_dir_all(&source_root);
+    let target_cleanup = std::fs::remove_dir_all(&target_root);
 
     let (
         first_result,
@@ -262,6 +229,7 @@ fn raft_request_duplicate_delete_preserves_recreated_inode() {
         ),
         "the original inode must stay gone, got: {original_lookup:?}"
     );
+    let echo = echo.expect("reading the journal echo must succeed");
     assert!(
         echo.is_empty(),
         "replay must not echo journal entries: {echo:?}"
@@ -278,6 +246,22 @@ fn raft_request_duplicate_delete_preserves_recreated_inode() {
         (4, 1),
         "the duplicate must advance the watermark to (4,1)"
     );
+    let cursors_before = (
+        cursors_before.0.expect("read request 101"),
+        cursors_before.1.expect("read request 102"),
+        cursors_before.2.expect("read request 103"),
+    );
+    let cursors_after = (
+        cursors_after
+            .0
+            .expect("read request 101 after the duplicate"),
+        cursors_after
+            .1
+            .expect("read request 102 after the duplicate"),
+        cursors_after
+            .2
+            .expect("read request 103 after the duplicate"),
+    );
     assert_eq!(
         cursors_before,
         (Some((1, 1)), Some((2, 1)), Some((3, 1))),
@@ -287,5 +271,6 @@ fn raft_request_duplicate_delete_preserves_recreated_inode() {
         cursors_after, cursors_before,
         "the duplicate must not rewrite any applied-request record"
     );
-    assert!(cleanup.is_none(), "cleanup failed: {cleanup:?}");
+    source_cleanup.expect("the source test tree must be removed");
+    target_cleanup.expect("the target test tree must be removed");
 }
