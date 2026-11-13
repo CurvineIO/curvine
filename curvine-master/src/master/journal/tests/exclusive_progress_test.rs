@@ -37,6 +37,32 @@ use std::time::Duration;
 
 const HANDSHAKE_WINDOW: Duration = Duration::from_secs(10);
 
+/// One bounded observation of a single result. The early window is the probe;
+/// the late window only runs when the probe timed out, and both observe the
+/// same receiver, so a late arrival is still the same request rather than a
+/// resend. `Disconnected` is a producer-side end, not a timeout.
+enum Waited<T> {
+    Delivered(T),
+    Disconnected,
+    Timeout,
+}
+
+fn wait_same_result<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    early: Duration,
+    late: Duration,
+) -> Waited<T> {
+    match rx.recv_timeout(early) {
+        Ok(value) => Waited::Delivered(value),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Waited::Disconnected,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match rx.recv_timeout(late) {
+            Ok(value) => Waited::Delivered(value),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Waited::Disconnected,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Waited::Timeout,
+        },
+    }
+}
+
 struct ProgressFixture {
     conf: ClusterConf,
     journal: JournalSystem,
@@ -339,9 +365,16 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     // terminal before the exclusive gate opens.
     drop(completion);
 
-    let delete_done = delete_done_rx
-        .recv_timeout(HANDSHAKE_WINDOW)
-        .expect("the delete must finish once the confirmation fails");
+    let delete_outcome = wait_same_result(&delete_done_rx, HANDSHAKE_WINDOW, HANDSHAKE_WINDOW);
+    let delete_done = match delete_outcome {
+        Waited::Delivered(result) => result,
+        Waited::Disconnected => {
+            panic!("the delete worker exited without reporting a result")
+        }
+        Waited::Timeout => panic!(
+            "the delete did not report a result; skipping its join and the blocking teardown"
+        ),
+    };
     let delete_err = match delete_done {
         Ok(_) => panic!("the delete must fail on a dropped confirmation"),
         Err(err) => err,
@@ -371,9 +404,14 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
 
     // The blocked RPC resumes only to be fenced: the writer refuses new
     // admissions after the terminal failure.
-    let rpc_result = rpc_rx
-        .recv_timeout(HANDSHAKE_WINDOW)
-        .expect("the blocked RPC must resume once the gate opens");
+    let rpc_outcome = wait_same_result(&rpc_rx, HANDSHAKE_WINDOW, HANDSHAKE_WINDOW);
+    let rpc_result = match rpc_outcome {
+        Waited::Delivered(result) => result,
+        Waited::Disconnected => {
+            panic!("the blocked RPC thread exited without reporting a result")
+        }
+        Waited::Timeout => panic!("the blocked RPC did not resume; skipping its join"),
+    };
     let rpc_err = rpc_result
         .err()
         .expect("the resumed RPC must be rejected by the fence, not run");
@@ -397,14 +435,12 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
                 .await
         })
         .unwrap();
-    fixture
-        .runtime
-        .block_on(async {
-            tokio::time::timeout(HANDSHAKE_WINDOW, shutdown_rx.receive())
-                .await
-                .expect("shutdown must be acknowledged")
-        })
-        .unwrap();
+    let shutdown_ack = fixture.runtime.block_on(async {
+        tokio::time::timeout(HANDSHAKE_WINDOW, shutdown_rx.receive()).await
+    });
+    if shutdown_ack.is_err() {
+        panic!("the shutdown was not acknowledged; skipping teardown that could block");
+    }
     writer.with_testing_receiver(|receiver| loop {
         match receiver.try_recv() {
             Ok(entry) => drop(entry),
@@ -413,12 +449,15 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     });
     // A shutdown ack is not worker exit: join the real apply worker and the
     // blocked RPC thread before tearing the directories down.
-    fixture.runtime.block_on(async {
-        tokio::time::timeout(HANDSHAKE_WINDOW, apply_worker)
-            .await
-            .expect("the apply worker must exit after shutdown")
-            .expect("the apply worker must not panic");
-    });
+    let worker_exit = fixture
+        .runtime
+        .block_on(async { tokio::time::timeout(HANDSHAKE_WINDOW, apply_worker).await });
+    match worker_exit {
+        Ok(result) => result.expect("the apply worker must not panic"),
+        Err(_) => {
+            panic!("the apply worker did not exit after shutdown; skipping blocking teardown")
+        }
+    }
     rpc.join().expect("the blocked RPC thread must not panic");
     // Release every independent handle this case still owns before the
     // journal system is shut down.
@@ -495,9 +534,17 @@ fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
     let delete_path = dir_path.clone();
     let worker = std::thread::spawn(move || done_tx.send(delete_fs.delete(&delete_path, true)));
 
-    let delete_result = done_rx.recv_timeout(HANDSHAKE_WINDOW);
+    let delete_outcome = wait_same_result(&done_rx, HANDSHAKE_WINDOW, HANDSHAKE_WINDOW);
+    // Remove the rule before any branch below can fail, so a panic never
+    // leaves the process-global fault configured.
     runtime.remove(rule_id).unwrap();
-    let delete_result = delete_result.expect("the delete must finish within the window");
+    let delete_result = match delete_outcome {
+        Waited::Delivered(result) => result,
+        Waited::Disconnected => panic!("the delete worker exited without reporting a result"),
+        Waited::Timeout => {
+            panic!("the delete did not report a result; skipping its join and blocking teardown")
+        }
+    };
     worker.join().expect("delete worker must not panic");
 
     // The op error keeps its original variant and message; the failure
@@ -726,9 +773,14 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
     // restore proceeds into apply_snapshot0 — reporting the holder failed.
     eprintln!("restore: dropping completion");
     drop(completion);
-    let delete_done = delete_done_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the delete must finish once the confirmation fails");
+    let delete_outcome = wait_same_result(&delete_done_rx, Duration::from_secs(10), Duration::from_secs(10));
+    let delete_done = match delete_outcome {
+        Waited::Delivered(result) => result,
+        Waited::Disconnected => panic!("the delete worker exited without reporting a result"),
+        Waited::Timeout => {
+            panic!("the delete did not report a result; skipping its join and blocking teardown")
+        }
+    };
     worker.join().expect("delete worker must not panic");
     let delete_err = match delete_done {
         Ok(_) => panic!("the delete must fail on a dropped confirmation"),
@@ -742,9 +794,15 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
         "the delete must surface the real commit error, got {delete_err}"
     );
 
-    let restore_result = restore_done_rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("the restore intent must return once the gate opens");
+    let restore_outcome =
+        wait_same_result(&restore_done_rx, Duration::from_secs(30), Duration::from_secs(30));
+    let restore_result = match restore_outcome {
+        Waited::Delivered(result) => result,
+        Waited::Disconnected => panic!("the restore thread exited without reporting a result"),
+        Waited::Timeout => panic!(
+            "the restore intent did not return; skipping its join and the blocking teardown"
+        ),
+    };
     restore_thread
         .join()
         .expect("restore thread must not panic");
