@@ -35,7 +35,7 @@ pub use self::fs_retry_cache::*;
 
 mod full_block_report;
 
-pub(crate) mod master_filesystem;
+mod master_filesystem;
 pub(crate) use self::master_filesystem::BlockInodeState;
 pub use self::master_filesystem::{
     BlockReportResult, DeleteMode, FreeOutcome, FsModeSnapshot, MasterFilesystem,

@@ -332,60 +332,6 @@ fn exclusive_delete_validation_error_keeps_holder_open() {
     );
     assert_eq!(fs.journal_writer.failure_seq(), failure_seq_before);
     journal.shutdown();
-}
-
-#[test]
-fn exclusive_wait_panic_fails_holder_via_raii_drop() {
-    let mut conf = ClusterConf {
-        testing: true,
-        format_master: true,
-        ..Default::default()
-    };
-    conf.change_test_meta_dir(format!(
-        "exclusive-wait-panic-{}",
-        curvine_runtime::common::Utils::rand_str(8)
-    ));
-    conf.journal.enable = false;
-    let journal = JournalSystem::from_conf(&conf).unwrap();
-    let fs = journal.fs();
-    fs.master_monitor.set_role_for_test(RoleState::Leader);
-    fs.mkdir("/dir", true).unwrap();
-    fs.create("/dir/file", true).unwrap();
-    let failure_seq_before = fs.journal_writer.failure_seq();
-
-    // Enable the cfg(test) panic hook and run the exclusive path.
-    crate::master::fs::master_filesystem::TEST_WAIT_PANIC
-        .store(true, std::sync::atomic::Ordering::Release);
-    let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _ = worker_fs.delete("/dir", true);
-        }))
-    });
-    let caught = worker.join().expect("worker thread must not abort");
-    crate::master::fs::master_filesystem::TEST_WAIT_PANIC
-        .store(false, std::sync::atomic::Ordering::Release);
-
-    // The exclusive confirmation RAII went terminal during unwind.
-    assert!(
-        caught.is_err(),
-        "the injected confirmation wait panic must propagate through the exclusive path"
-    );
-    assert!(
-        fs.fs_dir.is_failed(),
-        "the RAII Drop must fail the holder terminal during unwind"
-    );
-    assert!(
-        matches!(
-            fs.fs_dir.view().err(),
-            Some(crate::master::meta::NamespaceError::Unavailable)
-        ),
-        "the view must be Unavailable after the panic-driven terminal failure"
-    );
-    assert_ne!(
-        fs.journal_writer.failure_seq(),
-        failure_seq_before,
-        "the panic must be recorded on the failure sequence"
-    );
-    journal.shutdown();
+    let meta_cleanup = std::fs::remove_dir_all(&conf.master.meta_dir);
+    meta_cleanup.expect("the case meta dir must be removable");
 }

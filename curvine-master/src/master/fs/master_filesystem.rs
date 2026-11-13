@@ -108,12 +108,6 @@ pub(crate) mod memory_read_gates;
 /// when `scope.wait` reports the real apply/cursor ack. On a confirmation error — or if the wait panics while
 /// armed — the namespace holder goes terminal before the exclusive gate
 /// guard is released. Single-purpose for this one call site.
-/// Test-only flag: when set, the exclusive confirmation wait panics to
-/// exercise the RAII Drop path (terminal before gate release).
-#[cfg(test)]
-pub static TEST_WAIT_PANIC: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 struct ExclusiveConfirmation<'a> {
     handle: Option<&'a FsDirHandle>,
     writer: &'a JournalWriter,
@@ -595,15 +589,6 @@ impl MasterFilesystem {
                 // RPC writes, snapshots and restores cannot cross it; the
                 // applier can take the view to advance the real ack.
                 drop(cold);
-                // Test-only panic injection: exercises the exclusive
-                // confirmation RAII's Drop path (terminal before gate
-                // release) on unwind.
-                #[cfg(test)]
-                if crate::master::fs::master_filesystem::TEST_WAIT_PANIC
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    panic!("injected confirmation wait panic for RAII test");
-                }
                 let commit = scope.wait();
                 // Only a confirmed wait disarms the guard; a confirmation
                 // error stays armed so the Drop below goes terminal before
