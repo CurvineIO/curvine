@@ -1526,14 +1526,14 @@ impl FsDir {
     ) -> FsResult<FreeResult> {
         let mut free_res = FreeResult::default();
         let mut change_inodes = vec![];
-        // R6: hard-link aliases inside the same subtree resolve to the same
-        // inode. Each alias pushed its own store snapshot, and every
-        // snapshot was still in the "not freed" state, so the physical
-        // blocks/bytes were counted (and the inode processed) once per
-        // name. A free is a physical reclaim: process each unique inode
-        // exactly once (delete keeps its per-edge nlink multiplicity —
-        // that contract is unchanged).
-        let mut seen_inodes: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        // R6/F7: hard-link dedup is a RECURSIVE concern — non-recursive
+        // single-file frees process exactly one inode, so the HashSet is
+        // only allocated when the traversal can actually fan out.
+        let mut seen_inodes: Option<std::collections::HashSet<i64>> = if recursive {
+            Some(std::collections::HashSet::new())
+        } else {
+            None
+        };
 
         let mut stack = LinkedList::new();
         stack.push_back(inode);
@@ -1543,7 +1543,10 @@ impl FsDir {
                     // An alias whose inode was already reclaimed (another
                     // name processed it first) is already accounted for;
                     // otherwise its store row carries the real inode.
-                    if seen_inodes.contains(&e.id) {
+                    if seen_inodes
+                        .as_ref()
+                        .is_some_and(|seen| seen.contains(&e.id))
+                    {
                         continue;
                     }
                     if let Some(store_inode) = self.store.get_inode(e.id, Some(&e.name))? {
@@ -1564,7 +1567,10 @@ impl FsDir {
                     // must be reclaimed once. The FIRST name processes the
                     // inode (free + accounting); every later alias of the
                     // same id sees the seen-marker and stops.
-                    if !seen_inodes.insert(f.id) {
+                    if seen_inodes.as_mut().is_none_or(|seen| !seen.insert(f.id)) {
+                        // Non-recursive frees never enter here; a recursive
+                        // traversal that already saw this inode skips the
+                        // duplicate alias.
                         continue;
                     }
                     let locs = f.get_locs(&self.store)?;

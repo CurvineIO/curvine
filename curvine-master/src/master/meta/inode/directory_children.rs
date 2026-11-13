@@ -637,16 +637,16 @@ impl DirectoryChildren {
                 let Some(children) = children else {
                     continue;
                 };
-                let taken: Vec<(String, ChildEdge)> = children
+                // F7: only collect owned ChildEdges — the name is never
+                // needed by this method's contract and would be cloned per
+                // edge only to be dropped.
+                let taken: Vec<ChildEdge> = children
                     .list_options(&ListOptions {
                         limit: Some(remaining.saturating_add(1)),
                         start_after: None,
                     })
                     .into_iter()
-                    .map(|item| {
-                        let name = item.name().to_owned();
-                        (name, to_edge(item))
-                    })
+                    .map(to_edge)
                     .collect();
                 drop(children);
                 if taken.len() > remaining {
@@ -654,7 +654,7 @@ impl DirectoryChildren {
                     break;
                 }
                 remaining -= taken.len();
-                edges.extend(taken.into_iter().map(|(_, edge)| edge));
+                edges.extend(taken);
             }
         } else {
             let children = self.children.read();

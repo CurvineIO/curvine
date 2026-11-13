@@ -685,8 +685,7 @@ impl MasterFilesystem {
                         self.journal_writer.consume_location_pause_hook()
                     {
                         let _ = reached.send(());
-                        let _ =
-                            release.recv_timeout(std::time::Duration::from_secs(60));
+                        let _ = release.recv_timeout(std::time::Duration::from_secs(60));
                     }
                     let locks = self
                         .block_location_locks
@@ -2614,6 +2613,15 @@ impl MasterFilesystem {
                 }
             }
 
+            // F7: a NON-recursive directory free stays on the original cold
+            // body — the C2 bounded subtree plan only optimises genuine
+            // recursive requests. Single-file sharded fallback (above) is
+            // separate; reaching here with recursive=false means the target
+            // is a directory or a shard-unavailable file — no DFS budget
+            // overhead for a path that never needed the subtree plan.
+            if !recursive {
+                return Ok(ShardedOutcome::Fallback);
+            }
             // C2: recursive free runs the bounded subtree-lock path with
             // the full inode → worker → block order (a free always drops
             // the data blocks). Pre-body fallbacks keep the exclusive
