@@ -604,7 +604,9 @@ impl DirectoryChildren {
     /// proves the budget was exceeded — with no name sorting and no full
     /// inode DTOs. Returns `Some(edges)` when the complete edge set fits the
     /// budget, `None` when it does not (never a truncated success). A
-    /// zero budget succeeds only for an empty directory. Different names
+    /// zero budget succeeds only for an empty directory. `max_edges` of
+    /// `usize::MAX` is a valid unbounded budget: the probe limit saturates,
+    /// so no overflow and the full set is returned. Different names
     /// pointing at the same file id stay distinct edges. The caller
     /// captures `shared_version()` before enumerating; this method reads no
     /// DB and does not change the tree.
