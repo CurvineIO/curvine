@@ -499,6 +499,28 @@ impl JournalWriter {
         *self.plan_pause_hook.lock().unwrap() = Some((reached, release));
     }
 
+    /// Test-only instance-isolated pre-hot checkpoint (G3): arms the hook so
+    /// the next `run_metadata_write_with_fallback` admission pauses after
+    /// the outer epoch is captured/ensured and just before hot(epoch) runs.
+    /// Consumed once (take), so it disarms itself.
+    #[cfg(test)]
+    pub fn arm_pre_hot_hook(
+        &self,
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.pre_hot_hook.lock().unwrap() = Some((reached, release));
+    }
+
+    /// Test-only: consumes the armed pre-hot checkpoint, if any.
+    #[cfg(test)]
+    pub(crate) fn consume_pre_hot_hook(&self) -> Option<(
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )> {
+        self.pre_hot_hook.lock().unwrap().take()
+    }
+
     /// Test-only: consumes the armed plan checkpoint, if any.
     #[cfg(test)]
     pub(crate) fn consume_plan_pause_hook(
