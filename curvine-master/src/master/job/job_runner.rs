@@ -21,7 +21,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::{
-    JobTaskState, LoadJobCommand, LoadJobInfo, LoadJobResult, LoadTaskInfo, MountInfo,
+    JobTaskState, JobTaskType, LoadJobCommand, LoadJobInfo, LoadJobResult, LoadTaskInfo, MountInfo,
     WorkerAddress,
 };
 use curvine_runtime::common::CommonUtils;
@@ -173,6 +173,10 @@ impl LoadJobRunner {
             mnt,
             &ClientConf::default(),
             run_id,
+            match cv_source_mode {
+                CvSourceMode::LoadUfsOnlyFromUfs => JobTaskType::Load,
+                CvSourceMode::ExportCurvineToUfs => JobTaskType::Export,
+            },
         );
 
         Ok((job_context, source_path, target_path))

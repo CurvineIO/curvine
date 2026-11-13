@@ -16,10 +16,10 @@
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::ttl::TtlBucket;
-use crate::master::Master;
+use crate::master::{JobStore, Master};
 use curvine_core_error::CommonResult;
 use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
-use curvine_model::{MetricValue, WorkerInfo};
+use curvine_model::{JobTaskProgress, JobTaskState, JobTaskType, MetricValue, WorkerInfo};
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::sync::FastDashMap;
 use curvine_sys::version::ReleaseVersion;
@@ -34,6 +34,38 @@ const CLIENT_VERSION_NONE: &str = "none";
 /// Release version label of a client whose reported version cannot be parsed.
 /// Parsing keeps the label set bounded by real builds, not by client input.
 const CLIENT_VERSION_UNKNOWN: &str = "unknown";
+
+/// Job kinds and the states the master job manager moves a job through.
+/// `load_jobs` exports every combination, with 0 when no job is in it, so a
+/// dashboard series does not disappear while the store is empty.
+const LOAD_JOB_KINDS: [JobTaskType; 2] = [JobTaskType::Load, JobTaskType::Export];
+const LOAD_JOB_STATES: [JobTaskState; 6] = [
+    JobTaskState::Pending,
+    JobTaskState::Loading,
+    JobTaskState::Completed,
+    JobTaskState::Failed,
+    JobTaskState::Canceled,
+    JobTaskState::PartialSuccess,
+];
+
+fn job_kind_label(kind: JobTaskType) -> &'static str {
+    match kind {
+        JobTaskType::Load => "load",
+        JobTaskType::Export => "export",
+    }
+}
+
+fn job_state_label(state: JobTaskState) -> &'static str {
+    match state {
+        JobTaskState::UNKNOWN => "unknown",
+        JobTaskState::Pending => "pending",
+        JobTaskState::Loading => "loading",
+        JobTaskState::Completed => "completed",
+        JobTaskState::Failed => "failed",
+        JobTaskState::Canceled => "canceled",
+        JobTaskState::PartialSuccess => "partial_success",
+    }
+}
 
 struct ClientCompat {
     release_version: String,
@@ -227,6 +259,25 @@ pub struct MasterMetrics {
     pub(crate) reaped_locks_total: Counter,
     pub(crate) reaped_writers_total: Counter,
     pub(crate) reaped_stale_hints_total: Counter,
+
+    // Load and export jobs of the master job manager (#224), labelled by kind
+    // (load, export) and state. fs_mode exports are submitted from journal
+    // apply, so no client ever sees their job id; these metrics are how an
+    // operator notices that they fail. `load_jobs` is rebuilt from the job
+    // store on every scrape, and finished runs stay in it until
+    // `job.terminal_retention` expires. The counters see every run that enters
+    // the job store; a direct submit that needs no work (target already cached,
+    // nothing to copy) returns at submit time and is not counted.
+    pub(crate) load_jobs: GaugeVec,
+    pub(crate) load_job_finished_total: CounterVec,
+    // From job creation (including the wait for a load slot) to the terminal state.
+    pub(crate) load_job_duration_ms: HistogramVec,
+    // Worker task reports. A report for a run that has already finished is
+    // ignored by the job store and is not counted.
+    pub(crate) load_task_finished_total: CounterVec,
+    // Bytes copied by load and export tasks, summed from the growth of each
+    // task's reported `loaded_size`. Use rate() for throughput.
+    pub(crate) load_task_loaded_bytes_total: CounterVec,
 }
 
 impl MasterMetrics {
@@ -466,6 +517,46 @@ impl MasterMetrics {
                 "master_reaped_stale_hints_total",
                 "Ownership hints dropped because the inode or ownership was already gone",
             )?,
+
+            load_jobs: m::new_gauge_vec(
+                "load_jobs",
+                "Load and export jobs held by the master job manager, labelled by kind and state",
+                &["kind", "state"],
+            )?,
+            load_job_finished_total: m::new_counter_vec(
+                "load_job_finished_total",
+                "Load and export job runs that reached a terminal state, labelled by kind and state",
+                &["kind", "state"],
+            )?,
+            load_job_duration_ms: m::new_histogram_vec_with_buckets(
+                "load_job_duration_ms",
+                "Time (ms) from creating a load or export job run to its terminal state, labelled by kind and state",
+                &["kind", "state"],
+                &[
+                    100.0,
+                    1_000.0,
+                    10_000.0,
+                    60_000.0,
+                    300_000.0,
+                    900_000.0,
+                    1_800_000.0,
+                    3_600_000.0,
+                    10_800_000.0,
+                    21_600_000.0,
+                    43_200_000.0,
+                    86_400_000.0,
+                ],
+            )?,
+            load_task_finished_total: m::new_counter_vec(
+                "load_task_finished_total",
+                "Load and export tasks reported in a terminal state by workers, labelled by kind and state",
+                &["kind", "state"],
+            )?,
+            load_task_loaded_bytes_total: m::new_counter_vec(
+                "load_task_loaded_bytes_total",
+                "Bytes copied by load and export tasks as reported by workers, labelled by kind",
+                &["kind"],
+            )?,
         };
 
         Ok(wm)
@@ -531,6 +622,77 @@ impl MasterMetrics {
         self.checkpoint_time.inc_by(total_ms as i64);
         self.checkpoint_flush_time.inc_by(flush_ms as i64);
         self.checkpoint_last_duration_ms.set(total_ms as i64);
+    }
+
+    /// Records a job run that reached a terminal state `duration_ms` after it
+    /// was created.
+    pub(crate) fn record_load_job_finished(
+        &self,
+        kind: JobTaskType,
+        state: JobTaskState,
+        duration_ms: u64,
+    ) {
+        let labels = [job_kind_label(kind), job_state_label(state)];
+        self.load_job_finished_total
+            .with_label_values(&labels)
+            .inc();
+        self.load_job_duration_ms
+            .with_label_values(&labels)
+            .observe(duration_ms as f64);
+    }
+
+    /// Records a worker report that moved a task from `previous` to `current`:
+    /// the bytes copied since the previous report and, on the first terminal
+    /// report, the task's final state.
+    pub(crate) fn record_load_task_report(
+        &self,
+        kind: JobTaskType,
+        previous: &JobTaskProgress,
+        current: &JobTaskProgress,
+    ) {
+        let kind = job_kind_label(kind);
+        // A retried task restarts from 0; the bytes it copies again are new
+        // work, so only growth is counted and a drop is not subtracted.
+        let copied = current.loaded_size.saturating_sub(previous.loaded_size);
+        if copied > 0 {
+            self.load_task_loaded_bytes_total
+                .with_label_values(&[kind])
+                .inc_by(copied);
+        }
+
+        if !previous.state.is_finish() && current.state.is_finish() {
+            self.load_task_finished_total
+                .with_label_values(&[kind, job_state_label(current.state)])
+                .inc();
+        }
+    }
+
+    /// Rebuilds `load_jobs` from the job store. The master renders it before
+    /// `text_output`, which has no access to the job manager.
+    pub(crate) fn refresh_load_jobs(&self, jobs: &JobStore) {
+        Self::refresh_load_job_counts(&self.load_jobs, jobs);
+    }
+
+    fn refresh_load_job_counts(metric: &GaugeVec, jobs: &JobStore) {
+        let mut counts = HashMap::new();
+        for kind in LOAD_JOB_KINDS {
+            for state in LOAD_JOB_STATES {
+                counts.insert((job_kind_label(kind), job_state_label(state)), 0);
+            }
+        }
+        for entry in jobs.iter() {
+            let job = entry.value();
+            let state: JobTaskState = job.state.state();
+            *counts
+                .entry((job_kind_label(job.kind), job_state_label(state)))
+                .or_insert(0) += 1;
+        }
+
+        // Count first, so the window in which the gauge is empty stays short.
+        metric.reset();
+        for ((kind, state), count) in counts {
+            metric.with_label_values(&[kind, state]).set(count);
+        }
     }
 
     /// Renders all metrics. `journal_store` adds the journal DB RocksDB metrics;
@@ -627,8 +789,9 @@ impl Debug for MasterMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curvine_config::JournalConf;
-    use curvine_model::WorkerAddress;
+    use crate::master::JobContext;
+    use curvine_config::{ClientConf, JournalConf};
+    use curvine_model::{LoadJobCommand, MountInfo, WorkerAddress};
     use curvine_runtime::common::Utils;
 
     fn count(
@@ -811,6 +974,94 @@ mod tests {
         let output = Metrics::text_output().unwrap();
         assert!(
             !output.contains(&format!("{metric_name}{{worker_addr=\"{lost}\"}}")),
+            "{output}"
+        );
+    }
+
+    fn job(job_id: &str, source_path: &str, kind: JobTaskType, state: JobTaskState) -> JobContext {
+        let mut job = JobContext::with_conf(
+            &LoadJobCommand::builder(source_path).build(),
+            job_id.to_string(),
+            source_path.to_string(),
+            "/target".to_string(),
+            &MountInfo::default(),
+            &ClientConf::default(),
+            1,
+            kind,
+        );
+        job.state.advance_state(state, true);
+        job
+    }
+
+    #[test]
+    fn load_jobs_are_counted_by_kind_and_state() {
+        let metric_name = "test_load_jobs_are_counted_by_kind_and_state";
+        let metric = m::new_gauge_vec(metric_name, metric_name, &["kind", "state"]).unwrap();
+        let series = |kind: &str, state: &str, value: i64| {
+            format!("{metric_name}{{kind=\"{kind}\",state=\"{state}\"}} {value}")
+        };
+
+        let jobs = JobStore::new();
+        for (job_id, source_path, kind, state) in [
+            (
+                "load-1",
+                "s3://bucket/a",
+                JobTaskType::Load,
+                JobTaskState::Loading,
+            ),
+            (
+                "load-2",
+                "s3://bucket/b",
+                JobTaskType::Load,
+                JobTaskState::Loading,
+            ),
+            (
+                "load-3",
+                "s3://bucket/c",
+                JobTaskType::Load,
+                JobTaskState::Failed,
+            ),
+            (
+                "export-1",
+                "/fs/a",
+                JobTaskType::Export,
+                JobTaskState::Pending,
+            ),
+            (
+                "export-2",
+                "/fs/b",
+                JobTaskType::Export,
+                JobTaskState::PartialSuccess,
+            ),
+        ] {
+            jobs.insert(job_id.to_string(), job(job_id, source_path, kind, state));
+        }
+
+        MasterMetrics::refresh_load_job_counts(&metric, &jobs);
+        let output = Metrics::text_output().unwrap();
+        for expected in [
+            series("load", "loading", 2),
+            series("load", "failed", 1),
+            series("load", "pending", 0),
+            series("load", "completed", 0),
+            series("load", "canceled", 0),
+            series("load", "partial_success", 0),
+            series("export", "pending", 1),
+            series("export", "partial_success", 1),
+            series("export", "loading", 0),
+        ] {
+            assert!(output.contains(&expected), "missing {expected}: {output}");
+        }
+
+        // Every job left the store: all known states report 0.
+        jobs.clear();
+        MasterMetrics::refresh_load_job_counts(&metric, &jobs);
+        let output = Metrics::text_output().unwrap();
+        assert!(output.contains(&series("load", "loading", 0)), "{output}");
+        assert!(output.contains(&series("load", "failed", 0)), "{output}");
+        assert!(output.contains(&series("export", "pending", 0)), "{output}");
+        assert!(
+            output.contains(&series("export", "partial_success", 0)),
             "{output}"
         );
     }
