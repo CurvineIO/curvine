@@ -1692,6 +1692,16 @@ impl InodeStore {
         self.store.get_locations(block_id)
     }
 
+    /// F3 bounded read through the real store layer — the budget semantics
+    /// live in the Rocks layer; this wrapper preserves the call chain.
+    pub fn get_locations_bounded(
+        &self,
+        block_id: i64,
+        budget: usize,
+    ) -> CommonResult<Option<Vec<BlockLocation>>> {
+        self.store.get_locations_bounded(block_id, budget)
+    }
+
     pub fn get_locks(&self, id: i64) -> CommonResult<LockMeta> {
         self.store.get_locks(id)
     }

@@ -2016,10 +2016,7 @@ impl JournalLoader {
                         .as_ref()
                         .expect("need_locations implies a sampled location set");
                     for request in plan.inode_requests() {
-                        if !matches!(
-                            request.mode,
-                            crate::master::meta::InodeLockMode::Write
-                        ) {
+                        if !matches!(request.mode, crate::master::meta::InodeLockMode::Write) {
                             continue;
                         }
                         let Some(inode) = fs_dir

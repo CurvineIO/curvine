@@ -25,7 +25,7 @@ use crate::master::meta::inode::{
 };
 use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::meta::subtree_write_plan::{
-    SubtreeWritePlan, SUBTREE_LOCATION_LIMIT, SUBTREE_PLAN_LIMIT,
+    SubtreeLocationPlan, SubtreeWritePlan, SUBTREE_PLAN_LIMIT,
 };
 use crate::master::meta::{
     trash, BlockLocationLockManager, CacheInvalidationResult, ColdError, ColdFsDirGuard,
@@ -659,80 +659,45 @@ impl MasterFilesystem {
             // R5: the location budget is independent of the plan budget
             // and charges every actual entry (block + worker-location)
             // against SUBTREE_LOCATION_LIMIT (design §6).
-            let location_locks = if need_locations {
-                let mut block_ids: Vec<i64> = Vec::new();
-                let mut worker_ids: Vec<u32> = Vec::new();
-                let mut location_entries = 0usize;
-                let mut over_budget = false;
+            // F3: the shared SubtreeLocationPlan replaces the hand-written
+            // sampler — one whole-call budget counter (SUBTREE_LOCATION_
+            // LIMIT), bounded block iteration and location reads, owned IDs
+            // only.
+            let location_plan_and_locks = if need_locations {
                 {
                     let fs_dir = self.fs_dir.view()?;
                     if Self::checked_live_epoch(&fs_dir)? != planned_epoch {
                         drop(inode_locks);
                         return Ok(ShardedOutcome::Fallback);
                     }
-                    for request in requests {
-                        if !matches!(request.mode, InodeLockMode::Write) {
-                            continue;
-                        }
-                        let Some(inode) = fs_dir.store.get_inode(request.inode_id, None)? else {
-                            continue;
-                        };
-                        let Ok(file) = inode.as_file_ref() else {
-                            continue;
-                        };
-                        for block_id in file.block_ids() {
-                            location_entries += 1;
-                            if location_entries > SUBTREE_LOCATION_LIMIT {
-                                over_budget = true;
-                                break;
-                            }
-                            block_ids.push(block_id);
-                            for location in fs_dir.get_block_locations(block_id)? {
-                                location_entries += 1;
-                                worker_ids.push(location.worker_id);
-                                if location_entries > SUBTREE_LOCATION_LIMIT {
-                                    over_budget = true;
-                                    break;
-                                }
-                            }
-                            if over_budget {
-                                break;
-                            }
-                        }
-                        if over_budget {
-                            break;
-                        }
+                    // Static budget overflow: immediate typed fallback
+                    // (no futile retry).
+                    let Some(plan) = SubtreeLocationPlan::capture(&fs_dir, requests)? else {
+                        drop(inode_locks);
+                        return Ok(ShardedOutcome::Fallback);
+                    };
+                    // R7 location checkpoint: sampling is complete, the
+                    // worker/block stripes are not yet acquired — the driver
+                    // may add a location here to prove the post-lock coverage
+                    // check re-plans rather than accepting the stale sample.
+                    #[cfg(test)]
+                    if let Some((reached, release)) =
+                        self.journal_writer.consume_location_pause_hook()
+                    {
+                        let _ = reached.send(());
+                        let _ =
+                            release.recv_timeout(std::time::Duration::from_secs(60));
                     }
+                    let locks = self
+                        .block_location_locks
+                        .write_workers_blocks(plan.worker_ids(), plan.block_ids());
+                    Some((plan, locks))
                 }
-                if over_budget {
-                    drop(inode_locks);
-                    return Ok(ShardedOutcome::Fallback);
-                }
-                // R7 location checkpoint: sampling is complete, the worker/
-                // block stripes are not yet acquired — the driver may add a
-                // location here to prove the post-lock coverage check
-                // re-plans rather than accepting the stale sample.
-                #[cfg(test)]
-                if let Some((reached, release)) = self.journal_writer.consume_location_pause_hook()
-                {
-                    let _ = reached.send(());
-                    let _ = release.recv_timeout(std::time::Duration::from_secs(60));
-                }
-                // A missing location key or an empty set keeps the original
-                // business semantics: the locks cover whatever the live
-                // sampler saw, and the final revalidation re-checks the set.
-                Some((
-                    self.block_location_locks
-                        .write_workers_blocks(&worker_ids, &block_ids),
-                    (block_ids, worker_ids),
-                ))
             } else {
                 None
             };
-            // Location coverage identity for the final-view revalidation
-            // (R3): the sampled ids the acquired locks are known to cover.
-            let (location_locks, location_sample) = match location_locks {
-                Some((locks, ids)) => (Some(locks), Some(ids)),
+            let (location_plan, location_locks) = match location_plan_and_locks {
+                Some((plan, locks)) => (Some(plan), Some(locks)),
                 None => (None, None),
             };
 
@@ -765,30 +730,17 @@ impl MasterFilesystem {
                 // the live state — return None (release view/L/I, retry ≤3,
                 // then fallback) rather than running the body against
                 // unprotected locations.
+                // R3/F3: location coverage revalidation under the FINAL
+                // view — SubtreeLocationPlan::covers re-reads the current
+                // block/worker set and checks it is fully covered by the
+                // sampled set. New ids → churn (release view/L/I, retry
+                // ≤3, then fallback).
                 if need_locations {
-                    let (sampled_blocks, sampled_workers) = location_sample
+                    let plan = location_plan
                         .as_ref()
-                        .expect("need_locations implies a sampled location set");
-                    for request in requests {
-                        if !matches!(request.mode, InodeLockMode::Write) {
-                            continue;
-                        }
-                        let Some(inode) = fs_dir.store.get_inode(request.inode_id, None)? else {
-                            continue;
-                        };
-                        let Ok(file) = inode.as_file_ref() else {
-                            continue;
-                        };
-                        for block_id in file.block_ids() {
-                            if !sampled_blocks.contains(&block_id) {
-                                return Ok(None);
-                            }
-                            for location in fs_dir.get_block_locations(block_id)? {
-                                if !sampled_workers.contains(&location.worker_id) {
-                                    return Ok(None);
-                                }
-                            }
-                        }
+                        .expect("need_locations implies a location plan");
+                    if !plan.covers(&fs_dir, requests)? {
+                        return Ok(None);
                     }
                 }
 

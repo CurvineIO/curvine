@@ -165,6 +165,38 @@ impl RocksInodeStore {
         Ok(vec)
     }
 
+    /// F3 bounded location read: uses the existing prefix iterator with the
+    /// remaining budget — reads at most `budget + 1` rows, where the extra
+    /// one only proves the budget was exceeded. Returns the complete set
+    /// (Some) or `None` when it does not fit; never a truncated success.
+    /// The iterator is consumed within this call; no DB handle or iterator
+    /// escapes.
+    pub fn get_locations_bounded(
+        &self,
+        block_id: i64,
+        budget: usize,
+    ) -> CommonResult<Option<Vec<BlockLocation>>> {
+        let prefix = RocksUtils::i64_to_bytes(block_id);
+        let iter = self.db.prefix_scan(Self::CF_BLOCK, prefix)?;
+
+        let mut vec = Vec::with_capacity(budget.min(8));
+        let mut remaining = budget.saturating_add(1);
+        for item in iter {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            let bytes = item?;
+            let location = MetadataCodec::decode::<BlockLocation>(&bytes.1)?;
+            vec.push(location);
+            remaining -= 1;
+        }
+
+        if vec.len() > budget {
+            return Ok(None);
+        }
+        Ok(Some(vec))
+    }
+
     /// Reuse one iterator only within the caller's namespace guard.
     /// Results are owned; no iterator, pinned value, or cache escapes the call.
     pub fn get_locations_many(

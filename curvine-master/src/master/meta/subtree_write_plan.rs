@@ -256,3 +256,122 @@ impl SubtreeWritePlan {
         Ok(Some(resolved))
     }
 }
+
+/// F3: shared location plan for RPC and replay (design §6) — one budget
+/// counter over the WHOLE call, charging every actual block entry and
+/// worker-location entry (dedup happens at lock-key level, not here). Only
+/// owned IDs are kept; no DB Arc, no Guard, no lock acquisition. The
+/// bounded location read walks the existing prefix iterator with the
+/// remaining budget, returning complete `Some` or over-limit `None` —
+/// never a truncated success set.
+pub(crate) struct SubtreeLocationPlan {
+    block_ids: Vec<i64>,
+    worker_ids: Vec<u32>,
+}
+
+impl SubtreeLocationPlan {
+    /// Bounded location sampling over every Write inode in `requests`.
+    /// Charges one entry per block and one per worker-location against
+    /// `SUBTREE_LOCATION_LIMIT` (shared counter, dedup-before-counting is
+    /// forbidden). Returns `Ok(None)` when the budget is exceeded (static
+    /// overflow — no retry); a real store error is still `Err`.
+    /// No lock acquisition happens here.
+    pub(crate) fn capture(
+        fs_dir: &crate::master::meta::FsDir,
+        requests: &[InodeLockRequest],
+    ) -> FsResult<Option<Self>> {
+        let mut block_ids = Vec::new();
+        let mut worker_ids = Vec::new();
+        let mut entries = 0usize;
+
+        for request in requests {
+            if !matches!(request.mode, InodeLockMode::Write) {
+                continue;
+            }
+            let Some(inode) = fs_dir.store.get_inode(request.inode_id, None)? else {
+                continue;
+            };
+            let Ok(file) = inode.as_file_ref() else {
+                continue;
+            };
+            // Iterate the file's own blocks in bounded windows — never
+            // clone the full array before the budget check. The bounded
+            // read walks the existing prefix iterator with the remaining
+            // budget.
+            for block_id in file.block_ids() {
+                entries += 1;
+                if entries > SUBTREE_LOCATION_LIMIT {
+                    return Ok(None);
+                }
+                block_ids.push(block_id);
+                let Some(locations) = fs_dir
+                    .store
+                    .get_locations_bounded(block_id, SUBTREE_LOCATION_LIMIT - entries)?
+                else {
+                    return Ok(None);
+                };
+                for location in locations {
+                    entries += 1;
+                    if entries > SUBTREE_LOCATION_LIMIT {
+                        return Ok(None);
+                    }
+                    worker_ids.push(location.worker_id);
+                }
+            }
+        }
+
+        Ok(Some(Self {
+            block_ids,
+            worker_ids,
+        }))
+    }
+
+    /// Whether the current block/worker set is fully covered by the sampled
+    /// set (called under the FINAL view, after location locks are held).
+    /// Returns `false` when any live block/worker is missing from the
+    /// sampled set (release everything and retry ≤3).
+    pub(crate) fn covers(
+        &self,
+        fs_dir: &crate::master::meta::FsDir,
+        requests: &[InodeLockRequest],
+    ) -> FsResult<bool> {
+        for request in requests {
+            if !matches!(request.mode, InodeLockMode::Write) {
+                continue;
+            }
+            let Some(inode) = fs_dir.store.get_inode(request.inode_id, None)? else {
+                continue;
+            };
+            let Ok(file) = inode.as_file_ref() else {
+                continue;
+            };
+            for block_id in file.block_ids() {
+                if !self.block_ids.contains(&block_id) {
+                    return Ok(false);
+                }
+                let Some(locations) = fs_dir
+                    .store
+                    .get_locations_bounded(block_id, SUBTREE_LOCATION_LIMIT)?
+                else {
+                    // More live locations than the budget can verify: not
+                    // covered (the caller releases and retries).
+                    return Ok(false);
+                };
+                for location in locations {
+                    if !self.worker_ids.contains(&location.worker_id) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn block_ids(&self) -> &[i64] {
+        &self.block_ids
+    }
+
+    pub(crate) fn worker_ids(&self) -> &[u32] {
+        &self.worker_ids
+    }
+}
