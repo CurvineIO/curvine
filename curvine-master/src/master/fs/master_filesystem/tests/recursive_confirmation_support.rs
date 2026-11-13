@@ -163,7 +163,11 @@ pub(super) fn assert_holder_terminal(
 
 /// A pre-failure view stays a legal, droppable reference (FAILED is not a
 /// drain), while the terminated store rejects every new read.
-pub(super) fn terminal_holder_alive_probe(pre_view: &NamespaceGuard<'_>) {
+pub(super) fn terminal_holder_alive_probe(fs: &MasterFilesystem, pre_view: &NamespaceGuard<'_>) {
+    // FAILED is not a drain: the pre-failure view reference survives and can
+    // be dropped safely, but reads through the terminal store are rejected
+    // (the retirement invalidates the metadata store — same boundary as C1's
+    // cursor probe: healthy before, rejected after).
     let rejected = MasterFilesystem::resolve_path(pre_view, "/dir");
     assert!(
         rejected.is_err(),
@@ -237,17 +241,12 @@ pub(super) fn spawn_lock_waiter(
 
 /// Arming the real publication-failure boundary: the
 /// `master.metadata.recursive.publish_after_commit` fault point fires inside
-/// `publish_metadata_impl` after the durable store commit and before the live
-/// publication, so the body observes a genuine durable-but-unpublished error
-/// through the real fatal entry (no setter). The point declares no matcher
-/// keys, so the rule is one-shot (`times(1)`) and must only be armed by the
-/// case that is about to publish its own recursive mutation.
-/// Arming the real publication-failure boundary: the
-/// `master.metadata.recursive.publish_after_commit` fault point fires inside
 /// `unprotected_delete` after the store batch committed (durable) and before
 /// the first live publish, so the body observes a genuine
 /// durable-but-unpublished error through the real fatal entry (no setter).
-/// The `child_name` context key matches the top name of the deleted subtree.
+/// The `child_name` context key matches the top name of the deleted subtree;
+/// `times(1)` makes the rule a real one-shot, and each arming case must call
+/// `disarm_publication_failure` on exit so no process-level rule leaks.
 pub(super) fn arm_publication_failure(
     rule_id: &str,
     child_name: &str,
@@ -257,14 +256,14 @@ pub(super) fn arm_publication_failure(
     let rule = FaultRuleBuilder::named("master.metadata.recursive.publish_after_commit")
         .matches("child_name", child_name)
         .unwrap()
+        .times(1)
+        .unwrap()
         .return_error(format!("recursive publication failure: {child_name}"))
         .unwrap();
     runtime.configure(rule_id, rule).unwrap();
     runtime
 }
 
-/// Removing the armed publication-failure rule so later cases keep running
-/// with a healthy publication path.
 pub(super) fn disarm_publication_failure(runtime: &curvine_fault::FaultRuntime, rule_id: &str) {
     runtime.remove(rule_id).unwrap();
 }

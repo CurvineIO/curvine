@@ -81,17 +81,19 @@ fn recursive_body_unwind_terminals_before_unlock() -> FsResult<()> {
     let join_err = worker
         .join()
         .expect_err("the body unwind must abort the worker");
-    // After the release the stripe is free again: an actual non-blocking
-    // acquisition now succeeds, and the queued waiter picks up the terminal
-    // state.
-    assert!(
-        fs.inode_locks.try_read_inode(dir_id).is_some(),
-        "after the release the stripe must be acquirable again"
-    );
+    // The waiter picks up the terminal state after the unwind releases; its
+    // guard must be joined (dropped) before the final try-read, or the legal
+    // reader could still hold the stripe and race the Some assertion.
     let (failed_at_lock, view_err) = acquired_rx
         .recv_timeout(WORKER_TIMEOUT)
         .expect("the waiter must acquire after the unwind releases");
     reader.join().expect("the waiter must not panic");
+    // After the release (and with the waiter's guard dropped) an actual
+    // non-blocking acquisition succeeds again.
+    assert!(
+        fs.inode_locks.try_read_inode(dir_id).is_some(),
+        "after the release the stripe must be acquirable again"
+    );
 
     assert!(
         unwind_message(join_err).contains("recursive body unwind"),
@@ -256,6 +258,137 @@ fn recursive_commit_error_after_ok_body_terminals_holder() -> FsResult<()> {
     );
 
     assert_holder_terminal(&fs, &writer, seq_before);
+
+    drop(writer);
+    drop(fs);
+    shutdown_case(journal);
+    remove_case_dirs(&conf);
+    Ok(())
+}
+
+/// §8.1: an Ok body followed by a real commit failure returns the commit
+/// error and the guard's Drop terminalizes the holder before the slot ends.
+#[test]
+fn recursive_disjoint_writer_completes_while_another_waits() -> FsResult<()> {
+    let (conf, journal, mut fs) = confirmation_env("recursive-disjoint-inflight-writer");
+    fs.mkdir("/a", true).unwrap();
+    fs.mkdir("/b", true).unwrap();
+    drain_receipts(&fs.journal_writer.clone());
+
+    let writer = swap_receipts_writer(&mut fs, &journal, &conf);
+    let seq_before = writer.failure_seq();
+
+    // A publishes a real durable mutation and then waits for its receipt.
+    let (a_ready_tx, a_ready_rx) = std::sync::mpsc::channel();
+    let (a_done_tx, a_done_rx) = std::sync::mpsc::channel();
+    let a_fs = fs.clone();
+    let first = std::thread::spawn(move || {
+        let result = run_admitted(&a_fs, "/a", InodeLockMode::Read, false, |fs_dir| {
+            let inp = MasterFilesystem::resolve_path(fs_dir, "/a")?;
+            fs_dir.set_attr(
+                inp,
+                SetAttrOpts {
+                    mode: Some(0o600),
+                    ..Default::default()
+                },
+            )?;
+            a_ready_tx
+                .send(())
+                .expect("the driver must observe the body");
+            Ok(())
+        });
+        let _ = a_done_tx.send(result);
+    });
+    a_ready_rx
+        .recv_timeout(WORKER_TIMEOUT)
+        .expect("A must publish its body");
+    let a_entry = writer
+        .with_testing_receiver(|receiver| {
+            receiver
+                .recv_timeout(WORKER_TIMEOUT)
+                .expect("missing A's journal entry")
+        })
+        .unwrap();
+
+    // A still holds its ordinary slot while waiting for the receipt: the gate
+    // is not closed for exclusive use and a fresh admission succeeds.
+    assert!(
+        !fs.metadata_commit_gate().has_exclusive_writer(),
+        "a pending confirmation must not hold an exclusive gate"
+    );
+    assert!(
+        fs.metadata_commit_gate().try_enter().is_some(),
+        "the ordinary slot must stay available while another writer waits"
+    );
+
+    // B is a disjoint in-flight writer that must still be inside its
+    // confirmation window when A goes terminal: the driver holds B's real
+    // receipt without resolving it until after A's terminal, so the §8.2
+    // second half - terminal is not a cancellation of already-admitted
+    // writers - is observed on a genuinely in-flight admission, not a
+    // completed one.
+    let (b_done_tx, b_done_rx) = std::sync::mpsc::channel();
+    let b_fs = fs.clone();
+    let second = std::thread::spawn(move || {
+        let result = run_admitted(&b_fs, "/b", InodeLockMode::Read, false, |fs_dir| {
+            let inp = MasterFilesystem::resolve_path(fs_dir, "/b")?;
+            fs_dir.set_attr(
+                inp,
+                SetAttrOpts {
+                    mode: Some(0o640),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        });
+        let _ = b_done_tx.send(result);
+    });
+    let b_entry = writer
+        .with_testing_receiver(|receiver| {
+            receiver
+                .recv_timeout(WORKER_TIMEOUT)
+                .expect("missing B's journal entry")
+        })
+        .unwrap();
+    assert_eq!(
+        fs.file_status("/b").unwrap().mode,
+        0o640,
+        "B's body must have published while A still waits"
+    );
+    assert!(!fs.fs_dir.is_failed(), "B must not terminalize the holder");
+
+    // Now A's confirmation fails while B's real receipt is still pending.
+    let a_entry = a_entry;
+    drop(a_entry.completion);
+    let a_result =
+        await_worker(&a_done_rx, "A").expect("A must report after its confirmation fails");
+    first.join().expect("A must not panic");
+    assert!(
+        a_result
+            .unwrap_err()
+            .to_string()
+            .contains("journal commit failed"),
+        "A must surface its real commit error"
+    );
+    assert_holder_terminal(&fs, &writer, seq_before);
+
+    // B's terminal-time observation: its admission was live across A's
+    // terminal, and its own already-published body stays intact (terminal
+    // is not a cancellation); B then finishes under its original rules when
+    // the driver acks its real receipt: a real successful confirmation is a
+    // send on the completion channel, not a drop (drop = confirmation
+    // failure, which is A's path above).
+    b_entry
+        .completion
+        .as_ref()
+        .expect("B's receipt must still carry its completion sender")
+        .send(())
+        .expect("acking B's real receipt must succeed");
+    drop(b_entry.completion);
+    let b_result =
+        await_worker(&b_done_rx, "B after the terminal").expect("B must report its result");
+    second.join().expect("B must not panic");
+    b_result.unwrap();
 
     drop(writer);
     drop(fs);
