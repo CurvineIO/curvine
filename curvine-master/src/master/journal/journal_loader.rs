@@ -2737,6 +2737,10 @@ impl AppStorage for JournalLoader {
 mod journal_watermark_test;
 
 #[cfg(test)]
+#[path = "tests/recursive_replay_lock_test.rs"]
+mod recursive_replay_lock_test;
+
+#[cfg(test)]
 #[path = "tests/replay_lock_test.rs"]
 mod replay_lock_test;
 
