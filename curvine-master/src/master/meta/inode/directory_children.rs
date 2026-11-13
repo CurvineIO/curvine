@@ -599,6 +599,83 @@ impl DirectoryChildren {
         out
     }
 
+    /// Bounded edge enumeration for subtree planning (design §3): reads at
+    /// most `max_edges + 1` edges across the whole call — the extra one only
+    /// proves the budget was exceeded — with no name sorting and no full
+    /// inode DTOs. Returns `Some(edges)` when the complete edge set fits the
+    /// budget, `None` when it does not (never a truncated success). A
+    /// zero budget succeeds only for an empty directory. Different names
+    /// pointing at the same file id stay distinct edges. The caller
+    /// captures `shared_version()` before enumerating; this method reads no
+    /// DB and does not change the tree.
+    pub(crate) fn child_edges_bounded(&self, max_edges: usize) -> Option<Vec<ChildEdge>> {
+        let to_edge = |item: ChildItem<'_>| {
+            let edge = match &item {
+                ChildItem::DirNode { node, .. } => ChildEdge::Dir((*node).clone()),
+                ChildItem::FileEntry { id, .. } => ChildEdge::FileId(*id),
+                ChildItem::View(view) => ChildEdge::FileId(view.id()),
+            };
+            edge
+        };
+        let mut edges: Vec<ChildEdge> = Vec::new();
+        let mut remaining = max_edges;
+        let mut over = false;
+        if let Some(shards) = self.sharded() {
+            // One shared budget across all shards: each shard reads at most
+            // `remaining + 1`, so the whole call reads at most
+            // `max_edges + shard_probe_waste` where the probe waste is one
+            // edge on the single shard that proves the overflow.
+            for index in 0..shards.shards.len() {
+                if over {
+                    break;
+                }
+                let children = shards.shards[index]
+                    .get()
+                    .map(|shard| shard.children.read());
+                let Some(children) = children else {
+                    continue;
+                };
+                let taken: Vec<(String, ChildEdge)> = children
+                    .list_options(&ListOptions {
+                        limit: Some(remaining + 1),
+                        start_after: None,
+                    })
+                    .into_iter()
+                    .map(|item| {
+                        let name = item.name().to_owned();
+                        (name, to_edge(item))
+                    })
+                    .collect();
+                drop(children);
+                if taken.len() > remaining {
+                    over = true;
+                    break;
+                }
+                remaining -= taken.len();
+                edges.extend(taken.into_iter().map(|(_, edge)| edge));
+            }
+        } else {
+            let children = self.children.read();
+            if self.sharded().is_some() {
+                drop(children);
+                return self.child_edges_bounded(max_edges);
+            }
+            let taken: Vec<ChildItem<'_>> = children.list_options(&ListOptions {
+                limit: Some(remaining + 1),
+                start_after: None,
+            });
+            over = taken.len() > remaining;
+            if !over {
+                edges.extend(taken.into_iter().map(to_edge));
+            }
+        }
+        if over {
+            None
+        } else {
+            Some(edges)
+        }
+    }
+
     fn read_all_guards<R>(&self, f: impl Fn(&InodeChildren) -> R) -> Vec<R> {
         if let Some(shards) = self.sharded() {
             let guards = shards.read_all();
