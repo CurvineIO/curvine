@@ -64,6 +64,7 @@ public class MountRequestTest {
                 .replicas(3)
                 .removeProperty("old.property")
                 .writeType(WriteTypeProto.WRITE_TYPE_PROTO_FS_MODE)
+                .ttlAction(TtlActionProto.TTL_ACTION_PROTO_FREE)
                 .provider(ProviderProto.PROVIDER_PROTO_OPENDAL)
                 .autoCache(false)
                 .accessMode(AccessModeProto.ACCESS_MODE_PROTO_READ_WRITE)
@@ -88,6 +89,58 @@ public class MountRequestTest {
         Assert.assertEquals(
                 AccessModeProto.ACCESS_MODE_PROTO_READ_WRITE, request.getOptions().getAccessMode());
         Assert.assertTrue(request.getOptions().getWriteCache());
+    }
+
+    @Test
+    public void updateSendsOnlyExplicitOptions() {
+        MountRequest request = MountRequest.builder()
+                .ufsPath("oss://bucket/data")
+                .cvPath("/data")
+                .update(true)
+                .writeType(WriteTypeProto.WRITE_TYPE_PROTO_FS_MODE)
+                .build();
+
+        Assert.assertTrue(request.getOptions().getUpdate());
+        Assert.assertFalse(request.getOptions().hasTtlMs());
+        Assert.assertFalse(request.getOptions().hasTtlAction());
+        Assert.assertFalse(request.getOptions().hasAutoCache());
+        Assert.assertFalse(request.getOptions().hasAccessMode());
+        Assert.assertFalse(request.getOptions().hasWriteCache());
+        Assert.assertFalse(request.getOptions().hasStorageType());
+        Assert.assertFalse(request.getOptions().hasBlockSize());
+        Assert.assertFalse(request.getOptions().hasReplicas());
+        Assert.assertFalse(request.getOptions().hasProvider());
+        Assert.assertTrue(request.getOptions().getRemovePropertiesList().isEmpty());
+        Assert.assertTrue(request.getOptions().getAddPropertiesMap().isEmpty());
+    }
+
+    @Test
+    public void updateSendsExplicitlySetDefaults() {
+        MountRequest request = MountRequest.builder()
+                .ufsPath("oss://bucket/data")
+                .cvPath("/data")
+                .update(true)
+                .ttlMs(7L * 24L * 60L * 60L * 1000L)
+                .ttlAction(TtlActionProto.TTL_ACTION_PROTO_DELETE)
+                .autoCache(true)
+                .accessMode(AccessModeProto.ACCESS_MODE_PROTO_READ_ONLY)
+                .writeCache(false)
+                .build();
+
+        // Presence first: the proto2 getters already return these values when the field is
+        // absent, so only the has* checks catch an update that silently drops an explicit default.
+        Assert.assertTrue(request.getOptions().hasTtlMs());
+        Assert.assertTrue(request.getOptions().hasTtlAction());
+        Assert.assertTrue(request.getOptions().hasAutoCache());
+        Assert.assertTrue(request.getOptions().hasAccessMode());
+        Assert.assertTrue(request.getOptions().hasWriteCache());
+        Assert.assertEquals(7L * 24L * 60L * 60L * 1000L, request.getOptions().getTtlMs());
+        Assert.assertEquals(
+                TtlActionProto.TTL_ACTION_PROTO_DELETE, request.getOptions().getTtlAction());
+        Assert.assertTrue(request.getOptions().getAutoCache());
+        Assert.assertEquals(
+                AccessModeProto.ACCESS_MODE_PROTO_READ_ONLY, request.getOptions().getAccessMode());
+        Assert.assertFalse(request.getOptions().getWriteCache());
     }
 
     @Test

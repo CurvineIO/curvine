@@ -38,4 +38,4 @@ jobs:
 
       - name: Run unit tests
         working-directory: curvine-libsdk/java
-        run: mvn -B protobuf:compile test -Dtest='CurvineNativeLibraryResolverTest'
+        run: mvn -B protobuf:compile test -Dtest='CurvineNativeLibraryResolverTest,MountRequestTest'
