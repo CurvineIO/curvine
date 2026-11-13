@@ -369,14 +369,35 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
     drop(queued.completion.expect("missing commit confirmation"));
 
     // The helper's real result: op error keeps its original variant and
-    // context over the commit error.
-    let result: FsResult<()> = worker.join().expect("the exclusive worker must finish");
+    // context over the commit error. Bounded join first: the worker must
+    // finish on its own; a stuck worker is reported, not silently waited on.
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let joiner = std::thread::spawn(move || {
+        let joined = worker.join().expect("the exclusive worker must not abort");
+        result_tx
+            .send(joined)
+            .expect("the driver must be alive to receive the worker result");
+    });
+    let joined: Option<FsResult<()>> =
+        match result_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(joined) => Some(joined),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the joiner must stay alive until the worker result is sent")
+            }
+        };
+    let result: FsResult<()> = joined.expect("the exclusive worker must finish within the bound");
+    joiner.join().expect("the joiner thread must finish");
     let delete_err = result.expect_err("the exclusive op must fail with the op error");
+    assert!(
+        matches!(&delete_err, curvine_error::FsError::Common(_)),
+        "the original op error must keep its Common variant, got {delete_err:?}"
+    );
     assert!(
         delete_err
             .to_string()
             .contains("exclusive body: typed op error after enqueue"),
-        "the original op error must take priority, got {delete_err}"
+        "the original op error must keep its context, got {delete_err}"
     );
 
     // The holder must be terminal (body Err + seq moved → fail_closed).
@@ -402,7 +423,9 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
     drop(writer);
     journal.shutdown();
     let meta_cleanup = std::fs::remove_dir_all(&conf.master.meta_dir);
+    let journal_cleanup = std::fs::remove_dir_all(&conf.journal.journal_dir);
     meta_cleanup.expect("the case meta dir must be removable");
+    journal_cleanup.expect("the case journal dir must be removable");
 }
 
 #[test]
