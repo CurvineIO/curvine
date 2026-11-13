@@ -799,3 +799,53 @@ fn identity_replaced_between_capture_and_locking_is_not_deleted() {
         "the replacement identity must not survive under the removed tree"
     );
 }
+
+/// R7: the hard link is a name *outside* the deleted subtree. Adding it in the
+/// capture window must not change the outcome: after the subtree is deleted the
+/// external name still resolves to the same inode with the same content.
+#[test]
+fn external_hardlink_created_in_the_window_survives_the_delete() {
+    let fs = test_fs("plan-pause-external-hardlink");
+    fs.mkdir("/a/d0", true).unwrap();
+    fs.create("/a/d0/file", false).unwrap();
+    fs.mkdir("/outside", true).unwrap();
+    let file_id = fs.file_status("/a/d0/file").unwrap().id;
+
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    fs.journal_writer
+        .arm_plan_pause_hook(reached_tx, release_rx);
+
+    let delete_fs = fs.clone();
+    let handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+    reached_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the planner must reach the pause point");
+
+    // A new name for the inode, created outside the planned subtree.
+    fs.link("/a/d0/file".to_string(), "/outside/alias".to_string())
+        .expect("link outside the subtree");
+    release_tx.send(()).expect("release the planner");
+
+    handle
+        .join()
+        .expect("delete thread must not panic")
+        .expect("the delete must finish");
+
+    assert!(
+        fs.file_status("/a").is_err(),
+        "the planned tree must be gone"
+    );
+    // The external name is outside the plan: the inode must stay alive.
+    let survivor = fs
+        .file_status("/outside/alias")
+        .expect("an external hard link must survive a recursive delete");
+    assert_eq!(
+        survivor.id, file_id,
+        "the external name must still resolve to the same inode"
+    );
+    assert_eq!(
+        survivor.len, 0,
+        "the surviving name must keep the inode's content unchanged"
+    );
+}

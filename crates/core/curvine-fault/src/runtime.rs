@@ -141,6 +141,7 @@ impl FaultRuntime {
         &PROCESS_FAULT_RUNTIME
     }
 
+    /// Test-only: lists every point name in the process runtime's built
     /// Installs or replaces one rule.
     ///
     /// Rules for the same point are evaluated in rule-ID order. `Record`
