@@ -435,9 +435,9 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
                 .await
         })
         .unwrap();
-    let shutdown_ack = fixture.runtime.block_on(async {
-        tokio::time::timeout(HANDSHAKE_WINDOW, shutdown_rx.receive()).await
-    });
+    let shutdown_ack = fixture
+        .runtime
+        .block_on(async { tokio::time::timeout(HANDSHAKE_WINDOW, shutdown_rx.receive()).await });
     if shutdown_ack.is_err() {
         panic!("the shutdown was not acknowledged; skipping teardown that could block");
     }
@@ -773,7 +773,11 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
     // restore proceeds into apply_snapshot0 — reporting the holder failed.
     eprintln!("restore: dropping completion");
     drop(completion);
-    let delete_outcome = wait_same_result(&delete_done_rx, Duration::from_secs(10), Duration::from_secs(10));
+    let delete_outcome = wait_same_result(
+        &delete_done_rx,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    );
     let delete_done = match delete_outcome {
         Waited::Delivered(result) => result,
         Waited::Disconnected => panic!("the delete worker exited without reporting a result"),
@@ -794,14 +798,17 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
         "the delete must surface the real commit error, got {delete_err}"
     );
 
-    let restore_outcome =
-        wait_same_result(&restore_done_rx, Duration::from_secs(30), Duration::from_secs(30));
+    let restore_outcome = wait_same_result(
+        &restore_done_rx,
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
     let restore_result = match restore_outcome {
         Waited::Delivered(result) => result,
         Waited::Disconnected => panic!("the restore thread exited without reporting a result"),
-        Waited::Timeout => panic!(
-            "the restore intent did not return; skipping its join and the blocking teardown"
-        ),
+        Waited::Timeout => {
+            panic!("the restore intent did not return; skipping its join and the blocking teardown")
+        }
     };
     restore_thread
         .join()
