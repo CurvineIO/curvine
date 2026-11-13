@@ -175,6 +175,14 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
         loader_for_worker.run_apply(receiver).await;
     });
 
+    // Pre-operation opaque cursor handle: saved before the operation spawns.
+    let pre_cursor = mfs.fs_dir.view().unwrap().store.cursor_store();
+    let pre_cursor_probe = pre_cursor.get_applied_req(77);
+    assert!(
+        matches!(&pre_cursor_probe, Ok(None)),
+        "the live cursor must answer point lookups, got {pre_cursor_probe:?}"
+    );
+
     // Real role promotion through the actual role_change path.
     eprintln!("progress: promoting to leader");
     fixture
@@ -268,14 +276,14 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     let (rpc_tx, rpc_rx) = std::sync::mpsc::channel();
     let rpc = std::thread::spawn(move || {
         rpc_started_tx.send(()).unwrap();
-        rpc_tx.send(rpc_fs.create("/validation-2", false))
+        rpc_tx.send(rpc_fs.create("/validation", false))
     });
-    rpc_started_rx
-        .recv_timeout(HANDSHAKE_WINDOW)
-        .expect("rpc worker started");
+    let rpc_started = rpc_started_rx.recv_timeout(HANDSHAKE_WINDOW);
+    let rpc_pending = rpc_rx.recv_timeout(Duration::from_millis(200));
+    let rpc_still_blocked = matches!(rpc_pending, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
     assert!(
-        rpc_rx.recv_timeout(Duration::from_millis(200)).is_err(),
-        "a second write RPC must stay blocked by the exclusive gate"
+        rpc_still_blocked,
+        "a second write RPC must stay blocked by the exclusive gate, got {rpc_pending:?}"
     );
 
     // Real Scan through the loader: register the delete as committed, run the
@@ -338,6 +346,15 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
         "the view must be Unavailable after the terminal failure"
     );
     assert_ne!(writer.failure_seq(), failure_seq_before);
+    let cursor_retired = pre_cursor.get_applied_req(77);
+    let cursor_retired_err =
+        cursor_retired.expect_err("the retired cursor must fail point lookups");
+    assert!(
+        cursor_retired_err
+            .to_string()
+            .contains("cursor store unavailable during metadata restore"),
+        "the retired cursor must report the restore-unavailable error, got {cursor_retired_err}"
+    );
     assert!(
         delete_err
             .to_string()
@@ -390,8 +407,10 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     });
     drop(mfs);
     fixture.journal.shutdown();
-    let _ = std::fs::remove_dir_all(&fixture.meta_dir);
-    let _ = std::fs::remove_dir_all(&fixture.journal_dir);
+    let meta_cleanup = std::fs::remove_dir_all(&fixture.meta_dir);
+    let journal_cleanup = std::fs::remove_dir_all(&fixture.journal_dir);
+    meta_cleanup.expect("the meta dir must be removable");
+    journal_cleanup.expect("the journal dir must be removable");
 }
 
 #[cfg(feature = "fault-injection")]

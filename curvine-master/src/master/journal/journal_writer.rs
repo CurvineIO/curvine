@@ -356,9 +356,11 @@ impl JournalWriter {
         self.fail_metadata("metadata restore failed after store replacement began");
     }
 
-    /// Terminal fencing for the namespace holder (exclusive confirmation
-    /// error or cold drop panic). Unlike the source-specific methods, this
-    /// records the failure without claiming a restore replacement occurred.
+    /// Terminal fencing for the namespace holder. The underlying
+    /// `fail_metadata` call preserves whatever source error was already
+    /// recorded by a preceding `fail_metadata_commit/publication` call
+    /// (its `enter_safe_mode` will overwrite the reason, but the earlier
+    /// source-specific call's `last_error` was already stored).
     pub(crate) fn fail_metadata_holder_terminal(&self) {
         self.fail_metadata("namespace holder terminal after confirmation failure");
     }

@@ -7,6 +7,7 @@ use super::*;
 use crate::master::meta::inode::DirNode;
 use crate::master::meta::BlockMeta;
 use curvine_model::BlockLocation;
+use curvine_raft::raft::RoleState;
 use std::collections::HashMap;
 
 #[test]
@@ -288,4 +289,131 @@ fn build_located_blocks_reports_lost_blocks_like_the_live_path() {
         err.to_string().contains("Lost (no worker can read)"),
         "the lost-block check must fire, got {err}"
     );
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn exclusive_op_and_commit_error_preserves_original_op_error() {
+    // Direct private helper call: the exclusive body enqueues a real receipt
+    // (via fs_dir.delete → send_and_wait), then returns a distinguishable
+    // typed op error. The test drops the unique receipt to also fail the
+    // commit, exercising the (Err(op), Err(commit)) match arm.
+    use curvine_runtime::sync::channel::CallChannel;
+
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        format_master: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!(
+        "exclusive-op-commit-{}",
+        curvine_runtime::common::Utils::rand_str(8)
+    ));
+    conf.journal.snapshot_entries = 0;
+    conf.journal.writer_channel_size = 8;
+    let journal = JournalSystem::from_conf(&conf).unwrap();
+    let fs = journal.fs();
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
+    fs.mkdir("/dir", true).unwrap();
+    fs.create("/dir/file", true).unwrap();
+    fs.journal_writer.with_testing_receiver(|receiver| loop {
+        match receiver.try_recv() {
+            Ok(entry) => drop(entry),
+            Err(_) => break,
+        }
+    });
+    let failure_seq_before = fs.journal_writer.failure_seq();
+
+    // Install the receipts writer (require_raft_commit=true).
+    let writer = {
+        let rt = conf.journal.create_runtime();
+        let client = curvine_raft::raft::RaftClient::from_conf(rt, &conf.journal);
+        let mut writer = JournalWriter::new(
+            true,
+            client,
+            &conf.journal,
+            fs.journal_writer.recovery.clone(),
+        )
+        .unwrap();
+        writer.enable_testing_receipts(fs.journal_writer.recovery.clone());
+        let writer = Arc::new(writer);
+        fs.fs_dir
+            .begin_cold(DEFAULT_COLD_TIMEOUT)
+            .unwrap()
+            .journal_writer = writer.clone();
+        writer
+    };
+    fs.journal_writer = writer.clone();
+
+    // The exclusive body: first performs a real FsDir operation that enqueues
+    // a receipt (fs_dir.delete), then returns a distinguishable typed op
+    // error. This exercises the (Err(op), Err(commit)) match arm.
+    let op_error_message = "exclusive body: typed op error after enqueue";
+    let op_error = FsError::common(op_error_message);
+
+    // Acquire the exclusive path directly via the private helper.
+    let epoch = fs.journal_writer.metadata_epoch().unwrap();
+    let commit_gate = fs.metadata_commit_gate();
+    let mut confirmation = ExclusiveConfirmation {
+        handle: Some(&fs.fs_dir),
+        writer: &fs.journal_writer,
+    };
+    let mut gate = commit_gate.close_and_enter_if_open().unwrap();
+    let scope = fs.journal_writer.begin_commit_scope();
+    let mut cold = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+
+    let body_result: FsResult<()> = (|| {
+        let inp = InodePath::resolve(cold.root_node(), "/dir/file", &cold.store)?;
+        cold.delete(&inp, false)?;
+        // The send_and_wait inside fs_dir.delete has already enqueued the
+        // receipt. Now return the typed op error.
+        curvine_core_error::err_box!("{}", op_error_message)
+    })();
+
+    // Drop the cold owner before the confirmation wait.
+    drop(cold);
+
+    // The receipt was enqueued; drop the completion to fail the commit.
+    let queued = writer
+        .with_testing_receiver(|receiver| {
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("missing delete journal entry")
+        })
+        .expect("the receipts receiver must exist");
+    drop(queued.completion.expect("missing commit confirmation"));
+
+    // The confirmation wait now fails for real (the completion was dropped).
+    let commit = scope.wait();
+    confirmation.disarm();
+    drop(confirmation);
+    drop(gate);
+
+    // The op error takes priority over the commit error.
+    let delete_err = match (body_result, commit) {
+        (Err(op_err), _) => op_err,
+        (Ok(_), Err(commit_err)) => commit_err,
+        (Ok(value), Ok(())) => {
+            let _ = value;
+            panic!("the exclusive body must fail");
+        }
+    };
+
+    // The holder must be terminal (body Err + seq moved → fail_closed).
+    assert!(
+        fs.fs_dir.is_failed(),
+        "both failures must fail the holder closed"
+    );
+    assert!(
+        matches!(fs.fs_dir.view().err(), Some(crate::master::meta::NamespaceError::Unavailable)),
+        "the view must be Unavailable after both failures"
+    );
+
+    // The op error keeps its original variant and message.
+    assert!(
+        delete_err.to_string().contains(op_error_message),
+        "the original op error must take priority, got {delete_err}"
+    );
+    journal.shutdown();
 }
