@@ -146,16 +146,31 @@ fn root_is_written_when_it_is_the_target_and_filtered_as_ancestor() -> curvine_e
     let handle = fs.fs_dir();
     let view = handle.view().expect("namespace view");
 
-    // Root as a plain ancestor of a deeper target: it must not be forced Write.
+    // The mutated parent keeps its requested mode even when it is the root:
+    // design §4 keeps a root-Write that is the delete target's parent, and
+    // the sharded delete path retains it the same way (parent_index == 0).
     let inner = SubtreeWritePlan::capture(&view, "/x", InodeLockMode::Write)
         .expect("capture must succeed")
         .expect("plan expected");
     assert!(
-        !has_write(inner.inode_requests(), root_id),
-        "an ancestor root must not be Write for a non-root target: {:?}",
+        has_write(inner.inode_requests(), root_id),
+        "the mutated parent root must stay Write for /x: {:?}",
         inner.inode_requests()
     );
     assert!(has_write(inner.inode_requests(), x));
+
+    // A root that is only a plain ancestor (deeper target) is filtered.
+    fs.mkdir("/x/deep", false)?;
+    let deep = fs.file_status("/x/deep")?.id;
+    let deeper = SubtreeWritePlan::capture(&view, "/x/deep", InodeLockMode::Write)
+        .expect("capture must succeed")
+        .expect("plan expected");
+    assert!(
+        !has_write(deeper.inode_requests(), root_id),
+        "a plain-ancestor root must not be Write: {:?}",
+        deeper.inode_requests()
+    );
+    assert!(has_write(deeper.inode_requests(), deep));
 
     // Root as the real target: its Write must not be filtered away.
     let whole = SubtreeWritePlan::capture(&view, "/", InodeLockMode::Write)
@@ -314,8 +329,10 @@ fn oversized_subtree_returns_no_plan() -> curvine_error::FsResult<()> {
 fn exactly_at_the_limit_still_produces_a_plan() -> curvine_error::FsResult<()> {
     let fs = test_fs("limit-boundary");
     fs.mkdir("/edge", false)?;
-    // One directory + (LIMIT - 1) children == LIMIT counted entries.
-    for index in 0..SUBTREE_PLAN_LIMIT - 1 {
+    // Design §3 counts path-chain entries plus actually visited edges:
+    // chain [root, target] = 2, so exactly-at-limit means LIMIT - 2
+    // children, each reached through one counted edge.
+    for index in 0..SUBTREE_PLAN_LIMIT - 2 {
         fs.create(format!("/edge/f{index}"), false)?;
     }
 

@@ -140,11 +140,11 @@ impl SubtreeWritePlan {
         };
 
         let mut subtree: Vec<InodeLockRequest> = Vec::new();
+        // The target itself entered the budget as a chain entry; every
+        // further subtree member is charged exactly once, through the edge
+        // it was reached by (enumeration), never again on pop.
         let mut stack: Vec<ChildEdge> = vec![target_edge];
         while let Some(edge) = stack.pop() {
-            if !charge(&mut budget, 1) {
-                return Ok(None);
-            }
             match edge {
                 ChildEdge::FileId(id) => {
                     // Files are Write-locked too: a post-plan external hard
