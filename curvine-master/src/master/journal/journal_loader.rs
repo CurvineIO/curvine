@@ -24,7 +24,8 @@ use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::store::{JournalCursorStore, RocksInodeStore};
 use crate::master::meta::{
-    ColdError, ColdFsDirGuard, CommitGate, FsDir, InodeId, InodeLockRequest, NamespaceGuard,
+    BlockLocationLockManager, ColdError, ColdFsDirGuard, CommitGate, FsDir, InodeId, InodeLockMode,
+    InodeLockRequest, NamespaceGuard,
 };
 use crate::master::meta::{FsDirHandle, InodeLockManager};
 
@@ -100,6 +101,7 @@ pub struct JournalLoader {
     op_id: Arc<AtomicCounter>,
     mnt_mgr: Arc<MountManager>,
     journal_writer: Arc<JournalWriter>,
+    block_location_locks: Arc<BlockLocationLockManager>,
     ufs_loader: UfsLoader,
     worker_manager: SyncWorkerManager,
     worker_notify: Arc<Notify>,
@@ -268,6 +270,7 @@ impl JournalLoader {
         }
 
         let metadata_commit_gate = job_manager.master_fs().metadata_commit_gate();
+        let block_location_locks = job_manager.master_fs().block_location_locks.clone();
         let ufs_loader = UfsLoader::new(job_manager, fs_dir.clone(), conf);
         let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
         let worker_notify = worker_manager.read().registered_notify();
@@ -338,6 +341,7 @@ impl JournalLoader {
             node_id: conf.node_id()?,
             client,
             group_size: conf.journal_addrs.len().max(1),
+            block_location_locks,
             fs_dir,
             meta_data_dir,
             scan_control,
@@ -1828,13 +1832,134 @@ impl JournalLoader {
     /// journal recorded a publication failure during it (failure_seq moved);
     /// a pure validation/store error leaves the handle OPEN for normal
     /// backfill via replay.
-    fn with_replay_cold<T>(&self, body: impl FnOnce(&mut FsDir) -> FsResult<T>) -> CommonResult<T> {
+    /// C2 recursive replay coordination (design §8.2): the same planning
+    /// and lock pool as the RPC entry, but no RPC admission, no commit
+    /// scope, no journal writes and no self-ack. The confirmation-style
+    /// guard is declared after the inode/view bindings; an in-lock
+    /// Err+failure_seq move (or a body unwind) terminalizes the holder
+    /// before the locks drop. Budget overflow keeps the original cold
+    /// bridge; the apply worker never drains the ordinary gate.
+    fn with_replay_locks<T>(
+        &self,
+        path: &str,
+        parent_mode: crate::master::meta::InodeLockMode,
+        need_locations: bool,
+        body: impl FnOnce(&FsDir) -> FsResult<T>,
+    ) -> CommonResult<T> {
+        use crate::master::fs::master_filesystem::MetadataConfirmation;
+        use crate::master::meta::subtree_write_plan::SubtreeWritePlan;
+
+        let plan = {
+            let fs_dir = self.fs_dir.view().map_err(|e| e.to_string())?;
+            match SubtreeWritePlan::capture(&fs_dir, path, parent_mode) {
+                Ok(Some(plan)) => plan,
+                // Budget overflow / unresolvable: the cold bridge keeps the
+                // original behavior (§7).
+                Ok(None) => return self.with_replay_cold(body),
+                Err(e) => return Err(e.to_string().into()),
+            }
+        };
+        let inode_locks = self.inode_locks.lock_many(plan.inode_requests());
+
+        // Location locks for a recursive free replay (the same protection
+        // as the RPC path, minus admission): sample with a short view,
+        // drop the view, then take worker → block stripes.
+        let location_locks = if need_locations {
+            let mut block_ids: Vec<i64> = Vec::new();
+            let mut worker_ids: Vec<u32> = Vec::new();
+            {
+                let fs_dir = self.fs_dir.view().map_err(|e| e.to_string())?;
+                for request in plan.inode_requests() {
+                    if !matches!(request.mode, crate::master::meta::InodeLockMode::Write) {
+                        continue;
+                    }
+                    let Some(inode) = fs_dir
+                        .store
+                        .get_inode(request.inode_id, None)
+                        .map_err(|e| e.to_string())?
+                    else {
+                        continue;
+                    };
+                    let Ok(file) = inode.as_file_ref() else {
+                        continue;
+                    };
+                    for block_id in file.block_ids() {
+                        block_ids.push(block_id);
+                        if block_ids.len()
+                            > crate::master::meta::subtree_write_plan::SUBTREE_PLAN_LIMIT
+                        {
+                            drop(inode_locks);
+                            return self.with_replay_cold(body);
+                        }
+                        for location in fs_dir
+                            .get_block_locations(block_id)
+                            .map_err(|e| e.to_string())?
+                        {
+                            worker_ids.push(location.worker_id);
+                            if worker_ids.len()
+                                > crate::master::meta::subtree_write_plan::SUBTREE_PLAN_LIMIT
+                            {
+                                drop(inode_locks);
+                                return self.with_replay_cold(body);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(
+                self.block_location_locks
+                    .write_workers_blocks(&worker_ids, &block_ids),
+            )
+        } else {
+            None
+        };
+
+        // Pre-body revalidation: churn here (before the guard exists) falls
+        // back to the cold bridge with the locks dropped.
+        let churn = {
+            let fs_dir = self.fs_dir.view().map_err(|e| e.to_string())?;
+            plan.revalidate(&fs_dir, path)
+                .map_err(|e| e.to_string())?
+                .is_none()
+        };
+        if churn {
+            drop(location_locks);
+            drop(inode_locks);
+            return self.with_replay_cold(body);
+        }
+
+        // Guard declared after the inode/view bindings (§8.2); the final
+        // view and the body run inside the protected scope.
+        let result = (|| -> CommonResult<T> {
+            let fs_dir = self.fs_dir.view().map_err(|e| e.to_string())?;
+            let mut guard = MetadataConfirmation::arm(&self.fs_dir, &self.journal_writer);
+            let failure_seq_before = self.journal_writer.failure_seq();
+            let result = body(&fs_dir);
+            if result.is_err() && self.journal_writer.failure_seq() != failure_seq_before {
+                guard.fail_terminal();
+            }
+            drop(fs_dir);
+            if result.is_ok() {
+                // No fatal: disarm so the holder stays usable after the
+                // locks drop (replay has no confirmation wait to disarm it).
+                guard.disarm();
+            }
+            drop(guard);
+            result.map_err(|e| e.into())
+        })();
+
+        drop(location_locks);
+        drop(inode_locks);
+        result
+    }
+
+    fn with_replay_cold<T>(&self, body: impl FnOnce(&FsDir) -> FsResult<T>) -> CommonResult<T> {
         let mut cold = self
             .fs_dir
             .begin_cold(DEFAULT_COLD_TIMEOUT)
             .map_err(|e| e.to_string())?;
         let failure_seq_before = cold.journal_writer.failure_seq();
-        let result = body(&mut cold);
+        let result = body(&cold);
         match result {
             Ok(value) => Ok(value),
             Err(error) => {
@@ -2174,7 +2299,10 @@ impl JournalLoader {
                 .unwrap_or(false)
         };
         if is_dir {
-            return self.with_replay_cold(|fs_dir| {
+            // C2: a recursive directory delete replays under the bounded
+            // subtree-lock path (parent Write; no location locks — the
+            // Delete entry carries no block list).
+            return self.with_replay_locks(&entry_path, InodeLockMode::Write, false, |fs_dir| {
                 let inp = InodePath::resolve(fs_dir.root_node(), &entry_path, &fs_dir.store)?;
                 if inp.get_last_inode().is_none() {
                     warn!("Delete: path not found: {}", entry_path);
@@ -2195,11 +2323,11 @@ impl JournalLoader {
     }
 
     pub fn free(&self, entry: FreeEntry) -> CommonResult<()> {
-        // ponytail: recursive free touches the whole subtree without child
-        // stripe locks — replay falls back to begin_cold for correctness
-        // until c-2 adds subtree lock planning.
         if entry.recursive {
-            return self.with_replay_cold(|fs_dir| {
+            // C2: a recursive free replays under the bounded subtree-lock
+            // path with the full inode → worker → block order (a free
+            // always drops data blocks).
+            return self.with_replay_locks(&entry.path, InodeLockMode::Write, true, |fs_dir| {
                 let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
                 let Some(inode) = inp.get_last_inode() else {
                     warn!("Free: path not found: {:?}", entry);
@@ -2234,20 +2362,22 @@ impl JournalLoader {
     }
 
     pub fn set_attr(&self, entry: SetAttrEntry) -> CommonResult<()> {
-        // ponytail: recursive set_attr propagates into children without child
-        // stripe locks — replay falls back to begin_cold until c-2 adds
-        // subtree lock planning.
         if entry.opts.recursive {
-            return self.with_replay_cold(|fs_dir| {
-                let inp = InodePath::resolve(fs_dir.root_node(), &entry.path, &fs_dir.store)?;
+            // C2: a recursive set_attr replays under the bounded subtree-
+            // lock path (parent Read; no location locks — attributes do not
+            // touch blocks).
+            let entry_path = entry.path.clone();
+            let opts = entry.opts.clone();
+            return self.with_replay_locks(&entry_path, InodeLockMode::Read, false, |fs_dir| {
+                let inp = InodePath::resolve(fs_dir.root_node(), &entry_path, &fs_dir.store)?;
                 let last_inode = match inp.get_last_inode() {
                     Some(v) => v,
                     None => {
-                        warn!("SetAttr: path not found: {:?}", entry);
+                        warn!("SetAttr: path not found: {:?}", entry_path);
                         return Ok(());
                     }
                 };
-                fs_dir.unprotected_set_attr(last_inode, entry.opts)?;
+                fs_dir.unprotected_set_attr(last_inode, opts.clone())?;
                 Ok(())
             });
         }

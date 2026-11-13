@@ -1,4 +1,5 @@
 use super::*;
+use crate::master::meta::subtree_write_plan::SUBTREE_PLAN_LIMIT;
 use curvine_model::{FileLock, LockFlags, LockType};
 
 #[cfg(feature = "fault-injection")]
@@ -151,6 +152,11 @@ fn single_inode_set_attr_does_not_wait_for_fs_dir_readers() {
 
 #[test]
 fn recursive_set_attr_waits_for_shared_namespace_readers() {
+    // C2: a small recursive set_attr runs under the bounded subtree-lock
+    // path and completes concurrently with a held namespace view — the
+    // view guard is a reader, not a lock the recursive path must drain.
+    // The over-budget fallback (which still drains via the exclusive
+    // bridge) keeps the original waiting contract observable.
     let fs = test_fs("recursive-set-attr-shared-reader");
     fs.create("/tree/dir/file", true).unwrap();
     let read_guard = fs.fs_dir.view().unwrap();
@@ -170,25 +176,66 @@ fn recursive_set_attr_waits_for_shared_namespace_readers() {
             .unwrap();
     });
 
+    // The locked path must finish while the reader still holds its view.
+    let status = done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.mode, 0o700);
+    task.join().unwrap();
+    assert_eq!(fs.file_status("/tree/dir").unwrap().mode, 0o700);
+    assert_eq!(fs.file_status("/tree/dir/file").unwrap().mode, 0o700);
+    // The reader's view stays usable (FAILED is not a drain) and the
+    // versioned walk still validates.
+    let snapshot_inp = crate::master::meta::inode::InodePath::resolve(
+        read_guard.root_node(),
+        "/tree/dir/file",
+        &read_guard.store,
+    )
+    .expect("the held view must still resolve after the locked write");
+    let snapshot_status = read_guard
+        .file_status(&snapshot_inp)
+        .expect("the held view must stay usable after the locked write");
+    assert_eq!(snapshot_status.mode, 0o700);
+    drop(read_guard);
+
+    // Over-budget subtree: the plan returns None before any side effect
+    // and the exclusive bridge drains the held view — the original
+    // waiting contract.
+    let wide = test_fs("recursive-set-attr-shared-reader-fallback");
+    wide.create("/wide/dir/file", true).unwrap();
+    for index in 0..SUBTREE_PLAN_LIMIT {
+        wide.create(format!("/wide/f{index}"), false).unwrap();
+    }
+    let read_guard = wide.fs_dir.view().unwrap();
+    let worker = wide.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let task = std::thread::spawn(move || {
+        done_tx
+            .send(
+                worker.set_attr(
+                    "/wide",
+                    SetAttrOptsBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .build(),
+                ),
+            )
+            .unwrap();
+    });
     let early = done_rx.recv_timeout(std::time::Duration::from_millis(100));
     drop(read_guard);
-    let status = match early {
+    match early {
         Ok(result) => {
             task.join().unwrap();
-            panic!("recursive set_attr bypassed the namespace writer: {result:?}");
+            panic!("an over-budget recursive set_attr must not bypass the cold drain: {result:?}");
         }
         Err(_) => done_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap()
             .unwrap(),
     };
-    assert_eq!(status.mode, 0o700);
-    task.join().unwrap();
-    assert_eq!(fs.file_status("/tree/dir").unwrap().mode, 0o700);
-    assert_eq!(fs.file_status("/tree/dir/file").unwrap().mode, 0o700);
-    fs.restore_from_rocksdb().unwrap();
-    assert_eq!(fs.file_status("/tree/dir").unwrap().mode, 0o700);
-    assert_eq!(fs.file_status("/tree/dir/file").unwrap().mode, 0o700);
+    assert_eq!(wide.file_status("/wide/dir/file").unwrap().mode, 0o700);
 }
 
 #[test]

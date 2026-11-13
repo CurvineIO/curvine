@@ -54,11 +54,9 @@ pub use glob_utils::*;
 
 mod lock_meta;
 
-// C2 phase A (design 2026-11-13 §10): pure planning module, not yet wired
-// into execution entries — §8 (failure semantics, bounded journal queue) is
-// pending. Remove the allow when the execution entries start consuming it.
-#[allow(dead_code)]
-mod subtree_write_plan;
+// C2 planning module (design §3/§10): consumed by the recursive write
+// coordination entry and replay entries.
+pub(crate) mod subtree_write_plan;
 pub use self::lock_meta::LockMeta;
 
 pub mod trash;
