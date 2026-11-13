@@ -190,6 +190,12 @@ fn teardown(fs: MasterFilesystem, journal: JournalSystem, conf: &ClusterConf) {
 /// terminal holder right after acquiring it — proving the failure happened
 /// inside the lock window — and fresh views are rejected. The old reader and
 /// its cursor probe taken before the failure stay legal (FAILED ≠ drain).
+// The publication-failure contract needs the fault-injection runtime:
+// the injection point only registers under the fault feature (the shared
+// FAULT_POINT_REGISTRATIONS slice is feature-gated), so this case runs
+// only there — the default-mode publication contract is covered by the
+// confirmation's commit-failure cases that don't need an injection point.
+#[cfg(feature = "fault-injection")]
 #[test]
 fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
     let (conf, journal, mut fs) = confirmation_env("recursive-publication-inside-locks");
