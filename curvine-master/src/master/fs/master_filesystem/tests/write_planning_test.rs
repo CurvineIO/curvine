@@ -352,8 +352,12 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
             let inp = InodePath::resolve(fs_dir.root_node(), "/dir/file", &fs_dir.store)?;
             fs_dir.delete(&inp, false)?;
             // The send_and_wait inside fs_dir.delete has already enqueued the
-            // receipt. Now return a distinguishable typed op error.
-            err_box!("exclusive body: typed op error after enqueue")
+            // receipt. Now return a typed op error with a non-Common variant
+            // (the commit error is Common, so the variant alone must
+            // distinguish the two).
+            Err(FsError::file_not_found(
+                "exclusive body: typed op error after enqueue",
+            ))
         })
     });
 
@@ -389,16 +393,18 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
     let result: FsResult<()> = joined.expect("the exclusive worker must finish within the bound");
     joiner.join().expect("the joiner thread must finish");
     let delete_err = result.expect_err("the exclusive op must fail with the op error");
-    assert!(
-        matches!(&delete_err, curvine_error::FsError::Common(_)),
-        "the original op error must keep its Common variant, got {delete_err:?}"
-    );
-    assert!(
-        delete_err
-            .to_string()
-            .contains("exclusive body: typed op error after enqueue"),
-        "the original op error must keep its context, got {delete_err}"
-    );
+    // Direct variant + payload match: the op error must arrive as the
+    // original FileNotFound with its message, not a re-wrapped Common
+    // (which is what the commit error would look like).
+    match &delete_err {
+        err @ FsError::FileNotFound(_)
+            if err
+                .to_string()
+                .contains("exclusive body: typed op error after enqueue") => {}
+        other => panic!(
+            "the original op error must keep its FileNotFound variant and payload, got {other:?}"
+        ),
+    }
 
     // The holder must be terminal (body Err + seq moved → fail_closed).
     assert!(
