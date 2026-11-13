@@ -231,15 +231,14 @@ fn replay_of_a_missing_subtree_skips() -> FsResult<()> {
 /// not leave the apply gate closed.
 #[test]
 fn oversized_replay_completes_and_leaves_the_gate_open() -> FsResult<()> {
+    use crate::master::meta::subtree_write_plan::SUBTREE_PLAN_LIMIT;
+
     let source = JournalSystem::from_conf(&test_conf("oversize-source"))?;
     let source_fs = source.fs();
+    // The source only has to produce the entry; its own size proves nothing
+    // about the target.
     source_fs.mkdir("/w", false)?;
-    // One more member than the plan budget (SUBTREE_PLAN_LIMIT = 1024 per the
-    // final C2 design; the module is private to `meta`).
-    const PLAN_LIMIT: usize = 1024;
-    for index in 0..PLAN_LIMIT + 8 {
-        source_fs.create(format!("/w/f{index}"), false)?;
-    }
+    source_fs.create("/w/f0", false)?;
     let entry = capture_one(&source_fs, || {
         source_fs.delete("/w", true).unwrap();
     });
@@ -247,10 +246,28 @@ fn oversized_replay_completes_and_leaves_the_gate_open() -> FsResult<()> {
     let target = JournalSystem::from_conf(&test_conf("oversize-target"))?;
     let target_fs = target.fs();
     target_fs.mkdir("/w", false)?;
-    for index in 0..16 {
+    // The TARGET is the oversized one: one more member than the plan budget.
+    for index in 0..SUBTREE_PLAN_LIMIT + 1 {
         target_fs.create(format!("/w/f{index}"), false)?;
     }
     echo_entries(&target_fs);
+
+    // Direct evidence that this target cannot be planned, taken under a short
+    // view that is dropped before anything else runs.
+    {
+        let handle = target_fs.fs_dir.clone();
+        let view = handle.view()?;
+        let plan = crate::master::meta::subtree_write_plan::SubtreeWritePlan::capture(
+            &view,
+            "/w",
+            InodeLockMode::Write,
+        )?;
+        assert!(
+            plan.is_none(),
+            "the target subtree itself must exceed the {SUBTREE_PLAN_LIMIT}-entry plan budget"
+        );
+    }
+
     let loader = target.journal_loader();
     loader.apply_entry(entry)?;
 
@@ -258,10 +275,28 @@ fn oversized_replay_completes_and_leaves_the_gate_open() -> FsResult<()> {
         target_fs.file_status("/w").is_err(),
         "the over-budget replay must still delete through the cold bridge"
     );
-    // The apply gate must be open again: a plain write still works.
+    assert!(
+        echo_entries(&target_fs).is_empty(),
+        "replay must not echo journal entries"
+    );
+    // The apply gate must be open again, and the plan must be reachable for a
+    // small path afterwards (an oversized one must not poison later replays).
     target_fs
         .mkdir("/after", false)
         .expect("the apply gate must not be left closed");
+    {
+        let handle = target_fs.fs_dir.clone();
+        let view = handle.view()?;
+        let plan = crate::master::meta::subtree_write_plan::SubtreeWritePlan::capture(
+            &view,
+            "/after",
+            InodeLockMode::Write,
+        )?;
+        assert!(
+            plan.is_some(),
+            "a small subtree must still be plannable after an oversized replay"
+        );
+    }
     Ok(())
 }
 
@@ -377,3 +412,6 @@ fn app_storage_apply_advances_the_real_fsm_and_request_record() -> FsResult<()> 
 
 #[path = "recursive_replay_location_test.rs"]
 mod recursive_replay_location_test;
+
+#[path = "replay_free_test.rs"]
+mod replay_free_test;

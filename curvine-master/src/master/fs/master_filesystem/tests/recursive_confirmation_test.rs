@@ -347,9 +347,6 @@ fn assert_fenced_real_rpc_rejects<R: Send + 'static>(
     );
 }
 
-
-
-
 /// §8.1: a pure business error with an unmoved failure seq and an Ok
 /// confirmation keeps the holder usable — no retirement, no safe mode, and
 /// later ordinary writes succeed.

@@ -22,6 +22,21 @@ use curvine_model::{
     WorkerAddress, WorkerInfo, WorkerStatus,
 };
 
+fn install_worker(fs: &MasterFilesystem, worker_id: u32, session: &str) {
+    let mut worker = WorkerInfo::new(
+        WorkerAddress {
+            worker_id,
+            ..Default::default()
+        },
+        worker_id,
+    );
+    worker.status = WorkerStatus::Live;
+    worker.capacity = i64::MAX / 4;
+    worker.available = i64::MAX / 4;
+    worker.worker_session_id = session.to_string();
+    fs.add_test_worker(worker);
+}
+
 /// R2/F2: a location that appears *inside* the replay sampling window must make
 /// the post-lock coverage check re-plan. The driver stops the replay at the
 /// checkpoint the production code exposes (sampling complete, worker/block
@@ -31,21 +46,6 @@ use curvine_model::{
 /// the first one is released only after the report returns.
 #[test]
 fn replay_location_grown_inside_the_sampling_window_forces_a_second_capture() -> FsResult<()> {
-    fn install_worker(fs: &MasterFilesystem, worker_id: u32, session: &str) {
-        let mut worker = WorkerInfo::new(
-            WorkerAddress {
-                worker_id,
-                ..Default::default()
-            },
-            worker_id,
-        );
-        worker.status = WorkerStatus::Live;
-        worker.capacity = i64::MAX / 4;
-        worker.available = i64::MAX / 4;
-        worker.worker_session_id = session.to_string();
-        fs.add_test_worker(worker);
-    }
-
     /// Creates `path` with one completed block whose only location is worker 1.
     fn file_with_one_block(fs: &MasterFilesystem, path: &str) -> FsResult<i64> {
         fs.create(path, true)?;
@@ -207,12 +207,13 @@ fn replay_location_grown_inside_the_sampling_window_forces_a_second_capture() ->
         "replay must not echo journal entries"
     );
 
-    // End state per the real `stage_decrement_nlink` path: the last link drops
-    // the inode and its TTL, the gathered `DeleteResult` travels back to
-    // `JournalLoader::delete` which discards it and therefore issues no worker
-    // delete command - so BOTH location rows survive. Asserting an empty set
-    // would be asserting a reclamation this path does not perform, and an empty
-    // set would actually mean the replay silently skipped its work.
+    // End state of this path, stated as what it is and nothing more: the last
+    // link drops the inode and its TTL, and the gathered `DeleteResult` travels
+    // back to `JournalLoader::delete`, which discards it - so no worker delete
+    // command is issued and BOTH rows are still there. The two assertions below
+    // pin that contract and, through worker 2, that the in-window injection
+    // really happened. No reclamation mechanism elsewhere is asserted or assumed
+    // here; whether this path should reclaim at all is a separate question.
     let remaining = {
         let handle = target_fs.fs_dir.clone();
         let view = handle.view()?;
@@ -226,6 +227,99 @@ fn replay_location_grown_inside_the_sampling_window_forces_a_second_capture() ->
         remaining.iter().any(|loc| loc.worker_id == 2),
         "worker 2's row was added inside the window; if it is missing the \
          injection never happened: {remaining:?}"
+    );
+    Ok(())
+}
+
+/// G2: a legal small topology whose location set exceeds the shared budget must
+/// fall back to the cold bridge. The driver still `expect`s a plan whenever
+/// `need_locations` is set, so this shape panics today.
+///
+/// The fixture has to make the *plan* contain the files: a non-recursive delete
+/// only requests its parent directory, so it would sample nothing and never
+/// reach the budget. A recursive delete of four files does request them, and
+/// their locations (4 x 300 = 1200 > 1024) blow the whole-call budget while the
+/// topology stays trivially small.
+#[test]
+fn replay_with_an_over_budget_location_set_falls_back_instead_of_panicking() -> FsResult<()> {
+    use crate::master::meta::subtree_write_plan::SUBTREE_LOCATION_LIMIT;
+
+    const FILES: usize = 4;
+    const BLOCKS_PER_FILE: usize = 300;
+
+    let source = JournalSystem::from_conf(&test_conf("loc-budget-source"))?;
+    let target = JournalSystem::from_conf(&test_conf("loc-budget-target"))?;
+    let source_fs = source.fs();
+    let target_fs = target.fs();
+    install_worker(&target_fs, 1, "session-1");
+
+    // Source: the same small topology, no blocks - only the entry matters.
+    source_fs.mkdir("/t/d0", true)?;
+    for index in 0..FILES {
+        source_fs.create(&format!("/t/d0/f{index}"), true)?;
+    }
+    let entry = capture_one(&source_fs, || {
+        source_fs
+            .delete("/t", true)
+            .expect("the real recursive delete");
+    });
+    assert!(
+        matches!(&entry, JournalEntry::Delete(_)),
+        "the captured entry must be the typed recursive delete"
+    );
+
+    // Target: same topology, each file widened to 300 blocks with one location.
+    target_fs.mkdir("/t/d0", true)?;
+    for index in 0..FILES {
+        let path = format!("/t/d0/f{index}");
+        target_fs.create(&path, true)?;
+        let file_id = target_fs.file_status(&path)?.id;
+        let handle = target_fs.fs_dir.clone();
+        let view = handle.view()?;
+        let mut inode = view.store.get_inode(file_id, None)?.expect("file row");
+        let mut blocks = Vec::with_capacity(BLOCKS_PER_FILE);
+        for seq in 1..=BLOCKS_PER_FILE as i64 {
+            let block_id = crate::master::meta::InodeId::create_block_id(file_id, seq)?;
+            blocks.push(crate::master::meta::BlockMeta::new(block_id, 4096));
+        }
+        inode.as_file_mut()?.blocks = blocks;
+        let mut batch = view.store_ref().new_batch();
+        batch.write_inode(&inode)?;
+        batch.commit()?;
+        for seq in 1..=BLOCKS_PER_FILE as i64 {
+            let block_id = crate::master::meta::InodeId::create_block_id(file_id, seq)?;
+            view.store
+                .add_block_location(block_id, curvine_model::BlockLocation::with_id(1))?;
+        }
+        drop(inode);
+        drop(view);
+        drop(handle);
+    }
+    assert!(
+        FILES * BLOCKS_PER_FILE > SUBTREE_LOCATION_LIMIT,
+        "fixture: {FILES} x {BLOCKS_PER_FILE} entries must exceed the {SUBTREE_LOCATION_LIMIT} budget"
+    );
+    echo_entries(&target_fs);
+
+    // Must not panic: the driver has to leave the sampling view, release what it
+    // holds, and drive the same body through the cold bridge.
+    let loader = target.journal_loader();
+    loader.apply_entry(entry)?;
+
+    assert!(
+        target_fs.file_status("/t").is_err(),
+        "the replayed recursive delete must still remove the subtree"
+    );
+    assert!(
+        echo_entries(&target_fs).is_empty(),
+        "replay must not echo journal entries"
+    );
+    // The gate must stay usable: a panicking driver would leave the replay path
+    // unusable for every later entry.
+    target_fs.create("/after", true)?;
+    assert!(
+        target_fs.file_status("/after").is_ok(),
+        "the namespace must stay usable after an over-budget replay"
     );
     Ok(())
 }

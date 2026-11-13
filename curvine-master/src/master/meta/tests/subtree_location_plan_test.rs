@@ -277,3 +277,189 @@ fn empty_and_zero_location_blocks_stay_planable() {
     assert_eq!(fs.file_status("/no-blocks").expect("status").id, empty_id);
     assert_eq!(fs.file_status("/no-rows").expect("status").id, rowless_id);
 }
+
+/// G4a: ONE block whose own location set exceeds the budget. The earlier case
+/// with three rows proves per-row charging, not the over-limit rejection, so
+/// this one puts 1025 rows on a single block.
+#[test]
+fn one_block_with_more_location_rows_than_the_budget_returns_none() {
+    let fs = test_fs("budget-one-block-many-rows");
+    let (id, request) = file_request(&fs, "/one");
+    let block = fs
+        .add_block(
+            "/one",
+            None,
+            curvine_model::ClientAddress::default(),
+            vec![],
+            vec![],
+            0,
+            None,
+        )
+        .expect("allocate a block");
+    // SUBTREE_LOCATION_LIMIT + 1 rows on the SAME block.
+    for worker in 1..=(SUBTREE_LOCATION_LIMIT as u32 + 1) {
+        seed_locations(&fs, block.id, &[worker]);
+    }
+    let plan = plan_of(&fs, &[request]);
+    assert!(
+        plan.is_none(),
+        "a single block with {} location rows must exceed the {SUBTREE_LOCATION_LIMIT} budget",
+        SUBTREE_LOCATION_LIMIT + 1
+    );
+    // The inode and its block are still there; only the plan refuses.
+    assert_eq!(fs.file_status("/one").expect("status").id, id);
+}
+
+/// G4b: the bounded reader itself, at a zero budget. An empty block must come
+/// back as a complete empty set, a non-empty block must come back as over
+/// limit - never as a truncated success.
+#[test]
+fn bounded_location_read_with_a_zero_budget_distinguishes_empty_from_over_limit() {
+    let fs = test_fs("budget-zero");
+    let (_, _request) = file_request(&fs, "/empty");
+    let empty_block = fs
+        .add_block(
+            "/empty",
+            None,
+            curvine_model::ClientAddress::default(),
+            vec![],
+            vec![],
+            0,
+            None,
+        )
+        .expect("allocate an empty block");
+    let (_, _row_request) = file_request(&fs, "/with-row");
+    let row_block = fs
+        .add_block(
+            "/with-row",
+            None,
+            curvine_model::ClientAddress::default(),
+            vec![],
+            vec![],
+            0,
+            None,
+        )
+        .expect("allocate a block");
+    seed_locations(&fs, row_block.id, &[1]);
+
+    let handle = fs.fs_dir();
+    let view = handle.view().expect("namespace view");
+    let empty = view
+        .store
+        .get_locations_bounded(empty_block.id, 0)
+        .expect("the bounded read must not error");
+    assert_eq!(
+        empty.as_ref().map(|locs| locs.len()),
+        Some(0),
+        "a zero budget on a block with no rows must return a complete empty set"
+    );
+    let over = view
+        .store
+        .get_locations_bounded(row_block.id, 0)
+        .expect("the bounded read must not error");
+    assert!(
+        over.is_none(),
+        "a zero budget on a block that has a row must exceed the limit, not truncate"
+    );
+}
+
+/// G4c: the current block set grows after the sample. `covers` iterates the
+/// inode's real blocks now, so a block that appeared after capture must make it
+/// return false instead of silently passing.
+#[test]
+fn covers_rejects_a_block_added_after_the_sample() {
+    let fs = test_fs("covers-block-grew");
+    let (id, request) = one_block(&fs, "/grew");
+    let plan = plan_of(&fs, &[request]).expect("one block is inside the budget");
+
+    // Add a second block to the same inode after the sample.
+    let block_id = {
+        let handle = fs.fs_dir();
+        let view = handle.view().expect("namespace view");
+        let mut inode = view.store.get_inode(id, None).expect("inode").expect("row");
+        let file = inode.as_file_mut().expect("file");
+        let block_id = crate::master::meta::InodeId::create_block_id(id, 2).expect("block id");
+        file.blocks.push(BlockMeta::new(block_id, 4096));
+        let mut batch = view.store_ref().new_batch();
+        batch.write_inode(&inode).expect("write the widened inode");
+        batch.commit().expect("commit");
+        view.store
+            .add_block_location(block_id, BlockLocation::with_id(1))
+            .expect("seed the new block's location");
+        block_id
+    };
+    assert!(block_id > 0);
+
+    let handle = fs.fs_dir();
+    let view = handle.view().expect("namespace view");
+    assert!(
+        !SubtreeLocationPlan::covers(&plan, &view, &[request]).expect("covers"),
+        "a block that appeared after the sample must break coverage"
+    );
+}
+
+/// G4d: a worker that WAS sampled adds a location on a block the plan never saw.
+/// The whole-call counter and the block membership check must both refuse it -
+/// silently accepting would replay against a partially sampled set.
+#[test]
+fn covers_rejects_a_known_worker_expanding_onto_a_new_block() {
+    let fs = test_fs("covers-cross-block");
+    // Exactly at the budget: 512 blocks x (1 block entry + 1 location) = 1024.
+    let files_blocks = SUBTREE_LOCATION_LIMIT / 2;
+    let (id, request) = file_request(&fs, "/cross");
+    {
+        let handle = fs.fs_dir();
+        let view = handle.view().expect("namespace view");
+        let mut inode = view.store.get_inode(id, None).expect("inode").expect("row");
+        let mut blocks = Vec::with_capacity(files_blocks);
+        for seq in 1..=files_blocks as i64 {
+            let block_id =
+                crate::master::meta::InodeId::create_block_id(id, seq).expect("block id");
+            blocks.push(BlockMeta::new(block_id, 4096));
+        }
+        inode.as_file_mut().expect("file").blocks = blocks;
+        let mut batch = view.store_ref().new_batch();
+        batch.write_inode(&inode).expect("write");
+        batch.commit().expect("commit");
+        for seq in 1..=files_blocks as i64 {
+            let block_id =
+                crate::master::meta::InodeId::create_block_id(id, seq).expect("block id");
+            view.store
+                .add_block_location(block_id, BlockLocation::with_id(1))
+                .expect("seed location");
+        }
+    }
+    let plan = plan_of(&fs, &[request]).expect("exactly at the budget still plans");
+    assert_eq!(plan.block_ids().len(), files_blocks);
+
+    // Worker 1 is already known to the plan; put it on one more block that the
+    // plan never saw, so the set grows without introducing a new worker.
+    let extra = {
+        let handle = fs.fs_dir();
+        let view = handle.view().expect("namespace view");
+        let mut inode = view.store.get_inode(id, None).expect("inode").expect("row");
+        let extra = crate::master::meta::InodeId::create_block_id(id, files_blocks as i64 + 1)
+            .expect("block id");
+        inode
+            .as_file_mut()
+            .expect("file")
+            .blocks
+            .push(BlockMeta::new(extra, 4096));
+        let mut batch = view.store_ref().new_batch();
+        batch.write_inode(&inode).expect("write");
+        batch.commit().expect("commit");
+        view.store
+            .add_block_location(extra, BlockLocation::with_id(1))
+            .expect("seed the extra block's location");
+        extra
+    };
+    assert!(extra > 0);
+
+    let handle = fs.fs_dir();
+    let view = handle.view().expect("namespace view");
+    assert!(
+        !SubtreeLocationPlan::covers(&plan, &view, &[request]).expect("covers"),
+        "a known worker on a block outside the sample must break coverage, not \
+         pass because the worker id happens to be in the sampled set"
+    );
+}

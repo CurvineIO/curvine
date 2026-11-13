@@ -458,3 +458,6 @@ fn bounded_journal_queue_falls_back_before_the_body() {
 
 #[path = "recursive_lock_set_topology_test.rs"]
 mod recursive_lock_set_topology_test;
+
+#[path = "recursive_lock_set_window_test.rs"]
+mod recursive_lock_set_window_test;

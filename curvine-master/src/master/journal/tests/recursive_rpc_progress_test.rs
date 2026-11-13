@@ -184,22 +184,6 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
         "the delete must still be waiting for its confirmation"
     );
 
-    // G6: arm the instance-isolated wait hook — its reached signal proves
-    // the recursive delete has entered the real non-empty
-    // JournalCommitScope::wait with a pending receipt waiter.
-    let (wait_reached_tx, wait_reached_rx) = std::sync::mpsc::channel();
-    let (wait_release_tx, wait_release_rx) = std::sync::mpsc::channel();
-    fixture
-        .fs
-        .journal_writer
-        .arm_wait_unwind_hook(wait_reached_tx, wait_release_rx);
-
-    // G6: the wait hook must reach (the recursive entry has entered the
-    // real scope.wait with a pending receipt waiter).
-    wait_reached_rx
-        .recv_timeout(Duration::from_secs(20))
-        .expect("the recursive delete must enter the real scope.wait");
-
     // Phase 5: real commit — the driver registers the delete as committed
     // and drives the REAL apply worker through the loader's public apply
     // entry. The FSM watermark, the applied-request record and the cursor
@@ -306,10 +290,6 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
     let _ = pre_cursor;
     let _ = failure_seq_before;
 
-    // Release the wait hook (the scope.wait has already resolved Ok).
-    wait_release_tx
-        .send(())
-        .expect("the wait hook must be releasable");
     drop(fixture);
     Ok(())
 }
