@@ -354,7 +354,8 @@ fn exclusive_wait_panic_fails_holder_via_raii_drop() {
     let failure_seq_before = fs.journal_writer.failure_seq();
 
     // Enable the cfg(test) panic hook and run the exclusive path.
-    std::env::set_var("CURVINE_TEST_WAIT_PANIC", "1");
+    crate::master::fs::master_filesystem::TEST_WAIT_PANIC
+        .store(true, std::sync::atomic::Ordering::Release);
     let worker_fs = fs.clone();
     let worker = std::thread::spawn(move || {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -362,7 +363,8 @@ fn exclusive_wait_panic_fails_holder_via_raii_drop() {
         }))
     });
     let caught = worker.join().expect("worker thread must not abort");
-    std::env::remove_var("CURVINE_TEST_WAIT_PANIC");
+    crate::master::fs::master_filesystem::TEST_WAIT_PANIC
+        .store(false, std::sync::atomic::Ordering::Release);
 
     // The exclusive confirmation RAII went terminal during unwind.
     assert!(
