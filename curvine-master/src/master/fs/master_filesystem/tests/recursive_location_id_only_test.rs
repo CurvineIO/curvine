@@ -220,7 +220,14 @@ fn id_only_invalidation_excludes_with_the_delete_on_the_same_file_inode() {
         .arm_location_pause_hook(loc_reached_tx, loc_release_rx);
 
     let delete_fs = fs.clone();
-    let delete_handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+    let (delete_handle_done_tx, delete_handle_done_rx) = std::sync::mpsc::channel();
+    let delete_handle = std::thread::spawn(move || {
+        let result = delete_fs.delete("/a", true);
+        // Signal completion before returning so the driver never blocks
+        // unboundedly on a worker that finished its work but stalled later.
+        let _ = delete_handle_done_tx.send(());
+        result
+    });
     loc_reached_rx
         .recv_timeout(OBSERVE_WINDOW)
         .expect("the delete must reach its location sample");
@@ -253,6 +260,9 @@ fn id_only_invalidation_excludes_with_the_delete_on_the_same_file_inode() {
     );
 
     loc_release_tx.send(()).expect("release the delete");
+    delete_handle_done_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the delete must finish inside the bounded window");
     delete_handle
         .join()
         .expect("delete thread must not panic")

@@ -39,7 +39,14 @@ fn concurrent_block_report_keeps_only_the_reporting_workers_location() {
         .arm_location_pause_hook(loc_reached_tx, loc_release_rx);
 
     let free_fs = fs.clone();
-    let free = std::thread::spawn(move || free_fs.free("/f", true));
+    let (free_done_tx, free_done_rx) = std::sync::mpsc::channel();
+    let free = std::thread::spawn(move || {
+        let result = free_fs.free("/f", true);
+        // Signal completion before returning so the driver never blocks
+        // unboundedly on a worker that finished its work but stalled later.
+        let _ = free_done_tx.send(());
+        result
+    });
     loc_reached_rx
         .recv_timeout(OBSERVE_WINDOW)
         .expect("the free's location sample must reach the pause point");
@@ -73,6 +80,9 @@ fn concurrent_block_report_keeps_only_the_reporting_workers_location() {
 
     let recaptured = plan2_rx.recv_timeout(OBSERVE_WINDOW);
     let _ = plan2_release_tx.send(());
+    free_done_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the worker must finish inside the bounded window");
     let freed = free.join().expect("free thread must not panic");
 
     assert!(freed.is_ok(), "recursive free must succeed: {freed:?}");
@@ -178,7 +188,14 @@ fn location_added_after_sampling_forces_a_second_capture() {
         .arm_location_pause_hook(loc_reached_tx, loc_release_rx);
 
     let free_fs = fs.clone();
-    let handle = std::thread::spawn(move || free_fs.free("/t", true));
+    let (handle_done_tx, handle_done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = free_fs.free("/t", true);
+        // Signal completion before returning so the driver never blocks
+        // unboundedly on a worker that finished its work but stalled later.
+        let _ = handle_done_tx.send(());
+        result
+    });
 
     loc_reached_rx
         .recv_timeout(OBSERVE_WINDOW)
@@ -238,7 +255,14 @@ fn replication_completion_in_the_sampling_window_forces_a_second_capture() {
         .arm_location_pause_hook(loc_reached_tx, loc_release_rx);
 
     let free_fs = fs.clone();
-    let handle = std::thread::spawn(move || free_fs.free("/t", true));
+    let (handle_done_tx, handle_done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = free_fs.free("/t", true);
+        // Signal completion before returning so the driver never blocks
+        // unboundedly on a worker that finished its work but stalled later.
+        let _ = handle_done_tx.send(());
+        result
+    });
 
     loc_reached_rx
         .recv_timeout(OBSERVE_WINDOW)
@@ -296,7 +320,14 @@ fn block_report_racing_a_last_link_delete_forces_coverage() {
         .arm_location_pause_hook(loc_reached_tx, loc_release_rx);
 
     let delete_fs = fs.clone();
-    let handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+    let (handle_done_tx, handle_done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = delete_fs.delete("/a", true);
+        // Signal completion before returning so the driver never blocks
+        // unboundedly on a worker that finished its work but stalled later.
+        let _ = handle_done_tx.send(());
+        result
+    });
     loc_reached_rx
         .recv_timeout(OBSERVE_WINDOW)
         .expect("the location sample must reach the pause point");

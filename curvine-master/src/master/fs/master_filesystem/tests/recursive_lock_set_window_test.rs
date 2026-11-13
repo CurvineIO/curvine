@@ -37,7 +37,14 @@ fn subtree_moved_out_between_capture_and_locking_survives() {
         .arm_plan_pause_hook(reached_tx, release_rx);
 
     let delete_fs = fs.clone();
-    let handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = delete_fs.delete("/a", true);
+        // Signal completion so the driver never blocks unboundedly on a worker
+        // that finished the delete but stalled elsewhere.
+        let _ = done_tx.send(());
+        result
+    });
 
     reached_rx
         .recv_timeout(OBSERVE_WINDOW)
@@ -61,6 +68,9 @@ fn subtree_moved_out_between_capture_and_locking_survives() {
         "the revalidation must reject the stale lock set and capture again"
     );
 
+    done_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the delete must finish inside the bounded window");
     let result = handle.join().expect("delete thread must not panic");
     result.expect("the delete must finish, by re-plan or fallback");
 
@@ -91,7 +101,14 @@ fn node_created_between_capture_and_locking_is_not_orphaned() {
         .arm_plan_pause_hook(reached_tx, release_rx);
 
     let delete_fs = fs.clone();
-    let handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = delete_fs.delete("/a", true);
+        // Signal completion so the driver never blocks unboundedly on a worker
+        // that finished the delete but stalled elsewhere.
+        let _ = done_tx.send(());
+        result
+    });
 
     reached_rx
         .recv_timeout(OBSERVE_WINDOW)
@@ -116,6 +133,9 @@ fn node_created_between_capture_and_locking_is_not_orphaned() {
         "the revalidation must reject the stale lock set and capture again"
     );
 
+    done_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the delete must finish inside the bounded window");
     let result = handle.join().expect("delete thread must not panic");
     result.expect("the delete must finish, by re-plan or fallback");
 
@@ -148,7 +168,14 @@ fn node_moved_in_between_capture_and_locking_is_not_orphaned() {
         .arm_plan_pause_hook(reached_tx, release_rx);
 
     let delete_fs = fs.clone();
-    let handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = delete_fs.delete("/a", true);
+        // Signal completion so the driver never blocks unboundedly on a worker
+        // that finished the delete but stalled elsewhere.
+        let _ = done_tx.send(());
+        result
+    });
 
     reached_rx
         .recv_timeout(OBSERVE_WINDOW)
@@ -173,6 +200,9 @@ fn node_moved_in_between_capture_and_locking_is_not_orphaned() {
         "the revalidation must reject the stale lock set and capture again"
     );
 
+    done_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the delete must finish inside the bounded window");
     let result = handle.join().expect("delete thread must not panic");
     result.expect("the delete must finish, by re-plan or fallback");
 
@@ -210,7 +240,12 @@ fn exchange_in_the_same_window_is_serialized_not_concurrent() {
         .arm_plan_pause_hook(reached_tx, release_rx);
 
     let delete_fs = fs.clone();
-    let delete_handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+    let (delete_done_tx, delete_done_rx) = std::sync::mpsc::channel();
+    let delete_handle = std::thread::spawn(move || {
+        let result = delete_fs.delete("/a", true);
+        let _ = delete_done_tx.send(());
+        result
+    });
     reached_rx
         .recv_timeout(OBSERVE_WINDOW)
         .expect("the planner must reach the pause point");
@@ -237,7 +272,13 @@ fn exchange_in_the_same_window_is_serialized_not_concurrent() {
     );
     release_tx.send(()).expect("release the planner");
 
+    delete_done_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the delete must finish inside the bounded window");
     let deleted = delete_handle.join().expect("delete thread must not panic");
+    exchange_done_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the exchange must finish inside the bounded window once released");
     let exchanged = exchange_handle
         .join()
         .expect("exchange thread must not panic");
@@ -275,7 +316,14 @@ fn hardlink_added_between_capture_and_locking_is_accounted() {
         .arm_plan_pause_hook(reached_tx, release_rx);
 
     let delete_fs = fs.clone();
-    let handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = delete_fs.delete("/a", true);
+        // Signal completion so the driver never blocks unboundedly on a worker
+        // that finished the delete but stalled elsewhere.
+        let _ = done_tx.send(());
+        result
+    });
 
     reached_rx
         .recv_timeout(OBSERVE_WINDOW)
@@ -299,6 +347,9 @@ fn hardlink_added_between_capture_and_locking_is_accounted() {
         "the revalidation must reject the stale lock set and capture again"
     );
 
+    done_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the delete must finish inside the bounded window");
     let result = handle.join().expect("delete thread must not panic");
     result.expect("the delete must finish, by re-plan or fallback");
 
@@ -328,7 +379,14 @@ fn identity_replaced_between_capture_and_locking_is_not_deleted() {
 
     // Delete the whole tree on a worker thread, paused after capture.
     let delete_fs = fs.clone();
-    let handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = delete_fs.delete("/a", true);
+        // Signal completion so the driver never blocks unboundedly on a worker
+        // that finished the delete but stalled elsewhere.
+        let _ = done_tx.send(());
+        result
+    });
 
     reached_rx
         .recv_timeout(OBSERVE_WINDOW)
@@ -356,6 +414,9 @@ fn identity_replaced_between_capture_and_locking_is_not_deleted() {
         "the revalidation must reject the stale lock set and capture again"
     );
 
+    done_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the delete must finish inside the bounded window");
     let result = handle.join().expect("delete thread must not panic");
     result.expect("the delete must finish, by re-plan or fallback");
 
@@ -389,7 +450,14 @@ fn external_hardlink_created_in_the_window_survives_the_delete() {
         .arm_plan_pause_hook(reached_tx, release_rx);
 
     let delete_fs = fs.clone();
-    let handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = delete_fs.delete("/a", true);
+        // Signal completion so the driver never blocks unboundedly on a worker
+        // that finished the delete but stalled elsewhere.
+        let _ = done_tx.send(());
+        result
+    });
     reached_rx
         .recv_timeout(OBSERVE_WINDOW)
         .expect("the planner must reach the pause point");
@@ -399,6 +467,9 @@ fn external_hardlink_created_in_the_window_survives_the_delete() {
         .expect("link outside the subtree");
     release_tx.send(()).expect("release the planner");
 
+    done_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the delete must finish inside the bounded window");
     handle
         .join()
         .expect("delete thread must not panic")
