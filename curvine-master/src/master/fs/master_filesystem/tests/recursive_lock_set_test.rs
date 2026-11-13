@@ -612,3 +612,190 @@ fn node_created_between_capture_and_locking_is_not_orphaned() {
         "a node created inside the planned subtree must not be orphaned"
     );
 }
+
+/// R7: a node is moved *into* the planned subtree after capture. It is either
+/// removed with the tree or the operation re-plans; it must never survive as an
+/// orphan whose parent path is gone.
+#[test]
+fn node_moved_in_between_capture_and_locking_is_not_orphaned() {
+    let fs = test_fs("plan-pause-move-in-external");
+    fs.mkdir("/a/d0", true).unwrap();
+    fs.create("/a/d0/old", false).unwrap();
+    fs.mkdir("/b", true).unwrap();
+    fs.create("/b/extra", false).unwrap();
+
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    fs.journal_writer
+        .arm_plan_pause_hook(reached_tx, release_rx);
+
+    let delete_fs = fs.clone();
+    let handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+
+    reached_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the planner must reach the pause point");
+    // Move an outside node into the planned subtree, after capture.
+    fs.rename("/b/extra", "/a/d0/extra", RenameFlags::empty())
+        .expect("move a node into the subtree");
+    let moved_id = fs.file_status("/a/d0/extra").unwrap().id;
+    release_tx.send(()).expect("release the planner");
+
+    let result = handle.join().expect("delete thread must not panic");
+    result.expect("the delete must finish, by re-plan or fallback");
+
+    assert!(
+        fs.file_status("/a").is_err(),
+        "the planned tree must be gone"
+    );
+    assert!(
+        fs.file_status_by_id("/a/d0/extra", Some(moved_id)).is_err(),
+        "a node moved into the planned subtree must not be orphaned"
+    );
+}
+
+/// R7: an internal EXCHANGE in the same window is serialized by the gate, not
+/// made to complete concurrently. EXCHANGE always falls back to the exclusive
+/// path (`rename` requires `!flags.exchange_mode()` for the sharded path), so it
+/// waits for the delete's admission slot; running it synchronously inside the
+/// plan pause would make the fixture wait on itself.
+///
+/// Linearization is therefore allowed in either order: the delete may finish
+/// first and the exchange then reports FileNotFound. What must hold is the end
+/// state - the tree is gone and neither exchanged inode is left reachable.
+#[test]
+fn exchange_in_the_same_window_is_serialized_not_concurrent() {
+    let fs = test_fs("plan-pause-exchange");
+    fs.mkdir("/a/d0", true).unwrap();
+    fs.create("/a/d0/left", false).unwrap();
+    fs.create("/a/d0/right", false).unwrap();
+    let left_id = fs.file_status("/a/d0/left").unwrap().id;
+    let right_id = fs.file_status("/a/d0/right").unwrap().id;
+
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    fs.journal_writer
+        .arm_plan_pause_hook(reached_tx, release_rx);
+
+    let delete_fs = fs.clone();
+    let delete_handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+    reached_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the planner must reach the pause point");
+
+    // The exchange runs on its own thread: it must never be required to finish
+    // while the planner is paused.
+    let exchange_fs = fs.clone();
+    let exchange_handle = std::thread::spawn(move || {
+        exchange_fs.rename("/a/d0/left", "/a/d0/right", RenameFlags::EXCHANGE)
+    });
+    // Give the exchange a chance to queue behind the gate before we release.
+    std::thread::sleep(Duration::from_millis(100));
+    release_tx.send(()).expect("release the planner");
+
+    let deleted = delete_handle.join().expect("delete thread must not panic");
+    let exchanged = exchange_handle
+        .join()
+        .expect("exchange thread must not panic");
+
+    deleted.expect("the delete must finish");
+    // The exchange is allowed to lose the race: the tree may already be gone.
+    if let Err(error) = exchanged {
+        assert!(
+            error.to_string().contains("not found"),
+            "an exchange that loses the race must report the missing source, got {error}"
+        );
+    }
+
+    assert!(fs.file_status("/a").is_err(), "the tree must be gone");
+    assert!(
+        fs.file_status_by_id("/a/d0/left", Some(left_id)).is_err()
+            && fs.file_status_by_id("/a/d0/right", Some(right_id)).is_err(),
+        "neither exchanged inode may remain reachable"
+    );
+}
+
+/// R7: a hard link is added for a file inside the subtree after capture. The
+/// nlink accounting must stay consistent: after the tree is deleted no name of
+/// that inode may be reachable under the removed tree.
+#[test]
+fn hardlink_added_between_capture_and_locking_is_accounted() {
+    let fs = test_fs("plan-pause-hardlink");
+    fs.mkdir("/a/d0", true).unwrap();
+    fs.create("/a/d0/file", false).unwrap();
+    let file_id = fs.file_status("/a/d0/file").unwrap().id;
+
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    fs.journal_writer
+        .arm_plan_pause_hook(reached_tx, release_rx);
+
+    let delete_fs = fs.clone();
+    let handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+
+    reached_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the planner must reach the pause point");
+    // A second name for the same inode, still inside the planned subtree.
+    fs.link("/a/d0/file".to_string(), "/a/d0/alias".to_string())
+        .expect("add a hard link inside the subtree");
+    release_tx.send(()).expect("release the planner");
+
+    let result = handle.join().expect("delete thread must not panic");
+    result.expect("the delete must finish, by re-plan or fallback");
+
+    assert!(
+        fs.file_status("/a").is_err(),
+        "the planned tree must be gone"
+    );
+    assert!(
+        fs.file_status_by_id("/a/d0/alias", Some(file_id)).is_err(),
+        "the alias added after capture must not survive under the removed tree"
+    );
+}
+
+/// R7: the inode identity at a planned path changes after capture (same path,
+/// different id). The lock-set path must not delete the new identity by id.
+#[test]
+fn identity_replaced_between_capture_and_locking_is_not_deleted() {
+    let fs = test_fs("plan-pause-identity");
+    fs.mkdir("/a/d0", true).unwrap();
+    fs.create("/a/d0/slot", false).unwrap();
+    let old_id = fs.file_status("/a/d0/slot").unwrap().id;
+
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    fs.journal_writer
+        .arm_plan_pause_hook(reached_tx, release_rx);
+
+    // Delete the whole tree on a worker thread, paused after capture.
+    let delete_fs = fs.clone();
+    let handle = std::thread::spawn(move || delete_fs.delete("/a", true));
+
+    reached_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the planner must reach the pause point");
+    // Replace the identity at the planned path: remove and recreate.
+    fs.delete("/a/d0/slot", false)
+        .expect("remove the old identity");
+    fs.create("/a/d0/slot", false)
+        .expect("create a new identity");
+    let new_id = fs.file_status("/a/d0/slot").unwrap().id;
+    assert_ne!(new_id, old_id, "fixture: the identity must differ");
+    release_tx.send(()).expect("release the planner");
+
+    let result = handle.join().expect("delete thread must not panic");
+    result.expect("the delete must finish, by re-plan or fallback");
+
+    // The tree is deleted, so the replacement goes with it; what must not happen
+    // is the operation deleting only the recorded old id and leaving the new
+    // identity behind as a live child of a removed parent.
+    assert!(
+        fs.file_status("/a").is_err(),
+        "the planned tree must be gone"
+    );
+    assert!(
+        fs.file_status_by_id("/a/d0/slot", Some(new_id)).is_err(),
+        "the replacement identity must not survive under the removed tree"
+    );
+}

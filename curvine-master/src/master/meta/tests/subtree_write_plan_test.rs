@@ -347,3 +347,48 @@ fn exactly_at_the_limit_still_produces_a_plan() -> curvine_error::FsResult<()> {
     );
     Ok(())
 }
+
+/// R7: an internal EXCHANGE between capture and revalidation keeps the inode id
+/// set identical and only swaps where those inodes sit. The captured plan must
+/// still be refused: the version/token check has to exclude "same ids, moved
+/// inodes", which is exactly what EXCHANGE produces.
+///
+/// The capture view is released before the real public EXCHANGE runs: EXCHANGE
+/// itself falls back to the exclusive path, so holding a view across it would
+/// deadlock the fixture rather than describe the product.
+#[test]
+fn internal_exchange_invalidates_a_captured_plan() -> curvine_error::FsResult<()> {
+    let fs = test_fs("exchange-plan");
+    fs.mkdir("/x/d0", true)?;
+    fs.create("/x/d0/left", false)?;
+    fs.create("/x/d0/right", false)?;
+    let left = fs.file_status("/x/d0/left")?.id;
+    let right = fs.file_status("/x/d0/right")?.id;
+
+    let handle = fs.fs_dir();
+    let plan = {
+        let view = handle.view().expect("namespace view");
+        SubtreeWritePlan::capture(&view, "/x", InodeLockMode::Write)
+            .expect("capture must succeed")
+            .expect("plan expected")
+    };
+
+    // Real public EXCHANGE, with no view held by this thread.
+    fs.rename(
+        "/x/d0/left",
+        "/x/d0/right",
+        curvine_model::RenameFlags::EXCHANGE,
+    )
+    .expect("internal exchange must succeed");
+
+    let view = handle.view().expect("namespace view");
+    let revalidated = plan
+        .revalidate(&view, "/x")
+        .expect("revalidate must not error");
+    assert!(
+        revalidated.is_none(),
+        "an internal EXCHANGE keeps the id set but moves the inodes \
+         (left={left}, right={right}); the captured plan must not revalidate"
+    );
+    Ok(())
+}

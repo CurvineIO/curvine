@@ -40,6 +40,23 @@ fn test_fs_with_live_worker(name: &str) -> MasterFilesystem {
     test_fs_with_worker_session(name, "")
 }
 
+fn test_fs_with_two_workers(name: &str, session1: &str, session2: &str) -> MasterFilesystem {
+    let fs = test_fs_with_worker_session(name, session1);
+    let mut second = WorkerInfo::new(
+        WorkerAddress {
+            worker_id: 2,
+            ..Default::default()
+        },
+        1,
+    );
+    second.status = WorkerStatus::Live;
+    second.capacity = i64::MAX / 4;
+    second.available = i64::MAX / 4;
+    second.worker_session_id = session2.to_string();
+    fs.add_test_worker(second);
+    fs
+}
+
 fn test_fs_with_worker_session(name: &str, session: &str) -> MasterFilesystem {
     let fs = test_fs(name);
     let mut worker = WorkerInfo::new(
@@ -64,9 +81,13 @@ fn file_with_one_block(fs: &MasterFilesystem, path: &str) -> i64 {
     // `StoragePolicy::free` only clears blocks for a policy that may drop the
     // Curvine copy (TtlAction::Delete/Free); the default None would make every
     // free a no-op, so the fixture states the policy it exercises.
+    // replicas >= 2 keeps room for a second worker location: with the default
+    // replica count of 1, `add_replication_location_if_needed` refuses a second
+    // worker because the block is already fully replicated.
     let opts = CreateFileOptsBuilder::new()
         .create_parent(true)
         .ttl_action(TtlAction::Delete)
+        .replicas(2)
         .build();
     fs.create_with_opts(path, opts, OpenFlags::new_create().set_overwrite(true))
         .expect("create file");
@@ -406,5 +427,65 @@ fn location_added_after_sampling_forces_a_second_capture() {
     assert_eq!(
         freed.inodes, 1,
         "the restarted free must reclaim exactly one inode: {freed:?}"
+    );
+}
+
+/// R7: copy completion arrives inside the location sampling window. This uses
+/// the real `commit_replication_location` entry (worker session validated,
+/// worker/block location locks taken, durable row written), not a bare store
+/// write, and the late worker must force a fresh capture exactly like a late
+/// store row would.
+#[test]
+fn replication_completion_in_the_sampling_window_forces_a_second_capture() {
+    let fs = test_fs_with_two_workers("location-replication-race", "session-1", "session-2");
+    fs.mkdir("/t/d0", true).unwrap();
+    let block_id = file_with_one_block(&fs, "/t/d0/file");
+
+    let (loc_reached_tx, loc_reached_rx) = mpsc::channel();
+    let (loc_release_tx, loc_release_rx) = mpsc::channel();
+    fs.journal_writer
+        .arm_location_pause_hook(loc_reached_tx, loc_release_rx);
+
+    let free_fs = fs.clone();
+    let handle = std::thread::spawn(move || free_fs.free("/t", true));
+
+    loc_reached_rx
+        .recv_timeout(OBSERVE_WINDOW)
+        .expect("the location sample must reach the pause point");
+
+    // Real replication completion for the second worker, after the sample.
+    let added = fs
+        .commit_replication_location(block_id, BlockLocation::with_id(2), "session-2")
+        .expect("replication completion must succeed for a live session");
+
+    let (plan_reached_tx, plan_reached_rx) = mpsc::channel();
+    let (plan_release_tx, plan_release_rx) = mpsc::channel();
+    fs.journal_writer
+        .arm_plan_pause_hook(plan_reached_tx, plan_release_rx);
+
+    loc_release_tx.send(()).expect("release the free");
+
+    let recaptured = plan_reached_rx.recv_timeout(OBSERVE_WINDOW);
+    let _ = plan_release_tx.send(());
+    let freed = handle
+        .join()
+        .expect("free thread must not panic")
+        .expect("the free must finish");
+
+    assert!(
+        recaptured.is_ok(),
+        "a replication completion that lands after the sample must force a fresh \
+         capture (added={added}); without the coverage re-check the free would \
+         keep the stale worker set"
+    );
+    assert_eq!(
+        freed.inodes, 1,
+        "the restarted free must reclaim exactly one inode: {freed:?}"
+    );
+    // The session was validated, so the late location is real state, not a mock.
+    let locations = stored_locations(&fs, block_id);
+    assert!(
+        locations.iter().any(|loc| loc.worker_id == 2),
+        "the replayed free must have seen the completed second-worker location: {locations:?}"
     );
 }
