@@ -137,46 +137,79 @@ fn raft_request_duplicate_delete_preserves_recreated_inode() {
     let second_data = second.data.clone();
     let third = raft_batch_entry(3, 103, &recreate[0]);
 
-    let loader = target.journal_loader();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let apply = |entry: Entry| {
-        runtime
-            .block_on(async {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    loader.apply(true, ApplyMsg::new_entry(entry)),
-                )
-                .await
-            })
-            .expect("applying a committed entry must finish within the bound")
+    // Everything that borrows the target runs inside this block, so the
+    // filesystem, loader, runtime and the apply closure are dropped before
+    // either journal system is shut down.
+    let evidence = {
+        let target_fs = target.fs();
+        let loader = target.journal_loader();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let apply = |entry: Entry| {
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        loader.apply(true, ApplyMsg::new_entry(entry)),
+                    )
+                    .await
+                })
+                .expect("applying a committed entry must finish within the bound")
+        };
+        // Short view borrow: only the owned record leaves the block.
+        let applied_req = |req_id: i64| {
+            let handle = target_fs.fs_dir();
+            let view = handle.view().expect("namespace view");
+            view.get_rocks_store()
+                .get_applied_req(req_id)
+                .expect("read the applied-request record")
+                .map(|record| (record.index, record.term))
+        };
+
+        let first_result = apply(first);
+        let second_result = apply(second);
+        let third_result = apply(third);
+        let after_recreate = target_fs.file_status("/duplicate");
+        let fsm_before_duplicate = loader.get_fsm_state().applied;
+        let cursors_before = (applied_req(101), applied_req(102), applied_req(103));
+
+        // Duplicate proposal: identical batch payload and identical request id.
+        let duplicate = Entry {
+            index: 4,
+            term: 1,
+            data: second_data,
+            context: SerdeUtils::serialize(&req_delete)
+                .expect("encode duplicate context")
+                .into(),
+            ..Default::default()
+        };
+        let duplicate_result = apply(duplicate);
+        let after_duplicate = target_fs.file_status("/duplicate");
+        let original_lookup = target_fs.file_status_by_id("/duplicate", Some(original_id));
+        let fsm_after_duplicate = loader.get_fsm_state().applied;
+        let cursors_after = (applied_req(101), applied_req(102), applied_req(103));
+        let echo = target_fs.fs_dir().view().unwrap().take_entries();
+        (
+            first_result,
+            second_result,
+            third_result,
+            duplicate_result,
+            after_recreate,
+            after_duplicate,
+            original_lookup,
+            echo,
+            fsm_before_duplicate,
+            fsm_after_duplicate,
+            cursors_before,
+            cursors_after,
+        )
     };
-    let first_result = apply(first);
-    let second_result = apply(second);
-    let third_result = apply(third);
 
-    let target_fs = target.fs();
-    let after_recreate = target_fs.file_status("/duplicate");
-
-    // Duplicate proposal: identical batch payload and identical request id.
-    let duplicate = Entry {
-        index: 4,
-        term: 1,
-        data: second_data,
-        context: SerdeUtils::serialize(&req_delete)
-            .expect("encode duplicate context")
-            .into(),
-        ..Default::default()
-    };
-    let duplicate_result = apply(duplicate);
-
-    let after_duplicate = target_fs.file_status("/duplicate");
-    let original_lookup = target_fs.file_status_by_id("/duplicate", Some(original_id));
-    let echo = target_fs.fs_dir.view().unwrap().take_entries();
-
-    // Everything is collected; tear down before asserting.
+    // The source filesystem and both systems are released before the
+    // assertions; directory removal results are saved, not swallowed.
+    drop(source_fs);
     source.shutdown();
     target.shutdown();
     let cleanup = (|| {
@@ -188,6 +221,21 @@ fn raft_request_duplicate_delete_preserves_recreated_inode() {
         }
         first_error
     })();
+
+    let (
+        first_result,
+        second_result,
+        third_result,
+        duplicate_result,
+        after_recreate,
+        after_duplicate,
+        original_lookup,
+        echo,
+        fsm_before_duplicate,
+        fsm_after_duplicate,
+        cursors_before,
+        cursors_after,
+    ) = evidence;
 
     assert!(first_result.is_ok(), "mkdir apply: {first_result:?}");
     assert!(second_result.is_ok(), "delete apply: {second_result:?}");
@@ -217,6 +265,27 @@ fn raft_request_duplicate_delete_preserves_recreated_inode() {
     assert!(
         echo.is_empty(),
         "replay must not echo journal entries: {echo:?}"
+    );
+    // The durable watermark and per-request records show the duplicate was
+    // skipped, not replayed.
+    assert_eq!(
+        (fsm_before_duplicate.index, fsm_before_duplicate.term),
+        (3, 1),
+        "three first-time entries must advance the watermark to (3,1)"
+    );
+    assert_eq!(
+        (fsm_after_duplicate.index, fsm_after_duplicate.term),
+        (4, 1),
+        "the duplicate must advance the watermark to (4,1)"
+    );
+    assert_eq!(
+        cursors_before,
+        (Some((1, 1)), Some((2, 1)), Some((3, 1))),
+        "each first-time request must record its own index/term"
+    );
+    assert_eq!(
+        cursors_after, cursors_before,
+        "the duplicate must not rewrite any applied-request record"
     );
     assert!(cleanup.is_none(), "cleanup failed: {cleanup:?}");
 }
