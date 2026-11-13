@@ -330,10 +330,7 @@ impl SubtreeLocationPlan {
     /// set (called under the FINAL view, after location locks are held).
     /// Returns `false` when any live block/worker is missing from the
     /// sampled set (release everything and retry ≤3).
-    pub(crate) fn covers(
-        &self,
-        fs_dir: &crate::master::meta::FsDir,
-    ) -> FsResult<bool> {
+    pub(crate) fn covers(&self, fs_dir: &crate::master::meta::FsDir) -> FsResult<bool> {
         for &block_id in &self.block_ids {
             let Some(locations) = fs_dir
                 .store
