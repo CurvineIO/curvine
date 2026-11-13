@@ -796,8 +796,10 @@ pub struct CosnConf {
     pub secret_key: String,
     pub region: String,
     pub endpoint_suffix: Option<String>,
-    /// Optional COS APPID. When set, libhdfs connects as `cosn://<bucket>-<appid>`
-    /// even if the mount URI uses the short bucket name (`cosn://<bucket>/`).
+    /// Optional COS APPID, forwarded to Java as `fs.cosn.userinfo.appid`. The
+    /// mount URI authority is handed to libhdfs unchanged: hadoop-cos (and the
+    /// CHDFS trsf adapter, via `fs.cosn.trsf.fs.ofs.use.short.bucketname=true`)
+    /// append the appid themselves when the URI uses the short bucket name.
     pub appid: Option<String>,
     /// Optional Hadoop user for `hdfsBuilderSetUserName`. Not a COSN property.
     pub user: Option<String>,
@@ -847,26 +849,6 @@ impl CosnConf {
             user,
             properties: map.0,
         })
-    }
-
-    /// Authority used for libhdfs `hdfsBuilderSetNameNode` / COS HeadBucket.
-    ///
-    /// Hive and Curvine mounts often use the short bucket (`cosn://mybucket/`).
-    /// Hadoop-COS still calls HeadBucket on `uri.getHost()`, which COS rejects
-    /// unless it is `mybucket-<appid>`. Append `-<appid>` when configured and
-    /// not already present; leave the URI unchanged when appid is unset.
-    pub fn namenode_bucket(&self, uri_bucket: &str) -> String {
-        match self.appid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(id) => {
-                let suffix = format!("-{}", id);
-                if uri_bucket.ends_with(&suffix) {
-                    uri_bucket.to_string()
-                } else {
-                    format!("{}{}", uri_bucket, suffix)
-                }
-            }
-            None => uri_bucket.to_string(),
-        }
     }
 
     /// `(key, value)` pairs for `hdfsBuilderConfSetStr`.
@@ -1077,30 +1059,6 @@ mod cosn_conf_tests {
             map.get(CosnConf::APPID).map(String::as_str),
             Some("1250000000"),
             "resolved short-form appid must be emitted as fs.cosn.userinfo.appid"
-        );
-    }
-
-    #[test]
-    fn namenode_bucket_appends_appid_once() {
-        let mut props = base_user_props();
-        props.insert(CosnConf::APPID.to_string(), "1252161381".to_string());
-        let conf = CosnConf::with_map(props).unwrap();
-
-        assert_eq!(
-            conf.namenode_bucket("bigdatahll2"),
-            "bigdatahll2-1252161381"
-        );
-        assert_eq!(
-            conf.namenode_bucket("bigdatahll2-1252161381"),
-            "bigdatahll2-1252161381",
-            "must not append appid twice when the URI already uses bucket-appid"
-        );
-
-        let conf = CosnConf::with_map(base_user_props()).unwrap();
-        assert_eq!(
-            conf.namenode_bucket("bigdatahll2"),
-            "bigdatahll2",
-            "leave short names alone when appid is unset"
         );
     }
 }

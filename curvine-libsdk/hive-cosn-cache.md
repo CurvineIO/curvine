@@ -23,7 +23,9 @@ cluster-wide without restarting jobs.
 
 1. A running Curvine cluster with COSN mounts. Mount the exact Hive LOCATION
    prefix - keep the short bucket name when Hive uses it, and pass `cosn.appid`
-   so Curvine still reaches the real `bucket-appid`:
+   so hadoop-cos / the CHDFS trsf adapter resolve the real `bucket-appid` on the
+   Java side (add `-c fs.cosn.trsf.fs.ofs.use.short.bucketname=true` for
+   metadata-accelerated buckets):
 
    ```bash
    cv mount cosn://mybucket/warehouse/db/hot_table/ /cache/db/hot_table \
@@ -31,7 +33,8 @@ cluster-wide without restarting jobs.
      -c cosn.secretId=AKIDxxx \
      -c cosn.secretKey=yyy \
      -c cosn.region=ap-guangzhou \
-     -c cosn.appid=1250000000
+     -c cosn.appid=1250000000 \
+     -c fs.cosn.trsf.fs.ofs.use.short.bucketname=true
    ```
 
    See [curvine-ufs-cosn README](../../crates/adapters/curvine-ufs-cosn/README.md)

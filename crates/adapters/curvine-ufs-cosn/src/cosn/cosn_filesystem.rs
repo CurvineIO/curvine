@@ -35,51 +35,31 @@ pub struct CosnFileSystem {
 
 struct CosnFileSystemInner {
     fs: Arc<CosnFs>,
-    /// Authority on Curvine/Hive URIs. May be the short bucket when `appid` is set.
+    /// Authority of the mount URI (may be the short Hive bucket name). Handed
+    /// to libhdfs unchanged; hadoop-cos / the CHDFS trsf adapter resolve the
+    /// appid themselves from `fs.cosn.userinfo.appid`.
     uri_bucket: String,
-    /// Authority passed to libhdfs (`bucket` or `bucket-appid`).
-    namenode_bucket: String,
 }
 
-/// Rewrites a Curvine/Hive COSN path to the authority libhdfs connected with.
+/// Rewrites a Curvine/Hive COSN path to the form libhdfs expects.
 ///
-/// Mount and Hive LOCATION can stay `cosn://bucket/...` (short name). HeadBucket
-/// and subsequent libhdfs calls need `cosn://bucket-appid/...`.
-pub(crate) fn libhdfs_uri(path: &Path, uri_bucket: &str, namenode_bucket: &str) -> String {
+/// libhdfs is connected with the mount URI authority as-is, so COSN paths pass
+/// through unchanged; non-COSN paths degrade to their path portion.
+pub(crate) fn libhdfs_uri(path: &Path) -> String {
     if path.scheme() != Some(SCHEME) {
         return path.path().to_owned();
     }
-    if uri_bucket == namenode_bucket {
-        return path.full_path().to_owned();
-    }
-    match path.authority() {
-        Some(auth) if auth == uri_bucket || auth == namenode_bucket => {
-            format!("{}://{}{}", SCHEME, namenode_bucket, path.path())
-        }
-        _ => path.full_path().to_owned(),
-    }
+    path.full_path().to_owned()
 }
 
 /// Builds a Curvine path for a list entry. `mName` may be a full URI or an
-/// absolute path under the bucket. Hadoop may echo the namenode authority
-/// (`bucket-appid`); rewrite back to `uri_bucket` so mount lookup still matches.
-pub(crate) fn entry_path_for_bucket(
-    uri_bucket: &str,
-    namenode_bucket: &str,
-    m_name: &str,
-) -> FsResult<Path> {
-    let path = if m_name.contains("://") {
-        Path::from_str(m_name.trim_end_matches('/')).map_err(FsError::from)?
-    } else {
-        let trimmed = m_name.trim_start_matches('/').trim_end_matches('/');
-        Path::from_str(format!("{}://{}/{}", SCHEME, uri_bucket, trimmed)).map_err(FsError::from)?
-    };
-
-    if uri_bucket != namenode_bucket && path.authority() == Some(namenode_bucket) {
-        return Path::from_str(format!("{}://{}{}", SCHEME, uri_bucket, path.path()))
-            .map_err(FsError::from);
+/// absolute path under the bucket.
+pub(crate) fn entry_path_for_bucket(uri_bucket: &str, m_name: &str) -> FsResult<Path> {
+    if m_name.contains("://") {
+        return Path::from_str(m_name.trim_end_matches('/')).map_err(FsError::from);
     }
-    Ok(path)
+    let trimmed = m_name.trim_start_matches('/').trim_end_matches('/');
+    Path::from_str(format!("{}://{}/{}", SCHEME, uri_bucket, trimmed)).map_err(FsError::from)
 }
 
 pub(crate) fn file_status_from_info(path: &Path, info: &hdfsFileInfo) -> FileStatus {
@@ -145,10 +125,13 @@ impl CosnFileSystem {
         })?;
 
         // libhdfs treats the "name node" string as a filesystem URI when it
-        // contains `://`. COS HeadBucket needs `cosn://bucket-appid`; the mount
-        // URI may still be the short Hive name `cosn://bucket`.
-        let namenode_bucket = cosn_conf.namenode_bucket(&uri_bucket);
-        let name_node = format!("{}://{}", SCHEME, namenode_bucket);
+        // contains `://`. Hand the mount URI authority through unchanged —
+        // exactly like native Hadoop: hadoop-cos (and the CHDFS trsf adapter)
+        // resolve the appid themselves from `fs.cosn.userinfo.appid` and, for
+        // short bucket names, `fs.cosn.trsf.fs.ofs.use.short.bucketname=true`.
+        // Expanding `bucket` to `bucket-appid` here would double the appid in
+        // the CHDFS mount point id when that flag is set.
+        let name_node = format!("{}://{}", SCHEME, uri_bucket);
         let mut builder = CosnBuilder::new(name_node)?;
         builder.force_new_instance();
 
@@ -169,17 +152,15 @@ impl CosnFileSystem {
             inner: Arc::new(CosnFileSystemInner {
                 fs: Arc::new(fs),
                 uri_bucket,
-                namenode_bucket,
             }),
         })
     }
 
     fn path_cstring(&self, path: &Path) -> FsResult<std::ffi::CString> {
-        // Prefer a `cosn://...` URI whose authority matches the connected
-        // namenode (`bucket-appid` when appid is set). CosFileSystem is
-        // URI-aware and rejects bare relative paths the same way JindoSDK
-        // does for OSS.
-        let s = libhdfs_uri(path, &self.inner.uri_bucket, &self.inner.namenode_bucket);
+        // libhdfs is connected with the same authority as these paths, so a
+        // full `cosn://...` URI always matches. CosFileSystem is URI-aware and
+        // rejects bare relative paths the same way JindoSDK does for OSS.
+        let s = libhdfs_uri(path);
         cstring(&s)
     }
 
@@ -349,7 +330,6 @@ impl FileSystem<CosnWriter, CosnReader> for CosnFileSystem {
         let path_c = self.path_cstring(path)?;
         let path_owned = path.clone();
         let uri_bucket = self.inner.uri_bucket.clone();
-        let namenode_bucket = self.inner.namenode_bucket.clone();
         self.with_fs_blocking(move |fs| {
             let mut num_entries: c_int = 0;
             let infos = unsafe { hdfsListDirectory(fs.as_raw(), path_c.as_ptr(), &mut num_entries) };
@@ -368,7 +348,7 @@ impl FileSystem<CosnWriter, CosnReader> for CosnFileSystem {
             for i in 0..num_entries {
                 let info = unsafe { &*infos.offset(i as isize) };
                 let name = c_str_lossy(info.mName);
-                let entry_path = entry_path_for_bucket(&uri_bucket, &namenode_bucket, &name)?;
+                let entry_path = entry_path_for_bucket(&uri_bucket, &name)?;
                 if entry_path.path() == path_owned.path() {
                     continue;
                 }
@@ -439,52 +419,28 @@ mod tests {
 
     #[test]
     fn entry_path_accepts_absolute_and_uri() {
-        let from_abs = entry_path_for_bucket("bucket-125", "bucket-125", "/dir/file").unwrap();
+        let from_abs = entry_path_for_bucket("bucket-125", "/dir/file").unwrap();
         assert_eq!(from_abs.full_path(), "cosn://bucket-125/dir/file");
 
-        let from_uri =
-            entry_path_for_bucket("bucket-125", "bucket-125", "cosn://bucket-125/dir/file/").unwrap();
+        let from_uri = entry_path_for_bucket("bucket-125", "cosn://bucket-125/dir/file/").unwrap();
         assert_eq!(from_uri.full_path(), "cosn://bucket-125/dir/file");
     }
 
     #[test]
-    fn entry_path_rewrites_namenode_authority_back_to_short_bucket() {
-        let from_nn = entry_path_for_bucket(
-            "bigdatahll2",
-            "bigdatahll2-1252161381",
-            "cosn://bigdatahll2-1252161381/warehouse/file",
-        )
-        .unwrap();
-        assert_eq!(from_nn.full_path(), "cosn://bigdatahll2/warehouse/file");
-
-        let from_abs = entry_path_for_bucket(
-            "bigdatahll2",
-            "bigdatahll2-1252161381",
-            "/warehouse/file",
-        )
-        .unwrap();
-        assert_eq!(from_abs.full_path(), "cosn://bigdatahll2/warehouse/file");
-    }
-
-    #[test]
-    fn libhdfs_uri_expands_short_bucket_to_namenode() {
+    fn libhdfs_uri_passes_authority_through() {
+        // The mount URI authority (short or bucket-appid) is handed to libhdfs
+        // unchanged, so both forms pass through as-is.
         let short = Path::from_str("cosn://bigdatahll2/warehouse/file").unwrap();
+        assert_eq!(libhdfs_uri(&short), "cosn://bigdatahll2/warehouse/file");
+
+        let full = Path::from_str("cosn://bigdatahll2-1252161381/warehouse/file").unwrap();
         assert_eq!(
-            libhdfs_uri(&short, "bigdatahll2", "bigdatahll2-1252161381"),
+            libhdfs_uri(&full),
             "cosn://bigdatahll2-1252161381/warehouse/file"
         );
 
-        let already = Path::from_str("cosn://bigdatahll2-1252161381/warehouse/file").unwrap();
-        assert_eq!(
-            libhdfs_uri(&already, "bigdatahll2", "bigdatahll2-1252161381"),
-            "cosn://bigdatahll2-1252161381/warehouse/file"
-        );
-
-        let same = Path::from_str("cosn://bucket-125/a").unwrap();
-        assert_eq!(
-            libhdfs_uri(&same, "bucket-125", "bucket-125"),
-            "cosn://bucket-125/a"
-        );
+        let non_cosn = Path::from_str("cv://ns/cache/file").unwrap();
+        assert_eq!(libhdfs_uri(&non_cosn), "/cache/file");
     }
 
     #[test]

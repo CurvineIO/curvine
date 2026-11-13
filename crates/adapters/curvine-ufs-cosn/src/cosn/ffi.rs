@@ -16,9 +16,9 @@
 //!
 //! Despite the `hdfs` naming, nothing here is HDFS-specific. libhdfs forwards any
 //! name-node string containing `://` straight to `java.net.URI.create`, so
-//! handing it `cosn://<bucket>-<appid>` (short mount URIs are expanded when
-//! `fs.cosn.userinfo.appid` is set) makes it resolve `fs.cosn.impl` and hand
-//! back Tencent's `CosFileSystem`.
+//! handing it the mount URI as written (`cosn://<bucket>`, short or
+//! `bucket-appid`) makes it resolve `fs.cosn.impl` and hand back Tencent's
+//! `CosFileSystem`.
 
 use curvine_core_error::ErrorExt;
 use curvine_error::{FsError, FsResult};

@@ -35,7 +35,7 @@ Short form (`cv mount -c`):
 | `cosn.secretKey` | yes | `fs.cosn.userinfo.secretKey` |
 | `cosn.region` | yes | `fs.cosn.bucket.region` |
 | `cosn.endpoint_suffix` | no | `fs.cosn.bucket.endpoint_suffix` |
-| `cosn.appid` | no | `fs.cosn.userinfo.appid` — when set, libhdfs connects as `cosn://<bucket>-<appid>` even if the mount URI uses the short Hive name `cosn://<bucket>/` |
+| `cosn.appid` | no | `fs.cosn.userinfo.appid` — used by hadoop-cos / the CHDFS trsf adapter on the Java side to resolve short bucket names; the mount URI authority is handed to libhdfs unchanged |
 | `cosn.user` | no | Hadoop user (`hdfsBuilderSetUserName`) |
 
 Hadoop keys may be used directly instead of the short form.
@@ -50,7 +50,7 @@ cv mount cosn://mybucket-1250000000/ /mnt/cosn \
   --provider cosn
 ```
 
-Hive LOCATION using the short bucket (`cosn://mybucket/...`) must keep that short name on the mount UFS path so CosnProxy can map prefixes. Pass appid so native HeadBucket still uses `mybucket-1250000000`:
+Hive LOCATION using the short bucket (`cosn://mybucket/...`) must keep that short name on the mount UFS path so CosnProxy can map prefixes. Curvine hands the mount URI authority to libhdfs unchanged (same as native Hadoop), so pass appid plus the trsf short-bucketname flag and let the Java side resolve the full bucket name:
 
 ```bash
 cv mount cosn://mybucket/warehouse/db/hot_table/ /cache/db/hot_table \
@@ -61,6 +61,8 @@ cv mount cosn://mybucket/warehouse/db/hot_table/ /cache/db/hot_table \
   -c cosn.appid=1250000000 \
   -c fs.cosn.trsf.fs.ofs.use.short.bucketname=true
 ```
+
+The OFS client reads `fs.ofs.use.short.bucketname` (mapped from `fs.cosn.trsf.*`) as "the URI bucket is short, append `-<appid>` yourself" (`CHDFSHadoopFileSystemAdapter.initialize` appends blindly and never strips an existing suffix). So the rules match native Hadoop exactly: **short bucket URI + flag = OK; full `bucket-appid` URI + flag = appid doubled** (`mount_fs` fails with `MountPointNotExists` and mountPointId `<bucket>-<appid>-<appid>`); full `bucket-appid` URI without the flag = OK.
 
 ## Hive cache proxy (no table LOCATION change)
 
