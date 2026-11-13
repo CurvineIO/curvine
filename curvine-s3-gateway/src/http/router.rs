@@ -344,9 +344,29 @@ impl S3Router {
             return (StatusCode::BAD_REQUEST, b"").into_response();
         }
 
+        // `x-amz-metadata-directive: REPLACE` replaces the destination metadata
+        // with the request's; COPY (the default) inherits the source's.
+        let replace = req
+            .get_header("x-amz-metadata-directive")
+            .is_some_and(|value| value.eq_ignore_ascii_case("REPLACE"));
+        // A copy onto itself only makes sense when it replaces metadata.
+        // Without REPLACE it is a request error, not a no-op.
+        if src_bucket == dest[0] && src_key == dest[1] && !replace {
+            log::warn!("copy object onto itself without REPLACE: {src_bucket}/{src_key}");
+            return (StatusCode::BAD_REQUEST, b"").into_response();
+        }
+        let replacement = replace.then(|| crate::utils::s3_utils::S3Metadata::from_headers(&req));
+
         let source_conditions = crate::s3::handlers::Preconditions::from_headers(&req, true);
         match handlers
-            .copy_object(src_bucket, src_key, dest[0], dest[1], &source_conditions)
+            .copy_object(
+                src_bucket,
+                src_key,
+                dest[0],
+                dest[1],
+                &source_conditions,
+                replacement.as_ref(),
+            )
             .await
         {
             Ok(etag) => {

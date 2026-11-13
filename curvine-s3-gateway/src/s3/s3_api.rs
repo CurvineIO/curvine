@@ -1063,6 +1063,18 @@ pub async fn handle_post_delete_objects<
         }
     };
 
+    // S3 caps one request at 1000 keys and rejects an empty list. Silently
+    // deleting part of an oversized batch hid a client-side chunking bug.
+    if req_obj.objects.is_empty() || req_obj.objects.len() > 1000 {
+        log::warn!(
+            "DeleteObjects rejected: {} keys listed",
+            req_obj.objects.len()
+        );
+        resp.set_status(400);
+        resp.send_header();
+        return;
+    }
+
     // Execute deletions one by one
     let mut deleted = Vec::with_capacity(req_obj.objects.len());
     let opt = DeleteObjectOption {};
@@ -1406,6 +1418,27 @@ fn multipart_part_length<H: crate::auth::sig_v4::VHeader>(header: &H) -> Result<
     Ok(length)
 }
 
+/// `CompleteMultipartUpload` request body.
+///
+/// `parts` defaults to empty so a body with no `<Part>` reaches
+/// `validate_part_order` (which answers MalformedXML) instead of failing
+/// deserialization with a bare 400.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct CompleteMultiPartUploadRequest {
+    #[serde(rename = "Part", default)]
+    pub parts: Vec<CompletedPart>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct CompletedPart {
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "PartNumber")]
+    pub part_number: u32,
+}
+
 pub async fn handle_multipart_complete_session<
     T: VRequestPlus,
     F: VResponse,
@@ -1431,21 +1464,6 @@ pub async fn handle_multipart_complete_session<
     let upload_id = req.get_query("uploadId");
 
     if let Some(upload_id) = upload_id {
-        #[derive(Debug, serde::Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        pub struct CompleteMultiPartUploadRequest {
-            #[serde(rename = "Part")]
-            pub parts: Vec<CompletedPart>,
-        }
-        #[derive(Debug, serde::Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        pub struct CompletedPart {
-            #[serde(rename = "ETag")]
-            pub etag: String,
-            #[serde(rename = "PartNumber")]
-            pub part_number: u32,
-        }
-
         match req.body().await {
             Ok(body) => {
                 let parsed = match std::str::from_utf8(&body) {
@@ -2060,6 +2078,7 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         || err.starts_with("InvalidDigest")
         || err.starts_with("BadDigest")
         || err.starts_with("InvalidBucketName")
+        || err.starts_with("MalformedXML")
     {
         400
     } else if err.starts_with("InvalidPart")
@@ -2374,6 +2393,17 @@ mod tests {
         )
         .expect_err("short digest")
         .starts_with("InvalidDigest"));
+    }
+
+    /// An empty Complete body must reach the validator, not fail to parse.
+    #[test]
+    fn a_complete_body_without_parts_parses_as_empty() {
+        let body = r#"<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></CompleteMultipartUpload>"#;
+        let parsed: CompleteMultiPartUploadRequest =
+            quick_xml::de::from_str(body).expect("empty parts must parse");
+        // The empty list now reaches validate_part_order, whose MalformedXML
+        // result is covered by the handler tests.
+        assert!(parsed.parts.is_empty());
     }
 
     #[test]
