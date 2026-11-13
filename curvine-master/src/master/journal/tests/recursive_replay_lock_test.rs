@@ -374,3 +374,6 @@ fn app_storage_apply_advances_the_real_fsm_and_request_record() -> FsResult<()> 
     );
     Ok(())
 }
+
+#[path = "recursive_replay_location_test.rs"]
+mod recursive_replay_location_test;
