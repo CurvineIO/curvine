@@ -243,11 +243,11 @@ pub struct ListObjectOption {
 
 /// List Object Versions result
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
 #[serde(rename = "ListVersionsResult")]
 pub struct ListObjectVersionsResult {
     #[serde(rename = "xmlns", skip_serializing_if = "String::is_empty")]
     pub xmlns: String,
-    #[serde(rename = "Name")]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
@@ -261,11 +261,17 @@ pub struct ListObjectVersionsResult {
     pub next_version_id_marker: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_keys: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
     pub is_truncated: bool,
     #[serde(rename = "Version", default)]
     pub versions: Vec<ObjectVersion>,
     #[serde(rename = "DeleteMarker", default)]
     pub delete_markers: Vec<DeleteMarker>,
+    #[serde(default)]
+    pub common_prefixes: Vec<CommonPrefix>,
 }
 
 /// Object version info
@@ -276,6 +282,7 @@ pub struct ObjectVersion {
     pub version_id: String,
     pub is_latest: bool,
     pub last_modified: String,
+    #[serde(rename = "ETag")]
     pub etag: String,
     pub size: u64,
     pub storage_class: Option<String>,
@@ -356,4 +363,61 @@ pub struct DeleteError {
     pub version_id: Option<String>,
     pub code: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod list_versions_tests {
+    use super::*;
+
+    /// SDKs read `IsTruncated` and `NextKeyMarker` by their S3 element names;
+    /// snake_case elements made every page look final and dropped the marker.
+    #[test]
+    fn list_versions_uses_s3_element_names() {
+        let result = ListObjectVersionsResult {
+            xmlns: S3_NAMESPACE.to_string(),
+            name: "bucket".to_string(),
+            prefix: Some("nested/".to_string()),
+            key_marker: Some("a".to_string()),
+            version_id_marker: None,
+            next_key_marker: Some("nested/deeper/".to_string()),
+            next_version_id_marker: None,
+            max_keys: Some(1),
+            delimiter: Some("/".to_string()),
+            encoding_type: None,
+            is_truncated: true,
+            versions: vec![ObjectVersion {
+                key: "a".to_string(),
+                version_id: "1-1".to_string(),
+                is_latest: true,
+                last_modified: "2026-01-01T00:00:00.000Z".to_string(),
+                etag: "e".to_string(),
+                size: 1,
+                storage_class: None,
+                owner: None,
+            }],
+            delete_markers: Vec::new(),
+            common_prefixes: vec![CommonPrefix {
+                prefix: "nested/deeper/".to_string(),
+            }],
+        };
+
+        let xml = quick_xml::se::to_string(&result).expect("serialize ListVersionsResult");
+
+        assert!(xml.starts_with("<ListVersionsResult"), "{xml}");
+        for element in [
+            "<Name>bucket</Name>",
+            "<Prefix>nested/</Prefix>",
+            "<KeyMarker>a</KeyMarker>",
+            "<NextKeyMarker>nested/deeper/</NextKeyMarker>",
+            "<MaxKeys>1</MaxKeys>",
+            "<Delimiter>/</Delimiter>",
+            "<IsTruncated>true</IsTruncated>",
+            "<CommonPrefixes><Prefix>nested/deeper/</Prefix></CommonPrefixes>",
+            "<Version><Key>a</Key><VersionId>1-1</VersionId><IsLatest>true</IsLatest>",
+            "<ETag>e</ETag>",
+        ] {
+            assert!(xml.contains(element), "missing {element} in {xml}");
+        }
+        assert!(!xml.contains("is_truncated"), "{xml}");
+    }
 }

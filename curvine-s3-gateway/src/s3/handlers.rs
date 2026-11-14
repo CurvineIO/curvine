@@ -18,7 +18,6 @@ use super::ListObjectOption;
 use super::ListObjectVersionsHandler;
 use super::ListObjectVersionsOption;
 use super::ListObjectVersionsResult;
-use super::ObjectVersion;
 use super::PutObjectHandler;
 use super::PutObjectOption;
 use crate::s3::error_code::Error;
@@ -366,6 +365,23 @@ impl S3Handlers {
         let path = format!("/{bucket}");
         tracing::debug!("Mapped S3 bucket to Curvine path: {}", path);
         Ok(Path::from_str(&path)?)
+    }
+
+    /// Path of a bucket that is about to be listed.
+    ///
+    /// A missing bucket must be an error, not an empty listing: S3 answers 404,
+    /// and clients rely on it to detect a wrong bucket instead of concluding
+    /// the bucket is empty.
+    async fn listed_bucket_path(&self, bucket: &str) -> Result<Path, String> {
+        let bkt_path = self.cv_bucket_path(bucket).map_err(|e| e.to_string())?;
+        let bucket_status = self.fs.get_status(&bkt_path).await.map_err(|e| match e {
+            curvine_error::FsError::FileNotFound(_) => NO_SUCH_BUCKET.to_string(),
+            other => other.to_string(),
+        })?;
+        if !bucket_status.is_dir {
+            return Err(NO_SUCH_BUCKET.to_string());
+        }
+        Ok(bkt_path)
     }
 }
 
@@ -1209,19 +1225,7 @@ impl ListObjectHandler for S3Handlers {
         let bucket = bucket.to_string();
 
         async move {
-            let bkt_path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
-
-            // A missing bucket must be an error, not an empty listing: S3
-            // answers 404, and clients rely on it to detect a wrong bucket
-            // instead of concluding the bucket is empty.
-            let bucket_status = this.fs.get_status(&bkt_path).await.map_err(|e| match e {
-                curvine_error::FsError::FileNotFound(_) => NO_SUCH_BUCKET.to_string(),
-                other => other.to_string(),
-            })?;
-            if !bucket_status.is_dir {
-                return Err(NO_SUCH_BUCKET.to_string());
-            }
-
+            let bkt_path = this.listed_bucket_path(&bucket).await?;
             let dirs = BucketDirs {
                 fs: &this.fs,
                 bucket: &bkt_path,
@@ -1274,85 +1278,12 @@ impl ListObjectVersionsHandler for S3Handlers {
         let bucket = bucket.to_string();
 
         async move {
-            tracing::info!("ListObjectVersions request for bucket: {}", bucket);
-
-            let bkt_path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
-
-            let list = this
-                .fs
-                .list_status(&bkt_path)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            let mut versions = Vec::new();
-
-            for st in list {
-                if st.is_dir {
-                    continue;
-                }
-                // Same rule as ListObjects: staging objects are internal state.
-                if is_staging_name(&st.name) {
-                    continue;
-                }
-
-                let key = st.name.clone();
-
-                if let Some(prefix) = &opt.prefix {
-                    if !key.starts_with(prefix) {
-                        continue;
-                    }
-                }
-
-                let version_id = format!("{}-{}", st.mtime, st.len);
-
-                let version = ObjectVersion {
-                    key: key.clone(),
-                    version_id,
-                    is_latest: true,
-                    last_modified: crate::utils::s3_utils::format_s3_timestamp(st.mtime)
-                        .unwrap_or_else(|| {
-                            chrono::Utc::now()
-                                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                                .to_string()
-                        }),
-                    etag: crate::utils::s3_utils::generate_etag(&st),
-                    size: st.len as u64,
-                    storage_class: Some(crate::utils::s3_utils::map_storage_class(
-                        &st.storage_policy.storage_type,
-                    )),
-                    owner: Some(crate::utils::s3_utils::create_owner_info(&st)),
-                };
-
-                versions.push(version);
-            }
-
-            if let Some(max_keys) = opt.max_keys {
-                if max_keys > 0 && versions.len() > max_keys as usize {
-                    versions.truncate(max_keys as usize);
-                }
-            }
-
-            let result = ListObjectVersionsResult {
-                xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
-                name: bucket.to_string(),
-                prefix: opt.prefix.clone(),
-                key_marker: opt.key_marker.clone(),
-                version_id_marker: opt.version_id_marker.clone(),
-                next_key_marker: None,
-                next_version_id_marker: None,
-                max_keys: opt.max_keys.map(|k| k as u32),
-                is_truncated: false,
-                versions,
-                delete_markers: Vec::new(),
+            let bkt_path = this.listed_bucket_path(&bucket).await?;
+            let dirs = BucketDirs {
+                fs: &this.fs,
+                bucket: &bkt_path,
             };
-
-            tracing::info!(
-                "ListObjectVersions completed for bucket: {}, found {} versions",
-                bucket,
-                result.versions.len()
-            );
-
-            Ok(result)
+            super::listing::list_object_versions(&opt, &dirs).await
         }
     }
 }
