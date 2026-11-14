@@ -169,10 +169,15 @@ pub(super) fn assert_holder_terminal(
 /// retirement invalidates the metadata store — same boundary as C1's cursor
 /// probe). Used by the fault-only publication-failure case.
 #[cfg(feature = "fault-injection")]
-pub(super) fn terminal_holder_alive_probe(_fs: &MasterFilesystem, pre_view: &NamespaceGuard<'_>) {
+pub(super) fn terminal_holder_alive_probe(fs: &MasterFilesystem, pre_view: &NamespaceGuard<'_>) {
+    // Healthy before the terminal transition, rejected after: the probe walks
+    // a real path through the borrowed view, which is how the C1 cursor probe
+    // observes retirement.
+    let _ = fs;
+    let rejected = MasterFilesystem::resolve_path(pre_view, "/dir");
     assert!(
-        pre_view.store.get_inode(ROOT_INODE_ID, None).is_err(),
-        "the retired store must reject reads through a pre-failure view"
+        rejected.is_err(),
+        "reads through the terminal store must be rejected, not silently served"
     );
 }
 
