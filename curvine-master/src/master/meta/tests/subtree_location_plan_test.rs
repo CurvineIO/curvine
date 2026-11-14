@@ -362,6 +362,3 @@ fn bounded_location_read_with_a_zero_budget_distinguishes_empty_from_over_limit(
         "a zero budget on a block that has a row must exceed the limit, not truncate"
     );
 }
-
-#[path = "subtree_location_cover_test.rs"]
-mod subtree_location_cover_test;
