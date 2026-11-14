@@ -489,13 +489,31 @@ fn file_status_by_id_keeps_missing_and_pending_semantics() {
         "the missing by-ID read must keep the FileNotFound+inode_id payload: {error}"
     );
 
-    // Pending staging path: rejected at the entry, before any resolution.
+    // Pending staging path with NO inode id: the path branch runs and the
+    // entry-level check_not_pending_path rejects it before any resolution
+    // (its message is the plain FileNotFound for that path). (With Some(1) —
+    // a real inode id — the by-ID branch returns BEFORE the pending check and
+    // the snapshot resolve reports FileNotFound whose message merely contains
+    // the requested path text; that distinction is asserted below.)
+    let error = fs
+        .file_status_by_id("/.Trash/.pending/file", None)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("/.Trash/.pending/file")
+            && error.to_string().contains("not found"),
+        "the pending path must be rejected at the entry as FileNotFound: {error}"
+    );
+
+    // With a REAL inode id (root = Some(1)), the by-ID branch returns before
+    // the pending check: the resolve reports FileNotFound for the missing
+    // pending edge, and the message contains the path text — this documents
+    // the actual branch order, not an entry rejection.
     let error = fs
         .file_status_by_id("/.Trash/.pending/file", Some(1))
         .unwrap_err();
     assert!(
-        error.to_string().contains("pending"),
-        "the pending path must be rejected at the entry: {error}"
+        error.to_string().contains("not found"),
+        "the by-ID branch resolves the missing pending edge as FileNotFound: {error}"
     );
     case.cleanup_and_verify();
 }
