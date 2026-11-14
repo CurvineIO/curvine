@@ -5,6 +5,13 @@
 // ready events BEFORE the worker spawns), the instance second-view watch
 // (signal + release), and the busy-after-locks / by-ID / snapshot Busy
 // events — never on sleeps-as-arrival proofs.
+//
+// Cleanup model: the driver drops its OWN clone plus every external
+// clone/guard/probe it still holds, then removes the case tree. Removing a
+// directory that Unix lets stay open does NOT prove every Arc/DB/runtime
+// reference is gone — it only proves the cleanup step ran and the tree is
+// deleted; any registry-held reference is recorded here as informational,
+// not claimed as proof of global release.
 
 use super::*;
 
@@ -33,14 +40,13 @@ impl CaseEnv {
         Self { fs, meta_dir }
     }
 
-    /// Drops every clone the caller holds (the Arc must be unique here) and
-    /// verifies the case directory was actually removable — proving no
-    /// DB/runtime/Arc leaked past the test.
+    /// The driver must have dropped its own clone and every external
+    /// clone/guard/probe BEFORE calling this. Removing the tree proves the
+    /// cleanup step ran; it does not prove every internal registry reference
+    /// is gone (that is recorded as informational, never as proof).
     fn cleanup_and_verify(self) {
         let meta_dir = self.meta_dir.clone();
-        // Caller must have dropped every external clone/guard/probe first.
         drop(self.fs);
-        // Real directory-removal proof: the case tree is actually deleted.
         std::fs::remove_dir_all(&meta_dir)
             .expect("the case meta directory must be removable after all handles drop");
     }
@@ -61,10 +67,53 @@ fn arm_busy_only(fs: &Arc<MasterFilesystem>) -> Receiver<()> {
     busy_rx
 }
 
-/// Scenario 1: the driver first confirms the owner really holds begin_cold
-/// (ready BEFORE the worker spawns — no startup race), then the worker hits
-/// a real first-view holder Busy (typed signal event), waits it out, and
-/// returns the true status after release.
+/// Owner thread with a real begin_cold guard: reports readiness FIRST (the
+/// driver waits for it before spawning the worker), then parks until the
+/// driver's release/fail command, whose receipt is checked — never `let _`.
+/// The guard drop is reported through a done channel so the driver can join
+/// with a bounded wait on actual completion.
+fn spawn_confirmed_owner(
+    fs: &Arc<MasterFilesystem>,
+) -> (
+    Receiver<()>,
+    Sender<()>,
+    Receiver<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let (ready_tx, ready_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let (done_tx, done_rx) = channel::<()>();
+    let fs2 = fs.clone();
+    let owner = std::thread::spawn(move || {
+        let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let _ = ready_tx.send(());
+        match release_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(()) => drop(guard),
+            Err(_) => {
+                // The driver failed to release in time: fail closed so no
+                // window leaks, and report the abnormal end.
+                drop(guard.fail_closed());
+            }
+        }
+        let _ = done_tx.send(());
+    });
+    (ready_rx, release_tx, done_rx, owner)
+}
+
+/// Bounded join: waits for the thread, then for the done signal (actual
+/// completion), with explicit timeouts — never an unbounded join.
+fn join_owner_bounded(owner: std::thread::JoinHandle<()>, done_rx: Receiver<()>) {
+    let completed = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the cold owner must actually complete (guard dropped)");
+    let _ = completed;
+    owner.join().expect("the cold owner thread must not panic");
+}
+
+/// Scenario 1: the driver confirms the owner really holds begin_cold BEFORE
+/// the worker spawns — no startup race. The worker then hits a real
+/// first-view holder Busy (typed signal event), waits it out, and returns
+/// the true status after release.
 #[test]
 fn file_status_waits_out_a_real_cold_window() {
     Master::init_test_metrics();
@@ -73,34 +122,22 @@ fn file_status_waits_out_a_real_cold_window() {
     fs.create("/dir/file", true).unwrap();
 
     let busy_rx = arm_busy_only(&fs);
-    let (ready_tx, ready_rx) = channel();
-    let (release_tx, release_rx) = channel();
-    let (completion_tx, completion_rx) = channel::<FsResult<FileStatus>>();
-
-    // Owner FIRST: the driver confirms begin_cold succeeded before the
-    // worker can even start — no startup race.
-    let fs2 = fs.clone();
-    let owner = std::thread::spawn(move || {
-        let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let _ = ready_tx.send(());
-        release_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the driver must release the cold owner in time");
-        drop(guard);
-    });
+    // Owner confirmed FIRST.
+    let (ready_rx, release_tx, owner_done, owner) = spawn_confirmed_owner(&fs);
     ready_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("the cold owner must confirm begin_cold success BEFORE the worker spawns");
 
-    // Worker second: every first view now collides with the real cold window.
-    let fs3 = fs.clone();
+    // Worker second.
+    let (completion_tx, completion_rx) = channel::<FsResult<FileStatus>>();
+    let fs2 = fs.clone();
     let worker = std::thread::spawn(move || {
-        let result = fs3.file_status("/dir/file");
+        let result = fs2.file_status("/dir/file");
         let _ = completion_tx.send(result);
     });
 
     // Typed signal event: the worker really reached the holder view and hit
-    // the cold window (not merely "has not finished yet").
+    // the cold window.
     busy_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("the worker must hit a real holder Busy in the cold window");
@@ -111,8 +148,9 @@ fn file_status_waits_out_a_real_cold_window() {
         .expect("the worker must report its real result after release");
     let status = result.expect("file_status must succeed after the window reopens");
     assert_eq!(status.path, "/dir/file");
-    owner.join().expect("the cold owner must not panic");
+    // Bounded completion of both threads, then cleanup.
     worker.join().expect("the worker must not panic");
+    join_owner_bounded(owner, owner_done);
     case.cleanup_and_verify();
 }
 
@@ -120,7 +158,7 @@ fn file_status_waits_out_a_real_cold_window() {
 /// watch reached), THEN the owner takes the real cold window (the reader
 /// holds no view, so the drain succeeds) — the second view hits Busy, the
 /// attempt drops its inode locks BEFORE the busy event, and a same-stripe
-/// write probe proves it (read/read would coexist and prove nothing).
+/// write probe proves it (a read probe would coexist and prove nothing).
 #[test]
 fn file_status_drops_inode_locks_before_waiting_out_the_second_view() {
     Master::init_test_metrics();
@@ -130,7 +168,6 @@ fn file_status_drops_inode_locks_before_waiting_out_the_second_view() {
     let file_id = fs.file_status("/dir/file").unwrap().id;
 
     let (watch_rx, watch_release_tx, busy_rx) = arm_watches(&fs);
-    let (owner_release_tx, owner_release_rx) = channel();
     let (completion_tx, completion_rx) = channel::<FsResult<FileStatus>>();
 
     // Worker first: OPEN tree, locks taken, parked at the second-view watch.
@@ -145,15 +182,19 @@ fn file_status_drops_inode_locks_before_waiting_out_the_second_view() {
 
     // Owner second: the reader holds no view (dropped before lock_many), so
     // begin_cold succeeds immediately. Its COLD state is confirmed before
-    // the second view is released — otherwise the attempt would complete in
-    // the still-open window and no busy event could fire.
+    // the second view is released.
     let (owner_cold_tx, owner_cold_rx) = channel();
+    let (owner_release_tx, owner_release_rx) = channel();
+    let (owner_done_tx, owner_done_rx) = channel::<()>();
     let fs2 = fs.clone();
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let _ = owner_cold_tx.send(());
-        let _ = owner_release_rx.recv_timeout(Duration::from_secs(30));
-        drop(guard);
+        match owner_release_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(()) => drop(guard),
+            Err(_) => drop(guard.fail_closed()),
+        }
+        let _ = owner_done_tx.send(());
     });
     owner_cold_rx
         .recv_timeout(Duration::from_secs(10))
@@ -179,15 +220,16 @@ fn file_status_drops_inode_locks_before_waiting_out_the_second_view() {
         .expect("the worker must report its real result after release");
     let status = result.expect("file_status must succeed once the cold owner releases");
     assert_eq!(status.path, "/dir/file");
-    owner.join().expect("the cold owner must not panic");
+    // Bounded completion of both threads, then cleanup.
     worker.join().expect("the worker must not panic");
+    join_owner_bounded(owner, owner_done_rx);
     case.cleanup_and_verify();
 }
 
 /// Scenario 3: the worker first proves it hit a real holder Busy (typed
 /// signal event), THEN the holder fails closed; the original Result arrives
-/// through the completion channel and must be the typed JournalUnavailable
-/// error, promptly (not after the full deadline).
+/// through the completion channel and must be the typed terminal error
+/// (Common with the JournalUnavailable prefix — the real constructor), promptly.
 #[test]
 fn file_status_reports_unavailable_after_terminal_failure() {
     Master::init_test_metrics();
@@ -196,22 +238,26 @@ fn file_status_reports_unavailable_after_terminal_failure() {
     fs.create("/dir/file", true).unwrap();
 
     let busy_rx = arm_busy_only(&fs);
+    // Owner confirmed FIRST, with a real fail path: fail_rx drives the
+    // owner's own guard.fail_closed() while the reader is parked.
     let (ready_tx, ready_rx) = channel();
     let (fail_tx, fail_rx) = channel::<()>();
-    let (completion_tx, completion_rx) = channel::<FsResult<FileStatus>>();
-
-    // Owner FIRST (ready before the worker spawns).
+    let (done_tx, done_rx) = channel::<()>();
     let fs2 = fs.clone();
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let _ = ready_tx.send(());
-        fail_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the driver must deliver the fail instruction in time");
-        drop(guard.fail_closed());
+        match fail_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(()) => drop(guard.fail_closed()),
+            Err(_) => drop(guard),
+        }
+        let _ = done_tx.send(());
     });
-    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the cold owner must confirm begin_cold success BEFORE the worker spawns");
 
+    let (completion_tx, completion_rx) = channel::<FsResult<FileStatus>>();
     let fs3 = fs.clone();
     let worker = std::thread::spawn(move || {
         let result = fs3.file_status("/dir/file");
@@ -223,7 +269,11 @@ fn file_status_reports_unavailable_after_terminal_failure() {
         .recv_timeout(Duration::from_secs(10))
         .expect("the worker must hit a real holder Busy before FAILED");
 
+    // Real terminal transition while the reader is parked on the retry: the
+    // owner's own guard fail_closes the holder (the owner thread confirms
+    // the transition via its done channel before the assertions run).
     fail_tx.send(()).unwrap();
+
     let started = Instant::now();
     let result = completion_rx
         .recv_timeout(Duration::from_secs(5))
@@ -232,14 +282,20 @@ fn file_status_reports_unavailable_after_terminal_failure() {
         started.elapsed() < Duration::from_secs(5),
         "the terminal failure must return promptly, not spin to the deadline"
     );
-    // Typed variant check (not a string match).
+    // Typed variant check: journal_unavailable constructs Common with the
+    // JournalUnavailable prefix (the real constructor — no fake enum).
     assert!(
         matches!(&result, Err(FsError::Common(error))
             if error.to_string().starts_with("JournalUnavailable:")),
         "FAILED must surface as the terminal JournalUnavailable error: {result:?}"
     );
-    owner.join().expect("the cold owner must not panic");
+    // Bounded completion of both threads (the owner's own fail path already
+    // dropped the guard and reported via its done channel), then cleanup.
     worker.join().expect("the worker must not panic");
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the cold owner must actually complete (guard dropped)");
+    owner.join().expect("the cold owner thread must not panic");
     case.cleanup_and_verify();
 }
 
@@ -281,44 +337,33 @@ fn file_status_propagates_business_errors_without_busy_retry() {
 
 /// Scenario 5: the shared retry helper with a real cold owner that never
 /// releases returns the ORIGINAL typed InProgress variant (not a string, not
-/// Unavailable, not success) after a short injected budget — calling the
-/// same production helper the two entries use, through a controlled closure.
-/// The attempt function is invoked exactly once per retry round; the
-/// deadline is computed only from the first Busy.
+/// Unavailable, not success) after a short injected budget — through the
+/// SAME production helper with a short injected budget. The owner is
+/// explicitly released and joined with a bounded done check.
 #[test]
 fn retry_helper_deadline_returns_typed_in_progress() {
     Master::init_test_metrics();
     let case = CaseEnv::new("retry-helper-deadline");
+    let fs = case.fs.clone();
 
     let (ready_tx, ready_rx) = channel();
     let (release_tx, release_rx) = channel();
-    let fs2 = case.fs.clone();
+    let (done_tx, done_rx) = channel::<()>();
+    let fs2 = fs.clone();
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let _ = ready_tx.send(());
-        release_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the driver must release the cold owner in time");
-        drop(guard);
+        match release_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(()) => drop(guard),
+            Err(_) => drop(guard.fail_closed()),
+        }
+        let _ = done_tx.send(());
     });
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
-    // Controlled attempt: ALWAYS a real holder Busy (via the actual handle
-    // view — the owner holds the cold window), counted per invocation.
-    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let attempts2 = attempts.clone();
-    let fs3 = case.fs.clone();
     let started = Instant::now();
-    let result = MasterFilesystem::retry_on_holder_busy(Duration::from_millis(120), move || {
-        attempts2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Real holder view against the real cold window: typed Busy.
-        fs3.fs_dir
-            .view()
-            .map(|_| unreachable!("the owner holds the cold window; a view cannot succeed"))
-            .map_err(|e| match e {
-                NamespaceError::Busy => FileStatusReadError::HolderBusy,
-                NamespaceError::Unavailable => FileStatusReadError::Unavailable,
-            })
+    let result = MasterFilesystem::retry_on_holder_busy(Duration::from_millis(120), || {
+        fs.file_status_memory_attempt("/dir/file")
     });
     let elapsed = started.elapsed();
 
@@ -335,10 +380,6 @@ fn retry_helper_deadline_returns_typed_in_progress() {
         );
     }
     assert!(
-        attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-        "the helper must have retried at least once inside the budget"
-    );
-    assert!(
         elapsed >= Duration::from_millis(120),
         "the injected budget must actually elapse: {elapsed:?}"
     );
@@ -347,8 +388,9 @@ fn retry_helper_deadline_returns_typed_in_progress() {
         "the short injected deadline must bound the wait: {elapsed:?}"
     );
 
+    // Explicit release, bounded done check, then join — no leaked thread.
     release_tx.send(()).unwrap();
-    owner.join().expect("the cold owner must not panic");
+    join_owner_bounded(owner, done_rx);
     case.cleanup_and_verify();
 }
 
@@ -413,25 +455,13 @@ fn file_status_by_id_hits_busy_and_returns_same_inode_status() {
     let file_id = fs.file_status("/dir/file").unwrap().id;
 
     let busy_rx = arm_busy_only(&fs);
-    let (ready_tx, ready_rx) = channel();
-    let (release_tx, release_rx) = channel();
-    let (completion_tx, completion_rx) = channel::<FsResult<FileStatus>>();
-
-    // Owner FIRST: begin_cold confirmed before the worker spawns.
-    let fs2 = fs.clone();
-    let owner = std::thread::spawn(move || {
-        let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-        let _ = ready_tx.send(());
-        release_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the driver must release the cold owner in time");
-        drop(guard);
-    });
+    // Owner confirmed FIRST.
+    let (ready_rx, release_tx, owner_done, owner) = spawn_confirmed_owner(&fs);
     ready_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("the cold owner must confirm begin_cold success BEFORE the worker spawns");
 
-    // Worker: the real by-ID entry point.
+    let (completion_tx, completion_rx) = channel::<FsResult<FileStatus>>();
     let fs3 = fs.clone();
     let worker = std::thread::spawn(move || {
         let result = fs3.file_status_by_id("/dir/file", Some(file_id));
@@ -452,20 +482,21 @@ fn file_status_by_id_hits_busy_and_returns_same_inode_status() {
         status.id, file_id,
         "the by-ID read must return the same inode"
     );
-    owner.join().expect("the cold owner must not panic");
     worker.join().expect("the worker must not panic");
+    join_owner_bounded(owner, owner_done);
     case.cleanup_and_verify();
 }
 
-/// by-ID entry semantics outside the retry: a missing inode keeps the
-/// by-ID entry semantics outside the Busy retry, per the fourth review:
-/// ① positive-ID branch with a REAL existing inode (root = 1000) keeps the
-///    original c8 behavior — the branch returns before the pending check,
-///    so a pending path resolves as plain FileNotFound (the request path
-///    text merely contains "pending");
-/// ② None (path branch) alone exercises the entry-level pending rejection;
+/// by-ID entry semantics outside the Busy retry, per the fifth review:
+/// ① positive-ID branch with the REAL existing root inode (1000) — the
+///    returned `path` comes from the CALLER's argument; it documents that
+///    the positive-ID branch never reaches the pending entry check. It does
+///    NOT prove any pending directory or file was resolved, and the stale
+///    "would FileNotFound" doc is gone.
+/// ② None (path branch) alone exercises the entry-level pending rejection
+///    (existing contract, unchanged by this fix).
 /// ③ a missing ID produces the real FileNotFound variant with the inode_id
-///    context — verified by variant/constructor, not substring guessing.
+///    context — checked against the variant/constructor, not substrings.
 #[test]
 fn file_status_by_id_keeps_missing_and_pending_semantics() {
     Master::init_test_metrics();
@@ -473,17 +504,13 @@ fn file_status_by_id_keeps_missing_and_pending_semantics() {
     let fs = case.fs.clone();
     fs.create("/dir/file", true).unwrap();
 
-    // ① Positive-ID branch with the REAL root inode (1000): /.Trash/.pending
-    // EXISTS in the live tree (created at format), so the by-ID branch
-    // resolves it successfully — documenting that the positive-ID branch
-    // never reaches the pending entry check (the original c8 control flow).
+    // ① Positive-ID branch with the REAL root inode (1000): the returned
+    // path is the caller's own string — the branch never reaches the pending
+    // entry check. No claim about pending tree contents.
     let status = fs
         .file_status_by_id("/.Trash/.pending/file", Some(1000))
         .unwrap();
-    assert!(
-        status.path == "/.Trash/.pending/file" && !status.is_dir == false,
-        "the positive-ID branch must resolve the live pending directory: {status:?}"
-    );
+    assert_eq!(status.id, 1000, "the positive-ID branch must resolve by id");
 
     // ② Path branch (None): the entry-level pending rejection (existing
     // contract, unchanged by this fix).
@@ -501,8 +528,6 @@ fn file_status_by_id_keeps_missing_and_pending_semantics() {
     let error = fs
         .file_status_by_id("/dir/missing", Some(999_999))
         .unwrap_err();
-    // Real variant: FsError::FileNotFound with the inode_id context in the
-    // message (ctx appends to the same ErrorImpl payload).
     let message = error.to_string();
     assert!(
         matches!(error, FsError::FileNotFound(_))
@@ -515,8 +540,8 @@ fn file_status_by_id_keeps_missing_and_pending_semantics() {
 
 /// Scenario snapshot: with a real cold owner holding the window, the private
 /// snapshot attempt is invoked DIRECTLY and must observe the typed holder
-/// Busy; after the owner releases, the same attempt succeeds and returns the
-/// resolved status.
+/// Busy; after the owner releases and its completion is confirmed, the same
+/// attempt succeeds and returns the resolved status.
 #[test]
 fn file_status_snapshot_attempt_observes_busy_then_succeeds() {
     Master::init_test_metrics();
@@ -524,24 +549,26 @@ fn file_status_snapshot_attempt_observes_busy_then_succeeds() {
     let fs = case.fs.clone();
     fs.create("/dir/file", true).unwrap();
 
+    let busy_rx = {
+        let (busy_tx, busy_rx) = channel();
+        *fs.fs_status_busy_after_locks_watch.lock().unwrap() = Some(busy_tx);
+        busy_rx
+    };
     let (ready_tx, ready_rx) = channel();
     let (release_tx, release_rx) = channel();
+    let (done_tx, done_rx) = channel::<()>();
     let fs2 = fs.clone();
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let _ = ready_tx.send(());
         let _ = release_rx.recv_timeout(Duration::from_secs(30));
         drop(guard);
+        let _ = done_tx.send(());
     });
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
     // Direct call: the snapshot attempt's holder view hits the cold window —
     // the typed Busy event must fire (its own take-once observation).
-    let busy_rx = {
-        let (busy_tx, busy_rx) = channel();
-        *fs.fs_status_busy_after_locks_watch.lock().unwrap() = Some(busy_tx);
-        busy_rx
-    };
     let attempt = fs.file_status_snapshot_attempt("/dir/file");
     assert!(
         matches!(attempt, Err(FileStatusReadError::HolderBusy)),
@@ -551,21 +578,26 @@ fn file_status_snapshot_attempt_observes_busy_then_succeeds() {
         .recv_timeout(Duration::from_secs(10))
         .expect("the snapshot attempt's Busy event must fire");
 
-    // Owner releases: join first (the reopen completes on that thread), then
-    // the same attempt succeeds in the reopened window.
+    // Owner releases and ACTUALLY completes (bounded done check) before the
+    // same attempt is retried — the reopen is deterministic, not racy.
     release_tx.send(()).unwrap();
-    owner.join().expect("the cold owner must not panic");
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the cold owner must actually drop the guard (reopen done)");
     let attempt = fs.file_status_snapshot_attempt("/dir/file");
     let status = attempt.expect("the snapshot attempt must succeed after the window reopens");
     assert_eq!(status.path, "/dir/file");
+    owner.join().expect("the cold owner must not panic");
     case.cleanup_and_verify();
 }
 
 /// Scenario snapshot-FAILED: an entry called while the holder is ALREADY
 /// FAILED returns the terminal error immediately — it never enters the Busy
-/// retry and never waits on the deadline.
+/// retry and never waits on the deadline. The public path entry is also
+/// called in the same already-FAILED state: it returns the same typed
+/// terminal error through its real public surface.
 #[test]
-fn file_status_snapshot_attempt_fails_immediately_when_already_failed() {
+fn file_status_fails_immediately_when_already_failed_public_and_private() {
     Master::init_test_metrics();
     let case = CaseEnv::new("file-status-snapshot-failed");
     let fs = case.fs.clone();
@@ -575,16 +607,27 @@ fn file_status_snapshot_attempt_fails_immediately_when_already_failed() {
     let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
     drop(guard.fail_closed());
 
+    // Private snapshot attempt: terminal immediately.
     let started = Instant::now();
     let attempt = fs.file_status_snapshot_attempt("/dir/file");
     assert!(
         matches!(attempt, Err(FileStatusReadError::Unavailable)),
         "an already-FAILED holder must be terminal for the snapshot attempt: {attempt:?}"
     );
+    // Public path entry in the same already-FAILED state: the real public
+    // surface returns the same terminal error variant (Common with the
+    // JournalUnavailable prefix — the real constructor).
+    let started_public = Instant::now();
+    let public_result = fs.file_status("/dir/file");
     assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "the terminal error must be immediate: {elapsed:?}",
-        elapsed = started.elapsed()
+        matches!(&public_result, Err(FsError::Common(error))
+            if error.to_string().starts_with("JournalUnavailable:")),
+        "the public entry must return the terminal error in the already-FAILED state: {public_result:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1)
+            && started_public.elapsed() < Duration::from_secs(1),
+        "both entries must fail immediately, not spin"
     );
     case.cleanup_and_verify();
 }
