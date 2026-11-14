@@ -23,4 +23,4 @@ if [[ "$1" == "--version-json" ]] || [[ "$1" == "--version" ]] || [[ "$1" == "-V
   exit $?
 fi
 
-"${BIN_DIR}"/launch-process.sh worker $1
+exec "${BIN_DIR}"/launch-process.sh worker $1

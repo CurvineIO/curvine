@@ -1,0 +1,61 @@
+#
+# Copyright 2025 OPPO.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Template rendered by bin/curvine-systemd.sh install; @...@ placeholders are
+# replaced with the installation paths and the service account.
+#
+# One instance per mount point. The instance name is the escaped mount path:
+#   systemctl enable --now "$(systemd-escape --path --template=curvine-fuse@.service /curvine-fuse)"
+# Extra curvine-fuse options go into CURVINE_FUSE_OPTS through a drop-in
+# (systemctl edit curvine-fuse@<instance>.service).
+
+[Unit]
+Description=Curvine FUSE mount at %f
+Documentation=https://github.com/CurvineIO/curvine/tree/main/build/systemd
+Wants=network-online.target
+# Ordering only: start after the master and worker when they run on this host.
+After=network-online.target curvine-master.service curvine-worker.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@CURVINE_USER@
+Group=@CURVINE_GROUP@
+WorkingDirectory=@CURVINE_HOME@
+Environment=CURVINE_FUSE_OPTS=
+# One mount per unit: cleanup below only knows about %f, not mnt-0, mnt-1, ...
+ExecStart=@CURVINE_HOME@/bin/curvine-fuse.sh run --mnt-path %f --mnt-number 1 $CURVINE_FUSE_OPTS
+# A crashed or killed curvine-fuse leaves a dead mount behind ("Transport
+# endpoint is not connected"), which would make every restart attempt fail.
+# Detach it after each stop; after a clean stop the path is already unmounted
+# and the error is ignored. ExecStopPost= also runs when startup is refused,
+# so only detach when "run" left its marker in the runtime directory, which it
+# does after the mount path passed the checks. A mount that was already there
+# is never touched.
+RuntimeDirectory=curvine-fuse-%i
+ExecStopPost=-+/bin/sh -c '[ -e "$$RUNTIME_DIRECTORY/mount-path-ready" ] && exec /bin/umount -l "$$1"' sh %f
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+LimitNOFILE=1048576
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=curvine-fuse
+
+[Install]
+WantedBy=multi-user.target

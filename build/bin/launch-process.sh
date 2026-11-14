@@ -64,39 +64,41 @@ check() {
   fi
 }
 
+# Resolve the command line of SERVICE_NAME into SERVICE_CMD and the expected
+# process name into SERVICE_PROC. Shared by the background "start" and the
+# foreground "run" actions so both launch exactly the same command.
+resolve_service_cmd() {
+    if [[ "$SERVICE_NAME" = "worker" ]] || [[ "$SERVICE_NAME" = "master" ]] || [[ "$SERVICE_NAME" = "mds" ]] || [[ "$SERVICE_NAME" = "transfer" ]]; then
+      SERVICE_PROC="curvine-server"
+      SERVICE_CMD=("${CURVINE_HOME}/lib/curvine-server" --service "${SERVICE_NAME}" --conf "${CURVINE_CONF_FILE}")
+    elif [[ "$SERVICE_NAME" = "s3-gateway" ]]; then
+      SERVICE_PROC="curvine-s3-gateway"
+      SERVICE_CMD=("${CURVINE_HOME}/lib/curvine-s3-gateway" "${PARAMS[@]}")
+      if ! has_fuse_conf_arg; then
+        SERVICE_CMD+=(--conf "${CURVINE_CONF_FILE}")
+      fi
+    elif [[ "$SERVICE_NAME" = "fuse" ]]; then
+      SERVICE_PROC="curvine-fuse"
+      SERVICE_CMD=("${CURVINE_HOME}/lib/curvine-fuse" "${PARAMS[@]}")
+      if ! has_fuse_conf_arg; then
+        SERVICE_CMD+=(--conf "${CURVINE_CONF_FILE}")
+      fi
+    else
+      echo "Unknown service"
+      exit
+    fi
+}
+
 start() {
     check
+    resolve_service_cmd
 
-    name="unknown"
-    if [[ "$SERVICE_NAME" = "worker" ]] || [[ "$SERVICE_NAME" = "master" ]] || [[ "$SERVICE_NAME" = "mds" ]] || [[ "$SERVICE_NAME" = "transfer" ]]; then
-      name="curvine-server"
-      nohup "${CURVINE_HOME}/lib/curvine-server" \
-      --service ${SERVICE_NAME} \
-      --conf "${CURVINE_CONF_FILE}" \
-      > "${OUT_FILE}" 2>&1 < /dev/null  &
-    elif [[ "$SERVICE_NAME" = "s3-gateway" ]]; then
-       name="curvine-s3-gateway"
-       local gw_args=("${CURVINE_HOME}/lib/curvine-s3-gateway" "${PARAMS[@]}")
-       if ! has_fuse_conf_arg; then
-         gw_args+=(--conf "${CURVINE_CONF_FILE}")
-       fi
-       nohup "${gw_args[@]}" > "${OUT_FILE}" 2>&1 < /dev/null &
-    elif [[ "$SERVICE_NAME" = "fuse" ]]; then
-       name="curvine-fuse"
-       local fuse_args=("${CURVINE_HOME}/lib/curvine-fuse" "${PARAMS[@]}")
-       if ! has_fuse_conf_arg; then
-         fuse_args+=(--conf "${CURVINE_CONF_FILE}")
-       fi
-       nohup "${fuse_args[@]}" > "${OUT_FILE}" 2>&1 < /dev/null &
-    else
-       echo "Unknown service"
-       exit
-    fi
+    nohup "${SERVICE_CMD[@]}" > "${OUT_FILE}" 2>&1 < /dev/null &
 
     NEW_PID=$!
     sleep 3
 
-    if [[ $(ps -p "${NEW_PID}" -o comm=) =~ $name ]]; then
+    if [[ $(ps -p "${NEW_PID}" -o comm=) =~ $SERVICE_PROC ]]; then
         echo "${NEW_PID}" > "${PID_FILE}"
         echo "${SERVICE_NAME} start success, pid=${NEW_PID}"
     else
@@ -106,6 +108,15 @@ start() {
     fi
 
     head "${OUT_FILE}"
+}
+
+# Run the service in the foreground for a supervisor such as systemd.
+# exec replaces this shell, so the supervisor tracks the service process
+# itself, delivers SIGTERM to it directly and receives its output on
+# stdout/stderr. No PID file is written; the supervisor owns the lifecycle.
+run_foreground() {
+    resolve_service_cmd
+    exec "${SERVICE_CMD[@]}"
 }
 
 waitPid() {
@@ -235,6 +246,9 @@ case $1 in
         sleep 1
         start
         ;;
+    "run")
+        run_foreground
+        ;;
     "reload")
         if [[ "$SERVICE_NAME" != "fuse" ]]; then
           echo "reload is only supported for fuse service, ${SERVICE_NAME} does not support reload"
@@ -244,9 +258,9 @@ case $1 in
         ;;
      *)
         if [[ "$SERVICE_NAME" = "fuse" ]]; then
-          echo "Usage: [start|stop|restart|reload]"
+          echo "Usage: [start|stop|restart|reload|run]"
         else
-          echo "Usage: [start|stop|restart]"
+          echo "Usage: [start|stop|restart|run]"
         fi
         ;;
 esac
