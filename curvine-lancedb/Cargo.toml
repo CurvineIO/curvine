@@ -34,7 +34,7 @@ chrono = { workspace = true }
 curvine-client = { workspace = true }
 futures = { workspace = true }
 lance = { version = "4.0.0", default-features = false }
-lance-core = "4.0.0"
+lance-core = "14.0.2"
 lance-io = { version = "14.0.2", default-features = false }
 lance-namespace = "4.0.0"
 lance-table = "8.0.1"
