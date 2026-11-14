@@ -128,19 +128,6 @@ impl InodePath {
         Self::resolve_inner::<T, false, true>(root, path, store, ids, components_len)
     }
 
-    /// Capture directory versions before each traversal step and before the
-    /// caller reads the final directory's children.
-    pub fn resolve_versioned<T: AsRef<str>>(
-        root: Arc<DirNode>,
-        path: T,
-        store: &InodeStore,
-    ) -> CommonResult<Self> {
-        Ok(
-            Self::resolve_inner::<T, true, false>(root, path, store, &[], 0)?
-                .expect("unconditional path resolution always returns a path"),
-        )
-    }
-
     fn resolve_inner<T: AsRef<str>, const TRACK_VERSIONS: bool, const CHECK_IDS: bool>(
         root: Arc<DirNode>,
         path: T,
