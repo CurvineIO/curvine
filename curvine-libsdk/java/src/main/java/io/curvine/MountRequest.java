@@ -87,11 +87,25 @@ public final class MountRequest {
         }
 
         /**
-         * Select replacement-style update semantics for an existing mount.
+         * Select update semantics for an existing mount.
          *
-         * <p>All options in this request, including defaults for options not explicitly set,
-         * are sent to the master and can replace existing mount settings. Include each setting's
-         * current value in the request when it must be preserved.
+         * <p>Only the options set on this builder are sent; every option left unset keeps the
+         * mount's stored value, so an update that touches one setting no longer resets the others
+         * to this builder's defaults. An update also never derives {@link #ttlAction} from
+         * {@link #writeType}: the master keeps the stored write type, so the stored action is the
+         * only one consistent with it. Set the option explicitly to change it.
+         *
+         * <p>Two options are exceptions to that preservation contract:
+         *
+         * <ul>
+         *   <li>{@link #readVerifyUfs(boolean)} is a required proto field, so an update always
+         *       sends it and the master overwrites the stored value; an update that leaves it
+         *       unset sends {@code false} and disables UFS verification on the mount. Pass the
+         *       mount's current value when it must be preserved; #2104 tracks making the field
+         *       optional.
+         *   <li>{@link #writeType(WriteTypeProto)} is also always sent, but the master keeps the
+         *       stored write type, so setting it on an update has no effect.
+         * </ul>
          */
         public Builder update(boolean update) {
             this.update = update;
@@ -166,17 +180,45 @@ public final class MountRequest {
         public MountRequest build() {
             String checkedUfsPath = requireText(ufsPath, "ufsPath");
             String checkedCvPath = requireText(cvPath, "cvPath");
+            return new MountRequest(checkedUfsPath, checkedCvPath, buildOptions());
+        }
+
+        private MountOptionsProto buildOptions() {
             MountOptionsProto.Builder options = MountOptionsProto.newBuilder()
                     .setUpdate(update)
                     .putAllAddProperties(addProperties)
-                    .setTtlMs(ttlMs == null ? DEFAULT_TTL_MS : ttlMs)
-                    .setTtlAction(ttlAction == null ? defaultTtlAction(writeType) : ttlAction)
+                    // `read_verify_ufs` and `write_type` are required proto fields, so they are sent
+                    // on both paths. The master keeps the stored write type on update and ignores
+                    // the requested one; `read_verify_ufs` needs the presence-aware proto change
+                    // tracked by #2104 before an update can stop sending it.
                     .setReadVerifyUfs(readVerifyUfs)
-                    .addAllRemoveProperties(removeProperties)
                     .setWriteType(writeType)
-                    .setAutoCache(autoCache == null || autoCache)
-                    .setAccessMode(accessMode == null
-                            ? AccessModeProto.ACCESS_MODE_PROTO_READ_ONLY : accessMode);
+                    .addAllRemoveProperties(removeProperties);
+
+            if (update) {
+                // An update only sends the options the caller named; `MountInfo::merge_with`
+                // keeps every absent optional field, so an unnamed setting keeps its stored value.
+                if (ttlMs != null) {
+                    options.setTtlMs(ttlMs);
+                }
+                if (ttlAction != null) {
+                    options.setTtlAction(ttlAction);
+                }
+                if (autoCache != null) {
+                    options.setAutoCache(autoCache);
+                }
+                if (accessMode != null) {
+                    options.setAccessMode(accessMode);
+                }
+            } else {
+                // A create still sends the mount defaults so a new mount matches `cv mount`.
+                options.setTtlMs(ttlMs == null ? DEFAULT_TTL_MS : ttlMs)
+                        .setTtlAction(ttlAction == null ? defaultTtlAction(writeType) : ttlAction)
+                        .setAutoCache(autoCache == null || autoCache)
+                        .setAccessMode(accessMode == null
+                                ? AccessModeProto.ACCESS_MODE_PROTO_READ_ONLY : accessMode);
+            }
+
             if (writeCache != null) {
                 options.setWriteCache(writeCache);
             }
@@ -192,7 +234,7 @@ public final class MountRequest {
             if (provider != null) {
                 options.setProvider(provider);
             }
-            return new MountRequest(checkedUfsPath, checkedCvPath, options.build());
+            return options.build();
         }
 
         private static TtlActionProto defaultTtlAction(WriteTypeProto writeType) {
