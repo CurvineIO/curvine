@@ -386,6 +386,28 @@ pub async fn stream_get_object(
     let mut reader = match handlers.fs.open(&cv_path).await {
         Ok(reader) => reader,
         Err(e) => {
+            // A directory marker (`key/`) is an empty object: answer 200 with
+            // an empty body instead of turning a directory into 404. Only this
+            // failure path pays the extra metadata call, so a normal object GET
+            // is unchanged.
+            if let Ok(status) = handlers.fs.get_status(&cv_path).await {
+                if status.is_dir {
+                    let mut response = axum::response::Response::builder().status(200);
+                    for (name, value) in
+                        crate::utils::s3_utils::directory_marker_headers(status.mtime)
+                    {
+                        response = response.header(name, value);
+                    }
+                    return response
+                        .header(
+                            "x-amz-request-id",
+                            crate::utils::s3_utils::generate_request_id(),
+                        )
+                        .header("x-amz-id-2", crate::utils::s3_utils::generate_host_id())
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                }
+            }
             tracing::error!("Failed to open file at path {}: {}", cv_path, e);
             return axum::response::Response::builder()
                 .status(404)
