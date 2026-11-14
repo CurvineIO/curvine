@@ -24,7 +24,7 @@ use curvine_raft::raft::{
 };
 use curvine_raft::rocksdb::DBEngine;
 use curvine_raft::utils::SerdeUtils;
-use curvine_runtime::common::{Logger, Utils};
+use curvine_runtime::common::{LogConf, Logger, Utils};
 use curvine_runtime::runtime::RpcRuntime;
 use prost::Message;
 use raft::eraftpb::Entry;
@@ -160,7 +160,15 @@ fn recovery_process() {
         .unwrap()
         .parse()
         .unwrap();
-    Logger::default();
+    // The parent captures this child's stdout/stderr into process.log, which
+    // the recovery assertions read. Logger::default() writes to `logs/`, so
+    // those assertions would be vacuous; point the child logger at stderr.
+    // The handle must stay alive for the child's lifetime: dropping it drops
+    // the writer's WorkerGuard and discards everything still buffered.
+    let _logger = Logger::new(LogConf {
+        log_dir: Logger::TARGET_STDERR.to_string(),
+        ..Default::default()
+    });
     let rt = conf.create_runtime();
     let log = RocksLogStorage::from_conf(&conf, false);
     let app = DiskApp {

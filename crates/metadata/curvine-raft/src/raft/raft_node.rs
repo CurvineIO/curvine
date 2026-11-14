@@ -273,6 +273,16 @@ where
     pub async fn run(&mut self) {
         let mut promise = HashMap::new();
         if let Err(e) = self.run0(&mut promise).await {
+            // A node quarantined by member recovery must never have published
+            // Ready progress; say so explicitly before the stop below so the
+            // refusal is observable in the node log (an operator needs the
+            // reason, and the recovery contract tests assert this line).
+            if self.recovery.active {
+                warn!(
+                    "refusing to advance Ready for raft_id {} while member recovery is active",
+                    self.id()
+                );
+            }
             if e.is_storage_fatal() {
                 error!(
                     "raft node stop: {}. \
