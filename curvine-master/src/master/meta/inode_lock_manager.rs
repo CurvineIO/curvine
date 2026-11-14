@@ -123,6 +123,16 @@ impl InodeLockManager {
         self.locks.try_read_by_stripe(stripe)
     }
 
+    /// Test-only non-blocking exclusive observation (file_status Busy retry):
+    /// a write lock on the same stripe succeeds only when the parked reader's
+    /// read lock is gone — read/read coexistence would make a read probe
+    /// pass regardless.
+    #[cfg(test)]
+    pub fn try_write_inode(&self, inode_id: i64) -> Option<parking_lot::RwLockWriteGuard<'_, ()>> {
+        let stripe = self.locks.index(inode_id as u64);
+        self.locks.try_write_by_stripe(stripe)
+    }
+
     pub fn lock_many<'a>(&'a self, requests: &[InodeLockRequest]) -> InodeLockSet<'a> {
         let started = std::time::Instant::now();
         let mut stripes: SmallVec<[(usize, InodeLockMode); 8]> = requests

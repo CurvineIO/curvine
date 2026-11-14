@@ -2910,29 +2910,36 @@ impl MasterFilesystem {
             // from the same generation, even when another writer holds a read
             // guard. The holder-view Busy gets the same bounded out-of-lock
             // retry as the path branch (§S4: object-lock free waiting).
-            let deadline = std::time::Instant::now() + DEFAULT_COLD_TIMEOUT;
-            loop {
+            return Self::retry_on_holder_busy(DEFAULT_COLD_TIMEOUT, || {
+                // The holder view is matched typed at this boundary: a cold
+                // window becomes HolderBusy (locks-free retry), FAILED is
+                // terminal, and every other error (business, restore lease,
+                // store) is business — no payload inspection, no is_failed
+                // guessing.
                 let fs_dir = match self.fs_dir.view() {
                     Ok(view) => view,
-                    Err(NamespaceError::Busy) => {
-                        if std::time::Instant::now() >= deadline {
-                            return Err(NamespaceError::Busy.into());
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                        continue;
-                    }
+                    Err(NamespaceError::Busy) => return Err(FileStatusReadError::HolderBusy),
                     Err(NamespaceError::Unavailable) => {
-                        return err_ext!(FsError::journal_unavailable(
-                            "namespace permanently unavailable after failure"
-                        ))
+                        return Err(FileStatusReadError::Unavailable)
                     }
                 };
-                let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
-                let Some(inode) = snapshot.get_inode(id)? else {
-                    return err_ext!(FsError::file_not_found(path).ctx(format!("inode_id={}", id)));
+                let snapshot = InodeStoreSnapshot::new(
+                    fs_dir
+                        .store
+                        .checked_read_snapshot()
+                        .map_err(|e| FileStatusReadError::Business(FsError::from(e)))?,
+                );
+                let Some(inode) = snapshot
+                    .get_inode(id)
+                    .map_err(|e| FileStatusReadError::Business(FsError::from(e)))?
+                else {
+                    return Err(FileStatusReadError::Business(FsError::file_not_found(
+                        &format!("{path} (inode_id={})", id),
+                    )));
                 };
-                return Self::file_status_from_snapshot(&snapshot, path, inode);
-            }
+                Self::file_status_from_snapshot(&snapshot, path, inode)
+                    .map_err(|e| FileStatusReadError::Business(e))
+            });
         }
 
         Self::check_not_pending_path(path)?;
@@ -2959,6 +2966,15 @@ impl MasterFilesystem {
             let fs_dir = match self.fs_dir.view() {
                 Ok(view) => view,
                 Err(NamespaceError::Busy) => {
+                    // Signal-only first-view Busy observation (take-once):
+                    // proves the worker actually reached the holder view and
+                    // hit the cold window, distinct from merely not being
+                    // scheduled yet.
+                    #[cfg(test)]
+                    if let Some(busy) = self.fs_status_busy_after_locks_watch.lock().unwrap().take()
+                    {
+                        let _ = busy.send(());
+                    }
                     return Err(FileStatusReadError::HolderBusy);
                 }
                 Err(NamespaceError::Unavailable) => {
@@ -2995,8 +3011,10 @@ impl MasterFilesystem {
             let fs_dir = match self.fs_dir.view() {
                 Ok(view) => view,
                 Err(NamespaceError::Busy) => {
-                    // The inode locks are dropped when this scope ends — the
-                    // cold window must be waited on outside object locks.
+                    // Release the inode locks BEFORE signaling: the test's
+                    // "locks dropped" event must be true at send time, not
+                    // only at scope exit.
+                    drop(_locks);
                     #[cfg(test)]
                     if let Some(busy) = self.fs_status_busy_after_locks_watch.lock().unwrap().take()
                     {
@@ -3080,9 +3098,27 @@ impl MasterFilesystem {
     }
 
     fn file_status_memory(&self, path: &str) -> FsResult<FileStatus> {
-        let deadline = std::time::Instant::now() + DEFAULT_COLD_TIMEOUT;
+        Self::retry_on_holder_busy(DEFAULT_COLD_TIMEOUT, || {
+            self.file_status_memory_attempt(path)
+        })
+    }
+
+    /// Shared bounded out-of-lock wait for holder-view Busy: retries the
+    /// read attempt every 5ms until the deadline elapses. The deadline is
+    /// computed with `checked_add` so an extreme duration cannot panic; the
+    /// timeout surfaces as the original typed InProgress semantics. Used by
+    /// both the path and the by-ID entry points.
+    fn retry_on_holder_busy<F>(timeout: std::time::Duration, mut attempt: F) -> FsResult<FileStatus>
+    where
+        F: FnMut() -> Result<FileStatus, FileStatusReadError>,
+    {
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        let deadline = match deadline {
+            Some(deadline) => deadline,
+            None => std::time::Instant::now(),
+        };
         loop {
-            match self.file_status_memory_attempt(path) {
+            match attempt() {
                 Ok(status) => return Ok(status),
                 Err(FileStatusReadError::Business(error)) => return Err(error),
                 Err(FileStatusReadError::Unavailable) => {
