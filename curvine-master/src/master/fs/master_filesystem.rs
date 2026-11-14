@@ -738,7 +738,7 @@ impl MasterFilesystem {
 
     /// The global-lock create body, run against an owner-provided namespace
     /// (normal: a self-acquired cold handle; exclusive: the owner borrow).
-    fn create_with_global_lock_body(
+    fn create_cold_body(
         &self,
         fs_dir: &mut FsDir,
         path: &str,
@@ -939,7 +939,7 @@ impl MasterFilesystem {
                 || destination_ids.len() + 1 < destination_components
                 || source_ids.len() < 2
             {
-                // Side-effect-free internal fallback: needs the global lock.
+                // Side-effect-free internal fallback: needs the cold-window owner.
                 return Ok(ShardedOutcome::Fallback);
             }
 
@@ -998,7 +998,7 @@ impl MasterFilesystem {
         }
 
         // Retries exhausted with identity churn: side-effect-free, needs the
-        // global lock.
+        // cold-window owner.
         Ok(ShardedOutcome::Fallback)
     }
 
@@ -1018,7 +1018,7 @@ impl MasterFilesystem {
             };
             if !full {
                 // Side-effect-free planning point: an unresolved path needs
-                // the global lock (exclusive owner body).
+                // the cold-window exclusive owner.
                 return Ok(ShardedOutcome::Fallback);
             }
 
@@ -1059,7 +1059,7 @@ impl MasterFilesystem {
         for _ in 0..MAX_RETRIES {
             let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
             if !full || ids.len() < 2 || inode_id.is_some_and(|id| ids.last() != Some(&id)) {
-                // Side-effect-free planning point: needs the global lock.
+                // Side-effect-free planning point: needs the cold-window owner.
                 return Ok(ShardedOutcome::Fallback);
             }
 
@@ -1119,7 +1119,7 @@ impl MasterFilesystem {
         Ok(ShardedOutcome::Fallback)
     }
 
-    fn complete_file_with_global_lock_body(
+    fn complete_file_cold_body(
         &self,
         fs_dir: &mut FsDir,
         path: &str,
@@ -1199,11 +1199,11 @@ impl MasterFilesystem {
             return Ok(ShardedOutcome::Done(()));
         }
 
-        // Planning point: close needs the global lock.
+        // Planning point: close needs the cold-window owner.
         Ok(ShardedOutcome::Fallback)
     }
 
-    fn close_file_with_global_lock_body(
+    fn close_file_cold_body(
         &self,
         fs_dir: &mut FsDir,
         path: &str,
@@ -1361,7 +1361,7 @@ impl MasterFilesystem {
         Ok(ShardedOutcome::Fallback)
     }
 
-    fn link_with_global_lock_body(&self, fs_dir: &mut FsDir, src: &str, dst: &str) -> FsResult<()> {
+    fn link_cold_body(&self, fs_dir: &mut FsDir, src: &str, dst: &str) -> FsResult<()> {
         let src_path = Self::resolve_path(fs_dir, src)?;
         let dst_path = Self::resolve_path(fs_dir, dst)?;
         Self::check_not_reserved_path(src_path.path())?;
@@ -1454,10 +1454,10 @@ impl MasterFilesystem {
                         return Ok(ShardedOutcome::Done(Some(result)));
                     }
                 }
-                // Planning point: expired delete needs the global lock.
+                // Planning point: expired delete needs the cold-window owner.
                 Ok(ShardedOutcome::Fallback)
             },
-            |fs_dir| self.delete_expired_inode_with_global_lock_body(fs_dir, path, inode_id, mode),
+            |fs_dir| self.delete_expired_inode_cold_body(fs_dir, path, inode_id, mode),
         )?;
         let Some((mut result, inode)) = result else {
             return Ok(None);
@@ -1466,7 +1466,7 @@ impl MasterFilesystem {
         Ok(Some((result, inode)))
     }
 
-    fn delete_expired_inode_with_global_lock_body(
+    fn delete_expired_inode_cold_body(
         &self,
         fs_dir: &mut FsDir,
         path: &str,
@@ -1635,7 +1635,7 @@ impl MasterFilesystem {
                 if !self.master_monitor.is_active() {
                     return Ok(ShardedOutcome::Done(None));
                 }
-                // Planning point: delete needs the global lock.
+                // Planning point: delete needs the cold-window owner.
                 Ok(ShardedOutcome::Fallback)
             },
             |fs_dir| {
@@ -1724,7 +1724,7 @@ impl MasterFilesystem {
                 if !self.master_monitor.is_active() {
                     return Ok(ShardedOutcome::Done(None));
                 }
-                // Planning point: a purge batch needs the global lock.
+                // Planning point: a purge batch needs the cold-window owner.
                 Ok(ShardedOutcome::Fallback)
             },
             |fs_dir| {
@@ -1802,7 +1802,7 @@ impl MasterFilesystem {
                 if !self.master_monitor.is_active() {
                     return Ok(ShardedOutcome::Done(None));
                 }
-                // Planning point: the claim rename needs the global lock.
+                // Planning point: the claim rename needs the cold-window owner.
                 Ok(ShardedOutcome::Fallback)
             },
             |fs_dir| {
@@ -1833,7 +1833,7 @@ impl MasterFilesystem {
     ) -> FsResult<RestoredTrashEntry> {
         let restored = self.run_metadata_write_with_fallback(
             |epoch| {
-                // Planning point: restore needs the global lock.
+                // Planning point: restore needs the cold-window owner.
                 Ok(ShardedOutcome::Fallback)
             },
             |fs_dir| fs_dir.restore_trash(path.as_ref(), dst, overwrite),
@@ -1866,7 +1866,7 @@ impl MasterFilesystem {
         for batch in names.chunks(BATCH_SIZE) {
             staged += self.run_metadata_write_with_fallback(
                 |epoch| {
-                    // Planning point: staging renames need the global lock.
+                    // Planning point: staging renames need the cold-window owner.
                     Ok(ShardedOutcome::Fallback)
                 },
                 |fs_dir| {
@@ -2524,7 +2524,7 @@ impl MasterFilesystem {
                     }
                 }
 
-                // Planning point: this rename needs the global lock.
+                // Planning point: this rename needs the cold-window owner.
                 Ok(ShardedOutcome::Fallback)
             },
             |fs_dir| {
@@ -2608,7 +2608,7 @@ impl MasterFilesystem {
 
         let (status, deleted) = self.run_metadata_write_with_fallback(
             |epoch| {
-                // Plan first: a missing parent needs the global lock — an
+                // Plan first: a missing parent needs the cold-window owner — an
                 // explicit side-effect-free Fallback, not a cold re-entry.
                 let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
                 if ids.len() + 1 < components_len {
@@ -2621,7 +2621,7 @@ impl MasterFilesystem {
                     (ids, components_len, full, restore_epoch),
                 )
             },
-            |fs_dir| self.create_with_global_lock_body(fs_dir, path, opts.clone(), flags),
+            |fs_dir| self.create_cold_body(fs_dir, path, opts.clone(), flags),
         )?;
         if let Some(deleted) = deleted {
             self.worker_manager.write().remove_blocks(&deleted);
@@ -2676,7 +2676,7 @@ impl MasterFilesystem {
                     context: {"path" => path},
                 }
 
-                // Planning point: this open needs the global lock.
+                // Planning point: this open needs the cold-window owner.
                 Ok(ShardedOutcome::Fallback)
             },
             |fs_dir| {
@@ -2839,7 +2839,7 @@ impl MasterFilesystem {
         let path = path.as_ref();
         self.run_metadata_write_with_fallback(
             |_epoch| self.close_file_sharded(path, client_name),
-            |fs_dir| self.close_file_with_global_lock_body(fs_dir, path, client_name),
+            |fs_dir| self.close_file_cold_body(fs_dir, path, client_name),
         )
     }
 
@@ -3412,7 +3412,7 @@ impl MasterFilesystem {
                 )
             },
             |fs_dir| {
-                self.add_block_with_global_lock_body(
+                self.add_block_cold_body(
                     fs_dir,
                     path,
                     inode_id,
@@ -3581,7 +3581,7 @@ impl MasterFilesystem {
         Ok(ShardedOutcome::Fallback)
     }
 
-    fn add_block_with_global_lock_body(
+    fn add_block_cold_body(
         &self,
         fs_dir: &mut FsDir,
         path: &str,
@@ -3708,7 +3708,7 @@ impl MasterFilesystem {
                 )
             },
             |fs_dir| {
-                self.complete_file_with_global_lock_body(
+                self.complete_file_cold_body(
                     fs_dir,
                     path,
                     inode_id,
@@ -5097,7 +5097,7 @@ impl MasterFilesystem {
                         resolved,
                     );
                 }
-                // Planning point: symlink needs the global lock.
+                // Planning point: symlink needs the cold-window owner.
                 Ok(ShardedOutcome::Fallback)
             },
             |fs_dir| {
@@ -5129,10 +5129,10 @@ impl MasterFilesystem {
                     // Same contract as symlink: propagate the helper outcome.
                     return self.link_single_parent_sharded(&src_path, &dst_path, (src, dst));
                 }
-                // Planning point: link needs the global lock.
+                // Planning point: link needs the cold-window owner.
                 Ok(ShardedOutcome::Fallback)
             },
-            |fs_dir| self.link_with_global_lock_body(fs_dir, &src_path, &dst_path),
+            |fs_dir| self.link_cold_body(fs_dir, &src_path, &dst_path),
         )
     }
 
@@ -5166,11 +5166,11 @@ impl MasterFilesystem {
                 {
                     return Ok(ShardedOutcome::Done(result));
                 }
-                // Planning point: resize needs the global lock.
+                // Planning point: resize needs the cold-window owner.
                 Ok(ShardedOutcome::Fallback)
             },
             |fs_dir| {
-                self.resize_with_global_lock_body(fs_dir, path, inode_id, opts.clone(), available)
+                self.resize_cold_body(fs_dir, path, inode_id, opts.clone(), available)
             },
         )?;
 
@@ -5185,7 +5185,7 @@ impl MasterFilesystem {
         Ok(FileBlocks::new(inode.to_file_status(path)?, locs))
     }
 
-    fn resize_with_global_lock_body(
+    fn resize_cold_body(
         &self,
         fs_dir: &mut FsDir,
         path: &str,
@@ -5323,11 +5323,11 @@ impl MasterFilesystem {
                 )? {
                     return Ok(ShardedOutcome::Done(located));
                 }
-                // Planning point: assign needs the global lock.
+                // Planning point: assign needs the cold-window owner.
                 Ok(ShardedOutcome::Fallback)
             },
             |fs_dir| {
-                self.assign_worker_with_global_lock_body(
+                self.assign_worker_cold_body(
                     fs_dir,
                     path,
                     inode_id,
@@ -5339,7 +5339,7 @@ impl MasterFilesystem {
         )
     }
 
-    fn assign_worker_with_global_lock_body(
+    fn assign_worker_cold_body(
         &self,
         fs_dir: &mut FsDir,
         path: &str,
