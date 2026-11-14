@@ -73,6 +73,7 @@ impl MasterFilesystem {
     /// failure_seq honored, snapshot after gate release).
     pub(crate) fn run_metadata_write_with_fallback<R>(
         &self,
+        op: &'static str,
         hot: impl FnOnce(u64) -> FsResult<ShardedOutcome<R>>,
         cold_body: impl FnOnce(&mut FsDir) -> FsResult<R>,
     ) -> FsResult<R> {
@@ -105,6 +106,17 @@ impl MasterFilesystem {
                 Ok(value)
             }
             ShardedOutcome::Fallback => {
+                // S7 §7: count the final typed Fallback decision once per
+                // request (cold event), labelled by the static call-site op.
+                // The metrics registry is absent in pure-unit-test
+                // environments; a missing registry skips the count instead of
+                // constructing one (cold event, not a hot path).
+                if let Some(metrics) = crate::master::MASTER_METRICS.get() {
+                    metrics
+                        .metadata_lock_fallback_total
+                        .with_label_values(&[op])
+                        .inc();
+                }
                 // Normal slot, view and object locks are all released here.
                 self.run_metadata_write_exclusive(epoch, cold_body)
             }
