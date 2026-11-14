@@ -830,9 +830,11 @@ impl FsDir {
             // Do not journal or release blocks when live publication fails:
             // recovery may restore the still-uncommitted journal operation.
             // This can leave orphaned blocks that require recovery cleanup.
-            // IIFE: the fault handler's early `return` must leave this
-            // expression only, not the whole purge function.
-            let removed = (|| {
+            // The produce closure is bound before it is called: the fault
+            // handler's early `return` must leave this step only, not the
+            // whole purge function (an inline IIFE trips the lint while a
+            // plain block would change the return target).
+            let produce = || {
                 crate::fault_point! {
                     sync,
                     name: "master.metadata.purge.before_child_publication",
@@ -841,7 +843,8 @@ impl FsDir {
                     return_error: |fault| Err(fault.message.into()),
                 }
                 parent.delete_child(claim.child_id, &claim.name)
-            })();
+            };
+            let removed = produce();
             self.publish_metadata(removed)?;
         }
 

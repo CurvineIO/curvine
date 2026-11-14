@@ -1780,14 +1780,14 @@ fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
 fn test_filesystem_metadata_restore_with_full_journal_system_reopen() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let test_name = format!("restore-full-{}", Utils::rand_str(6));
-    let hash1 = {
+    let fingerprint1 = {
         let (fs, js) = new_fs_with_journal(true, &test_name)?;
         fs.mkdir("/a", false)?;
         fs.mkdir("/x1/x2/x3", true)?;
-        let hash = fs.sum_hash()?;
+        let fingerprint = tree_fingerprint(&fs)?;
         drop(fs);
         js.shutdown();
-        hash
+        fingerprint
     };
 
     let (fs, js) = reopen_fs_with_journal(false, &test_name)?;
@@ -1795,7 +1795,11 @@ fn test_filesystem_metadata_restore_with_full_journal_system_reopen() -> CommonR
 
     assert!(fs.exists("/a")?);
     assert!(fs.exists("/x1/x2/x3")?);
-    assert_eq!(hash1, fs.sum_hash()?);
+    assert_eq!(
+        fingerprint1,
+        tree_fingerprint(&fs)?,
+        "restored live tree must match the persisted one field by field"
+    );
 
     drop(fs);
     js.shutdown();
