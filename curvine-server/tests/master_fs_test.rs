@@ -77,6 +77,47 @@ fn master_fs_test_serial() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Semantic fingerprint of the whole live tree: path → (id, is_dir, mtime,
+/// atime, nlink, sorted child names). The encoded crc sum cannot be compared
+/// across a live tree and a rebuilt one (their children containers differ),
+/// while every one of these fields must match exactly.
+fn tree_fingerprint(
+    fs: &MasterFilesystem,
+) -> CommonResult<std::collections::BTreeMap<String, (i64, bool, i64, i64, u32, Vec<String>)>> {
+    use std::collections::BTreeMap;
+    fn walk(
+        v: &curvine_master::master::meta::inode::InodeView,
+        path: &str,
+        out: &mut BTreeMap<String, (i64, bool, i64, i64, u32, Vec<String>)>,
+    ) {
+        let mut names: Vec<String> = v.children().iter().map(|c| c.name().to_string()).collect();
+        names.sort();
+        out.insert(
+            path.to_string(),
+            (
+                v.id(),
+                v.is_dir(),
+                v.mtime(),
+                v.atime(),
+                v.nlink().unwrap_or(0),
+                names.clone(),
+            ),
+        );
+        for c in v.children() {
+            let child = if path == "/" {
+                format!("/{}", c.name())
+            } else {
+                format!("{}/{}", path, c.name())
+            };
+            walk(&c, &child, out);
+        }
+    }
+    let view = fs.fs_dir.view()?;
+    let mut out = BTreeMap::new();
+    walk(&view.root_view(), "/", &mut out);
+    Ok(out)
+}
+
 // Use a lightweight filesystem-only setup for tests that do not need the full
 // journal runtime lifecycle.
 fn new_fs(format: bool, name: &str) -> MasterFilesystem {
@@ -1711,13 +1752,13 @@ fn test_rpc_retry_cache_for_idempotent_operations() -> CommonResult<()> {
 fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     // First phase: create metadata and persist to RocksDB
-    let hash1 = {
+    let fingerprint1 = {
         let fs = new_fs(true, "restore");
         fs.mkdir("/a", false)?;
         fs.mkdir("/x1/x2/x3", true)?;
-        let hash = fs.sum_hash()?;
+        let fingerprint = tree_fingerprint(&fs)?;
         drop(fs);
-        hash
+        fingerprint
     }; // Scope ensures all resources are dropped before reopening DB
 
     // Second phase: restore from persisted metadata
@@ -1726,8 +1767,11 @@ fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
 
     assert!(fs.exists("/a")?);
     assert!(fs.exists("/x1/x2/x3")?);
-    let hash2 = fs.sum_hash()?;
-    assert_eq!(hash1, hash2);
+    let fingerprint2 = tree_fingerprint(&fs)?;
+    assert_eq!(
+        fingerprint1, fingerprint2,
+        "restored live tree must match the persisted one field by field"
+    );
 
     Ok(())
 }
