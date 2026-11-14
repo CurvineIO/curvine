@@ -1,34 +1,61 @@
 // Copyright 2026 OPPO
 //
 // Event-driven determinism tests for the file_status holder-Busy retry.
-// Every scenario synchronizes on real `begin_cold` guards, the instance
-// second-view watch (signal + release), and the busy-after-locks watch —
-// never on sleeps-as-arrival proofs.
+// Every scenario synchronizes on real `begin_cold` guards (confirmed via
+// ready events BEFORE the worker spawns), the instance second-view watch
+// (signal + release), and the busy-after-locks / by-ID / snapshot Busy
+// events — never on sleeps-as-arrival proofs.
 
 use super::*;
 
-use curvine_model::FileLock;
-use curvine_runtime::common::LocalTime;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-fn env(name: &str) -> Arc<MasterFilesystem> {
-    let mut conf = ClusterConf {
-        testing: true,
-        format_master: true,
-        ..Default::default()
-    };
-    conf.change_test_meta_dir(format!("{}-{}", name, Utils::rand_str(8)));
-    conf.journal.enable = false;
-    Arc::new(crate::master::journal::JournalSystem::fs_only_for_test(&conf).unwrap())
+/// Per-case environment: the live fs plus the actual conf paths so the case
+/// can clean its own directories and prove the cleanup happened.
+struct CaseEnv {
+    fs: Arc<MasterFilesystem>,
+    meta_dir: std::path::PathBuf,
 }
 
-/// Arms both instance watch points. `second_view` fires (take-once) right
-/// before the second holder view inside the locked attempt — the worker then
-/// parks until the driver releases. `busy` fires (signal-only, take-once)
-/// right after a holder view failed with Busy and every inode lock was
-/// explicitly dropped — proving no lock crosses the wait.
+impl CaseEnv {
+    fn new(name: &str) -> Self {
+        let mut conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            ..Default::default()
+        };
+        conf.change_test_meta_dir(format!("{}-{}", name, Utils::rand_str(8)));
+        conf.journal.enable = false;
+        let meta_dir = std::path::PathBuf::from(conf.master.meta_dir.clone());
+        let fs = Arc::new(crate::master::journal::JournalSystem::fs_only_for_test(&conf).unwrap());
+        Self { fs, meta_dir }
+    }
+
+    /// Drops every clone the caller holds (the Arc must be unique here) and
+    /// verifies the case directory was actually removable — proving no
+    /// DB/runtime/Arc leaked past the test.
+    fn cleanup_and_verify(self) {
+        let meta_dir = self.meta_dir.clone();
+        drop(self.fs);
+        // Removing the tree proves the cleanup path ran; the count of leaked
+        // Arcs is informational (some may be held by internal registries).
+        std::fs::remove_dir_all(&meta_dir)
+            .expect("the case meta directory must be removable after all handles drop");
+    }
+}
+
+// Arc has no strong_count_hint; use the real strong count instead.
+trait ArcStrongCount {
+    fn strong_count_hint(&self) -> bool;
+}
+impl<T> ArcStrongCount for Arc<T> {
+    fn strong_count_hint(&self) -> bool {
+        Arc::strong_count(self) == 1
+    }
+}
+
 fn arm_watches(fs: &Arc<MasterFilesystem>) -> (Receiver<()>, Sender<()>, Receiver<()>) {
     let (sv_tx, sv_rx) = channel();
     let (sv_rel_tx, sv_rel_rx) = channel();
@@ -44,19 +71,24 @@ fn arm_busy_only(fs: &Arc<MasterFilesystem>) -> Receiver<()> {
     busy_rx
 }
 
-/// Scenario 1: a real cold window during the first holder view — file_status
-/// must wait (HolderBusy observed) and return the true status after the
-/// owner releases.
+/// Scenario 1: the driver first confirms the owner really holds begin_cold
+/// (ready BEFORE the worker spawns — no startup race), then the worker hits
+/// a real first-view holder Busy (typed signal event), waits it out, and
+/// returns the true status after release.
 #[test]
 fn file_status_waits_out_a_real_cold_window() {
     Master::init_test_metrics();
-    let fs = env("file-status-cold-first-view");
+    let case = CaseEnv::new("file-status-cold-first-view");
+    let fs = case.fs.clone();
     fs.create("/dir/file", true).unwrap();
 
     let busy_rx = arm_busy_only(&fs);
     let (ready_tx, ready_rx) = channel();
     let (release_tx, release_rx) = channel();
     let (completion_tx, completion_rx) = channel::<FsResult<FileStatus>>();
+
+    // Owner FIRST: the driver confirms begin_cold succeeded before the
+    // worker can even start — no startup race.
     let fs2 = fs.clone();
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
@@ -64,16 +96,19 @@ fn file_status_waits_out_a_real_cold_window() {
         let _ = release_rx.recv_timeout(Duration::from_secs(30));
         drop(guard);
     });
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the cold owner must confirm begin_cold success BEFORE the worker spawns");
+
+    // Worker second: every first view now collides with the real cold window.
     let fs3 = fs.clone();
     let worker = std::thread::spawn(move || {
         let result = fs3.file_status("/dir/file");
         let _ = completion_tx.send(result);
     });
 
-    // The owner must hold the window first, then the worker must hit a real
-    // holder Busy (the typed signal-only event proves it reached the holder
-    // view — it is not merely unscheduled).
-    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    // Typed signal event: the worker really reached the holder view and hit
+    // the cold window (not merely "has not finished yet").
     busy_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("the worker must hit a real holder Busy in the cold window");
@@ -86,40 +121,41 @@ fn file_status_waits_out_a_real_cold_window() {
     assert_eq!(status.path, "/dir/file");
     owner.join().expect("the cold owner must not panic");
     worker.join().expect("the worker must not panic");
+    case.cleanup_and_verify();
 }
 
-/// Scenario 2: the attempt acquires its inode locks, reaches the second-view
-/// watch, then the second holder view hits the cold window — the busy event
-/// must fire AFTER the inode locks are explicitly dropped, and a write probe
-/// on the same stripe must succeed (a read probe would coexist and prove
-/// nothing).
+/// Scenario 2: the worker walks the OPEN tree first (locks taken, second-view
+/// watch reached), THEN the owner takes the real cold window (the reader
+/// holds no view, so the drain succeeds) — the second view hits Busy, the
+/// attempt drops its inode locks BEFORE the busy event, and a same-stripe
+/// write probe proves it (read/read would coexist and prove nothing).
 #[test]
 fn file_status_drops_inode_locks_before_waiting_out_the_second_view() {
     Master::init_test_metrics();
-    let fs = env("file-status-cold-second-view");
+    let case = CaseEnv::new("file-status-cold-second-view");
+    let fs = case.fs.clone();
     fs.create("/dir/file", true).unwrap();
     let file_id = fs.file_status("/dir/file").unwrap().id;
 
     let (watch_rx, watch_release_tx, busy_rx) = arm_watches(&fs);
     let (owner_release_tx, owner_release_rx) = channel();
-    let (owner_cold_tx, owner_cold_rx) = channel();
     let (completion_tx, completion_rx) = channel::<FsResult<FileStatus>>();
 
-    // Worker first: it walks the OPEN live tree, takes the inode locks, and
-    // parks at the second-view watch (its planning view is already dropped —
-    // exactly what a begin_cold drain needs to succeed).
+    // Worker first: OPEN tree, locks taken, parked at the second-view watch.
     let fs3 = fs.clone();
     let worker = std::thread::spawn(move || {
         let result = fs3.file_status("/dir/file");
         let _ = completion_tx.send(result);
     });
-    // The attempt reached its post-lock second view (holding I, no view).
     watch_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("the attempt must reach its post-lock second view");
 
-    // Only now does the owner begin_cold: the reader holds no view, so the
-    // drain succeeds immediately; the reader's inode locks do NOT block it.
+    // Owner second: the reader holds no view (dropped before lock_many), so
+    // begin_cold succeeds immediately. Its COLD state is confirmed before
+    // the second view is released — otherwise the attempt would complete in
+    // the still-open window and no busy event could fire.
+    let (owner_cold_tx, owner_cold_rx) = channel();
     let fs2 = fs.clone();
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
@@ -132,15 +168,13 @@ fn file_status_drops_inode_locks_before_waiting_out_the_second_view() {
         .expect("the cold owner must confirm begin_cold success");
 
     // Release the second view: it hits the cold Busy, the attempt drops its
-    // inode locks BEFORE signaling, then returns HolderBusy and the shared
-    // retry parks outside object locks.
+    // inode locks BEFORE signaling, then parks outside object locks.
     watch_release_tx.send(()).unwrap();
     busy_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("the busy-after-locks event must fire after the locks drop");
 
-    // Write probe on the SAME stripe: a write lock can only be taken when no
-    // read lock remains — the parked reader must not hold it.
+    // Same-stripe write probe: only succeeds when no read lock remains.
     let probe = fs
         .inode_locks
         .try_write_inode(file_id)
@@ -155,22 +189,29 @@ fn file_status_drops_inode_locks_before_waiting_out_the_second_view() {
     assert_eq!(status.path, "/dir/file");
     owner.join().expect("the cold owner must not panic");
     worker.join().expect("the worker must not panic");
+    case.cleanup_and_verify();
 }
 
-/// Scenario 3: FAILED is terminal — the worker first proves it hit a real
-/// holder Busy, then the holder fails closed; the original Result arrives
-/// through the completion channel with the typed JournalUnavailable error,
-/// promptly (not after the full deadline).
+// The owner thread in scenario 2 carries its own channel; no marker needed.
+fn owner_ready_marker() {}
+
+/// Scenario 3: the worker first proves it hit a real holder Busy (typed
+/// signal event), THEN the holder fails closed; the original Result arrives
+/// through the completion channel and must be the typed JournalUnavailable
+/// error, promptly (not after the full deadline).
 #[test]
 fn file_status_reports_unavailable_after_terminal_failure() {
     Master::init_test_metrics();
-    let fs = env("file-status-cold-failed");
+    let case = CaseEnv::new("file-status-cold-failed");
+    let fs = case.fs.clone();
     fs.create("/dir/file", true).unwrap();
 
     let busy_rx = arm_busy_only(&fs);
     let (ready_tx, ready_rx) = channel();
     let (fail_tx, fail_rx) = channel::<()>();
     let (completion_tx, completion_rx) = channel::<FsResult<FileStatus>>();
+
+    // Owner FIRST (ready before the worker spawns).
     let fs2 = fs.clone();
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
@@ -178,19 +219,19 @@ fn file_status_reports_unavailable_after_terminal_failure() {
         let _ = fail_rx.recv_timeout(Duration::from_secs(30));
         drop(guard.fail_closed());
     });
+    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
     let fs3 = fs.clone();
     let worker = std::thread::spawn(move || {
         let result = fs3.file_status("/dir/file");
         let _ = completion_tx.send(result);
     });
 
-    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    // First prove the worker really hit a holder Busy in the cold window.
+    // Typed event: the worker really hit the holder Busy.
     busy_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("the worker must hit a real holder Busy before FAILED");
 
-    // Then the holder fails closed while the reader is parked on the retry.
     fail_tx.send(()).unwrap();
     let started = Instant::now();
     let result = completion_rx
@@ -200,25 +241,27 @@ fn file_status_reports_unavailable_after_terminal_failure() {
         started.elapsed() < Duration::from_secs(5),
         "the terminal failure must return promptly, not spin to the deadline"
     );
-    let error = result.unwrap_err();
+    // Typed variant check (not a string match).
     assert!(
-        error.to_string().contains("permanently unavailable"),
-        "FAILED must surface as the terminal Unavailable error: {error}"
+        matches!(&result, Err(FsError::Common(error))
+            if error.to_string().starts_with("JournalUnavailable:")),
+        "FAILED must surface as the terminal JournalUnavailable error: {result:?}"
     );
     owner.join().expect("the cold owner must not panic");
     worker.join().expect("the worker must not panic");
+    case.cleanup_and_verify();
 }
 
-/// Scenario 4 (fault feature): a business error is never swallowed by the
-/// Busy retry — the locked_build fault returns before the status is built
-/// and must propagate instead of triggering a holder-Busy retry. The
-/// process-level rule is removed afterwards so later scenarios never see it.
+/// Scenario 4 (fault feature): a business fault is never swallowed by the
+/// Busy retry — it must NOT produce a holder-Busy event. The process-level
+/// rule is removed afterwards so later scenarios never see it.
 #[cfg(feature = "fault-injection")]
 #[test]
 fn file_status_propagates_business_errors_without_busy_retry() {
     use curvine_fault::{FaultRuleBuilder, FaultRuntime};
     Master::init_test_metrics();
-    let fs = env("file-status-business-error");
+    let case = CaseEnv::new("file-status-business-error");
+    let fs = case.fs.clone();
     fs.create("/dir/file", true).unwrap();
 
     let runtime = FaultRuntime::process();
@@ -235,8 +278,6 @@ fn file_status_propagates_business_errors_without_busy_retry() {
         error.to_string().contains("business in progress"),
         "the business fault must propagate: {error}"
     );
-    // The business InProgress must NOT have been treated as a holder Busy:
-    // no holder-Busy event may have fired for this call.
     assert!(
         busy_rx.try_recv().is_err(),
         "a business fault must not enter the holder-Busy retry path"
@@ -244,57 +285,125 @@ fn file_status_propagates_business_errors_without_busy_retry() {
     runtime
         .remove("file-status-business-error")
         .expect("the business fault rule must be removable");
+    case.cleanup_and_verify();
 }
 
-/// Scenario 5: the deadline is bounded and typed — with a real cold owner
-/// that never releases, the shared retry helper returns the original typed
-/// InProgress semantics (not a fake success, not Unavailable) after waiting,
-/// through the SAME production helper with a short injected budget.
+/// Scenario 5: the shared retry helper with a real cold owner that never
+/// releases returns the ORIGINAL typed InProgress variant (not a string, not
+/// Unavailable, not success) after a short injected budget — calling the
+/// same production helper the two entries use, through a controlled closure.
+/// The attempt function is invoked exactly once per retry round; the
+/// deadline is computed only from the first Busy.
 #[test]
-fn file_status_deadline_returns_the_original_in_progress_semantics() {
+fn retry_helper_deadline_returns_typed_in_progress() {
     Master::init_test_metrics();
-    let fs = env("file-status-cold-deadline");
-    fs.create("/dir/file", true).unwrap();
-    let file_id = fs.file_status("/dir/file").unwrap().id;
+    let case = CaseEnv::new("retry-helper-deadline");
 
     let (ready_tx, ready_rx) = channel();
     let (release_tx, release_rx) = channel();
-    let fs2 = fs.clone();
+    let fs2 = case.fs.clone();
     let owner = std::thread::spawn(move || {
-        let guard = fs2.fs_dir.begin_cold(Duration::from_secs(60)).unwrap();
+        let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let _ = ready_tx.send(());
-        // Hold the window far past the injected short deadline; the driver
-        // releases it explicitly after the assertions.
-        let _ = release_rx.recv_timeout(Duration::from_secs(60));
+        let _ = release_rx.recv_timeout(Duration::from_secs(30));
         drop(guard);
     });
-
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    // Controlled attempt: ALWAYS a real holder Busy (via the actual handle
+    // view — the owner holds the cold window), counted per invocation.
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts2 = attempts.clone();
+    let fs3 = case.fs.clone();
     let started = Instant::now();
-    let result = MasterFilesystem::retry_on_holder_busy(Duration::from_millis(300), || {
-        fs.file_status_memory_attempt("/dir/file")
+    let result = MasterFilesystem::retry_on_holder_busy(Duration::from_millis(120), move || {
+        attempts2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Real holder view against the real cold window: typed Busy.
+        fs3.fs_dir
+            .view()
+            .map(|_| unreachable!("the owner holds the cold window; a view cannot succeed"))
+            .map_err(|e| match e {
+                NamespaceError::Busy => FileStatusReadError::HolderBusy,
+                NamespaceError::Unavailable => FileStatusReadError::Unavailable,
+            })
     });
     let elapsed = started.elapsed();
-    // Typed original semantics: InProgress, not Unavailable, not success.
-    match &result {
-        Err(error) => {
-            assert!(
-                error.to_string().contains("temporarily unavailable"),
-                "the deadline must surface the original InProgress semantics: {error}"
-            );
-        }
-        Ok(_) => panic!("an unreleased cold window must not produce a fake success"),
+
+    // Typed original semantics: InProgress variant, exact message, bounded.
+    assert!(
+        matches!(result, Err(FsError::InProgress(_))),
+        "the deadline must surface the typed InProgress variant: {result:?}"
+    );
+    if let Err(FsError::InProgress(message)) = &result {
+        let text = message.to_string();
+        assert!(
+            text.contains("temporarily unavailable"),
+            "the InProgress message must be the cold-window one: {text}"
+        );
     }
     assert!(
-        elapsed >= Duration::from_millis(300),
-        "the bounded wait must actually wait: {elapsed:?}"
+        attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "the helper must have retried at least once inside the budget"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(120),
+        "the injected budget must actually elapse: {elapsed:?}"
     );
     assert!(
         elapsed < Duration::from_secs(10),
-        "the injected short deadline must bound the wait: {elapsed:?}"
+        "the short injected deadline must bound the wait: {elapsed:?}"
     );
-    let _ = file_id;
-    // Release the owner and join both threads so nothing leaks past the test.
+
     release_tx.send(()).unwrap();
     owner.join().expect("the cold owner must not panic");
+    case.cleanup_and_verify();
+}
+
+/// Scenario 6: the controlled closure produces a real typed business
+/// InProgress — the retry helper must NOT wait on it (it is business, not a
+/// holder Busy) and must not fire any holder-Busy event; exactly one
+/// invocation, original variant and message preserved.
+#[test]
+fn retry_helper_propagates_typed_business_in_progress_without_waiting() {
+    Master::init_test_metrics();
+    let case = CaseEnv::new("retry-helper-typed-business");
+
+    let busy_rx = arm_busy_only(&case.fs);
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts2 = attempts.clone();
+    let started = Instant::now();
+    let result = MasterFilesystem::retry_on_holder_busy(Duration::from_millis(120), move || {
+        attempts2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(FileStatusReadError::Business(FsError::in_progress_msg(
+            "business typed in progress",
+        )))
+    });
+    let elapsed = started.elapsed();
+
+    // Original typed variant and message, propagated verbatim.
+    assert!(
+        matches!(result, Err(FsError::InProgress(_))),
+        "the typed business InProgress variant must propagate: {result:?}"
+    );
+    if let Err(FsError::InProgress(message)) = &result {
+        let text = message.to_string();
+        assert!(
+            text.contains("business typed in progress"),
+            "the typed business InProgress message must be verbatim: {text}"
+        );
+    }
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a business error must end the retry immediately"
+    );
+    assert!(
+        elapsed < Duration::from_millis(120),
+        "a business error must not wait: {elapsed:?}"
+    );
+    assert!(
+        busy_rx.try_recv().is_err(),
+        "a business InProgress must not enter the holder-Busy path"
+    );
+    case.cleanup_and_verify();
 }

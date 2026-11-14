@@ -2918,7 +2918,16 @@ impl MasterFilesystem {
                 // guessing.
                 let fs_dir = match self.fs_dir.view() {
                     Ok(view) => view,
-                    Err(NamespaceError::Busy) => return Err(FileStatusReadError::HolderBusy),
+                    Err(err @ NamespaceError::Busy) => {
+                        #[cfg(test)]
+                        if let Some(busy) =
+                            self.fs_status_busy_after_locks_watch.lock().unwrap().take()
+                        {
+                            let _ = busy.send(());
+                        }
+                        let _ = err;
+                        return Err(FileStatusReadError::HolderBusy);
+                    }
                     Err(NamespaceError::Unavailable) => {
                         return Err(FileStatusReadError::Unavailable)
                     }
@@ -2972,8 +2981,10 @@ impl MasterFilesystem {
                     // hit the cold window, distinct from merely not being
                     // scheduled yet.
                     #[cfg(test)]
-                    if let Some(busy) = self.fs_status_busy_after_locks_watch.lock().unwrap().take()
-                    {
+                    let first_view_busy =
+                        self.fs_status_busy_after_locks_watch.lock().unwrap().take();
+                    #[cfg(test)]
+                    if let Some(busy) = first_view_busy {
                         let _ = busy.send(());
                     }
                     return Err(FileStatusReadError::HolderBusy);
@@ -2998,9 +3009,9 @@ impl MasterFilesystem {
             drop(fs_dir);
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
             #[cfg(test)]
-            if let Some((reached, release)) =
-                self.fs_status_second_view_watch.lock().unwrap().take()
-            {
+            let second_view_event = self.fs_status_second_view_watch.lock().unwrap().take();
+            #[cfg(test)]
+            if let Some((reached, release)) = second_view_event {
                 // Mutex released before signaling; this thread then waits
                 // (outside any driver-owned lock? NO — it holds _locks) for
                 // the driver's bounded release. The driver-side proof of the
@@ -3017,8 +3028,10 @@ impl MasterFilesystem {
                     // only at scope exit.
                     drop(_locks);
                     #[cfg(test)]
-                    if let Some(busy) = self.fs_status_busy_after_locks_watch.lock().unwrap().take()
-                    {
+                    let busy_after_locks =
+                        self.fs_status_busy_after_locks_watch.lock().unwrap().take();
+                    #[cfg(test)]
+                    if let Some(busy) = busy_after_locks {
                         let _ = busy.send(());
                     }
                     return Err(FileStatusReadError::HolderBusy);
@@ -3106,18 +3119,18 @@ impl MasterFilesystem {
 
     /// Shared bounded out-of-lock wait for holder-view Busy: retries the
     /// read attempt every 5ms until the deadline elapses. The deadline is
-    /// computed with `checked_add` so an extreme duration cannot panic; the
-    /// timeout surfaces as the original typed InProgress semantics. Used by
-    /// both the path and the by-ID entry points.
+    /// only computed (with `checked_add`, so an extreme duration cannot
+    /// panic) after the FIRST real holder Busy — a conflict-free read keeps
+    /// the original no-extra-timer hot path. The timeout surfaces as the
+    /// original typed InProgress semantics. Used by both the path and the
+    /// by-ID entry points.
     fn retry_on_holder_busy<F>(timeout: std::time::Duration, mut attempt: F) -> FsResult<FileStatus>
     where
         F: FnMut() -> Result<FileStatus, FileStatusReadError>,
     {
-        let deadline = std::time::Instant::now().checked_add(timeout);
-        let deadline = match deadline {
-            Some(deadline) => deadline,
-            None => std::time::Instant::now(),
-        };
+        // None until the first real holder Busy: conflict-free reads never
+        // touch the clock, matching the original hot-path design.
+        let mut deadline: Option<std::time::Instant> = None;
         loop {
             match attempt() {
                 Ok(status) => return Ok(status),
@@ -3132,12 +3145,18 @@ impl MasterFilesystem {
                     // be opened by any concurrent cold_acquire_wait consumer
                     // (glob list_status etc.). Unavailable is terminal and
                     // was already reported inside the attempt.
+                    let deadline = *deadline.get_or_insert_with(|| {
+                        std::time::Instant::now()
+                            .checked_add(timeout)
+                            .unwrap_or_else(std::time::Instant::now)
+                    });
                     if std::time::Instant::now() >= deadline {
                         return err_ext!(FsError::in_progress_msg(
                             "namespace is temporarily unavailable (cold window)"
                         ));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    std::thread::sleep(std::time::Duration::from_millis(5).min(remaining));
                 }
             }
         }
@@ -3147,8 +3166,16 @@ impl MasterFilesystem {
     /// directory attributes together. Also the safe reader while the restore
     /// flag is set, mirroring the old hot-path semantics.
     fn file_status_snapshot_attempt(&self, path: &str) -> Result<FileStatus, FileStatusReadError> {
+        #[cfg(test)]
+        let snapshot_busy_event = self.fs_status_busy_after_locks_watch.lock().unwrap().take();
         let fs_dir = self.fs_dir.view().map_err(|e| match e {
-            NamespaceError::Busy => FileStatusReadError::HolderBusy,
+            NamespaceError::Busy => {
+                #[cfg(test)]
+                if let Some(busy) = snapshot_busy_event {
+                    let _ = busy.send(());
+                }
+                FileStatusReadError::HolderBusy
+            }
             NamespaceError::Unavailable => FileStatusReadError::Unavailable,
         })?;
         let snapshot = InodeStoreSnapshot::new(
