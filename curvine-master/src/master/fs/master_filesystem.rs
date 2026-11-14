@@ -18,8 +18,8 @@ use crate::master::fs::full_block_report::{
 };
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
-use crate::master::meta::fs_dir_handle::MetadataConfirmation;
 use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
+use crate::master::meta::fs_dir_handle::{MetadataConfirmation, NamespaceError};
 use crate::master::meta::inode::{
     ChildEdge, InodeDir, InodeEntry, InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR,
     ROOT_INODE_ID, ROOT_INODE_NAME,
@@ -203,6 +203,23 @@ struct FullBlockReconcileJob {
 const FULL_BLOCK_RECONCILE_THREADS: usize = 2;
 const FULL_BLOCK_RECONCILE_QUEUE_SIZE: usize = 128;
 const WORKER_LOCATION_LOCK_STRIPES: usize = 256;
+
+/// Error of one file_status read attempt. `HolderBusy` means a holder view
+/// saw the cold window (typed `NamespaceError::Busy` — every guard/lock is
+/// already dropped on return, so the caller may wait outside object locks);
+/// `Unavailable` is the terminal holder state; anything else is a business
+/// error converted from `FsError`.
+enum FileStatusReadError {
+    HolderBusy,
+    Unavailable,
+    Business(FsError),
+}
+
+impl From<FsError> for FileStatusReadError {
+    fn from(e: FsError) -> Self {
+        Self::Business(e)
+    }
+}
 
 impl MasterFilesystem {
     // Max block-report location updates applied under one namespace guard.
@@ -2870,13 +2887,32 @@ impl MasterFilesystem {
         let path = path.as_ref();
         if let Some(id) = inode_id.filter(|id| *id > 0) {
             // Directory inode fields and its separate attributes must come
-            // from the same generation, even when another writer holds a read guard.
-            let fs_dir = self.fs_dir.view()?;
-            let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
-            let Some(inode) = snapshot.get_inode(id)? else {
-                return err_ext!(FsError::file_not_found(path).ctx(format!("inode_id={}", id)));
-            };
-            return Self::file_status_from_snapshot(&snapshot, path, inode);
+            // from the same generation, even when another writer holds a read
+            // guard. The holder-view Busy gets the same bounded out-of-lock
+            // retry as the path branch (§S4: object-lock free waiting).
+            let deadline = std::time::Instant::now() + DEFAULT_COLD_TIMEOUT;
+            loop {
+                let fs_dir = match self.fs_dir.view() {
+                    Ok(view) => view,
+                    Err(NamespaceError::Busy) => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(NamespaceError::Busy.into());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(NamespaceError::Unavailable) => {
+                        return err_ext!(FsError::journal_unavailable(
+                            "namespace permanently unavailable after failure"
+                        ))
+                    }
+                };
+                let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+                let Some(inode) = snapshot.get_inode(id)? else {
+                    return err_ext!(FsError::file_not_found(path).ctx(format!("inode_id={}", id)));
+                };
+                return Self::file_status_from_snapshot(&snapshot, path, inode);
+            }
         }
 
         Self::check_not_pending_path(path)?;
@@ -2894,39 +2930,68 @@ impl MasterFilesystem {
     /// one batch, identity is re-verified under them, and the status is
     /// built inside the same locked window: a writer that mutates any read
     /// inode holds its write lock first, so meta and attributes cannot tear.
-    fn file_status_memory(&self, path: &str) -> FsResult<FileStatus> {
+    /// One attempt of the locked live-tree file_status read. `HolderBusy`
+    /// means a holder view saw the cold window (typed, from `view_typed`) —
+    /// every guard/lock is already dropped on return, so the caller may wait
+    /// outside object locks. Business errors travel inside `Done`.
+    fn file_status_memory_attempt(&self, path: &str) -> Result<FileStatus, FileStatusReadError> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
-            let fs_dir = self.fs_dir.view()?;
+            let fs_dir = match self.fs_dir.view() {
+                Ok(view) => view,
+                Err(NamespaceError::Busy) => {
+                    return Err(FileStatusReadError::HolderBusy);
+                }
+                Err(NamespaceError::Unavailable) => {
+                    return Err(FileStatusReadError::Unavailable);
+                }
+            };
             // Reads stay available while the restore flag is set: the
             // snapshot protocol is the pre-S4 safe reader in that window.
             let plan_epoch = match Self::checked_live_epoch(&fs_dir) {
                 Ok(epoch) => epoch,
                 Err(_) => {
                     drop(fs_dir);
-                    return self.file_status_snapshot(path);
+                    return self.file_status_snapshot_attempt(path);
                 }
             };
-            let plan = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
+            let plan = match Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default()) {
+                Ok(plan) => plan,
+                Err(error) => return Err(error.into()),
+            };
             drop(fs_dir);
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
-            let fs_dir = self.fs_dir.view()?;
+            let fs_dir = match self.fs_dir.view() {
+                Ok(view) => view,
+                Err(NamespaceError::Busy) => {
+                    // The inode locks are dropped when this scope ends — the
+                    // cold window must be waited on outside object locks.
+                    return Err(FileStatusReadError::HolderBusy);
+                }
+                Err(NamespaceError::Unavailable) => {
+                    return Err(FileStatusReadError::Unavailable);
+                }
+            };
             let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
                 Ok(epoch) => epoch,
                 Err(_) => {
                     drop(_locks);
                     drop(fs_dir);
-                    return self.file_status_snapshot(path);
+                    return self.file_status_snapshot_attempt(path);
                 }
             };
             if locked_epoch != plan_epoch {
                 continue;
             }
-            let verified = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
+            let verified =
+                match Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default()) {
+                    Ok(verified) => verified,
+                    Err(error) => return Err(error.into()),
+                };
             if !plan.matches(&verified) {
                 continue;
             }
             if !verified.full {
-                return err_ext!(FsError::file_not_found(path));
+                return Err(FsError::file_not_found(path).into());
             }
             #[cfg(test)]
             crate::fault_point! {
@@ -2934,7 +2999,7 @@ impl MasterFilesystem {
                 name: "master.metadata.file_status.locked_build",
                 description: "Inside the locked window before the status is built",
                 context: {"path" => path},
-                return_error: |fault| Err(fault.message.into()),
+                return_error: |fault| Err(FileStatusReadError::Business(FsError::from(fault.message))),
             }
             #[cfg(test)]
             memory_read_gates::park(
@@ -2946,36 +3011,86 @@ impl MasterFilesystem {
                 // set_attr holds the write lock, so meta and attributes read
                 // one consistent generation.
                 Some(ChildEdge::Dir(node)) => {
-                    InodeDir::from_dir_node_live(verified.target_name.clone(), node)
-                        .to_file_status(path)?
+                    match InodeDir::from_dir_node_live(verified.target_name.clone(), node)
+                        .to_file_status(path)
+                        .map_err(|e| FsError::from(e))
+                    {
+                        Ok(status) => status,
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 Some(ChildEdge::FileId(id)) => {
-                    let inode = fs_dir
+                    let inode = match fs_dir
                         .store
-                        .get_inode(id, Some(&verified.target_name))?
-                        .ok_or_else(|| FsError::file_not_found(path))?;
-                    inode.to_file_status(path)?
+                        .get_inode(id, Some(&verified.target_name))
+                        .map_err(|e| FsError::from(e))
+                    {
+                        Ok(Some(inode)) => inode,
+                        Ok(None) => return Err(FsError::file_not_found(path).into()),
+                        Err(error) => return Err(error.into()),
+                    };
+                    match inode.to_file_status(path).map_err(|e| FsError::from(e)) {
+                        Ok(status) => status,
+                        Err(error) => return Err(error.into()),
+                    }
                 }
-                None => return err_ext!(FsError::file_not_found(path)),
+                None => return Err(FsError::file_not_found(path).into()),
             };
             return Ok(status);
         }
         // Contention fallback: the pre-S4 snapshot read.
-        self.file_status_snapshot(path)
+        self.file_status_snapshot_attempt(path)
+    }
+
+    fn file_status_memory(&self, path: &str) -> FsResult<FileStatus> {
+        let deadline = std::time::Instant::now() + DEFAULT_COLD_TIMEOUT;
+        loop {
+            match self.file_status_memory_attempt(path) {
+                Ok(status) => return Ok(status),
+                Err(FileStatusReadError::Business(error)) => return Err(error),
+                Err(FileStatusReadError::Unavailable) => {
+                    return err_ext!(FsError::journal_unavailable(
+                        "namespace permanently unavailable after failure"
+                    ))
+                }
+                Err(FileStatusReadError::HolderBusy) => {
+                    // Bounded wait outside object locks: the cold window may
+                    // be opened by any concurrent cold_acquire_wait consumer
+                    // (glob list_status etc.). Unavailable is terminal and
+                    // was already reported inside the attempt.
+                    if std::time::Instant::now() >= deadline {
+                        return err_ext!(FsError::in_progress_msg(
+                            "namespace is temporarily unavailable (cold window)"
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
     }
 
     /// Pre-S4 status read: one store snapshot decides edges, inode rows and
     /// directory attributes together. Also the safe reader while the restore
     /// flag is set, mirroring the old hot-path semantics.
-    fn file_status_snapshot(&self, path: &str) -> FsResult<FileStatus> {
-        let fs_dir = self.fs_dir.view()?;
-        let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
-        let resolved = snapshot.resolve_path(path)?;
+    fn file_status_snapshot_attempt(&self, path: &str) -> Result<FileStatus, FileStatusReadError> {
+        let fs_dir = self.fs_dir.view().map_err(|e| match e {
+            NamespaceError::Busy => FileStatusReadError::HolderBusy,
+            NamespaceError::Unavailable => FileStatusReadError::Unavailable,
+        })?;
+        let snapshot = InodeStoreSnapshot::new(
+            fs_dir
+                .store
+                .checked_read_snapshot()
+                .map_err(|e| FileStatusReadError::Business(FsError::from(e)))?,
+        );
+        let resolved = snapshot
+            .resolve_path(path)
+            .map_err(|e| FileStatusReadError::Business(FsError::from(e)))?;
         let inode = resolved
             .target()
             .ok_or_else(|| FsError::file_not_found(path))?
             .clone();
-        Self::file_status_from_snapshot(&snapshot, path, inode)
+        Ok(Self::file_status_from_snapshot(&snapshot, path, inode)?)
     }
 
     /// Hot-path existence check over the live tree with the same locked
