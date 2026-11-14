@@ -379,6 +379,9 @@ impl CommitGate {
             "exclusive namespace commit gate entered with active writers"
         );
         lifecycle.exclusive = true;
+        if let Some(metrics) = crate::master::MASTER_METRICS.get() {
+            metrics.commit_gate_exclusive_enter_total.inc();
+        }
         Some(CommitGateExclusiveGuard { gate: self })
     }
 
@@ -401,9 +404,19 @@ impl CommitGate {
 
     /// Safe as a restore barrier only while a closing guard is held.
     pub fn wait_for_quiescence(&self) {
+        // S7 §7.1: this is the only place a caller holds a close guard and
+        // waits for in-flight writers to drain — the cold restore-barrier
+        // path. Timing lives entirely here; ordinary RPC writes never touch
+        // this method, so the histogram sees only cold-path samples.
+        let start = std::time::Instant::now();
         let mut lifecycle = self.lifecycle.lock();
         while self.any_in_flight() {
             self.changed.wait(&mut lifecycle);
+        }
+        if let Some(metrics) = crate::master::MASTER_METRICS.get() {
+            metrics
+                .commit_gate_drain_wait_us
+                .observe(start.elapsed().as_micros() as f64);
         }
     }
 

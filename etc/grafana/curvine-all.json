@@ -10865,6 +10865,210 @@
       ],
       "title": "元数据写回退（冷桥）次数",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "含义：命名空间提交门关闭屏障等待在途写者归零的耗时（仅恢复/快照等冷路径屏障记录），显示 P50 与 P99 两档。\n趋势：P99 持续抬升说明有慢写者或大量在途写者拖住恢复屏障，主备切换/快照会变慢；平时接近下限属于正常，长期无样本说明恢复屏障未发生。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 77
+      },
+      "id": 99003,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(commit_gate_drain_wait_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"}[$__rate_interval])))",
+          "format": "time_series",
+          "interval": "",
+          "legendFormat": "P50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(commit_gate_drain_wait_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"}[$__rate_interval])))",
+          "format": "time_series",
+          "interval": "",
+          "legendFormat": "P99",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "提交门排空等待时长",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "含义：独占快照写者成功占用提交门固定槽 0 的累计次数（快照/恢复生命周期事件）。\n趋势：速率上升说明快照/恢复操作变频繁；该事件期间普通写会被挡在门外，若与写延迟尖峰时间重合，优先核对是否由独占窗口造成。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 77
+      },
+      "id": 99004,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum by (instance) (commit_gate_exclusive_enter_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"})",
+          "format": "time_series",
+          "interval": "",
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "提交门独占进入次数",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

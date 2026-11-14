@@ -18,7 +18,7 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::ttl::TtlBucket;
 use crate::master::Master;
 use curvine_core_error::CommonResult;
-use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
+use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics, Metrics as m};
 use curvine_model::{MetricValue, WorkerInfo};
 use curvine_runtime::sync::FastDashMap;
 use curvine_sys::version::ReleaseVersion;
@@ -194,6 +194,15 @@ pub struct MasterMetrics {
     // static call-site identity (op). Cold event — a plain business error or
     // an in-place retry does not count.
     pub(crate) metadata_lock_fallback_total: CounterVec,
+
+    // S7 §7.1: wall time each restore barrier spent draining in-flight
+    // namespace writers to zero (close → quiescence). Only the cold
+    // restore/restore-barrier path records this; ordinary RPC writes never
+    // touch it. Buckets reuse the existing lock-acquire latency edges.
+    pub(crate) commit_gate_drain_wait_us: Histogram,
+    // S7 §7.1: successful exclusive (snapshot) admissions that occupied
+    // slot 0. Label-free by design — there is exactly one dimension.
+    pub(crate) commit_gate_exclusive_enter_total: Counter,
 
     // Compatibility metrics.
     // Per-verdict gauge: 1 for the current verdict of each worker
@@ -418,6 +427,15 @@ impl MasterMetrics {
                 "metadata_lock_fallback_total",
                 "Sharded-lock write requests that made the final typed Fallback decision and enter exclusive coordination, labelled by static call site",
                 &["op"],
+            )?,
+            commit_gate_drain_wait_us: m::new_histogram_with_buckets(
+                "commit_gate_drain_wait_us",
+                "Wall microseconds each namespace commit-gate close barrier spent waiting for in-flight writers to drain (restore barriers only)",
+                &buckets,
+            )?,
+            commit_gate_exclusive_enter_total: m::new_counter(
+                "commit_gate_exclusive_enter_total",
+                "Total number of exclusive snapshot admissions that occupied commit-gate slot 0",
             )?,
 
             compat_worker_verdict: m::new_gauge_vec(
