@@ -134,6 +134,18 @@ pub struct MasterFilesystem {
     /// keeps the direct release path, which is correct only while the replayer
     /// waits for each export. Shared by every clone so none bypasses the gate.
     fs_mode_releaser: Arc<OnceCell<Arc<dyn FsModeReleaser>>>,
+    /// Test-only instance-isolated observation point: armed once per test,
+    /// fires (take) right before the second holder view inside the locked
+    /// file_status attempt — proving the attempt actually reached the
+    /// post-lock view that can collide with a cold window.
+    #[cfg(test)]
+    fs_status_second_view_watch:
+        Arc<std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>,
+    /// Test-only: fires after the second holder view failed with Busy and
+    /// every inode lock was already dropped — proving no lock crosses the
+    /// wait before the outer retry sleeps.
+    #[cfg(test)]
+    fs_status_busy_after_locks_watch: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>>,
 }
 
 /// Result of [`MasterFilesystem::free_or_defer`].
@@ -289,6 +301,10 @@ impl MasterFilesystem {
             ),
             pending_drain: Default::default(),
             fs_mode_releaser: Default::default(),
+            #[cfg(test)]
+            fs_status_second_view_watch: Default::default(),
+            #[cfg(test)]
+            fs_status_busy_after_locks_watch: Default::default(),
             metadata_commit_gate: Default::default(),
             journal_writer,
         }
@@ -341,6 +357,10 @@ impl MasterFilesystem {
             worker_location_locks: js.fs().worker_location_locks.clone(),
             pending_drain: js.fs().pending_drain.clone(),
             fs_mode_releaser: js.fs().fs_mode_releaser.clone(),
+            #[cfg(test)]
+            fs_status_second_view_watch: js.fs().fs_status_second_view_watch.clone(),
+            #[cfg(test)]
+            fs_status_busy_after_locks_watch: js.fs().fs_status_busy_after_locks_watch.clone(),
             metadata_commit_gate: js.fs().metadata_commit_gate(),
             journal_writer: js.fs().journal_writer.clone(),
         }
@@ -2960,11 +2980,28 @@ impl MasterFilesystem {
             };
             drop(fs_dir);
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
+            #[cfg(test)]
+            if let Some((reached, release)) =
+                self.fs_status_second_view_watch.lock().unwrap().take()
+            {
+                // Mutex released before signaling; this thread then waits
+                // (outside any driver-owned lock? NO — it holds _locks) for
+                // the driver's bounded release. The driver-side proof of the
+                // no-locks-across-wait contract is the stripe probe that
+                // must succeed while this thread is parked.
+                let _ = reached.send(());
+                let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+            }
             let fs_dir = match self.fs_dir.view() {
                 Ok(view) => view,
                 Err(NamespaceError::Busy) => {
                     // The inode locks are dropped when this scope ends — the
                     // cold window must be waited on outside object locks.
+                    #[cfg(test)]
+                    if let Some(busy) = self.fs_status_busy_after_locks_watch.lock().unwrap().take()
+                    {
+                        let _ = busy.send(());
+                    }
                     return Err(FileStatusReadError::HolderBusy);
                 }
                 Err(NamespaceError::Unavailable) => {
@@ -6820,6 +6857,8 @@ mod tests {
     mod expect_gen_test;
     #[path = "fallback_contract_test.rs"]
     mod fallback_contract_test;
+    #[path = "file_status_cold_window_test.rs"]
+    mod file_status_cold_window_test;
     #[path = "fs_mode_release_gate_test.rs"]
     mod fs_mode_release_gate_test;
     #[path = "get_block_locations_batch_test.rs"]
