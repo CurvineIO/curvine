@@ -18,7 +18,9 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::ttl::TtlBucket;
 use crate::master::Master;
 use curvine_core_error::CommonResult;
-use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics, Metrics as m};
+use curvine_metrics::{
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics, Metrics as m,
+};
 use curvine_model::{MetricValue, WorkerInfo};
 use curvine_runtime::sync::FastDashMap;
 use curvine_sys::version::ReleaseVersion;
