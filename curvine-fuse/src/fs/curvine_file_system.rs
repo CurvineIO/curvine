@@ -20,7 +20,7 @@ use crate::fs::plock_wait_registry::{
 use crate::fs::state::{FileHandle, NodeState};
 use crate::fuse_metrics::{
     ReaddirTimer, INVAL_REASON_FLUSH, INVAL_REASON_FSYNC, INVAL_REASON_MKDIR, INVAL_REASON_RELEASE,
-    INVAL_REASON_RENAME, INVAL_REASON_RESIZE, INVAL_REASON_RMDIR,
+    INVAL_REASON_RENAME, INVAL_REASON_RESIZE,
 };
 use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
@@ -2143,12 +2143,7 @@ impl fs::FileSystem for CurvineFileSystem {
             .await?;
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         self.ensure_writable_path(&path)?;
-
-        let _guard = self.state.lock_path(&path).await;
-        self.state.delete_path(&path, false).await?;
-        self.state.unlink(op.header.nodeid, name, false)?;
-        self.state
-            .invalid_cache(op.header.nodeid, None, INVAL_REASON_RMDIR);
+        self.state.fs_rmdir(op.header.nodeid, name).await?;
 
         Ok(())
     }
