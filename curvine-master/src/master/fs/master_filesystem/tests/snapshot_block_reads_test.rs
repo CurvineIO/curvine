@@ -19,9 +19,7 @@
 use super::*;
 use crate::master::meta::inode::DirNode;
 use crate::master::meta::BlockMeta;
-use curvine_model::state::FileType;
 use curvine_model::BlockLocation;
-use std::collections::HashMap;
 
 /// Removes the live child edge for `path` (a file under /data) while keeping
 /// the store row, forcing the public block-read to fall back to the store
@@ -36,7 +34,7 @@ fn hide_live_edge_for_snapshot_fallback(
     // would take a read lock on the same stripe and trip the debug
     // re-entrancy check.
     let parent_id = fs.file_status("/data").unwrap().id;
-    let child_id = fs.file_status(&format!("/data/{name}")).unwrap().id;
+    let child_id = fs.file_status(format!("/data/{name}")).unwrap().id;
     let locks = inode_locks.write_inode(parent_id);
     let view = fs.fs_dir.view().unwrap();
     let root = view.root_node();
@@ -203,7 +201,7 @@ fn block_locations_snapshot_fallback_rejects_corrupt_non_tail_block() {
     // Classify the final observation explicitly. A business result (an FsErr
     // included) and a disconnected channel both mean the worker has finished;
     // only a final Timeout means it is still running.
-    let delivered = matches!(&received, Ok(_));
+    let delivered = received.is_ok();
     let worker_exited = matches!(
         &received,
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
@@ -348,7 +346,7 @@ fn block_locations_snapshot_fallback_matches_the_live_result() {
     // Classify the final observation explicitly. A business result (an FsErr
     // included) and a disconnected channel both mean the worker has finished;
     // only a final Timeout means it is still running.
-    let delivered = matches!(&received, Ok(_));
+    let delivered = received.is_ok();
     let worker_exited = matches!(
         &received,
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected)

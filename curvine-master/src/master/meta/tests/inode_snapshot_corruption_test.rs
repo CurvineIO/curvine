@@ -87,8 +87,7 @@ fn inode_snapshot_rejects_key_and_payload_id_mismatch() {
     }
     let error = fs
         .create_tree()
-        .err()
-        .expect("corrupt inode must fail restore");
+        .expect_err("corrupt inode must fail restore");
     assert!(error.to_string().contains("inode record id mismatch"));
 
     // Exercise the parallel deserialization path when more than one CPU is available.
@@ -97,8 +96,7 @@ fn inode_snapshot_rejects_key_and_payload_id_mismatch() {
     }
     let error = fs
         .create_tree()
-        .err()
-        .expect("corrupt inode must fail restore");
+        .expect_err("corrupt inode must fail restore");
     assert!(error.to_string().contains("inode record id mismatch"));
 }
 

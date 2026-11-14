@@ -406,8 +406,7 @@ fn app_storage_apply_advances_the_real_fsm_and_request_record() -> FsResult<()> 
             .encode()
             .map_err(|e| curvine_error::FsError::from(e.to_string()))?,
         context: SerdeUtils::serialize(&req_id)
-            .map_err(|e| curvine_error::FsError::from(e.to_string()))?
-            .into(),
+            .map_err(|e| curvine_error::FsError::from(e.to_string()))?,
         ..Default::default()
     };
 

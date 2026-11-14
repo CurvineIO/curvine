@@ -55,7 +55,7 @@ fn two_threads_hold_guards_on_distinct_slots() {
         let Some(second_index) = slots.iter().position(|&s| s != first_slot) else {
             panic!("pigeonhole: {slot_count}+1 guards must occupy >=2 distinct slots");
         };
-        let second_slot = slots[second_index];
+        let _second_slot = slots[second_index];
 
         // A concurrent close waits for BOTH original-slot drops (pick the
         // two distinct-slot guards).

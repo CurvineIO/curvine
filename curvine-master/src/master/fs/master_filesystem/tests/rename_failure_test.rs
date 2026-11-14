@@ -724,12 +724,12 @@ fn exchange_preserves_parent_links_and_subtrees_after_restore() {
                     "/right/target"
                 };
                 if source_dir {
-                    fs.mkdir(&format!("{source}/child"), true).unwrap();
+                    fs.mkdir(format!("{source}/child"), true).unwrap();
                 } else {
                     fs.create(source, true).unwrap();
                 }
                 if target_dir {
-                    fs.mkdir(&format!("{target}/child"), true).unwrap();
+                    fs.mkdir(format!("{target}/child"), true).unwrap();
                 } else {
                     fs.create(target, true).unwrap();
                 }
@@ -756,10 +756,10 @@ fn exchange_preserves_parent_links_and_subtrees_after_restore() {
                         );
                     }
                     if source_dir {
-                        assert!(fs.exists(&format!("{target}/child")).unwrap());
+                        assert!(fs.exists(format!("{target}/child")).unwrap());
                     }
                     if target_dir {
-                        assert!(fs.exists(&format!("{source}/child")).unwrap());
+                        assert!(fs.exists(format!("{source}/child")).unwrap());
                     }
                 }
             }

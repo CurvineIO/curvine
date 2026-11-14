@@ -20,11 +20,8 @@ use super::*;
 use crate::master::journal::journal_writer::tests::{build_writer, test_conf};
 use crate::master::journal::{JournalEntry, JournalSystem};
 use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
-use crate::master::meta::NamespaceError;
-use crate::master::Master;
 use curvine_config::ClusterConf;
 use curvine_raft::raft::RoleState;
-use curvine_runtime::common::Utils;
 use std::sync::Arc;
 use std::time::Duration;
 

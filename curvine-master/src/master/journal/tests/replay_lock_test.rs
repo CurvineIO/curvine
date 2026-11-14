@@ -20,8 +20,6 @@ use crate::master::journal::{AddBlockEntry, DeleteEntry, LinkEntry, RenameEntry}
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::subtree_write_plan::{SubtreeWritePlan, SUBTREE_PLAN_LIMIT};
 use crate::master::meta::InodeLockMode;
-use crate::master::Master;
-use curvine_config::ClusterConf;
 
 #[test]
 fn rename_replay_accepts_same_parent_and_cross_parent() -> FsResult<()> {
@@ -33,7 +31,7 @@ fn rename_replay_accepts_same_parent_and_cross_parent() -> FsResult<()> {
     // Same parent: both chains share the root and the parent, so the old
     // merged-dedup validation (which kept duplicate roots) rejected it.
     fs.mkdir("/same", true)?;
-    let a = fs.create("/same/a", true)?;
+    let _a = fs.create("/same/a", true)?;
     let b = fs.create("/same/b", true)?;
     let src_id = fs.file_status("/same/a")?.id;
     loader.apply_entry(JournalEntry::Rename(RenameEntry {

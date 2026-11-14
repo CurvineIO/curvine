@@ -18,7 +18,7 @@
 
 use super::*;
 use curvine_model::{
-    BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
+    BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress,
     WorkerAddress, WorkerInfo, WorkerStatus,
 };
 
@@ -264,7 +264,7 @@ fn replay_with_an_over_budget_location_set_falls_back_instead_of_panicking() -> 
     // Source: the same small topology, no blocks - only the entry matters.
     source_fs.mkdir("/t/d0", true)?;
     for index in 0..FILES {
-        source_fs.create(&format!("/t/d0/f{index}"), true)?;
+        source_fs.create(format!("/t/d0/f{index}"), true)?;
     }
     let entry = capture_one(&source_fs, || {
         source_fs

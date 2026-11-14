@@ -217,7 +217,7 @@ fn topology_reads_wait_for_shared_namespace_writers() {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut threads = Vec::new();
     let cold_ops: [u8; 5] = [3, 5, 6, 7, 8];
-    for (index, &operation) in cold_ops.iter().enumerate() {
+    for (_index, &operation) in cold_ops.iter().enumerate() {
         let fs = fs.clone();
         let started_tx = started_tx.clone();
         let (release_tx, release_rx) = std::sync::mpsc::channel();

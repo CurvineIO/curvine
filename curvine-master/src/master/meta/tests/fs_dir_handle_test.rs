@@ -127,11 +127,11 @@ fn invalid_timeout_touches_nothing() {
 fn cold_error_exit_restores_the_same_view() {
     let (handle, _) = build("error-exit");
     let next_id = handle.view().unwrap().last_inode_id() + 1;
-    let result: Result<(), ()> = (|| {
+    let result: Result<(), ()> = {
         let mut cold = handle.begin_cold(Duration::from_secs(1)).unwrap();
         cold.view().update_last_inode_id(next_id).unwrap();
         Err(())
-    })();
+    };
     assert!(result.is_err());
     assert_eq!(handle.view().unwrap().last_inode_id(), next_id);
 }
@@ -179,10 +179,7 @@ fn cold_guard_leaves_no_stale_strong_reference() {
     assert!(handle.view().is_ok());
     // A second cold run still proves unique ownership without waiting for
     // any timeout: no dropped guard leaked an `Arc`.
-    assert!(matches!(
-        handle.begin_cold(Duration::from_millis(20)),
-        Ok(_)
-    ));
+    assert!(handle.begin_cold(Duration::from_millis(20)).is_ok());
 }
 
 // Terminal failure: `fail_closed(writer)` for a failed confirmation that may

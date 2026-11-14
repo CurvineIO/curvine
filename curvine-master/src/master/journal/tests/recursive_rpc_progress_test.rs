@@ -82,7 +82,7 @@ fn committed_entry(op_entry: JournalEntry, req_id: i64) -> Entry {
         index: 1,
         term: 1,
         data: batch.encode().unwrap(),
-        context: SerdeUtils::serialize(&req_id).unwrap().into(),
+        context: SerdeUtils::serialize(&req_id).unwrap(),
         ..Default::default()
     }
 }

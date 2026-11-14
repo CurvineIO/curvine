@@ -188,7 +188,7 @@ fn location_added_after_sampling_forces_a_second_capture() {
         .arm_location_pause_hook(loc_reached_tx, loc_release_rx);
 
     let free_fs = fs.clone();
-    let (handle_done_tx, handle_done_rx) = std::sync::mpsc::channel();
+    let (handle_done_tx, _handle_done_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         let result = free_fs.free("/t", true);
         // Signal completion before returning so the driver never blocks
@@ -255,7 +255,7 @@ fn replication_completion_in_the_sampling_window_forces_a_second_capture() {
         .arm_location_pause_hook(loc_reached_tx, loc_release_rx);
 
     let free_fs = fs.clone();
-    let (handle_done_tx, handle_done_rx) = std::sync::mpsc::channel();
+    let (handle_done_tx, _handle_done_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         let result = free_fs.free("/t", true);
         // Signal completion before returning so the driver never blocks
@@ -320,7 +320,7 @@ fn block_report_racing_a_last_link_delete_forces_coverage() {
         .arm_location_pause_hook(loc_reached_tx, loc_release_rx);
 
     let delete_fs = fs.clone();
-    let (handle_done_tx, handle_done_rx) = std::sync::mpsc::channel();
+    let (handle_done_tx, _handle_done_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         let result = delete_fs.delete("/a", true);
         // Signal completion before returning so the driver never blocks

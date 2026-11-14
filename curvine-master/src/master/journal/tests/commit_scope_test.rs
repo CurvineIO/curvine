@@ -1,7 +1,6 @@
 use super::{
     CommitScopeEntry, JournalCommitScope, JournalWriter, RecoveryGate, JOURNAL_COMMIT_SCOPES,
 };
-use crate::master::journal::JournalSystem;
 use crate::master::Master;
 use curvine_config::{ClusterConf, JournalConf};
 use curvine_raft::raft::RaftClient;

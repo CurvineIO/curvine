@@ -290,11 +290,11 @@ fn id_only_invalidation_excludes_with_the_delete_on_the_same_file_inode() {
         .file_status("/outside-keep")
         .expect("the external name must survive");
     assert_eq!(survivor.id, file_id);
-    match {
+    let res = {
         let handle = fs.fs_dir.clone();
         let view = handle.view().expect("namespace view");
         view.store.get_inode(file_id, None).unwrap()
-    } {
+    }; match res {
         Some(crate::master::meta::inode::InodeView::File(file)) => assert!(
             file.blocks.iter().all(|b| b.id != block_id),
             "the cleanup must leave the reclaimed block out of the inode"

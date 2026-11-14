@@ -1038,14 +1038,12 @@ fn free_file_does_not_wait_for_a_shared_namespace_reader() {
     worker.join().unwrap();
     assert_eq!(result.inodes, 1);
     assert!(
-        fs.fs_dir
+        !fs.fs_dir
             .view()
             .unwrap()
             .store
             .get_locations(block_id)
-            .unwrap()
-            .len()
-            > 0
+            .unwrap().is_empty()
     );
 }
 
@@ -2817,7 +2815,7 @@ fn complete_file_commit_failure_keeps_memory_and_store_unchanged() {
 fn status_probe_owned() {
     let fs = test_fs("status-probe-owned");
     for i in 0..256 {
-        fs.create(&format!("/parent/file-{i}"), true).unwrap();
+        fs.create(format!("/parent/file-{i}"), true).unwrap();
     }
     let id = fs.file_status("/parent/file-0").unwrap().id;
     let mut samples = Vec::new();

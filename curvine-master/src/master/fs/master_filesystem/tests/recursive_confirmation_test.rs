@@ -4,23 +4,12 @@
 
 use super::recursive_confirmation_support::*;
 use super::recursive_confirmation_support::{
-    arm_publication_failure, await_worker, remove_case_dirs, run_admitted, shutdown_case,
-    typed_op_error, WORKER_TIMEOUT,
+    await_worker, remove_case_dirs, run_admitted, shutdown_case,
+    typed_op_error,
 };
 use super::*;
-use crate::master::journal::RecoveryGate;
-use curvine_raft::raft::RaftClient;
 
-use crate::master::meta::fs_dir_handle::NamespaceGuard;
-use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
-use crate::master::meta::{ColdError, NamespaceError};
-use crate::master::Master;
-use curvine_raft::raft::RoleState;
-use std::sync::mpsc::Receiver;
-use std::sync::mpsc::Sender;
-use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 
 /// §8.1: a real publication failure inside the body moves the failure seq,
 /// so the confirmation guard terminalizes the holder while the locks are
@@ -204,7 +193,7 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
 /// drop, so a waiter that queued for the lock sees the failed holder.
 #[test]
 fn recursive_fenced_admission_rejected_without_holder_retirement() -> FsResult<()> {
-    let (conf, journal, mut fs) = confirmation_env("recursive-role-fence");
+    let (conf, journal, fs) = confirmation_env("recursive-role-fence");
     fs.mkdir("/tree", true).unwrap();
     fs.create("/tree/file", true).unwrap();
     fs.journal_writer.with_testing_receiver(|receiver| loop {
@@ -282,7 +271,7 @@ fn recursive_fenced_admission_rejected_without_holder_retirement() -> FsResult<(
 /// later ordinary writes succeed.
 #[test]
 fn recursive_plain_business_error_keeps_holder_alive() -> FsResult<()> {
-    let (conf, journal, mut fs) = confirmation_env("recursive-plain-business-error");
+    let (conf, journal, fs) = confirmation_env("recursive-plain-business-error");
     fs.mkdir("/tree", true).unwrap();
     drain_receipts(&fs.journal_writer.clone());
     let writer = fs.journal_writer.clone();
@@ -381,7 +370,7 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
                 .expect("missing the recursive set_attr journal entry")
         })
         .unwrap();
-    let _commit_failed = drop(queued.completion);
+    drop(queued.completion);
 
     let result = await_worker(&done_rx, "the double failure")
         .expect("the double failure must report its result");

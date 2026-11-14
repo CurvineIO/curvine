@@ -53,9 +53,7 @@ fn modes_for(requests: &[InodeLockRequest], id: i64) -> Vec<InodeLockMode> {
 }
 
 fn has_write(requests: &[InodeLockRequest], id: i64) -> bool {
-    modes_for(requests, id)
-        .iter()
-        .any(|mode| *mode == InodeLockMode::Write)
+    modes_for(requests, id).contains(&InodeLockMode::Write)
 }
 
 #[test]

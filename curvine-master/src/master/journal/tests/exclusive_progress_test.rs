@@ -18,10 +18,9 @@
 //! the receipt must fail the holder closed.
 
 use super::*;
-use crate::master::fs::DeleteMode;
 use crate::master::journal::{JournalBatch, JournalEntry, JournalSystem};
 use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
-use crate::master::meta::{InodeId, NamespaceError};
+use crate::master::meta::NamespaceError;
 use crate::master::Master;
 use curvine_config::ClusterConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -146,7 +145,7 @@ fn committed_entry(op_entry: JournalEntry, req_id: i64) -> Entry {
         index: 1,
         term: 1,
         data: batch.encode().unwrap(),
-        context: SerdeUtils::serialize(&req_id).unwrap().into(),
+        context: SerdeUtils::serialize(&req_id).unwrap(),
         ..Default::default()
     }
 }
@@ -431,8 +430,7 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
         Waited::Timeout => panic!("the blocked RPC did not resume; skipping its join"),
     };
     let rpc_err = rpc_result
-        .err()
-        .expect("the resumed RPC must be rejected by the fence, not run");
+        .expect_err("the resumed RPC must be rejected by the fence, not run");
     assert!(
         rpc_err
             .to_string()

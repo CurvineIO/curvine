@@ -78,8 +78,7 @@ fn tree_restore_fails_when_directory_attribute_column_is_unavailable() {
     let store = InodeStore::new(rocks, Arc::new(TtlBucketList::new(60_000).unwrap())).unwrap();
     let error = store
         .create_tree()
-        .err()
-        .expect("missing CF must fail restore");
+        .expect_err("missing CF must fail restore");
     assert!(error.to_string().contains(RocksInodeStore::CF_DIR_ATTRS));
     drop(store);
 

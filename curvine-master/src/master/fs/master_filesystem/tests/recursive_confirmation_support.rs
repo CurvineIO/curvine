@@ -164,7 +164,7 @@ pub(super) fn assert_holder_terminal(
 
 /// A pre-failure view stays a legal, droppable reference (FAILED is not a
 /// drain), while the terminated store rejects every new read.
-pub(super) fn terminal_holder_alive_probe(fs: &MasterFilesystem, pre_view: &NamespaceGuard<'_>) {
+pub(super) fn terminal_holder_alive_probe(_fs: &MasterFilesystem, pre_view: &NamespaceGuard<'_>) {
     // FAILED is not a drain: the pre-failure view reference survives and can
     // be dropped safely, but reads through the terminal store are rejected
     // (the retirement invalidates the metadata store — same boundary as C1's
@@ -216,8 +216,8 @@ pub(super) fn remove_case_dirs(conf: &ClusterConf) {
 }
 
 pub(super) fn shutdown_case(journal: JournalSystem) {
-    let ack = journal.shutdown();
-    drop(ack);
+    journal.shutdown();
+    drop(());
 }
 
 /// A reader that reports before and after the blocking object-lock

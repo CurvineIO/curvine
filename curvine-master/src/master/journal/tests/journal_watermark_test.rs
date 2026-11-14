@@ -3,7 +3,6 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
-use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT; // You may obtain a copy of the License at
                                                               //
                                                               //     http://www.apache.org/licenses/LICENSE-2.0
                                                               //
@@ -136,7 +135,7 @@ fn cursor_flush_cannot_hide_a_committed_inode_after_restart() {
         for item in fs.fs_dir.view().unwrap().take_entries() {
             batch.push(item);
         }
-        assert!(batch.len() > 0);
+        assert!(!batch.is_empty());
         journal
             .append_committed_entry_for_test(Entry {
                 index: 1,
@@ -234,7 +233,7 @@ fn corrupt_journal_batch_is_classified_as_metadata_damage() {
     let corrupt = Entry {
         index: 1,
         term: 1,
-        data: vec![0xff].into(),
+        data: vec![0xff],
         ..Default::default()
     };
     let error = runtime

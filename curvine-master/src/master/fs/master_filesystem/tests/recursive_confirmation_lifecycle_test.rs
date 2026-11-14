@@ -244,7 +244,7 @@ fn recursive_commit_error_after_ok_body_terminals_holder() -> FsResult<()> {
                 .expect("missing the recursive set_attr journal entry")
         })
         .unwrap();
-    let _commit_failed = drop(queued.completion);
+    drop(queued.completion);
 
     let commit_err = await_worker(&done_rx, "the commit failure")
         .expect("the commit failure must report its result")
@@ -403,7 +403,7 @@ fn recursive_disjoint_writer_completes_while_another_waits() -> FsResult<()> {
 /// on the original epoch, with no body side effect and a live holder.
 #[test]
 fn recursive_fenced_inside_plan_window_rejected_by_original_epoch() -> FsResult<()> {
-    let (conf, journal, mut fs) = confirmation_env("recursive-fenced-plan-window");
+    let (conf, journal, fs) = confirmation_env("recursive-fenced-plan-window");
     fs.mkdir("/tree", true).unwrap();
     drain_receipts(&fs.journal_writer.clone());
     let writer = fs.journal_writer.clone();

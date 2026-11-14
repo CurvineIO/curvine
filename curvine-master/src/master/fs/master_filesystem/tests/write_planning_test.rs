@@ -4,7 +4,6 @@
 // lookups, a stop at intermediate files, and rejection of invalid or
 // pending-namespace paths.
 use super::*;
-use crate::master::meta::inode::DirNode;
 use crate::master::meta::BlockMeta;
 use curvine_model::BlockLocation;
 use curvine_raft::raft::RoleState;

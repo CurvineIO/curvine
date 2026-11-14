@@ -168,7 +168,7 @@ fn leader_bookkeeping_does_not_wait_for_namespace_writer() {
             index: 8192,
             term: 1,
             data: batch.encode().unwrap(),
-            context: SerdeUtils::serialize(&7_i64).unwrap().into(),
+            context: SerdeUtils::serialize(&7_i64).unwrap(),
             ..Default::default()
         };
         let namespace = loader.fs_dir.clone();

@@ -253,7 +253,10 @@ fn file_status_reports_unavailable_after_terminal_failure() {
         let _ = ready_tx.send(());
         let fail_receipt = fail_rx.recv_timeout(Duration::from_secs(30));
         match fail_receipt {
-            Ok(()) => drop(guard.fail_closed()),
+            Ok(()) => {
+                guard.fail_closed();
+                drop(())
+            },
             Err(_) => drop(guard),
         }
         drop(fs2);
@@ -618,7 +621,8 @@ fn file_status_fails_immediately_when_already_failed_public_and_private() {
 
     // Take the holder to the real FAILED state (guard fail path).
     let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
-    drop(guard.fail_closed());
+    guard.fail_closed();
+    drop(());
 
     // Private snapshot attempt: terminal immediately.
     let started = Instant::now();

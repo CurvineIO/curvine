@@ -24,7 +24,7 @@
 //! report/completion interleavings live in the location test files.
 
 use super::super::subtree_write_plan::{SubtreeLocationPlan, SUBTREE_LOCATION_LIMIT};
-use super::super::{InodeLockMode, InodeLockRequest};
+use super::super::InodeLockRequest;
 use crate::master::fs::MasterFilesystem;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::BlockMeta;
