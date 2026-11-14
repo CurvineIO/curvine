@@ -1260,7 +1260,9 @@ fn cold_member_rebuilds_from_committed_log_against_live_majority() -> CommonResu
 
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let converged = returning_fs.exists("/committed-while-away").unwrap_or(false)
+        let converged = returning_fs
+            .exists("/committed-while-away")
+            .unwrap_or(false)
             && returning_fs
                 .exists("/committed-also-while-away")
                 .unwrap_or(false);
