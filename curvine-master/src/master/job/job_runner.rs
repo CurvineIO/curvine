@@ -35,6 +35,27 @@ use log::{debug, error, info, warn};
 use std::collections::LinkedList;
 use std::sync::Arc;
 
+/// Maximum number of load-task submissions kept in flight at once.
+const SUBMIT_CONCURRENCY: usize = 1024;
+
+/// Run `submit` over `items` with at most `limit` futures in flight.
+///
+/// A plain `try_join_all` over one future per item keeps the whole set live and
+/// makes every poll O(n); bounding the window keeps memory flat and the poll
+/// cost proportional to `limit` instead of the number of tasks.
+async fn submit_with_bound<I, T, F, Fut>(items: I, limit: usize, submit: F) -> FsResult<()>
+where
+    I: IntoIterator<Item = T>,
+    F: FnMut(T) -> Fut,
+    Fut: std::future::Future<Output = FsResult<()>>,
+{
+    stream::iter(items)
+        .map(submit)
+        .buffer_unordered(limit)
+        .try_collect::<()>()
+        .await
+}
+
 pub struct LoadJobRunner {
     jobs: JobStore,
     master_fs: MasterFilesystem,
@@ -418,7 +439,7 @@ impl LoadJobRunner {
             }
         }
 
-        if let Err(err) = self.submit_all_task(tasks).await {
+        if let Err(err) = self.submit_all_task(tasks, Some((&job_id, None))).await {
             warn!("dispatch {} job {} failed: {}", job_kind, job_id, err);
             // @todo Cancel sub-tasks that may have already been dispatched.
             if let Err(update_err) = self.jobs.update_state(
@@ -546,7 +567,10 @@ impl LoadJobRunner {
             return Ok(());
         }
 
-        if let Err(err) = self.submit_all_task(tasks).await {
+        if let Err(err) = self
+            .submit_all_task(tasks, Some((&queued.job_id, Some(queued.run_id))))
+            .await
+        {
             warn!("dispatch load job {} failed: {}", queued.job_id, err);
             let failed_current_run = self.jobs.update_state_if_run(
                 &queued.job_id,
@@ -605,26 +629,52 @@ impl LoadJobRunner {
         true
     }
 
-    async fn submit_all_task(&self, tasks: FastHashMap<String, TaskDetail>) -> FsResult<()> {
+    /// `active` is the `(job_id, run_id)` this submission belongs to; once the job
+    /// leaves the running state (canceled / replaced / removed) no new task is
+    /// admitted, so a cancellation cannot keep spawning copies.
+    async fn submit_all_task(
+        &self,
+        tasks: FastHashMap<String, TaskDetail>,
+        active: Option<(&str, Option<u64>)>,
+    ) -> FsResult<()> {
         // Submit with bounded concurrency. Building one future per file and
         // joining them all at once makes every poll O(n): for a job with
         // millions of files that pins a whole core in
         // FuturesUnordered::poll_next and delays dispatch to the workers.
-        const SUBMIT_CONCURRENCY: usize = 1024;
+        submit_with_bound(
+            tasks.take(),
+            SUBMIT_CONCURRENCY,
+            |(id, task): (String, TaskDetail)| async move {
+                if let Some((job_id, run_id)) = active {
+                    if !self.run_is_active(job_id, run_id) {
+                        debug!(
+                            "job {} is no longer running, skip submitting sub-task {}",
+                            job_id, id
+                        );
+                        return Ok(());
+                    }
+                }
 
-        stream::iter(tasks.take())
-            .map(|(id, task)| async move {
                 let worker = task.task.worker.clone();
                 let client = self.factory.get_worker_client(&worker).await?;
                 client.submit_load_task(task.task).await?;
                 debug!("dispatched sub-task {} to worker {}", id, worker);
                 Ok::<(), FsError>(())
-            })
-            .buffer_unordered(SUBMIT_CONCURRENCY)
-            .try_collect::<()>()
-            .await?;
+            },
+        )
+        .await
+    }
 
-        Ok(())
+    /// A run is still allowed to submit when the store holds it, it is running,
+    /// and (when known) it is the run that asked for the submission.
+    fn run_is_active(&self, job_id: &str, run_id: Option<u64>) -> bool {
+        match self.jobs.get(job_id) {
+            Some(job) => {
+                let state: JobTaskState = job.state.state();
+                state.is_running() && run_id.map_or(true, |run| job.run_id == run)
+            }
+            None => false,
+        }
     }
 
     async fn create_all_tasks(
@@ -780,6 +830,7 @@ mod tests {
     use curvine_runtime::common::Utils;
     use curvine_runtime::runtime::{RpcRuntime, Runtime};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -926,5 +977,49 @@ mod tests {
             "cancel took {:?}; stalled workers were waited on serially",
             elapsed
         );
+    }
+
+    /// The submission window must stay bounded. With more items than
+    /// `SUBMIT_CONCURRENCY`, at most that many submissions may be in flight at
+    /// once, and every item must still be submitted exactly once. This fails if
+    /// the bounded stream is replaced by an unbounded `try_join_all` again.
+    #[test]
+    fn submit_with_bound_caps_in_flight_submissions() {
+        let rt = Runtime::new("submit-bound-test", 2, 8);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let submitted = Arc::new(AtomicUsize::new(0));
+
+        let total = SUBMIT_CONCURRENCY * 3;
+        let items: Vec<usize> = (0..total).collect();
+        let res = rt.block_on(submit_with_bound(items, SUBMIT_CONCURRENCY, |_item| {
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            let submitted = submitted.clone();
+            async move {
+                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(current, Ordering::SeqCst);
+                // Hold the slot so a second submission can overlap.
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                submitted.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), FsError>(())
+            }
+        }));
+
+        assert!(res.is_ok(), "bounded submission failed: {:?}", res);
+        assert_eq!(
+            submitted.load(Ordering::SeqCst),
+            total,
+            "every task must be submitted exactly once"
+        );
+        let peak = max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak <= SUBMIT_CONCURRENCY,
+            "in-flight submissions {} exceeded the bound {}",
+            peak,
+            SUBMIT_CONCURRENCY
+        );
+        assert!(peak > 1, "the test did not exercise any concurrency");
     }
 }
